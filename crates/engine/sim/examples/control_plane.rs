@@ -8,8 +8,8 @@ use uniserve_core::{
     CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
-    GenerationRuntimeCapabilities, ImageParams, OperationType, RequestId, SamplingParams,
-    TriggerPolicyDescriptor, UndVisibility,
+    GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor,
+    UndVisibility,
 };
 use uniserve_engine_api::{EngineHandle, GenEvent};
 use uniserve_scheduler::{ControlTokens, Scheduler};
@@ -61,13 +61,11 @@ fn main() {
             20,
             &cache,
             &GenerationRuntimeCapabilities {
-                supported_operation_types: vec![
-                    OperationType::SequenceExtend,
-                    OperationType::SequenceDecode,
-                    OperationType::Flow,
-                    OperationType::MaterializeImage,
-                    OperationType::TransferKv,
-                ],
+                supports_understanding: true,
+                supports_vision_encode: false,
+                supports_latent_encode: false,
+                supports_image_generation: true,
+                supports_commit_writeback: true,
                 max_latent_units: 64,
                 latent_downsample: 16,
                 max_vae_grid_tokens: 64,

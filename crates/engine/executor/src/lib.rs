@@ -5,14 +5,14 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::{BlockId, CommandWaker, GeneratedImageCommitCapabilities, RequestId};
 use uniserve_worker_wire::{
-    Batch, EngineCaps, ExecutionResult, Operation, OperationType, RequestKind, SnapshotRef,
+    Batch, CompletionReport, EngineCaps, Operation, RequestKind, SnapshotRef, WorkVariant,
     WorkerRequest,
 };
 
 /// Synchronous model-engine seam used by deterministic local implementations.
 pub trait ModelEngine: Send {
     fn caps(&self) -> EngineCaps;
-    fn execute(&mut self, batch: Batch) -> anyhow::Result<ExecutionResult>;
+    fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport>;
     fn drop_session(&mut self, id: RequestId) -> anyhow::Result<()>;
 }
 
@@ -50,32 +50,34 @@ pub enum WorkerKind {
     Gen,
 }
 
-const FULL_OPERATIONS: &[OperationType] = &OperationType::ALL;
-const ENCODER_OPERATIONS: &[OperationType] =
-    &[OperationType::EncodeVision, OperationType::EncodeLatent];
-const PREFILL_OPERATIONS: &[OperationType] = &[OperationType::SequenceExtend];
-const DECODE_OPERATIONS: &[OperationType] = &[
-    OperationType::SequenceDecode,
-    OperationType::SequenceVerify,
-    OperationType::Flow,
-    OperationType::MaterializeImage,
-    OperationType::TransferKv,
+const FULL_WORK: &[WorkVariant] = &WorkVariant::ALL;
+const ENCODER_WORK: &[WorkVariant] = &[WorkVariant::EncodeVision, WorkVariant::EncodeLatent];
+const PREFILL_WORK: &[WorkVariant] = &[WorkVariant::TokenExtend];
+const DECODE_WORK: &[WorkVariant] = &[
+    WorkVariant::TokenDecode,
+    WorkVariant::TokenVerify,
+    WorkVariant::Draft,
+    WorkVariant::GenFlow,
+    WorkVariant::Materialize,
+    WorkVariant::TransferKvPublish,
+    WorkVariant::TransferKvInstall,
 ];
-const SAMPLER_OPERATIONS: &[OperationType] = &[OperationType::SequenceSample];
-const POSTPROCESS_OPERATIONS: &[OperationType] = &[OperationType::MaterializeFrame];
-const UND_OPERATIONS: &[OperationType] = &[
-    OperationType::SequenceExtend,
-    OperationType::SequenceDecode,
-    OperationType::SequenceVerify,
-    OperationType::SequenceSample,
-    OperationType::EncodeVision,
-    OperationType::EncodeLatent,
-    OperationType::TransferKv,
+const SAMPLER_WORK: &[WorkVariant] = &[WorkVariant::Draft];
+const POSTPROCESS_WORK: &[WorkVariant] = &[WorkVariant::Materialize];
+const UND_WORK: &[WorkVariant] = &[
+    WorkVariant::TokenExtend,
+    WorkVariant::TokenDecode,
+    WorkVariant::TokenVerify,
+    WorkVariant::Draft,
+    WorkVariant::EncodeVision,
+    WorkVariant::EncodeLatent,
+    WorkVariant::TransferKvPublish,
+    WorkVariant::TransferKvInstall,
 ];
-const GEN_OPERATIONS: &[OperationType] = &[
-    OperationType::Flow,
-    OperationType::MaterializeImage,
-    OperationType::MaterializeFrame,
+const GEN_WORK: &[WorkVariant] = &[
+    WorkVariant::GenTransition,
+    WorkVariant::GenFlow,
+    WorkVariant::Materialize,
 ];
 
 impl WorkerKind {
@@ -108,24 +110,23 @@ impl WorkerKind {
         })
     }
 
-    /// Exact operation types accepted by this worker role.
-    pub fn supported_operation_types(self) -> &'static [OperationType] {
+    /// Exact work variants accepted by this worker role.
+    pub fn supported_work(self) -> &'static [WorkVariant] {
         match self {
-            Self::Full => FULL_OPERATIONS,
-            Self::Encoder => ENCODER_OPERATIONS,
-            Self::Prefill => PREFILL_OPERATIONS,
-            Self::Decode => DECODE_OPERATIONS,
-            Self::Sampler => SAMPLER_OPERATIONS,
-            Self::PostProcess => POSTPROCESS_OPERATIONS,
-            Self::Und => UND_OPERATIONS,
-            Self::Gen => GEN_OPERATIONS,
+            Self::Full => FULL_WORK,
+            Self::Encoder => ENCODER_WORK,
+            Self::Prefill => PREFILL_WORK,
+            Self::Decode => DECODE_WORK,
+            Self::Sampler => SAMPLER_WORK,
+            Self::PostProcess => POSTPROCESS_WORK,
+            Self::Und => UND_WORK,
+            Self::Gen => GEN_WORK,
         }
     }
 
-    /// Whether this role accepts this exact typed operation.
+    /// Whether this role accepts this operation's work variant.
     pub fn handles(self, operation: &Operation) -> bool {
-        self.supported_operation_types()
-            .contains(&operation.operation_type())
+        self.supported_work().contains(&operation.work.variant())
     }
 }
 
@@ -433,7 +434,7 @@ pub trait Executor: Send {
     }
 
     fn submit(&mut self, batch: Batch) -> anyhow::Result<()>;
-    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>>;
+    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>>;
 
     /// Data-plane causality gate: whether every data-plane tensor the request's
     /// next op depends on is reachable on the worker that would run it. The
@@ -479,7 +480,7 @@ pub trait Executor: Send {
     fn wait_result_timeout(
         &mut self,
         timeout: Duration,
-    ) -> anyhow::Result<Option<ExecutionResult>> {
+    ) -> anyhow::Result<Option<CompletionReport>> {
         let Some(deadline) = Instant::now().checked_add(timeout) else {
             return self.poll();
         };
@@ -494,7 +495,7 @@ pub trait Executor: Send {
             std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
         }
     }
-    fn next_result(&mut self) -> anyhow::Result<ExecutionResult>;
+    fn next_result(&mut self) -> anyhow::Result<CompletionReport>;
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64>;
     fn control_wait(
         &mut self,
@@ -507,7 +508,10 @@ pub trait Executor: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_worker_wire::{MaterializeKind, SequenceMode};
+    use uniserve_core::RequestId;
+    use uniserve_worker_wire::{
+        Bounds, Domain, OpId, RequestKey, RouteId, TokenMode, VersionRef, Work,
+    };
 
     #[test]
     fn payload_free_control_round_trips() {
@@ -522,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_kind_round_trips_and_maps_ops() {
+    fn worker_kind_round_trips_and_maps_work() {
         for kind in [
             WorkerKind::Full,
             WorkerKind::Encoder,
@@ -534,69 +538,44 @@ mod tests {
             WorkerKind::Gen,
         ] {
             assert_eq!(WorkerKind::from_token(kind.as_str()), Some(kind));
-            assert!(!kind.supported_operation_types().is_empty());
+            assert!(!kind.supported_work().is_empty());
         }
-        let extend = sequence(SequenceMode::Extend);
-        let decode = sequence(SequenceMode::Decode);
-        let sample = sequence(SequenceMode::Sample);
-        let image = materialize(MaterializeKind::Image);
-        let frame = materialize(MaterializeKind::Frame);
+        let extend = op(Work::Token(TokenMode::Extend));
+        let decode = op(Work::Token(TokenMode::Decode));
+        let draft = op(Work::Draft);
+        let materialize = op(Work::Materialize);
 
         assert!(WorkerKind::Full.handles(&extend));
         assert!(WorkerKind::Prefill.handles(&extend));
         assert!(!WorkerKind::Prefill.handles(&decode));
         assert!(WorkerKind::Decode.handles(&decode));
-        assert!(WorkerKind::Sampler.handles(&sample));
-        assert!(WorkerKind::Decode.handles(&image));
-        assert!(WorkerKind::PostProcess.handles(&frame));
+        assert!(WorkerKind::Sampler.handles(&draft));
+        assert!(WorkerKind::Decode.handles(&materialize));
+        assert!(WorkerKind::PostProcess.handles(&materialize));
         assert!(WorkerKind::Und.handles(&decode));
-        assert!(!WorkerKind::Und.handles(&image));
-        assert!(WorkerKind::Gen.handles(&image));
+        assert!(!WorkerKind::Und.handles(&materialize));
+        assert!(WorkerKind::Gen.handles(&materialize));
         assert!(!WorkerKind::Gen.handles(&decode));
         assert_eq!(WorkerKind::from_token("nope"), None);
     }
 
-    fn sequence(mode: SequenceMode) -> Operation {
-        use uniserve_worker_wire::{
-            KvLeaseDelta, PublishedProduct, SequenceInput, SequenceOperation, TokenInput,
-            TokenPolicy, TokenSource,
-        };
-        Operation::Sequence(SequenceOperation {
-            mode,
-            lease: KvLeaseDelta::default(),
-            position: (0, 1),
-            policy: TokenPolicy::default(),
-            input: if mode == SequenceMode::Sample {
-                SequenceInput::PublishedLogits(PublishedProduct {
-                    handle: 1,
-                    locator: String::new(),
-                })
-            } else {
-                SequenceInput::Tokens(TokenInput {
-                    token_ids: vec![1],
-                    source: TokenSource::Wire,
-                    draft_token_ids: Vec::new(),
-                    return_all_logits: false,
-                })
-            },
-        })
-    }
-
-    fn materialize(kind: MaterializeKind) -> Operation {
-        use uniserve_worker_wire::{
-            KvLeaseDelta, MaterializeInput, MaterializeOperation, PublishedProduct, TokenPolicy,
-        };
-        Operation::Materialize(MaterializeOperation {
-            kind,
-            lease: KvLeaseDelta::default(),
-            position: 0,
-            conditioning_position: 0,
-            policy: TokenPolicy::default(),
-            input: MaterializeInput::Published(PublishedProduct {
-                handle: 1,
-                locator: String::new(),
-            }),
-        })
+    fn op(work: Work) -> Operation {
+        let request_key = RequestKey::new(1, RequestId(1), 1);
+        Operation::registered(
+            request_key,
+            OpId(1),
+            VersionRef::admission_root(request_key, OpId(1), "0".repeat(64)),
+            work,
+            RouteId(0),
+            Domain::Und,
+            Bounds::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
+        )
     }
 
     #[test]

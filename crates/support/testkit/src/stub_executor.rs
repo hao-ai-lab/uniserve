@@ -1,5 +1,5 @@
 //! A configurable [`Executor`] test double for integration tests: it declares
-//! configurable [`EngineCaps`], serves a queue of canned [`ExecutionResult`]s,
+//! configurable [`EngineCaps`], serves a queue of canned [`CompletionReport`]s,
 //! and records every submitted [`Batch`] for assertions.
 
 use std::collections::VecDeque;
@@ -7,9 +7,8 @@ use std::collections::VecDeque;
 use uniserve_core::RequestId;
 use uniserve_executor::{ControlAck, ControlOp, Executor};
 use uniserve_worker_wire::{
-    Batch, EncodeDelta, EngineCaps, ExecutionResult, FlowDelta, MaterializeDelta,
-    MaterializedProduct, Operation, OperationResult, ResultDelta, SequenceDelta, SequenceEffect,
-    TransferDelta,
+    Batch, CompletionRecord, CompletionReport, EngineCaps, FinishFlags, LogicalLengths, OpStatus,
+    Operation, Point, RegistrationAck, TimingCounters, TokenSpan, Work,
 };
 
 /// Configurable [`Executor`] double for unit and integration tests.
@@ -17,22 +16,23 @@ use uniserve_worker_wire::{
 /// Behavior is fully driven by its fields:
 ///
 /// * [`caps`](Self::caps) — the [`EngineCaps`] reported to the scheduler.
-/// * [`results`](Self::results) — canned [`ExecutionResult`]s served in FIFO order
-///   by [`poll`](Executor::poll) / [`next_result`](Executor::next_result). When
-///   the queue is exhausted, [`echo_submitted`](Self::echo_submitted) decides
-///   whether a submit synthesizes an echo result or leaves nothing to poll.
+/// * [`results`](Self::results) — canned [`CompletionReport`]s served in FIFO
+///   order by [`poll`](Executor::poll) / [`next_result`](Executor::next_result).
+///   When the queue is exhausted, [`echo_submitted`](Self::echo_submitted)
+///   decides whether a submit synthesizes an echo report or leaves nothing to
+///   poll.
 /// * [`submitted`](Self::submitted) — every [`Batch`] passed to
 ///   [`submit`](Executor::submit), in order, for post-hoc assertions.
 /// * [`controls`](Self::controls) — every [`ControlOp`] passed to
 ///   [`control`](Executor::control) / [`control_wait`](Executor::control_wait).
 pub struct StubExecutor {
     pub caps: EngineCaps,
-    pub results: VecDeque<ExecutionResult>,
+    pub results: VecDeque<CompletionReport>,
     pub submitted: Vec<Batch>,
     pub controls: Vec<ControlOp>,
-    /// When `results` is empty, synthesize one typed result per operation.
+    /// When `results` is empty, synthesize one completion per operation.
     pub echo_submitted: bool,
-    ready: VecDeque<ExecutionResult>,
+    ready: VecDeque<CompletionReport>,
 }
 
 impl Default for StubExecutor {
@@ -42,7 +42,7 @@ impl Default for StubExecutor {
 }
 
 impl StubExecutor {
-    /// A stub with default [`EngineCaps`], no canned results, and echo enabled.
+    /// A stub with default [`EngineCaps`], no canned reports, and echo enabled.
     pub fn new() -> Self {
         Self {
             caps: EngineCaps::default(),
@@ -66,68 +66,76 @@ impl StubExecutor {
         self
     }
 
-    /// Preload canned [`ExecutionResult`]s, served in FIFO order, and stop
-    /// synthesizing echo results.
-    pub fn with_results(mut self, results: impl IntoIterator<Item = ExecutionResult>) -> Self {
+    /// Preload canned [`CompletionReport`]s, served in FIFO order, and stop
+    /// synthesizing echo reports.
+    pub fn with_results(mut self, results: impl IntoIterator<Item = CompletionReport>) -> Self {
         self.results = results.into_iter().collect();
         self.echo_submitted = false;
         self
     }
 
-    /// Whether to synthesize an echo [`ExecutionResult`] per submit once the canned
-    /// `results` queue is exhausted.
+    /// Whether to synthesize an echo [`CompletionReport`] per submit once the
+    /// canned `results` queue is exhausted.
     pub fn echo_when_empty(mut self, echo: bool) -> Self {
         self.echo_submitted = echo;
         self
     }
 
-    fn echo_result(batch: &Batch) -> ExecutionResult {
-        let operations = batch
-            .operations
-            .iter()
-            .map(|operation| OperationResult {
-                session_id: operation.session_id,
-                epoch: operation.epoch,
-                op_id: operation.op_id,
-                base_version: operation.base_version,
-                result_version: operation.base_version.saturating_add(1),
-                delta: match &operation.operation {
-                    Operation::Sequence(_) => ResultDelta::Sequence(SequenceDelta {
-                        effect: SequenceEffect {
-                            sampled_token_ids: vec![operation.session_id.0 as u32],
-                            ..SequenceEffect::default()
-                        },
-                    }),
-                    Operation::Flow(flow) => ResultDelta::Flow(FlowDelta {
-                        steps_completed: flow.start_step.saturating_add(flow.step_count),
-                        done: false,
-                    }),
-                    Operation::Encode(_) => ResultDelta::Encode(EncodeDelta {
-                        product_handle: operation.session_id.0.max(1),
-                        kv_tokens: 1,
-                        image_size: None,
-                    }),
-                    Operation::Materialize(_) => ResultDelta::Materialize(MaterializeDelta {
-                        product: MaterializedProduct::Published(
-                            uniserve_worker_wire::PublishedProduct {
-                                handle: operation.session_id.0.max(1),
-                                locator: format!("stub-product-{}", operation.session_id.0),
-                            },
-                        ),
-                        kv_tokens: None,
-                        sequence: None,
-                    }),
-                    Operation::Transfer(transfer) => ResultDelta::Transfer(TransferDelta {
-                        product: Some(transfer.source.clone()),
-                        kv_tokens: None,
-                        sequence: None,
-                    }),
-                },
-            })
-            .collect();
-        ExecutionResult {
+    /// The terminal completion an echoing stub emits for one operation. A token
+    /// operation commits the request's session id as its single token; every
+    /// other work variant contributes no committed tokens.
+    fn echo_record(operation: &Operation) -> CompletionRecord {
+        let (parent_index, parent_semantic) = match &operation.parent.point {
+            Point::Fixed {
+                point_index,
+                semantic_digest,
+            } => (*point_index, semantic_digest.clone()),
+            Point::Device { .. } => (0, "0".repeat(64)),
+        };
+        let selected_point = if operation.advances_state {
+            parent_index.saturating_add(1)
+        } else {
+            parent_index
+        };
+        let committed_tokens = if matches!(operation.work, Work::Token(_)) {
+            vec![operation.request_key.session_id.0 as u32]
+        } else {
+            Vec::new()
+        };
+        let mut record = CompletionRecord {
+            request_key: operation.request_key,
+            op_id: operation.op_id,
+            completion_slot_generation: 0,
+            status: OpStatus::Ok,
+            selected_point,
+            logical_lengths: LogicalLengths {
+                token_len: committed_tokens.len() as u32,
+                kv_visible_len: 0,
+                latent_len: 0,
+            },
+            token_span: TokenSpan {
+                base: 0,
+                len: committed_tokens.len() as u32,
+            },
+            committed_tokens,
+            finish_flags: FinishFlags::default(),
+            product_generations: operation.outputs.iter().map(|out| out.generation).collect(),
+            semantic_digest: String::new(),
+            error_code: None,
+            timing_counters: TimingCounters::default(),
+        };
+        record.semantic_digest =
+            record.compute_semantic_digest(&parent_semantic, &operation.plan_digest);
+        record
+    }
+
+    fn echo_result(batch: &Batch) -> CompletionReport {
+        let completions = batch.operations.iter().map(Self::echo_record).collect();
+        CompletionReport {
             step_id: batch.step_id,
-            operations,
+            completions,
+            products: Vec::new(),
+            registration: RegistrationAck { visible: true },
             worker_exec_us: Some(0),
             forward_stats: None,
         }
@@ -158,11 +166,11 @@ impl Executor for StubExecutor {
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
         Ok(self.ready.pop_front())
     }
 
-    fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
         self.ready
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("StubExecutor has no ready result"))
@@ -189,7 +197,7 @@ impl Executor for StubExecutor {
 }
 
 impl StubExecutor {
-    /// Drop the next ready result without polling it (e.g. to model a worker that
+    /// Drop the next ready report without polling it (e.g. to model a worker that
     /// discarded `req_id`'s in-flight op).
     pub fn forget_ready(&mut self, _req_id: RequestId) {
         self.ready.pop_front();
@@ -201,61 +209,55 @@ mod tests {
     use super::*;
     use uniserve_core::SamplingParams;
     use uniserve_worker_wire::{
-        Admission, KvAllocation, KvLeaseDelta, SequenceAdmission, SequenceInput, SequenceMode,
-        SequenceOperation, TokenInput, TokenPolicy, TokenSource,
+        Admission, Bounds, Domain, OpId, RequestKey, RouteId, TokenMode, UndAdmission, VersionRef,
     };
 
     fn batch(step_id: u64, session_id: u64) -> Batch {
+        let request_key = RequestKey::new(0, RequestId(session_id), 1);
         let admission = Admission::new(
-            RequestId(session_id),
-            Some(SequenceAdmission {
+            request_key,
+            Some(UndAdmission {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
-                kv: KvAllocation {
-                    block_ids: Vec::new(),
-                    prefix_len: 0,
-                    group_id: 0,
-                },
+                kv: Default::default(),
             }),
             None,
             None,
         )
         .expect("admission");
-        let mut operation = uniserve_worker_wire::OperationEnvelope::unsealed(
-            RequestId(session_id),
-            Operation::Sequence(SequenceOperation {
-                mode: SequenceMode::Decode,
-                lease: KvLeaseDelta::default(),
-                position: (0, 1),
-                policy: TokenPolicy::default(),
-                input: SequenceInput::Tokens(TokenInput {
-                    token_ids: vec![1],
-                    source: TokenSource::Wire,
-                    draft_token_ids: Vec::new(),
-                    return_all_logits: false,
-                }),
-            }),
+        let parent = VersionRef::admission_root(request_key, OpId(1), admission.digest.clone());
+        let operation = Operation::registered(
+            request_key,
+            OpId(step_id.max(1)),
+            parent,
+            Work::Token(TokenMode::Decode),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_tokens: 1,
+                ..Bounds::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
         );
-        operation.admission_digest = admission.digest.clone();
-        operation.model_spec_digest = "0".repeat(64);
-        operation.weight_digest = "1".repeat(64);
-        operation.seal(1, step_id, step_id.saturating_sub(1));
         Batch::new(step_id, vec![admission], vec![operation])
     }
 
     #[test]
-    fn echo_mode_records_batches_and_echoes_one_result_per_operation() {
+    fn echo_mode_records_batches_and_echoes_one_completion_per_operation() {
         let mut executor = StubExecutor::new().with_pipeline_depth(4);
         executor.submit(batch(1, 7)).expect("submit");
         assert_eq!(executor.submitted.len(), 1);
         assert_eq!(executor.pipeline_depth(), 4);
-        let result = executor.poll().expect("poll").expect("echoed result");
-        assert_eq!(result.step_id, 1);
-        assert_eq!(result.operations[0].session_id, RequestId(7));
-        let ResultDelta::Sequence(delta) = &result.operations[0].delta else {
-            panic!("expected sequence delta");
-        };
-        assert_eq!(delta.effect.sampled_token_ids, vec![7]);
+        let report = executor.poll().expect("poll").expect("echoed report");
+        assert_eq!(report.step_id, 1);
+        assert_eq!(report.completions[0].request_key.session_id, RequestId(7));
+        assert_eq!(report.completions[0].committed_tokens, vec![7]);
         assert!(executor.poll().expect("poll").is_none());
     }
 

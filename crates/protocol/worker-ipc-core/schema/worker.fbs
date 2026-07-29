@@ -1,26 +1,64 @@
 namespace uniserve.wire;
 
-// Protocol v3 uses the five closed semantic variants below.
-enum OperationKind : ubyte { Sequence, Flow, Encode, Materialize, Transfer }
-enum OperationType : ubyte {
-  SequenceExtend,
-  SequenceDecode,
-  SequenceVerify,
-  SequenceSample,
-  Flow,
+// The closed leaves of the `Work` algebra. Every configured route runs one of
+// these; the nesting (Token/Encode/Transfer/Gen) lives in the Rust and Python
+// types and flattens to this exhaustive tag on the wire.
+enum WorkVariant : ubyte {
+  TokenExtend,
+  TokenDecode,
+  TokenVerify,
+  Draft,
   EncodeVision,
   EncodeLatent,
-  MaterializeImage,
-  MaterializeFrame,
   TransferProduct,
-  TransferKv
+  TransferKvPublish,
+  TransferKvInstall,
+  GenTransition,
+  GenFlow,
+  Materialize
 }
-enum SequenceMode : ubyte { Extend, Decode, Verify, Sample }
-enum TokenSource : ubyte { Wire, LastSampled }
-enum EncodeKind : ubyte { Vision, Latent }
-enum MaterializeKind : ubyte { Image, Frame }
-enum TransferKind : ubyte { Product, Kv }
 
+enum Domain : ubyte { Und, Gen }
+
+enum ProductKind : ubyte {
+  Token,
+  Logprob,
+  Draft,
+  VisionFeature,
+  LatentFeature,
+  Kv,
+  Latent,
+  Artifact,
+  Completion
+}
+
+enum StorageClass : ubyte {
+  DeviceTensor,
+  PagedKv,
+  LatentArena,
+  HostStaging,
+  CompletionArena
+}
+
+enum DType : ubyte { U8, U16, U32, I32, I64, F16, BF16, F32 }
+
+enum OpStatus : ubyte { Ok, Predicated, Error }
+
+enum ErrorCode : ubyte {
+  InvalidOperation,
+  ResourceExhausted,
+  ComputeError,
+  Cancelled,
+  Internal
+}
+
+enum DrawLayout : ubyte { TargetSampling, SpeculativeProposal, FlowNoise }
+
+enum Disposition : ubyte { Publish, Retain, Discard }
+
+enum CloseReason : ubyte { Completed, Cancelled, Error, Preempted }
+
+// Administrative worker command channel (separate from request `Control`).
 enum ReqKind : ubyte {
   GetCapabilities,
   Execute,
@@ -40,15 +78,10 @@ enum ReqKind : ubyte {
 enum RespKind : ubyte { Capabilities, Result, Ok, Error, Metrics, Pressure, Snapshot }
 enum AdapterMode : ubyte { None, EngineWide, PerRequest, MultiAdapter }
 enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent, Scratch, Adapter }
-enum LeasePolicy : ubyte { PerRequest, Evictable, Pinned }
-enum ResourceEventKind : ubyte { Issued, Released, Evicted, InvariantViolation }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
 
 table U32List { items:[uint]; }
-table U64List { items:[ulong]; }
 table TokenBias { token_id:uint; bias:float; }
-table TokenLogprob { token_id:uint; logprob:float; rank:uint; }
-table PositionLogprobs { entries:[TokenLogprob]; }
 table BlockPair { src:uint; dst:uint; }
 table StringU64Pair { key:string; value:ulong; }
 
@@ -99,16 +132,6 @@ table ImageParams {
   retain_images:bool = true;
 }
 
-table Guidance {
-  branch_count:ubyte;
-  text_scale:float;
-  image_scale:float;
-  renorm_type:string;
-  renorm_min:float;
-  interval_lo:float;
-  interval_hi:float;
-}
-
 table KvGroupSpec {
   group_id:uint;
   block_offset:uint;
@@ -142,7 +165,7 @@ table EngineCaps {
   num_blocks:uint;
   num_layers:uint;
   scratch_capacity_tokens:ulong;
-  supported_operation_types:[OperationType];
+  supported_work:[WorkVariant];
   max_latent_size:uint;
   latent_downsample:uint;
   bytes_per_token:ulong;
@@ -165,8 +188,162 @@ table EngineCaps {
   resource_classes:[ResourceClass];
   model_spec_digest:string;
   weight_digest:string;
+  protocol_layout_digest:string;
+  route_capability_digest:string;
   restored_sessions:[ulong];
 }
+
+// ---- Identities and the four protocol records -----------------------------
+
+table RequestKey {
+  authority_id:ulong;
+  session_id:ulong;
+  epoch:ulong;
+}
+
+table PointFixed {
+  point_index:uint;
+  semantic_digest:string;
+}
+
+table PointDevice {
+  selected_point:ProductRef;
+  producer_plan_digest:string;
+}
+
+union Point { PointFixed, PointDevice }
+
+table VersionRef {
+  request_key:RequestKey;
+  producer_op_id:ulong;
+  point:Point;
+}
+
+// One dimension of a bounded shape: a host-static extent when `device` is
+// false, or the fixed maximum of the single device-actual axis when true.
+table DimBound {
+  device:bool;
+  value:uint;
+}
+
+table ShapeBound { dims:[DimBound]; }
+
+table PointRange {
+  base_point:uint;
+  max_points:uint;
+}
+
+table ProductRef {
+  request_key:RequestKey;
+  producer_op_id:ulong;
+  output_index:ushort;
+  generation:uint;
+  kind:ProductKind;
+  storage_class:StorageClass;
+  dtype:DType;
+  shape_bound:ShapeBound;
+  point_range:PointRange;
+}
+
+table Bounds {
+  max_points:uint;
+  max_tokens:uint;
+  max_kv_pages:uint;
+  max_latent_bytes:ulong;
+  max_completion_bytes:ulong;
+  max_transfer_bytes:ulong;
+}
+
+table Rng {
+  seed:ulong;
+  semantic_index_base:ulong;
+  draw_layout:DrawLayout;
+}
+
+table Operation {
+  request_key:RequestKey;
+  op_id:ulong;
+  parent:VersionRef;
+  work:WorkVariant;
+  route:uint;
+  domain:Domain;
+  advances_state:bool;
+  bounds:Bounds;
+  inputs:[ProductRef];
+  outputs:[ProductRef];
+  new_kv_blocks:[uint];
+  predicate:ProductRef;
+  rng:Rng;
+  control_seq:ulong;
+  plan_digest:string;
+}
+
+table LogicalLengths {
+  token_len:uint;
+  kv_visible_len:uint;
+  latent_len:uint;
+}
+
+table TokenSpan {
+  base:uint;
+  len:uint;
+}
+
+table FinishFlags {
+  eos:bool;
+  length:bool;
+  stop:bool;
+}
+
+table TimingCounters {
+  queued_us:ulong;
+  device_us:ulong;
+  copy_us:ulong;
+  host_us:ulong;
+}
+
+table CompletionRecord {
+  request_key:RequestKey;
+  op_id:ulong;
+  completion_slot_generation:uint;
+  status:OpStatus;
+  selected_point:uint;
+  logical_lengths:LogicalLengths;
+  token_span:TokenSpan;
+  committed_tokens:[uint];
+  finish_flags:FinishFlags;
+  product_generations:[uint];
+  semantic_digest:string;
+  error_code:ErrorCode = null;
+  timing_counters:TimingCounters;
+}
+
+table ControlCommit {
+  request_key:RequestKey;
+  control_seq:ulong;
+  expected_parent:VersionRef;
+  selected:VersionRef;
+  public_event_limit:ulong;
+  disposition:Disposition;
+}
+
+table ControlClose {
+  request_key:RequestKey;
+  control_seq:ulong;
+  cutoff:VersionRef;
+  reason:CloseReason;
+}
+
+table ControlRelease {
+  request_key:RequestKey;
+  op_id:ulong;
+}
+
+union Control { ControlCommit, ControlClose, ControlRelease }
+
+table ControlEnvelope { control:Control; }
+
+// ---- Admission framing (session establishment) ----------------------------
 
 table KvAllocation {
   block_ids:[uint];
@@ -174,224 +351,47 @@ table KvAllocation {
   group_id:uint;
 }
 
-table SequenceAdmission {
+table UndAdmission {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   kv:KvAllocation;
 }
 
-table FlowAdmission { image:ImageParams; }
+table GenAdmission { image:ImageParams; }
 
 table Admission {
-  session_id:ulong;
+  request_key:RequestKey;
   digest:string;
-  sequence:SequenceAdmission;
-  flow:FlowAdmission;
+  und:UndAdmission;
+  gen_admission:GenAdmission;
   adapter_id:uint = null;
 }
 
-table KvLeaseDelta {
-  group_id:uint;
-  new_blocks:[uint];
-}
-
-table TokenPolicy {
-  allowed_tokens:[uint];
-  suppress_tokens:[uint];
-  recent_tokens:[uint];
-  publish_kv:bool;
-  publish_kv_on_tokens:[uint];
-}
-
-table TokenInput {
-  token_ids:[uint];
-  source:TokenSource;
-  draft_token_ids:[uint];
-  return_all_logits:bool;
-}
-
-table PublishedLogits {
-  handle:ulong;
-  locator:string;
-}
-
-table PublishedKv {
-  handle:ulong;
-  locators:[string];
-  source_version:ulong;
-  kv_tokens:uint;
-  block_ids:[uint];
-  group_id:uint;
-  position:uint;
-}
-
-union SequenceInput { TokenInput, PublishedLogits }
-
-table SequenceOperation {
-  mode:SequenceMode;
-  lease:KvLeaseDelta;
-  position_start:uint;
-  position_end:uint;
-  policy:TokenPolicy;
-  input:SequenceInput;
-}
-
-table FlowOperation {
-  latent_handle:ulong;
-  position:uint;
-  start_step:ushort;
-  step_count:ushort = 1;
-  conditioning_position:uint;
-  conditioning:PublishedKv;
-  guidance:Guidance;
-  image_prompt:string;
-}
-
-table InlineImage {
-  base64:string;
-  content_hash:ulong;
-}
-
-table StagedProduct {
-  handle:ulong;
-  content_hash:ulong;
-}
-
-table CachedProduct { content_hash:ulong; }
-union EncodeInput { InlineImage, StagedProduct, CachedProduct }
-
-table EncodeOperation {
-  kind:EncodeKind;
-  lease:KvLeaseDelta;
-  position_start:uint;
-  position_end:uint;
-  conditioning_position:uint;
-  input:EncodeInput;
-}
-
-table LatentProduct { handle:ulong; }
-table PublishedProduct { handle:ulong; locator:string; }
-union MaterializeInput { LatentProduct, PublishedProduct }
-
-table MaterializeOperation {
-  kind:MaterializeKind;
-  lease:KvLeaseDelta;
-  position:uint;
-  conditioning_position:uint;
-  policy:TokenPolicy;
-  input:MaterializeInput;
-}
-
-table TransferOperation {
-  kind:TransferKind;
-  lease:KvLeaseDelta;
-  position:uint;
-  conditioning_position:uint;
-  policy:TokenPolicy;
-  source:PublishedProduct;
-}
-
-union Operation {
-  SequenceOperation,
-  FlowOperation,
-  EncodeOperation,
-  MaterializeOperation,
-  TransferOperation
-}
-
-table OperationEnvelope {
-  session_id:ulong;
-  epoch:ulong;
-  op_id:ulong;
-  base_version:ulong;
-  digest:string;
-  admission_digest:string;
-  model_spec_digest:string;
-  weight_digest:string;
-  operation:Operation;
-}
-
-table SessionProjection {
-  session_id:ulong;
-  epoch:ulong;
-  version:ulong;
-  last_op_id:ulong;
-  admission_digest:string;
-  source_digest:string;
-  last_sampled_token:uint = null;
-}
-
 table Batch {
-  protocol_version:ushort;
   step_id:ulong;
   admissions:[Admission];
-  projections:[SessionProjection];
-  operations:[OperationEnvelope];
+  operations:[Operation];
+  controls:[ControlEnvelope];
+  input_products:[ProductPayload];
 }
 
-table SequenceEffect {
-  sampled_token_ids:[uint];
-  sampled_logprob:float = null;
-  top_logprobs:[TokenLogprob];
-  prompt_logprobs:[PositionLogprobs];
-  accepted_draft_tokens:uint = null;
-  kv_tokens:uint = null;
-  published_logits:PublishedProduct;
-  published_kv:PublishedKv;
+// ---- Worker response payloads ---------------------------------------------
+
+table RegistrationAck { visible:bool; }
+
+// A resolved output-product value the worker delivers for host consumption:
+// requested logprob blobs, materialized image bytes, and similar. Never a
+// lineage identity, so it enters no semantic digest.
+table ProductPayload {
+  product:ProductRef;
+  bytes:[ubyte];
 }
 
-table SequenceDelta { effect:SequenceEffect; }
-table FlowDelta { steps_completed:ushort; done:bool; }
-table EncodeDelta {
-  product_handle:ulong;
-  kv_tokens:uint;
-  height:uint = null;
-  width:uint = null;
-}
-
-table ImageArtifact {
-  png_base64:string;
-  height:uint;
-  width:uint;
-  handle:ulong;
-  locator:string;
-}
-
-table FrameRecord { count:uint; }
-union MaterializedProduct { ImageArtifact, PublishedProduct, FrameRecord }
-
-table MaterializeDelta {
-  product:MaterializedProduct;
-  kv_tokens:uint = null;
-  sequence:SequenceEffect;
-}
-
-table TransferDelta {
-  product:PublishedProduct;
-  kv_tokens:uint = null;
-  sequence:SequenceEffect;
-}
-
-union ResultDelta {
-  SequenceDelta,
-  FlowDelta,
-  EncodeDelta,
-  MaterializeDelta,
-  TransferDelta
-}
-
-table OperationResult {
-  session_id:ulong;
-  epoch:ulong;
-  op_id:ulong;
-  base_version:ulong;
-  result_version:ulong;
-  delta:ResultDelta;
-}
-
-table ExecutionResult {
+table CompletionReport {
   step_id:ulong;
-  operations:[OperationResult];
+  completions:[CompletionRecord];
+  products:[ProductPayload];
+  registration:RegistrationAck;
   worker_exec_us:ulong = null;
   forward_stats:WorkerForwardStats;
 }
@@ -462,8 +462,7 @@ table WorkerRequest {
 }
 
 table ErrorOperationIdentity {
-  session_id:ulong;
-  epoch:ulong;
+  request_key:RequestKey;
   op_id:ulong;
 }
 
@@ -471,7 +470,7 @@ table WorkerResponse {
   kind:RespKind;
   call_id:ulong = null;
   capabilities:EngineCaps;
-  result:ExecutionResult;
+  completion_report:CompletionReport;
   metrics:WorkerMetrics;
   pressure:[ResourcePressure];
   message:string;

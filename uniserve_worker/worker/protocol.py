@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
-from ..batch import Batch, ExecutionResult
+from ..batch import Batch, CompletionReport, WorkVariant
 from ..capabilities import (
     AdapterMode,
     EngineCaps,
@@ -13,6 +13,7 @@ from ..capabilities import (
     RankInfo,
     RequestKind,
     ResourceClass,
+    work_variants_for_operation_types,
 )
 from ..foundation.errors import capability_mismatch
 from ..runtime.snapshot_store import SnapshotRef
@@ -22,6 +23,7 @@ from ..spec import OperationType
 @dataclass(frozen=True, slots=True)
 class WorkerContract:
     capabilities: EngineCaps
+    effective_operation_types: frozenset[OperationType]
 
     @classmethod
     def compile(
@@ -35,7 +37,7 @@ class WorkerContract:
     ) -> WorkerContract:
         if int(pipeline_depth) <= 0:
             raise capability_mismatch("worker pipeline depth must be positive")
-        implemented = frozenset(declared_capabilities.supported_operation_types) | frozenset(
+        implemented = frozenset(declared_capabilities.operation_types) | frozenset(
             system_operation_types
         )
         effective = tuple(
@@ -43,7 +45,8 @@ class WorkerContract:
             for operation_type in OperationType
             if operation_type in allowed_operation_types and operation_type in implemented
         )
-        if not effective:
+        effective_work = work_variants_for_operation_types(effective)
+        if not effective_work:
             raise capability_mismatch(
                 f"{owner} implements none of the requested operation types "
                 f"{sorted(value.value for value in allowed_operation_types)!r}"
@@ -51,9 +54,10 @@ class WorkerContract:
         return cls(
             capabilities=replace(
                 declared_capabilities,
-                supported_operation_types=effective,
+                supported_work=effective_work,
                 pipeline_depth=int(pipeline_depth),
             ),
+            effective_operation_types=frozenset(effective),
         )
 
 
@@ -62,7 +66,7 @@ class Worker(Protocol):
     @property
     def contract(self) -> WorkerContract: ...
 
-    def execute(self, batch: Batch) -> ExecutionResult: ...
+    def execute(self, batch: Batch) -> CompletionReport: ...
 
     def drop_session(self, session_id: int) -> None: ...
 
@@ -86,7 +90,7 @@ class Worker(Protocol):
 def model_free_capabilities(
     *,
     block_size: int,
-    supported_operation_types: tuple[OperationType, ...],
+    supported_work: tuple[WorkVariant, ...],
     supported_controls: tuple[RequestKind, ...] = (),
     num_layers: int = 1,
     num_blocks: int = 1,
@@ -107,7 +111,7 @@ def model_free_capabilities(
         num_blocks=num_blocks,
         num_layers=num_layers,
         scratch_capacity_tokens=scratch_capacity_tokens,
-        supported_operation_types=supported_operation_types,
+        supported_work=supported_work,
         max_latent_size=max_latent_size,
         latent_downsample=latent_downsample,
         max_vae_grid_tokens=0,

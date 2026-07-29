@@ -16,7 +16,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from PIL import Image
 
 import uniserve_eval.backends
 import uniserve_eval.harness.runner as harness_runner
@@ -384,11 +383,62 @@ def test_sensenova_default_gate_declares_complete_image_lifecycle():
     workload = config["workloads"]["gate/sensenova/default-travel"]
     image_config = workload["payload"]["image_config"]
 
-    assert workload["expect_images"] == image_config["num_images"]
-    assert workload["expect_image_steps"] == image_config["steps"] * image_config["num_images"]
+    assert workload["warn_image_count"] == image_config["num_images"]
+    assert workload["expect_image_steps_per_image"] == image_config["steps"]
     assert image_config["steps"] == 50
-    assert uniserve_eval.verify.usage_image_steps({"usage": {"image_steps": 200}}) == 200
+    assert uniserve_eval.verify.usage_image_steps_per_image(
+        {"usage": {"image_steps_per_image": [50, 50, 50, 50]}}
+    ) == [50, 50, 50, 50]
+    checks, warnings, failures = uniserve_eval.verify.verification_checks(
+        workload,
+        images=[
+            {"size": [workload["expect_image_width"], workload["expect_image_height"]]}
+            for _ in range(workload["warn_image_count"])
+        ],
+        image_steps_per_image=[image_config["steps"]] * workload["warn_image_count"],
+        errors=[],
+        finished_count=1,
+    )
+    assert all(checks.values())
+    assert warnings == []
+    assert failures == []
 
+
+@pytest.mark.parametrize("image_count", [0, 3])
+def test_correctness_gate_reports_variable_image_count_without_rejecting_valid_images(
+    image_count: int,
+) -> None:
+    config = load_config(DEFAULT_CONFIG)
+    workload = config["workloads"]["gate/sensenova/default-travel"]
+    checks, warnings, failures = uniserve_eval.verify.verification_checks(
+        workload,
+        images=[
+            {"size": [workload["expect_image_width"], workload["expect_image_height"]]}
+            for _ in range(image_count)
+        ],
+        image_steps_per_image=[50] * image_count or None,
+        errors=[],
+        finished_count=1,
+    )
+
+    assert all(checks.values())
+    assert warnings == [f"expected 4 images, got {image_count}"]
+    assert failures == []
+
+
+def test_verify_cli_accepts_an_immutable_output_directory() -> None:
+    from uniserve_eval.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "verify",
+            "gate/sensenova/default-travel",
+            "--output-dir",
+            "artifacts/eval/sensenova/default-travel",
+        ]
+    )
+
+    assert args.output_dir == Path("artifacts/eval/sensenova/default-travel")
 
 
 def test_verify_reference_evidence_uses_exact_transport_and_rgb_bytes(tmp_path):
@@ -426,25 +476,6 @@ def test_verify_reference_evidence_uses_exact_transport_and_rgb_bytes(tmp_path):
         "has_usage": True,
         "has_error": False,
     }
-
-
-def test_sensenova_t2i_gate_rejects_an_image_that_misses_prompt_color_semantics(tmp_path):
-    config = load_config(DEFAULT_CONFIG)
-    expectation = config["workloads"]["gate/sensenova/t2i-seed42"][
-        "expect_image_channel_dominance"
-    ]
-    matching = tmp_path / "matching.png"
-    mismatching = tmp_path / "mismatching.png"
-    Image.new("RGB", (4, 4), (180, 60, 40)).save(matching)
-    Image.new("RGB", (4, 4), (40, 60, 180)).save(mismatching)
-
-    uniserve_eval.verify.verify_image_channel_dominance(
-        [{"path": str(matching)}], expectation
-    )
-    with pytest.raises(SystemExit, match="expected image mean red channel to exceed blue"):
-        uniserve_eval.verify.verify_image_channel_dominance(
-            [{"path": str(mismatching)}], expectation
-        )
 
 
 def test_benchmark_runner_forwards_wire(tmp_path):

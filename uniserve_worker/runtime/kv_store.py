@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import RLock
 
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
-from ..batch import Admission, KvLeaseDelta, PublishedKv
+from ..batch import Admission
 from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import bucketed_page_count, ceil_div
 from .host_staging import (
@@ -21,6 +21,40 @@ from .host_staging import (
 )
 from .kv_pool import PagedKVPool
 from .transfer import Locator, Transport
+
+
+@dataclass(frozen=True, slots=True)
+class KvSnapshot:
+    """A committed local KV view published for Gen conditioning or a replica.
+
+    Transport locators, page identities, and extents stay worker-local: the
+    wire protocol names a published KV product by :class:`ProductRef` identity
+    and the worker binds that identity to these physical addresses here.
+    """
+
+    locators: tuple[str, ...]
+    source_version: int
+    kv_tokens: int
+    block_ids: tuple[int, ...]
+    group_id: int
+    position: int
+
+    def for_tensor_rank(self, rank: int, size: int) -> KvSnapshot:
+        """Select this rank's contiguous locator group from a TP publication."""
+
+        rank = int(rank)
+        size = int(size)
+        if size < 1 or rank < 0 or rank >= size:
+            raise invalid_descriptor("published KV tensor-parallel rank is invalid")
+        if not self.locators:
+            return self
+        if len(self.locators) % size:
+            raise invalid_descriptor(
+                "published KV locators do not divide across tensor-parallel ranks"
+            )
+        width = len(self.locators) // size
+        start = rank * width
+        return replace(self, locators=self.locators[start : start + width])
 
 
 @dataclass(slots=True)
@@ -556,23 +590,24 @@ class KvStore:
             return len(block_ids) * block_size
 
     def admit(self, admission: Admission) -> None:
+        session_id = admission.request_key.session_id
         with self._lock:
-            sequence = admission.sequence
-            if sequence is None:
-                self._entries.setdefault(admission.session_id, KvEntry())
+            und = admission.und
+            if und is None:
+                self._entries.setdefault(session_id, KvEntry())
                 return
-            if admission.session_id in self._entries:
+            if session_id in self._entries:
                 return
-            allocation = sequence.kv
+            allocation = und.kv
             entry = KvEntry(
                 block_ids=list(allocation.block_ids),
                 prefix_len=allocation.prefix_len,
                 length=allocation.prefix_len,
                 group_id=allocation.group_id,
             )
-            self._validate_blocks(admission.session_id, entry.block_ids, entry.prefix_len)
-            self._entries[admission.session_id] = entry
-            self._register(admission.session_id, entry.block_ids)
+            self._validate_blocks(session_id, entry.block_ids, entry.prefix_len)
+            self._entries[session_id] = entry
+            self._register(session_id, entry.block_ids)
 
     def get(self, session_id: int) -> KvEntry:
         with self._lock:
@@ -580,27 +615,6 @@ class KvStore:
                 return self._entries[int(session_id)]
             except KeyError:
                 raise invalid_descriptor(f"session {session_id} has no KV state") from None
-
-    def apply_lease(self, session_id: int, lease: KvLeaseDelta) -> None:
-        with self._lock:
-            entry = self.get(session_id)
-            if lease.group_id != entry.group_id:
-                raise invalid_descriptor(
-                    f"session {session_id} KV group {lease.group_id} does not match {entry.group_id}"
-                )
-            new = list(lease.new_blocks)
-            if not new:
-                return
-            if entry.block_ids[-len(new) :] == new:
-                return
-            duplicate = set(entry.block_ids) & set(new)
-            if duplicate:
-                raise invalid_descriptor(
-                    f"session {session_id} KV lease repeats blocks {sorted(duplicate)}"
-                )
-            self._validate_blocks(session_id, new, entry.length)
-            entry.block_ids.extend(new)
-            self._register(session_id, new)
 
     def validate_write(self, session_id: int, begin: int, end: int) -> None:
         entry = self.get(session_id)
@@ -619,6 +633,31 @@ class KvStore:
             end = entry.length + int(tokens)
             self.validate_write(session_id, entry.length, end)
             entry.length = end
+
+    def append_kv_blocks(self, session_id: int, new_blocks: Sequence[int]) -> None:
+        """Grow a session's block lease by the blocks an operation appends this step.
+
+        The session entry starts from the admission's :class:`KvAllocation` blocks
+        and grows by exactly each operation's declared ``new_kv_blocks`` before its
+        forward writes, so the block table covers the write position as the
+        sequence crosses a page boundary. Re-applying the same tail is a no-op.
+        """
+
+        with self._lock:
+            entry = self.get(session_id)
+            new = [int(value) for value in new_blocks]
+            if not new:
+                return
+            if entry.block_ids[-len(new) :] == new:
+                return
+            duplicate = set(entry.block_ids) & set(new)
+            if duplicate:
+                raise invalid_descriptor(
+                    f"session {session_id} KV append repeats blocks {sorted(duplicate)}"
+                )
+            self._validate_blocks(session_id, new, entry.length)
+            entry.block_ids.extend(new)
+            self._register(session_id, new)
 
     def view(
         self,
@@ -701,7 +740,7 @@ class KvStore:
         source_version: int,
         position: int,
         transport: object | None = None,
-    ) -> PublishedKv:
+    ) -> KvSnapshot:
         entry = self.get(session_id)
         locators: list[str] = []
         if transport is not None:
@@ -723,8 +762,7 @@ class KvStore:
             # so the copies the previous publication handed the transport are
             # unreachable and their device memory returns here.
             self._retain_published(session_id, tuple(locators), transport)
-        return PublishedKv(
-            handle=int(session_id),
+        return KvSnapshot(
             locators=tuple(locators),
             source_version=int(source_version),
             kv_tokens=entry.length,
@@ -758,7 +796,7 @@ class KvStore:
         for encoded in locators:
             release(Locator.from_wire_json(encoded))
 
-    def import_snapshot(self, session_id: int, snapshot: PublishedKv, transport: Transport) -> None:
+    def import_snapshot(self, session_id: int, snapshot: KvSnapshot, transport: Transport) -> None:
         """Install a complete transferred snapshot without exposing partial state.
 
         Every locator is fetched and its tensor geometry is validated before a
@@ -784,7 +822,7 @@ class KvStore:
     def _import_snapshot(
         self,
         session_id: int,
-        snapshot: PublishedKv,
+        snapshot: KvSnapshot,
         transport: Transport,
         transaction: KvTxn,
     ) -> None:
@@ -1299,6 +1337,12 @@ class KvTxn:
             raise RuntimeError("KV advance targets a session outside this step")
         self._store.advance(int(session_id), int(tokens))
 
+    def append_kv_blocks(self, session_id: int, new_blocks: Sequence[int]) -> None:
+        self._require_open()
+        if int(session_id) not in self._session_ids:
+            raise RuntimeError("KV append targets a session outside this step")
+        self._store.append_kv_blocks(int(session_id), new_blocks)
+
     def release_generation(self, session_id: int, generation: int) -> None:
         self._require_open()
         if int(session_id) not in self._session_ids:
@@ -1308,7 +1352,7 @@ class KvTxn:
     def import_snapshot(
         self,
         session_id: int,
-        snapshot: PublishedKv,
+        snapshot: KvSnapshot,
         transport: Transport,
     ) -> None:
         self._require_open()

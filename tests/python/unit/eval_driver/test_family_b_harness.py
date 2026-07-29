@@ -293,6 +293,7 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
                 "prompt_tokens": 7,
                 "completion_tokens": 3,
                 "prompt_tokens_details": {"cached_tokens": 5},
+                "image_steps_per_image": [50],
             }
         },
         {"type": "sse_done"},
@@ -307,6 +308,7 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
     assert record.images == 1
     assert record.first_image_latency == pytest.approx(3.0)
     assert record.image_latencies == pytest.approx([3.0])
+    assert record.image_steps == [50]
     assert record.prompt_len == 7
     assert record.output_len == 3
     assert record.prompt_len_source == "server_usage"
@@ -314,8 +316,38 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
     assert record.cached_prompt_tokens == 5
     assert record.cached_prompt_tokens_source == "openai_usage_prompt_tokens_details"
     assert record.output_modalities == ["text", "image", "text"]
+    assert record.modality_events == [
+        {
+            "modalities": ["text"],
+            "client_time": 11.0,
+            "text_bytes": 1,
+            "image_count": 0,
+        },
+        {
+            "modalities": ["image"],
+            "client_time": 13.0,
+            "text_bytes": 0,
+            "image_count": 1,
+        },
+        {
+            "modalities": ["text"],
+            "client_time": 14.0,
+            "text_bytes": 1,
+            "image_count": 0,
+        },
+        {
+            "modalities": ["text"],
+            "client_time": 14.25,
+            "text_bytes": 1,
+            "image_count": 0,
+        },
+    ]
     assert record.finish_reason == "stop"
-    assert record.record_dict()["generated_text_sha256"] == hashlib.sha256(b"abc").hexdigest()
+    persisted = record.record_dict()
+    assert persisted["generated_text_sha256"] == hashlib.sha256(b"abc").hexdigest()
+    assert [event["client_offset_ms"] for event in persisted["modality_events"]] == pytest.approx(
+        [1000.0, 3000.0, 4000.0, 4250.0]
+    )
 
 
 def test_interleave_summary_requires_visible_text_image_transition() -> None:
@@ -349,6 +381,38 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
         images=1,
         image_latencies=[3.0],
         output_modalities=["text", "image", "text"],
+        modality_events=[
+            {
+                "modalities": ["text"],
+                "client_time": 0.5,
+                "text_bytes": 5,
+                "image_count": 0,
+            },
+            {
+                "modalities": ["text"],
+                "client_time": 0.75,
+                "text_bytes": 8,
+                "image_count": 0,
+            },
+            {
+                "modalities": ["image"],
+                "client_time": 3.0,
+                "text_bytes": 0,
+                "image_count": 1,
+            },
+            {
+                "modalities": ["text"],
+                "client_time": 3.5,
+                "text_bytes": 4,
+                "image_count": 0,
+            },
+            {
+                "modalities": ["text"],
+                "client_time": 3.7,
+                "text_bytes": 3,
+                "image_count": 0,
+            },
+        ],
         decoded_images=[inspect_image_bytes(_png_bytes())],
     )
     contract = benchmark_contract(spec, [{"id": "interleave-1"}])
@@ -356,26 +420,34 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
     summary = build_summary(spec, "http://x", [record], dur_s=4.0, contract=contract)
 
     assert summary["artifact"]["generation_conformance"]["valid"] is True
-    assert summary["metrics"]["modality_interleave"] == {
-        "requests_with_text_and_image": 1,
-        "modality_transitions": {
-            "count": 1,
-            "mean": 2.0,
-            "std": 0.0,
-            "min": 2.0,
-            "p50": 2.0,
-            "p90": 2.0,
-            "p95": 2.0,
-            "p99": 2.0,
-            "max": 2.0,
-        },
-        "patterns": {"text->image->text": 1},
-    }
+    assert summary["artifact"]["checks"]["interleave_latency_conformance"] is True
+    assert summary["metrics"]["ttft_ms"]["count"] == 1
+    assert summary["metrics"]["tpot_ms"]["count"] == 1
+    assert summary["metrics"]["images"]["image_latency_ms"]["count"] == 1
+    timing = summary["metrics"]["modality_interleave"]["transition_timing"]
+    assert timing["valid"] is True
+    assert timing["timestamp_coverage"] == 1.0
+    assert timing["transition_sample_coverage"] == 1.0
+    assert timing["request_signatures"] == {"interleave-1": "text->image->text"}
+    assert timing["transition_latency_ms"]["count"] == 2
+    assert timing["transition_latency_ms"]["mean"] == pytest.approx(1375.0)
+    assert timing["text_to_image_transition_latency_ms"]["mean"] == pytest.approx(2250.0)
+    assert timing["image_to_text_transition_latency_ms"]["mean"] == pytest.approx(500.0)
+    digest = timing["latency_definition_digest"]
+    assert isinstance(digest, str) and len(digest) == 64
 
     missing_text = dataclasses.replace(
         record,
         generated_text="",
         output_modalities=["image"],
+        modality_events=[
+            {
+                "modalities": ["image"],
+                "client_time": 3.0,
+                "text_bytes": 0,
+                "image_count": 1,
+            }
+        ],
     )
     invalid_summary = build_summary(
         spec,
@@ -387,6 +459,77 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
     conformance = invalid_summary["artifact"]["generation_conformance"]
     assert conformance["valid"] is False
     assert conformance["mismatched_request_ids"] == ["interleave-1"]
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            {
+                "modalities": ["text", "image"],
+                "client_time": 1.0,
+                "text_bytes": 5,
+                "image_count": 1,
+            }
+        ],
+        [
+            {
+                "modalities": ["text"],
+                "client_time": None,
+                "text_bytes": 5,
+                "image_count": 0,
+            },
+            {
+                "modalities": ["image"],
+                "client_time": 2.0,
+                "text_bytes": 0,
+                "image_count": 1,
+            },
+        ],
+    ],
+)
+def test_interleave_timing_requires_unambiguous_complete_event_timestamps(
+    events: list[dict[str, object]],
+) -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.INTERLEAVE,
+        model="SenseNova-U1",
+        num_prompts=1,
+        max_tokens=256,
+        max_images=1,
+        width=2,
+        height=3,
+        steps=50,
+        denoise_updates=50,
+        ignore_eos=False,
+        acceptance_min_images_per_success=1.0,
+    )
+    record = RequestRecord(
+        request_id="interleave-1",
+        task="interleave",
+        success=True,
+        classifier="ok",
+        latency=3.0,
+        ttft=0.5,
+        token_timing_available=True,
+        prompt_len=16,
+        output_len=3,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="intro",
+        images=1,
+        image_latencies=[2.0],
+        output_modalities=["text", "image"],
+        modality_events=events,
+        decoded_images=[inspect_image_bytes(_png_bytes())],
+    )
+    contract = benchmark_contract(spec, [{"id": "interleave-1"}])
+
+    summary = build_summary(spec, "http://x", [record], dur_s=3.0, contract=contract)
+
+    assert summary["artifact"]["generation_conformance"]["valid"] is True
+    assert summary["artifact"]["checks"]["interleave_latency_conformance"] is False
+    assert summary["artifact"]["valid"] is False
 
 
 def test_interleave_dataset_serves_ueval_prompts_verbatim(
@@ -722,7 +865,11 @@ def test_chat_json_counts_message_images() -> None:
                         },
                     }
                 ],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 0},
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 0,
+                    "image_steps_per_image": [50],
+                },
             }
 
     class _Client:
@@ -737,6 +884,7 @@ def test_chat_json_counts_message_images() -> None:
     assert record.classifier == "ok"
     assert record.images == 1
     assert len(record.image_latencies) == 1
+    assert record.image_steps == [50]
 
 
 # --- SSE framing --------------------------------------------------------------

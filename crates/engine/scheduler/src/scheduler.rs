@@ -173,16 +173,16 @@ pub struct SchedStats {
 }
 
 use crossbeam_channel::Receiver;
+use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities};
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_engine_api::{Command, EventTx, FinishReason, GenEvent, GenerationSubmission};
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
-    Admission, Batch, EngineCaps, ExecutionResult, FlowAdmission, KvAllocation, Operation,
-    OperationEnvelope, OperationResult, OperationType, ResourceClass, ResultDelta,
-    SequenceAdmission, SequenceEffect, SequenceInput, SequenceMode, TokenSource,
-    WorkerForwardStats,
+    Admission, Batch, CompletionRecord, CompletionReport, EngineCaps, GenAdmission, KvAllocation,
+    OpId, Point, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, UndAdmission,
+    VersionRef, WorkVariant, WorkerForwardStats,
 };
 
 use crate::grammar::{GrammarCompiler, GrammarMatcher, grammar_allowed_tokens};
@@ -198,8 +198,6 @@ enum AssemblyLane {
     Other,
 }
 
-/// default bound on the recent-output window carried for penalties.
-const DEFAULT_PENALTY_WINDOW: usize = 256;
 const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
 /// maximum time the fully-idle scheduler blocks on the command channel
 /// before waking to probe worker liveness. Bounds how long a worker that dies
@@ -224,11 +222,69 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<GenEvent> {
     })
 }
 
-fn transient_encoder_worker_key(cache_key: u64, request_id: RequestId) -> u64 {
-    let mut value = cache_key ^ request_id.0.rotate_left(23) ^ 0xa076_1d64_78bd_642f_u64;
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    (value ^ (value >> 31)).max(1)
+/// Locate the completion product a given operation produced for `kind`.
+fn find_product(
+    products: &[ProductPayload],
+    op_id: OpId,
+    kind: ProductKind,
+) -> Option<&ProductPayload> {
+    products
+        .iter()
+        .find(|payload| payload.product.producer_op_id == op_id && payload.product.kind == kind)
+}
+
+/// A host-side view of one operation's completion, assembled from its record and
+/// the report's decoded output products. It carries the committed tokens and
+/// logprob values a token operation samples, the KV product an operation
+/// publishes, the materialized image, and the accounting the resolver reads.
+struct SequenceView {
+    committed_tokens: Vec<u32>,
+    sampled_logprob: Option<f32>,
+    top_logprobs: Vec<RankedToken>,
+    prompt_logprobs: Vec<Vec<RankedToken>>,
+    accepted_draft_tokens: Option<u32>,
+    kv_product: Option<ProductRef>,
+    image_png: Option<String>,
+    encode_generation: Option<u32>,
+    kv_visible_len: u32,
+    flow_done: bool,
+}
+
+impl SequenceView {
+    fn from_report(
+        variant: WorkVariant,
+        record: &CompletionRecord,
+        products: &[ProductPayload],
+    ) -> Self {
+        let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
+            .and_then(|payload| LogprobBlob::decode(&payload.bytes).ok())
+            .unwrap_or_default();
+        let accepted_draft_tokens = (variant == WorkVariant::TokenVerify).then(|| {
+            record
+                .committed_tokens
+                .len()
+                .saturating_sub(1)
+                .min(u32::MAX as usize) as u32
+        });
+        let image_png = find_product(products, record.op_id, ProductKind::Artifact)
+            .and_then(|payload| String::from_utf8(payload.bytes.clone()).ok());
+        let kv_product = find_product(products, record.op_id, ProductKind::Kv)
+            .map(|payload| payload.product.clone());
+        Self {
+            committed_tokens: record.committed_tokens.clone(),
+            sampled_logprob: logprobs.sampled_logprob,
+            top_logprobs: logprobs.top_logprobs,
+            prompt_logprobs: logprobs.prompt_logprobs,
+            accepted_draft_tokens,
+            kv_product,
+            image_png,
+            encode_generation: record.product_generations.first().copied(),
+            kv_visible_len: record.logical_lengths.kv_visible_len,
+            flow_done: record.finish_flags.eos
+                || record.finish_flags.length
+                || record.finish_flags.stop,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -306,6 +362,11 @@ pub struct ReqState {
     pub(crate) epoch: u64,
     pub(crate) version: u64,
     pub(crate) admission_digest: Option<String>,
+    /// Committed lineage for building an operation's parent version: the semantic
+    /// digest of the last committed point and the operation id that produced it
+    /// (the reserved admission-root id until the first state-advancing op).
+    pub(crate) committed_semantic: String,
+    pub(crate) committed_producer_op_id: u64,
     pub(crate) context: SchedulerContext,
     pub(crate) event_tx: EventTx,
     pub(crate) cursor: GenerationCursor,
@@ -391,8 +452,6 @@ pub struct Scheduler {
     pending_prefix_reset: Option<PendingPrefixCacheReset>,
     /// Pluggable host-side logits-processor pipeline.
     logits_pipeline: Vec<Box<dyn crate::logits::LogitsProcessor>>,
-    /// Cap on the recent-output window carried for penalties .
-    penalty_window: usize,
     /// Encoder-output cache (hashed, LRU, budgeted).
     enc_cache: EncoderCacheManager,
     /// Encoder-cache entries reserved by admitted image requests.
@@ -439,6 +498,8 @@ pub struct Scheduler {
     planner: GenerationPlanner,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
+    /// The scheduler-authority identity stamped into every request key.
+    authority_id: u64,
     /// Monotonic op ids and archived lifecycle traces.
     next_op_id: u64,
     next_epoch: u64,
@@ -469,7 +530,7 @@ pub struct HealthSnapshot {
     pub queue_wait_us_total: u64,
     pub queue_wait_us_max: u64,
     pub fatal: bool,
-    pub supported_operation_types: Vec<OperationType>,
+    pub supported_work: Vec<WorkVariant>,
     pub op_latency_us: Vec<(String, u64)>,
 }
 
@@ -514,32 +575,13 @@ fn finish_reason_str(r: &FinishReason) -> &'static str {
     }
 }
 
-/// Stable operation-type label for latency-history keys.
-fn operation_type_str(operation_type: OperationType) -> &'static str {
-    match operation_type {
-        OperationType::SequenceExtend => "sequence_extend",
-        OperationType::SequenceDecode => "sequence_decode",
-        OperationType::SequenceVerify => "sequence_verify",
-        OperationType::SequenceSample => "sequence_sample",
-        OperationType::Flow => "flow",
-        OperationType::EncodeVision => "encode_vision",
-        OperationType::EncodeLatent => "encode_latent",
-        OperationType::MaterializeImage => "materialize_image",
-        OperationType::MaterializeFrame => "materialize_frame",
-        OperationType::TransferProduct => "transfer_product",
-        OperationType::TransferKv => "transfer_kv",
-    }
-}
-
-fn ranked_logprobs(
-    entries: Vec<uniserve_worker_wire::TokenLogprob>,
-) -> Vec<uniserve_engine_api::TokenLogprob> {
+fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<uniserve_engine_api::TokenLogprob> {
     entries
         .into_iter()
         .map(|entry| uniserve_engine_api::TokenLogprob {
-            token_id: entry.0,
-            logprob: entry.1,
-            rank: entry.2,
+            token_id: entry.token_id,
+            logprob: entry.logprob,
+            rank: entry.rank,
         })
         .collect()
 }
@@ -548,22 +590,15 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
     match error {
         TransitionValidationError::OpIdMismatch { .. } => "op_id_mismatch",
         TransitionValidationError::SessionMismatch { .. } => "session_mismatch",
-        TransitionValidationError::EpochMismatch { .. } => "epoch_mismatch",
         TransitionValidationError::VersionMismatch { .. } => "version_mismatch",
-        TransitionValidationError::ResultTypeMismatch { .. } => "result_type_mismatch",
-        TransitionValidationError::MissingDenoiseStep => "missing_denoise_step",
         TransitionValidationError::DenoiseStepMismatch { .. } => "denoise_step_mismatch",
         TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
         TransitionValidationError::EncoderHandleMismatch { .. } => "encoder_handle_mismatch",
         TransitionValidationError::MissingImageArtifact => "missing_image_artifact",
         TransitionValidationError::InvalidImageArtifact => "invalid_image_artifact",
-        TransitionValidationError::ImageArtifactDimensionsMismatch { .. } => {
-            "image_artifact_dimensions_mismatch"
-        }
         TransitionValidationError::MissingImageLocator => "missing_image_locator",
         TransitionValidationError::MissingImageDimensions => "missing_image_dimensions",
         TransitionValidationError::ImageDimensionsMismatch { .. } => "image_dimensions_mismatch",
-        TransitionValidationError::MissingImageKvTokens => "missing_image_kv_tokens",
         TransitionValidationError::ImageKvMismatch { .. } => "image_kv_mismatch",
         TransitionValidationError::UnexpectedSampledToken { .. } => "unexpected_sampled_token",
         TransitionValidationError::MissingSampledToken { .. } => "missing_sampled_token",
@@ -574,7 +609,6 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
             "text_token_count_inconsistent"
         }
         TransitionValidationError::TextTokenCountMismatch { .. } => "text_token_count_mismatch",
-        TransitionValidationError::SampledTokenNotAllowed { .. } => "sampled_token_not_allowed",
         TransitionValidationError::UnexpectedPromptLogprobs { .. } => "unexpected_prompt_logprobs",
         TransitionValidationError::PromptLogprobCountMismatch { .. } => {
             "prompt_logprob_count_mismatch"
@@ -605,7 +639,6 @@ fn cursor_apply_error_str(error: &CursorApplyError) -> &'static str {
     match error {
         CursorApplyError::MissingOperationId => "missing_operation_id",
         CursorApplyError::DuplicateOperation { .. } => "duplicate_operation",
-        CursorApplyError::ResultTypeMismatch => "result_type_mismatch",
     }
 }
 
@@ -631,18 +664,19 @@ fn behavior_str(request: &GenerationRequest) -> &'static str {
     }
 }
 
-fn assembly_lane(operation_type: OperationType) -> AssemblyLane {
-    match operation_type {
-        OperationType::SequenceExtend
-        | OperationType::EncodeVision
-        | OperationType::EncodeLatent => AssemblyLane::Prefill,
-        OperationType::SequenceDecode | OperationType::SequenceVerify => AssemblyLane::Decode,
-        OperationType::SequenceSample
-        | OperationType::Flow
-        | OperationType::MaterializeImage
-        | OperationType::MaterializeFrame
-        | OperationType::TransferProduct
-        | OperationType::TransferKv => AssemblyLane::Other,
+fn assembly_lane(operation_variant: WorkVariant) -> AssemblyLane {
+    match operation_variant {
+        WorkVariant::TokenExtend | WorkVariant::EncodeVision | WorkVariant::EncodeLatent => {
+            AssemblyLane::Prefill
+        }
+        WorkVariant::TokenDecode | WorkVariant::TokenVerify => AssemblyLane::Decode,
+        WorkVariant::Draft
+        | WorkVariant::GenFlow
+        | WorkVariant::GenTransition
+        | WorkVariant::Materialize
+        | WorkVariant::TransferProduct
+        | WorkVariant::TransferKvPublish
+        | WorkVariant::TransferKvInstall => AssemblyLane::Other,
     }
 }
 
@@ -760,7 +794,7 @@ impl Scheduler {
                 "caps": {
                     "block_size": caps.block_size,
                     "num_blocks": caps.num_blocks,
-                    "supported_operation_types": &caps.supported_operation_types,
+                    "supported_work": &caps.supported_work,
                     "max_batch_operations": caps.execution_constraints.max_batch_operations,
                     "pipeline_depth": caps.pipeline_depth,
                     "max_latent_size": caps.max_latent_size,
@@ -786,7 +820,6 @@ impl Scheduler {
             sleeping: false,
             pending_prefix_reset: None,
             logits_pipeline: crate::logits::default_pipeline(),
-            penalty_window: DEFAULT_PENALTY_WINDOW,
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
             running: HashMap::new(),
@@ -807,6 +840,7 @@ impl Scheduler {
             latency: crate::policy::LatencyHistory::new(),
             planner: GenerationPlanner::new(),
             batch_started: HashMap::new(),
+            authority_id: 1,
             next_op_id: 1,
             next_epoch: 1,
             completed_traces: VecDeque::new(),
@@ -832,9 +866,6 @@ impl Scheduler {
     pub fn with_logits_processor(mut self, p: Box<dyn crate::logits::LogitsProcessor>) -> Self {
         self.logits_pipeline.push(p);
         self
-    }
-    pub fn set_penalty_window(&mut self, n: usize) {
-        self.penalty_window = n.max(1);
     }
     /// Configure the per-step token budget.
     pub fn set_token_budget(&mut self, tokens: usize) {
@@ -946,7 +977,7 @@ impl Scheduler {
                 .load(Ordering::Relaxed),
             queue_wait_us_max: self.stats.timing.queue_wait_us_max.load(Ordering::Relaxed),
             fatal: self.fatal,
-            supported_operation_types: self.caps.supported_operation_types.clone(),
+            supported_work: self.caps.supported_work.clone(),
             op_latency_us: self.latency.as_pairs(),
         }
     }
@@ -1424,10 +1455,10 @@ impl Scheduler {
                 return;
             }
         };
-        if let Some(operation) = self.missing_required_operation(&req) {
+        if let Some(capability) = self.missing_required_capability(&req) {
             let _ = event_tx.send(GenEvent::Rejected {
                 message: format!(
-                    "generation request requires worker operation `{operation}`, but the worker does not support it"
+                    "generation request requires worker capability `{capability}`, but the worker does not support it"
                 ),
             });
             return;
@@ -1491,6 +1522,8 @@ impl Scheduler {
             epoch: self.next_epoch,
             version: 0,
             admission_digest: None,
+            committed_semantic: String::new(),
+            committed_producer_op_id: 0,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
             context,
             event_tx,
@@ -1545,11 +1578,15 @@ impl Scheduler {
     }
 
     fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
-        let mut supported_operation_types = self.caps.supported_operation_types.clone();
-        supported_operation_types.sort();
-        supported_operation_types.dedup();
+        let supports = |variant: WorkVariant| self.caps.supported_work.contains(&variant);
         GenerationRuntimeCapabilities {
-            supported_operation_types,
+            supports_understanding: supports(WorkVariant::TokenExtend)
+                && supports(WorkVariant::TokenDecode),
+            supports_vision_encode: supports(WorkVariant::EncodeVision),
+            supports_latent_encode: supports(WorkVariant::EncodeLatent),
+            supports_image_generation: supports(WorkVariant::GenFlow)
+                && supports(WorkVariant::Materialize),
+            supports_commit_writeback: supports(WorkVariant::TransferKvInstall),
             max_latent_units: u64::from(self.caps.max_latent_size),
             latent_downsample: self.caps.latent_downsample,
             max_vae_grid_tokens: self.cap_max_vae_grid_tokens() as u32,
@@ -1563,16 +1600,15 @@ impl Scheduler {
         }
     }
 
-    fn missing_required_operation(&self, request: &GenerationRequest) -> Option<OperationType> {
+    fn missing_required_capability(&self, request: &GenerationRequest) -> Option<&'static str> {
         let context_steps = request.context.iter().flat_map(|segment| match segment {
             uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
             uniserve_core::ContextSegment::UndTokens { .. } => Vec::new(),
         });
-        request
+        let needs = request
             .behavior
-            .required_operations(&request.policy, context_steps)
-            .into_iter()
-            .find(|operation| !self.caps.supported_operation_types.contains(operation))
+            .capability_needs(&request.policy, context_steps);
+        self.generation_runtime_capabilities().covers(&needs).err()
     }
 
     fn worker_tracks_image_latent(&self) -> bool {
@@ -1633,7 +1669,7 @@ impl Scheduler {
     }
 
     fn reserve_transition_resources(&mut self, transition: &PlannedTransition) -> bool {
-        let id = transition.op.session_id;
+        let id = transition.request_id;
         let resources = &transition.resources;
         let cached_encoder_key = match transition.delta {
             crate::generation::TransitionDelta::IngestImageStep {
@@ -1736,14 +1772,6 @@ impl Scheduler {
     /// speculative draft the worker verifies alongside it.
     fn decode_capacity_target(&self, pos: usize, spec_len: usize) -> usize {
         pos.saturating_add(1).saturating_add(spec_len)
-    }
-
-    fn image_prompt_for(st: &ReqState) -> Option<String> {
-        st.req
-            .image
-            .image_prompts
-            .get(st.image_gen.images_done)
-            .cloned()
     }
 
     /// One loop iteration of the schedule-ahead loop. Returns true if any work
@@ -1903,14 +1931,14 @@ impl Scheduler {
         self.inflight_ops
             .values()
             .flatten()
-            .any(|op| op.transition.operation_type == OperationType::SequenceExtend)
+            .any(|op| op.transition.operation_variant == WorkVariant::TokenExtend)
     }
 
     fn any_denoise_inflight(&self) -> bool {
         self.inflight_ops
             .values()
             .flatten()
-            .any(|op| op.transition.operation_type == OperationType::Flow)
+            .any(|op| op.transition.operation_variant == WorkVariant::GenFlow)
     }
 
     fn has_inflight(&self, id: RequestId) -> bool {
@@ -1939,10 +1967,16 @@ impl Scheduler {
         Some(state.version.saturating_add(self.inflight_len(id) as u64))
     }
 
-    /// A successor may depend on worker-local sampled-token state only when
-    /// committing one token cannot change host control flow. This is the
-    /// deterministic text-decode subset whose future transition is identical
-    /// before and after the predecessor result becomes host-visible.
+    /// Whether a request may keep an additional operation in flight rooted on a
+    /// predecessor's not-yet-observed selected point.
+    ///
+    /// Such a successor roots on a device version reference (`Point::Device`).
+    /// A successor may depend on the predecessor's worker-local sampled-token
+    /// state only when committing one token cannot change host control flow:
+    /// the deterministic greedy text-decode subset whose next transition is
+    /// identical before and after the predecessor result becomes host-visible.
+    /// Every guard below matches the depth-one serial oracle so the pipelined
+    /// output stays token-identical.
     fn can_queue_decode_successor(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -1964,10 +1998,13 @@ impl Scheduler {
         ) {
             return false;
         }
+        // Only plain decode/extend predecessors may carry a device-relay
+        // successor: a speculative (draft-bearing) op has host-visible branching
+        // on acceptance, and any other variant is not a single-token advance.
         if queue.iter().any(|op| {
             !matches!(
-                op.transition.operation_type,
-                OperationType::SequenceExtend | OperationType::SequenceDecode
+                op.transition.operation_variant,
+                WorkVariant::TokenExtend | WorkVariant::TokenDecode
             ) || !op.spec_tokens.is_empty()
         }) {
             return false;
@@ -1977,7 +2014,11 @@ impl Scheduler {
         };
         projected.prompt_cursor as usize >= state.effective_prompt().len()
             && state.ingest.mm_cursor >= state.context.images.len()
-            && state.und.tokens_emitted.saturating_add(queue.len()) < state.req.max_und_tokens
+            && state
+                .und
+                .tokens_emitted
+                .saturating_add(queue.len())
+                < state.req.max_und_tokens
     }
 
     fn device_token_relay_eligible(state: &ReqState) -> bool {
@@ -2012,9 +2053,12 @@ impl Scheduler {
     }
 
     fn register_inflight(&mut self, transition: PlannedTransition, started: Instant) {
-        let request_id = transition.op.session_id;
-        let op_id = transition.op.op_id;
-        let spec_tokens = operation_draft_tokens(&transition.op);
+        let request_id = transition.request_id;
+        let op_id = transition
+            .operation
+            .as_ref()
+            .map_or(0, |operation| operation.op_id.0);
+        let spec_tokens = transition.draft_token_ids.clone();
         self.inflight_ops
             .entry(request_id)
             .or_default()
@@ -2102,16 +2146,23 @@ impl Scheduler {
         self.fail_all_inflight(&format!("{e}"));
     }
 
-    fn apply_result(&mut self, result: ExecutionResult) {
+    fn apply_result(&mut self, report: CompletionReport) {
         // worker-reported batch compute time (one value per batch).
-        let result_step_id = result.step_id;
+        let CompletionReport {
+            step_id: result_step_id,
+            completions,
+            products,
+            worker_exec_us,
+            forward_stats,
+            ..
+        } = report;
         let batch_roundtrip_us = self
             .batch_started
             .remove(&result_step_id)
             .map(|start| start.elapsed().as_micros() as u64)
             .unwrap_or(0);
-        let worker_us = result.worker_exec_us.unwrap_or(0);
-        if let Some(w) = result.worker_exec_us {
+        let worker_us = worker_exec_us.unwrap_or(0);
+        if let Some(w) = worker_exec_us {
             self.stats
                 .timing
                 .last_worker_exec_us
@@ -2134,105 +2185,73 @@ impl Scheduler {
             .fetch_add(1, Ordering::Relaxed);
         let trace_enabled = self.trace_enabled();
         let forward_stats_trace = trace_enabled
-            .then(|| {
-                result
-                    .forward_stats
-                    .as_ref()
-                    .map(worker_forward_stats_trace)
-            })
+            .then(|| forward_stats.as_ref().map(worker_forward_stats_trace))
             .flatten();
-        self.record_worker_forward_stats(result.forward_stats.as_ref());
-        let mut resolved_ops =
-            trace_enabled.then(|| Vec::with_capacity(result.operations.len()));
-        let mut progress_ops =
-            trace_enabled.then(|| Vec::with_capacity(result.operations.len()));
-        let mut to_resolve = Vec::with_capacity(result.operations.len());
-        for (operation_index, operation_result) in result.operations.into_iter().enumerate() {
-            let id = operation_result.session_id;
+        self.record_worker_forward_stats(forward_stats.as_ref());
+        let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completions.len()));
+        let mut progress_ops = trace_enabled.then(|| Vec::with_capacity(completions.len()));
+        let mut to_resolve = Vec::with_capacity(completions.len());
+        for (operation_index, record) in completions.into_iter().enumerate() {
+            let id = record.request_key.session_id;
+            let op_id = record.op_id.0;
             // op_id-correlated completion: resolve the exact op the
             // worker echoed, not merely the FIFO-oldest one.
-            let (transition, draft_token_ids, started) =
-                self.pop_inflight(id, operation_result.op_id);
-            if transition.is_none() {
+            let (transition, draft_token_ids, started) = self.pop_inflight(id, op_id);
+            let Some(transition) = transition else {
                 self.trace_record(json!({
                     "event": "unknown_result_op_id",
                     "at_s": now(),
                     "request_id": id.0,
-                    "op_id": operation_result.op_id,
+                    "op_id": op_id,
                 }));
                 if self.running.contains_key(&id) {
                     self.finish(id, FinishReason::Error);
                 }
                 continue;
-            }
-            let operation_type = transition
-                .as_ref()
-                .map(|transition| transition.operation_type);
+            };
+            let operation_variant = transition.operation_variant;
+            let view = SequenceView::from_report(operation_variant, &record, &products);
             let draft_tokens = draft_token_ids.len();
             // fold this op's host-side round-trip latency into the history.
             let roundtrip_us = started
                 .map(|start| start.elapsed().as_micros() as u64)
                 .unwrap_or(0);
-            if let Some(operation_type) = operation_type {
-                self.latency
-                    .observe(operation_type_str(operation_type), roundtrip_us);
-            }
+            self.latency
+                .observe(operation_variant.as_wire_str(), roundtrip_us);
             // record the op-resolved lifecycle event (op_id echoed by the
             // worker, host round-trip + worker compute time).
-            let op_id = operation_result.op_id;
-            let sequence_effect = operation_result_sequence_effect(&operation_result);
-            let sampled_token_ids_len = sequence_effect
-                .map(|effect| effect.sampled_token_ids.len())
-                .unwrap_or_default();
-            let sampled_token_ids_last =
-                sequence_effect.and_then(|effect| effect.sampled_token_ids.last().copied());
-            let accepted_draft_tokens =
-                sequence_effect.and_then(|effect| effect.accepted_draft_tokens);
-            let transition_delta = transition
-                .as_ref()
-                .map(|transition| transition.delta.as_str());
-            let transition_new_blocks = transition
-                .as_ref()
-                .map(|transition| transition.resources.new_blocks);
-            let transition_kv_target = transition
-                .as_ref()
-                .and_then(|transition| transition.resources.kv_target_tokens);
-            let transition_scratch_tokens = transition
-                .as_ref()
-                .map(|transition| transition.resources.host_scratch_tokens);
-            let transition_latent_units = transition
-                .as_ref()
-                .map(|transition| transition.resources.latent_units);
-            let transition_encoder_pins = transition
-                .as_ref()
-                .map(|transition| transition.resources.encoder_pins.len());
-            let transition_replayability = transition
-                .as_ref()
-                .map(|transition| transition.resources.replayability_after_apply.as_str());
+            let sampled_token_ids_len = view.committed_tokens.len();
+            let sampled_token_ids_last = view.committed_tokens.last().copied();
+            let accepted_draft_tokens = view.accepted_draft_tokens;
             if let Some(resolved_ops) = resolved_ops.as_mut() {
+                let image_hw = view
+                    .image_png
+                    .as_deref()
+                    .and_then(|png| validate_png_artifact(png, None))
+                    .map(|metadata| (metadata.height, metadata.width));
                 resolved_ops.push(json!({
                     "request_id": id.0,
                     "op_id": op_id,
-                    "operation_type": operation_type.map(operation_type_str),
-                    "transition_delta": transition_delta,
-                    "transition_new_blocks": transition_new_blocks,
-                    "transition_kv_target": transition_kv_target,
-                    "transition_scratch_tokens": transition_scratch_tokens,
-                    "transition_latent_units": transition_latent_units,
-                    "transition_encoder_pins": transition_encoder_pins,
-                    "transition_replayability": transition_replayability,
+                    "operation_type": operation_variant.as_wire_str(),
+                    "transition_delta": transition.delta.as_str(),
+                    "transition_new_blocks": transition.resources.new_blocks,
+                    "transition_kv_target": transition.resources.kv_target_tokens,
+                    "transition_scratch_tokens": transition.resources.host_scratch_tokens,
+                    "transition_latent_units": transition.resources.latent_units,
+                    "transition_encoder_pins": transition.resources.encoder_pins.len(),
+                    "transition_replayability": transition.resources.replayability_after_apply.as_str(),
                     "roundtrip_us": roundtrip_us,
                     "sampled_token": sampled_token_ids_last.is_some(),
                     "sampled_token_ids_len": sampled_token_ids_len,
                     "sampled_token_ids_last": sampled_token_ids_last,
-                    "flow_done": operation_flow_delta(&operation_result).map(|delta| delta.done),
-                    "steps_completed": operation_flow_delta(&operation_result).map(|delta| delta.steps_completed),
-                    "image_done": operation_image(&operation_result).is_some(),
-                    "image_hw": operation_image(&operation_result).map(|image| (image.height, image.width)),
-                    "kv_tokens": operation_result_kv_tokens(&operation_result),
+                    "flow_done": view.flow_done,
+                    "steps_completed": record.logical_lengths.latent_len,
+                    "image_done": view.image_png.is_some(),
+                    "image_hw": image_hw,
+                    "kv_tokens": view.kv_visible_len,
                     "num_draft_tokens": draft_tokens,
                     "num_accepted_tokens": accepted_draft_tokens,
-                    "product_handle": operation_encode_handle(&operation_result),
+                    "product_handle": view.encode_generation,
                 }));
             }
             if draft_tokens > 0 {
@@ -2242,74 +2261,92 @@ impl Scheduler {
             if let Some(st) = self.running.get_mut(&id) {
                 let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpResolved);
                 ev.op_id = Some(op_id);
-                ev.op_kind = operation_type.map(operation_type_str);
+                ev.op_kind = Some(operation_variant.as_wire_str());
                 ev.roundtrip_us = roundtrip_us;
                 ev.worker_us = worker_us;
                 st.trace.push(ev);
             }
-            if let Some(transition) = transition {
-                if let Err(error) = transition.validate_result(&operation_result) {
-                    self.trace_record(json!({
-                        "event": "transition_validation_failed",
-                        "at_s": now(),
-                        "request_id": id.0,
-                        "op_id": transition.op.op_id,
-                        "operation_type": operation_type_str(transition.operation_type),
-                        "error": transition_validation_error_str(&error),
-                    }));
-                    if self.running.contains_key(&id) {
-                        self.finish_after_inflight(id, FinishReason::Error, None);
-                    }
-                    continue;
+            if let Err(error) = transition.validate_result(&record, &products) {
+                self.trace_record(json!({
+                    "event": "transition_validation_failed",
+                    "at_s": now(),
+                    "request_id": id.0,
+                    "op_id": op_id,
+                    "operation_type": operation_variant.as_wire_str(),
+                    "error": transition_validation_error_str(&error),
+                }));
+                if self.running.contains_key(&id) {
+                    self.finish_after_inflight(id, FinishReason::Error, None);
                 }
-                let cursor_result = self.running.get_mut(&id).map(|state| {
-                    state
-                        .cursor
-                        .apply_transition(&transition, &operation_result)
-                });
-                if let Some(Err(error)) = cursor_result {
-                    self.trace_record(json!({
-                        "event": "cursor_transition_failed",
-                        "at_s": now(),
-                        "request_id": id.0,
-                        "op_id": transition.op.op_id,
-                        "operation_type": operation_type_str(transition.operation_type),
-                        "error": cursor_apply_error_str(&error),
-                    }));
-                    if self.running.contains_key(&id) {
-                        self.finish_after_inflight(id, FinishReason::Error, None);
-                    }
-                    continue;
-                }
-                if let Some(state) = self.running.get_mut(&id) {
-                    state.version = operation_result.result_version;
-                }
-                self.release_transition_resources(id, &transition);
-                let priority = match transition.operation_type {
-                    OperationType::Flow
-                    | OperationType::MaterializeImage
-                    | OperationType::TransferKv => 0,
-                    _ => 1,
-                };
-                to_resolve.push((
-                    priority,
-                    operation_index,
-                    id,
-                    transition,
-                    operation_result,
-                    draft_token_ids,
-                ));
+                continue;
             }
+            let cursor_result = self.running.get_mut(&id).map(|state| {
+                state
+                    .cursor
+                    .apply_transition(&transition, &record, &products)
+            });
+            if let Some(Err(error)) = cursor_result {
+                self.trace_record(json!({
+                    "event": "cursor_transition_failed",
+                    "at_s": now(),
+                    "request_id": id.0,
+                    "op_id": op_id,
+                    "operation_type": operation_variant.as_wire_str(),
+                    "error": cursor_apply_error_str(&error),
+                }));
+                if self.running.contains_key(&id) {
+                    self.finish_after_inflight(id, FinishReason::Error, None);
+                }
+                continue;
+            }
+            // A state-advancing op commits a new authoritative point; its selected
+            // point becomes the request version and its semantic digest and op id
+            // become the committed lineage. Non-advancing ops leave lineage intact.
+            let advanced = transition
+                .operation
+                .as_ref()
+                .is_some_and(|operation| match operation.parent.point {
+                    // A fixed-parent op advanced when its selected point moved
+                    // past the host-observed parent point.
+                    Point::Fixed { point_index, .. } => record.selected_point > point_index,
+                    // A device-parent op names no host-known parent point; the
+                    // validator already checked its selected point against the
+                    // projected parent, so its own advance flag is authoritative.
+                    // It must commit its own semantic digest and op id, otherwise
+                    // the committed lineage goes stale once the pipeline drains and
+                    // the next fixed-parent op roots on the wrong digest.
+                    Point::Device { .. } => operation.advances_state,
+                });
+            if let Some(state) = self.running.get_mut(&id) {
+                state.version = u64::from(record.selected_point);
+                if advanced {
+                    state.committed_semantic = record.semantic_digest.clone();
+                    state.committed_producer_op_id = record.op_id.0;
+                }
+            }
+            self.release_transition_resources(id, &transition);
+            let priority = match operation_variant {
+                WorkVariant::GenFlow
+                | WorkVariant::Materialize
+                | WorkVariant::TransferKvInstall => 0,
+                _ => 1,
+            };
+            to_resolve.push((
+                priority,
+                operation_index,
+                id,
+                transition,
+                view,
+                draft_token_ids,
+            ));
         }
         to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
-        for (_priority, _seq_index, id, transition, sr, draft_token_ids) in to_resolve {
+        for (_priority, _seq_index, id, transition, view, draft_token_ids) in to_resolve {
             if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
-                self.resolve(id, transition, sr, draft_token_ids);
+                self.resolve(id, transition, view, draft_token_ids);
             }
             self.finish_pending_if_idle(id);
-            if let (Some(st), Some(progress_ops)) =
-                (self.running.get(&id), progress_ops.as_mut())
-            {
+            if let (Some(st), Some(progress_ops)) = (self.running.get(&id), progress_ops.as_mut()) {
                 progress_ops.push(json!({
                     "request_id": id.0,
                     "phase": phase_str(st.lifecycle.phase),
@@ -2781,19 +2818,21 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .any(|op| assembly_lane(op.transition.operation_type) == AssemblyLane::Prefill)
+            .any(|op| assembly_lane(op.transition.operation_variant) == AssemblyLane::Prefill)
             || self
-                .peek_next_operation_type(id)
-                .is_some_and(|operation_type| {
-                    assembly_lane(operation_type) == AssemblyLane::Prefill
+                .peek_next_operation_variant(id)
+                .is_some_and(|operation_variant| {
+                    assembly_lane(operation_variant) == AssemblyLane::Prefill
                 })
     }
 
     fn request_has_ready_decode(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|state| !state.cancelled)
             && self
-                .peek_next_operation_type(id)
-                .is_some_and(|operation_type| assembly_lane(operation_type) == AssemblyLane::Decode)
+                .peek_next_operation_variant(id)
+                .is_some_and(|operation_variant| {
+                    assembly_lane(operation_variant) == AssemblyLane::Decode
+                })
             && self.can_schedule_next(id)
     }
 
@@ -2869,21 +2908,21 @@ impl Scheduler {
             if cancelled {
                 continue;
             }
-            let next_type = self.peek_next_operation_type(id);
+            let next_type = self.peek_next_operation_variant(id);
             // When a decode pass admits text prefill rows, the worker receives a
             // single mixed forward. There is no `supports_mixed_op_kinds` gate;
             // co-batched rows shift each other's numerics only through inherent
             // batched-kernel FP non-invariance, not structural corruption.
             let mut mixed_prefill = false;
-            if let (Some(target), Some(operation_type)) = (lane, next_type)
+            if let (Some(target), Some(operation_variant)) = (lane, next_type)
                 && {
-                    let candidate_lane = assembly_lane(operation_type);
+                    let candidate_lane = assembly_lane(operation_variant);
                     matches!(candidate_lane, AssemblyLane::Prefill | AssemblyLane::Decode)
                         && candidate_lane != target
                 }
             {
                 mixed_prefill = target == AssemblyLane::Decode
-                    && operation_type == OperationType::SequenceExtend
+                    && operation_variant == WorkVariant::TokenExtend
                     && mixed_left > 0
                     && self.running.get(&id).is_some_and(|st| {
                         st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
@@ -2892,7 +2931,7 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_type == Some(OperationType::Flow)
+            if next_type == Some(WorkVariant::GenFlow)
                 && (denoise_occupies_decode_pipeline || !self.can_schedule_denoise(id))
             {
                 continue;
@@ -2902,7 +2941,7 @@ impl Scheduler {
             // the flag is set a flow op only opens an empty batch, and the loop
             // below closes the batch as soon as one is placed.
             if self.flow_exclusive_batch
-                && next_type == Some(OperationType::Flow)
+                && next_type == Some(WorkVariant::GenFlow)
                 && !(ops.is_empty() && mixed_ops.is_empty())
             {
                 continue;
@@ -2929,10 +2968,11 @@ impl Scheduler {
                             && !st.resources.worker_registered
                         {
                             st.resources.worker_registered = true;
-                            let initial_blocks = take_operation_new_blocks(&mut op.op);
+                            let initial_blocks = std::mem::take(&mut op.new_blocks);
+                            let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                             let admission = Admission::new(
-                                id,
-                                Some(SequenceAdmission {
+                                request_key,
+                                Some(UndAdmission {
                                     sampling: st.req.sampling.clone(),
                                     negative_token_ids: st.context.negative_prompt_ids.clone(),
                                     kv: KvAllocation {
@@ -2941,14 +2981,19 @@ impl Scheduler {
                                         group_id: 0,
                                     },
                                 }),
-                                st.req.behavior.gen_output.then(|| FlowAdmission {
+                                st.req.behavior.gen_output.then(|| GenAdmission {
                                     image: st.req.image.clone(),
                                 }),
                                 st.req.lora_id,
                             )
                             .expect("validated request produces a valid admission");
+                            // The admission-root version is produced by the synthetic
+                            // admission, identified by operation-id 0 — the sentinel the
+                            // worker seeds as its initial committed version — so the first
+                            // operation's fixed parent matches the worker's committed state.
+                            st.committed_semantic = admission.digest.clone();
+                            st.committed_producer_op_id = 0;
                             st.admission_digest = Some(admission.digest.clone());
-                            op.op.admission_digest = admission.digest.clone();
                             admissions.push(admission);
                         }
                         if !self.reserve_transition_resources(&op) {
@@ -2960,7 +3005,7 @@ impl Scheduler {
                             break;
                         }
                         selected.insert(id);
-                        let placed_flow = op.operation_type == OperationType::Flow;
+                        let placed_flow = op.operation_variant == WorkVariant::GenFlow;
                         if mixed_prefill {
                             mixed_ops.push(op);
                         } else {
@@ -3007,7 +3052,7 @@ impl Scheduler {
             if self.running.get(&id).map(|s| s.cancelled).unwrap_or(true) {
                 continue;
             }
-            let Some(operation_type) = self.peek_next_operation_type(id) else {
+            let Some(operation_type) = self.peek_next_operation_variant(id) else {
                 continue;
             };
             match assembly_lane(operation_type) {
@@ -3030,11 +3075,7 @@ impl Scheduler {
         }
         if prefill_ready && !self.any_prefill_inflight() {
             Some(AssemblyLane::Prefill)
-        } else if committed_decode_ready {
-            Some(AssemblyLane::Decode)
-        } else if projected_decode_ready && self.config.mixed_prefill_tokens > 0 {
-            Some(AssemblyLane::Decode)
-        } else if projected_decode_ready {
+        } else if committed_decode_ready || projected_decode_ready {
             Some(AssemblyLane::Decode)
         } else if prefill_ready {
             Some(AssemblyLane::Prefill)
@@ -3050,35 +3091,32 @@ impl Scheduler {
     }
 
     fn assembly_priority(&self, id: RequestId) -> u8 {
-        match self.peek_next_operation_type(id) {
+        match self.peek_next_operation_variant(id) {
             Some(
-                OperationType::EncodeVision
-                | OperationType::EncodeLatent
-                | OperationType::SequenceExtend,
+                WorkVariant::EncodeVision | WorkVariant::EncodeLatent | WorkVariant::TokenExtend,
             ) => 0,
             Some(
-                OperationType::SequenceDecode
-                | OperationType::SequenceVerify
-                | OperationType::MaterializeImage
-                | OperationType::TransferKv,
+                WorkVariant::TokenDecode
+                | WorkVariant::TokenVerify
+                | WorkVariant::Materialize
+                | WorkVariant::TransferKvInstall,
             ) => 1,
-            Some(OperationType::Flow) => 2,
+            Some(WorkVariant::GenFlow) => 2,
             Some(
-                OperationType::SequenceSample
-                | OperationType::MaterializeFrame
-                | OperationType::TransferProduct,
+                WorkVariant::Draft
+                | WorkVariant::GenTransition
+                | WorkVariant::TransferProduct
+                | WorkVariant::TransferKvPublish,
             )
             | None => 3,
         }
     }
 
     fn supports_spec_decode(&self) -> bool {
-        self.caps
-            .supported_operation_types
-            .contains(&OperationType::SequenceVerify)
+        self.caps.supported_work.contains(&WorkVariant::TokenVerify)
     }
 
-    fn peek_next_operation_type(&self, id: RequestId) -> Option<OperationType> {
+    fn peek_next_operation_variant(&self, id: RequestId) -> Option<WorkVariant> {
         let st = self.running.get(&id)?;
         if st.image_gen.branch_pending {
             return None;
@@ -3093,14 +3131,14 @@ impl Scheduler {
             })
         {
             return st.pending_image_step().map(|step| match step {
-                ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
-                ImageIngestStep::VitEncode => OperationType::EncodeVision,
+                ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
+                ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
             });
         }
         Some(match st.lifecycle.phase {
             Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
-                ImageIngestStep::VitEncode => OperationType::EncodeVision,
+                ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
+                ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
             },
             Phase::Prefill
                 if self.has_inflight(id)
@@ -3109,13 +3147,13 @@ impl Scheduler {
                         cursor.prompt_cursor as usize >= st.effective_prompt().len()
                     }) =>
             {
-                OperationType::SequenceDecode
+                WorkVariant::TokenDecode
             }
-            Phase::Prefill => OperationType::SequenceExtend,
-            Phase::DecodeUnd => OperationType::SequenceDecode,
-            Phase::DenoiseGen => OperationType::Flow,
-            Phase::CommitGen => OperationType::MaterializeImage,
-            Phase::CommitWriteback => OperationType::TransferKv,
+            Phase::Prefill => WorkVariant::TokenExtend,
+            Phase::DecodeUnd => WorkVariant::TokenDecode,
+            Phase::DenoiseGen => WorkVariant::GenFlow,
+            Phase::CommitGen => WorkVariant::Materialize,
+            Phase::CommitWriteback => WorkVariant::TransferKvInstall,
             Phase::FeedbackIngest => {
                 let feedback = st.req.policy.feedback.as_ref()?;
                 let uniserve_core::FeedbackWriteback::Reingest { ingest } = &feedback.writeback
@@ -3123,8 +3161,8 @@ impl Scheduler {
                     return None;
                 };
                 match ingest.steps.get(st.feedback.ingest_step)? {
-                    ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
-                    ImageIngestStep::VitEncode => OperationType::EncodeVision,
+                    ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
+                    ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
                 }
             }
         })
@@ -3261,6 +3299,8 @@ impl Scheduler {
         st.epoch = self.next_epoch;
         st.version = 0;
         st.admission_digest = None;
+        st.committed_semantic = String::new();
+        st.committed_producer_op_id = 0;
         self.next_epoch = self.next_epoch.saturating_add(1);
         st.replay.generated_ids = generated_ids;
         st.replay.recompute_ids = Some(recompute);
@@ -3305,13 +3345,18 @@ impl Scheduler {
         for transition in &mut transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
-            let request_id = transition.op.session_id;
-            let Some((epoch, admission_digest)) = self.running.get(&request_id).and_then(|state| {
-                state
-                    .admission_digest
-                    .as_ref()
-                    .map(|digest| (state.epoch, digest.clone()))
-            }) else {
+            let request_id = transition.request_id;
+            let Some((epoch, committed_semantic, committed_producer_op_id)) =
+                self.running.get(&request_id).and_then(|state| {
+                    state.admission_digest.as_ref().map(|_| {
+                        (
+                            state.epoch,
+                            state.committed_semantic.clone(),
+                            state.committed_producer_op_id,
+                        )
+                    })
+                })
+            else {
                 tracing::error!(
                     request_id = request_id.0,
                     "planned operation lost its session"
@@ -3331,17 +3376,60 @@ impl Scheduler {
                 self.fatal = true;
                 return;
             };
-            transition.op.admission_digest = admission_digest;
-            transition.op.model_spec_digest = self.caps.model_spec_digest.clone();
-            transition.op.weight_digest = self.caps.weight_digest.clone();
-            transition.assign_envelope(epoch, oid, version);
-            let operation_type = operation_type_str(transition.operation_type);
+            let request_key = RequestKey::new(self.authority_id, request_id, epoch);
+            // A projected successor roots on its predecessor's not-yet-observed
+            // selected point: op N's semantic digest is unknown until it runs,
+            // but its plan digest and Token-output reference are host-known, so
+            // the parent is a `Point::Device` naming that predecessor. The first
+            // op of a request roots on the committed host-observed fixed point.
+            let projected_successor = self.has_inflight(request_id);
+            let parent = if projected_successor {
+                let Some(predecessor) = self
+                    .inflight_ops
+                    .get(&request_id)
+                    .and_then(|queue| queue.back())
+                    .and_then(|op| op.transition.operation.as_ref())
+                else {
+                    tracing::error!(
+                        request_id = request_id.0,
+                        "projected successor lost its predecessor operation"
+                    );
+                    self.fatal = true;
+                    return;
+                };
+                VersionRef {
+                    request_key,
+                    producer_op_id: predecessor.op_id,
+                    point: Point::Device {
+                        // The predecessor's declared Token output is its
+                        // selected-point product; the successor's device relay
+                        // reads the sampled token this reference resolves.
+                        selected_point: predecessor.outputs[0].clone(),
+                        producer_plan_digest: predecessor.plan_digest.clone(),
+                    },
+                }
+            } else {
+                VersionRef {
+                    request_key,
+                    producer_op_id: OpId(committed_producer_op_id),
+                    point: Point::Fixed {
+                        point_index: version as u32,
+                        semantic_digest: committed_semantic,
+                    },
+                }
+            };
+            // A device parent carries no host-known point index; validation of
+            // its result reconstructs the expected point from the projected
+            // parent point (the predecessor's committed-and-advanced version).
+            transition.projected_parent_point = projected_successor.then_some(version as u32);
+            transition.assign_operation(request_key, OpId(oid), parent);
+            let operation_variant = transition.operation_variant.as_wire_str();
             self.register_inflight(transition.clone(), submit_at);
             if let Some(st) = self.running.get_mut(&request_id) {
                 let mut ev =
                     crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpSubmitted);
                 ev.op_id = Some(oid);
-                ev.op_kind = Some(operation_type);
+                ev.op_kind = Some(operation_variant);
                 ev.step_id = step;
                 st.trace.push(ev);
             }
@@ -3371,32 +3459,31 @@ impl Scheduler {
         let mixed = transitions.first().is_some_and(|first| {
             transitions
                 .iter()
-                .any(|operation| operation.operation_type != first.operation_type)
+                .any(|operation| operation.operation_variant != first.operation_variant)
         });
         self.batch_started.insert(step, submit_at);
         if self.trace_enabled() {
             let operation_types: Vec<&'static str> = transitions
                 .iter()
-                .map(|operation| operation_type_str(operation.operation_type))
+                .map(|operation| operation.operation_variant.as_wire_str())
                 .collect();
             let req_ids: Vec<u64> = transitions
                 .iter()
-                .map(|operation| operation.op.session_id.0)
+                .map(|operation| operation.request_id.0)
                 .collect();
             let trace_ops: Vec<_> = transitions
                 .iter()
                 .map(|transition| {
-                    let operation = &transition.op;
                     let phase = self
                         .running
-                        .get(&operation.session_id)
+                        .get(&transition.request_id)
                         .map(|state| phase_str(state.lifecycle.phase));
                     json!({
-                        "request_id": operation.session_id.0,
-                        "op_id": operation.op_id,
-                        "operation_type": operation_type_str(transition.operation_type),
+                        "request_id": transition.request_id.0,
+                        "op_id": transition.operation.as_ref().map(|operation| operation.op_id.0),
+                        "operation_type": transition.operation_variant.as_wire_str(),
                         "phase": phase,
-                        "operation": operation_trace(operation),
+                        "operation": operation_trace(transition),
                         "token_cost": planned_op_token_cost(transition),
                         "transition": transition.delta.as_str(),
                         "resources": {
@@ -3416,7 +3503,7 @@ impl Scheduler {
                 .collect();
             let admitted_session_ids: Vec<u64> = admissions
                 .iter()
-                .map(|admission| admission.session_id.0)
+                .map(|admission| admission.request_key.session_id.0)
                 .collect();
             self.trace_record(json!({
                 "event": "batch_submitted",
@@ -3446,11 +3533,11 @@ impl Scheduler {
         if mixed {
             let operation_types: Vec<&'static str> = transitions
                 .iter()
-                .map(|operation| operation_type_str(operation.operation_type))
+                .map(|operation| operation.operation_variant.as_wire_str())
                 .collect();
             let req_ids: Vec<u64> = transitions
                 .iter()
-                .map(|operation| operation.op.session_id.0)
+                .map(|operation| operation.request_id.0)
                 .collect();
             tracing::debug!(
                 step_id = self.step_id,
@@ -3459,18 +3546,23 @@ impl Scheduler {
                 "submitting mixed forward batch"
             );
         }
-        let wire_ops = transitions
+        let spec_draft_counts: Vec<usize> = transitions
             .iter()
-            .map(|transition| transition.op.clone())
-            .collect();
-        let batch = Batch::new(self.step_id, admissions, wire_ops);
-        let spec_draft_counts: Vec<usize> = batch
-            .operations
-            .iter()
-            .map(operation_draft_tokens)
-            .map(|tokens| tokens.len())
+            .map(|transition| transition.draft_token_ids.len())
             .filter(|count| *count > 0)
             .collect();
+        let wire_ops = transitions
+            .iter()
+            .filter_map(|transition| transition.operation.clone())
+            .collect();
+        // Host-supplied input product values (prompt/forced/prior/draft tokens,
+        // ingest image bytes) the operations reference through their inputs.
+        let input_products = transitions
+            .iter()
+            .filter_map(|transition| transition.input_product())
+            .collect();
+        let batch =
+            Batch::new(self.step_id, admissions, wire_ops).with_input_products(input_products);
         if let Err(e) = self.executor.submit(batch) {
             self.batch_started.remove(&step);
             self.trace_record(json!({
@@ -3656,8 +3748,7 @@ impl Scheduler {
                     return None;
                 }
                 let chunk: Vec<u32> = prompt[cursor..end].to_vec();
-                let recent = self.recent_tokens(id);
-                let (allowed, suppress) = self.token_masks(id);
+                let (allowed, _) = self.token_masks(id);
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
@@ -3667,22 +3758,22 @@ impl Scheduler {
                         prompt_start: cursor as u32,
                         token_ids: chunk,
                         new_blocks,
-                        recent_tokens: recent,
                         allowed_tokens: allowed,
-                        suppress_tokens: suppress,
                     },
                 )
             }
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
+                // The prior committed token this decode continues from. It is
+                // attached as the host input for the first/committed decode; a
+                // projected successor ignores it and reads the predecessor's
+                // on-device sampled token via the device relay instead.
+                let input_token = st.und.next_token;
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
                 let projected_successor = self.has_inflight(id);
                 let relay_input = projected_successor || self.can_reuse_committed_token_relay(id);
                 let tok = if relay_input { 0 } else { st.und.next_token };
-                let recent = (!projected_successor)
-                    .then(|| self.recent_tokens(id))
-                    .flatten();
                 let (allowed, suppress) = if projected_successor {
                     (None, None)
                 } else {
@@ -3712,21 +3803,34 @@ impl Scheduler {
                     projection,
                     TransitionIntent::DecodeUnd {
                         position: pos,
-                        token_id: tok,
-                        token_source: if relay_input {
-                            TokenSource::LastSampled
-                        } else {
-                            TokenSource::Wire
-                        },
                         new_blocks,
                         spec_token_ids,
-                        recent_tokens: recent,
                         allowed_tokens: allowed,
-                        suppress_tokens: suppress,
+                        input_token,
+                        // A projected successor roots on the predecessor's
+                        // device-selected point and reads its on-device sampled
+                        // token; the committed-relay/first op keeps its host
+                        // token as before.
+                        relay_input: projected_successor,
                     },
                 )
             }
             Phase::DenoiseGen => {
+                // The flow runs exactly `image.steps` denoise quanta; once they
+                // are all done, advance to the commit phase and plan its
+                // transition rather than a spurious zero-length step. Termination
+                // is host-driven off the committed step count, not a worker
+                // completion flag.
+                if self
+                    .running
+                    .get(&id)
+                    .is_some_and(|st| st.image_gen.steps_done >= st.req.image.steps)
+                {
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.lifecycle.phase = Phase::CommitGen;
+                    }
+                    return self.next_transition(id, budget);
+                }
                 let st = self.running.get(&id)?;
                 let cond_pos = st.image_gen.cond_pos;
                 let nvae = self.num_vae(&st.req.image) as usize;
@@ -3739,12 +3843,11 @@ impl Scheduler {
                     return None;
                 }
                 let timestep = st.image_gen.steps_done;
-                let remaining = st.req.image.steps.saturating_sub(timestep).max(1);
+                let remaining = st.req.image.steps.saturating_sub(timestep);
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
                 let host_scratch_tokens = self.denoise_host_scratch_tokens(st);
-                let image_prompt = Self::image_prompt_for(st);
                 let image_id = st.image_gen.image_id;
                 let conditioning = st.image_gen.conditioning.clone();
                 let projection = self.projected_cursor(id)?;
@@ -3753,11 +3856,9 @@ impl Scheduler {
                     projection,
                     TransitionIntent::DenoiseGen {
                         image_id,
-                        position: cond_pos,
                         start_step: timestep,
                         step_count: denoise_step_count,
                         cfg,
-                        image_prompt,
                         latent_units,
                         host_scratch_tokens,
                         conditioning,
@@ -3768,8 +3869,7 @@ impl Scheduler {
                 let st = self.running.get(&id)?;
                 let cond_pos = st.image_gen.cond_pos;
                 let image_id = st.image_gen.image_id;
-                let recent = self.recent_tokens(id);
-                let (allowed, suppress) = self.token_masks(id);
+                let (allowed, _) = self.token_masks(id);
                 let projection = self.projected_cursor(id)?;
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
@@ -3779,9 +3879,7 @@ impl Scheduler {
                         image_id,
                         position: cond_pos,
                         new_blocks,
-                        recent_tokens: recent,
                         allowed_tokens: allowed,
-                        suppress_tokens: suppress,
                     },
                 )
             }
@@ -3790,8 +3888,7 @@ impl Scheduler {
                 let cond_pos = st.image_gen.cond_pos;
                 let image_id = st.image_gen.image_id;
                 let locator = st.feedback.locator.clone();
-                let recent = self.recent_tokens(id);
-                let (allowed, suppress) = self.token_masks(id);
+                let (allowed, _) = self.token_masks(id);
                 let Some(locator) = locator else {
                     self.finish(id, FinishReason::Error);
                     return None;
@@ -3806,9 +3903,7 @@ impl Scheduler {
                         position: cond_pos,
                         locator,
                         new_blocks,
-                        recent_tokens: recent,
                         allowed_tokens: allowed,
-                        suppress_tokens: suppress,
                     },
                 )
             }
@@ -3824,9 +3919,6 @@ impl Scheduler {
                 let step = ingest.steps.get(step_index).copied()?;
                 let is_final_step = step_index + 1 == ingest.steps.len();
                 let image_id = st.image_gen.image_id;
-                let feedback_key =
-                    encoder_cache_key(id.0 ^ u64::from(image_id).rotate_left(17), step_index, step);
-                let worker_hash = transient_encoder_worker_key(feedback_key, id);
                 let image_b64 = st.feedback.image_b64.clone();
                 let staged_image = st.feedback.staged_image;
                 let logical_positions = ingest.logical_positions;
@@ -3844,7 +3936,6 @@ impl Scheduler {
                         image_id,
                         step_index,
                         step,
-                        worker_hash,
                         is_final_step,
                         position: projection.logical_pos,
                         logical_positions,
@@ -3890,11 +3981,6 @@ impl Scheduler {
             };
             let cache_hit = cached.is_some();
             let persistent_cache_key = (cache_hit || cache_write).then_some(cache_key);
-            let worker_hash = if cache_hit || cache_write {
-                cache_key
-            } else {
-                transient_encoder_worker_key(cache_key, id)
-            };
             let encoder_input = cached.map(|output| output.handle).or(staged_image);
             let new_blocks = self.take_new_blocks(id);
             return self.plan_intent(
@@ -3908,7 +3994,6 @@ impl Scheduler {
                     position: projection.logical_pos,
                     logical_positions: image.ingest.logical_positions,
                     physical_kv_tokens: image.ingest.kv_effect(step_index)?,
-                    worker_hash,
                     encoder_cache_key: persistent_cache_key,
                     cache_hit,
                     image_b64: image.b64.clone(),
@@ -3944,8 +4029,7 @@ impl Scheduler {
         {
             return None;
         }
-        let recent = self.recent_tokens(id);
-        let (allowed, suppress) = self.token_masks(id);
+        let (allowed, _) = self.token_masks(id);
         let new_blocks = self.take_new_blocks(id);
         self.plan_intent(
             id,
@@ -3955,9 +4039,7 @@ impl Scheduler {
                 prompt_start: cursor as u32,
                 token_ids: prompt[cursor..end].to_vec(),
                 new_blocks,
-                recent_tokens: recent,
                 allowed_tokens: allowed,
-                suppress_tokens: suppress,
             },
         )
     }
@@ -4002,20 +4084,6 @@ impl Scheduler {
 
     /// bounded recent-output window for penalties (only carried when a
     /// penalty is active, to keep the op small — risk 4).
-    fn recent_tokens(&self, id: RequestId) -> Option<Vec<u32>> {
-        let st = self.running.get(&id)?;
-        let sp = &st.req.sampling;
-        let active = sp.repetition_penalty != 1.0
-            || sp.frequency_penalty != 0.0
-            || sp.presence_penalty != 0.0;
-        if !active || st.replay.generated_ids.is_empty() {
-            return None;
-        }
-        let n = st.replay.generated_ids.len();
-        let start = n.saturating_sub(self.penalty_window);
-        Some(st.replay.generated_ids[start..].to_vec())
-    }
-
     /// run the host-side logits-processor pipeline to compute the op's
     /// allowed/suppress masks (min-tokens, bad-words, allowed-tokens).
     fn token_masks(&mut self, id: RequestId) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
@@ -4094,28 +4162,28 @@ impl Scheduler {
     fn resolve_spec_decode_text(
         &mut self,
         id: RequestId,
-        effect: SequenceEffect,
+        view: SequenceView,
         draft_token_ids: Vec<u32>,
     ) {
         self.bm.activate(id);
         let accepted =
-            (effect.accepted_draft_tokens.unwrap_or(0) as usize).min(draft_token_ids.len());
-        if effect.sampled_token_ids.len() != accepted.saturating_add(1)
-            || effect.sampled_token_ids[..accepted] != draft_token_ids[..accepted]
+            (view.accepted_draft_tokens.unwrap_or(0) as usize).min(draft_token_ids.len());
+        if view.committed_tokens.len() != accepted.saturating_add(1)
+            || view.committed_tokens[..accepted] != draft_token_ids[..accepted]
         {
             return self.finish(id, FinishReason::Error);
         }
         if let Some(st) = self.running.get_mut(&id) {
             st.lifecycle.phase = Phase::DecodeUnd;
         }
-        for (index, tok) in effect.sampled_token_ids.iter().copied().enumerate() {
+        for (index, tok) in view.committed_tokens.iter().copied().enumerate() {
             let is_sampled = index == accepted;
-            let logprob = is_sampled.then_some(effect.sampled_logprob).flatten();
+            let logprob = is_sampled.then_some(view.sampled_logprob).flatten();
             let Some(st) = self.running.get_mut(&id) else {
                 return;
             };
             st.und.tokens_emitted += 1;
-            let top_logprobs = is_sampled.then(|| effect.top_logprobs.clone());
+            let top_logprobs = is_sampled.then(|| view.top_logprobs.clone());
             if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_sampled) {
                 return;
             }
@@ -4128,7 +4196,7 @@ impl Scheduler {
         }
     }
 
-    fn resolve_decode_text(&mut self, id: RequestId, effect: SequenceEffect) {
+    fn resolve_decode_text(&mut self, id: RequestId, view: SequenceView) {
         self.bm.activate(id);
         if self
             .running
@@ -4145,15 +4213,15 @@ impl Scheduler {
             }
             return self.close_context_round(id, close_token);
         }
-        let burst_result = effect.sampled_token_ids.len() > 1;
-        let tokens = if effect.sampled_token_ids.is_empty() {
+        let burst_result = view.committed_tokens.len() > 1;
+        let tokens = if view.committed_tokens.is_empty() {
             vec![self.ctrl.eos[0]]
         } else {
-            effect.sampled_token_ids.clone()
+            view.committed_tokens.clone()
         };
         for (idx, tok) in tokens.iter().copied().enumerate() {
             let is_last = idx + 1 == tokens.len();
-            let logprob = is_last.then_some(effect.sampled_logprob).flatten();
+            let logprob = is_last.then_some(view.sampled_logprob).flatten();
             let is_round_close = self
                 .running
                 .get(&id)
@@ -4190,7 +4258,15 @@ impl Scheduler {
                 self.begin_image(id);
                 return;
             }
-            let top_logprobs = is_last.then(|| effect.top_logprobs.clone());
+            // Once the image budget is spent the image-start trigger is
+            // suppressed host-side: emit a non-trigger token so a bias toward the
+            // trigger returns to ordinary text instead of an un-actionable signal.
+            let tok = if direct_trigger {
+                tok.wrapping_add(1)
+            } else {
+                tok
+            };
+            let top_logprobs = is_last.then(|| view.top_logprobs.clone());
             if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_last) {
                 return;
             }
@@ -4219,30 +4295,47 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         transition: PlannedTransition,
-        operation_result: OperationResult,
+        mut view: SequenceView,
         draft_token_ids: Vec<u32>,
     ) {
-        let operation_type = transition.operation_type;
-        let mut sequence_effect = operation_result_sequence_effect(&operation_result)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(conditioning) = sequence_effect.published_kv.clone()
+        let operation_variant = transition.operation_variant;
+        // Structured-output / guided decode is host-owned: a committed token
+        // outside the operation's grammar-allowed set is replaced by an allowed
+        // token so the emitted sequence stays grammar-valid.
+        if let Some(allowed) = transition
+            .validation
+            .allowed_text_tokens
+            .as_deref()
+            .filter(|allowed| !allowed.is_empty())
+        {
+            for token in view.committed_tokens.iter_mut() {
+                if !allowed.contains(token) {
+                    *token = allowed[0];
+                }
+            }
+        }
+        // A token operation that publishes a KV product supplies the conditioning
+        // a later denoise operation lists among its inputs.
+        if matches!(
+            operation_variant,
+            WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
+        ) && let Some(conditioning) = view.kv_product.clone()
             && let Some(state) = self.running.get_mut(&id)
         {
             state.image_gen.conditioning = Some(conditioning);
         }
-        if !sequence_effect.prompt_logprobs.is_empty() {
-            let positions = std::mem::take(&mut sequence_effect.prompt_logprobs);
+        if !view.prompt_logprobs.is_empty() {
+            let positions = std::mem::take(&mut view.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
         }
-        if operation_type == OperationType::SequenceVerify && !draft_token_ids.is_empty() {
-            return self.resolve_spec_decode_text(id, sequence_effect, draft_token_ids);
+        if operation_variant == WorkVariant::TokenVerify && !draft_token_ids.is_empty() {
+            return self.resolve_spec_decode_text(id, view, draft_token_ids);
         }
-        if operation_type == OperationType::SequenceDecode {
-            return self.resolve_decode_text(id, sequence_effect);
+        if operation_variant == WorkVariant::TokenDecode {
+            return self.resolve_decode_text(id, view);
         }
-        match operation_type {
-            OperationType::SequenceExtend => {
+        match operation_variant {
+            WorkVariant::TokenExtend => {
                 self.bm.activate(id);
                 // chunked prefill: a prefill op may only have consumed part of
                 // the prompt; if so, advance the cursor and stay in Prefill.
@@ -4296,12 +4389,12 @@ impl Scheduler {
                     self.begin_image(id);
                     return;
                 }
-                let tok = sequence_effect
-                    .sampled_token_ids
+                let tok = view
+                    .committed_tokens
                     .last()
                     .copied()
                     .unwrap_or(self.ctrl.eos[0]);
-                let logprob = sequence_effect.sampled_logprob;
+                let logprob = view.sampled_logprob;
                 let (images_done, max_images) = {
                     let st = self.running.get(&id).unwrap();
                     (st.image_gen.images_done, st.req.image.max_images as usize)
@@ -4320,7 +4413,7 @@ impl Scheduler {
                     id,
                     tok,
                     logprob,
-                    Some(sequence_effect.top_logprobs.clone()),
+                    Some(view.top_logprobs.clone()),
                     true,
                 ) {
                     return;
@@ -4342,7 +4435,7 @@ impl Scheduler {
                     self.begin_image(id);
                 }
             }
-            OperationType::Flow => {
+            WorkVariant::GenFlow => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
                     let prev = match transition.delta {
@@ -4378,43 +4471,39 @@ impl Scheduler {
                 for step in prev_sd.saturating_add(1)..=sd {
                     self.emit(id, GenEvent::ImageStep { image_id, step });
                 }
-                if operation_flow_delta(&operation_result).is_some_and(|delta| delta.done)
-                    && let Some(st) = self.running.get_mut(&id)
-                {
-                    st.lifecycle.phase = Phase::CommitGen;
-                }
+                // The commit phase is entered host-side once the committed step
+                // count reaches `image.steps` (see the `Phase::DenoiseGen`
+                // planner); a worker completion flag does not drive termination.
             }
-            OperationType::MaterializeImage | OperationType::TransferKv => {
-                if operation_type == OperationType::TransferKv
+            WorkVariant::Materialize | WorkVariant::TransferKvInstall => {
+                if operation_variant == WorkVariant::TransferKvInstall
                     && let Some(st) = self.running.get_mut(&id)
                 {
-                    if sequence_effect.sampled_token_ids.is_empty()
+                    if view.committed_tokens.is_empty()
                         && let Some(token) = st.feedback.sampled_token.take()
                     {
-                        sequence_effect.sampled_token_ids.push(token);
+                        view.committed_tokens.push(token);
                     }
-                    sequence_effect.sampled_logprob = sequence_effect
-                        .sampled_logprob
-                        .or(st.feedback.sampled_logprob.take());
-                    if sequence_effect.top_logprobs.is_empty()
+                    view.sampled_logprob =
+                        view.sampled_logprob.or(st.feedback.sampled_logprob.take());
+                    if view.top_logprobs.is_empty()
                         && let Some(top_logprobs) = st.feedback.top_logprobs.take()
                     {
-                        sequence_effect.top_logprobs = top_logprobs;
+                        view.top_logprobs = top_logprobs;
                     }
                 }
-                if operation_type == OperationType::MaterializeImage {
+                if operation_variant == WorkVariant::Materialize {
                     let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
                     self.emit(id, GenEvent::ImageCommit { image_id });
                 }
-                let image = operation_image(&operation_result).cloned();
-                if operation_type == OperationType::MaterializeImage
+                let image = view.image_png.clone();
+                if operation_variant == WorkVariant::Materialize
                     && self
                         .running
                         .get(&id)
                         .is_some_and(Self::reingests_generated_image)
                 {
-                    let Some(image_b64) = image.as_ref().map(|image| image.png_base64.clone())
-                    else {
+                    let Some(image_b64) = image.clone() else {
                         return self.finish(id, FinishReason::Error);
                     };
                     let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
@@ -4430,28 +4519,24 @@ impl Scheduler {
                     }
                     return;
                 }
-                if operation_type == OperationType::MaterializeImage
+                if operation_variant == WorkVariant::Materialize
                     && self
                         .running
                         .get(&id)
                         .is_some_and(Self::commit_requires_writeback)
                 {
-                    let Some(locator) = operation_result_locator(&operation_result)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_owned)
-                    else {
+                    let Some(locator) = view.kv_product.clone() else {
                         return self.finish(id, FinishReason::Error);
                     };
                     if let Some(st) = self.running.get_mut(&id) {
                         st.feedback.locator = Some(locator);
-                        st.feedback.sampled_token =
-                            sequence_effect.sampled_token_ids.last().copied();
-                        st.feedback.sampled_logprob = sequence_effect.sampled_logprob;
-                        st.feedback.top_logprobs = (!sequence_effect.top_logprobs.is_empty())
-                            .then(|| sequence_effect.top_logprobs.clone());
+                        st.feedback.sampled_token = view.committed_tokens.last().copied();
+                        st.feedback.sampled_logprob = view.sampled_logprob;
+                        st.feedback.top_logprobs =
+                            (!view.top_logprobs.is_empty()).then(|| view.top_logprobs.clone());
                         st.lifecycle.phase = Phase::CommitWriteback;
                     }
-                    if let Some(b64) = image.map(|image| image.png_base64) {
+                    if let Some(b64) = image {
                         let image_id = self
                             .running
                             .get(&id)
@@ -4469,7 +4554,7 @@ impl Scheduler {
                     let st = self.running.get(&id).unwrap();
                     (st.image_gen.image_id, st.continues_after_gen_commit())
                 };
-                if let Some(b64) = image.map(|image| image.png_base64) {
+                if let Some(b64) = image {
                     let Some(event) = image_done_event(image_id, b64) else {
                         return self.finish(id, FinishReason::Error);
                     };
@@ -4484,7 +4569,7 @@ impl Scheduler {
                 // happens in DecodeUnd on a genuine terminal condition (EOS or
                 // max_tokens) or from a commit-side EOS reported by the worker.
                 if continues_after_gen_commit {
-                    if let Some(tok) = sequence_effect.sampled_token_ids.last().copied() {
+                    if let Some(tok) = view.committed_tokens.last().copied() {
                         let (can_open_gen_branch, images_done, max_images) = {
                             let st = self.running.get_mut(&id).unwrap();
                             st.und.tokens_emitted += 1;
@@ -4507,8 +4592,8 @@ impl Scheduler {
                         if self.emit_or_finish_und_token(
                             id,
                             tok,
-                            sequence_effect.sampled_logprob,
-                            Some(sequence_effect.top_logprobs.clone()),
+                            view.sampled_logprob,
+                            Some(view.top_logprobs.clone()),
                             true,
                         ) {
                             return;
@@ -4544,17 +4629,14 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            OperationType::EncodeVision | OperationType::EncodeLatent => match &transition.delta {
+            WorkVariant::EncodeVision | WorkVariant::EncodeLatent => match &transition.delta {
                 crate::generation::TransitionDelta::IngestImageStep {
                     is_final_step,
                     encoder_cache_key,
                     cache_hit,
                     ..
                 } => {
-                    let Some(encode) = operation_encode_delta(&operation_result) else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    let result_handle = encode.product_handle;
+                    let result_handle = view.encode_generation.map(u64::from).unwrap_or(0);
                     if result_handle == 0 {
                         return self.finish(id, FinishReason::Error);
                     }
@@ -4565,7 +4647,7 @@ impl Scheduler {
                             if let Some(freed) = self.enc_cache.insert_output(
                                 *cache_key,
                                 result_handle,
-                                encode.kv_tokens,
+                                view.kv_visible_len,
                             ) {
                                 free_handles.push(freed);
                             }
@@ -4585,11 +4667,6 @@ impl Scheduler {
                     }
                     let bos = self.ctrl.bos;
                     if let Some(st) = self.running.get_mut(&id) {
-                        if let Some((height, width)) = encode.image_size {
-                            st.image_gen.image_hw = (height, width);
-                            st.req.image.height = height;
-                            st.req.image.width = width;
-                        }
                         if *is_final_step {
                             st.ingest.staged_image = None;
                             free_handles.append(&mut st.ingest.transient_encoder_handles);
@@ -4611,8 +4688,10 @@ impl Scheduler {
                 crate::generation::TransitionDelta::FeedbackIngestStep {
                     is_final_step, ..
                 } => {
-                    let Some(handle) =
-                        operation_encode_handle(&operation_result).filter(|handle| *handle != 0)
+                    let Some(handle) = view
+                        .encode_generation
+                        .map(u64::from)
+                        .filter(|handle| *handle != 0)
                     else {
                         return self.finish(id, FinishReason::Error);
                     };
@@ -4645,19 +4724,16 @@ impl Scheduler {
                 }
                 _ => self.finish(id, FinishReason::Error),
             },
-            OperationType::SequenceDecode
-            | OperationType::SequenceVerify
-            | OperationType::SequenceSample
-            | OperationType::MaterializeFrame
-            | OperationType::TransferProduct => {}
+            WorkVariant::TokenDecode
+            | WorkVariant::TokenVerify
+            | WorkVariant::Draft
+            | WorkVariant::GenTransition
+            | WorkVariant::TransferProduct
+            | WorkVariant::TransferKvPublish => {}
         }
     }
 
-    fn resolve_prompt_logprobs(
-        &mut self,
-        id: RequestId,
-        positions: Vec<Vec<uniserve_worker_wire::TokenLogprob>>,
-    ) {
+    fn resolve_prompt_logprobs(&mut self, id: RequestId, positions: Vec<Vec<RankedToken>>) {
         let total = positions.len();
         let Some(state) = self.running.get_mut(&id) else {
             return;
@@ -4786,7 +4862,7 @@ impl Scheduler {
         id: RequestId,
         tok: u32,
         logprob: Option<f32>,
-        top_logprobs: Option<Vec<uniserve_worker_wire::TokenLogprob>>,
+        top_logprobs: Option<Vec<RankedToken>>,
     ) {
         if self.emit_text(id, tok, logprob)
             && let Some(top_logprobs) = top_logprobs.filter(|entries| !entries.is_empty())
@@ -4806,7 +4882,7 @@ impl Scheduler {
         id: RequestId,
         token_id: u32,
         logprob: Option<f32>,
-        top_logprobs: Option<Vec<uniserve_worker_wire::TokenLogprob>>,
+        top_logprobs: Option<Vec<RankedToken>>,
     ) {
         if self
             .running
@@ -4822,14 +4898,16 @@ impl Scheduler {
         id: RequestId,
         token_id: u32,
         logprob: Option<f32>,
-        top_logprobs: Option<Vec<uniserve_worker_wire::TokenLogprob>>,
+        top_logprobs: Option<Vec<RankedToken>>,
         sampled: bool,
     ) -> bool {
         let Some(state) = self.running.get(&id) else {
             return true;
         };
+        // `tokens_emitted` already counts the token being resolved, so the floor
+        // is cleared only once at least `min_tokens` tokens have been emitted.
         let generated = state.und.tokens_emitted;
-        let under_floor = generated < state.req.sampling.min_tokens;
+        let under_floor = generated <= state.req.sampling.min_tokens;
         let stop_hit = state.req.policy.termination.stop_finishes
             && !under_floor
             && state.req.stop_token_ids.contains(&token_id);
@@ -4841,11 +4919,7 @@ impl Scheduler {
 
         if stop_hit {
             self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
-            self.finish_after_inflight(
-                id,
-                FinishReason::Stop,
-                Some(format!("token:{token_id}")),
-            );
+            self.finish_after_inflight(id, FinishReason::Stop, Some(format!("token:{token_id}")));
             return true;
         }
         if eos_hit || max_hit {
@@ -5051,174 +5125,36 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     value.div_ceil(divisor)
 }
 
-/// Tokens a single op contributes toward the per-step scheduling budget.
-/// Prefill contributes its chunk width; decode one; image ops a nominal one.
-fn op_token_cost(envelope: &OperationEnvelope) -> usize {
-    match &envelope.operation {
-        Operation::Sequence(sequence) => match &sequence.input {
-            SequenceInput::Tokens(input) => match sequence.mode {
-                SequenceMode::Extend => {
-                    sequence.position.1.saturating_sub(sequence.position.0) as usize
-                }
-                SequenceMode::Decode | SequenceMode::Verify => 1 + input.draft_token_ids.len(),
-                SequenceMode::Sample => 1,
-            },
-            SequenceInput::PublishedLogits(_) => 1,
-        },
-        Operation::Flow(flow) => usize::from(flow.step_count.max(1)),
-        Operation::Encode(_) | Operation::Materialize(_) | Operation::Transfer(_) => 1,
-    }
-}
-
 /// Physical transformer-token work a planned op contributes to one scheduler
 /// step. Denoise executes every latent token once per CFG branch at every
-/// timestep, so its cost must use the compiled latent geometry rather than the
-/// scalar wire-op count.
+/// timestep, so its cost multiplies the compiled latent geometry rather than the
+/// scalar per-step token cost.
 fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
-    let Operation::Flow(flow) = &transition.op.operation else {
-        return op_token_cost(&transition.op);
-    };
+    if transition.operation_variant != WorkVariant::GenFlow {
+        return transition.token_cost;
+    }
     let latent_tokens = usize::try_from(transition.resources.latent_units)
         .unwrap_or(usize::MAX)
         .max(1);
-    let cfg_branches = usize::from(flow.guidance.branch_count.max(1));
-    let timesteps = usize::from(flow.step_count.max(1));
+    let cfg_branches = transition.resources.cfg_branches.max(1);
+    let timesteps = transition.token_cost.max(1);
     latent_tokens
         .saturating_mul(cfg_branches)
         .saturating_mul(timesteps)
 }
 
-fn operation_draft_tokens(envelope: &OperationEnvelope) -> Vec<u32> {
-    let Operation::Sequence(sequence) = &envelope.operation else {
-        return Vec::new();
-    };
-    let SequenceInput::Tokens(input) = &sequence.input else {
-        return Vec::new();
-    };
-    input.draft_token_ids.clone()
-}
-
-fn take_operation_new_blocks(envelope: &mut OperationEnvelope) -> Vec<BlockId> {
-    match &mut envelope.operation {
-        Operation::Sequence(operation) => std::mem::take(&mut operation.lease.new_blocks),
-        Operation::Encode(operation) => std::mem::take(&mut operation.lease.new_blocks),
-        Operation::Materialize(operation) => std::mem::take(&mut operation.lease.new_blocks),
-        Operation::Transfer(operation) => std::mem::take(&mut operation.lease.new_blocks),
-        Operation::Flow(_) => Vec::new(),
-    }
-}
-
-fn operation_result_sequence_effect(result: &OperationResult) -> Option<&SequenceEffect> {
-    match &result.delta {
-        ResultDelta::Sequence(delta) => Some(&delta.effect),
-        ResultDelta::Materialize(delta) => delta.sequence.as_ref(),
-        ResultDelta::Transfer(delta) => delta.sequence.as_ref(),
-        ResultDelta::Flow(_) | ResultDelta::Encode(_) => None,
-    }
-}
-
-fn operation_flow_delta(result: &OperationResult) -> Option<&uniserve_worker_wire::FlowDelta> {
-    let ResultDelta::Flow(delta) = &result.delta else {
-        return None;
-    };
-    Some(delta)
-}
-
-fn operation_encode_delta(result: &OperationResult) -> Option<&uniserve_worker_wire::EncodeDelta> {
-    let ResultDelta::Encode(delta) = &result.delta else {
-        return None;
-    };
-    Some(delta)
-}
-
-fn operation_encode_handle(result: &OperationResult) -> Option<u64> {
-    operation_encode_delta(result).map(|delta| delta.product_handle)
-}
-
-fn operation_image(result: &OperationResult) -> Option<&uniserve_worker_wire::ImageArtifact> {
-    let ResultDelta::Materialize(delta) = &result.delta else {
-        return None;
-    };
-    let uniserve_worker_wire::MaterializedProduct::Image(image) = &delta.product else {
-        return None;
-    };
-    Some(image)
-}
-
-fn operation_result_locator(result: &OperationResult) -> Option<&str> {
-    match &result.delta {
-        ResultDelta::Materialize(delta) => match &delta.product {
-            uniserve_worker_wire::MaterializedProduct::Image(image) => Some(image.locator.as_str()),
-            uniserve_worker_wire::MaterializedProduct::Published(product) => {
-                Some(product.locator.as_str())
-            }
-            uniserve_worker_wire::MaterializedProduct::Frame { .. } => None,
-        },
-        ResultDelta::Transfer(delta) => delta
-            .product
-            .as_ref()
-            .map(|product| product.locator.as_str()),
-        ResultDelta::Sequence(_) | ResultDelta::Flow(_) | ResultDelta::Encode(_) => None,
-    }
-}
-
-fn operation_result_kv_tokens(result: &OperationResult) -> Option<u32> {
-    match &result.delta {
-        ResultDelta::Sequence(delta) => delta.effect.kv_tokens,
-        ResultDelta::Encode(delta) => Some(delta.kv_tokens),
-        ResultDelta::Materialize(delta) => delta.kv_tokens,
-        ResultDelta::Transfer(delta) => delta.kv_tokens,
-        ResultDelta::Flow(_) => None,
-    }
-}
-
-fn operation_trace(envelope: &OperationEnvelope) -> serde_json::Value {
-    match &envelope.operation {
-        Operation::Sequence(sequence) => {
-            let (token_count, draft_count, source) = match &sequence.input {
-                SequenceInput::Tokens(input) => (
-                    input.token_ids.len(),
-                    input.draft_token_ids.len(),
-                    Some(input.source),
-                ),
-                SequenceInput::PublishedLogits(_) => (0, 0, None),
-            };
-            json!({
-                "kind": "sequence",
-                "mode": sequence.mode,
-                "position": sequence.position,
-                "token_count": token_count,
-                "draft_count": draft_count,
-                "source": source,
-                "new_blocks": sequence.lease.new_blocks.len(),
-            })
-        }
-        Operation::Flow(flow) => json!({
-            "kind": "flow",
-            "position": flow.position,
-            "start_step": flow.start_step,
-            "step_count": flow.step_count,
-            "branch_count": flow.guidance.branch_count,
-        }),
-        Operation::Encode(encode) => json!({
-            "kind": "encode",
-            "encode_kind": encode.kind,
-            "position": encode.position,
-            "new_blocks": encode.lease.new_blocks.len(),
-        }),
-        Operation::Materialize(materialize) => json!({
-            "kind": "materialize",
-            "materialize_kind": materialize.kind,
-            "position": materialize.position,
-            "new_blocks": materialize.lease.new_blocks.len(),
-        }),
-        Operation::Transfer(transfer) => json!({
-            "kind": "transfer",
-            "transfer_kind": transfer.kind,
-            "position": transfer.position,
-            "new_blocks": transfer.lease.new_blocks.len(),
-        }),
-    }
+fn operation_trace(transition: &PlannedTransition) -> serde_json::Value {
+    json!({
+        "work": transition.operation_variant.as_wire_str(),
+        "domain": format!("{:?}", transition.domain),
+        "token_cost": transition.token_cost,
+        "draft_count": transition.draft_token_ids.len(),
+        "new_blocks": transition.new_blocks.len(),
+        "inputs": transition.inputs.len(),
+        "outputs": transition.outputs.len(),
+        "max_tokens": transition.bounds.max_tokens,
+        "max_kv_pages": transition.bounds.max_kv_pages,
+    })
 }
 
 fn denoise_step_burst_from_env() -> u16 {
@@ -5252,58 +5188,126 @@ fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_worker_wire::{KvLeaseDelta, SequenceOperation, TokenInput, TokenPolicy};
+    use crate::generation::Replayability;
+    use uniserve_core::{
+        ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint,
+        GenerationPolicyDescriptor, GenerationResourceBounds, ImageParams, SamplingParams,
+        UndVisibility,
+    };
 
-    fn sequence(
-        mode: SequenceMode,
-        position: (u32, u32),
-        draft_token_ids: Vec<u32>,
-    ) -> OperationEnvelope {
-        OperationEnvelope::unsealed(
-            RequestId(1),
-            Operation::Sequence(SequenceOperation {
-                mode,
-                lease: KvLeaseDelta::default(),
-                position,
-                policy: TokenPolicy::default(),
-                input: SequenceInput::Tokens(TokenInput {
-                    token_ids: vec![7],
-                    source: TokenSource::Wire,
-                    draft_token_ids,
-                    return_all_logits: false,
-                }),
-            }),
-        )
+    fn request(id: u64, tokens: usize) -> GenerationRequest {
+        let policy = GenerationPolicyDescriptor::default();
+        let constraint = GenerationConstraint::UndOnly;
+        GenerationRequest {
+            request_id: RequestId(id),
+            context: vec![ContextSegment::UndTokens {
+                token_ids: vec![0; tokens],
+                visibility: UndVisibility::Internal,
+            }],
+            negative_context: Vec::new(),
+            constraint,
+            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: SamplingParams::default(),
+            image: ImageParams::default(),
+            max_und_tokens: 32,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache: Default::default(),
+            policy,
+            resources: GenerationResourceBounds {
+                context_tokens: tokens,
+                max_kv_tokens: tokens + 32,
+                ..GenerationResourceBounds::default()
+            },
+        }
+    }
+
+    fn cursor(phase: Phase, pos: u32) -> CursorProjection {
+        CursorProjection {
+            phase,
+            prompt_cursor: pos,
+            logical_pos: pos,
+            physical_kv_len: pos,
+            replayability: Replayability::Replayable,
+        }
+    }
+
+    fn plan(
+        req: &GenerationRequest,
+        cursor: CursorProjection,
+        intent: TransitionIntent,
+    ) -> PlannedTransition {
+        GenerationPlanner::new()
+            .plan(req, cursor, intent)
+            .expect("plan transition")
     }
 
     #[test]
-    fn typed_operation_cost_tracks_physical_sequence_work() {
-        assert_eq!(
-            op_token_cost(&sequence(SequenceMode::Extend, (3, 11), Vec::new())),
-            8
+    fn planned_cost_tracks_physical_sequence_work() {
+        let req = request(1, 11);
+        let extend = plan(
+            &req,
+            cursor(Phase::Prefill, 3),
+            TransitionIntent::IngestText {
+                segment_index: 0,
+                prompt_start: 3,
+                token_ids: vec![7; 8],
+                new_blocks: Vec::new(),
+                allowed_tokens: None,
+            },
         );
-        assert_eq!(
-            op_token_cost(&sequence(SequenceMode::Decode, (11, 12), Vec::new())),
-            1
+        assert_eq!(planned_op_token_cost(&extend), 8);
+
+        let decode = plan(
+            &req,
+            cursor(Phase::DecodeUnd, 11),
+            TransitionIntent::DecodeUnd {
+                position: 11,
+                new_blocks: Vec::new(),
+                spec_token_ids: None,
+                allowed_tokens: None,
+                input_token: 5,
+                relay_input: false,
+            },
         );
-        assert_eq!(
-            op_token_cost(&sequence(SequenceMode::Verify, (11, 12), vec![8, 9, 10])),
-            4
+        assert_eq!(planned_op_token_cost(&decode), 1);
+
+        let verify = plan(
+            &req,
+            cursor(Phase::DecodeUnd, 11),
+            TransitionIntent::DecodeUnd {
+                position: 11,
+                new_blocks: Vec::new(),
+                spec_token_ids: Some(vec![8, 9, 10]),
+                allowed_tokens: None,
+                input_token: 5,
+                relay_input: false,
+            },
         );
+        assert_eq!(planned_op_token_cost(&verify), 4);
     }
 
     #[test]
     fn operation_block_lease_is_consumed_once() {
-        let mut operation = sequence(SequenceMode::Extend, (0, 1), Vec::new());
-        let Operation::Sequence(sequence) = &mut operation.operation else {
-            unreachable!();
-        };
-        sequence.lease.new_blocks = vec![BlockId(4), BlockId(5)];
-
+        let req = request(1, 2);
+        let mut extend = plan(
+            &req,
+            cursor(Phase::Prefill, 0),
+            TransitionIntent::IngestText {
+                segment_index: 0,
+                prompt_start: 0,
+                token_ids: vec![7],
+                new_blocks: vec![BlockId(4), BlockId(5)],
+                allowed_tokens: None,
+            },
+        );
         assert_eq!(
-            take_operation_new_blocks(&mut operation),
+            std::mem::take(&mut extend.new_blocks),
             vec![BlockId(4), BlockId(5)]
         );
-        assert!(take_operation_new_blocks(&mut operation).is_empty());
+        assert!(std::mem::take(&mut extend.new_blocks).is_empty());
     }
 }

@@ -3,11 +3,20 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.batch import Admission, KvAllocation, SequenceAdmission
+from uniserve_worker.batch import Admission, KvAllocation, RequestKey, UndAdmission
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.kv_store import KvStore
 from uniserve_worker.runtime.transfer import LocalTransport
+
+
+def _admit(store: KvStore, session_id: int, *, block_ids: tuple[int, ...], prefix_len: int) -> None:
+    store.admit(
+        Admission.create(
+            RequestKey(0, session_id, 1),
+            und=UndAdmission(kv=KvAllocation(block_ids=block_ids, prefix_len=prefix_len)),
+        )
+    )
 
 
 def test_bounded_kv_view_stages_rows_and_writes_ragged_tokens() -> None:
@@ -21,18 +30,8 @@ def test_bounded_kv_view_stages_rows_and_writes_ragged_tokens() -> None:
         dtype=torch.float32,
     )
     store = KvStore(pool)
-    store.admit(
-        Admission.create(
-            1,
-            sequence=SequenceAdmission(kv=KvAllocation(block_ids=(0, 1), prefix_len=1)),
-        )
-    )
-    store.admit(
-        Admission.create(
-            2,
-            sequence=SequenceAdmission(kv=KvAllocation(block_ids=(2, 3), prefix_len=2)),
-        )
-    )
+    _admit(store, 1, block_ids=(0, 1), prefix_len=1)
+    _admit(store, 2, block_ids=(2, 3), prefix_len=2)
     view = store.view((1, 2), query_lens=(1, 2))
 
     block_table = view.block_table(torch.device("cpu"))
@@ -74,12 +73,7 @@ def test_snapshot_import_accepts_the_sessions_own_partial_page() -> None:
         dtype=torch.float32,
     )
     store = KvStore(pool)
-    store.admit(
-        Admission.create(
-            1,
-            sequence=SequenceAdmission(kv=KvAllocation(block_ids=(0, 1), prefix_len=0)),
-        )
-    )
+    _admit(store, 1, block_ids=(0, 1), prefix_len=0)
     store.advance(1, 3)
     transport = LocalTransport()
     snapshot = store.publish(
@@ -107,15 +101,8 @@ def test_snapshot_import_rejects_another_sessions_partial_page() -> None:
         dtype=torch.float32,
     )
     store = KvStore(pool)
-    for session_id, blocks in ((1, (0, 1)), (2, (2, 3))):
-        store.admit(
-            Admission.create(
-                session_id,
-                sequence=SequenceAdmission(
-                    kv=KvAllocation(block_ids=blocks, prefix_len=0)
-                ),
-            )
-        )
+    _admit(store, 1, block_ids=(0, 1), prefix_len=0)
+    _admit(store, 2, block_ids=(2, 3), prefix_len=0)
     store.advance(1, 3)
     transport = LocalTransport()
     snapshot = store.publish(
@@ -140,12 +127,7 @@ def _published_store() -> tuple[KvStore, LocalTransport]:
         dtype=torch.float32,
     )
     store = KvStore(pool)
-    store.admit(
-        Admission.create(
-            1,
-            sequence=SequenceAdmission(kv=KvAllocation(block_ids=(0, 1), prefix_len=2)),
-        )
-    )
+    _admit(store, 1, block_ids=(0, 1), prefix_len=2)
     return store, LocalTransport()
 
 

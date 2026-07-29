@@ -1,72 +1,357 @@
-"""Typed values crossing the scheduler-to-worker execution boundary."""
+"""Typed values crossing the scheduler-to-worker execution boundary.
+
+The scheduler and worker exchange four cross-layer records — :class:`Operation`,
+:class:`VersionRef`, :class:`ProductRef`, and :class:`CompletionRecord` — plus a
+request :class:`Control` command. Every operation names one closed :class:`Work`
+variant, one exact parent version, and its declared input and output products.
+Two host-computed digests fix identity: :meth:`Operation.compute_plan_digest`
+over immutable registration fields, and
+:meth:`CompletionRecord.compute_semantic_digest` over the selected result. The
+digest byte layout matches the Rust ``worker-wire`` crate exactly so both sides
+compute identical digests.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import math
+import re
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import lru_cache
 from typing import Any, TypeAlias, TypeVar, cast
 
-from . import spec as _spec
 from .foundation.errors import invalid_descriptor
 
-EXECUTION_PROTOCOL_VERSION = 3
 
-
-class SequenceMode(StrEnum):
+class TokenMode(StrEnum):
     EXTEND = "extend"
     DECODE = "decode"
     VERIFY = "verify"
-    SAMPLE = "sample"
 
 
-class TokenSource(StrEnum):
-    WIRE = "wire"
-    LAST_SAMPLED = "last_sampled"
-
-
-class EncodeKind(StrEnum):
+class EncodeMode(StrEnum):
     VISION = "vision"
     LATENT = "latent"
 
 
-class MaterializeKind(StrEnum):
-    IMAGE = "image"
-    FRAME = "frame"
-
-
-class TransferKind(StrEnum):
+class TransferMode(StrEnum):
     PRODUCT = "product"
+    KV_PUBLISH = "kv_publish"
+    KV_INSTALL = "kv_install"
+
+
+class GenMode(StrEnum):
+    TRANSITION = "transition"
+    FLOW = "flow"
+
+
+class WorkVariant(StrEnum):
+    TOKEN_EXTEND = "token_extend"
+    TOKEN_DECODE = "token_decode"
+    TOKEN_VERIFY = "token_verify"
+    DRAFT = "draft"
+    ENCODE_VISION = "encode_vision"
+    ENCODE_LATENT = "encode_latent"
+    TRANSFER_PRODUCT = "transfer_product"
+    TRANSFER_KV_PUBLISH = "transfer_kv_publish"
+    TRANSFER_KV_INSTALL = "transfer_kv_install"
+    GEN_TRANSITION = "gen_transition"
+    GEN_FLOW = "gen_flow"
+    MATERIALIZE = "materialize"
+
+
+class Domain(StrEnum):
+    UND = "und"
+    GEN = "gen"
+
+
+class ProductKind(StrEnum):
+    TOKEN = "token"
+    LOGPROB = "logprob"
+    DRAFT = "draft"
+    VISION_FEATURE = "vision_feature"
+    LATENT_FEATURE = "latent_feature"
     KV = "kv"
+    LATENT = "latent"
+    ARTIFACT = "artifact"
+    COMPLETION = "completion"
 
 
-def _operation_type(operation: Operation) -> _spec.OperationType:
-    if isinstance(operation, SequenceOperation):
-        return {
-            SequenceMode.EXTEND: _spec.OperationType.SEQUENCE_EXTEND,
-            SequenceMode.DECODE: _spec.OperationType.SEQUENCE_DECODE,
-            SequenceMode.VERIFY: _spec.OperationType.SEQUENCE_VERIFY,
-            SequenceMode.SAMPLE: _spec.OperationType.SEQUENCE_SAMPLE,
-        }[operation.mode]
-    if isinstance(operation, FlowOperation):
-        return _spec.OperationType.FLOW
-    if isinstance(operation, EncodeOperation):
-        return {
-            EncodeKind.VISION: _spec.OperationType.ENCODE_VISION,
-            EncodeKind.LATENT: _spec.OperationType.ENCODE_LATENT,
-        }[operation.kind]
-    if isinstance(operation, MaterializeOperation):
-        return {
-            MaterializeKind.IMAGE: _spec.OperationType.MATERIALIZE_IMAGE,
-            MaterializeKind.FRAME: _spec.OperationType.MATERIALIZE_FRAME,
-        }[operation.kind]
-    return {
-        TransferKind.PRODUCT: _spec.OperationType.TRANSFER_PRODUCT,
-        TransferKind.KV: _spec.OperationType.TRANSFER_KV,
-    }[operation.kind]
+class StorageClass(StrEnum):
+    DEVICE_TENSOR = "device_tensor"
+    PAGED_KV = "paged_kv"
+    LATENT_ARENA = "latent_arena"
+    HOST_STAGING = "host_staging"
+    COMPLETION_ARENA = "completion_arena"
+
+
+class DType(StrEnum):
+    U8 = "u8"
+    U16 = "u16"
+    U32 = "u32"
+    I32 = "i32"
+    I64 = "i64"
+    F16 = "f16"
+    BF16 = "bf16"
+    F32 = "f32"
+
+
+class OpStatus(StrEnum):
+    OK = "ok"
+    PREDICATED = "predicated"
+    ERROR = "error"
+
+
+class ErrorCode(StrEnum):
+    INVALID_OPERATION = "invalid_operation"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+    COMPUTE_ERROR = "compute_error"
+    CANCELLED = "cancelled"
+    INTERNAL = "internal"
+
+
+class DrawLayout(StrEnum):
+    TARGET_SAMPLING = "target_sampling"
+    SPECULATIVE_PROPOSAL = "speculative_proposal"
+    FLOW_NOISE = "flow_noise"
+
+
+class Disposition(StrEnum):
+    PUBLISH = "publish"
+    RETAIN = "retain"
+    DISCARD = "discard"
+
+
+class CloseReason(StrEnum):
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    ERROR = "error"
+    PREEMPTED = "preempted"
+
+
+class AdapterMode(StrEnum):
+    NONE = "none"
+    ENGINE_WIDE = "engine_wide"
+    PER_REQUEST = "per_request"
+    MULTI_ADAPTER = "multi_adapter"
+
+
+# Ordered `(kind, mode)` for every closed `Work` leaf; the position is the
+# canonical variant index used on the wire and in the plan digest.
+_WORK_VARIANTS: tuple[tuple[str, str | None], ...] = (
+    ("token", "extend"),
+    ("token", "decode"),
+    ("token", "verify"),
+    ("draft", None),
+    ("encode", "vision"),
+    ("encode", "latent"),
+    ("transfer", "product"),
+    ("transfer", "kv_publish"),
+    ("transfer", "kv_install"),
+    ("gen", "transition"),
+    ("gen", "flow"),
+    ("materialize", None),
+)
+_STATE_ADVANCING_WORK = frozenset({0, 1, 2, 9, 10})
+
+# Canonical variant-index tables. Digest byte layouts index enum members by
+# declaration order (mirroring the Rust codec); precomputing the tables keeps
+# the per-operation digest recomputation off `list(Enum).index` linear scans.
+_WORK_VARIANT_MEMBERS: tuple[WorkVariant, ...] = tuple(WorkVariant)
+_WORK_PAIR_INDEX: dict[tuple[str, str | None], int] = {
+    pair: index for index, pair in enumerate(_WORK_VARIANTS)
+}
+_DOMAIN_INDEX = {member: index for index, member in enumerate(Domain)}
+_PRODUCT_KIND_INDEX = {member: index for index, member in enumerate(ProductKind)}
+_STORAGE_CLASS_INDEX = {member: index for index, member in enumerate(StorageClass)}
+_DTYPE_INDEX = {member: index for index, member in enumerate(DType)}
+_OP_STATUS_INDEX = {member: index for index, member in enumerate(OpStatus)}
+_DRAW_LAYOUT_INDEX = {member: index for index, member in enumerate(DrawLayout)}
+_DISPOSITION_INDEX = {member: index for index, member in enumerate(Disposition)}
+_CLOSE_REASON_INDEX = {member: index for index, member in enumerate(CloseReason)}
+_ADAPTER_MODE_INDEX = {member: index for index, member in enumerate(AdapterMode)}
+
+# Precompiled little-endian packers. Multi-field formats fuse the fixed-width
+# runs of the record digests into single calls; `<` guarantees no padding, so
+# the produced bytes are identical to packing each field separately.
+_PACK_B = struct.Struct("<B").pack
+_PACK_H = struct.Struct("<H").pack
+_PACK_I = struct.Struct("<I").pack
+_PACK_Q = struct.Struct("<Q").pack
+_PACK_F = struct.Struct("<f").pack
+_PACK_II = struct.Struct("<II").pack
+_PACK_BI = struct.Struct("<BI").pack
+_PACK_QQB = struct.Struct("<QQB").pack
+_PACK_QQQ = struct.Struct("<QQQ").pack
+_PACK_QQQQB = struct.Struct("<QQQQB").pack
+_PACK_IB = struct.Struct("<IB").pack
+_PACK_BBB = struct.Struct("<BBB").pack
+_PACK_BIBB = struct.Struct("<BIBB").pack
+_PACK_IIIII = struct.Struct("<IIIII").pack
+_PACK_IIIQQQ = struct.Struct("<IIIQQQ").pack
+_PACK_PRODUCT_HEAD = struct.Struct("<QQQQHIBBB").pack
+
+
+class _Digest:
+    """Little-endian, length-prefixed SHA-256 builder mirroring the Rust codec.
+
+    Fields accumulate into one byte buffer hashed once at :meth:`finish`; the
+    digest bytes are identical to streaming each field into the hash.
+    """
+
+    __slots__ = ("buf",)
+
+    def __init__(self, domain: bytes) -> None:
+        self.buf = bytearray(domain)
+
+    def finish(self) -> str:
+        return hashlib.sha256(self.buf).hexdigest()
+
+    def u8(self, value: int) -> None:
+        self.buf += _PACK_B(value)
+
+    def u16(self, value: int) -> None:
+        self.buf += _PACK_H(value)
+
+    def u32(self, value: int) -> None:
+        self.buf += _PACK_I(value)
+
+    def u64(self, value: int) -> None:
+        self.buf += _PACK_Q(value)
+
+    def f32(self, value: float) -> None:
+        self.buf += _PACK_F(value)
+
+    def boolean(self, value: bool) -> None:
+        self.buf += _PACK_B(int(value))
+
+    def string(self, value: str) -> None:
+        encoded = value.encode("utf-8")
+        buf = self.buf
+        buf += _PACK_Q(len(encoded))
+        buf += encoded
+
+    def u32s(self, values: Sequence[int]) -> None:
+        buf = self.buf
+        buf += _PACK_Q(len(values))
+        for value in values:
+            buf += _PACK_I(value)
+
+    def option(self, value: object | None, encode: Any) -> None:
+        if value is None:
+            self.buf += b"\x00"
+        else:
+            self.buf += b"\x01"
+            encode(value)
+
+
+# Field-name lists of the four records, in declaration order, copied verbatim
+# from the Rust `protocol_layout_digest` source. They fix the byte layout of the
+# startup agreement digest and must not be reordered or extended here — the goal
+# is byte-identical cross-language agreement, not layout completeness.
+_LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
+    (
+        "request_key",
+        "op_id",
+        "parent",
+        "work",
+        "route",
+        "domain",
+        "advances_state",
+        "bounds",
+        "inputs",
+        "outputs",
+        "predicate",
+        "rng",
+        "control_seq",
+        "plan_digest",
+    ),
+    ("request_key", "producer_op_id", "point"),
+    (
+        "request_key",
+        "producer_op_id",
+        "output_index",
+        "generation",
+        "kind",
+        "storage_class",
+        "dtype",
+        "shape_bound",
+        "point_range",
+    ),
+    (
+        "request_key",
+        "op_id",
+        "completion_slot_generation",
+        "status",
+        "selected_point",
+        "logical_lengths",
+        "token_span",
+        "finish_flags",
+        "product_generations",
+        "semantic_digest",
+        "error_code",
+        "timing_counters",
+    ),
+)
+
+
+def protocol_layout_digest() -> str:
+    """The canonical protocol-layout digest over the closed ``Work`` and
+    ``Control`` variants and the fixed record field layouts.
+
+    Mirrors the Rust ``worker-wire`` ``protocol_layout_digest`` byte-for-byte so
+    a scheduler, worker, and frontend agree at admission.
+    """
+
+    digest = _Digest(b"uniserve-protocol-layout\0")
+    digest.u64(len(WorkVariant))
+    for variant in WorkVariant:
+        digest.string(variant.value)
+    for control in ("commit", "close", "release"):
+        digest.string(control)
+    for record in _LAYOUT_RECORDS:
+        digest.u64(len(record))
+        for name in record:
+            digest.string(name)
+    return digest.finish()
+
+
+def route_capability_digest(
+    supported_work: Sequence[WorkVariant],
+    max_cfg_branches: int,
+    max_latent_size: int,
+    max_vae_grid_tokens: int,
+    max_vit_grid_tokens: int,
+    adapter_mode: AdapterMode,
+    max_batch_operations: int,
+    kv_dtype: str,
+    model_dtype: str,
+    attention_backend: str,
+) -> str:
+    """The route-capability digest: supported work, sampler and shape regime, and
+    mixed-submission capability. Mirrors the Rust
+    ``EngineCaps::compute_route_capability_digest`` byte-for-byte.
+    """
+
+    order = _WORK_VARIANT_MEMBERS
+    variants = sorted({order.index(WorkVariant(variant)) for variant in supported_work})
+    digest = _Digest(b"uniserve-route-capability\0")
+    digest.u64(len(variants))
+    for variant in variants:
+        digest.u8(variant)
+    digest.u32(max_cfg_branches)
+    digest.u32(max_latent_size)
+    digest.u32(max_vae_grid_tokens)
+    digest.u32(max_vit_grid_tokens)
+    digest.u8(_ADAPTER_MODE_INDEX[AdapterMode(adapter_mode)])
+    digest.u32(max_batch_operations)
+    digest.string(kv_dtype)
+    digest.string(model_dtype)
+    digest.string(attention_backend)
+    return digest.finish()
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,13 +606,886 @@ class KvAllocation:
 
 
 @dataclass(frozen=True, slots=True)
-class SequenceAdmission:
+class RequestKey:
+    authority_id: int
+    session_id: int
+    epoch: int
+
+    def __post_init__(self) -> None:
+        _nonnegative(self.authority_id, "request_key.authority_id")
+        _nonnegative(self.session_id, "request_key.session_id")
+        _nonnegative(self.epoch, "request_key.epoch")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "request_key") -> RequestKey:
+        key = _fast_request_key(value)
+        if key is not None:
+            return key
+        data = _map(value, where)
+        return cls(
+            authority_id=_uint(data.get("authority_id"), f"{where}.authority_id"),
+            session_id=_uint(data.get("session_id"), f"{where}.session_id"),
+            epoch=_uint(data.get("epoch"), f"{where}.epoch"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "authority_id": self.authority_id,
+            "session_id": self.session_id,
+            "epoch": self.epoch,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StaticDim:
+    extent: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceDim:
+    bound: int
+
+
+DimBound: TypeAlias = StaticDim | DeviceDim
+
+
+@dataclass(frozen=True, slots=True)
+class ShapeBound:
+    dims: tuple[DimBound, ...] = ()
+
+    def __post_init__(self) -> None:
+        device_dims = sum(1 for dim in self.dims if isinstance(dim, DeviceDim))
+        if device_dims > 1:
+            raise invalid_descriptor("a shape bound carries more than one device-actual dimension")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "shape_bound") -> ShapeBound:
+        data = _map(value, where)
+        dims: list[DimBound] = []
+        for index, item in enumerate(_seq(data.get("dims", ()), f"{where}.dims")):
+            kind, payload = _tagged(item, f"{where}.dims[{index}]")
+            if kind == "static":
+                dims.append(StaticDim(_uint(payload, f"{where}.dims[{index}].value")))
+            elif kind == "device":
+                inner = _map(payload, f"{where}.dims[{index}].value")
+                dims.append(DeviceDim(_uint(inner.get("max"), f"{where}.dims[{index}].value.max")))
+            else:
+                raise invalid_descriptor(f"{where}.dims[{index}] has unknown variant {kind!r}")
+        return cls(tuple(dims))
+
+    def to_wire(self) -> dict[str, object]:
+        return {"dims": [_dim_to_wire(dim) for dim in self.dims]}
+
+
+def _dim_to_wire(dim: DimBound) -> dict[str, object]:
+    if isinstance(dim, StaticDim):
+        return {"kind": "static", "value": dim.extent}
+    return {"kind": "device", "value": {"max": dim.bound}}
+
+
+@dataclass(frozen=True, slots=True)
+class PointRange:
+    base_point: int = 0
+    max_points: int = 0
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "point_range") -> PointRange:
+        point_range = _fast_point_range(value)
+        if point_range is not None:
+            return point_range
+        data = _map(value, where)
+        return cls(
+            base_point=_uint(data.get("base_point"), f"{where}.base_point"),
+            max_points=_uint(data.get("max_points"), f"{where}.max_points"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {"base_point": self.base_point, "max_points": self.max_points}
+
+
+@dataclass(frozen=True, slots=True)
+class ProductRef:
+    request_key: RequestKey
+    producer_op_id: int
+    output_index: int
+    generation: int
+    kind: ProductKind
+    storage_class: StorageClass
+    dtype: DType
+    shape_bound: ShapeBound
+    point_range: PointRange
+
+    def __post_init__(self) -> None:
+        self.shape_bound.__post_init__()
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "product_ref") -> ProductRef:
+        reference = _fast_product_ref(value)
+        if reference is not None:
+            return reference
+        data = _map(value, where)
+        return cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            producer_op_id=_uint(data.get("producer_op_id"), f"{where}.producer_op_id"),
+            output_index=_uint(data.get("output_index"), f"{where}.output_index"),
+            generation=_uint(data.get("generation"), f"{where}.generation"),
+            kind=_enum(ProductKind, data.get("kind"), f"{where}.kind"),
+            storage_class=_enum(StorageClass, data.get("storage_class"), f"{where}.storage_class"),
+            dtype=_enum(DType, data.get("dtype"), f"{where}.dtype"),
+            shape_bound=ShapeBound.from_wire(data.get("shape_bound"), f"{where}.shape_bound"),
+            point_range=PointRange.from_wire(data.get("point_range"), f"{where}.point_range"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_key": self.request_key.to_wire(),
+            "producer_op_id": self.producer_op_id,
+            "output_index": self.output_index,
+            "generation": self.generation,
+            "kind": self.kind.value,
+            "storage_class": self.storage_class.value,
+            "dtype": self.dtype.value,
+            "shape_bound": self.shape_bound.to_wire(),
+            "point_range": self.point_range.to_wire(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FixedPoint:
+    point_index: int
+    semantic_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class DevicePoint:
+    selected_point: ProductRef
+    producer_plan_digest: str
+
+
+Point: TypeAlias = FixedPoint | DevicePoint
+
+
+@dataclass(frozen=True, slots=True)
+class VersionRef:
+    request_key: RequestKey
+    producer_op_id: int
+    point: Point
+
+    def is_fixed(self) -> bool:
+        return isinstance(self.point, FixedPoint)
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "version_ref") -> VersionRef:
+        reference = _fast_version_ref(value)
+        if reference is not None:
+            return reference
+        data = _map(value, where)
+        kind, payload = _tagged(data.get("point"), f"{where}.point")
+        if kind == "fixed":
+            inner = _map(payload, f"{where}.point.value")
+            point: Point = FixedPoint(
+                point_index=_uint(inner.get("point_index"), f"{where}.point.value.point_index"),
+                semantic_digest=_str(
+                    inner.get("semantic_digest"), f"{where}.point.value.semantic_digest"
+                ),
+            )
+        elif kind == "device":
+            inner = _map(payload, f"{where}.point.value")
+            point = DevicePoint(
+                selected_point=ProductRef.from_wire(
+                    inner.get("selected_point"), f"{where}.point.value.selected_point"
+                ),
+                producer_plan_digest=_str(
+                    inner.get("producer_plan_digest"),
+                    f"{where}.point.value.producer_plan_digest",
+                ),
+            )
+        else:
+            raise invalid_descriptor(f"{where}.point has unknown variant {kind!r}")
+        return cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            producer_op_id=_uint(data.get("producer_op_id"), f"{where}.producer_op_id"),
+            point=point,
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        if isinstance(self.point, FixedPoint):
+            point = {
+                "kind": "fixed",
+                "value": {
+                    "point_index": self.point.point_index,
+                    "semantic_digest": self.point.semantic_digest,
+                },
+            }
+        else:
+            point = {
+                "kind": "device",
+                "value": {
+                    "selected_point": self.point.selected_point.to_wire(),
+                    "producer_plan_digest": self.point.producer_plan_digest,
+                },
+            }
+        return {
+            "request_key": self.request_key.to_wire(),
+            "producer_op_id": self.producer_op_id,
+            "point": point,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Work:
+    kind: str
+    mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.kind, self.mode) not in _WORK_PAIR_INDEX:
+            raise invalid_descriptor(f"unknown work variant {(self.kind, self.mode)!r}")
+
+    @property
+    def variant_index(self) -> int:
+        return _WORK_PAIR_INDEX[(self.kind, self.mode)]
+
+    @property
+    def variant(self) -> WorkVariant:
+        return _WORK_VARIANT_MEMBERS[self.variant_index]
+
+    @property
+    def advances_state(self) -> bool:
+        return self.variant_index in _STATE_ADVANCING_WORK
+
+    @classmethod
+    def token(cls, mode: TokenMode) -> Work:
+        return cls("token", mode.value)
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "work") -> Work:
+        work = _fast_work(value)
+        if work is not None:
+            return work
+        kind, payload = _tagged(value, where)
+        mode = None if payload is None else _str(payload, f"{where}.value")
+        return cls(kind, mode)
+
+    def to_wire(self) -> dict[str, object]:
+        if self.mode is None:
+            return {"kind": self.kind}
+        return {"kind": self.kind, "value": self.mode}
+
+
+@dataclass(frozen=True, slots=True)
+class Bounds:
+    max_points: int = 0
+    max_tokens: int = 0
+    max_kv_pages: int = 0
+    max_latent_bytes: int = 0
+    max_completion_bytes: int = 0
+    max_transfer_bytes: int = 0
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "bounds") -> Bounds:
+        bounds = _fast_bounds(value)
+        if bounds is not None:
+            return bounds
+        data = _map(value, where)
+        return cls(
+            max_points=_uint(data.get("max_points"), f"{where}.max_points"),
+            max_tokens=_uint(data.get("max_tokens"), f"{where}.max_tokens"),
+            max_kv_pages=_uint(data.get("max_kv_pages"), f"{where}.max_kv_pages"),
+            max_latent_bytes=_uint(data.get("max_latent_bytes"), f"{where}.max_latent_bytes"),
+            max_completion_bytes=_uint(
+                data.get("max_completion_bytes"), f"{where}.max_completion_bytes"
+            ),
+            max_transfer_bytes=_uint(data.get("max_transfer_bytes"), f"{where}.max_transfer_bytes"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "max_points": self.max_points,
+            "max_tokens": self.max_tokens,
+            "max_kv_pages": self.max_kv_pages,
+            "max_latent_bytes": self.max_latent_bytes,
+            "max_completion_bytes": self.max_completion_bytes,
+            "max_transfer_bytes": self.max_transfer_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Rng:
+    seed: int
+    semantic_index_base: int
+    draw_layout: DrawLayout
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "rng") -> Rng:
+        rng = _fast_rng(value)
+        if rng is not None:
+            return rng
+        data = _map(value, where)
+        return cls(
+            seed=_uint(data.get("seed"), f"{where}.seed"),
+            semantic_index_base=_uint(
+                data.get("semantic_index_base"), f"{where}.semantic_index_base"
+            ),
+            draw_layout=_enum(DrawLayout, data.get("draw_layout"), f"{where}.draw_layout"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "seed": self.seed,
+            "semantic_index_base": self.semantic_index_base,
+            "draw_layout": self.draw_layout.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Operation:
+    request_key: RequestKey
+    op_id: int
+    parent: VersionRef
+    work: Work
+    route: int
+    domain: Domain
+    advances_state: bool
+    bounds: Bounds
+    inputs: tuple[ProductRef, ...]
+    outputs: tuple[ProductRef, ...]
+    new_kv_blocks: tuple[int, ...]
+    predicate: ProductRef | None
+    rng: Rng | None
+    control_seq: int
+    plan_digest: str
+
+    @classmethod
+    def registered(
+        cls,
+        *,
+        request_key: RequestKey,
+        op_id: int,
+        parent: VersionRef,
+        work: Work,
+        route: int,
+        domain: Domain,
+        bounds: Bounds,
+        inputs: tuple[ProductRef, ...] = (),
+        outputs: tuple[ProductRef, ...] = (),
+        new_kv_blocks: tuple[int, ...] = (),
+        predicate: ProductRef | None = None,
+        rng: Rng | None = None,
+        control_seq: int = 0,
+    ) -> Operation:
+        value = cls(
+            request_key=request_key,
+            op_id=op_id,
+            parent=parent,
+            work=work,
+            route=route,
+            domain=domain,
+            advances_state=work.advances_state,
+            bounds=bounds,
+            inputs=inputs,
+            outputs=outputs,
+            new_kv_blocks=new_kv_blocks,
+            predicate=predicate,
+            rng=rng,
+            control_seq=control_seq,
+            plan_digest="",
+        )
+        return replace(value, plan_digest=value.compute_plan_digest())
+
+    def compute_plan_digest(self) -> str:
+        digest = _Digest(b"uniserve-operation\0")
+        buf = digest.buf
+        key = self.request_key
+        buf += _PACK_QQQ(key.authority_id, key.session_id, key.epoch)
+        buf += _PACK_Q(self.op_id)
+        _digest_version_ref(digest, self.parent)
+        buf += _PACK_BIBB(
+            self.work.variant_index,
+            self.route,
+            _DOMAIN_INDEX[self.domain],
+            int(self.advances_state),
+        )
+        _digest_bounds(digest, self.bounds)
+        buf += _PACK_Q(len(self.inputs))
+        for product in self.inputs:
+            _digest_product_ref(digest, product)
+        buf += _PACK_Q(len(self.outputs))
+        for product in self.outputs:
+            _digest_product_ref(digest, product)
+        if self.predicate is None:
+            buf += b"\x00"
+        else:
+            buf += b"\x01"
+            _digest_product_ref(digest, self.predicate)
+        if self.rng is None:
+            buf += b"\x00"
+        else:
+            buf += b"\x01"
+            _digest_rng(digest, self.rng)
+        digest.u32s(self.new_kv_blocks)
+        return digest.finish()
+
+    def validate(self) -> None:
+        if self.op_id < 1:
+            raise invalid_descriptor("operation id must be positive")
+        if self.advances_state != self.work.advances_state:
+            raise invalid_descriptor(
+                "operation declares an advances_state inconsistent with its work variant"
+            )
+        output_indices: set[int] = set()
+        for product in self.outputs:
+            if product.request_key != self.request_key or product.producer_op_id != self.op_id:
+                raise invalid_descriptor("an output product is not owned by its producing operation")
+            if product.output_index in output_indices:
+                raise invalid_descriptor("operation repeats an output index")
+            output_indices.add(product.output_index)
+        if not _is_digest(self.plan_digest):
+            raise invalid_descriptor("operation plan digest is not a lowercase SHA-256 digest")
+        if self.plan_digest != self.compute_plan_digest():
+            raise invalid_descriptor("operation plan digest does not match its registration fields")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "operation") -> Operation:
+        # Field decoding follows declaration order with a no-allocation fast
+        # path per field; the fallback branches reproduce the original decode
+        # (and therefore the original error) for anything anomalous.
+        data = _map(value, where)
+        get = data.get
+        request_key = _fast_request_key(get("request_key"))
+        if request_key is None:
+            request_key = RequestKey.from_wire(get("request_key"), f"{where}.request_key")
+        op_id = get("op_id")
+        if not (type(op_id) is int and op_id >= 0):
+            op_id = _uint(op_id, f"{where}.op_id")
+        parent = _fast_version_ref(get("parent"))
+        if parent is None:
+            parent = VersionRef.from_wire(get("parent"), f"{where}.parent")
+        work = _fast_work(get("work"))
+        if work is None:
+            work = Work.from_wire(get("work"), f"{where}.work")
+        route = get("route")
+        if not (type(route) is int and route >= 0):
+            route = _uint(route, f"{where}.route")
+        domain_raw = get("domain")
+        domain = _DOMAIN_BY_VALUE.get(domain_raw) if type(domain_raw) is str else None
+        if domain is None:
+            domain = _enum(Domain, domain_raw, f"{where}.domain")
+        advances_state = get("advances_state")
+        if advances_state is not True and advances_state is not False:
+            advances_state = _bool(advances_state, f"{where}.advances_state")
+        bounds = _fast_bounds(get("bounds"))
+        if bounds is None:
+            bounds = Bounds.from_wire(get("bounds"), f"{where}.bounds")
+        inputs = _fast_product_refs(get("inputs", ()))
+        if inputs is None:
+            inputs = tuple(
+                ProductRef.from_wire(item, f"{where}.inputs[{index}]")
+                for index, item in enumerate(_seq(data.get("inputs", ()), f"{where}.inputs"))
+            )
+        outputs = _fast_product_refs(get("outputs", ()))
+        if outputs is None:
+            outputs = tuple(
+                ProductRef.from_wire(item, f"{where}.outputs[{index}]")
+                for index, item in enumerate(_seq(data.get("outputs", ()), f"{where}.outputs"))
+            )
+        new_kv_blocks = _fast_uints(get("new_kv_blocks", ()))
+        if new_kv_blocks is None:
+            new_kv_blocks = _uints(data.get("new_kv_blocks", ()), f"{where}.new_kv_blocks")
+        predicate_raw = get("predicate")
+        if predicate_raw is None:
+            predicate = None
+        else:
+            predicate = _fast_product_ref(predicate_raw)
+            if predicate is None:
+                predicate = ProductRef.from_wire(predicate_raw, f"{where}.predicate")
+        rng_raw = get("rng")
+        if rng_raw is None:
+            rng = None
+        else:
+            rng = _fast_rng(rng_raw)
+            if rng is None:
+                rng = Rng.from_wire(rng_raw, f"{where}.rng")
+        control_seq = get("control_seq")
+        if not (type(control_seq) is int and control_seq >= 0):
+            control_seq = _uint(control_seq, f"{where}.control_seq")
+        plan_digest = get("plan_digest")
+        if type(plan_digest) is not str:
+            plan_digest = _str(plan_digest, f"{where}.plan_digest")
+        operation = cls(
+            request_key=request_key,
+            op_id=op_id,
+            parent=parent,
+            work=work,
+            route=route,
+            domain=domain,
+            advances_state=advances_state,
+            bounds=bounds,
+            inputs=inputs,
+            outputs=outputs,
+            new_kv_blocks=new_kv_blocks,
+            predicate=predicate,
+            rng=rng,
+            control_seq=control_seq,
+            plan_digest=plan_digest,
+        )
+        operation.validate()
+        return operation
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_key": self.request_key.to_wire(),
+            "op_id": self.op_id,
+            "parent": self.parent.to_wire(),
+            "work": self.work.to_wire(),
+            "route": self.route,
+            "domain": self.domain.value,
+            "advances_state": self.advances_state,
+            "bounds": self.bounds.to_wire(),
+            "inputs": [product.to_wire() for product in self.inputs],
+            "outputs": [product.to_wire() for product in self.outputs],
+            "new_kv_blocks": list(self.new_kv_blocks),
+            "predicate": None if self.predicate is None else self.predicate.to_wire(),
+            "rng": None if self.rng is None else self.rng.to_wire(),
+            "control_seq": self.control_seq,
+            "plan_digest": self.plan_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalLengths:
+    token_len: int = 0
+    kv_visible_len: int = 0
+    latent_len: int = 0
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "logical_lengths") -> LogicalLengths:
+        data = _map(value, where)
+        return cls(
+            token_len=_uint(data.get("token_len"), f"{where}.token_len"),
+            kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),
+            latent_len=_uint(data.get("latent_len"), f"{where}.latent_len"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "token_len": self.token_len,
+            "kv_visible_len": self.kv_visible_len,
+            "latent_len": self.latent_len,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TokenSpan:
+    base: int = 0
+    len: int = 0
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "token_span") -> TokenSpan:
+        data = _map(value, where)
+        return cls(
+            base=_uint(data.get("base"), f"{where}.base"),
+            len=_uint(data.get("len"), f"{where}.len"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {"base": self.base, "len": self.len}
+
+
+@dataclass(frozen=True, slots=True)
+class FinishFlags:
+    eos: bool = False
+    length: bool = False
+    stop: bool = False
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "finish_flags") -> FinishFlags:
+        data = _map(value, where)
+        return cls(
+            eos=_bool(data.get("eos", False), f"{where}.eos"),
+            length=_bool(data.get("length", False), f"{where}.length"),
+            stop=_bool(data.get("stop", False), f"{where}.stop"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {"eos": self.eos, "length": self.length, "stop": self.stop}
+
+
+@dataclass(frozen=True, slots=True)
+class TimingCounters:
+    queued_us: int = 0
+    device_us: int = 0
+    copy_us: int = 0
+    host_us: int = 0
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "timing_counters") -> TimingCounters:
+        data = _map(value, where)
+        return cls(
+            queued_us=_uint(data.get("queued_us", 0), f"{where}.queued_us"),
+            device_us=_uint(data.get("device_us", 0), f"{where}.device_us"),
+            copy_us=_uint(data.get("copy_us", 0), f"{where}.copy_us"),
+            host_us=_uint(data.get("host_us", 0), f"{where}.host_us"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "queued_us": self.queued_us,
+            "device_us": self.device_us,
+            "copy_us": self.copy_us,
+            "host_us": self.host_us,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionRecord:
+    request_key: RequestKey
+    op_id: int
+    completion_slot_generation: int
+    status: OpStatus
+    selected_point: int
+    logical_lengths: LogicalLengths
+    token_span: TokenSpan
+    committed_tokens: tuple[int, ...]
+    finish_flags: FinishFlags
+    product_generations: tuple[int, ...]
+    semantic_digest: str
+    error_code: ErrorCode | None
+    timing_counters: TimingCounters
+
+    def compute_semantic_digest(self, parent_semantic: str, plan_digest: str) -> str:
+        digest = _Digest(b"uniserve-semantic\0")
+        digest.string(parent_semantic)
+        digest.string(plan_digest)
+        buf = digest.buf
+        lengths = self.logical_lengths
+        span = self.token_span
+        buf += _PACK_IB(self.selected_point, _OP_STATUS_INDEX[self.status])
+        buf += _PACK_IIIII(
+            lengths.token_len,
+            lengths.kv_visible_len,
+            lengths.latent_len,
+            span.base,
+            span.len,
+        )
+        digest.u32s(self.committed_tokens)
+        flags = self.finish_flags
+        buf += _PACK_BBB(int(flags.eos), int(flags.length), int(flags.stop))
+        digest.u32s(self.product_generations)
+        return digest.finish()
+
+    def validate(self) -> None:
+        if self.op_id < 1:
+            raise invalid_descriptor("completion op id must be positive")
+        if not _is_digest(self.semantic_digest):
+            raise invalid_descriptor("completion semantic digest is not a lowercase SHA-256 digest")
+        if self.status is OpStatus.ERROR:
+            if self.error_code is None:
+                raise invalid_descriptor("an error completion must carry an error code")
+        elif self.error_code is not None:
+            raise invalid_descriptor("a non-error completion must not carry an error code")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "completion") -> CompletionRecord:
+        data = _map(value, where)
+        record = cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
+            completion_slot_generation=_uint(
+                data.get("completion_slot_generation"), f"{where}.completion_slot_generation"
+            ),
+            status=_enum(OpStatus, data.get("status"), f"{where}.status"),
+            selected_point=_uint(data.get("selected_point"), f"{where}.selected_point"),
+            logical_lengths=LogicalLengths.from_wire(
+                data.get("logical_lengths"), f"{where}.logical_lengths"
+            ),
+            token_span=TokenSpan.from_wire(data.get("token_span"), f"{where}.token_span"),
+            committed_tokens=_uints(
+                data.get("committed_tokens", ()), f"{where}.committed_tokens"
+            ),
+            finish_flags=FinishFlags.from_wire(data.get("finish_flags"), f"{where}.finish_flags"),
+            product_generations=_uints(
+                data.get("product_generations", ()), f"{where}.product_generations"
+            ),
+            semantic_digest=_str(data.get("semantic_digest"), f"{where}.semantic_digest"),
+            error_code=(
+                None
+                if data.get("error_code") is None
+                else _enum(ErrorCode, data["error_code"], f"{where}.error_code")
+            ),
+            timing_counters=TimingCounters.from_wire(
+                data.get("timing_counters"), f"{where}.timing_counters"
+            ),
+        )
+        record.validate()
+        return record
+
+    def to_wire(self) -> dict[str, object]:
+        key = self.request_key
+        lengths = self.logical_lengths
+        span = self.token_span
+        flags = self.finish_flags
+        timing = self.timing_counters
+        error_code = self.error_code
+        return {
+            "request_key": {
+                "authority_id": key.authority_id,
+                "session_id": key.session_id,
+                "epoch": key.epoch,
+            },
+            "op_id": self.op_id,
+            "completion_slot_generation": self.completion_slot_generation,
+            "status": self.status.value,
+            "selected_point": self.selected_point,
+            "logical_lengths": {
+                "token_len": lengths.token_len,
+                "kv_visible_len": lengths.kv_visible_len,
+                "latent_len": lengths.latent_len,
+            },
+            "token_span": {"base": span.base, "len": span.len},
+            "committed_tokens": list(self.committed_tokens),
+            "finish_flags": {"eos": flags.eos, "length": flags.length, "stop": flags.stop},
+            "product_generations": list(self.product_generations),
+            "semantic_digest": self.semantic_digest,
+            "error_code": None if error_code is None else error_code.value,
+            "timing_counters": {
+                "queued_us": timing.queued_us,
+                "device_us": timing.device_us,
+                "copy_us": timing.copy_us,
+                "host_us": timing.host_us,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Commit:
+    request_key: RequestKey
+    control_seq: int
+    expected_parent: VersionRef
+    selected: VersionRef
+    public_event_limit: int
+    disposition: Disposition
+
+
+@dataclass(frozen=True, slots=True)
+class Close:
+    request_key: RequestKey
+    control_seq: int
+    cutoff: VersionRef
+    reason: CloseReason
+
+
+@dataclass(frozen=True, slots=True)
+class Release:
+    request_key: RequestKey
+    op_id: int
+
+
+Control: TypeAlias = Commit | Close | Release
+
+
+def _control_variant_index(control: Control) -> int:
+    if isinstance(control, Commit):
+        return 0
+    if isinstance(control, Close):
+        return 1
+    return 2
+
+
+def control_content_digest(control: Control) -> str:
+    digest = _Digest(b"uniserve-control\0")
+    digest.u8(_control_variant_index(control))
+    _digest_request_key(digest, control.request_key)
+    if isinstance(control, Commit):
+        digest.u64(control.control_seq)
+        _digest_version_ref(digest, control.expected_parent)
+        _digest_version_ref(digest, control.selected)
+        digest.u64(control.public_event_limit)
+        digest.u8(_DISPOSITION_INDEX[control.disposition])
+    elif isinstance(control, Close):
+        digest.u64(control.control_seq)
+        _digest_version_ref(digest, control.cutoff)
+        digest.u8(_CLOSE_REASON_INDEX[control.reason])
+    else:
+        digest.u64(control.op_id)
+    return digest.finish()
+
+
+def control_from_wire(value: object, where: str = "control") -> Control:
+    kind, payload = _tagged(value, where)
+    data = _map(payload, f"{where}.value")
+    request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.value.request_key")
+    if kind == "commit":
+        commit = Commit(
+            request_key=request_key,
+            control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
+            expected_parent=VersionRef.from_wire(
+                data.get("expected_parent"), f"{where}.value.expected_parent"
+            ),
+            selected=VersionRef.from_wire(data.get("selected"), f"{where}.value.selected"),
+            public_event_limit=_uint(
+                data.get("public_event_limit"), f"{where}.value.public_event_limit"
+            ),
+            disposition=_enum(Disposition, data.get("disposition"), f"{where}.value.disposition"),
+        )
+        if not commit.selected.is_fixed():
+            raise invalid_descriptor("a commit control must select a fixed version")
+        control: Control = commit
+    elif kind == "close":
+        control = Close(
+            request_key=request_key,
+            control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
+            cutoff=VersionRef.from_wire(data.get("cutoff"), f"{where}.value.cutoff"),
+            reason=_enum(CloseReason, data.get("reason"), f"{where}.value.reason"),
+        )
+        if not control.cutoff.is_fixed():
+            raise invalid_descriptor("a close control must name a fixed cutoff version")
+    elif kind == "release":
+        control = Release(
+            request_key=request_key,
+            op_id=_uint(data.get("op_id"), f"{where}.value.op_id"),
+        )
+    else:
+        raise invalid_descriptor(f"{where} has unknown variant {kind!r}")
+    return control
+
+
+def control_to_wire(control: Control) -> dict[str, object]:
+    if isinstance(control, Commit):
+        return {
+            "kind": "commit",
+            "value": {
+                "request_key": control.request_key.to_wire(),
+                "control_seq": control.control_seq,
+                "expected_parent": control.expected_parent.to_wire(),
+                "selected": control.selected.to_wire(),
+                "public_event_limit": control.public_event_limit,
+                "disposition": control.disposition.value,
+            },
+        }
+    if isinstance(control, Close):
+        return {
+            "kind": "close",
+            "value": {
+                "request_key": control.request_key.to_wire(),
+                "control_seq": control.control_seq,
+                "cutoff": control.cutoff.to_wire(),
+                "reason": control.reason.value,
+            },
+        }
+    return {
+        "kind": "release",
+        "value": {"request_key": control.request_key.to_wire(), "op_id": control.op_id},
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class UndAdmission:
     sampling: SamplingParams = field(default_factory=SamplingParams)
     negative_token_ids: tuple[int, ...] = ()
     kv: KvAllocation = field(default_factory=KvAllocation)
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "sequence admission") -> SequenceAdmission:
+    def from_wire(cls, value: object, where: str = "und admission") -> UndAdmission:
         data = _map(value, where)
         return cls(
             sampling=SamplingParams.from_wire(data.get("sampling", {}), f"{where}.sampling"),
@@ -346,11 +1504,11 @@ class SequenceAdmission:
 
 
 @dataclass(frozen=True, slots=True)
-class FlowAdmission:
+class GenAdmission:
     image: ImageParams = field(default_factory=ImageParams)
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "flow admission") -> FlowAdmission:
+    def from_wire(cls, value: object, where: str = "gen admission") -> GenAdmission:
         data = _map(value, where)
         return cls(image=ImageParams.from_wire(data.get("image", {}), f"{where}.image"))
 
@@ -360,46 +1518,45 @@ class FlowAdmission:
 
 @dataclass(frozen=True, slots=True)
 class Admission:
-    session_id: int
+    request_key: RequestKey
     digest: str
-    sequence: SequenceAdmission | None
-    flow: FlowAdmission | None
+    und: UndAdmission | None
+    gen_admission: GenAdmission | None
     adapter_id: int | None = None
 
     def __post_init__(self) -> None:
-        _nonnegative(self.session_id, "admission.session_id")
-        if self.sequence is None and self.flow is None:
-            raise invalid_descriptor("admission must declare sequence or flow state")
+        if self.und is None and self.gen_admission is None:
+            raise invalid_descriptor("admission must declare an understanding or generation branch")
         if self.adapter_id is not None:
             _nonnegative(self.adapter_id, "admission.adapter_id")
 
     @classmethod
     def create(
         cls,
-        session_id: int,
+        request_key: RequestKey,
         *,
-        sequence: SequenceAdmission | None = None,
-        flow: FlowAdmission | None = None,
+        und: UndAdmission | None = None,
+        gen_admission: GenAdmission | None = None,
         adapter_id: int | None = None,
     ) -> Admission:
-        value = cls(session_id, "", sequence, flow, adapter_id)
+        value = cls(request_key, "", und, gen_admission, adapter_id)
         return replace(value, digest=value.payload_digest())
 
     @classmethod
     def from_wire(cls, value: object, where: str = "admission") -> Admission:
         data = _map(value, where)
         admission = cls(
-            session_id=_uint(data.get("session_id"), f"{where}.session_id"),
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
             digest=_str(data.get("digest"), f"{where}.digest"),
-            sequence=(
+            und=(
                 None
-                if data.get("sequence") is None
-                else SequenceAdmission.from_wire(data["sequence"], f"{where}.sequence")
+                if data.get("und") is None
+                else UndAdmission.from_wire(data["und"], f"{where}.und")
             ),
-            flow=(
+            gen_admission=(
                 None
-                if data.get("flow") is None
-                else FlowAdmission.from_wire(data["flow"], f"{where}.flow")
+                if data.get("gen_admission") is None
+                else GenAdmission.from_wire(data["gen_admission"], f"{where}.gen_admission")
             ),
             adapter_id=_optional_uint(data.get("adapter_id"), f"{where}.adapter_id"),
         )
@@ -410,573 +1567,68 @@ class Admission:
         if not _is_digest(self.digest):
             raise invalid_descriptor("admission digest must be a lowercase SHA-256 digest")
         if self.digest != self.payload_digest():
-            raise invalid_descriptor(f"admission digest mismatch for session {self.session_id}")
+            raise invalid_descriptor(
+                f"admission digest mismatch for request {self.request_key.session_id}"
+            )
 
     def payload_digest(self) -> str:
-        digest = _Digest(b"uniserve-admission-v3\0")
-        digest.u64(self.session_id)
-        digest.option(self.sequence, lambda value: _digest_sequence_admission(digest, value))
-        digest.option(self.flow, lambda value: _digest_image(digest, value.image))
+        digest = _Digest(b"uniserve-admission\0")
+        _digest_request_key(digest, self.request_key)
+        digest.option(self.und, lambda value: _digest_und_admission(digest, value))
+        digest.option(self.gen_admission, lambda value: _digest_image(digest, value.image))
         digest.option(self.adapter_id, digest.u32)
         return digest.finish()
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "session_id": self.session_id,
+            "request_key": self.request_key.to_wire(),
             "digest": self.digest,
-            "sequence": None if self.sequence is None else self.sequence.to_wire(),
-            "flow": None if self.flow is None else self.flow.to_wire(),
+            "und": None if self.und is None else self.und.to_wire(),
+            "gen_admission": None if self.gen_admission is None else self.gen_admission.to_wire(),
             "adapter_id": self.adapter_id,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class KvLeaseDelta:
-    group_id: int = 0
-    new_blocks: tuple[int, ...] = ()
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "lease") -> KvLeaseDelta:
-        data = _map(value, where)
-        return cls(
-            group_id=_uint(data.get("group_id", 0), f"{where}.group_id"),
-            new_blocks=_uints(data.get("new_blocks", ()), f"{where}.new_blocks"),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {"group_id": self.group_id, "new_blocks": list(self.new_blocks)}
-
-
-@dataclass(frozen=True, slots=True)
-class TokenPolicy:
-    allowed_tokens: tuple[int, ...] = ()
-    suppress_tokens: tuple[int, ...] = ()
-    recent_tokens: tuple[int, ...] = ()
-    publish_kv: bool = False
-    publish_kv_on_tokens: tuple[int, ...] = ()
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "token policy") -> TokenPolicy:
-        data = _map(value, where)
-        return cls(
-            allowed_tokens=_uints(data.get("allowed_tokens", ()), f"{where}.allowed_tokens"),
-            suppress_tokens=_uints(data.get("suppress_tokens", ()), f"{where}.suppress_tokens"),
-            recent_tokens=_uints(data.get("recent_tokens", ()), f"{where}.recent_tokens"),
-            publish_kv=_bool(data.get("publish_kv", False), f"{where}.publish_kv"),
-            publish_kv_on_tokens=_uints(
-                data.get("publish_kv_on_tokens", ()), f"{where}.publish_kv_on_tokens"
-            ),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "allowed_tokens": list(self.allowed_tokens),
-            "suppress_tokens": list(self.suppress_tokens),
-            "recent_tokens": list(self.recent_tokens),
-            "publish_kv": self.publish_kv,
-            "publish_kv_on_tokens": list(self.publish_kv_on_tokens),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class TokenInput:
-    token_ids: tuple[int, ...]
-    source: TokenSource = TokenSource.WIRE
-    draft_token_ids: tuple[int, ...] = ()
-    return_all_logits: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.token_ids:
-            raise invalid_descriptor("model sequence requires at least one token id")
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "token input") -> TokenInput:
-        data = _map(value, where)
-        return cls(
-            token_ids=_uints(data.get("token_ids", ()), f"{where}.token_ids"),
-            source=_enum(TokenSource, data.get("source"), f"{where}.source"),
-            draft_token_ids=_uints(data.get("draft_token_ids", ()), f"{where}.draft_token_ids"),
-            return_all_logits=_bool(
-                data.get("return_all_logits", False), f"{where}.return_all_logits"
-            ),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "token_ids": list(self.token_ids),
-            "source": self.source.value,
-            "draft_token_ids": list(self.draft_token_ids),
-            "return_all_logits": self.return_all_logits,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class PublishedProduct:
-    handle: int
-    locator: str
-
-    def __post_init__(self) -> None:
-        if self.handle <= 0 and not self.locator:
-            raise invalid_descriptor("published product requires a handle or locator")
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "published product") -> PublishedProduct:
-        data = _map(value, where)
-        return cls(
-            handle=_uint(data.get("handle", 0), f"{where}.handle"),
-            locator=_str(data.get("locator", ""), f"{where}.locator"),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {"handle": self.handle, "locator": self.locator}
-
-
-@dataclass(frozen=True, slots=True)
-class PublishedKv:
-    handle: int
-    locators: tuple[str, ...]
-    source_version: int
-    kv_tokens: int
-    block_ids: tuple[int, ...]
-    group_id: int
-    position: int
-
-    def __post_init__(self) -> None:
-        if self.handle <= 0 and not self.locators:
-            raise invalid_descriptor("published KV requires a local handle or data-plane locators")
-        if self.source_version < 1:
-            raise invalid_descriptor("published KV source version must be positive")
-        if self.kv_tokens and not self.block_ids:
-            raise invalid_descriptor("non-empty published KV requires logical blocks")
-        if len(set(self.block_ids)) != len(self.block_ids):
-            raise invalid_descriptor("published KV repeats a logical block")
-        if any(not locator for locator in self.locators):
-            raise invalid_descriptor("published KV contains an empty locator")
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "published KV") -> PublishedKv:
-        data = _map(value, where)
-        return cls(
-            handle=_uint(data.get("handle", 0), f"{where}.handle"),
-            locators=tuple(
-                _str(item, f"{where}.locators[{index}]")
-                for index, item in enumerate(_seq(data.get("locators", ()), f"{where}.locators"))
-            ),
-            source_version=_uint(data.get("source_version"), f"{where}.source_version"),
-            kv_tokens=_uint(data.get("kv_tokens"), f"{where}.kv_tokens"),
-            block_ids=_uints(data.get("block_ids", ()), f"{where}.block_ids"),
-            group_id=_uint(data.get("group_id", 0), f"{where}.group_id"),
-            position=_uint(data.get("position"), f"{where}.position"),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "handle": self.handle,
-            "locators": list(self.locators),
-            "source_version": self.source_version,
-            "kv_tokens": self.kv_tokens,
-            "block_ids": list(self.block_ids),
-            "group_id": self.group_id,
-            "position": self.position,
-        }
-
-    def for_tensor_rank(self, rank: int, size: int) -> PublishedKv:
-        """Select this rank's contiguous locator group from a TP publication."""
-
-        rank = int(rank)
-        size = int(size)
-        if size < 1 or rank < 0 or rank >= size:
-            raise invalid_descriptor("published KV tensor-parallel rank is invalid")
-        if not self.locators:
-            return self
-        if len(self.locators) % size:
-            raise invalid_descriptor(
-                "published KV locators do not divide across tensor-parallel ranks"
-            )
-        width = len(self.locators) // size
-        start = rank * width
-        return replace(self, locators=self.locators[start : start + width])
-
-
-SequenceInput: TypeAlias = TokenInput | PublishedProduct
-
-
-@dataclass(frozen=True, slots=True)
-class SequenceOperation:
-    mode: SequenceMode
-    lease: KvLeaseDelta
-    position: tuple[int, int]
-    policy: TokenPolicy
-    input: SequenceInput
-
-    def __post_init__(self) -> None:
-        if self.position[1] < self.position[0]:
-            raise invalid_descriptor("sequence position range is inverted")
-        if self.mode is SequenceMode.SAMPLE:
-            if not isinstance(self.input, PublishedProduct):
-                raise invalid_descriptor("sample sequence requires published logits")
-        elif not isinstance(self.input, TokenInput):
-            raise invalid_descriptor("model sequence requires token input")
-        else:
-            token_input = self.input
-            if self.mode is SequenceMode.EXTEND:
-                if token_input.source is not TokenSource.WIRE:
-                    raise invalid_descriptor("sequence extend requires wire token input")
-                if token_input.draft_token_ids:
-                    raise invalid_descriptor("sequence extend cannot carry draft work")
-            elif self.mode is SequenceMode.DECODE:
-                if len(token_input.token_ids) != 1 or token_input.draft_token_ids:
-                    raise invalid_descriptor(
-                        "sequence decode requires one input token and no draft"
-                    )
-            elif self.mode is SequenceMode.VERIFY:
-                if len(token_input.token_ids) != 1 or not token_input.draft_token_ids:
-                    raise invalid_descriptor("sequence verify requires one input token and a draft")
-
-
-@dataclass(frozen=True, slots=True)
-class Guidance:
-    branch_count: int
-    text_scale: float
-    image_scale: float
-    renorm_type: str
-    renorm_min: float
-    interval: tuple[float, float]
-
-    def __post_init__(self) -> None:
-        if self.branch_count < 1:
-            raise invalid_descriptor("flow guidance requires a branch")
-        if any(
-            not math.isfinite(float(value))
-            for value in (*self.interval, self.text_scale, self.image_scale, self.renorm_min)
-        ):
-            raise invalid_descriptor("guidance values must be finite")
-
-
-@dataclass(frozen=True, slots=True)
-class FlowOperation:
-    latent_handle: int
-    position: int
-    start_step: int
-    step_count: int
-    conditioning_position: int
-    conditioning: PublishedKv | None
-    guidance: Guidance
-    image_prompt: str
-
-    def __post_init__(self) -> None:
-        if self.latent_handle < 1:
-            raise invalid_descriptor("flow operation requires a latent handle")
-        if self.step_count < 1:
-            raise invalid_descriptor("flow step count must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class InlineImage:
-    base64: str
-    content_hash: int
-
-    def __post_init__(self) -> None:
-        if not self.base64 or self.content_hash < 1:
-            raise invalid_descriptor("inline encode input is invalid")
-
-
-@dataclass(frozen=True, slots=True)
-class StagedProduct:
-    handle: int
-    content_hash: int
-
-    def __post_init__(self) -> None:
-        if self.handle < 1 or self.content_hash < 1:
-            raise invalid_descriptor("staged encode input is invalid")
-
-
-@dataclass(frozen=True, slots=True)
-class CachedProduct:
-    content_hash: int
-
-    def __post_init__(self) -> None:
-        if self.content_hash < 1:
-            raise invalid_descriptor("cached encode input is invalid")
-
-
-EncodeInput: TypeAlias = InlineImage | StagedProduct | CachedProduct
-
-
-@dataclass(frozen=True, slots=True)
-class EncodeOperation:
-    kind: EncodeKind
-    lease: KvLeaseDelta
-    position: tuple[int, int]
-    conditioning_position: int
-    input: EncodeInput
-
-    def __post_init__(self) -> None:
-        if self.position[1] < self.position[0]:
-            raise invalid_descriptor("encode position range is inverted")
-
-
-@dataclass(frozen=True, slots=True)
-class LatentProduct:
-    handle: int
-
-    def __post_init__(self) -> None:
-        if self.handle < 1:
-            raise invalid_descriptor("materialize operation requires a latent handle")
-
-
-MaterializeInput: TypeAlias = LatentProduct | PublishedProduct
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializeOperation:
-    kind: MaterializeKind
-    lease: KvLeaseDelta
-    position: int
-    conditioning_position: int
-    policy: TokenPolicy
-    input: MaterializeInput
-
-
-@dataclass(frozen=True, slots=True)
-class TransferOperation:
-    kind: TransferKind
-    lease: KvLeaseDelta
-    position: int
-    conditioning_position: int
-    policy: TokenPolicy
-    source: PublishedProduct
-
-
-Operation: TypeAlias = (
-    SequenceOperation | FlowOperation | EncodeOperation | MaterializeOperation | TransferOperation
-)
-
-
-@dataclass(frozen=True, slots=True)
-class OperationEnvelope:
-    session_id: int
-    epoch: int
-    op_id: int
-    base_version: int
-    digest: str
-    admission_digest: str
-    model_spec_digest: str
-    weight_digest: str
-    operation: Operation
-
-    def __post_init__(self) -> None:
-        if self.epoch < 1:
-            raise invalid_descriptor("operation epoch must be positive")
-        if self.op_id < 1:
-            raise invalid_descriptor("operation id must be positive")
-        _nonnegative(self.session_id, "operation.session_id")
-        _nonnegative(self.base_version, "operation.base_version")
-
-    @property
-    def kind(self) -> _spec.OperationKind:
-        return self.operation_type.kind
-
-    @property
-    def operation_type(self) -> _spec.OperationType:
-        return _operation_type(self.operation)
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        session_id: int,
-        epoch: int,
-        op_id: int,
-        base_version: int,
-        admission_digest: str,
-        model_spec_digest: str,
-        weight_digest: str,
-        operation: Operation,
-    ) -> OperationEnvelope:
-        value = cls(
-            session_id,
-            epoch,
-            op_id,
-            base_version,
-            "",
-            admission_digest,
-            model_spec_digest,
-            weight_digest,
-            operation,
-        )
-        return replace(value, digest=value.payload_digest())
-
-    @classmethod
-    def from_wire(
-        cls,
-        value: object,
-        where: str = "operation",
-        *,
-        validate: bool = True,
-    ) -> OperationEnvelope:
-        data = _map(value, where)
-        envelope = cls(
-            session_id=_uint(data.get("session_id"), f"{where}.session_id"),
-            epoch=_uint(data.get("epoch"), f"{where}.epoch"),
-            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            base_version=_uint(data.get("base_version"), f"{where}.base_version"),
-            digest=_str(data.get("digest"), f"{where}.digest"),
-            admission_digest=_str(data.get("admission_digest"), f"{where}.admission_digest"),
-            model_spec_digest=_str(data.get("model_spec_digest"), f"{where}.model_spec_digest"),
-            weight_digest=_str(data.get("weight_digest"), f"{where}.weight_digest"),
-            operation=_parse_operation(data.get("operation"), f"{where}.operation"),
-        )
-        if validate:
-            envelope.validate()
-        return envelope
-
-    def validate(self) -> None:
-        for name in ("admission_digest", "model_spec_digest", "weight_digest", "digest"):
-            if not _is_digest(getattr(self, name)):
-                raise invalid_descriptor(f"operation {name.replace('_', ' ')} is invalid")
-        if self.digest != self.payload_digest():
-            raise invalid_descriptor(f"operation digest mismatch for session {self.session_id}")
-
-    def payload_digest(self) -> str:
-        digest = _Digest(b"uniserve-operation-v3\0")
-        digest.u64(self.session_id)
-        digest.u64(self.epoch)
-        digest.u64(self.op_id)
-        digest.u64(self.base_version)
-        digest.string(self.admission_digest)
-        digest.string(self.model_spec_digest)
-        digest.string(self.weight_digest)
-        _digest_operation(digest, self.operation)
-        return digest.finish()
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "session_id": self.session_id,
-            "epoch": self.epoch,
-            "op_id": self.op_id,
-            "base_version": self.base_version,
-            "digest": self.digest,
-            "admission_digest": self.admission_digest,
-            "model_spec_digest": self.model_spec_digest,
-            "weight_digest": self.weight_digest,
-            "operation": _operation_to_wire(self.operation),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class SessionProjection:
-    session_id: int
-    epoch: int
-    version: int
-    last_op_id: int
-    admission_digest: str
-    source_digest: str
-    last_sampled_token: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.epoch < 1 or self.version < 1 or self.last_op_id < 1:
-            raise invalid_descriptor("session projection must identify committed state")
-        _nonnegative(self.session_id, "session projection.session_id")
-        if not _is_digest(self.admission_digest) or not _is_digest(self.source_digest):
-            raise invalid_descriptor("session projection digest is invalid")
-        if self.last_sampled_token is not None:
-            _nonnegative(self.last_sampled_token, "session projection.last_sampled_token")
-
-    def validate_for(self, operation: OperationEnvelope) -> None:
-        if (
-            self.session_id != operation.session_id
-            or self.epoch != operation.epoch
-            or self.version != operation.base_version
-            or self.admission_digest != operation.admission_digest
-        ):
-            raise invalid_descriptor("session projection does not match operation identity")
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "session projection") -> SessionProjection:
-        data = _map(value, where)
-        return cls(
-            session_id=_uint(data.get("session_id"), f"{where}.session_id"),
-            epoch=_uint(data.get("epoch"), f"{where}.epoch"),
-            version=_uint(data.get("version"), f"{where}.version"),
-            last_op_id=_uint(data.get("last_op_id"), f"{where}.last_op_id"),
-            admission_digest=_str(data.get("admission_digest"), f"{where}.admission_digest"),
-            source_digest=_str(data.get("source_digest"), f"{where}.source_digest"),
-            last_sampled_token=_optional_uint(
-                data.get("last_sampled_token"), f"{where}.last_sampled_token"
-            ),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "session_id": self.session_id,
-            "epoch": self.epoch,
-            "version": self.version,
-            "last_op_id": self.last_op_id,
-            "admission_digest": self.admission_digest,
-            "source_digest": self.source_digest,
-            "last_sampled_token": self.last_sampled_token,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class Batch:
     step_id: int
-    admissions: tuple[Admission, ...]
-    projections: tuple[SessionProjection, ...]
-    operations: tuple[OperationEnvelope, ...]
-    protocol_version: int = EXECUTION_PROTOCOL_VERSION
-    native_envelope_validated: bool = field(default=False, compare=False, repr=False)
+    admissions: tuple[Admission, ...] = ()
+    operations: tuple[Operation, ...] = ()
+    controls: tuple[Control, ...] = ()
+    input_products: tuple[ProductPayload, ...] = ()
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> None:
-        if self.protocol_version != EXECUTION_PROTOCOL_VERSION:
-            raise invalid_descriptor(
-                f"unsupported execution protocol version {self.protocol_version}"
-            )
-        if not self.operations:
-            raise invalid_descriptor("execution batch must contain an operation")
-        if not self.native_envelope_validated:
-            for operation in self.operations:
-                operation.validate()
-        sessions = tuple(value.session_id for value in self.operations)
-        if len(set(sessions)) != len(sessions):
-            raise invalid_descriptor("execution batch contains multiple operations for one session")
-        admitted = tuple(value.session_id for value in self.admissions)
+        if not self.operations and not self.controls:
+            raise invalid_descriptor("a submission batch must carry at least one operation or control")
+        request_keys = [operation.request_key for operation in self.operations]
+        if len(set(request_keys)) != len(request_keys):
+            raise invalid_descriptor("a submission batch carries multiple operations for one request")
+        admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
-            raise invalid_descriptor("execution batch contains duplicate admissions")
-        operations = {value.session_id: value for value in self.operations}
+            raise invalid_descriptor("a submission batch carries a duplicate admission")
         for admission in self.admissions:
             admission.validate()
-            admitted_operation = operations.get(admission.session_id)
-            if admitted_operation is None:
-                raise invalid_descriptor("execution batch admits a session without an operation")
-            if admitted_operation.admission_digest != admission.digest:
+            if admission.request_key not in request_keys:
+                raise invalid_descriptor("a submission batch admits a request without an operation")
+        identities: dict[tuple[RequestKey, int | None, int], str] = {}
+        for control in self.controls:
+            seq = control.control_seq if isinstance(control, (Commit, Close)) else None
+            identity = (control.request_key, seq, _control_variant_index(control))
+            content = control_content_digest(control)
+            existing = identities.get(identity)
+            if existing is not None and existing != content:
                 raise invalid_descriptor(
-                    f"operation admission digest mismatch for session {admission.session_id}"
+                    "a submission batch reuses a control identity with different content"
                 )
-        projected = tuple(value.session_id for value in self.projections)
-        if len(set(projected)) != len(projected):
-            raise invalid_descriptor("execution batch contains duplicate session projections")
-        for projection in self.projections:
-            projected_operation = operations.get(projection.session_id)
-            if projected_operation is None:
-                raise invalid_descriptor("execution batch projects a session without an operation")
-            projection.validate_for(projected_operation)
+            identities[identity] = content
 
     @classmethod
     def from_wire(cls, value: object) -> Batch:
         data = _map(value, "execute batch")
-        protocol_version = _uint(data.get("protocol_version"), "execute batch.protocol_version")
-        native_envelope_validated = _bool(
-            data.get("_native_envelope_validated", False),
-            "execute batch._native_envelope_validated",
-        )
         return cls(
-            protocol_version=protocol_version,
-            native_envelope_validated=native_envelope_validated,
             step_id=_uint(data.get("step_id"), "execute batch.step_id"),
             admissions=tuple(
                 Admission.from_wire(item, f"execute batch.admissions[{index}]")
@@ -984,362 +1636,210 @@ class Batch:
                     _seq(data.get("admissions", ()), "execute batch.admissions")
                 )
             ),
-            projections=tuple(
-                SessionProjection.from_wire(item, f"execute batch.projections[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("projections", ()), "execute batch.projections")
-                )
-            ),
             operations=tuple(
-                OperationEnvelope.from_wire(
-                    item,
-                    f"execute batch.operations[{index}]",
-                    validate=not native_envelope_validated,
-                )
+                Operation.from_wire(item, f"execute batch.operations[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("operations", ()), "execute batch.operations")
                 )
             ),
+            controls=tuple(
+                control_from_wire(item, f"execute batch.controls[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("controls", ()), "execute batch.controls")
+                )
+            ),
+            input_products=tuple(
+                ProductPayload.from_wire(item, f"execute batch.input_products[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("input_products", ()), "execute batch.input_products")
+                )
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "protocol_version": self.protocol_version,
             "step_id": self.step_id,
             "admissions": [value.to_wire() for value in self.admissions],
-            "projections": [value.to_wire() for value in self.projections],
             "operations": [value.to_wire() for value in self.operations],
+            "controls": [control_to_wire(value) for value in self.controls],
+            "input_products": [value.to_wire() for value in self.input_products],
         }
 
 
 @dataclass(frozen=True, slots=True)
-class TokenLogprob:
-    token_id: int
-    logprob: float
-    rank: int
+class RegistrationAck:
+    visible: bool = False
 
     @classmethod
-    def from_wire(cls, value: object, where: str) -> TokenLogprob:
-        items = _seq(value, where)
-        if len(items) != 3:
-            raise invalid_descriptor(f"{where} must contain token, logprob, and rank")
-        return cls(
-            _uint(items[0], f"{where}[0]"),
-            _float(items[1], f"{where}[1]"),
-            _uint(items[2], f"{where}[2]"),
-        )
+    def from_wire(cls, value: object, where: str = "registration") -> RegistrationAck:
+        data = _map(value, where)
+        return cls(visible=_bool(data.get("visible", False), f"{where}.visible"))
 
-    def to_wire(self) -> list[int | float]:
-        return [self.token_id, self.logprob, self.rank]
+    def to_wire(self) -> dict[str, object]:
+        return {"visible": self.visible}
 
 
 @dataclass(frozen=True, slots=True)
-class SequenceEffect:
-    sampled_token_ids: tuple[int, ...] = ()
-    sampled_logprob: float | None = None
-    top_logprobs: tuple[TokenLogprob, ...] = ()
-    prompt_logprobs: tuple[tuple[TokenLogprob, ...], ...] = ()
-    accepted_draft_tokens: int | None = None
-    kv_tokens: int | None = None
-    published_logits: PublishedProduct | None = None
-    published_kv: PublishedKv | None = None
+class ProductPayload:
+    product: ProductRef
+    payload: bytes
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "sequence effect") -> SequenceEffect:
+    def from_wire(cls, value: object, where: str = "product payload") -> ProductPayload:
         data = _map(value, where)
         return cls(
-            sampled_token_ids=_uints(
-                data.get("sampled_token_ids", ()), f"{where}.sampled_token_ids"
-            ),
-            sampled_logprob=_optional_float(
-                data.get("sampled_logprob"), f"{where}.sampled_logprob"
-            ),
-            top_logprobs=tuple(
-                TokenLogprob.from_wire(item, f"{where}.top_logprobs[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("top_logprobs", ()), f"{where}.top_logprobs")
-                )
-            ),
-            prompt_logprobs=tuple(
-                tuple(
-                    TokenLogprob.from_wire(
-                        entry, f"{where}.prompt_logprobs[{index}][{entry_index}]"
-                    )
-                    for entry_index, entry in enumerate(
-                        _seq(row, f"{where}.prompt_logprobs[{index}]")
-                    )
-                )
-                for index, row in enumerate(
-                    _seq(data.get("prompt_logprobs", ()), f"{where}.prompt_logprobs")
-                )
-            ),
-            accepted_draft_tokens=_optional_uint(
-                data.get("accepted_draft_tokens"), f"{where}.accepted_draft_tokens"
-            ),
-            kv_tokens=_optional_uint(data.get("kv_tokens"), f"{where}.kv_tokens"),
-            published_logits=(
-                None
-                if data.get("published_logits") is None
-                else PublishedProduct.from_wire(
-                    data["published_logits"], f"{where}.published_logits"
-                )
-            ),
-            published_kv=(
-                None
-                if data.get("published_kv") is None
-                else PublishedKv.from_wire(data["published_kv"], f"{where}.published_kv")
+            product=ProductRef.from_wire(data.get("product"), f"{where}.product"),
+            payload=(
+                raw
+                if type(raw := data.get("bytes", b"")) is bytes
+                else bytes(raw)
+                if isinstance(raw, (bytearray, memoryview))
+                else bytes(_uints(raw, f"{where}.bytes"))
             ),
         )
 
     def to_wire(self) -> dict[str, object]:
-        return {
-            "sampled_token_ids": [int(value) for value in self.sampled_token_ids],
-            "sampled_logprob": self.sampled_logprob,
-            "top_logprobs": [value.to_wire() for value in self.top_logprobs],
-            "prompt_logprobs": [[entry.to_wire() for entry in row] for row in self.prompt_logprobs],
-            "accepted_draft_tokens": self.accepted_draft_tokens,
-            "kv_tokens": self.kv_tokens,
-            "published_logits": (
-                None if self.published_logits is None else self.published_logits.to_wire()
-            ),
-            "published_kv": None if self.published_kv is None else self.published_kv.to_wire(),
-        }
+        return {"product": self.product.to_wire(), "bytes": self.payload}
 
 
-@dataclass(frozen=True, slots=True)
-class SequenceDelta:
-    effect: SequenceEffect
+def encode_token_product_bytes(tokens: Sequence[int]) -> bytes:
+    """Encode a ``ProductKind.TOKEN`` product value.
+
+    The layout is a little-endian ``u32`` count followed by that many
+    little-endian ``u32`` token ids, matching the Rust ``worker-wire`` codec so
+    the scheduler and worker share one exact format.
+    """
+
+    out = bytearray(struct.pack("<I", len(tokens)))
+    for token in tokens:
+        out += struct.pack("<I", token)
+    return bytes(out)
 
 
-@dataclass(frozen=True, slots=True)
-class FlowDelta:
-    steps_completed: int
-    done: bool
+def decode_token_product_bytes(data: bytes) -> tuple[int, ...]:
+    """Decode a ``ProductKind.TOKEN`` product value produced by
+    :func:`encode_token_product_bytes`."""
 
-
-@dataclass(frozen=True, slots=True)
-class EncodeDelta:
-    product_handle: int
-    kv_tokens: int
-    image_size: tuple[int, int] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ImageArtifact:
-    png_base64: str
-    height: int
-    width: int
-    handle: int
-    locator: str
-
-
-@dataclass(frozen=True, slots=True)
-class FrameRecord:
-    count: int
-
-
-MaterializedProduct: TypeAlias = ImageArtifact | PublishedProduct | FrameRecord
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializeDelta:
-    product: MaterializedProduct
-    kv_tokens: int | None = None
-    sequence: SequenceEffect | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TransferDelta:
-    product: PublishedProduct | None = None
-    kv_tokens: int | None = None
-    sequence: SequenceEffect | None = None
-
-
-ResultDelta: TypeAlias = SequenceDelta | FlowDelta | EncodeDelta | MaterializeDelta | TransferDelta
-
-
-def _delta_kind(delta: ResultDelta) -> _spec.OperationKind:
-    if isinstance(delta, SequenceDelta):
-        return _spec.OperationKind.SEQUENCE
-    if isinstance(delta, FlowDelta):
-        return _spec.OperationKind.FLOW
-    if isinstance(delta, EncodeDelta):
-        return _spec.OperationKind.ENCODE
-    if isinstance(delta, MaterializeDelta):
-        return _spec.OperationKind.MATERIALIZE
-    return _spec.OperationKind.TRANSFER
-
-
-@dataclass(frozen=True, slots=True)
-class OperationResult:
-    session_id: int
-    epoch: int
-    op_id: int
-    base_version: int
-    result_version: int
-    delta: ResultDelta
-
-    @classmethod
-    def for_operation(cls, operation: OperationEnvelope, delta: ResultDelta) -> OperationResult:
-        result = cls(
-            session_id=operation.session_id,
-            epoch=operation.epoch,
-            op_id=operation.op_id,
-            base_version=operation.base_version,
-            result_version=operation.base_version + 1,
-            delta=delta,
+    if len(data) < 4:
+        raise invalid_descriptor("token product bytes are too short to carry a count")
+    (count,) = struct.unpack_from("<I", data, 0)
+    expected = 4 + count * 4
+    if len(data) != expected:
+        raise invalid_descriptor(
+            f"token product byte length {len(data)} does not match declared count {count}"
         )
-        result.validate_for(operation)
-        return result
-
-    def validate_for(self, operation: OperationEnvelope) -> None:
-        if (
-            self.session_id,
-            self.epoch,
-            self.op_id,
-            self.base_version,
-            self.result_version,
-        ) != (
-            operation.session_id,
-            operation.epoch,
-            operation.op_id,
-            operation.base_version,
-            operation.base_version + 1,
-        ):
-            raise invalid_descriptor("operation result identity or version does not match")
-        if _delta_kind(self.delta) is not operation.kind:
-            raise invalid_descriptor("operation result delta variant does not match operation")
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "operation result") -> OperationResult:
-        data = _map(value, where)
-        return cls(
-            session_id=_uint(data.get("session_id"), f"{where}.session_id"),
-            epoch=_uint(data.get("epoch"), f"{where}.epoch"),
-            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            base_version=_uint(data.get("base_version"), f"{where}.base_version"),
-            result_version=_uint(data.get("result_version"), f"{where}.result_version"),
-            delta=_delta_from_wire(data.get("delta"), f"{where}.delta"),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "session_id": self.session_id,
-            "epoch": self.epoch,
-            "op_id": self.op_id,
-            "base_version": self.base_version,
-            "result_version": self.result_version,
-            "delta": _delta_to_wire(self.delta),
-        }
+    return tuple(struct.unpack_from("<I", data, 4 + index * 4)[0] for index in range(count))
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerForwardStats:
-    mode_counts: Mapping[str, int] = field(default_factory=dict)
-    mode_tokens: Mapping[str, int] = field(default_factory=dict)
-    mode_us: Mapping[str, int] = field(default_factory=dict)
-    component_us: Mapping[str, int] = field(default_factory=dict)
-    attention_launches: int = 0
-    attention_us: int = 0
-    attention_backend_counts: Mapping[str, int] = field(default_factory=dict)
-    cuda_graph_captures: int = 0
-    cuda_graph_replays: int = 0
-    cuda_graph_misses: int = 0
-    cuda_graph_fallbacks: int = 0
-    cuda_graph_unpadded_tokens: int = 0
-    cuda_graph_padded_tokens: int = 0
-    cuda_graph_runtime_mode_counts: Mapping[str, int] = field(default_factory=dict)
-    text_decode_token_relay_hits: int = 0
-    text_decode_token_relay_misses: int = 0
-    text_decode_position_relay_hits: int = 0
-    text_decode_position_relay_misses: int = 0
-    flashinfer_decode_plan_calls: int = 0
-    flashinfer_decode_plan_reuses: int = 0
-    flashinfer_decode_plan_rows: int = 0
-    flashinfer_decode_plan_indices: int = 0
-    flashinfer_decode_graph_plan_calls: int = 0
-    flashinfer_decode_graph_plan_reuses: int = 0
-    spec_verify_rows: int = 0
-    spec_verify_draft_tokens: int = 0
-    spec_verify_accepted_tokens: int = 0
-    spec_verify_rejected_tokens: int = 0
-    spec_verify_committed_tokens: int = 0
-    spec_verify_path_counts: Mapping[str, int] = field(default_factory=dict)
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            name: dict(value) if isinstance(value, Mapping) else value
-            for name, value in ((name, getattr(self, name)) for name in self.__dataclass_fields__)
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionResult:
+class CompletionReport:
     step_id: int
-    operations: tuple[OperationResult, ...]
+    completions: tuple[CompletionRecord, ...]
+    products: tuple[ProductPayload, ...] = ()
+    registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
-    forward_stats: WorkerForwardStats | None = None
 
-    def validate_for(self, batch: Batch) -> None:
-        if self.step_id != batch.step_id:
-            raise invalid_descriptor("execution result step does not match batch")
-        if len(self.operations) != len(batch.operations):
-            raise invalid_descriptor("execution result operation count does not match batch")
-        for result, operation in zip(self.operations, batch.operations, strict=True):
-            result.validate_for(operation)
+    @classmethod
+    def from_wire(cls, value: object, where: str = "completion report") -> CompletionReport:
+        data = _map(value, where)
+        return cls(
+            step_id=_uint(data.get("step_id"), f"{where}.step_id"),
+            completions=tuple(
+                CompletionRecord.from_wire(item, f"{where}.completions[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("completions", ()), f"{where}.completions")
+                )
+            ),
+            products=tuple(
+                ProductPayload.from_wire(item, f"{where}.products[{index}]")
+                for index, item in enumerate(_seq(data.get("products", ()), f"{where}.products"))
+            ),
+            registration=RegistrationAck.from_wire(
+                data.get("registration", {}), f"{where}.registration"
+            ),
+            worker_exec_us=_optional_uint(data.get("worker_exec_us"), f"{where}.worker_exec_us"),
+        )
 
     def to_wire(self) -> dict[str, object]:
         return {
             "step_id": self.step_id,
-            "operations": [value.to_wire() for value in self.operations],
+            "completions": [value.to_wire() for value in self.completions],
+            "products": [value.to_wire() for value in self.products],
+            "registration": self.registration.to_wire(),
             "worker_exec_us": self.worker_exec_us,
-            "forward_stats": None if self.forward_stats is None else self.forward_stats.to_wire(),
         }
 
 
-class _Digest:
-    def __init__(self, domain: bytes) -> None:
-        self.value = hashlib.sha256()
-        self.value.update(domain)
-        self.u16(EXECUTION_PROTOCOL_VERSION)
+# ---------------------------------------------------------------------------
+# Digest helpers mirroring the Rust `CanonicalDigest`
+# ---------------------------------------------------------------------------
 
-    def finish(self) -> str:
-        return self.value.hexdigest()
 
-    def u8(self, value: int) -> None:
-        self.value.update(struct.pack("<B", value))
+def _digest_request_key(digest: _Digest, value: RequestKey) -> None:
+    digest.buf += _PACK_QQQ(value.authority_id, value.session_id, value.epoch)
 
-    def u16(self, value: int) -> None:
-        self.value.update(struct.pack("<H", value))
 
-    def u32(self, value: int) -> None:
-        self.value.update(struct.pack("<I", value))
-
-    def u64(self, value: int) -> None:
-        self.value.update(struct.pack("<Q", value))
-
-    def f32(self, value: float) -> None:
-        self.value.update(struct.pack("<f", value))
-
-    def boolean(self, value: bool) -> None:
-        self.u8(int(value))
-
-    def string(self, value: str) -> None:
-        encoded = value.encode("utf-8")
-        self.u64(len(encoded))
-        self.value.update(encoded)
-
-    def u32s(self, values: Sequence[int]) -> None:
-        self.u64(len(values))
-        for value in values:
-            self.u32(value)
-
-    def option(self, value: object | None, encode: Any) -> None:
-        if value is None:
-            self.u8(0)
+def _digest_shape_bound(digest: _Digest, value: ShapeBound) -> None:
+    buf = digest.buf
+    dims = value.dims
+    buf += _PACK_Q(len(dims))
+    for dim in dims:
+        if isinstance(dim, StaticDim):
+            buf += _PACK_BI(0, dim.extent)
         else:
-            self.u8(1)
-            encode(value)
+            buf += _PACK_BI(1, dim.bound)
+
+
+def _digest_product_ref(digest: _Digest, value: ProductRef) -> None:
+    key = value.request_key
+    digest.buf += _PACK_PRODUCT_HEAD(
+        key.authority_id,
+        key.session_id,
+        key.epoch,
+        value.producer_op_id,
+        value.output_index,
+        value.generation,
+        _PRODUCT_KIND_INDEX[value.kind],
+        _STORAGE_CLASS_INDEX[value.storage_class],
+        _DTYPE_INDEX[value.dtype],
+    )
+    _digest_shape_bound(digest, value.shape_bound)
+    point_range = value.point_range
+    digest.buf += _PACK_II(point_range.base_point, point_range.max_points)
+
+
+def _digest_version_ref(digest: _Digest, value: VersionRef) -> None:
+    key = value.request_key
+    point = value.point
+    if isinstance(point, FixedPoint):
+        digest.buf += _PACK_QQQQB(
+            key.authority_id, key.session_id, key.epoch, value.producer_op_id, 0
+        )
+        digest.buf += _PACK_I(point.point_index)
+        digest.string(point.semantic_digest)
+    else:
+        digest.buf += _PACK_QQQQB(
+            key.authority_id, key.session_id, key.epoch, value.producer_op_id, 1
+        )
+        _digest_product_ref(digest, point.selected_point)
+        digest.string(point.producer_plan_digest)
+
+
+def _digest_bounds(digest: _Digest, value: Bounds) -> None:
+    digest.buf += _PACK_IIIQQQ(
+        value.max_points,
+        value.max_tokens,
+        value.max_kv_pages,
+        value.max_latent_bytes,
+        value.max_completion_bytes,
+        value.max_transfer_bytes,
+    )
+
+
+def _digest_rng(digest: _Digest, value: Rng) -> None:
+    digest.buf += _PACK_QQB(
+        value.seed, value.semantic_index_base, _DRAW_LAYOUT_INDEX[value.draw_layout]
+    )
 
 
 def _digest_sampling(digest: _Digest, value: SamplingParams) -> None:
@@ -1388,7 +1888,7 @@ def _digest_image(digest: _Digest, value: ImageParams) -> None:
     digest.boolean(value.retain_images)
 
 
-def _digest_sequence_admission(digest: _Digest, value: SequenceAdmission) -> None:
+def _digest_und_admission(digest: _Digest, value: UndAdmission) -> None:
     _digest_sampling(digest, value.sampling)
     digest.u32s(value.negative_token_ids)
     digest.u32s(value.kv.block_ids)
@@ -1396,455 +1896,32 @@ def _digest_sequence_admission(digest: _Digest, value: SequenceAdmission) -> Non
     digest.u32(value.kv.group_id)
 
 
-def _digest_lease(digest: _Digest, value: KvLeaseDelta) -> None:
-    digest.u32(value.group_id)
-    digest.u32s(value.new_blocks)
-
-
-def _digest_policy(digest: _Digest, value: TokenPolicy) -> None:
-    digest.u32s(value.allowed_tokens)
-    digest.u32s(value.suppress_tokens)
-    digest.u32s(value.recent_tokens)
-    digest.boolean(value.publish_kv)
-    digest.u32s(value.publish_kv_on_tokens)
-
-
-def _digest_published(digest: _Digest, value: PublishedProduct) -> None:
-    digest.u64(value.handle)
-
-
-def _digest_published_kv(digest: _Digest, value: PublishedKv) -> None:
-    digest.u64(value.handle)
-    digest.u64(value.source_version)
-    digest.u32(value.kv_tokens)
-    digest.u32s(value.block_ids)
-    digest.u32(value.group_id)
-    digest.u32(value.position)
-
-
-def _digest_operation(digest: _Digest, value: Operation) -> None:
-    if isinstance(value, SequenceOperation):
-        digest.u8(0)
-        digest.u8(list(SequenceMode).index(value.mode))
-        _digest_lease(digest, value.lease)
-        digest.u32(value.position[0])
-        digest.u32(value.position[1])
-        _digest_policy(digest, value.policy)
-        if isinstance(value.input, TokenInput):
-            digest.u8(0)
-            digest.u32s(value.input.token_ids)
-            digest.u8(list(TokenSource).index(value.input.source))
-            digest.u32s(value.input.draft_token_ids)
-            digest.boolean(value.input.return_all_logits)
-        else:
-            digest.u8(1)
-            _digest_published(digest, value.input)
-        return
-    if isinstance(value, FlowOperation):
-        digest.u8(1)
-        digest.u64(value.latent_handle)
-        digest.u32(value.position)
-        digest.u16(value.start_step)
-        digest.u16(value.step_count)
-        digest.u32(value.conditioning_position)
-        digest.option(
-            value.conditioning, lambda conditioning: _digest_published_kv(digest, conditioning)
-        )
-        digest.u8(value.guidance.branch_count)
-        digest.f32(value.guidance.text_scale)
-        digest.f32(value.guidance.image_scale)
-        digest.string(value.guidance.renorm_type)
-        digest.f32(value.guidance.renorm_min)
-        digest.f32(value.guidance.interval[0])
-        digest.f32(value.guidance.interval[1])
-        digest.string(value.image_prompt)
-        return
-    if isinstance(value, EncodeOperation):
-        digest.u8(2)
-        digest.u8(list(EncodeKind).index(value.kind))
-        _digest_lease(digest, value.lease)
-        digest.u32(value.position[0])
-        digest.u32(value.position[1])
-        digest.u32(value.conditioning_position)
-        if isinstance(value.input, InlineImage):
-            digest.u8(0)
-            digest.string(value.input.base64)
-            digest.u64(value.input.content_hash)
-        elif isinstance(value.input, StagedProduct):
-            digest.u8(1)
-            digest.u64(value.input.handle)
-            digest.u64(value.input.content_hash)
-        else:
-            digest.u8(2)
-            digest.u64(value.input.content_hash)
-        return
-    if isinstance(value, MaterializeOperation):
-        digest.u8(3)
-        digest.u8(list(MaterializeKind).index(value.kind))
-        _digest_lease(digest, value.lease)
-        digest.u32(value.position)
-        digest.u32(value.conditioning_position)
-        _digest_policy(digest, value.policy)
-        if isinstance(value.input, LatentProduct):
-            digest.u8(0)
-            digest.u64(value.input.handle)
-        else:
-            digest.u8(1)
-            _digest_published(digest, value.input)
-        return
-    digest.u8(4)
-    digest.u8(list(TransferKind).index(value.kind))
-    _digest_lease(digest, value.lease)
-    digest.u32(value.position)
-    digest.u32(value.conditioning_position)
-    _digest_policy(digest, value.policy)
-    _digest_published(digest, value.source)
-
-
-def _parse_operation(value: object, where: str) -> Operation:
-    tagged = _tagged(value, where)
-    kind = tagged[0]
-    data = _map(tagged[1], f"{where}.value")
-    if kind == _spec.OperationKind.SEQUENCE.value:
-        position = _uint_pair(data.get("position"), f"{where}.value.position")
-        input_kind, input_value = _tagged(data.get("input"), f"{where}.value.input")
-        if input_kind == "tokens":
-            sequence_input: SequenceInput = TokenInput.from_wire(
-                input_value, f"{where}.value.input.value"
-            )
-        elif input_kind == "published_logits":
-            sequence_input = PublishedProduct.from_wire(input_value, f"{where}.value.input.value")
-        else:
-            raise invalid_descriptor(f"{where}.value.input has unknown variant {input_kind!r}")
-        return SequenceOperation(
-            mode=_enum(SequenceMode, data.get("mode"), f"{where}.value.mode"),
-            lease=KvLeaseDelta.from_wire(data.get("lease", {}), f"{where}.value.lease"),
-            position=position,
-            policy=TokenPolicy.from_wire(data.get("policy", {}), f"{where}.value.policy"),
-            input=sequence_input,
-        )
-    if kind == _spec.OperationKind.FLOW.value:
-        guidance_data = _map(data.get("guidance"), f"{where}.value.guidance")
-        interval = _float_pair(guidance_data.get("interval"), f"{where}.value.guidance.interval")
-        return FlowOperation(
-            latent_handle=_uint(data.get("latent_handle"), f"{where}.value.latent_handle"),
-            position=_uint(data.get("position"), f"{where}.value.position"),
-            start_step=_uint(data.get("start_step"), f"{where}.value.start_step"),
-            step_count=_uint(data.get("step_count"), f"{where}.value.step_count"),
-            conditioning_position=_uint(
-                data.get("conditioning_position"), f"{where}.value.conditioning_position"
-            ),
-            conditioning=(
-                None
-                if data.get("conditioning") is None
-                else PublishedKv.from_wire(data["conditioning"], f"{where}.value.conditioning")
-            ),
-            guidance=Guidance(
-                branch_count=_uint(
-                    guidance_data.get("branch_count"), f"{where}.value.guidance.branch_count"
-                ),
-                text_scale=_float(
-                    guidance_data.get("text_scale"), f"{where}.value.guidance.text_scale"
-                ),
-                image_scale=_float(
-                    guidance_data.get("image_scale"), f"{where}.value.guidance.image_scale"
-                ),
-                renorm_type=_str(
-                    guidance_data.get("renorm_type"), f"{where}.value.guidance.renorm_type"
-                ),
-                renorm_min=_float(
-                    guidance_data.get("renorm_min"), f"{where}.value.guidance.renorm_min"
-                ),
-                interval=interval,
-            ),
-            image_prompt=_str(data.get("image_prompt", ""), f"{where}.value.image_prompt"),
-        )
-    if kind == _spec.OperationKind.ENCODE.value:
-        input_kind, input_value = _tagged(data.get("input"), f"{where}.value.input")
-        input_data = _map(input_value, f"{where}.value.input.value")
-        if input_kind == "inline_image":
-            encode_input: EncodeInput = InlineImage(
-                _str(input_data.get("base64"), f"{where}.value.input.value.base64"),
-                _uint(input_data.get("content_hash"), f"{where}.value.input.value.content_hash"),
-            )
-        elif input_kind == "staged_product":
-            encode_input = StagedProduct(
-                _uint(input_data.get("handle"), f"{where}.value.input.value.handle"),
-                _uint(input_data.get("content_hash"), f"{where}.value.input.value.content_hash"),
-            )
-        elif input_kind == "cached_product":
-            encode_input = CachedProduct(
-                _uint(input_data.get("content_hash"), f"{where}.value.input.value.content_hash")
-            )
-        else:
-            raise invalid_descriptor(f"{where}.value.input has unknown variant {input_kind!r}")
-        return EncodeOperation(
-            kind=_enum(EncodeKind, data.get("kind"), f"{where}.value.kind"),
-            lease=KvLeaseDelta.from_wire(data.get("lease", {}), f"{where}.value.lease"),
-            position=_uint_pair(data.get("position"), f"{where}.value.position"),
-            conditioning_position=_uint(
-                data.get("conditioning_position"), f"{where}.value.conditioning_position"
-            ),
-            input=encode_input,
-        )
-    if kind == _spec.OperationKind.MATERIALIZE.value:
-        input_kind, input_value = _tagged(data.get("input"), f"{where}.value.input")
-        if input_kind == "latent":
-            materialize_input: MaterializeInput = LatentProduct(
-                _uint(
-                    _map(input_value, f"{where}.value.input.value").get("handle"),
-                    f"{where}.value.input.value.handle",
-                )
-            )
-        elif input_kind == "published":
-            materialize_input = PublishedProduct.from_wire(
-                input_value, f"{where}.value.input.value"
-            )
-        else:
-            raise invalid_descriptor(f"{where}.value.input has unknown variant {input_kind!r}")
-        return MaterializeOperation(
-            kind=_enum(MaterializeKind, data.get("kind"), f"{where}.value.kind"),
-            lease=KvLeaseDelta.from_wire(data.get("lease", {}), f"{where}.value.lease"),
-            position=_uint(data.get("position"), f"{where}.value.position"),
-            conditioning_position=_uint(
-                data.get("conditioning_position"), f"{where}.value.conditioning_position"
-            ),
-            policy=TokenPolicy.from_wire(data.get("policy", {}), f"{where}.value.policy"),
-            input=materialize_input,
-        )
-    if kind == _spec.OperationKind.TRANSFER.value:
-        return TransferOperation(
-            kind=_enum(TransferKind, data.get("kind"), f"{where}.value.kind"),
-            lease=KvLeaseDelta.from_wire(data.get("lease", {}), f"{where}.value.lease"),
-            position=_uint(data.get("position"), f"{where}.value.position"),
-            conditioning_position=_uint(
-                data.get("conditioning_position"), f"{where}.value.conditioning_position"
-            ),
-            policy=TokenPolicy.from_wire(data.get("policy", {}), f"{where}.value.policy"),
-            source=PublishedProduct.from_wire(data.get("source"), f"{where}.value.source"),
-        )
-    raise invalid_descriptor(f"{where} has unknown variant {kind!r}")
-
-
-def _operation_to_wire(value: Operation) -> dict[str, object]:
-    if isinstance(value, SequenceOperation):
-        input_value = (
-            {"kind": "tokens", "value": value.input.to_wire()}
-            if isinstance(value.input, TokenInput)
-            else {"kind": "published_logits", "value": value.input.to_wire()}
-        )
-        payload: dict[str, object] = {
-            "mode": value.mode.value,
-            "lease": value.lease.to_wire(),
-            "position": list(value.position),
-            "policy": value.policy.to_wire(),
-            "input": input_value,
-        }
-        return {"kind": "sequence", "value": payload}
-    if isinstance(value, FlowOperation):
-        return {
-            "kind": "flow",
-            "value": {
-                "latent_handle": value.latent_handle,
-                "position": value.position,
-                "start_step": value.start_step,
-                "step_count": value.step_count,
-                "conditioning_position": value.conditioning_position,
-                "conditioning": (
-                    None if value.conditioning is None else value.conditioning.to_wire()
-                ),
-                "guidance": {
-                    "branch_count": value.guidance.branch_count,
-                    "text_scale": value.guidance.text_scale,
-                    "image_scale": value.guidance.image_scale,
-                    "renorm_type": value.guidance.renorm_type,
-                    "renorm_min": value.guidance.renorm_min,
-                    "interval": list(value.guidance.interval),
-                },
-                "image_prompt": value.image_prompt,
-            },
-        }
-    if isinstance(value, EncodeOperation):
-        if isinstance(value.input, InlineImage):
-            input_value = {
-                "kind": "inline_image",
-                "value": {"base64": value.input.base64, "content_hash": value.input.content_hash},
-            }
-        elif isinstance(value.input, StagedProduct):
-            input_value = {
-                "kind": "staged_product",
-                "value": {"handle": value.input.handle, "content_hash": value.input.content_hash},
-            }
-        else:
-            input_value = {
-                "kind": "cached_product",
-                "value": {"content_hash": value.input.content_hash},
-            }
-        return {
-            "kind": "encode",
-            "value": {
-                "kind": value.kind.value,
-                "lease": value.lease.to_wire(),
-                "position": list(value.position),
-                "conditioning_position": value.conditioning_position,
-                "input": input_value,
-            },
-        }
-    if isinstance(value, MaterializeOperation):
-        input_value = (
-            {"kind": "latent", "value": {"handle": value.input.handle}}
-            if isinstance(value.input, LatentProduct)
-            else {"kind": "published", "value": value.input.to_wire()}
-        )
-        return {
-            "kind": "materialize",
-            "value": {
-                "kind": value.kind.value,
-                "lease": value.lease.to_wire(),
-                "position": value.position,
-                "conditioning_position": value.conditioning_position,
-                "policy": value.policy.to_wire(),
-                "input": input_value,
-            },
-        }
-    return {
-        "kind": "transfer",
-        "value": {
-            "kind": value.kind.value,
-            "lease": value.lease.to_wire(),
-            "position": value.position,
-            "conditioning_position": value.conditioning_position,
-            "policy": value.policy.to_wire(),
-            "source": value.source.to_wire(),
-        },
-    }
-
-
-def _delta_to_wire(value: ResultDelta) -> dict[str, object]:
-    if isinstance(value, SequenceDelta):
-        return {"kind": "sequence", "value": {"effect": value.effect.to_wire()}}
-    if isinstance(value, FlowDelta):
-        return {
-            "kind": "flow",
-            "value": {"steps_completed": value.steps_completed, "done": value.done},
-        }
-    if isinstance(value, EncodeDelta):
-        return {
-            "kind": "encode",
-            "value": {
-                "product_handle": value.product_handle,
-                "kv_tokens": value.kv_tokens,
-                "image_size": None if value.image_size is None else list(value.image_size),
-            },
-        }
-    if isinstance(value, MaterializeDelta):
-        if isinstance(value.product, ImageArtifact):
-            product = {
-                "kind": "image",
-                "value": {
-                    "png_base64": value.product.png_base64,
-                    "height": value.product.height,
-                    "width": value.product.width,
-                    "handle": value.product.handle,
-                    "locator": value.product.locator,
-                },
-            }
-        elif isinstance(value.product, PublishedProduct):
-            product = {"kind": "published", "value": value.product.to_wire()}
-        else:
-            product = {"kind": "frame", "value": {"count": value.product.count}}
-        return {
-            "kind": "materialize",
-            "value": {
-                "product": product,
-                "kv_tokens": value.kv_tokens,
-                "sequence": None if value.sequence is None else value.sequence.to_wire(),
-            },
-        }
-    return {
-        "kind": "transfer",
-        "value": {
-            "product": None if value.product is None else value.product.to_wire(),
-            "kv_tokens": value.kv_tokens,
-            "sequence": None if value.sequence is None else value.sequence.to_wire(),
-        },
-    }
-
-
-def _delta_from_wire(value: object, where: str) -> ResultDelta:
-    kind, raw = _tagged(value, where)
-    data = _map(raw, f"{where}.value")
-    if kind == "sequence":
-        return SequenceDelta(SequenceEffect.from_wire(data.get("effect"), f"{where}.value.effect"))
-    if kind == "flow":
-        return FlowDelta(
-            steps_completed=_uint(data.get("steps_completed"), f"{where}.value.steps_completed"),
-            done=_bool(data.get("done"), f"{where}.value.done"),
-        )
-    if kind == "encode":
-        raw_size = data.get("image_size")
-        return EncodeDelta(
-            product_handle=_uint(data.get("product_handle"), f"{where}.value.product_handle"),
-            kv_tokens=_uint(data.get("kv_tokens"), f"{where}.value.kv_tokens"),
-            image_size=(
-                None if raw_size is None else _uint_pair(raw_size, f"{where}.value.image_size")
-            ),
-        )
-    if kind == "materialize":
-        product_kind, raw_product = _tagged(data.get("product"), f"{where}.value.product")
-        product_data = _map(raw_product, f"{where}.value.product.value")
-        if product_kind == "image":
-            product: MaterializedProduct = ImageArtifact(
-                png_base64=_str(
-                    product_data.get("png_base64"),
-                    f"{where}.value.product.value.png_base64",
-                ),
-                height=_uint(product_data.get("height"), f"{where}.value.product.value.height"),
-                width=_uint(product_data.get("width"), f"{where}.value.product.value.width"),
-                handle=_uint(product_data.get("handle"), f"{where}.value.product.value.handle"),
-                locator=_str(
-                    product_data.get("locator", ""),
-                    f"{where}.value.product.value.locator",
-                ),
-            )
-        elif product_kind == "published":
-            product = PublishedProduct.from_wire(raw_product, f"{where}.value.product.value")
-        elif product_kind == "frame":
-            product = FrameRecord(
-                _uint(product_data.get("count"), f"{where}.value.product.value.count")
-            )
-        else:
-            raise invalid_descriptor(f"{where}.value.product has unknown variant {product_kind!r}")
-        return MaterializeDelta(
-            product=product,
-            kv_tokens=_optional_uint(data.get("kv_tokens"), f"{where}.value.kv_tokens"),
-            sequence=(
-                None
-                if data.get("sequence") is None
-                else SequenceEffect.from_wire(data["sequence"], f"{where}.value.sequence")
-            ),
-        )
-    if kind == "transfer":
-        return TransferDelta(
-            product=(
-                None
-                if data.get("product") is None
-                else PublishedProduct.from_wire(data["product"], f"{where}.value.product")
-            ),
-            kv_tokens=_optional_uint(data.get("kv_tokens"), f"{where}.value.kv_tokens"),
-            sequence=(
-                None
-                if data.get("sequence") is None
-                else SequenceEffect.from_wire(data["sequence"], f"{where}.value.sequence")
-            ),
-        )
-    raise invalid_descriptor(f"{where} has unknown variant {kind!r}")
-
+# ---------------------------------------------------------------------------
+# Decode helpers
+#
+# Every helper (and every `_fast_*` record decoder below) has one contract: on
+# well-formed wire values it produces exactly the value the original readable
+# decode would, without allocating error-location strings on the happy path;
+# on anything anomalous it falls back to the original checks so the raised
+# error is identical. `type(x) is T` guards route exotic-but-valid values
+# (int/str subclasses) onto the fallback, which accepts them as before.
+# ---------------------------------------------------------------------------
 
 _E = TypeVar("_E", bound=StrEnum)
 
+_DOMAIN_BY_VALUE: Mapping[str, Domain] = Domain._value2member_map_  # type: ignore[assignment]
+_PRODUCT_KIND_BY_VALUE: Mapping[str, ProductKind] = ProductKind._value2member_map_  # type: ignore[assignment]
+_STORAGE_CLASS_BY_VALUE: Mapping[str, StorageClass] = StorageClass._value2member_map_  # type: ignore[assignment]
+_DTYPE_BY_VALUE: Mapping[str, DType] = DType._value2member_map_  # type: ignore[assignment]
+_DRAW_LAYOUT_BY_VALUE: Mapping[str, DrawLayout] = DrawLayout._value2member_map_  # type: ignore[assignment]
+
 
 def _enum(kind: type[_E], value: object, where: str) -> _E:
+    if type(value) is str:
+        member = kind._value2member_map_.get(value)
+        if member is not None:
+            return cast(_E, member)
+        raise invalid_descriptor(f"{where} has unknown value {value!r}")
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     try:
@@ -1854,12 +1931,17 @@ def _enum(kind: type[_E], value: object, where: str) -> _E:
 
 
 def _map(value: object, where: str) -> Mapping[str, Any]:
+    if type(value) is dict:
+        return value
     if not isinstance(value, Mapping):
         raise invalid_descriptor(f"{where} must be a map")
     return cast(Mapping[str, Any], value)
 
 
 def _seq(value: object, where: str) -> Sequence[Any]:
+    kind = type(value)
+    if kind is list or kind is tuple:
+        return value
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise invalid_descriptor(f"{where} must be a list")
     return value
@@ -1884,12 +1966,14 @@ def _str(value: object, where: str) -> str:
 
 
 def _bool(value: object, where: str) -> bool:
-    if not isinstance(value, bool):
-        raise invalid_descriptor(f"{where} must be a bool")
-    return value
+    if value is True or value is False:
+        return value
+    raise invalid_descriptor(f"{where} must be a bool")
 
 
 def _uint(value: object, where: str) -> int:
+    if type(value) is int and value >= 0:
+        return value
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(f"{where} must be a non-negative integer")
     return value
@@ -1900,42 +1984,303 @@ def _optional_uint(value: object, where: str) -> int | None:
 
 
 def _float(value: object, where: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise invalid_descriptor(f"{where} must be a number")
+    kind = type(value)
+    if kind is not float and kind is not int:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise invalid_descriptor(f"{where} must be a number")
     result = float(value)
     if not math.isfinite(result):
         raise invalid_descriptor(f"{where} must be finite")
     return result
 
 
-def _optional_float(value: object, where: str) -> float | None:
-    return None if value is None else _float(value, where)
-
-
 def _uints(value: object, where: str) -> tuple[int, ...]:
-    return tuple(_uint(item, f"{where}[{index}]") for index, item in enumerate(_seq(value, where)))
-
-
-def _uint_pair(value: object, where: str) -> tuple[int, int]:
-    items = _pair(value, where)
-    return _uint(items[0], f"{where}[0]"), _uint(items[1], f"{where}[1]")
-
-
-def _float_pair(value: object, where: str) -> tuple[float, float]:
-    items = _pair(value, where)
-    return _float(items[0], f"{where}[0]"), _float(items[1], f"{where}[1]")
+    items = _seq(value, where)
+    for item in items:
+        if not (type(item) is int and item >= 0):
+            return tuple(
+                _uint(item, f"{where}[{index}]") for index, item in enumerate(items)
+            )
+    return tuple(items)
 
 
 def _nonnegative(value: int, where: str) -> None:
     _uint(value, where)
 
 
+_HEX64_MATCH = re.compile(r"[0-9a-f]{64}\Z").match
+
+
 def _is_digest(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
+    return isinstance(value, str) and len(value) == 64 and _HEX64_MATCH(value) is not None
+
+
+# ---------------------------------------------------------------------------
+# Allocation-light record decoders for the per-batch hot path
+#
+# Each returns the decoded record for a well-formed wire value and ``None``
+# otherwise; the caller falls back to the original decode, which re-parses in
+# declaration order and raises the original error for the first bad field.
+# Construction bypasses ``__init__``/``__post_init__`` only where the fast
+# path itself enforces everything those validators check.
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=8192)
+def _interned_request_key(authority_id: int, session_id: int, epoch: int) -> RequestKey:
+    key = object.__new__(RequestKey)
+    object.__setattr__(key, "authority_id", authority_id)
+    object.__setattr__(key, "session_id", session_id)
+    object.__setattr__(key, "epoch", epoch)
+    return key
+
+
+def _fast_request_key(value: object) -> RequestKey | None:
+    if type(value) is not dict:
+        return None
+    authority_id = value.get("authority_id")
+    session_id = value.get("session_id")
+    epoch = value.get("epoch")
+    if (
+        type(authority_id) is int
+        and authority_id >= 0
+        and type(session_id) is int
+        and session_id >= 0
+        and type(epoch) is int
+        and epoch >= 0
+    ):
+        return _interned_request_key(authority_id, session_id, epoch)
+    return None
+
+
+def _fast_point_range(value: object) -> PointRange | None:
+    if type(value) is not dict:
+        return None
+    base_point = value.get("base_point")
+    max_points = value.get("max_points")
+    if type(base_point) is int and base_point >= 0 and type(max_points) is int and max_points >= 0:
+        point_range = object.__new__(PointRange)
+        object.__setattr__(point_range, "base_point", base_point)
+        object.__setattr__(point_range, "max_points", max_points)
+        return point_range
+    return None
+
+
+def _fast_shape_bound(value: object) -> ShapeBound | None:
+    if type(value) is not dict:
+        return None
+    raw_dims = value.get("dims", ())
+    kind = type(raw_dims)
+    if kind is not list and kind is not tuple:
+        return None
+    dims: list[DimBound] = []
+    device_dims = 0
+    for item in raw_dims:
+        if type(item) is not dict:
+            return None
+        tag = item.get("kind")
+        payload = item.get("value")
+        if tag == "static" and type(tag) is str:
+            if not (type(payload) is int and payload >= 0):
+                return None
+            dims.append(StaticDim(payload))
+        elif tag == "device" and type(tag) is str:
+            if type(payload) is not dict:
+                return None
+            bound = payload.get("max")
+            if not (type(bound) is int and bound >= 0):
+                return None
+            dims.append(DeviceDim(bound))
+            device_dims += 1
+        else:
+            return None
+    if device_dims > 1:
+        # Fall back so the original decode raises the canonical error.
+        return None
+    shape = object.__new__(ShapeBound)
+    object.__setattr__(shape, "dims", tuple(dims))
+    return shape
+
+
+def _fast_product_ref(value: object) -> ProductRef | None:
+    if type(value) is not dict:
+        return None
+    request_key = _fast_request_key(value.get("request_key"))
+    if request_key is None:
+        return None
+    producer_op_id = value.get("producer_op_id")
+    output_index = value.get("output_index")
+    generation = value.get("generation")
+    if not (
+        type(producer_op_id) is int
+        and producer_op_id >= 0
+        and type(output_index) is int
+        and output_index >= 0
+        and type(generation) is int
+        and generation >= 0
+    ):
+        return None
+    raw_kind = value.get("kind")
+    raw_storage = value.get("storage_class")
+    raw_dtype = value.get("dtype")
+    if type(raw_kind) is not str or type(raw_storage) is not str or type(raw_dtype) is not str:
+        return None
+    kind = _PRODUCT_KIND_BY_VALUE.get(raw_kind)
+    storage_class = _STORAGE_CLASS_BY_VALUE.get(raw_storage)
+    dtype = _DTYPE_BY_VALUE.get(raw_dtype)
+    if kind is None or storage_class is None or dtype is None:
+        return None
+    shape_bound = _fast_shape_bound(value.get("shape_bound"))
+    if shape_bound is None:
+        return None
+    point_range = _fast_point_range(value.get("point_range"))
+    if point_range is None:
+        return None
+    reference = object.__new__(ProductRef)
+    set_field = object.__setattr__
+    set_field(reference, "request_key", request_key)
+    set_field(reference, "producer_op_id", producer_op_id)
+    set_field(reference, "output_index", output_index)
+    set_field(reference, "generation", generation)
+    set_field(reference, "kind", kind)
+    set_field(reference, "storage_class", storage_class)
+    set_field(reference, "dtype", dtype)
+    set_field(reference, "shape_bound", shape_bound)
+    set_field(reference, "point_range", point_range)
+    return reference
+
+
+def _fast_product_refs(value: object) -> tuple[ProductRef, ...] | None:
+    kind = type(value)
+    if kind is not list and kind is not tuple:
+        return None
+    references: list[ProductRef] = []
+    for item in value:
+        reference = _fast_product_ref(item)
+        if reference is None:
+            return None
+        references.append(reference)
+    return tuple(references)
+
+
+def _fast_version_ref(value: object) -> VersionRef | None:
+    if type(value) is not dict:
+        return None
+    request_key = _fast_request_key(value.get("request_key"))
+    if request_key is None:
+        return None
+    producer_op_id = value.get("producer_op_id")
+    if not (type(producer_op_id) is int and producer_op_id >= 0):
+        return None
+    raw_point = value.get("point")
+    if type(raw_point) is not dict:
+        return None
+    tag = raw_point.get("kind")
+    payload = raw_point.get("value")
+    if type(tag) is not str or type(payload) is not dict:
+        return None
+    point: Point
+    if tag == "fixed":
+        point_index = payload.get("point_index")
+        semantic_digest = payload.get("semantic_digest")
+        if not (type(point_index) is int and point_index >= 0 and type(semantic_digest) is str):
+            return None
+        point = FixedPoint(point_index, semantic_digest)
+    elif tag == "device":
+        selected_point = _fast_product_ref(payload.get("selected_point"))
+        producer_plan_digest = payload.get("producer_plan_digest")
+        if selected_point is None or type(producer_plan_digest) is not str:
+            return None
+        point = DevicePoint(selected_point, producer_plan_digest)
+    else:
+        return None
+    reference = object.__new__(VersionRef)
+    object.__setattr__(reference, "request_key", request_key)
+    object.__setattr__(reference, "producer_op_id", producer_op_id)
+    object.__setattr__(reference, "point", point)
+    return reference
+
+
+def _fast_work(value: object) -> Work | None:
+    if type(value) is not dict:
+        return None
+    kind = value.get("kind")
+    mode = value.get("value")
+    if type(kind) is str and (mode is None or type(mode) is str) and (kind, mode) in _WORK_PAIR_INDEX:
+        work = object.__new__(Work)
+        object.__setattr__(work, "kind", kind)
+        object.__setattr__(work, "mode", mode)
+        return work
+    return None
+
+
+def _fast_bounds(value: object) -> Bounds | None:
+    if type(value) is not dict:
+        return None
+    max_points = value.get("max_points")
+    max_tokens = value.get("max_tokens")
+    max_kv_pages = value.get("max_kv_pages")
+    max_latent_bytes = value.get("max_latent_bytes")
+    max_completion_bytes = value.get("max_completion_bytes")
+    max_transfer_bytes = value.get("max_transfer_bytes")
+    if (
+        type(max_points) is int
+        and max_points >= 0
+        and type(max_tokens) is int
+        and max_tokens >= 0
+        and type(max_kv_pages) is int
+        and max_kv_pages >= 0
+        and type(max_latent_bytes) is int
+        and max_latent_bytes >= 0
+        and type(max_completion_bytes) is int
+        and max_completion_bytes >= 0
+        and type(max_transfer_bytes) is int
+        and max_transfer_bytes >= 0
+    ):
+        bounds = object.__new__(Bounds)
+        set_field = object.__setattr__
+        set_field(bounds, "max_points", max_points)
+        set_field(bounds, "max_tokens", max_tokens)
+        set_field(bounds, "max_kv_pages", max_kv_pages)
+        set_field(bounds, "max_latent_bytes", max_latent_bytes)
+        set_field(bounds, "max_completion_bytes", max_completion_bytes)
+        set_field(bounds, "max_transfer_bytes", max_transfer_bytes)
+        return bounds
+    return None
+
+
+def _fast_rng(value: object) -> Rng | None:
+    if type(value) is not dict:
+        return None
+    seed = value.get("seed")
+    semantic_index_base = value.get("semantic_index_base")
+    raw_layout = value.get("draw_layout")
+    if not (
+        type(seed) is int
+        and seed >= 0
+        and type(semantic_index_base) is int
+        and semantic_index_base >= 0
+        and type(raw_layout) is str
+    ):
+        return None
+    draw_layout = _DRAW_LAYOUT_BY_VALUE.get(raw_layout)
+    if draw_layout is None:
+        return None
+    rng = object.__new__(Rng)
+    object.__setattr__(rng, "seed", seed)
+    object.__setattr__(rng, "semantic_index_base", semantic_index_base)
+    object.__setattr__(rng, "draw_layout", draw_layout)
+    return rng
+
+
+def _fast_uints(value: object) -> tuple[int, ...] | None:
+    kind = type(value)
+    if kind is not list and kind is not tuple:
+        return None
+    for item in value:
+        if not (type(item) is int and item >= 0):
+            return None
+    return tuple(value)
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

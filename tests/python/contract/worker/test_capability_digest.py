@@ -1,0 +1,73 @@
+"""The worker capability wire reports the exact agreement digests.
+
+Admission requires that a worker's protocol-layout and route-capability digests
+match the canonical ones and that every party agrees. A missing or empty digest
+field yields a malformed capability record at the Rust boundary (a flatbuffer
+string with no terminator), so this test pins both digests, their canonical
+values, and the ``supported_work`` shape the capability handshake serializes.
+The live cross-language handshake is the GPU backstop; this guards the Python
+wire the bridge consumes so a blank digest can never regress silently.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from tests.python.fixtures.execution_worker import execution_worker
+from uniserve_worker import batch
+from uniserve_worker.batch import AdapterMode, WorkVariant
+from uniserve_worker.capabilities import EngineCaps
+from uniserve_worker.server.app import dispatch
+
+pytestmark = pytest.mark.contract
+
+
+def _is_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _recompute_route_digest(wire: dict) -> str:
+    return batch.route_capability_digest(
+        tuple(WorkVariant(value) for value in wire["supported_work"]),
+        wire["max_cfg_branches"],
+        wire["max_latent_size"],
+        wire["max_vae_grid_tokens"],
+        wire["max_vit_grid_tokens"],
+        AdapterMode(wire["adapter_mode"]),
+        wire["execution_constraints"]["max_batch_operations"],
+        wire["kv_dtype"],
+        wire["model_dtype"],
+        wire["attention_backend"],
+    )
+
+
+def test_capability_wire_carries_the_agreement_digests_and_work_shape():
+    worker = execution_worker()
+    wire = dispatch(worker, {"kind": "get_capabilities"})["capabilities"]
+
+    assert "supported_operation_types" not in wire
+    assert wire["supported_work"]
+    known = {variant.value for variant in WorkVariant}
+    assert all(value in known for value in wire["supported_work"])
+
+    assert _is_digest(wire["protocol_layout_digest"])
+    assert _is_digest(wire["route_capability_digest"])
+    assert wire["protocol_layout_digest"] == batch.protocol_layout_digest()
+    assert wire["route_capability_digest"] == _recompute_route_digest(wire)
+
+
+def test_capability_wire_round_trips_and_recomputes_stable_digests():
+    worker = execution_worker()
+    caps = worker.contract.capabilities
+
+    restored = EngineCaps.from_wire(caps.to_wire())
+
+    assert restored == caps
+    assert restored.protocol_layout_digest == batch.protocol_layout_digest()
+    assert restored.route_capability_digest == caps.route_capability_digest
+    assert _is_digest(restored.protocol_layout_digest)
+    assert _is_digest(restored.route_capability_digest)

@@ -16,8 +16,5 @@ uniserve-worker-wire.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
-[dev-dependencies]
-uniserve-testkit.workspace = true
-
 [lints]
 workspace = true

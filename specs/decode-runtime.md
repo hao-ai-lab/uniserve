@@ -1,6 +1,7 @@
 # Transactional asynchronous generation runtime RFC
 
 Status: Implementation-ready
+NOTE: EVERYTHING SHOULD BE IMPLEMENTED BEFORE MARKED AS DONE.
 
 ## Normative language
 
@@ -16,6 +17,47 @@ Sampling and speculative acceptance resolve on device. A successor may consume a
 
 A scheduler batch may contain Und and Gen partitions. Each partition is physically submitted under a declared execution capability and has independent readiness and accounting. Domain-homogeneous submission is universally valid. A route may use tensorized mixed submission only after proving that Gen rows cannot alter Und structure, state, or publication.
 
+## Background
+
+The serving decode path this protocol governs is host-paced today: a worker call returns after its sampled tokens are host-visible, the scheduler interprets each token before constructing the successor operation, and stop, grammar, Gen-trigger, and KV-publication decisions ride on that per-token host round trip. The evidence below establishes that this loop, not model compute, bounds serving throughput, and it fixes the constraints the protocol is designed against.
+
+### Fixed per-step cost bounds decode
+
+A concurrency-1 measurement on the SenseNova-U1 route records 8.67 ms per decode token with the model forward accounting for 0.38 ms of it, and per-token cost within 3% of its floor from 64 SMs to the full 152-SM device ([`green-context-sm-allocation.md`](green-context-sm-allocation.md)). The per-token bound is therefore per-step scheduling, launch, synchronization, and completion overhead rather than compute or memory bandwidth, and its relative weight grows as the model shrinks: an 8B text tower does not yield a proportional throughput advantage over Qwen3-32B.
+
+The current I2T operating points are 1698.3, 1728.8, and 1751.9 aggregate output token/s at [`r4`](../artifacts/benchmark/sensenova_u1_i2t/sensenova_beans_i2t/uniserve_r4/summary.md), [`r8`](../artifacts/benchmark/sensenova_u1_i2t/sensenova_beans_i2t/uniserve_r8/summary.md), and [`r16`](../artifacts/benchmark/sensenova_u1_i2t/sensenova_beans_i2t/uniserve_r16/summary.md). These are non-streaming responses with natural-EOS lengths, so they carry no TTFT or TPOT samples and are not model-efficiency comparisons against fixed-work ShareGPT text points.
+
+### Identical work separates on runtime structure alone
+
+Two Qwen3-32B ShareGPT `r8` runs execute the same 200-prompt workload on the same model, precision, and hardware and emit essentially identical output tokens (≈43.3k):
+
+| Execution structure | Output tok/s | Mean TPOT | Mean TTFT | Artifact |
+| --- | ---: | ---: | ---: | --- |
+| Host-paced per-token loop | 689.4 | 110.6 ms | 674.2 ms | [summary](../artifacts/benchmark/decode_runtime/qwen3_sharegpt/uniserve_r8/summary.md) |
+| Device continuation for the eligible greedy subset | 1345.2 | 17.1 ms | 89.4 ms | [summary](../artifacts/benchmark/runtime_qualification/qwen3_sharegpt/uniserve_r8/summary.md) |
+
+A 1.95x aggregate and 6.5x TPOT separation under identical emitted work is attributable to execution, completion, and scheduling structure, not to model kernels. At the measured 23.98 time-weighted active users, the 1345.2 aggregate corresponds to 56.1 output token/s per user.
+
+### Continuation currently covers only a deterministic greedy subset
+
+The scheduler queues a same-request successor against worker-local sampled-token state only when committing one token cannot change host control flow (`can_queue_decode_successor` and `device_token_relay_eligible` in `crates/engine/scheduler/src/scheduler.rs`): replayable non-Gen text with no grammar, no stop strings or stop-token IDs, temperature at most zero, zero min-tokens, no logprobs, no bad-word or allowed-token constraints, neutral penalties, no logit bias, and no token-conditional Gen trigger policy. The worker defers host token materialization only for plain-greedy rows without a KV-publication policy (`defer_host_token` in `uniserve_worker/execution/executor.py`), one non-deferrable row forces host finalization for its whole sampling group, and the stochastic and logprob sampler paths execute synchronous `.cpu().tolist()` on the request path. The SenseNova interleave workload samples at temperature 0.6, top-p 0.95, top-k 20, so stochastic, Gen, logprob, grammar, and publication-bearing requests all observe every token on the host before a successor exists.
+
+### Pipelining and burst loops are not continuity
+
+Worker call pipelining overlaps batches from different requests; it does not shorten one request's causal chain when the successor is constructed only after host interpretation of the predecessor, so device bubbles reappear at low concurrency, long sequences, and interleave. Amortizing the fixed cost with a worker-internal forward-sample loop reduces launch overhead but keeps sampling synchronous, hides per-operation completion from the host, and cannot place stop, grammar, cancellation, or Gen-transition decisions at exact points. The protocol therefore relays generation-tagged device products with per-operation completions instead of batching host round trips.
+
+### Interleave serializes twice
+
+A `gen_output` request is excluded from same-request continuation entirely, and a token-conditional publication policy disables worker-side token deferral, so Und decode ahead of a Gen transition observes every token on the host even though almost no token triggers the transition. KV publication snapshots the full committed prefix per layer on every publication, retains only the newest snapshot, and the same-node transport copies device memory to the host synchronously on the publishing thread (`publish` in `uniserve_worker/runtime/kv_store.py`, `ShmTransport.publish` in `uniserve_worker/runtime/transfer.py`). No destination watermark, incremental suffix, or producer-readiness event exists, and the host token read doubles as the publication's producer-completion barrier. Publication is therefore specified here as an independently fenced non-state operation with declared extents rather than as a deletable host read.
+
+### Mixed batches couple lifecycles before they contend for SMs
+
+On the interleave workload, 96–97% of flow operations share a forward with text rows; packed and exclusive admission are indistinguishable on aggregate throughput at every measured concurrency, packed token gaps inherit the denoise cadence, exclusive admission thins text batches and worsens per-request TPOT tails, and packed attention is measured not to be the dominant cost of sharing ([`mixed-batch-scheduling.md`](mixed-batch-scheduling.md)). The coupling that costs is lifecycle coupling: one batch-scoped completion, sampling groups that finalize together, and shared failure and backpressure. This protocol therefore gives Und and Gen independent completion, accounting, failure, and backpressure while retaining shared admission, and treats residual co-residency interference as a measured quantity; SM partitioning allocates compute only and cannot remove per-step host cost.
+
+### One protocol instead of per-workload fast paths
+
+Separate fast paths for greedy, stochastic, speculative, Gen, and distributed KV each carry a private lifecycle and cannot compose. The records and invariants in this RFC exist so the capabilities combine: stochastic sampling with speculative acceptance, token streaming with incremental KV publication, interleave with cancellation, distributed transport with exact versioning, and mixed admission with independent completion.
+
 ## Scope
 
 This RFC defines:
@@ -29,9 +71,10 @@ This RFC defines:
 - Client-observed TTFT, TPOT, image-latency, and modality-transition-latency semantics for interleaved output.
 - Mixed-service admission, physical execution capabilities, and interference accounting.
 - Single-process, tensor-parallel, staged, and disaggregated execution.
-- A checkpointed construction plan and a smoke-first performance-protection protocol.
 
-This RFC does not define Green Context sizing or SM placement. The runtime exposes the measurements and partition boundaries required to evaluate that architecture separately.
+This RFC does not define Green Context sizing or SM placement; the SM-budget measurements for that decision are recorded in [`green-context-sm-allocation.md`](green-context-sm-allocation.md). The runtime exposes the measurements and partition boundaries required to evaluate that architecture separately.
+
+The construction checkpoint sequence, staged cutover, validation economy, correctness qualification, and performance-protection gates for this runtime are defined in [`decode-runtime-construction.md`](decode-runtime-construction.md).
 
 ## Required outcomes
 
@@ -43,6 +86,7 @@ This RFC does not define Green Context sizing or SM placement. The runtime expos
 - Independent Und and Gen completion, accounting, backpressure, and publication even when both domains are admitted in one scheduler batch.
 - UEval exposes comparable latency distributions for first text, token progress, decoded images, and every visible text/image boundary.
 - End-to-end decode performance in the reference-parity band while preserving correctness and workload semantics.
+- One protocol serves greedy, stochastic, speculative, logprob, Gen, and interleave execution; no workload has a private fast path, and continuous-submission eligibility is a declared route capability.
 
 ## Feasibility basis
 
@@ -88,6 +132,7 @@ The following facts are fields rather than standalone classes:
 - Resolved, committed, and published positions are cursors in the scheduler request row.
 - A readiness fence is an event identifier stored in a product or resource entry.
 - Resource access ownership is a logical-reference count plus producer and reader event identifiers in the resource entry.
+- Backpressure state is one per-request credit vector whose dimensions are resource kinds.
 - A state family is the point-indexed output range of one operation.
 - Mixed execution is a capability value on a batch partition.
 - CPU processor state is scheduler-local state addressed by request and semantic point.
@@ -100,7 +145,7 @@ The following facts are fields rather than standalone classes:
 
 A state point is `(producer_op_id, point_index)`. For a token-producing operation, point `0` names the exact parent and points `1..K` name successive output prefixes. For a Gen operation, points name declared flow or transition boundaries. An operation that does not advance request state produces products rooted at its parent point.
 
-An operation plan digest covers immutable registration fields, including the exact identity of any device-resolved parent products. A semantic digest covers the fixed parent semantic digest, operation plan digest, selected point, and semantic output delta. The worker computes the semantic digest on the host from a ready pinned completion record; device continuation relies on exact producer, point-product, output-generation, and plan-digest identity and does not run a digest algorithm on the accelerator.
+The protocol uses exactly two digests. The operation plan digest names what an operation was registered to run: it covers immutable registration fields, including the exact identity of any device-resolved parent products. The semantic digest names what the operation's selected result was: it covers the fixed parent semantic digest, the operation plan digest, the selected point, and the semantic output delta. The worker computes the semantic digest on the host from a ready pinned completion record; device continuation relies on exact producer, point-product, output-generation, and plan-digest identity and does not run a digest algorithm on the accelerator.
 
 Scalar lengths, batch slots, page indices, and sequence numbers are accounting fields and MUST NOT serve as state identity.
 
@@ -195,7 +240,7 @@ ProductRef {
 
 The scheduler assigns the output index and logical generation from an acquired product credit, so a successor can name the product before its producer resolves. The worker product table binds the reference to `(store, slot, physical_generation, byte_offset, producer_event)` during atomic registration. The logical generation protects protocol-reference reuse; the independently checked physical generation protects slot reuse. Physical slot identities, tensors, and CUDA event objects remain worker-local.
 
-The generation is checked on registration, lookup, stream-wait insertion, completion packing, transfer submission, and reclamation. A stale generation is a protocol fault.
+The worker store's entry APIs check the generation on registration, lookup, stream-wait insertion, completion packing, transfer submission, and reclamation; no other module compares generations. A stale generation is a protocol fault.
 
 The producer records the table entry's producer event after every write that makes the product valid. A consumer resolves the reference, inserts a stream wait on that event, and records its own read-done event in the same store entry.
 
@@ -263,8 +308,8 @@ The scheduler's existing request/session state stores:
 - Registered operations and ordered controls.
 - CPU grammar, decoder, stop-string, and custom-processor states.
 - RNG coordinate allocation and token-processor deltas.
-- Output journal entries and client-delivery credits.
-- Execution, completion, KV, product, latent, transfer, CPU-task, and output credits.
+- Output journal entries.
+- The request credit vector.
 - Cancellation cutoff, terminal reason, and progress timestamps.
 
 The scheduler is the sole writer of semantic commit order and public event order.
@@ -321,6 +366,24 @@ A mutable shared table records a reader event for each consuming stream. When a 
 12. Resource exhaustion returns backpressure without partial registration, synchronous reclamation, or unbounded allocation.
 13. Every physical batch partition has independent completion, error, work, and performance accounting.
 14. Duplicate protocol delivery is idempotent; conflicting reuse of an identity is contained as a protocol fault.
+
+## Invariant enforcement
+
+Each invariant is enforced by a named chokepoint API, a closed type, or a static check rather than by per-module convention. Code that reaches protocol state only through these chokepoints cannot violate the corresponding invariant silently; a violation surfaces as a deterministic protocol fault, a rejected registration, or a build failure.
+
+| Enforcement point | Owner | Enforced invariants |
+| --- | --- | --- |
+| Operation planning and credit reservation | Scheduler | Exact parentage (2), RNG coordinate assignment (10), and atomic reservation with backpressure (12). |
+| Ordered control emission | Scheduler commit path | Single committed lineage (1), ancestor and control-sequence order (3), cursor immobility for non-state operations (4), public event order (5), CPU semantic gating (8), and close-cutoff dominance (9). |
+| Atomic registration transaction | Worker executor | Generation-tagged references with recorded producer events (6), no partial side effect on rejection (12), and duplicate idempotency with identity-conflict containment (14). |
+| Store entry APIs | Worker stores | Generation validation on every access (6) and producer- and reader-event-safe reuse (7). |
+| Submission boundary | Executor | Stream waits and reader-event registration for every input product, so consuming code cannot bypass invariants 6 and 7. |
+| Commit-rooted publication | Worker KV store and frontend output journal | Committed-only prefix-cache and remote visibility (11) and committed-root ordered public delivery (5). |
+| Partitioned batch structure | Scheduler batch and executor | Independent per-partition completion, error, work, and performance accounting (13). |
+| Closed protocol types | Protocol crates, FlatBuffers schema, and Python decoding | Exhaustive `work` and `Control` variants and bounded record layouts at compile and decode time. |
+| Forbidden-synchronization checks | Static analysis and runtime traces | The steady-state zero-blocking contract on every request-path call site. |
+
+Model, kernel, and frontend code interacts with the protocol only through these enforcement points; the invariant list specifies the chokepoints and is not a review checklist applied to every module.
 
 ## Steady-state zero-blocking contract
 
@@ -567,7 +630,7 @@ A route may declare tensorized mixed submission when a conformance proof establi
 - Batch permutation tests reproduce the serial oracle across all supported mixtures and shapes.
 - Interference measurements meet the declared service envelope.
 
-SenseNova production interleave requires the tensorized mixed capability because its parity target includes shared-batch execution. Qualification failure stops the mixed-execution checkpoint and requires an explicit resource-partitioning architecture decision; it cannot silently substitute domain-homogeneous calls in a passing candidate. Routes that do not declare tensorized mixed submission use domain-homogeneous physical calls while preserving joint admission, fairness, and accounting. The capability is route-static and does not introduce a per-request compatibility path.
+SenseNova production interleave requires the tensorized mixed capability because its parity target includes shared-batch execution. A failed tensorized-mixed qualification requires an explicit resource-partitioning architecture decision; it cannot be resolved by silently substituting domain-homogeneous calls in a passing candidate. Routes that do not declare tensorized mixed submission use domain-homogeneous physical calls while preserving joint admission, fairness, and accounting. The capability is route-static and does not introduce a per-request compatibility path.
 
 ### Service policy
 
@@ -601,7 +664,7 @@ Transfer failure leaves the source version authoritative and the destination ent
 
 ## Resource bounds and backpressure
 
-Admission reserves finite credits for:
+Admission reserves one finite credit vector per request. Its dimensions are:
 
 - Registered operations.
 - Execution and completion slots.
@@ -613,7 +676,7 @@ Admission reserves finite credits for:
 - CPU tasks.
 - Output journal bytes.
 
-Every route declares per-request and worker-wide maxima. Credits are acquired before operation registration and released by logical release plus event-safe physical reclamation.
+Every route declares per-request and worker-wide maxima for each dimension. The credit vector is acquired before operation registration and released by logical release plus event-safe physical reclamation; no resource kind has an independent reservation protocol.
 
 Credit exhaustion returns `WouldBlock`, reduces execution-window depth, or pauses admission. It cannot invoke a blocking wait, reuse a live generation, drop a semantic result, or grow an unbounded queue.
 
@@ -664,418 +727,18 @@ The design extends existing ownership areas and does not require a parallel runt
 
 The four protocol records are plain data carriers. Readiness queries, credit accounting, store reclamation, and ordered commit are methods on their owning modules rather than independently instantiated managers.
 
-## Performance mechanism priorities
+### Role protocol surface
 
-| Mechanism | Expected critical-path effect | Primary qualification evidence |
+Each contribution role uses a bounded protocol surface, and the owning runtime layers apply the rest of the protocol on its behalf.
+
+| Role | Protocol surface used directly | Applied by the runtime on its behalf |
 | --- | --- | --- |
-| Query-only pinned completion and separate execution/completion storage | Removes device-completion waits and completion-slot reuse waits from every text decode route; enables any-ready result handling. | Zero-sync trace, completion-ready-to-observed delay, Qwen3 and SenseNova I2T throughput. |
-| Device product relay and bounded execution window | Allows a request's next operation to consume sampled tokens, selected points, and lengths before host observation; fills bubbles without changing sampling semantics. | Positive continuation ratio, effective window depth, Qwen3 and I2T TPOT and output throughput. |
-| Common device sampler and branch-local token state | Extends zero-blocking behavior from greedy selection to stochastic sampling, logprobs, penalties, and speculative verification. | Sampling oracle, forbidden-sync count, per-mode continuation ratio. |
-| Prefix-addressable speculative state and exact KV extents | Lets acceptance, next draft work, and semantic rollback proceed without scalar length reads or full-prefix publication. | Acceptance work, KV extent counters, transfer bytes, speculative throughput. |
-| Future-based CPU continuations | Prevents grammar, stop-string, encoding, and transport latency from stalling the scheduler or unrelated requests. | Per-request suspension trace, runnable-request progress, commit-delay attribution. |
-| Independent Und/Gen batch partitions and bounded Gen quanta | Contains structural coupling and exposes queue and device interference while retaining shared admission and fairness. | UEval `c4` TTFT, TPOT, image latency, transition latency, default-travel `elapsed_s`, domain queue/device timing, and transition and step conformance. |
-
-Expected effects are design hypotheses until the named measurements validate them. A root-cause claim requires direct timing, trace, counter, or controlled-ablation evidence.
-
-## Staged cutover and rollback
-
-Each construction checkpoint changes one complete ownership boundary and leaves one canonical runtime path:
-
-- A protocol checkpoint changes Rust types, FlatBuffers, Python decoding, worker registration, stubs, simulator, and contract fixtures in one source tree.
-- A completion checkpoint changes submission, readiness, pinned storage, response serialization, and reclamation in one source tree.
-- A device-product checkpoint changes producer binding, consumer lookup, stream dependencies, reader events, graph slots, and reclamation in one source tree.
-- A semantic checkpoint changes sampler state, RNG, commit, cancellation, frontend journal, and corresponding serial-oracle properties in one source tree.
-- A KV or Gen checkpoint changes scheduler planning, worker state, stores, transfer, route execution, and conformance accounting in one source tree.
-
-A checkpoint does not retain a dormant alternative implementation, request-level mode selector, adapter, fallback, or cross-version session path. Its source tree either satisfies the boundary contract or is not eligible for acceptance.
-
-Scheduler and worker processes advertise one exact protocol-layout digest at startup. A deployment admits traffic only after all ranks, workers, and frontends agree on that digest and route-capability digest. Deployment drains active sessions before replacing a process whose digest changes; a session never crosses protocol layouts.
-
-Rollback selects the complete source and artifact set of the immediately preceding accepted checkpoint, drains active sessions, and restarts the matched scheduler, worker, frontend, and evaluator environment. No in-memory request or store entry is interpreted across checkpoint layouts. Because every checkpoint leaves configured routes usable and accepted artifacts immutable, rollback does not require a compatibility implementation in the runtime.
-
-Risk is bounded before expensive validation by compile-time exhaustiveness for every closed variant, protocol property tests for malformed and duplicate messages, CPU lifecycle simulation for ordering and capacity, and one-request route construction smokes. A failure at any layer stops progression at that layer; later checkpoints do not absorb an unresolved defect.
-
-## Construction checkpoints
-
-Every checkpoint preserves one runtime contract and leaves all configured routes usable. A checkpoint commit is eligible only after its correctness smoke and performance gate pass under the protocol in this RFC.
-
-One canonical runtime path serves all enabled modes after each checkpoint; checkpoint selection is not a runtime mode. Affected tests are derived from the invariants and observable properties listed here and avoid coupling acceptance to internal type names.
-
-### Checkpoint 1: Protocol and owned rows
-
-Deliver:
-
-- The four records and `Control` serialization.
-- The closed `work` algebra for every configured route.
-- Exact request, operation, point, generation, and digest validation.
-- Scheduler and worker row fields with single-writer ownership.
-- Atomic reserve and registration.
-- Depth-one execution of every configured route exclusively through the canonical operation protocol.
-
-Prove:
-
-- Duplicate delivery is idempotent.
-- Conflicting identities are contained.
-- Capacity failure has no partial side effect.
-- Existing routes preserve serial-oracle output.
-- Protocol-layout and route-capability digest disagreement prevents admission.
-
-### Checkpoint 2: Completion progress
-
-Deliver:
-
-- Separate execution and completion slots.
-- Pinned completion copies with query-only readiness.
-- Any-ready progress dispatch and combined scheduler wakeup.
-- Completion-slot generation validation.
-
-Prove:
-
-- Out-of-order global completion makes progress.
-- No request-path synchronization is observed.
-- Execution storage can retire independently from host completion storage.
-
-### Checkpoint 3: Device products and lifetime
-
-Deliver:
-
-- Generation-tagged product lookup.
-- Producer-event stream waits and reader-event registration.
-- Device parent and predicate consumption.
-- Event-safe reclamation for shared execution storage.
-
-Prove:
-
-- Same-request continuation occurs before parent host observation.
-- Stale generations fail deterministically.
-- Delayed consumers cannot observe reused storage.
-
-This checkpoint closes the first major integration boundary.
-
-### Checkpoint 4: Sampling and token state
-
-Deliver:
-
-- Common device sampler for supported greedy and stochastic modes.
-- Deterministic semantic RNG coordinates.
-- Branch-local token-processor deltas and logprob products.
-- Device finish and invalid-distribution handling.
-
-Prove:
-
-- Depth-one and pipelined runs match the serial oracle.
-- Batch permutation, window depth, and completion order do not change committed output.
-- Every supported sampling mode avoids host scalar extraction.
-
-### Checkpoint 5: Execution window and CPU continuations
-
-Deliver:
-
-- Bounded window admission and device predicates.
-- Grammar, stop-string, decoder, and custom-processor futures.
-- Ordered semantic and public cursors.
-- Cancellation and output-credit backpressure.
-
-Prove:
-
-- A slow CPU continuation stalls only its lineage.
-- Stop-string rollback selects an exact prefix.
-- Cancellation cannot publish or reclaim beyond its cutoff.
-- Slow clients do not retain execution slots.
-
-This checkpoint closes the second major integration boundary.
-
-### Checkpoint 6: Speculation and KV
-
-Deliver:
-
-- Device acceptance, selected point, accepted span, and continuation products.
-- Prefix-indexed token state and exact rollback.
-- KV reserved, initialized, visible, committed, and published extents.
-- Incremental immutable publication and exact-base validation.
-
-Prove:
-
-- Ordinary and speculative modes share sampling semantics.
-- Accepted prefixes and KV views match the serial oracle.
-- Rejected bytes never become semantic or remotely visible.
-- Publication overlaps execution without request-path synchronization.
-
-### Checkpoint 7: Gen, interleave, and batch partitions
-
-Deliver:
-
-- Gen transition, bounded flow quantum, latent ownership, and artifact materialization operations.
-- Generated-image feedback through exact parent references.
-- Scheduler batch partitions with independent completion and accounting.
-- Tensorized mixed capability and interference proof for SenseNova production interleave and every other route that declares it.
-- Server-side visible-modality public-commit timing correlated with the client-observed transition samples.
-
-Prove:
-
-- Repeated Und/Gen travel preserves transition, step, image, and token invariants.
-- Gen and Und failures, backpressure, and completion remain independent.
-- Batch composition does not alter Und output or Gen quality.
-- Interference is attributable to queue, launch, kernel, completion, and commit phases.
-- SenseNova tensorized mixed submission meets its service envelope or the checkpoint stops for an explicit resource-partitioning architecture decision.
-- Every conforming UEval transition has an unambiguous client timestamp pair, and the benchmark reports TTFT, TPOT, image latency, and transition latency with complete sample coverage.
-
-This checkpoint closes the third major integration boundary.
-
-### Checkpoint 8: Topology and recovery
-
-Deliver:
-
-- Tensor-parallel collective identity and sampling ownership.
-- Staged and disaggregated exact-base transport.
-- Preemption checkpoints and exact replay where supported.
-- Worker, transfer, CPU-future, and cancellation failure handling.
-
-Prove:
-
-- All ranks agree on selected point and digest.
-- Gap, stale epoch, digest conflict, and close-cutoff violations are rejected.
-- Recovery cannot expose ambiguous state.
-- Resource bounds hold during failure and cancellation storms.
-
-This checkpoint closes production qualification.
-
-## Validation economy
-
-Long model tests and benchmarks are scarce measurement operations. Validation is staged so inexpensive checks reject a bad candidate before a server launch or artifact-producing run, and successful evidence is retained until a subsequent change actually invalidates it.
-
-Formal benchmark suites are checkpoint acceptance operations rather than the first mechanism used to discover construction errors. Intermediate edits use static checks, affected CPU tests, and the smallest route-specific smoke that exercises the changed path. A route smoke is eligible only after the checkpoint's substantive runtime deliverables are integrated, and the fixed performance suite runs once for that candidate after every required smoke passes.
-
-### Measurement prerequisite
-
-Before generating the first formal anchor, `uniserve_eval` extends its existing `RequestRecord` and interleave summary with ordered `(modality, client_timestamp)` observations derived from the already stamped SSE events. The summary computes aggregate and directional transition-latency distributions, timestamp coverage, and per-request modality-segment signatures without introducing a parallel benchmark path.
-
-Synthetic SSE fixtures with fixed timestamps prove same-modality segment coalescing, text-to-image and image-to-text direction, one sample per boundary, nonnegative latency, mixed-modality ambiguity rejection, and complete serialization into request, summary, and comparison artifacts. These checks require no model or GPU.
-
-After the synthetic checks pass, one interleave route smoke uses the first seed-42 MJHQ prompt from dataset revision `15b0a659e066e763d0e9a6cd8f00e25f8af5e084` at `c1`, one image, 4,096 maximum completion tokens, 2,048×1,152 output, and 50 denoise updates. The smoke verifies that all visible events receive timestamps and that a conforming request yields the expected number of transition samples. The formal 32-prompt UEval `c4` anchor remains a distinct workload and runs only after this smoke. Transition counts, E2E time, image latency, or server phase timing cannot substitute for the client-observed transition-latency metric.
-
-The frozen latency-definition digest becomes part of every anchor and candidate artifact. A change to event classification, segment construction, clock source, formula, aggregation, or missing-sample policy defines a different measurement protocol and requires a separately qualified anchor.
-
-### Candidate identity
-
-Every validation artifact records:
-
-- Source parent commit and exact candidate-tree digest.
-- Model and tokenizer asset digests.
-- Dataset and prompt-selection digest.
-- Runtime, driver, CUDA, compiler, and dependency versions.
-- GPU type, count, topology, clocks, power policy, and free-memory preflight.
-- Server and harness profile IDs and all resolved arguments.
-- Precision, quantization, cache, prefix-cache, sampling, image-quality, and seed settings.
-- Warmup count, measured-run count, request count, arrival or concurrency semantics, and timeout.
-- Work counters and failure counts.
-- Client clock source, latency-definition digest, transition timestamp coverage, and per-request modality-segment signatures for interleaved workloads.
-
-An artifact missing any required provenance or work invariant is invalid and cannot enter a baseline or gate.
-
-The checkpoint commit tree MUST equal the candidate-tree digest recorded by its accepted gate. Any executable change after the gate invalidates the result.
-
-### Baselines
-
-The first checkpoint candidate is constructed and passes all static, CPU, and route smokes before any formal anchor work begins. At first-checkpoint acceptance, an immutable parent source tree produces the pinned anchor under the fixed protocol, followed by the immutable candidate tree; the two source trees use the same evaluator, model assets, dataset rows, environment, profiles, and hardware. An existing artifact may serve as the anchor only when it already satisfies every provenance and protocol requirement in this RFC. Each accepted checkpoint becomes the previous-checkpoint comparator.
-
-Every candidate is compared with both:
-
-- The immutable anchor, which prevents cumulative drift.
-- The immediately preceding accepted checkpoint, which localizes a regression.
-
-The anchor is never replaced by a slower candidate. A baseline and candidate must match hardware, model assets, prompts, workload semantics, cache settings, quality controls, and metric definitions. A protocol change requires an independently named qualification run and cannot be spliced into the existing series.
-
-Reference-system runs are not repeated for every checkpoint. They are executed at reference qualification boundaries under the aligned protocol. Checkpoint protection compares UniServe with pinned UniServe artifacts.
-
-### Smoke ladder
-
-The following levels run in order:
-
-1. Static and targeted checks validate serialization, bounds, ownership, forbidden synchronization sites, imports, kernels, and affected unit properties without loading a model.
-2. Environment preflight validates model assets, datasets, GPU health and idleness, memory headroom, ports, profile expansion, output capacity, and the absence of stale benchmark processes.
-3. Route smoke starts one server and submits one bounded representative request at a time with no benchmark warmup; it validates route construction, output shape, work counters, completion progress, trace visibility, and zero failures.
-4. The checkpoint performance suite runs only after all relevant route smoke passes.
-5. The major-boundary suite runs only after the checkpoint suite passes at a declared integration boundary.
-
-Smoke output is diagnostic and never substitutes for a formal benchmark or correctness gate. The smoke workload may use smaller bounded work to expose construction, shape, memory, completion, and protocol failures quickly; the formal profile remains unchanged.
-
-SenseNova text, image, and interleave smokes SHOULD reuse one healthy server sequentially when their fixed profile permits it. Formal measurement points use a fresh server.
-
-Before starting a long test, route smoke, or benchmark, the runner records the exact affected-scope manifest: source paths and runtime capabilities exercised, required static and CPU checks, route smokes, and downstream formal points. Each smoke point is an independent evidence unit. A failure stops the sequence immediately; the failure is diagnosed and repaired before any further expensive point runs.
-
-A successful smoke remains valid when a later failure or repair does not affect its source dependency footprint, model assets, profile, hardware, runtime settings, or exercised capability. A repair invalidates exactly the static checks, CPU tests, smokes, and formal points whose declared dependency footprint intersects the change. Shared scheduler, protocol, executor, sampler, KV, model-runner, or transport changes may invalidate multiple routes, but the invalidated set MUST be stated explicitly from the dependency footprint. The runner MUST NOT restart the complete smoke ladder merely because a later smoke failed.
-
-The same affected-scope rule applies to long correctness tests. A failed test is followed by diagnosis and a source correction, then the smallest targeted check that exercises the correction; already successful unrelated long tests are not repeated.
-
-### Retry discipline
-
-Automatic retry count is zero for smoke, correctness gates, and benchmarks.
-
-On crash, timeout, invalid output, work-count mismatch, server health failure, or missing provenance:
-
-1. Stop the suite immediately.
-2. Preserve logs and the invalid artifact.
-3. Diagnose and repair the root cause.
-4. Derive the invalidated evidence set from the repair's dependency footprint.
-5. Run the cheapest relevant static check, affected CPU test, and smallest affected route smoke.
-6. Resume formal execution only at invalidated points; retain successful unaffected evidence.
-
-An unchanged candidate is never rerun to seek a passing result. A valid threshold failure triggers profiling and a code or configuration correction before another formal run.
-
-One explicitly authorized confirmation run is the maximum for a valid but surprising result. It is diagnostic, retains both artifacts, and cannot replace the first result to create an acceptance pass. Crash, timeout, and invalid-artifact failures are not eligible for confirmation reruns.
-
-All artifact-producing points run serially with at most one benchmark server and one harness process. The point order is fixed in the run manifest before results are observed and is chosen using prior cost estimates so cheap failure detection precedes expensive work.
-
-## Checkpoint performance protection
-
-Immediately before every implementation checkpoint commit, the candidate runs the fixed Qwen3 32B arrival-rate point and the highest declared SenseNova T2I and I2T concurrency points. `r16` is an open-loop request-rate point; `c32` is a closed-loop concurrency point.
-
-| Route | Canonical profile | Point | Fixed work | Required performance metrics |
-| --- | --- | --- | --- | --- |
-| Qwen3 32B ShareGPT | `qwen3_sharegpt_uniserve` | `r16` | 200 prompts under the profile's open-loop arrival process | Aggregate output token/s, mean TTFT, mean TPOT |
-| SenseNova T2I MJHQ | `sensenova_mjhq_t2i_uniserve` | `c32` | 32 prompts at client concurrency 32 | Images/s |
-| SenseNova I2T Beans | `sensenova_beans_i2t_uniserve` | `c32` | 32 prompts at client concurrency 32 | Aggregate output token/s |
-
-Every point also requires zero failed requests and exact profile-defined work and output validity. Correctness, work count, image validity, and protocol integrity have zero performance grace.
-
-For a metric where larger is better:
-
-```text
-regression = max(0, 1 - candidate / baseline)
-```
-
-For a metric where smaller is better:
-
-```text
-regression = max(0, candidate / baseline - 1)
-```
-
-The classification is:
-
-- `target-pass`: every required metric has regression at most `5%` against both the anchor and previous checkpoint.
-- `grace-pass`: every required metric has regression at most `7%`, representing the `5%` target plus `2` percentage points of measurement grace, and at least one metric exceeds `5%`.
-- `block`: any required metric exceeds `7%`, or any correctness, work, validity, or provenance requirement fails.
-
-A `grace-pass` may establish a checkpoint but cannot weaken the anchor. Its exact metrics and attribution status remain visible, and the next major integration boundary must return to `target-pass`. The 2-point grace replaces repeat-until-stable behavior; it does not justify extra measured runs.
-
-The checkpoint commit is created only after the triplet has a valid `target-pass` or `grace-pass`. If a point blocks, remaining expensive points do not run until diagnosis and repair.
-
-## Major-boundary performance protection
-
-After checkpoints 3, 5, and 7, and at production qualification after checkpoint 8, run the following after the checkpoint triplet:
-
-| Route | Canonical profile | Point | Required evidence |
-| --- | --- | --- | --- |
-| SenseNova default travel | `gate/sensenova/default-travel` | One fixed request | Correct multimodal travel, four generated images, 200 image steps, configured dimensions and quality checks, zero failures, and `elapsed_s` |
-| SenseNova UEval interleave | `sensenova_ueval_interleave_uniserve` | 32 prompts at `c4` | Profile-defined visible-text, decoded-image, and modality-transition conformance; 100% transition timestamp coverage; matching per-request token/image/step work and modality-segment signatures; zero failures; mean TTFT; mean TPOT; mean image latency; overall and directional mean transition latency; and complete latency distributions |
-
-The default-travel gate uses its declared SenseNova server topology and has its own anchor. It is not compared directly with the single-GPU throughput profiles.
-
-The same `5%` target and `7%` hard boundary apply to the four UEval latency families and every available transition direction against both anchor and previous major-boundary artifacts. Correctness, timestamp coverage, modality signature, and work invariants allow no grace.
-
-These suites run at named integration boundaries because they are end-to-end and expensive. They are not repeated for documentation-only changes or for a checkpoint whose executable critical path is byte-identical to the already validated candidate.
-
-### UEval latency contract
-
-UEval latency uses the benchmark client's monotonic `perf_counter` clock. Every received SSE event is timestamped before parsing or deferred processing can reorder it.
-
-A visible text event contains non-empty content or reasoning text. A visible image event carries at least one image that subsequently decodes and satisfies the profile's format and dimension requirements. Consecutive visible events of the same modality form one modality segment.
-
-A transition is a pair of adjacent modality segments with different modalities. Its source timestamp is the last visible event timestamp in the source segment, its destination timestamp is the first visible event timestamp in the destination segment, and its latency is `destination_timestamp - source_timestamp`.
-
-The request-to-first-segment interval is not a transition: request-to-first-text is TTFT, while request-to-image receipt contributes to image latency. The final-segment-to-terminal interval is request E2E rather than transition latency. An SSE event containing both visible text and image has ambiguous intra-event order and makes that request invalid for transition-latency qualification.
-
-The four primary UEval latency families are:
-
-- TTFT: request send to the first visible text event, averaged over all 32 conforming requests.
-- TPOT: the canonical `(request E2E - TTFT) / (server-reported completion tokens - 1)` per request, averaged over requests with at least two completion tokens. This user-observed metric includes image and transition stalls after the first text token; transition latency provides the boundary attribution.
-- Image latency: request send to each successfully decoded image event, averaged over all decoded images.
-- Transition latency: the client-observed gap for every text-to-image or image-to-text boundary, averaged over all transitions.
-
-The artifact reports count, mean, standard deviation, minimum, p50, p90, p95, p99, and maximum for each family. Transition latency is reported both as one aggregate distribution and as separate text-to-image and image-to-text distributions. The `5% + 2` performance classification applies to each primary mean and to each directional mean whose baseline sample count is nonzero; tail distributions remain mandatory diagnostic evidence.
-
-A valid comparison requires 32 successful conforming requests, server-reported token counts sufficient for TPOT, a client timestamp for every visible modality event, a nonnegative latency for every boundary, and the same per-request token count, decoded-image count, image-step count, and ordered modality-segment signature in candidate and baseline. A missing timestamp, ambiguous mixed-modality event, changed work or signature, missing primary metric, image sample-count mismatch, or transition sample-count mismatch invalidates the point rather than silently dropping samples.
-
-Total elapsed time, text output token/s, images/s, transition counts, token counts, image counts, and image steps remain required work and capacity evidence for UEval, but the four latency families are its major-boundary performance gate.
-
-## Correctness qualification
-
-### Serial oracle
-
-For every supported feature combination, compare committed output with a depth-one serial execution using identical model, precision, processor order, RNG coordinates, cache state, image controls, and prompts.
-
-Required comparisons include:
-
-- Greedy, temperature, top-k, top-p, min-p, penalties, forced tokens, bad words, EOS, and logprobs.
-- Ordinary and speculative decoding.
-- Grammar, stop tokens, stop strings spanning token boundaries, and custom processor suspension.
-- Cancellation before submission, during execution, after resolution, during CPU continuation, during transfer, and during public delivery.
-- Prefix-cache hit and miss, KV publication, destination installation, and immutable replica reuse.
-- Und-only, Gen-only, and repeated Und/Gen travel.
-- UEval visible-modality order and transition signature under the fixed 32-prompt `c4` workload.
-- Domain-homogeneous and any qualified tensorized mixed execution.
-- Single-GPU, tensor-parallel, staged, and disaggregated routes.
-
-### Protocol properties
-
-Property and stress tests verify:
-
-- Parent and control order under out-of-order completion.
-- Duplicate delivery and conflicting identity handling.
-- Generation wrap protection and stale-reference rejection.
-- Atomic reserve/register failure.
-- Predicated descendant no-op behavior.
-- Reader-event-safe reclamation.
-- Bounded queues under slow CPU, transport, and client consumers.
-- Prefix-point rollback and output-journal byte rollback.
-- Close dominance over queued descendants.
-- Deterministic replay from an exact checkpoint.
-- Transition extraction produces exactly one nonnegative sample per adjacent unequal-modality segment pair and preserves direction.
-
-### Zero-sync proof
-
-Static checks cover all request-path call sites for forbidden synchronization and scalar materialization. Runtime traces cover scheduler, executor, sampler, model route, KV, transfer, completion, frontend, metrics, and error paths.
-
-The runtime gate requires:
-
-- Zero forbidden synchronization detections in steady state.
-- Positive same-request device continuation for an eligible route.
-- No global FIFO completion stall.
-- No pageable D2H completion copy.
-- No synchronous reclamation or transfer wait.
-- CPU-only features suspend only the affected request.
-
-## Reference and scaling qualification
-
-Reference comparison aligns model weights, tensor parallelism, precision, prompts, preprocessing, cache behavior, sampling, arrival or concurrency semantics, warmup, maximum tokens or image steps, and metric definitions. Any unaligned capability is an explicit limitation and invalidates a parity claim.
-
-For Qwen3 32B ShareGPT, production qualification reports aggregate and per-GPU output token/s, per-user output token/s, TTFT, TPOT, work, and failures for UniServe and SGLang. The target is at least `95%` of aligned SGLang aggregate output token/s without violating correctness or latency gates.
-
-For SenseNova I2T, production qualification reports `r4`, `r8`, and `r16` aggregate, per-GPU, and per-user output token/s, together with TTFT, TPOT, realized arrival rate, active-user occupancy, work, and failures.
-
-Per-GPU throughput is aggregate output token/s divided by the GPUs assigned to that measured server. Per-user throughput is aggregate output token/s divided by the time-weighted mean number of active text-generation users; configured rate or concurrency is not used as a substitute for observed occupancy.
-
-SenseNova T2I reports aggregate and per-GPU image throughput, image latency, steps, and failures under its canonical profile. UEval reports TTFT, TPOT, image latency, overall and directional transition latency, complete distributions, throughput, steps, transitions, modality signatures, timestamp coverage, and failures under its canonical profile. Quality controls and step counts remain fixed.
-
-## Performance attribution
-
-A failed performance gate is profiled before implementation changes are selected. Attribution separates:
-
-- Scheduler queue and wakeup delay.
-- Host launch and Python overhead.
-- Device model, sampler, acceptance, KV, Gen, and copy-stream time.
-- Completion-ready to host-observed delay.
-- Host-observed to semantic-commit delay.
-- Semantic to public-delivery delay.
-- Transfer and replica installation.
-- CPU grammar, decoding, encoding, and serialization.
-- Memory pressure, reclamation lag, and predicated wasted work.
-- Und/Gen co-residency and partition interference.
-- Text-to-image transition time split into Gen admission, flow execution, materialization, encoding, public commit, and client delivery.
-- Image-to-text transition time split into artifact installation, feedback encoding, KV extension, Und scheduling, first-token execution, public commit, and client delivery.
-
-Root-cause claims require direct timing, trace, counter, or controlled-ablation evidence. Metric-derived symptoms, plausible mechanisms, and unvalidated targets are labeled separately.
+| Model route author | `work` variant semantics, declared input and output products, and the route capability declaration. | Generation checks, stream waits, event recording, registration, credits, and controls. |
+| Kernel and sampler author | Device tensor layouts, bounded shape contracts, and RNG coordinate mapping. | Protocol records, events, and lifetime state. |
+| Scheduler contributor | `Operation`, `VersionRef`, `Control`, the credit vector, and request-row cursors. | Physical slots, CUDA events, and device storage binding. |
+| Worker runtime contributor | Store-entry fields, generations, producer and reader events, registration, and reclamation. | Semantic commit order and public event order. |
+| Frontend contributor | Output journal entries, per-request commit order, and output credits. | Device state, product lifetime, and KV state. |
+| Evaluator contributor | Client-visible events, artifacts, and metric definitions. | Every runtime record and owned table. |
 
 ## Risks and containment
 
@@ -1090,23 +753,16 @@ Root-cause claims require direct timing, trace, counter, or controlled-ablation 
 | Gen monopolizes the device. | Bounded flow quanta, work-normalized deficit, age and deadline input, and per-domain admission. |
 | Completion processing becomes a scheduler bottleneck. | Any-ready queries, bounded drain budgets, separate arenas, and lifecycle delay metrics. |
 | Distributed peers disagree on state. | Exact base version, digest, contiguous extent, epoch validation, and all-rank completion agreement. |
-| Benchmark noise hides drift. | Immutable anchor plus previous-point comparison, a fixed 5% target and 2-point grace, one measured run, and no result-seeking retries. |
-| Transition samples are ambiguous or compositionally different. | Per-event monotonic timestamps, explicit segment construction, directional distributions, 100% coverage, and exact per-request modality-signature matching. |
-| Expensive validation discovers trivial failures late or repeats unaffected evidence. | Static checks, environment preflight, one-request route smoke, affected-scope invalidation, and serial formal points in a fixed cost-aware order. |
 
 ## Acceptance
 
 The runtime is accepted when:
 
 - The four-record protocol and owned table fields cover every configured generation route without a parallel transaction or lifecycle hierarchy.
-- Every correctness and protocol property passes for supported sampling, speculation, KV, Gen, interleave, cancellation, topology, and failure combinations.
+- Every correctness and protocol property defined in [`decode-runtime-construction.md`](decode-runtime-construction.md) passes for supported sampling, speculation, KV, Gen, interleave, cancellation, topology, and failure combinations.
 - Runtime evidence shows zero steady-state blocking host/device observation.
 - Eligible routes demonstrate same-request continuation through device products.
 - CPU-only continuations suspend one lineage without blocking scheduler progress.
 - Storage remains bounded and generation-safe under delayed completion, cancellation, slow clients, slow CPU work, transfer backpressure, and mixed service.
-- The UEval measurement prerequisite is qualified before its anchor, with complete event timestamps, deterministic segment construction, and aggregate plus directional transition-latency output.
-- Every construction checkpoint satisfies Qwen3 ShareGPT `r16`, SenseNova T2I `c32`, and SenseNova I2T `c32` protection before its commit.
-- Every major integration boundary satisfies SenseNova default-travel end-to-end time and the SenseNova UEval 32-prompt `c4` TTFT, TPOT, image-latency, and transition-latency protection gates.
-- Reference-aligned Qwen3 32B ShareGPT throughput reaches the declared parity target.
-- SenseNova I2T `r4`, `r8`, and `r16` reports include aggregate, per-GPU, and per-user throughput with valid work and occupancy accounting.
-- Benchmark artifacts are serial, provenance-complete, smoke-preceded, free of automatic retries, and contain only canonical valid runs.
+
+Checkpoint eligibility, performance protection, and benchmark acceptance for each construction stage are governed by [`decode-runtime-construction.md`](decode-runtime-construction.md).

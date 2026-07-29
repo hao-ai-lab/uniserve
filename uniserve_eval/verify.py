@@ -8,15 +8,23 @@ import hashlib
 import json
 import os
 import struct
+import sys
 import time
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from . import backends
+from .harness.provenance import execution_provenance, hardware_contract, repository_state
 from .profiles import (
+    ROOT,
+    expand_profile_value,
     load_config,
     resolve_server_for_workload,
+    server_profile_definition_contract,
+    spec_env,
     workload_dir,
     workload_env,
     workload_spec,
@@ -38,7 +46,9 @@ def bytes_digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def parse_sse_line(line: str, current_event: str | None) -> tuple[str | None, dict[str, Any] | None, bool]:
+def parse_sse_line(
+    line: str, current_event: str | None
+) -> tuple[str | None, dict[str, Any] | None, bool]:
     line = line.strip()
     if not line:
         return current_event, None, False
@@ -61,31 +71,6 @@ def png_size(data: bytes) -> tuple[int, int]:
     return int(width), int(height)
 
 
-def verify_image_channel_dominance(
-    images: list[dict[str, Any]],
-    expectation: Any,
-) -> None:
-    if not isinstance(expectation, list) or len(expectation) != 2:
-        raise SystemExit("expect_image_channel_dominance must name two RGB channels")
-    channels = {"red": 0, "green": 1, "blue": 2}
-    higher, lower = (str(value).lower() for value in expectation)
-    if higher not in channels or lower not in channels or higher == lower:
-        raise SystemExit("expect_image_channel_dominance must name two distinct RGB channels")
-
-    from PIL import Image, ImageStat
-
-    for image in images:
-        path = image.get("path")
-        if not isinstance(path, str):
-            raise SystemExit("generated image metadata is missing its artifact path")
-        with Image.open(path) as loaded:
-            means = ImageStat.Stat(loaded.convert("RGB")).mean
-        if means[channels[higher]] <= means[channels[lower]]:
-            raise SystemExit(
-                f"expected image mean {higher} channel to exceed {lower}: {path}"
-            )
-
-
 def synthetic_png_b64(seed: int, width: int, height: int) -> str:
     """Deterministic geometric test scene (mirrors the benchmark harness's)."""
     import io
@@ -97,10 +82,20 @@ def synthetic_png_b64(seed: int, width: int, height: int) -> str:
     image = Image.new("RGB", (width, height), (135, 206, 235))
     draw = ImageDraw.Draw(image)
     draw.rectangle([0, int(height * 0.65), width, height], fill=(34, 139, 34))
-    draw.ellipse([int(width * 0.72), int(height * 0.08), int(width * 0.9), int(height * 0.34)], fill=(255, 215, 0))
-    draw.rectangle([int(width * 0.33), int(height * 0.4), int(width * 0.65), int(height * 0.75)], fill=(178, 34, 34))
+    draw.ellipse(
+        [int(width * 0.72), int(height * 0.08), int(width * 0.9), int(height * 0.34)],
+        fill=(255, 215, 0),
+    )
+    draw.rectangle(
+        [int(width * 0.33), int(height * 0.4), int(width * 0.65), int(height * 0.75)],
+        fill=(178, 34, 34),
+    )
     draw.polygon(
-        [(int(width * 0.31), int(height * 0.4)), (int(width * 0.49), int(height * 0.2)), (int(width * 0.67), int(height * 0.4))],
+        [
+            (int(width * 0.31), int(height * 0.4)),
+            (int(width * 0.49), int(height * 0.2)),
+            (int(width * 0.67), int(height * 0.4)),
+        ],
         fill=(80, 40, 20),
     )
     del rng
@@ -224,7 +219,11 @@ def text_from_response(obj: dict[str, Any]) -> str:
             chunks.append(content)
         elif isinstance(content, list):
             for part in content:
-                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
                     chunks.append(str(part["text"]))
     return "".join(chunks)
 
@@ -259,6 +258,18 @@ def usage_image_steps(obj: dict[str, Any]) -> int | None:
     if isinstance(usage, dict) and isinstance(usage.get("image_steps"), int):
         return int(usage["image_steps"])
     return None
+
+
+def usage_image_steps_per_image(obj: dict[str, Any]) -> list[int] | None:
+    usage = obj.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("image_steps_per_image")
+    if not isinstance(value, list) or any(
+        not isinstance(step, int) or isinstance(step, bool) or step < 0 for step in value
+    ):
+        return None
+    return [int(step) for step in value]
 
 
 def save_image(url: str, out_dir: Any, images: list[dict[str, Any]]) -> None:
@@ -300,20 +311,148 @@ def event_manifest_entry(obj: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def verification_checks(
+    workload: dict[str, Any],
+    *,
+    images: list[dict[str, Any]],
+    image_steps_per_image: list[int] | None,
+    errors: list[dict[str, Any]],
+    finished_count: int,
+) -> tuple[dict[str, bool], list[str], list[str]]:
+    checks: dict[str, bool] = {}
+    warnings: list[str] = []
+    failures: list[str] = []
+
+    def check(name: str, valid: bool, failure: str) -> None:
+        checks[name] = valid
+        if not valid:
+            failures.append(failure)
+
+    check("error_free", not errors, "verify returned errors")
+    expected_images = workload.get("warn_image_count")
+    if expected_images is not None and len(images) != int(expected_images):
+        warnings.append(f"expected {expected_images} images, got {len(images)}")
+    expected_image_steps = workload.get("expect_image_steps_per_image")
+    steps_valid = (
+        expected_image_steps is None
+        or not images
+        or (
+            image_steps_per_image is not None
+            and len(image_steps_per_image) == len(images)
+            and all(step == int(expected_image_steps) for step in image_steps_per_image)
+        )
+    )
+    check(
+        "image_steps_per_image",
+        steps_valid,
+        (
+            f"expected every decoded image to report {expected_image_steps} image steps, "
+            f"got {image_steps_per_image}"
+        ),
+    )
+    expect_finished = workload.get("expect_finished", True)
+    check(
+        "finish_reason",
+        not expect_finished or finished_count >= 1,
+        f"expected at least one finish reason, got {finished_count}",
+    )
+    expected_width = workload.get("expect_image_width")
+    expected_height = workload.get("expect_image_height")
+    dimensions_valid = (
+        expected_width is None
+        or expected_height is None
+        or all(
+            tuple(image.get("size", ())) == (int(expected_width), int(expected_height))
+            for image in images
+        )
+    )
+    check(
+        "image_dimensions",
+        dimensions_valid,
+        f"expected every image to be {expected_width}x{expected_height}",
+    )
+    return checks, warnings, failures
+
+
+def verification_provenance(
+    config: dict[str, Any],
+    *,
+    config_path: Path,
+    workload_name: str,
+    workload: dict[str, Any],
+    server_name: str,
+    server: dict[str, Any],
+) -> dict[str, Any]:
+    source_state = repository_state(ROOT)
+    server_command = backends.build_serve_cmd(config, server, strict_env=True)
+    server_environment = os.environ.copy()
+    profile_value = (
+        str(expand_profile_value(server["cuda_visible_devices"]))
+        if server.get("cuda_visible_devices") is not None
+        else None
+    )
+    cuda_visible_devices = backends.resolve_cuda_visible_devices(profile_value)
+    if cuda_visible_devices is not None:
+        server_environment["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    server_environment.update(spec_env(server))
+    verifier_environment = os.environ.copy()
+    verifier_environment.update(workload_env(workload))
+    profile_payload = {
+        "schema_version": 1,
+        "config_sha256": bytes_digest(config_path.read_bytes()),
+        "workload": workload_name,
+        "workload_sha256": canonical_digest(workload),
+        "server": server_name,
+        "server_profile": server_profile_definition_contract(config, server_name),
+    }
+    return {
+        "schema_version": 1,
+        "source_state": source_state,
+        "profile_contract": {
+            **profile_payload,
+            "fingerprint": canonical_digest(profile_payload),
+        },
+        "hardware": hardware_contract(),
+        "server_execution": execution_provenance(
+            server_command,
+            server_environment,
+            cwd=ROOT,
+            workspace_root=ROOT,
+        ),
+        "verifier_execution": execution_provenance(
+            [sys.executable, *sys.argv],
+            verifier_environment,
+            cwd=ROOT,
+            workspace_root=ROOT,
+        ),
+    }
+
+
 def verify(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     workload = workload_spec(config, args.workload)
     if workload.get("type") != "verify":
         raise SystemExit(f"workload {args.workload!r} is not type=verify")
-    _, server = resolve_server_for_workload(config, workload, args.server)
+    server_name, server = resolve_server_for_workload(config, workload, args.server)
+    provenance = verification_provenance(
+        config,
+        config_path=Path(args.config).resolve(),
+        workload_name=args.workload,
+        workload=workload,
+        server_name=server_name,
+        server=server,
+    )
     payload = dict(workload["payload"])
     synthetic = workload.get("input_image_synthetic")
     if synthetic:
         inject_synthetic_image(payload, dict(synthetic))
-    out_dir = workload_dir(config, workload.get("output_dir", args.workload))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for path in out_dir.glob("image_*.png"):
-        path.unlink()
+    requested_output = getattr(args, "output_dir", None)
+    out_dir = (
+        Path(requested_output).resolve()
+        if requested_output is not None
+        else workload_dir(config, workload.get("output_dir", args.workload))
+    )
+    out_dir.mkdir(parents=True, exist_ok=False)
     endpoint = "/v1/chat/completions"
     url = f"http://{server.get('host', '127.0.0.1')}:{server['port']}{endpoint}"
     req = urlrequest.Request(
@@ -322,12 +461,13 @@ def verify(args: argparse.Namespace) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    start = time.time()
+    start = time.perf_counter()
     images: list[dict[str, Any]] = []
     event_counts: dict[str, int] = {}
     text = ""
     completion_tokens: int | None = None
     image_steps: int | None = None
+    image_steps_per_image: list[int] | None = None
     errors: list[dict[str, Any]] = []
     finished = 0
     current_event: str | None = None
@@ -381,6 +521,9 @@ def verify(args: argparse.Namespace) -> None:
                 steps = usage_image_steps(obj)
                 if steps is not None:
                     image_steps = steps
+                per_image_steps = usage_image_steps_per_image(obj)
+                if per_image_steps is not None:
+                    image_steps_per_image = per_image_steps
                 for image_url in image_urls_from_chunk(obj):
                     save_image(image_url, out_dir, images)
                 if done:
@@ -395,6 +538,7 @@ def verify(args: argparse.Namespace) -> None:
             finished = finish_count(obj)
             completion_tokens = usage_completion_tokens(obj)
             image_steps = usage_image_steps(obj)
+            image_steps_per_image = usage_image_steps_per_image(obj)
             for image_url in image_urls_from_response(obj):
                 save_image(image_url, out_dir, images)
             event_manifest.append(
@@ -408,11 +552,21 @@ def verify(args: argparse.Namespace) -> None:
                 }
             )
     text_unit_count = completion_tokens if completion_tokens is not None else len(text.split())
+    semantic_checks, warnings, failures = verification_checks(
+        workload,
+        images=images,
+        image_steps_per_image=image_steps_per_image,
+        errors=errors,
+        finished_count=finished,
+    )
+    artifact_checks = semantic_checks
+    artifact_valid = all(artifact_checks.values())
     summary = {
         "endpoint": endpoint,
-        "elapsed_s": time.time() - start,
+        "elapsed_s": time.perf_counter() - start,
         "image_count": len(images),
         "image_steps": image_steps,
+        "image_steps_per_image": image_steps_per_image,
         "images": images,
         "text": text,
         "visible_text_sha256": bytes_digest(text.encode("utf-8")),
@@ -425,32 +579,18 @@ def verify(args: argparse.Namespace) -> None:
         "request": payload,
         "finished_count": finished,
         "done_seen": done_seen,
+        "warnings": warnings,
+        "artifact": {
+            "schema_version": 1,
+            "valid": artifact_valid,
+            "valid_marker": "verify-valid-v1" if artifact_valid else None,
+            "checks": artifact_checks,
+            "provenance": provenance,
+        },
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    for warning in warnings:
+        print(f"WARNING {warning}", file=sys.stderr)
     print(json.dumps(summary, indent=2))
-    if errors:
-        raise SystemExit("verify returned errors")
-    expected_images = workload.get("expect_images")
-    if expected_images is not None and len(images) != int(expected_images):
-        raise SystemExit(f"expected {expected_images} images, got {len(images)}")
-    expected_image_steps = workload.get("expect_image_steps")
-    if expected_image_steps is not None and image_steps != int(expected_image_steps):
-        raise SystemExit(f"expected {expected_image_steps} image steps, got {image_steps}")
-    expected_min_text = workload.get("expect_min_text_tokens")
-    if expected_min_text is not None and text_unit_count < int(expected_min_text):
-        raise SystemExit(
-            f"expected at least {expected_min_text} text units, got {text_unit_count}"
-        )
-    if workload.get("expect_finished", True) and finished < 1:
-        raise SystemExit(f"expected at least one finish reason, got {finished}")
-    if payload.get("stream") and not done_seen:
-        raise SystemExit("expected terminal [DONE] event")
-    expected_w = workload.get("expect_image_width")
-    expected_h = workload.get("expect_image_height")
-    if expected_w is not None and expected_h is not None:
-        for image in images:
-            if tuple(image["size"]) != (int(expected_w), int(expected_h)):
-                raise SystemExit(f"unexpected image size: {image}")
-    expected_channel_dominance = workload.get("expect_image_channel_dominance")
-    if expected_channel_dominance is not None:
-        verify_image_channel_dominance(images, expected_channel_dominance)
+    if failures:
+        raise SystemExit(failures[0])

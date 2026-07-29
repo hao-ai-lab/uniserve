@@ -16,20 +16,12 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from ..batch import (
-    EncodeDelta,
-    ExecutionResult,
-    FlowDelta,
-    ImageArtifact,
+    CompletionRecord,
+    CompletionReport,
     ImageParams,
-    MaterializeDelta,
-    OperationResult,
-    PublishedKv,
-    PublishedProduct,
-    ResultDelta,
+    RequestKey,
     SamplingParams,
-    SequenceDelta,
-    SequenceEffect,
-    TransferDelta,
+    TokenMode,
 )
 from ..foundation.errors import invalid_descriptor
 from .adapter_store import AdapterSnapshot, AdapterStore
@@ -145,13 +137,13 @@ class SnapshotProvider:
     def snapshot_execution(
         self,
         session_ids: set[int],
-        result: ExecutionResult,
-    ) -> ExecutionResult:
+        report: CompletionReport,
+    ) -> CompletionReport:
         requested = {int(value) for value in session_ids}
-        if {operation.session_id for operation in result.operations} != requested:
-            raise invalid_descriptor("execution result does not match its snapshot session set")
-        _, replacements = self._snapshot_sessions(requested)
-        return _map_execution_result_locators(result, lambda raw: replacements.get(raw, raw))
+        if {completion.request_key.session_id for completion in report.completions} != requested:
+            raise invalid_descriptor("completion report does not match its snapshot session set")
+        self._snapshot_sessions(requested)
+        return report
 
     def _snapshot_sessions(
         self,
@@ -194,12 +186,6 @@ class SnapshotProvider:
                 raw: self._durable_locator(raw, digest, key)
                 for raw, key in locator_assets.items()
             }
-            self.replay.rewrite_results(
-                requested,
-                lambda result: _map_result_locators(
-                    result, lambda raw: replacements.get(raw, raw)
-                ),
-            )
             self.products.rewrite_locators(requested, replacements)
             return refs, replacements
 
@@ -351,12 +337,9 @@ class SnapshotProvider:
                         "op_id": value.op_id,
                         "digest": value.digest,
                         "step_id": value.step_id,
-                        "result": _map_result_locators(
-                            value.result,
-                            lambda raw, index=index: locator(raw, f"replay.{index}"),
-                        ).to_wire(),
+                        "result": value.result.to_wire(),
                     }
-                    for index, value in enumerate(replay)
+                    for value in replay
                 ],
                 "adapter": self._adapter_to_json(adapter, tensor),
             }
@@ -420,14 +403,14 @@ class SnapshotProvider:
             in selected
         )
         required_assets = {
-            key for value in (*raw_products, *raw_replay) for key in _asset_references(value)
+            key for value in raw_products for key in _asset_references(value)
         }
         assets, published_assets = self._restore_assets(manifest, tensors, required_assets)
         try:
             products = tuple(
                 self._product_from_json(value, tensors, assets) for value in raw_products
             )
-            replay = tuple(self._replay_from_json(value, assets) for value in raw_replay)
+            replay = tuple(self._replay_from_json(value) for value in raw_replay)
             adapter = self._adapter_from_json(manifest.get("adapter"), tensors)
             decoded = _DecodedSnapshot(
                 sessions,
@@ -524,8 +507,7 @@ class SnapshotProvider:
         for record in decoded.replay:
             if record.session_id not in selected:
                 raise invalid_descriptor("snapshot replay record has an undeclared session")
-            if record.result.result_version != record.result.base_version + 1:
-                raise invalid_descriptor("snapshot replay result version is invalid")
+            record.result.validate()
 
     def _validate_manifest_identity(
         self,
@@ -659,6 +641,7 @@ class SnapshotProvider:
     @staticmethod
     def _session_to_json(session: RequestSession) -> dict[str, object]:
         return {
+            "authority_id": session.request_key.authority_id,
             "session_id": session.session_id,
             "epoch": session.epoch,
             "version": session.version,
@@ -667,6 +650,10 @@ class SnapshotProvider:
             "image": None if session.image is None else session.image.to_wire(),
             "negative_token_ids": list(session.negative_token_ids),
             "adapter_id": session.adapter_id,
+            "committed_op_id": session.committed_op_id,
+            # ``str`` finalizes a digest still deferred behind an in-flight decode
+            # response; snapshotting is a control op off the decode critical path.
+            "committed_digest": str(session.committed_digest),
             "latent_handle": session.latent_handle,
             "product_handles": sorted(session.product_handles),
             "prompt_logits_handle": session.prompt_logits_handle,
@@ -674,7 +661,6 @@ class SnapshotProvider:
             "flow_step": session.flow_step,
             "rng_counter": session.rng_counter,
             "last_op_id": session.last_op_id,
-            "last_digest": session.last_digest,
             "last_step_id": session.last_step_id,
         }
 
@@ -682,9 +668,11 @@ class SnapshotProvider:
     def _session_from_json(value: object) -> RequestSession:
         data = _mapping(value, "snapshot session")
         return RequestSession(
-            session_id=_uint(data.get("session_id"), "snapshot session.session_id"),
-            epoch=_uint(data.get("epoch"), "snapshot session.epoch"),
-            version=_uint(data.get("version"), "snapshot session.version"),
+            request_key=RequestKey(
+                authority_id=_uint(data.get("authority_id"), "snapshot session.authority_id"),
+                session_id=_uint(data.get("session_id"), "snapshot session.session_id"),
+                epoch=_uint(data.get("epoch"), "snapshot session.epoch"),
+            ),
             admission_digest=_digest(
                 data.get("admission_digest"), "snapshot session.admission_digest"
             ),
@@ -702,6 +690,11 @@ class SnapshotProvider:
                 data.get("negative_token_ids"), "snapshot session.negative_token_ids"
             ),
             adapter_id=_optional_uint(data.get("adapter_id"), "snapshot session.adapter_id"),
+            version=_uint(data.get("version"), "snapshot session.version"),
+            committed_op_id=_uint(data.get("committed_op_id"), "snapshot session.committed_op_id"),
+            committed_digest=_digest(
+                data.get("committed_digest"), "snapshot session.committed_digest"
+            ),
             latent_handle=_optional_uint(
                 data.get("latent_handle"), "snapshot session.latent_handle"
             ),
@@ -719,11 +712,6 @@ class SnapshotProvider:
             flow_step=_uint(data.get("flow_step"), "snapshot session.flow_step"),
             rng_counter=_uint(data.get("rng_counter"), "snapshot session.rng_counter"),
             last_op_id=_optional_uint(data.get("last_op_id"), "snapshot session.last_op_id"),
-            last_digest=(
-                None
-                if data.get("last_digest") is None
-                else _digest(data["last_digest"], "snapshot session.last_digest")
-            ),
             last_step_id=_optional_uint(data.get("last_step_id"), "snapshot session.last_step_id"),
         )
 
@@ -850,19 +838,15 @@ class SnapshotProvider:
         )
 
     @staticmethod
-    def _replay_from_json(
-        value: object,
-        assets: Mapping[str, str],
-    ) -> ReplayRecord:
+    def _replay_from_json(value: object) -> ReplayRecord:
         data = _mapping(value, "snapshot replay")
-        result = OperationResult.from_wire(data.get("result"), "snapshot replay.result")
         return ReplayRecord(
             session_id=_uint(data.get("session_id"), "snapshot replay.session_id"),
             epoch=_uint(data.get("epoch"), "snapshot replay.epoch"),
             op_id=_uint(data.get("op_id"), "snapshot replay.op_id"),
             digest=_digest(data.get("digest"), "snapshot replay.digest"),
             step_id=_uint(data.get("step_id"), "snapshot replay.step_id"),
-            result=_map_result_locators(result, lambda raw: _resolve_asset(raw, assets)),
+            result=CompletionRecord.from_wire(data.get("result"), "snapshot replay.result"),
         )
 
     @staticmethod
@@ -1126,10 +1110,8 @@ def _product_payload_from_json(
             ),
         )
     if kind == "logits":
-        from ..batch import SequenceMode
-
         try:
-            source_mode = SequenceMode(
+            source_mode = TokenMode(
                 _string(
                     data.get("source_mode"),
                     "snapshot product payload.source_mode",
@@ -1173,65 +1155,6 @@ def _product_payload_from_json(
             )
         )
     raise invalid_descriptor(f"snapshot product payload kind {kind!r} is unsupported")
-
-
-def _map_result_locators(
-    result: OperationResult,
-    transform: Any,
-) -> OperationResult:
-    def published(value: PublishedProduct | None) -> PublishedProduct | None:
-        if value is None:
-            return None
-        return replace(value, locator=transform(value.locator))
-
-    def published_kv(value: PublishedKv | None) -> PublishedKv | None:
-        if value is None:
-            return None
-        return replace(value, locators=tuple(transform(raw) for raw in value.locators))
-
-    def sequence(value: SequenceEffect | None) -> SequenceEffect | None:
-        if value is None:
-            return None
-        return replace(
-            value,
-            published_logits=published(value.published_logits),
-            published_kv=published_kv(value.published_kv),
-        )
-
-    delta = result.delta
-    mapped: ResultDelta
-    if isinstance(delta, SequenceDelta):
-        mapped = replace(delta, effect=cast(SequenceEffect, sequence(delta.effect)))
-    elif isinstance(delta, MaterializeDelta):
-        product = delta.product
-        if isinstance(product, ImageArtifact):
-            product = replace(product, locator=transform(product.locator))
-        elif isinstance(product, PublishedProduct):
-            product = cast(PublishedProduct, published(product))
-        mapped = replace(delta, product=product, sequence=sequence(delta.sequence))
-    elif isinstance(delta, TransferDelta):
-        mapped = replace(
-            delta,
-            product=published(delta.product),
-            sequence=sequence(delta.sequence),
-        )
-    elif isinstance(delta, (FlowDelta, EncodeDelta)):
-        mapped = delta
-    else:
-        raise TypeError("snapshot result delta is not a closed variant")
-    return replace(result, delta=mapped)
-
-
-def _map_execution_result_locators(
-    result: ExecutionResult,
-    transform: Any,
-) -> ExecutionResult:
-    return replace(
-        result,
-        operations=tuple(
-            _map_result_locators(operation, transform) for operation in result.operations
-        ),
-    )
 
 
 def _snapshot_asset_meta(value: Mapping[str, object]) -> dict[str, object]:

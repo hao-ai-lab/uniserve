@@ -1,0 +1,201 @@
+{
+  "parent_semantic_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "operation": {
+    "request_key": {
+      "authority_id": 4,
+      "session_id": 7,
+      "epoch": 2
+    },
+    "op_id": 11,
+    "parent": {
+      "request_key": {
+        "authority_id": 4,
+        "session_id": 7,
+        "epoch": 2
+      },
+      "producer_op_id": 1,
+      "point": {
+        "kind": "fixed",
+        "value": {
+          "point_index": 0,
+          "semantic_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    "work": {
+      "kind": "token",
+      "value": "decode"
+    },
+    "route": 9,
+    "domain": "und",
+    "advances_state": true,
+    "bounds": {
+      "max_points": 1,
+      "max_tokens": 1,
+      "max_kv_pages": 2,
+      "max_latent_bytes": 0,
+      "max_completion_bytes": 4096,
+      "max_transfer_bytes": 0
+    },
+    "inputs": [
+      {
+        "request_key": {
+          "authority_id": 4,
+          "session_id": 7,
+          "epoch": 2
+        },
+        "producer_op_id": 1,
+        "output_index": 0,
+        "generation": 1,
+        "kind": "vision_feature",
+        "storage_class": "device_tensor",
+        "dtype": "bf16",
+        "shape_bound": {
+          "dims": [
+            {
+              "kind": "static",
+              "value": 3
+            },
+            {
+              "kind": "device",
+              "value": {
+                "max": 256
+              }
+            }
+          ]
+        },
+        "point_range": {
+          "base_point": 0,
+          "max_points": 1
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "request_key": {
+          "authority_id": 4,
+          "session_id": 7,
+          "epoch": 2
+        },
+        "producer_op_id": 11,
+        "output_index": 0,
+        "generation": 3,
+        "kind": "token",
+        "storage_class": "device_tensor",
+        "dtype": "i32",
+        "shape_bound": {
+          "dims": [
+            {
+              "kind": "static",
+              "value": 1
+            }
+          ]
+        },
+        "point_range": {
+          "base_point": 0,
+          "max_points": 1
+        }
+      },
+      {
+        "request_key": {
+          "authority_id": 4,
+          "session_id": 7,
+          "epoch": 2
+        },
+        "producer_op_id": 11,
+        "output_index": 1,
+        "generation": 5,
+        "kind": "kv",
+        "storage_class": "paged_kv",
+        "dtype": "bf16",
+        "shape_bound": {
+          "dims": [
+            {
+              "kind": "device",
+              "value": {
+                "max": 64
+              }
+            }
+          ]
+        },
+        "point_range": {
+          "base_point": 0,
+          "max_points": 1
+        }
+      }
+    ],
+    "new_kv_blocks": [
+      64
+    ],
+    "predicate": null,
+    "rng": {
+      "seed": 81985529216486895,
+      "semantic_index_base": 40,
+      "draw_layout": "target_sampling"
+    },
+    "control_seq": 7,
+    "plan_digest": "4351f199f28c2cc2d2afc4b0a099cc0bb98c7b54a160144936766500c7b00360"
+  },
+  "completion": {
+    "request_key": {
+      "authority_id": 4,
+      "session_id": 7,
+      "epoch": 2
+    },
+    "op_id": 11,
+    "completion_slot_generation": 2,
+    "status": "ok",
+    "selected_point": 1,
+    "logical_lengths": {
+      "token_len": 41,
+      "kv_visible_len": 41,
+      "latent_len": 0
+    },
+    "token_span": {
+      "base": 40,
+      "len": 1
+    },
+    "committed_tokens": [
+      50256
+    ],
+    "finish_flags": {
+      "eos": false,
+      "length": false,
+      "stop": true
+    },
+    "product_generations": [
+      3,
+      5
+    ],
+    "semantic_digest": "70c1efedc88e7ed67764c2e2fc918b417dc8762e6c3e19460eba349d62c54b3b",
+    "error_code": null,
+    "timing_counters": {
+      "queued_us": 0,
+      "device_us": 0,
+      "copy_us": 0,
+      "host_us": 0
+    }
+  },
+  "plan_digest": "4351f199f28c2cc2d2afc4b0a099cc0bb98c7b54a160144936766500c7b00360",
+  "semantic_digest": "70c1efedc88e7ed67764c2e2fc918b417dc8762e6c3e19460eba349d62c54b3b",
+  "protocol_layout_digest": "c810ea4d39c44a479a7214b5697638a0994546a60d31088dd54d5b5c1bf8ee41",
+  "route_capability_sample": {
+    "supported_work": [
+      "token_decode",
+      "token_extend",
+      "gen_flow",
+      "encode_vision",
+      "token_decode"
+    ],
+    "max_cfg_branches": 3,
+    "max_latent_size": 4096,
+    "max_vae_grid_tokens": 64,
+    "max_vit_grid_tokens": 64,
+    "adapter_mode": "per_request",
+    "max_batch_operations": 16,
+    "kv_dtype": "bfloat16",
+    "model_dtype": "bfloat16",
+    "attention_backend": "flashinfer"
+  },
+  "route_capability_digest": "269115830e7dcb8b7b118242bc54b542bd8cd02f410d969f2570ea7b5239ce55"
+}

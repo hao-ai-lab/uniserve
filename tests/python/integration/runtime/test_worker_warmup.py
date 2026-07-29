@@ -1,28 +1,38 @@
-"""Startup warmup drives valid batches through the real execution path.
+"""Startup warmup drives valid depth-one batches through the real forward path.
 
-The warmup exists to pay first-use attention-kernel JIT before the worker is
-reachable. Its value is only realized on CUDA, but the synthetic prefill /
-decode / flow batches it constructs must stay valid: earlier drafts tripped
-the ``session_id >= 1`` transaction-identity rule and the flow CFG
-``branch_count`` bound. These tests exercise the construction on the CPU stub
-so a regression in the batch shapes is caught without a GPU.
+Warmup pays first-use attention-kernel JIT before the worker is reachable. Its
+value is realized on CUDA, but the synthetic prefill/decode/flow batches it
+constructs must stay valid records that actually run a forward. These tests
+exercise that construction on the CPU stub so a regression in the batch shapes
+is caught without a GPU.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
+from torch import nn
 
 from tests.python.fixtures.execution_worker import execution_worker
+from uniserve_worker.forward import ForwardBatch, ForwardOutput
+from uniserve_worker.server.stub import StubModel
 from uniserve_worker.spec import OperationType
 
 pytestmark = pytest.mark.integration
 
 
+class _Observed(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.neural = StubModel()
+        self.spec = self.neural.spec
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def forward(self, batch: ForwardBatch) -> ForwardOutput:
+        self.calls.append((str(batch.route), tuple(type(row).__name__ for row in batch.rows)))
+        return self.neural(batch)
+
+
 def test_warmup_is_a_safe_noop_off_cuda() -> None:
-    # The public entry point guards on CUDA; on the stub's CPU device it must
-    # return without raising and without leaving sessions behind.
     worker = execution_worker()
     worker.warmup()
     assert worker.sessions.session_ids() == ()
@@ -43,36 +53,26 @@ def test_warmup_image_geometry_fits_the_declared_latent_capacity() -> None:
         assert latent_tokens <= caps.max_vae_grid_tokens
 
 
-def test_warmup_sequence_runs_and_cleans_up() -> None:
-    worker = execution_worker()
-    types = worker.contract.capabilities.supported_operation_types
-    if OperationType.SEQUENCE_EXTEND not in types:
+def test_warmup_sequence_drives_a_real_forward_and_cleans_up() -> None:
+    model = _Observed()
+    worker = execution_worker(model)
+    if OperationType.SEQUENCE_EXTEND not in worker.contract.capabilities.operation_types:
         pytest.skip("stub does not support sequence extend")
-    # Directly drive the construction the CUDA gate would otherwise skip.
+
     worker._warmup_sequence()
-    # The warmup owns session id 1 transiently and must drop it before serving.
-    assert 1 not in worker.sessions.session_ids()
+
+    assert model.calls
+    assert all(row_kinds == ("TokenRow",) for _route, row_kinds in model.calls)
+    assert worker.sessions.session_ids() == ()
 
 
-def test_prefill_graph_warmup_runs_each_bucket_and_cleans_up(monkeypatch) -> None:
-    worker = execution_worker()
-    worker._execution = replace(
-        worker._execution,
-        prefill_cuda_graph_warmup_tokens=(4, 8),
-    )
-    token_counts: list[int] = []
-    execute = worker.executor.execute
+def test_warmup_flow_drives_a_real_forward_and_cleans_up() -> None:
+    model = _Observed()
+    worker = execution_worker(model)
+    if OperationType.FLOW not in worker.contract.capabilities.operation_types:
+        pytest.skip("stub does not support flow")
 
-    def observe(batch):
-        token_counts.extend(
-            envelope.operation.position[1] - envelope.operation.position[0]
-            for envelope in batch.operations
-        )
-        return execute(batch)
+    worker._warmup_flow()
 
-    monkeypatch.setattr(worker.executor, "execute", observe)
-
-    worker._warmup_prefill_graphs()
-
-    assert token_counts == [8, 8, 4, 4]
+    assert any("FlowRow" in row_kinds for _route, row_kinds in model.calls)
     assert worker.sessions.session_ids() == ()

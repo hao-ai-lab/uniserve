@@ -363,6 +363,7 @@ pub struct Usage {
     pub completion_tokens_details: Option<CompletionTokenUsageInfo>,
     pub image_count: Option<u32>,
     pub image_steps: Option<u32>,
+    pub image_steps_per_image: Option<Vec<u32>>,
 }
 
 impl Usage {
@@ -379,6 +380,7 @@ impl Usage {
             completion_tokens_details: None,
             image_count: None,
             image_steps: None,
+            image_steps_per_image: None,
         }
     }
 
@@ -394,6 +396,13 @@ impl Usage {
             image_steps: Some(image_steps),
             ..Self::from_counts(prompt_tokens, completion_tokens)
         }
+    }
+
+    /// Attach the observed denoising-step count for each completed image.
+    pub fn with_image_steps_per_image(mut self, image_steps_per_image: Vec<u32>) -> Self {
+        self.image_steps_per_image =
+            (!image_steps_per_image.is_empty()).then_some(image_steps_per_image);
+        self
     }
 }
 

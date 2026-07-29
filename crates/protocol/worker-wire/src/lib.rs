@@ -1,19 +1,21 @@
-//! Versioned worker execution protocol.
+//! Worker execution protocol.
 //!
-//! Protocol v3 defines one closed operation algebra: sequence, flow, encode,
-//! materialize, and transfer. Every effect is returned through the matching
-//! typed delta.
+//! The scheduler and worker exchange four cross-layer records — [`Operation`],
+//! [`VersionRef`], [`ProductRef`], and [`CompletionRecord`] — plus a request
+//! [`Control`] command. Every operation names one closed [`Work`] variant, one
+//! exact parent version, and its declared input and output products. The worker
+//! returns exactly one [`CompletionRecord`] per operation. Two host-computed
+//! digests fix identity: an operation [`Operation::plan_digest`] over immutable
+//! registration fields, and a [`CompletionRecord::compute_semantic_digest`] over
+//! the selected result.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use uniserve_core::{BlockId, ImageParams, KvCacheGroupSpec, RankInfo, RequestId, SamplingParams};
-pub use uniserve_core::{
-    EncodeKind, MaterializeKind, OperationKind, OperationType, SequenceMode, TransferKind,
-};
 
 pub mod flat;
 pub mod resources;
@@ -27,817 +29,1042 @@ pub use resources::{
     ResourcePressure,
 };
 
-pub const EXECUTION_PROTOCOL_VERSION: u16 = 3;
+/// A lowercase 64-character SHA-256 digest string. Both protocol digests and
+/// the model and route identities use this canonical form.
+pub type Digest = String;
 
+// ---------------------------------------------------------------------------
+// Identities
+// ---------------------------------------------------------------------------
+
+/// `(authority_id, session_id, epoch)`. The epoch advances whenever an admitted
+/// identity is reused, so no operation or product reference aliases across
+/// requests or epochs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenSource {
-    Wire,
-    LastSampled,
+pub struct RequestKey {
+    pub authority_id: u64,
+    pub session_id: RequestId,
+    pub epoch: u64,
 }
 
+impl RequestKey {
+    pub const fn new(authority_id: u64, session_id: RequestId, epoch: u64) -> Self {
+        Self {
+            authority_id,
+            session_id,
+            epoch,
+        }
+    }
+}
+
+/// Unique within one scheduler-authority lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OpId(pub u64);
+
+/// Route identity assigned by the scheduler for capability negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RouteId(pub u32);
+
+// ---------------------------------------------------------------------------
+// Closed `Work` algebra
+// ---------------------------------------------------------------------------
+
+/// State effect and role of a token operation's device work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenMode {
+    Extend,
+    Decode,
+    Verify,
+}
+
+/// Encoder role producing an immutable auxiliary feature product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncodeMode {
+    Vision,
+    Latent,
+}
+
+/// Movement role for an immutable product or a committed KV view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferMode {
+    Product,
+    KvPublish,
+    KvInstall,
+}
+
+/// Generation-lineage role for a Gen route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenMode {
+    Transition,
+    Flow,
+}
+
+/// The single closed work algebra. The state effect and role of each variant
+/// are fixed; sampling is device postprocessing inside `Token(*)`, not a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum Work {
+    Token(TokenMode),
+    Draft,
+    Encode(EncodeMode),
+    Transfer(TransferMode),
+    Gen(GenMode),
+    Materialize,
+}
+
+/// The flat exhaustive tag for one [`Work`] leaf, used on the wire and in
+/// capability negotiation. Declaration order is the canonical index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum WorkVariant {
+    TokenExtend = 0,
+    TokenDecode = 1,
+    TokenVerify = 2,
+    Draft = 3,
+    EncodeVision = 4,
+    EncodeLatent = 5,
+    TransferProduct = 6,
+    TransferKvPublish = 7,
+    TransferKvInstall = 8,
+    GenTransition = 9,
+    GenFlow = 10,
+    Materialize = 11,
+}
+
+impl WorkVariant {
+    pub const ALL: [Self; 12] = [
+        Self::TokenExtend,
+        Self::TokenDecode,
+        Self::TokenVerify,
+        Self::Draft,
+        Self::EncodeVision,
+        Self::EncodeLatent,
+        Self::TransferProduct,
+        Self::TransferKvPublish,
+        Self::TransferKvInstall,
+        Self::GenTransition,
+        Self::GenFlow,
+        Self::Materialize,
+    ];
+
+    /// Whether a variant advances the authoritative request lineage.
+    pub const fn advances_state(self) -> bool {
+        matches!(
+            self,
+            Self::TokenExtend
+                | Self::TokenDecode
+                | Self::TokenVerify
+                | Self::GenTransition
+                | Self::GenFlow
+        )
+    }
+
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::TokenExtend => "token_extend",
+            Self::TokenDecode => "token_decode",
+            Self::TokenVerify => "token_verify",
+            Self::Draft => "draft",
+            Self::EncodeVision => "encode_vision",
+            Self::EncodeLatent => "encode_latent",
+            Self::TransferProduct => "transfer_product",
+            Self::TransferKvPublish => "transfer_kv_publish",
+            Self::TransferKvInstall => "transfer_kv_install",
+            Self::GenTransition => "gen_transition",
+            Self::GenFlow => "gen_flow",
+            Self::Materialize => "materialize",
+        }
+    }
+}
+
+impl Work {
+    pub const fn variant(self) -> WorkVariant {
+        match self {
+            Self::Token(TokenMode::Extend) => WorkVariant::TokenExtend,
+            Self::Token(TokenMode::Decode) => WorkVariant::TokenDecode,
+            Self::Token(TokenMode::Verify) => WorkVariant::TokenVerify,
+            Self::Draft => WorkVariant::Draft,
+            Self::Encode(EncodeMode::Vision) => WorkVariant::EncodeVision,
+            Self::Encode(EncodeMode::Latent) => WorkVariant::EncodeLatent,
+            Self::Transfer(TransferMode::Product) => WorkVariant::TransferProduct,
+            Self::Transfer(TransferMode::KvPublish) => WorkVariant::TransferKvPublish,
+            Self::Transfer(TransferMode::KvInstall) => WorkVariant::TransferKvInstall,
+            Self::Gen(GenMode::Transition) => WorkVariant::GenTransition,
+            Self::Gen(GenMode::Flow) => WorkVariant::GenFlow,
+            Self::Materialize => WorkVariant::Materialize,
+        }
+    }
+
+    pub const fn from_variant(variant: WorkVariant) -> Self {
+        match variant {
+            WorkVariant::TokenExtend => Self::Token(TokenMode::Extend),
+            WorkVariant::TokenDecode => Self::Token(TokenMode::Decode),
+            WorkVariant::TokenVerify => Self::Token(TokenMode::Verify),
+            WorkVariant::Draft => Self::Draft,
+            WorkVariant::EncodeVision => Self::Encode(EncodeMode::Vision),
+            WorkVariant::EncodeLatent => Self::Encode(EncodeMode::Latent),
+            WorkVariant::TransferProduct => Self::Transfer(TransferMode::Product),
+            WorkVariant::TransferKvPublish => Self::Transfer(TransferMode::KvPublish),
+            WorkVariant::TransferKvInstall => Self::Transfer(TransferMode::KvInstall),
+            WorkVariant::GenTransition => Self::Gen(GenMode::Transition),
+            WorkVariant::GenFlow => Self::Gen(GenMode::Flow),
+            WorkVariant::Materialize => Self::Materialize,
+        }
+    }
+
+    /// The canonical state effect fixed by the work table.
+    pub const fn advances_state(self) -> bool {
+        self.variant().advances_state()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Product references and bounded shapes
+// ---------------------------------------------------------------------------
+
+/// The role a product plays for its consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ProductKind {
+    Token = 0,
+    Logprob = 1,
+    Draft = 2,
+    VisionFeature = 3,
+    LatentFeature = 4,
+    Kv = 5,
+    Latent = 6,
+    Artifact = 7,
+    Completion = 8,
+}
+
+/// The worker store family that backs a product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum StorageClass {
+    DeviceTensor = 0,
+    PagedKv = 1,
+    LatentArena = 2,
+    HostStaging = 3,
+    CompletionArena = 4,
+}
+
+/// Element type of a product's backing storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum DType {
+    U8 = 0,
+    U16 = 1,
+    U32 = 2,
+    I32 = 3,
+    I64 = 4,
+    F16 = 5,
+    #[serde(rename = "bf16")]
+    BF16 = 6,
+    F32 = 7,
+}
+
+/// One dimension of a bounded shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum DimBound {
+    /// A host-static extent.
+    Static(u32),
+    /// The single device-actual axis, bounded by this fixed maximum.
+    Device { max: u32 },
+}
+
+/// A shape that is host-static except for at most one device-actual axis, which
+/// carries a fixed maximum. A product reference never carries an unbounded shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct ShapeBound {
+    pub dims: Vec<DimBound>,
+}
+
+impl ShapeBound {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let device_dims = self
+            .dims
+            .iter()
+            .filter(|dim| matches!(dim, DimBound::Device { .. }))
+            .count();
+        anyhow::ensure!(
+            device_dims <= 1,
+            "a shape bound carries more than one device-actual dimension"
+        );
+        Ok(())
+    }
+}
+
+/// The state points a product spans, rooted at `base_point`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct PointRange {
+    pub base_point: u32,
+    pub max_points: u32,
+}
+
+/// A generation-tagged reference to a declared device or host product. Physical
+/// slots, tensors, and events stay worker-local and never appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProductRef {
+    pub request_key: RequestKey,
+    pub producer_op_id: OpId,
+    pub output_index: u16,
+    pub generation: u32,
+    pub kind: ProductKind,
+    pub storage_class: StorageClass,
+    pub dtype: DType,
+    pub shape_bound: ShapeBound,
+    pub point_range: PointRange,
+}
+
+impl ProductRef {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.shape_bound.validate()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Version references
+// ---------------------------------------------------------------------------
+
+/// One exact state point.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum Point {
+    /// A host-observed state point named by its index and semantic digest.
+    Fixed {
+        point_index: u32,
+        semantic_digest: Digest,
+    },
+    /// A device-selected point a successor may consume before host observation.
+    Device {
+        selected_point: ProductRef,
+        producer_plan_digest: Digest,
+    },
+}
+
+/// Names one exact state point of a producer operation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VersionRef {
+    pub request_key: RequestKey,
+    pub producer_op_id: OpId,
+    pub point: Point,
+}
+
+impl VersionRef {
+    /// The admission root: point zero of the request-admission operation.
+    pub fn admission_root(
+        request_key: RequestKey,
+        producer_op_id: OpId,
+        semantic_digest: Digest,
+    ) -> Self {
+        Self {
+            request_key,
+            producer_op_id,
+            point: Point::Fixed {
+                point_index: 0,
+                semantic_digest,
+            },
+        }
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        matches!(self.point, Point::Fixed { .. })
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match &self.point {
+            Point::Fixed {
+                semantic_digest, ..
+            } => anyhow::ensure!(
+                is_digest(semantic_digest),
+                "fixed version reference has an invalid semantic digest"
+            ),
+            Point::Device {
+                selected_point,
+                producer_plan_digest,
+            } => {
+                selected_point.validate()?;
+                anyhow::ensure!(
+                    is_digest(producer_plan_digest),
+                    "device version reference has an invalid producer plan digest"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operation
+// ---------------------------------------------------------------------------
+
+/// Whether an operation belongs to the understanding or generation branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Domain {
+    Und = 0,
+    Gen = 1,
+}
+
+/// Hard resource maxima the scheduler reserves before an operation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct Bounds {
+    pub max_points: u32,
+    pub max_tokens: u32,
+    pub max_kv_pages: u32,
+    pub max_latent_bytes: u64,
+    pub max_completion_bytes: u64,
+    pub max_transfer_bytes: u64,
+}
+
+/// How the common sampler consumes deterministic random draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum DrawLayout {
+    TargetSampling = 0,
+    SpeculativeProposal = 1,
+    FlowNoise = 2,
+}
+
+/// Deterministic random-draw coordinates for one operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Rng {
+    pub seed: u64,
+    pub semantic_index_base: u64,
+    pub draw_layout: DrawLayout,
+}
+
+/// One immutable unit of registered work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Operation {
+    pub request_key: RequestKey,
+    pub op_id: OpId,
+    pub parent: VersionRef,
+    pub work: Work,
+    pub route: RouteId,
+    pub domain: Domain,
+    pub advances_state: bool,
+    pub bounds: Bounds,
+    pub inputs: Vec<ProductRef>,
+    pub outputs: Vec<ProductRef>,
+    /// The KV blocks this operation appends to its session's KV view as the
+    /// sequence grows (empty when this step adds no block). The scheduler's block
+    /// manager allocates them; the worker grows its KV entry by exactly these
+    /// blocks during registration.
+    pub new_kv_blocks: Vec<BlockId>,
+    pub predicate: Option<ProductRef>,
+    pub rng: Option<Rng>,
+    pub control_seq: u64,
+    pub plan_digest: Digest,
+}
+
+impl Operation {
+    /// Build an operation and fill in its plan digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn registered(
+        request_key: RequestKey,
+        op_id: OpId,
+        parent: VersionRef,
+        work: Work,
+        route: RouteId,
+        domain: Domain,
+        bounds: Bounds,
+        inputs: Vec<ProductRef>,
+        outputs: Vec<ProductRef>,
+        new_kv_blocks: Vec<BlockId>,
+        predicate: Option<ProductRef>,
+        rng: Option<Rng>,
+        control_seq: u64,
+    ) -> Self {
+        let mut operation = Self {
+            request_key,
+            op_id,
+            parent,
+            work,
+            route,
+            domain,
+            advances_state: work.advances_state(),
+            bounds,
+            inputs,
+            outputs,
+            new_kv_blocks,
+            predicate,
+            rng,
+            control_seq,
+            plan_digest: String::new(),
+        };
+        operation.plan_digest = operation.compute_plan_digest();
+        operation
+    }
+
+    /// The immutable registration identity digest.
+    pub fn compute_plan_digest(&self) -> Digest {
+        let mut digest = CanonicalDigest::new(b"uniserve-operation\0");
+        digest.request_key(self.request_key);
+        digest.op_id(self.op_id);
+        digest.version_ref(&self.parent);
+        digest.u8(self.work.variant() as u8);
+        digest.u32(self.route.0);
+        digest.u8(self.domain as u8);
+        digest.bool(self.advances_state);
+        digest.bounds(&self.bounds);
+        digest.u64(self.inputs.len() as u64);
+        for input in &self.inputs {
+            digest.product_ref(input);
+        }
+        digest.u64(self.outputs.len() as u64);
+        for output in &self.outputs {
+            digest.product_ref(output);
+        }
+        digest.option(self.predicate.as_ref(), CanonicalDigest::product_ref);
+        digest.option(self.rng.as_ref(), CanonicalDigest::rng);
+        digest.u32s(self.new_kv_blocks.iter().map(|block| block.0));
+        digest.finish()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.op_id.0 > 0, "operation id must be positive");
+        anyhow::ensure!(
+            self.advances_state == self.work.advances_state(),
+            "operation declares an advances_state inconsistent with its work variant"
+        );
+        self.parent.validate()?;
+        self.bounds_are_finite()?;
+        let mut output_indices = HashSet::with_capacity(self.outputs.len());
+        for output in &self.outputs {
+            output.validate()?;
+            anyhow::ensure!(
+                output.request_key == self.request_key && output.producer_op_id == self.op_id,
+                "an output product is not owned by its producing operation"
+            );
+            anyhow::ensure!(
+                output.point_range.max_points <= self.bounds.max_points.max(1),
+                "an output product exceeds the operation point bound"
+            );
+            anyhow::ensure!(
+                output_indices.insert(output.output_index),
+                "operation repeats an output index"
+            );
+        }
+        for input in &self.inputs {
+            input.validate()?;
+        }
+        if let Some(predicate) = &self.predicate {
+            predicate.validate()?;
+        }
+        anyhow::ensure!(
+            is_digest(&self.plan_digest),
+            "operation plan digest is not a lowercase SHA-256 digest"
+        );
+        anyhow::ensure!(
+            self.plan_digest == self.compute_plan_digest(),
+            "operation plan digest does not match its registration fields"
+        );
+        Ok(())
+    }
+
+    fn bounds_are_finite(&self) -> anyhow::Result<()> {
+        // Bounds are unsigned integers; the invariant enforced here is that a
+        // state-advancing operation can advance by at least one point.
+        if self.advances_state {
+            anyhow::ensure!(
+                self.bounds.max_points >= 1,
+                "a state-advancing operation must admit at least one point"
+            );
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Completion record
+// ---------------------------------------------------------------------------
+
+/// Terminal status of one operation's completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum OpStatus {
+    Ok = 0,
+    Predicated = 1,
+    Error = 2,
+}
+
+/// A deterministic error class for a failed completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ErrorCode {
+    InvalidOperation = 0,
+    ResourceExhausted = 1,
+    ComputeError = 2,
+    Cancelled = 3,
+    Internal = 4,
+}
+
+/// Accounting lengths carried by a completion. These are accounting fields, not
+/// state identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct LogicalLengths {
+    pub token_len: u32,
+    pub kv_visible_len: u32,
+    pub latent_len: u32,
+}
+
+/// The span of tokens an operation contributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct TokenSpan {
+    pub base: u32,
+    pub len: u32,
+}
+
+/// Device-observed finish candidates for a token operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct FinishFlags {
+    pub eos: bool,
+    pub length: bool,
+    pub stop: bool,
+}
+
+/// Per-operation timing counters. Accounting only; never state identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct TimingCounters {
+    pub queued_us: u64,
+    pub device_us: u64,
+    pub copy_us: u64,
+    pub host_us: u64,
+}
+
+/// The fixed-layout record a worker emits once for every operation, after its
+/// copy event is query-ready and its pinned fields are validated on the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionRecord {
+    pub request_key: RequestKey,
+    pub op_id: OpId,
+    pub completion_slot_generation: u32,
+    pub status: OpStatus,
+    pub selected_point: u32,
+    pub logical_lengths: LogicalLengths,
+    pub token_span: TokenSpan,
+    /// The tokens this operation sampled or selected on device — the semantic
+    /// output delta for a `Token(*)` operation, empty for every other work
+    /// variant. Bounded by the operation's `max_tokens`.
+    pub committed_tokens: Vec<u32>,
+    pub finish_flags: FinishFlags,
+    pub product_generations: Vec<u32>,
+    pub semantic_digest: Digest,
+    pub error_code: Option<ErrorCode>,
+    pub timing_counters: TimingCounters,
+}
+
+impl CompletionRecord {
+    /// The selected-result identity digest, host-computed from the ready record.
+    /// The committed token values are part of the semantic output delta, so two
+    /// different tokens selected at the same span do not share a lineage.
+    pub fn compute_semantic_digest(&self, parent_semantic: &str, plan_digest: &str) -> Digest {
+        let mut digest = CanonicalDigest::new(b"uniserve-semantic\0");
+        digest.string(parent_semantic);
+        digest.string(plan_digest);
+        digest.u32(self.selected_point);
+        digest.u8(self.status as u8);
+        digest.u32(self.logical_lengths.token_len);
+        digest.u32(self.logical_lengths.kv_visible_len);
+        digest.u32(self.logical_lengths.latent_len);
+        digest.u32(self.token_span.base);
+        digest.u32(self.token_span.len);
+        digest.u32s(self.committed_tokens.iter().copied());
+        digest.bool(self.finish_flags.eos);
+        digest.bool(self.finish_flags.length);
+        digest.bool(self.finish_flags.stop);
+        digest.u32s(self.product_generations.iter().copied());
+        digest.finish()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.op_id.0 > 0, "completion op id must be positive");
+        anyhow::ensure!(
+            is_digest(&self.semantic_digest),
+            "completion semantic digest is not a lowercase SHA-256 digest"
+        );
+        match self.status {
+            OpStatus::Error => anyhow::ensure!(
+                self.error_code.is_some(),
+                "an error completion must carry an error code"
+            ),
+            OpStatus::Ok | OpStatus::Predicated => anyhow::ensure!(
+                self.error_code.is_none(),
+                "a non-error completion must not carry an error code"
+            ),
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Control
+// ---------------------------------------------------------------------------
+
+/// What to do with a committed selected point's public output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Disposition {
+    Publish = 0,
+    Retain = 1,
+    Discard = 2,
+}
+
+/// Why a request lineage is being closed at a cutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum CloseReason {
+    Completed = 0,
+    Cancelled = 1,
+    Error = 2,
+    Preempted = 3,
+}
+
+/// The entire request-runtime command channel. Administrative worker commands
+/// (drop session, copy KV, adapters, prefix-cache reset, snapshot and restore)
+/// are a separate channel and are not part of `Control`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum Control {
+    /// Commit a selected fixed point and expose public output up to a limit.
+    Commit {
+        request_key: RequestKey,
+        control_seq: u64,
+        expected_parent: VersionRef,
+        selected: VersionRef,
+        public_event_limit: u64,
+        disposition: Disposition,
+    },
+    /// Close a lineage at a fixed cutoff, dominating every uncommitted descendant.
+    Close {
+        request_key: RequestKey,
+        control_seq: u64,
+        cutoff: VersionRef,
+        reason: CloseReason,
+    },
+    /// Drop the scheduler's logical ownership of one operation.
+    Release {
+        request_key: RequestKey,
+        op_id: OpId,
+    },
+}
+
+impl Control {
+    pub fn request_key(&self) -> RequestKey {
+        match self {
+            Self::Commit { request_key, .. }
+            | Self::Close { request_key, .. }
+            | Self::Release { request_key, .. } => *request_key,
+        }
+    }
+
+    /// The variant tag used in the idempotency identity.
+    pub const fn variant_index(&self) -> u8 {
+        match self {
+            Self::Commit { .. } => 0,
+            Self::Close { .. } => 1,
+            Self::Release { .. } => 2,
+        }
+    }
+
+    /// The `control_seq` for commit and close; releases carry no sequence.
+    pub const fn control_seq(&self) -> Option<u64> {
+        match self {
+            Self::Commit { control_seq, .. } | Self::Close { control_seq, .. } => {
+                Some(*control_seq)
+            }
+            Self::Release { .. } => None,
+        }
+    }
+
+    /// The canonical content digest for idempotency: two controls with the same
+    /// `(request_key, control_seq, variant)` but different content conflict.
+    pub fn content_digest(&self) -> Digest {
+        let mut digest = CanonicalDigest::new(b"uniserve-control\0");
+        digest.u8(self.variant_index());
+        digest.request_key(self.request_key());
+        match self {
+            Self::Commit {
+                control_seq,
+                expected_parent,
+                selected,
+                public_event_limit,
+                disposition,
+                ..
+            } => {
+                digest.u64(*control_seq);
+                digest.version_ref(expected_parent);
+                digest.version_ref(selected);
+                digest.u64(*public_event_limit);
+                digest.u8(*disposition as u8);
+            }
+            Self::Close {
+                control_seq,
+                cutoff,
+                reason,
+                ..
+            } => {
+                digest.u64(*control_seq);
+                digest.version_ref(cutoff);
+                digest.u8(*reason as u8);
+            }
+            Self::Release { op_id, .. } => {
+                digest.op_id(*op_id);
+            }
+        }
+        digest.finish()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Commit {
+                expected_parent,
+                selected,
+                ..
+            } => {
+                expected_parent.validate()?;
+                selected.validate()?;
+                anyhow::ensure!(
+                    selected.is_fixed(),
+                    "a commit control must select a fixed version"
+                );
+            }
+            Self::Close { cutoff, .. } => {
+                cutoff.validate()?;
+                anyhow::ensure!(
+                    cutoff.is_fixed(),
+                    "a close control must name a fixed cutoff version"
+                );
+            }
+            Self::Release { op_id, .. } => {
+                anyhow::ensure!(op_id.0 > 0, "a release control must name a valid operation");
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admission framing (session establishment)
+// ---------------------------------------------------------------------------
+
+/// A logical KV allocation established at admission for a token lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct KvAllocation {
     pub block_ids: Vec<BlockId>,
     pub prefix_len: u32,
     pub group_id: u32,
 }
 
+/// Understanding-branch admission: sampling parameters, negative tokens, and KV.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SequenceAdmission {
+pub struct UndAdmission {
     pub sampling: SamplingParams,
     pub negative_token_ids: Vec<u32>,
     pub kv: KvAllocation,
 }
 
+/// Generation-branch admission: image parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FlowAdmission {
+pub struct GenAdmission {
     pub image: ImageParams,
 }
 
+/// Session establishment framing. Carries the per-domain parameters a lineage
+/// needs before its operations run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Admission {
-    pub session_id: RequestId,
-    pub digest: String,
-    pub sequence: Option<SequenceAdmission>,
-    pub flow: Option<FlowAdmission>,
+    pub request_key: RequestKey,
+    pub digest: Digest,
+    pub und: Option<UndAdmission>,
+    pub gen_admission: Option<GenAdmission>,
     pub adapter_id: Option<u32>,
 }
 
 impl Admission {
     pub fn new(
-        session_id: RequestId,
-        sequence: Option<SequenceAdmission>,
-        flow: Option<FlowAdmission>,
+        request_key: RequestKey,
+        und: Option<UndAdmission>,
+        gen_admission: Option<GenAdmission>,
         adapter_id: Option<u32>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            sequence.is_some() || flow.is_some(),
-            "admission must declare sequence or flow state"
+            und.is_some() || gen_admission.is_some(),
+            "admission must declare an understanding or generation branch"
         );
         let mut admission = Self {
-            session_id,
+            request_key,
             digest: String::new(),
-            sequence,
-            flow,
+            und,
+            gen_admission,
             adapter_id,
         };
-        admission.digest = admission.payload_digest(EXECUTION_PROTOCOL_VERSION);
+        admission.digest = admission.payload_digest();
         Ok(admission)
     }
 
-    pub fn validate(&self, protocol_version: u16) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.sequence.is_some() || self.flow.is_some(),
-            "admission must declare sequence or flow state"
-        );
-        anyhow::ensure!(
-            is_digest(&self.digest),
-            "admission digest must be a lowercase SHA-256 digest"
-        );
-        anyhow::ensure!(
-            self.digest == self.payload_digest(protocol_version),
-            "admission digest mismatch for session {}",
-            self.session_id.0
-        );
-        if let Some(sequence) = &self.sequence {
-            sequence.sampling.validate()?;
-            anyhow::ensure!(
-                sequence.kv.prefix_len == 0 || !sequence.kv.block_ids.is_empty(),
-                "a non-empty KV prefix requires allocated blocks"
-            );
-            anyhow::ensure!(
-                sequence.kv.block_ids.iter().collect::<HashSet<_>>().len()
-                    == sequence.kv.block_ids.len(),
-                "KV allocation repeats a logical block"
-            );
-        }
-        if let Some(flow) = &self.flow {
-            flow.image.validate()?;
-        }
-        Ok(())
-    }
-
-    pub fn payload_digest(&self, protocol_version: u16) -> String {
-        let mut digest = CanonicalDigest::new(b"uniserve-admission-v3\0", protocol_version);
-        digest.u64(self.session_id.0);
-        digest.option(self.sequence.as_ref(), |digest, sequence| {
-            digest.sampling(&sequence.sampling);
-            digest.u32s(sequence.negative_token_ids.iter().copied());
-            digest.u32s(sequence.kv.block_ids.iter().map(|block| block.0));
-            digest.u32(sequence.kv.prefix_len);
-            digest.u32(sequence.kv.group_id);
+    pub fn payload_digest(&self) -> Digest {
+        let mut digest = CanonicalDigest::new(b"uniserve-admission\0");
+        digest.request_key(self.request_key);
+        digest.option(self.und.as_ref(), |digest, und| {
+            digest.sampling(&und.sampling);
+            digest.u32s(und.negative_token_ids.iter().copied());
+            digest.u32s(und.kv.block_ids.iter().map(|block| block.0));
+            digest.u32(und.kv.prefix_len);
+            digest.u32(und.kv.group_id);
         });
-        digest.option(self.flow.as_ref(), |digest, flow| digest.image(&flow.image));
+        digest.option(self.gen_admission.as_ref(), |digest, branch| {
+            digest.image(&branch.image)
+        });
         digest.option(self.adapter_id, CanonicalDigest::u32);
         digest.finish()
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct KvLeaseDelta {
-    pub group_id: u32,
-    pub new_blocks: Vec<BlockId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct TokenPolicy {
-    pub allowed_tokens: Vec<u32>,
-    pub suppress_tokens: Vec<u32>,
-    pub recent_tokens: Vec<u32>,
-    pub publish_kv: bool,
-    pub publish_kv_on_tokens: Vec<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenInput {
-    pub token_ids: Vec<u32>,
-    pub source: TokenSource,
-    pub draft_token_ids: Vec<u32>,
-    pub return_all_logits: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishedProduct {
-    pub handle: u64,
-    pub locator: String,
-}
-
-impl PublishedProduct {
-    fn validate(&self, label: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.handle > 0 || !self.locator.is_empty(),
-            "{label} requires a handle or locator"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishedKv {
-    pub handle: u64,
-    /// Data-plane locators grouped contiguously in tensor-parallel rank order.
-    pub locators: Vec<String>,
-    pub source_version: u64,
-    pub kv_tokens: u32,
-    pub block_ids: Vec<BlockId>,
-    pub group_id: u32,
-    pub position: u32,
-}
-
-impl PublishedKv {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.handle > 0 || !self.locators.is_empty(),
-            "published KV requires a local handle or data-plane locators"
-        );
-        anyhow::ensure!(
-            self.source_version > 0,
-            "published KV source version must be positive"
-        );
-        anyhow::ensure!(
-            self.kv_tokens == 0 || !self.block_ids.is_empty(),
-            "non-empty published KV requires logical blocks"
-        );
-        anyhow::ensure!(
-            self.block_ids.iter().collect::<HashSet<_>>().len() == self.block_ids.len(),
-            "published KV repeats a logical block"
-        );
-        anyhow::ensure!(
-            self.locators.iter().all(|locator| !locator.is_empty()),
-            "published KV contains an empty locator"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum SequenceInput {
-    Tokens(TokenInput),
-    PublishedLogits(PublishedProduct),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SequenceOperation {
-    pub mode: SequenceMode,
-    pub lease: KvLeaseDelta,
-    pub position: (u32, u32),
-    pub policy: TokenPolicy,
-    pub input: SequenceInput,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Guidance {
-    pub branch_count: u8,
-    pub text_scale: f32,
-    pub image_scale: f32,
-    pub renorm_type: String,
-    pub renorm_min: f32,
-    pub interval: (f32, f32),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FlowOperation {
-    pub latent_handle: u64,
-    pub position: u32,
-    pub start_step: u16,
-    pub step_count: u16,
-    pub conditioning_position: u32,
-    pub conditioning: Option<PublishedKv>,
-    pub guidance: Guidance,
-    pub image_prompt: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum EncodeInput {
-    InlineImage { base64: String, content_hash: u64 },
-    StagedProduct { handle: u64, content_hash: u64 },
-    CachedProduct { content_hash: u64 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EncodeOperation {
-    pub kind: EncodeKind,
-    pub lease: KvLeaseDelta,
-    pub position: (u32, u32),
-    pub conditioning_position: u32,
-    pub input: EncodeInput,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum MaterializeInput {
-    Latent { handle: u64 },
-    Published(PublishedProduct),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaterializeOperation {
-    pub kind: MaterializeKind,
-    pub lease: KvLeaseDelta,
-    pub position: u32,
-    pub conditioning_position: u32,
-    pub policy: TokenPolicy,
-    pub input: MaterializeInput,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransferOperation {
-    pub kind: TransferKind,
-    pub lease: KvLeaseDelta,
-    pub position: u32,
-    pub conditioning_position: u32,
-    pub policy: TokenPolicy,
-    pub source: PublishedProduct,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum Operation {
-    Sequence(SequenceOperation),
-    Flow(FlowOperation),
-    Encode(EncodeOperation),
-    Materialize(MaterializeOperation),
-    Transfer(TransferOperation),
-}
-
-impl Operation {
-    pub const fn kind(&self) -> OperationKind {
-        match self {
-            Self::Sequence(_) => OperationKind::Sequence,
-            Self::Flow(_) => OperationKind::Flow,
-            Self::Encode(_) => OperationKind::Encode,
-            Self::Materialize(_) => OperationKind::Materialize,
-            Self::Transfer(_) => OperationKind::Transfer,
-        }
-    }
-
-    pub const fn operation_type(&self) -> OperationType {
-        match self {
-            Self::Sequence(operation) => match operation.mode {
-                SequenceMode::Extend => OperationType::SequenceExtend,
-                SequenceMode::Decode => OperationType::SequenceDecode,
-                SequenceMode::Verify => OperationType::SequenceVerify,
-                SequenceMode::Sample => OperationType::SequenceSample,
-            },
-            Self::Flow(_) => OperationType::Flow,
-            Self::Encode(operation) => match operation.kind {
-                EncodeKind::Vision => OperationType::EncodeVision,
-                EncodeKind::Latent => OperationType::EncodeLatent,
-            },
-            Self::Materialize(operation) => match operation.kind {
-                MaterializeKind::Image => OperationType::MaterializeImage,
-                MaterializeKind::Frame => OperationType::MaterializeFrame,
-            },
-            Self::Transfer(operation) => match operation.kind {
-                TransferKind::Product => OperationType::TransferProduct,
-                TransferKind::Kv => OperationType::TransferKv,
-            },
-        }
-    }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        match self {
-            Self::Sequence(operation) => {
-                anyhow::ensure!(
-                    operation.position.1 >= operation.position.0,
-                    "sequence position range is inverted"
-                );
-                match (&operation.mode, &operation.input) {
-                    (SequenceMode::Sample, SequenceInput::PublishedLogits(product)) => {
-                        product.validate("published logits")
-                    }
-                    (SequenceMode::Sample, SequenceInput::Tokens(_)) => {
-                        anyhow::bail!("sample sequence requires published logits")
-                    }
-                    (_, SequenceInput::PublishedLogits(_)) => {
-                        anyhow::bail!("model sequence requires token input")
-                    }
-                    (_, SequenceInput::Tokens(input)) => {
-                        anyhow::ensure!(
-                            !input.token_ids.is_empty(),
-                            "model sequence requires at least one token id"
-                        );
-                        match operation.mode {
-                            SequenceMode::Extend => {
-                                anyhow::ensure!(
-                                    input.source == TokenSource::Wire,
-                                    "sequence extend requires wire token input"
-                                );
-                                anyhow::ensure!(
-                                    input.draft_token_ids.is_empty(),
-                                    "sequence extend cannot carry draft work"
-                                );
-                            }
-                            SequenceMode::Decode => {
-                                anyhow::ensure!(
-                                    input.token_ids.len() == 1 && input.draft_token_ids.is_empty(),
-                                    "sequence decode requires one input token and no draft"
-                                );
-                            }
-                            SequenceMode::Verify => {
-                                anyhow::ensure!(
-                                    input.token_ids.len() == 1 && !input.draft_token_ids.is_empty(),
-                                    "sequence verify requires one input token and a draft"
-                                );
-                            }
-                            SequenceMode::Sample => {
-                                unreachable!("sample/token mismatch is rejected by the outer match")
-                            }
-                        }
-                        Ok(())
-                    }
-                }
-            }
-            Self::Flow(operation) => {
-                anyhow::ensure!(
-                    operation.latent_handle > 0,
-                    "flow operation requires a latent handle"
-                );
-                anyhow::ensure!(operation.step_count > 0, "flow step count must be positive");
-                anyhow::ensure!(
-                    operation.guidance.branch_count > 0,
-                    "flow guidance requires a branch"
-                );
-                if let Some(conditioning) = &operation.conditioning {
-                    conditioning.validate()?;
-                }
-                validate_finite_guidance(&operation.guidance)
-            }
-            Self::Encode(operation) => {
-                anyhow::ensure!(
-                    operation.position.1 >= operation.position.0,
-                    "encode position range is inverted"
-                );
-                match &operation.input {
-                    EncodeInput::InlineImage {
-                        base64,
-                        content_hash,
-                    } => {
-                        anyhow::ensure!(!base64.is_empty(), "inline encode input is empty");
-                        anyhow::ensure!(*content_hash > 0, "encode content hash must be positive");
-                    }
-                    EncodeInput::StagedProduct {
-                        handle,
-                        content_hash,
-                    } => {
-                        anyhow::ensure!(
-                            *handle > 0 && *content_hash > 0,
-                            "staged encode input is invalid"
-                        );
-                    }
-                    EncodeInput::CachedProduct { content_hash } => {
-                        anyhow::ensure!(*content_hash > 0, "cached encode input is invalid")
-                    }
-                }
-                Ok(())
-            }
-            Self::Materialize(operation) => match &operation.input {
-                MaterializeInput::Latent { handle } => {
-                    anyhow::ensure!(
-                        *handle > 0,
-                        "materialize operation requires a latent handle"
-                    );
-                    Ok(())
-                }
-                MaterializeInput::Published(product) => product.validate("materialize input"),
-            },
-            Self::Transfer(operation) => operation.source.validate("transfer source"),
+        anyhow::ensure!(
+            self.und.is_some() || self.gen_admission.is_some(),
+            "admission must declare an understanding or generation branch"
+        );
+        anyhow::ensure!(
+            is_digest(&self.digest),
+            "admission digest is not a lowercase SHA-256 digest"
+        );
+        anyhow::ensure!(
+            self.digest == self.payload_digest(),
+            "admission digest does not match its payload"
+        );
+        if let Some(und) = &self.und {
+            und.sampling.validate()?;
+            anyhow::ensure!(
+                und.kv.prefix_len == 0 || !und.kv.block_ids.is_empty(),
+                "a non-empty KV prefix requires allocated blocks"
+            );
+            anyhow::ensure!(
+                und.kv.block_ids.iter().collect::<HashSet<_>>().len() == und.kv.block_ids.len(),
+                "KV allocation repeats a logical block"
+            );
         }
-    }
-}
-
-fn validate_finite_guidance(guidance: &Guidance) -> anyhow::Result<()> {
-    for value in [
-        guidance.text_scale,
-        guidance.image_scale,
-        guidance.renorm_min,
-        guidance.interval.0,
-        guidance.interval.1,
-    ] {
-        anyhow::ensure!(value.is_finite(), "guidance values must be finite");
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OperationEnvelope {
-    pub session_id: RequestId,
-    pub epoch: u64,
-    pub op_id: u64,
-    pub base_version: u64,
-    pub digest: String,
-    pub admission_digest: String,
-    pub model_spec_digest: String,
-    pub weight_digest: String,
-    pub operation: Operation,
-}
-
-impl OperationEnvelope {
-    pub fn unsealed(session_id: RequestId, operation: Operation) -> Self {
-        Self {
-            session_id,
-            epoch: 0,
-            op_id: 0,
-            base_version: 0,
-            digest: String::new(),
-            admission_digest: String::new(),
-            model_spec_digest: String::new(),
-            weight_digest: String::new(),
-            operation,
+        if let Some(branch) = &self.gen_admission {
+            branch.image.validate()?;
         }
-    }
-
-    pub const fn kind(&self) -> OperationKind {
-        self.operation.kind()
-    }
-
-    pub const fn operation_type(&self) -> OperationType {
-        self.operation.operation_type()
-    }
-
-    pub fn seal(&mut self, epoch: u64, op_id: u64, base_version: u64) {
-        self.epoch = epoch;
-        self.op_id = op_id;
-        self.base_version = base_version;
-        self.refresh_digest();
-    }
-
-    pub fn refresh_digest(&mut self) {
-        self.digest = self.payload_digest(EXECUTION_PROTOCOL_VERSION);
-    }
-
-    pub fn validate(&self, protocol_version: u16) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            protocol_version == EXECUTION_PROTOCOL_VERSION,
-            "unsupported execution protocol version {protocol_version}"
-        );
-        anyhow::ensure!(self.epoch > 0, "operation epoch must be positive");
-        anyhow::ensure!(self.op_id > 0, "operation id must be positive");
-        anyhow::ensure!(
-            is_digest(&self.admission_digest),
-            "operation admission digest is invalid"
-        );
-        anyhow::ensure!(
-            is_digest(&self.model_spec_digest),
-            "operation model spec digest is invalid"
-        );
-        anyhow::ensure!(
-            is_digest(&self.weight_digest),
-            "operation weight digest is invalid"
-        );
-        self.operation.validate()?;
-        anyhow::ensure!(is_digest(&self.digest), "operation digest is invalid");
-        anyhow::ensure!(
-            self.digest == self.payload_digest(protocol_version),
-            "operation digest mismatch for session {}",
-            self.session_id.0
-        );
         Ok(())
     }
-
-    pub fn payload_digest(&self, protocol_version: u16) -> String {
-        let mut digest = CanonicalDigest::new(b"uniserve-operation-v3\0", protocol_version);
-        digest.u64(self.session_id.0);
-        digest.u64(self.epoch);
-        digest.u64(self.op_id);
-        digest.u64(self.base_version);
-        digest.string(&self.admission_digest);
-        digest.string(&self.model_spec_digest);
-        digest.string(&self.weight_digest);
-        digest.operation(&self.operation);
-        digest.finish()
-    }
 }
 
+// ---------------------------------------------------------------------------
+// Batch and response framing
+// ---------------------------------------------------------------------------
+
+/// A submission window: a topologically ordered set of operations plus any
+/// controls, and the admissions that establish their lineages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
-    pub protocol_version: u16,
     pub step_id: u64,
     pub admissions: Vec<Admission>,
-    pub projections: Vec<SessionProjection>,
-    pub operations: Vec<OperationEnvelope>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionProjection {
-    pub session_id: RequestId,
-    pub epoch: u64,
-    pub version: u64,
-    pub last_op_id: u64,
-    pub admission_digest: String,
-    pub source_digest: String,
-    pub last_sampled_token: Option<u32>,
-}
-
-impl SessionProjection {
-    pub fn validate_for(&self, operation: &OperationEnvelope) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.session_id == operation.session_id,
-            "session projection targets a different session"
-        );
-        anyhow::ensure!(
-            self.epoch == operation.epoch,
-            "session projection epoch does not match operation"
-        );
-        anyhow::ensure!(
-            self.version == operation.base_version,
-            "session projection version does not match operation base version"
-        );
-        anyhow::ensure!(
-            self.version > 0 && self.last_op_id > 0,
-            "session projection must identify committed state"
-        );
-        anyhow::ensure!(
-            self.admission_digest == operation.admission_digest,
-            "session projection admission identity does not match operation"
-        );
-        anyhow::ensure!(
-            is_digest(&self.admission_digest),
-            "session projection admission digest is invalid"
-        );
-        anyhow::ensure!(
-            is_digest(&self.source_digest),
-            "session projection source digest is invalid"
-        );
-        Ok(())
-    }
+    pub operations: Vec<Operation>,
+    pub controls: Vec<Control>,
+    /// Host-supplied input product values the operations reference through
+    /// `Operation::inputs`, matched by `ProductRef` identity. These are
+    /// transported values, not lineage identity: `plan_digest` already covers
+    /// the input product references, so `input_products` enters no digest.
+    pub input_products: Vec<ProductPayload>,
 }
 
 impl Batch {
-    pub fn new(
-        step_id: u64,
-        admissions: Vec<Admission>,
-        operations: Vec<OperationEnvelope>,
-    ) -> Self {
+    pub fn new(step_id: u64, admissions: Vec<Admission>, operations: Vec<Operation>) -> Self {
         Self {
-            protocol_version: EXECUTION_PROTOCOL_VERSION,
             step_id,
             admissions,
-            projections: Vec::new(),
             operations,
+            controls: Vec::new(),
+            input_products: Vec::new(),
         }
+    }
+
+    pub fn with_controls(mut self, controls: Vec<Control>) -> Self {
+        self.controls = controls;
+        self
+    }
+
+    pub fn with_input_products(mut self, input_products: Vec<ProductPayload>) -> Self {
+        self.input_products = input_products;
+        self
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.protocol_version == EXECUTION_PROTOCOL_VERSION,
-            "unsupported execution protocol version {}",
-            self.protocol_version
+            !self.operations.is_empty() || !self.controls.is_empty(),
+            "a submission batch must carry at least one operation or control"
         );
-        anyhow::ensure!(
-            !self.operations.is_empty(),
-            "execution batch must contain an operation"
-        );
-        let mut sessions = HashSet::with_capacity(self.operations.len());
+        // Depth one: at most one runnable operation per request per batch.
+        let mut request_keys = HashSet::with_capacity(self.operations.len());
         for operation in &self.operations {
-            operation.validate(self.protocol_version)?;
+            operation.validate()?;
             anyhow::ensure!(
-                sessions.insert(operation.session_id),
-                "batch contains multiple operations for session {}",
-                operation.session_id.0
+                request_keys.insert(operation.request_key),
+                "a submission batch carries multiple operations for one request"
             );
         }
         let mut admitted = HashSet::with_capacity(self.admissions.len());
         for admission in &self.admissions {
-            admission.validate(self.protocol_version)?;
+            admission.validate()?;
             anyhow::ensure!(
-                admitted.insert(admission.session_id),
-                "batch contains duplicate admission for session {}",
-                admission.session_id.0
+                admitted.insert(admission.request_key),
+                "a submission batch carries a duplicate admission"
             );
-            let operation = self
-                .operations
-                .iter()
-                .find(|operation| operation.session_id == admission.session_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "batch admits session {} without an operation",
-                        admission.session_id.0
-                    )
-                })?;
             anyhow::ensure!(
-                operation.admission_digest == admission.digest,
-                "operation admission digest mismatch for session {}",
-                admission.session_id.0
+                self.operations
+                    .iter()
+                    .any(|operation| operation.request_key == admission.request_key),
+                "a submission batch admits a request without an operation"
             );
         }
-        let mut projected = HashSet::with_capacity(self.projections.len());
-        for projection in &self.projections {
-            anyhow::ensure!(
-                projected.insert(projection.session_id),
-                "batch contains duplicate projection for session {}",
-                projection.session_id.0
+        // Idempotency identity: (request_key, control_seq, variant, content).
+        let mut control_identities: std::collections::HashMap<
+            (RequestKey, Option<u64>, u8),
+            Digest,
+        > = std::collections::HashMap::new();
+        for control in &self.controls {
+            control.validate()?;
+            let identity = (
+                control.request_key(),
+                control.control_seq(),
+                control.variant_index(),
             );
-            let operation = self
-                .operations
-                .iter()
-                .find(|operation| operation.session_id == projection.session_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "batch projects session {} without an operation",
-                        projection.session_id.0
-                    )
-                })?;
-            projection.validate_for(operation)?;
+            let content = control.content_digest();
+            if let Some(existing) = control_identities.get(&identity) {
+                anyhow::ensure!(
+                    existing == &content,
+                    "a submission batch reuses a control identity with different content"
+                );
+            } else {
+                control_identities.insert(identity, content);
+            }
+        }
+        for payload in &self.input_products {
+            payload.validate()?;
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct TokenLogprob(pub u32, pub f32, pub u32);
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct SequenceEffect {
-    pub sampled_token_ids: Vec<u32>,
-    pub sampled_logprob: Option<f32>,
-    pub top_logprobs: Vec<TokenLogprob>,
-    pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
-    pub accepted_draft_tokens: Option<u32>,
-    pub kv_tokens: Option<u32>,
-    pub published_logits: Option<PublishedProduct>,
-    pub published_kv: Option<PublishedKv>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SequenceDelta {
-    pub effect: SequenceEffect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlowDelta {
-    pub steps_completed: u16,
-    pub done: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EncodeDelta {
-    pub product_handle: u64,
-    pub kv_tokens: u32,
-    pub image_size: Option<(u32, u32)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageArtifact {
-    pub png_base64: String,
-    pub height: u32,
-    pub width: u32,
-    pub handle: u64,
-    pub locator: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum MaterializedProduct {
-    Image(ImageArtifact),
-    Published(PublishedProduct),
-    Frame { count: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MaterializeDelta {
-    pub product: MaterializedProduct,
-    pub kv_tokens: Option<u32>,
-    pub sequence: Option<SequenceEffect>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TransferDelta {
-    pub product: Option<PublishedProduct>,
-    pub kv_tokens: Option<u32>,
-    pub sequence: Option<SequenceEffect>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum ResultDelta {
-    Sequence(SequenceDelta),
-    Flow(FlowDelta),
-    Encode(EncodeDelta),
-    Materialize(MaterializeDelta),
-    Transfer(TransferDelta),
-}
-
-impl ResultDelta {
-    pub const fn kind(&self) -> OperationKind {
-        match self {
-            Self::Sequence(_) => OperationKind::Sequence,
-            Self::Flow(_) => OperationKind::Flow,
-            Self::Encode(_) => OperationKind::Encode,
-            Self::Materialize(_) => OperationKind::Materialize,
-            Self::Transfer(_) => OperationKind::Transfer,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OperationResult {
-    pub session_id: RequestId,
-    pub epoch: u64,
-    pub op_id: u64,
-    pub base_version: u64,
-    pub result_version: u64,
-    pub delta: ResultDelta,
-}
-
-impl OperationResult {
-    pub fn validate_for(&self, operation: &OperationEnvelope) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.session_id == operation.session_id,
-            "result session does not match operation"
-        );
-        anyhow::ensure!(
-            self.epoch == operation.epoch,
-            "result epoch does not match operation"
-        );
-        anyhow::ensure!(
-            self.op_id == operation.op_id,
-            "result identity does not match operation"
-        );
-        anyhow::ensure!(
-            self.base_version == operation.base_version,
-            "result base version does not match operation"
-        );
-        anyhow::ensure!(
-            self.result_version == operation.base_version.saturating_add(1),
-            "result version does not advance exactly once"
-        );
-        anyhow::ensure!(
-            self.delta.kind() == operation.kind(),
-            "result delta variant does not match operation"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExecutionResult {
-    pub step_id: u64,
-    pub operations: Vec<OperationResult>,
-    pub worker_exec_us: Option<u64>,
-    pub forward_stats: Option<WorkerForwardStats>,
-}
-
-impl ExecutionResult {
-    pub fn validate_for(&self, batch: &Batch) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.step_id == batch.step_id,
-            "result step does not match batch"
-        );
-        anyhow::ensure!(
-            self.operations.len() == batch.operations.len(),
-            "result operation count does not match batch"
-        );
-        for (result, operation) in self.operations.iter().zip(&batch.operations) {
-            result.validate_for(operation)?;
-        }
-        Ok(())
-    }
-}
-
+/// The per-operation forward statistics a worker attaches to a completion report.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkerForwardStats {
     pub mode_counts: BTreeMap<String, u64>,
@@ -872,6 +1099,103 @@ pub struct WorkerForwardStats {
     pub spec_verify_path_counts: BTreeMap<String, u64>,
 }
 
+/// Envelope metadata reporting whether an atomic registration became visible. It
+/// carries no semantic lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RegistrationAck {
+    pub visible: bool,
+}
+
+/// A resolved product value carried across the boundary: a host-supplied input
+/// value the worker consumes (prompt, forced, or draft token ids; encode image
+/// bytes) referenced through `Operation::inputs`, or a worker-produced output
+/// value the host consumes (requested logprob blobs, materialized image bytes).
+/// The `product` identifies what the value is by `ProductRef` identity; the
+/// bytes are the value. A product payload is never a lineage identity and enters
+/// no digest.
+///
+/// The protocol layer treats `bytes` as opaque; the codec agreement is enforced
+/// by consumers. The one convention this crate fixes and shares with the Python
+/// worker is the `ProductKind::Token` layout, produced and parsed by
+/// [`encode_token_product_bytes`] and [`decode_token_product_bytes`]: a
+/// little-endian `u32` count `N`, then `N` little-endian `u32` token ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductPayload {
+    pub product: ProductRef,
+    /// Raw value bytes. `serde_bytes` keeps the pyo3 boundary on the
+    /// bytes fast path (one buffer copy) instead of a per-element
+    /// integer-sequence walk, which costs hundreds of milliseconds for a
+    /// multi-megabyte image artifact.
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+impl ProductPayload {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.product.validate()
+    }
+}
+
+/// Encode a `ProductKind::Token` product value: a little-endian `u32` count
+/// followed by that many little-endian `u32` token ids.
+pub fn encode_token_product_bytes(tokens: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + tokens.len() * 4);
+    bytes.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        bytes.extend_from_slice(&token.to_le_bytes());
+    }
+    bytes
+}
+
+/// Decode a `ProductKind::Token` product value produced by
+/// [`encode_token_product_bytes`].
+pub fn decode_token_product_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u32>> {
+    anyhow::ensure!(
+        bytes.len() >= 4,
+        "token product bytes are too short to carry a count"
+    );
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let expected = 4 + count * 4;
+    anyhow::ensure!(
+        bytes.len() == expected,
+        "token product byte length {} does not match declared count {count}",
+        bytes.len()
+    );
+    Ok(bytes[4..]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect())
+}
+
+/// A worker response frame: one completion per submitted operation, the resolved
+/// output-product values for host consumption, and the registration
+/// acknowledgement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletionReport {
+    pub step_id: u64,
+    pub completions: Vec<CompletionRecord>,
+    pub products: Vec<ProductPayload>,
+    pub registration: RegistrationAck,
+    pub worker_exec_us: Option<u64>,
+    pub forward_stats: Option<WorkerForwardStats>,
+}
+
+impl CompletionReport {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for completion in &self.completions {
+            completion.validate()?;
+        }
+        for payload in &self.products {
+            payload.validate()?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities and startup agreement
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterMode {
@@ -887,13 +1211,16 @@ pub struct ExecutionConstraints {
     pub max_batch_operations: u32,
 }
 
+/// A worker's advertised capabilities. Admission requires every rank, worker,
+/// and frontend to agree on both the protocol-layout and route-capability
+/// digests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineCaps {
     pub block_size: u32,
     pub num_blocks: u32,
     pub num_layers: u32,
     pub scratch_capacity_tokens: u64,
-    pub supported_operation_types: Vec<OperationType>,
+    pub supported_work: Vec<WorkVariant>,
     pub max_latent_size: u32,
     pub latent_downsample: u32,
     pub max_vae_grid_tokens: u32,
@@ -914,19 +1241,83 @@ pub struct EngineCaps {
     pub adapter_mode: AdapterMode,
     pub execution_constraints: ExecutionConstraints,
     pub resource_classes: Vec<ResourceClass>,
-    pub model_spec_digest: String,
-    pub weight_digest: String,
+    pub model_spec_digest: Digest,
+    pub weight_digest: Digest,
+    pub protocol_layout_digest: Digest,
+    pub route_capability_digest: Digest,
     pub restored_sessions: Vec<RequestId>,
+}
+
+impl EngineCaps {
+    /// The canonical protocol-layout digest: a disagreement means a peer reads a
+    /// different record layout and must not be admitted.
+    pub fn canonical_protocol_layout_digest() -> Digest {
+        protocol_layout_digest()
+    }
+
+    /// The route-capability digest: per-route supported work, sampler and shape
+    /// regime, and mixed-submission capability summarized for the agreement.
+    pub fn compute_route_capability_digest(&self) -> Digest {
+        let mut digest = CanonicalDigest::new(b"uniserve-route-capability\0");
+        let mut variants: Vec<u8> = self
+            .supported_work
+            .iter()
+            .map(|variant| *variant as u8)
+            .collect();
+        variants.sort_unstable();
+        variants.dedup();
+        digest.u64(variants.len() as u64);
+        for variant in variants {
+            digest.u8(variant);
+        }
+        digest.u32(self.max_cfg_branches);
+        digest.u32(self.max_latent_size);
+        digest.u32(self.max_vae_grid_tokens);
+        digest.u32(self.max_vit_grid_tokens);
+        digest.u8(self.adapter_mode as u8);
+        digest.u32(self.execution_constraints.max_batch_operations);
+        digest.string(&self.kv_dtype);
+        digest.string(&self.model_dtype);
+        digest.string(&self.attention_backend);
+        digest.finish()
+    }
+
+    /// Whether this process may be admitted alongside `other`.
+    pub fn agrees_with(&self, other: &Self) -> bool {
+        self.protocol_layout_digest == other.protocol_layout_digest
+            && self.route_capability_digest == other.route_capability_digest
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.supported_work.is_empty(),
+            "worker capabilities declare no work variants"
+        );
+        anyhow::ensure!(
+            self.protocol_layout_digest == protocol_layout_digest(),
+            "worker capabilities carry a disagreeing protocol-layout digest"
+        );
+        anyhow::ensure!(
+            self.route_capability_digest == self.compute_route_capability_digest(),
+            "worker capabilities carry an inconsistent route-capability digest"
+        );
+        anyhow::ensure!(
+            (self.model_spec_digest.is_empty() && self.weight_digest.is_empty())
+                || (is_digest(&self.model_spec_digest) && is_digest(&self.weight_digest)),
+            "worker capability model and weight identities are incomplete"
+        );
+        Ok(())
+    }
 }
 
 impl Default for EngineCaps {
     fn default() -> Self {
-        Self {
+        let mut caps = Self {
             block_size: 64,
             num_blocks: 4096,
             num_layers: 28,
             scratch_capacity_tokens: 1 << 20,
-            supported_operation_types: vec![OperationType::SequenceExtend],
+            supported_work: vec![WorkVariant::TokenExtend, WorkVariant::TokenDecode],
             max_latent_size: 0,
             latent_downsample: 1,
             max_vae_grid_tokens: 0,
@@ -949,10 +1340,83 @@ impl Default for EngineCaps {
             resource_classes: Vec::new(),
             model_spec_digest: String::new(),
             weight_digest: String::new(),
+            protocol_layout_digest: protocol_layout_digest(),
+            route_capability_digest: String::new(),
             restored_sessions: Vec::new(),
-        }
+        };
+        caps.route_capability_digest = caps.compute_route_capability_digest();
+        caps
     }
 }
+
+/// The canonical protocol-layout digest over the closed `Work` and `Control`
+/// variants and the fixed record field layouts.
+pub fn protocol_layout_digest() -> Digest {
+    let mut digest = CanonicalDigest::new(b"uniserve-protocol-layout\0");
+    digest.u64(WorkVariant::ALL.len() as u64);
+    for variant in WorkVariant::ALL {
+        digest.string(variant.as_wire_str());
+    }
+    for control in ["commit", "close", "release"] {
+        digest.string(control);
+    }
+    // Record field layouts, in declaration order.
+    let record_layouts: [&[&str]; 4] = [
+        &[
+            "request_key",
+            "op_id",
+            "parent",
+            "work",
+            "route",
+            "domain",
+            "advances_state",
+            "bounds",
+            "inputs",
+            "outputs",
+            "predicate",
+            "rng",
+            "control_seq",
+            "plan_digest",
+        ],
+        &["request_key", "producer_op_id", "point"],
+        &[
+            "request_key",
+            "producer_op_id",
+            "output_index",
+            "generation",
+            "kind",
+            "storage_class",
+            "dtype",
+            "shape_bound",
+            "point_range",
+        ],
+        &[
+            "request_key",
+            "op_id",
+            "completion_slot_generation",
+            "status",
+            "selected_point",
+            "logical_lengths",
+            "token_span",
+            "finish_flags",
+            "product_generations",
+            "semantic_digest",
+            "error_code",
+            "timing_counters",
+        ],
+    ];
+    for record in record_layouts {
+        digest.u64(record.len() as u64);
+        for field in record {
+            digest.string(field);
+        }
+    }
+    digest.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Administrative request and response framing
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1013,7 +1477,7 @@ pub struct SnapshotRef {
     pub session_id: RequestId,
     pub epoch: u64,
     pub version: u64,
-    pub digest: String,
+    pub digest: Digest,
     pub locator: String,
 }
 
@@ -1146,9 +1610,8 @@ pub enum ResponseKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorOperationIdentity {
-    pub session_id: u64,
-    pub epoch: u64,
-    pub op_id: u64,
+    pub request_key: RequestKey,
+    pub op_id: OpId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1156,7 +1619,7 @@ pub struct WorkerResponse {
     pub kind: ResponseKind,
     pub call_id: Option<u64>,
     pub capabilities: Option<EngineCaps>,
-    pub result: Option<ExecutionResult>,
+    pub completion_report: Option<CompletionReport>,
     pub metrics: Option<WorkerMetrics>,
     pub pressure: Option<Vec<ResourcePressure>>,
     pub message: Option<String>,
@@ -1170,12 +1633,12 @@ pub struct WorkerResponse {
 }
 
 impl WorkerResponse {
-    pub fn capabilities(capabilities: EngineCaps) -> Self {
+    fn bare(kind: ResponseKind) -> Self {
         Self {
-            kind: ResponseKind::Capabilities,
+            kind,
             call_id: None,
-            capabilities: Some(capabilities),
-            result: None,
+            capabilities: None,
+            completion_report: None,
             metrics: None,
             pressure: None,
             message: None,
@@ -1189,63 +1652,35 @@ impl WorkerResponse {
         }
     }
 
-    pub fn result(result: ExecutionResult) -> Self {
+    pub fn capabilities(capabilities: EngineCaps) -> Self {
         Self {
-            kind: ResponseKind::Result,
-            call_id: None,
-            capabilities: None,
-            result: Some(result),
-            metrics: None,
-            pressure: None,
-            message: None,
-            code: None,
-            retryable: None,
-            fatal: None,
-            phase: None,
-            route: None,
-            operations: Vec::new(),
-            snapshot: None,
+            capabilities: Some(capabilities),
+            ..Self::bare(ResponseKind::Capabilities)
+        }
+    }
+
+    pub fn completion_report(report: CompletionReport) -> Self {
+        Self {
+            completion_report: Some(report),
+            ..Self::bare(ResponseKind::Result)
         }
     }
 
     pub fn ok() -> Self {
-        Self {
-            kind: ResponseKind::Ok,
-            call_id: None,
-            capabilities: None,
-            result: None,
-            metrics: None,
-            pressure: None,
-            message: None,
-            code: None,
-            retryable: None,
-            fatal: None,
-            phase: None,
-            route: None,
-            operations: Vec::new(),
-            snapshot: None,
-        }
+        Self::bare(ResponseKind::Ok)
     }
 
     pub fn snapshot(snapshot: SnapshotRef) -> Self {
         Self {
-            kind: ResponseKind::Snapshot,
-            call_id: None,
-            capabilities: None,
-            result: None,
-            metrics: None,
-            pressure: None,
-            message: None,
-            code: None,
-            retryable: None,
-            fatal: None,
-            phase: None,
-            route: None,
-            operations: Vec::new(),
             snapshot: Some(snapshot),
+            ..Self::bare(ResponseKind::Snapshot)
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Canonical digest helper
+// ---------------------------------------------------------------------------
 
 fn is_digest(value: &str) -> bool {
     value.len() == 64
@@ -1254,13 +1689,15 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+/// A little-endian, length-prefixed SHA-256 builder. Each digest is domain
+/// separated by a neutral tag; the byte layout is mirrored exactly by the Python
+/// worker so both sides compute identical digests.
 struct CanonicalDigest(Sha256);
 
 impl CanonicalDigest {
-    fn new(domain: &[u8], version: u16) -> Self {
+    fn new(domain: &[u8]) -> Self {
         let mut digest = Sha256::new();
         digest.update(domain);
-        digest.update(version.to_le_bytes());
         Self(digest)
     }
 
@@ -1304,6 +1741,83 @@ impl CanonicalDigest {
             }
             None => self.u8(0),
         }
+    }
+
+    fn request_key(&mut self, value: RequestKey) {
+        self.u64(value.authority_id);
+        self.u64(value.session_id.0);
+        self.u64(value.epoch);
+    }
+
+    fn op_id(&mut self, value: OpId) {
+        self.u64(value.0);
+    }
+
+    fn shape_bound(&mut self, value: &ShapeBound) {
+        self.u64(value.dims.len() as u64);
+        for dim in &value.dims {
+            match dim {
+                DimBound::Static(extent) => {
+                    self.u8(0);
+                    self.u32(*extent);
+                }
+                DimBound::Device { max } => {
+                    self.u8(1);
+                    self.u32(*max);
+                }
+            }
+        }
+    }
+
+    fn product_ref(&mut self, value: &ProductRef) {
+        self.request_key(value.request_key);
+        self.op_id(value.producer_op_id);
+        self.u16(value.output_index);
+        self.u32(value.generation);
+        self.u8(value.kind as u8);
+        self.u8(value.storage_class as u8);
+        self.u8(value.dtype as u8);
+        self.shape_bound(&value.shape_bound);
+        self.u32(value.point_range.base_point);
+        self.u32(value.point_range.max_points);
+    }
+
+    fn version_ref(&mut self, value: &VersionRef) {
+        self.request_key(value.request_key);
+        self.op_id(value.producer_op_id);
+        match &value.point {
+            Point::Fixed {
+                point_index,
+                semantic_digest,
+            } => {
+                self.u8(0);
+                self.u32(*point_index);
+                self.string(semantic_digest);
+            }
+            Point::Device {
+                selected_point,
+                producer_plan_digest,
+            } => {
+                self.u8(1);
+                self.product_ref(selected_point);
+                self.string(producer_plan_digest);
+            }
+        }
+    }
+
+    fn bounds(&mut self, value: &Bounds) {
+        self.u32(value.max_points);
+        self.u32(value.max_tokens);
+        self.u32(value.max_kv_pages);
+        self.u64(value.max_latent_bytes);
+        self.u64(value.max_completion_bytes);
+        self.u64(value.max_transfer_bytes);
+    }
+
+    fn rng(&mut self, value: &Rng) {
+        self.u64(value.seed);
+        self.u64(value.semantic_index_base);
+        self.u8(value.draw_layout as u8);
     }
 
     fn sampling(&mut self, value: &SamplingParams) {
@@ -1356,254 +1870,7 @@ impl CanonicalDigest {
         }
         self.bool(value.retain_images);
     }
-
-    fn lease(&mut self, value: &KvLeaseDelta) {
-        self.u32(value.group_id);
-        self.u32s(value.new_blocks.iter().map(|block| block.0));
-    }
-    fn policy(&mut self, value: &TokenPolicy) {
-        self.u32s(value.allowed_tokens.iter().copied());
-        self.u32s(value.suppress_tokens.iter().copied());
-        self.u32s(value.recent_tokens.iter().copied());
-        self.bool(value.publish_kv);
-        self.u32s(value.publish_kv_on_tokens.iter().copied());
-    }
-    fn published(&mut self, value: &PublishedProduct) {
-        self.u64(value.handle);
-    }
-    fn published_kv(&mut self, value: &PublishedKv) {
-        self.u64(value.handle);
-        self.u64(value.source_version);
-        self.u32(value.kv_tokens);
-        self.u32s(value.block_ids.iter().map(|block| block.0));
-        self.u32(value.group_id);
-        self.u32(value.position);
-    }
-
-    fn operation(&mut self, value: &Operation) {
-        match value {
-            Operation::Sequence(operation) => {
-                self.u8(0);
-                self.u8(match operation.mode {
-                    SequenceMode::Extend => 0,
-                    SequenceMode::Decode => 1,
-                    SequenceMode::Verify => 2,
-                    SequenceMode::Sample => 3,
-                });
-                self.lease(&operation.lease);
-                self.u32(operation.position.0);
-                self.u32(operation.position.1);
-                self.policy(&operation.policy);
-                match &operation.input {
-                    SequenceInput::Tokens(input) => {
-                        self.u8(0);
-                        self.u32s(input.token_ids.iter().copied());
-                        self.u8(match input.source {
-                            TokenSource::Wire => 0,
-                            TokenSource::LastSampled => 1,
-                        });
-                        self.u32s(input.draft_token_ids.iter().copied());
-                        self.bool(input.return_all_logits);
-                    }
-                    SequenceInput::PublishedLogits(product) => {
-                        self.u8(1);
-                        self.published(product);
-                    }
-                }
-            }
-            Operation::Flow(operation) => {
-                self.u8(1);
-                self.u64(operation.latent_handle);
-                self.u32(operation.position);
-                self.u16(operation.start_step);
-                self.u16(operation.step_count);
-                self.u32(operation.conditioning_position);
-                self.option(operation.conditioning.as_ref(), |digest, conditioning| {
-                    digest.published_kv(conditioning)
-                });
-                self.u8(operation.guidance.branch_count);
-                self.f32(operation.guidance.text_scale);
-                self.f32(operation.guidance.image_scale);
-                self.string(&operation.guidance.renorm_type);
-                self.f32(operation.guidance.renorm_min);
-                self.f32(operation.guidance.interval.0);
-                self.f32(operation.guidance.interval.1);
-                self.string(&operation.image_prompt);
-            }
-            Operation::Encode(operation) => {
-                self.u8(2);
-                self.u8(match operation.kind {
-                    EncodeKind::Vision => 0,
-                    EncodeKind::Latent => 1,
-                });
-                self.lease(&operation.lease);
-                self.u32(operation.position.0);
-                self.u32(operation.position.1);
-                self.u32(operation.conditioning_position);
-                match &operation.input {
-                    EncodeInput::InlineImage {
-                        base64,
-                        content_hash,
-                    } => {
-                        self.u8(0);
-                        self.string(base64);
-                        self.u64(*content_hash);
-                    }
-                    EncodeInput::StagedProduct {
-                        handle,
-                        content_hash,
-                    } => {
-                        self.u8(1);
-                        self.u64(*handle);
-                        self.u64(*content_hash);
-                    }
-                    EncodeInput::CachedProduct { content_hash } => {
-                        self.u8(2);
-                        self.u64(*content_hash);
-                    }
-                }
-            }
-            Operation::Materialize(operation) => {
-                self.u8(3);
-                self.u8(match operation.kind {
-                    MaterializeKind::Image => 0,
-                    MaterializeKind::Frame => 1,
-                });
-                self.lease(&operation.lease);
-                self.u32(operation.position);
-                self.u32(operation.conditioning_position);
-                self.policy(&operation.policy);
-                match &operation.input {
-                    MaterializeInput::Latent { handle } => {
-                        self.u8(0);
-                        self.u64(*handle);
-                    }
-                    MaterializeInput::Published(product) => {
-                        self.u8(1);
-                        self.published(product);
-                    }
-                }
-            }
-            Operation::Transfer(operation) => {
-                self.u8(4);
-                self.u8(match operation.kind {
-                    TransferKind::Product => 0,
-                    TransferKind::Kv => 1,
-                });
-                self.lease(&operation.lease);
-                self.u32(operation.position);
-                self.u32(operation.conditioning_position);
-                self.policy(&operation.policy);
-                self.published(&operation.source);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn digest() -> String {
-        "ab".repeat(32)
-    }
-
-    #[test]
-    fn operation_union_is_closed_and_versioned() {
-        assert_eq!(EXECUTION_PROTOCOL_VERSION, 3);
-        assert_eq!(OperationKind::ALL.len(), 5);
-        let mut operation = OperationEnvelope::unsealed(
-            RequestId(7),
-            Operation::Sequence(SequenceOperation {
-                mode: SequenceMode::Decode,
-                lease: KvLeaseDelta::default(),
-                position: (3, 4),
-                policy: TokenPolicy::default(),
-                input: SequenceInput::Tokens(TokenInput {
-                    token_ids: vec![9],
-                    source: TokenSource::Wire,
-                    draft_token_ids: Vec::new(),
-                    return_all_logits: false,
-                }),
-            }),
-        );
-        operation.admission_digest = digest();
-        operation.model_spec_digest = digest();
-        operation.weight_digest = digest();
-        operation.seal(2, 11, 4);
-        operation.validate(EXECUTION_PROTOCOL_VERSION).unwrap();
-    }
-
-    #[test]
-    fn result_variant_must_match_operation() {
-        let mut operation = OperationEnvelope::unsealed(
-            RequestId(1),
-            Operation::Flow(FlowOperation {
-                latent_handle: 1,
-                position: 0,
-                start_step: 0,
-                step_count: 1,
-                conditioning_position: 0,
-                conditioning: None,
-                guidance: Guidance {
-                    branch_count: 1,
-                    text_scale: 1.0,
-                    image_scale: 1.0,
-                    renorm_type: "none".into(),
-                    renorm_min: 0.0,
-                    interval: (0.0, 1.0),
-                },
-                image_prompt: String::new(),
-            }),
-        );
-        operation.admission_digest = digest();
-        operation.model_spec_digest = digest();
-        operation.weight_digest = digest();
-        operation.seal(1, 2, 0);
-        let result = OperationResult {
-            session_id: RequestId(1),
-            epoch: 1,
-            op_id: 2,
-            base_version: 0,
-            result_version: 1,
-            delta: ResultDelta::Sequence(SequenceDelta {
-                effect: SequenceEffect::default(),
-            }),
-        };
-        assert!(result.validate_for(&operation).is_err());
-    }
-
-    #[test]
-    fn operation_identity_excludes_runtime_locator_addresses() {
-        let operation = |locator: &str| {
-            let mut envelope = OperationEnvelope::unsealed(
-                RequestId(5),
-                Operation::Transfer(TransferOperation {
-                    kind: TransferKind::Product,
-                    lease: KvLeaseDelta::default(),
-                    position: 8,
-                    conditioning_position: 8,
-                    policy: TokenPolicy::default(),
-                    source: PublishedProduct {
-                        handle: 17,
-                        locator: locator.into(),
-                    },
-                }),
-            );
-            envelope.admission_digest = digest();
-            envelope.model_spec_digest = digest();
-            envelope.weight_digest = digest();
-            envelope.seal(3, 9, 2);
-            envelope
-        };
-
-        let before_recovery = operation("physical-locator-a");
-        let after_recovery = operation("physical-locator-b");
-
-        assert_eq!(before_recovery.digest, after_recovery.digest);
-        before_recovery
-            .validate(EXECUTION_PROTOCOL_VERSION)
-            .unwrap();
-        after_recovery.validate(EXECUTION_PROTOCOL_VERSION).unwrap();
-    }
-}
+mod tests;

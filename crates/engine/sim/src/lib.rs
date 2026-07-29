@@ -1,8 +1,10 @@
 //! GPU-free execution engine for scheduler and frontend conformance tests.
 //!
 //! The simulator is a strict peer of the production execution protocol: it
-//! consumes typed admissions and operations, enforces lifecycle/version/replay
-//! invariants, and returns typed deltas without a second simulation-only schema.
+//! consumes typed admissions and operations, enforces lifecycle, version, and
+//! replay invariants, and returns one [`CompletionRecord`] per operation with the
+//! resolved output-product values a host consumes. Every state point is named by
+//! its point index and semantic digest, exactly as a real worker names it.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -12,15 +14,14 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_core::{
-    ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling, score_token_logprobs,
-};
+use uniserve_core::product_blob::{LogprobBlob, RankedToken};
+use uniserve_core::{ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling};
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
-    Admission, Batch, EncodeDelta, EncodeInput, EngineCaps, ExecutionResult, FlowDelta,
-    ImageArtifact, MaterializeDelta, MaterializedProduct, Operation, OperationEnvelope,
-    OperationResult, OperationType, RequestKind, ResultDelta, SequenceDelta, SequenceEffect,
-    SequenceInput, SequenceMode, TokenLogprob, TransferDelta,
+    Admission, Batch, CompletionRecord, CompletionReport, DType, Digest, EngineCaps, FinishFlags,
+    GenMode, LogicalLengths, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
+    ProductRef, RegistrationAck, RequestKind, ShapeBound, StorageClass, TimingCounters, TokenMode,
+    TokenSpan, TransferMode, Work, WorkVariant,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -40,7 +41,7 @@ pub struct SimExecutor {
     caps: EngineCaps,
     depth: usize,
     to_worker: Sender<Job>,
-    from_worker: Receiver<anyhow::Result<ExecutionResult>>,
+    from_worker: Receiver<anyhow::Result<CompletionReport>>,
     in_flight: usize,
     next_call_id: u64,
     handle: Option<JoinHandle<()>>,
@@ -144,7 +145,7 @@ impl Executor for SimExecutor {
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
         match self.from_worker.try_recv() {
             Ok(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -160,7 +161,7 @@ impl Executor for SimExecutor {
     fn wait_result_timeout(
         &mut self,
         timeout: Duration,
-    ) -> anyhow::Result<Option<ExecutionResult>> {
+    ) -> anyhow::Result<Option<CompletionReport>> {
         match self.from_worker.recv_timeout(timeout) {
             Ok(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -173,7 +174,7 @@ impl Executor for SimExecutor {
         }
     }
 
-    fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
         let result = self
             .from_worker
             .recv()
@@ -217,28 +218,35 @@ impl Drop for SimExecutor {
     }
 }
 
+/// The completion and its resolved product values recorded for a committed
+/// operation, replayed verbatim when the same operation is resubmitted.
 #[derive(Clone)]
-struct RecordedResult {
-    digest: String,
-    result: OperationResult,
+struct RecordedCompletion {
+    plan_digest: Digest,
+    completion: CompletionRecord,
+    products: Vec<ProductPayload>,
 }
 
+/// One lineage's authoritative state: the last committed fixed point, the
+/// synthetic token cursor, denoise progress, and the terminal record of every
+/// committed operation for replay.
 #[derive(Clone)]
 struct SimSession {
     admission: Admission,
-    epoch: Option<u64>,
-    version: u64,
+    point_index: u32,
+    committed_semantic: Digest,
     emitted: usize,
     flow_step: u16,
-    terminal: BTreeMap<u64, RecordedResult>,
+    terminal: BTreeMap<u64, RecordedCompletion>,
 }
 
 impl SimSession {
     fn new(admission: Admission) -> Self {
+        let committed_semantic = admission.digest.clone();
         Self {
             admission,
-            epoch: None,
-            version: 0,
+            point_index: 0,
+            committed_semantic,
             emitted: 0,
             flow_step: 0,
             terminal: BTreeMap::new(),
@@ -246,14 +254,14 @@ impl SimSession {
     }
 
     fn sampling(&self) -> Option<&SamplingParams> {
-        self.admission
-            .sequence
-            .as_ref()
-            .map(|sequence| &sequence.sampling)
+        self.admission.und.as_ref().map(|und| &und.sampling)
     }
 
     fn image(&self) -> Option<&ImageParams> {
-        self.admission.flow.as_ref().map(|flow| &flow.image)
+        self.admission
+            .gen_admission
+            .as_ref()
+            .map(|branch| &branch.image)
     }
 }
 
@@ -263,48 +271,49 @@ pub struct SimEngine {
     text_len: usize,
     fake_eos: u32,
     vocab: usize,
-    commit_token: Option<u32>,
     sessions: HashMap<RequestId, SimSession>,
 }
 
 impl SimEngine {
     pub fn new() -> Self {
+        let mut caps = EngineCaps {
+            supported_work: vec![
+                WorkVariant::TokenExtend,
+                WorkVariant::TokenDecode,
+                WorkVariant::TokenVerify,
+                WorkVariant::Draft,
+                WorkVariant::EncodeVision,
+                WorkVariant::EncodeLatent,
+                WorkVariant::GenTransition,
+                WorkVariant::GenFlow,
+                WorkVariant::Materialize,
+                WorkVariant::TransferProduct,
+                WorkVariant::TransferKvPublish,
+                WorkVariant::TransferKvInstall,
+            ],
+            max_latent_size: 65_536,
+            latent_downsample: 16,
+            max_vae_grid_tokens: 1_024,
+            max_vit_grid_tokens: 64,
+            encoder_cache_budget: 256,
+            supported_controls: vec![
+                RequestKind::DropSession,
+                RequestKind::CopyKv,
+                RequestKind::ReleaseProducts,
+                RequestKind::LoadAdapter,
+                RequestKind::UnloadAdapter,
+                RequestKind::ResetPrefixCache,
+            ],
+            model_spec_digest: "0".repeat(64),
+            weight_digest: "1".repeat(64),
+            ..EngineCaps::default()
+        };
+        caps.route_capability_digest = caps.compute_route_capability_digest();
         Self {
-            caps: EngineCaps {
-                supported_operation_types: vec![
-                    OperationType::SequenceExtend,
-                    OperationType::SequenceDecode,
-                    OperationType::SequenceVerify,
-                    OperationType::SequenceSample,
-                    OperationType::Flow,
-                    OperationType::EncodeVision,
-                    OperationType::EncodeLatent,
-                    OperationType::MaterializeImage,
-                    OperationType::MaterializeFrame,
-                    OperationType::TransferProduct,
-                    OperationType::TransferKv,
-                ],
-                max_latent_size: 65_536,
-                latent_downsample: 16,
-                max_vae_grid_tokens: 1_024,
-                max_vit_grid_tokens: 64,
-                encoder_cache_budget: 256,
-                supported_controls: vec![
-                    RequestKind::DropSession,
-                    RequestKind::CopyKv,
-                    RequestKind::ReleaseProducts,
-                    RequestKind::LoadAdapter,
-                    RequestKind::UnloadAdapter,
-                    RequestKind::ResetPrefixCache,
-                ],
-                model_spec_digest: "0".repeat(64),
-                weight_digest: "1".repeat(64),
-                ..EngineCaps::default()
-            },
+            caps,
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
-            commit_token: None,
             sessions: HashMap::new(),
         }
     }
@@ -329,23 +338,15 @@ impl SimEngine {
         logits
     }
 
-    fn sample(
-        &self,
-        session_id: RequestId,
-        session: &SimSession,
-        sequence: &uniserve_worker_wire::SequenceOperation,
-        index: usize,
-    ) -> SampleOutput {
+    fn sample(&self, session_id: RequestId, session: &SimSession, index: usize) -> SampleOutput {
         let mut logits = self.synth_logits(session_id, index);
         match session.sampling() {
             Some(sampling) => apply_sampling(
                 &mut logits,
                 sampling,
-                &sequence.policy.recent_tokens,
-                (!sequence.policy.allowed_tokens.is_empty())
-                    .then_some(sequence.policy.allowed_tokens.as_slice()),
-                (!sequence.policy.suppress_tokens.is_empty())
-                    .then_some(sequence.policy.suppress_tokens.as_slice()),
+                &[],
+                sampling.allowed_token_ids.as_deref(),
+                None,
                 sampling.n_logprobs as usize,
             ),
             None => SampleOutput {
@@ -360,164 +361,158 @@ impl SimEngine {
         }
     }
 
-    fn sequence_effect(
-        &self,
-        envelope: &OperationEnvelope,
-        session: &mut SimSession,
-        sequence: &uniserve_worker_wire::SequenceOperation,
-    ) -> anyhow::Result<SequenceEffect> {
-        let SequenceInput::Tokens(input) = &sequence.input else {
-            let output = self.sample(envelope.session_id, session, sequence, session.emitted);
-            return Ok(sample_effect(session.sampling(), output, 1));
-        };
-        let mut effect = SequenceEffect::default();
-        if input.return_all_logits {
-            let sampling = session
-                .sampling()
-                .ok_or_else(|| anyhow::anyhow!("sequence session has no sampling admission"))?;
-            let skip = usize::from(sequence.position.0 == 0);
-            effect.prompt_logprobs = input
-                .token_ids
-                .iter()
-                .enumerate()
-                .skip(skip)
-                .map(|(offset, token)| {
-                    let logits = self.synth_logits(
-                        envelope.session_id,
-                        (sequence.position.0 as usize)
-                            .saturating_add(offset)
-                            .saturating_sub(1),
-                    );
-                    score_token_logprobs(
-                        &logits,
-                        *token,
-                        sampling.n_prompt_logprobs as usize,
-                        &sampling.logprob_token_ids,
-                    )
-                    .into_iter()
-                    .map(|(token, logprob, rank)| TokenLogprob(token, logprob, rank))
-                    .collect()
-                })
-                .collect();
-        }
-        let output = self.sample(envelope.session_id, session, sequence, session.emitted);
-        match sequence.mode {
-            SequenceMode::Extend => {
-                effect = merge_sample(effect, session.sampling(), output);
-                session.emitted = session.emitted.max(1);
-            }
-            SequenceMode::Decode => {
-                effect = merge_sample(effect, session.sampling(), output);
-                session.emitted = session.emitted.saturating_add(1);
-            }
-            SequenceMode::Verify => {
-                effect.sampled_token_ids = input.draft_token_ids.clone();
-                effect.sampled_token_ids.push(output.token);
-                effect.accepted_draft_tokens = Some(input.draft_token_ids.len() as u32);
-                effect.sampled_logprob = session
-                    .sampling()
-                    .is_some_and(SamplingParams::generated_logprobs_requested)
-                    .then_some(output.logprob);
-                effect.top_logprobs = output
-                    .top
-                    .into_iter()
-                    .map(|(token, logprob, rank)| TokenLogprob(token, logprob, rank))
-                    .collect();
-                session.emitted = session
-                    .emitted
-                    .saturating_add(effect.sampled_token_ids.len());
-            }
-            SequenceMode::Sample => anyhow::bail!("sample sequence requires published logits"),
-        }
-        effect.kv_tokens = Some(input.token_ids.len() as u32);
-        Ok(effect)
-    }
-
+    /// Execute one operation against its session, producing the terminal
+    /// [`CompletionRecord`] and any resolved output-product values.
     fn execute_operation(
         &self,
-        envelope: &OperationEnvelope,
+        operation: &Operation,
         session: &mut SimSession,
-    ) -> anyhow::Result<ResultDelta> {
-        Ok(match &envelope.operation {
-            Operation::Sequence(sequence) => ResultDelta::Sequence(SequenceDelta {
-                effect: self.sequence_effect(envelope, session, sequence)?,
-            }),
-            Operation::Flow(flow) => {
-                let completed = flow.start_step.saturating_add(flow.step_count);
-                session.flow_step = completed;
+    ) -> anyhow::Result<(CompletionRecord, Vec<ProductPayload>)> {
+        let point_index = session.point_index;
+        let selected_point = if operation.advances_state {
+            point_index.saturating_add(1)
+        } else {
+            point_index
+        };
+        let parent_semantic = session.committed_semantic.clone();
+
+        let mut record = CompletionRecord {
+            request_key: operation.request_key,
+            op_id: operation.op_id,
+            completion_slot_generation: 0,
+            status: OpStatus::Ok,
+            selected_point,
+            logical_lengths: LogicalLengths::default(),
+            token_span: TokenSpan::default(),
+            committed_tokens: Vec::new(),
+            finish_flags: FinishFlags::default(),
+            product_generations: operation.outputs.iter().map(|out| out.generation).collect(),
+            semantic_digest: String::new(),
+            error_code: None,
+            timing_counters: TimingCounters::default(),
+        };
+        let mut products = Vec::new();
+
+        match operation.work {
+            Work::Token(mode) => {
+                let index = session.emitted;
+                let output = self.sample(operation.request_key.session_id, session, index);
+                // A committed EOS reproduces the natural-termination behavior the
+                // synthetic distribution enforces past `text_len`.
+                record.finish_flags.eos = output.token == self.fake_eos;
+                record.token_span = TokenSpan {
+                    base: index as u32,
+                    len: 1,
+                };
+                record.logical_lengths = LogicalLengths {
+                    token_len: 1,
+                    kv_visible_len: operation.bounds.max_tokens,
+                    latent_len: 0,
+                };
+                match mode {
+                    TokenMode::Extend => session.emitted = session.emitted.max(1),
+                    TokenMode::Decode | TokenMode::Verify => {
+                        session.emitted = session.emitted.saturating_add(1)
+                    }
+                }
+                record.committed_tokens = vec![output.token];
+                let blob = LogprobBlob {
+                    sampled_logprob: session
+                        .sampling()
+                        .is_some_and(SamplingParams::generated_logprobs_requested)
+                        .then_some(output.logprob),
+                    top_logprobs: output
+                        .top
+                        .iter()
+                        .map(|(token_id, logprob, rank)| RankedToken {
+                            token_id: *token_id,
+                            logprob: *logprob,
+                            rank: *rank,
+                        })
+                        .collect(),
+                    prompt_logprobs: Vec::new(),
+                };
+                if !blob.is_empty() {
+                    products.push(ProductPayload {
+                        product: output_ref(
+                            operation,
+                            ProductKind::Logprob,
+                            StorageClass::CompletionArena,
+                        ),
+                        bytes: blob.encode(),
+                    });
+                }
+            }
+            Work::Draft => {}
+            Work::Encode(_) => {
+                record.logical_lengths.kv_visible_len = 1;
+            }
+            Work::Transfer(mode) => {
+                record.logical_lengths.kv_visible_len =
+                    matches!(mode, TransferMode::KvPublish | TransferMode::KvInstall) as u32;
+            }
+            Work::Gen(GenMode::Transition) => {}
+            Work::Gen(GenMode::Flow) => {
+                let steps = operation.bounds.max_points.max(1) as u16;
+                session.flow_step = session.flow_step.saturating_add(steps);
                 let total = session
                     .image()
                     .map(|image| image.steps)
                     .unwrap_or(DEFAULT_DENOISE_STEPS);
-                ResultDelta::Flow(FlowDelta {
-                    steps_completed: completed,
-                    done: completed >= total,
-                })
+                record.logical_lengths.latent_len = u32::from(session.flow_step);
+                // Denoise completion surfaces as a length finish once the flow has
+                // advanced through every scheduled step.
+                record.finish_flags.length = session.flow_step >= total;
             }
-            Operation::Encode(encode) => {
-                let content_hash = match &encode.input {
-                    EncodeInput::InlineImage { content_hash, .. }
-                    | EncodeInput::StagedProduct { content_hash, .. }
-                    | EncodeInput::CachedProduct { content_hash } => *content_hash,
-                };
-                let handle = content_hash.wrapping_mul(0x9E37_79B1) | 1;
-                ResultDelta::Encode(EncodeDelta {
-                    product_handle: handle,
-                    kv_tokens: 1,
-                    image_size: session.image().map(|image| (image.height, image.width)),
-                })
-            }
-            Operation::Materialize(materialize) => match materialize.kind {
-                uniserve_worker_wire::MaterializeKind::Image => {
-                    session.flow_step = 0;
-                    session.emitted = 0;
-                    let (height, width) = session
-                        .image()
-                        .map(|image| (image.height, image.width))
-                        .unwrap_or(DEFAULT_IMAGE_HW);
+            Work::Materialize => {
+                session.flow_step = 0;
+                session.emitted = 0;
+                if let Some(image) = session.image().cloned() {
+                    let (height, width) = if image.height > 0 && image.width > 0 {
+                        (image.height, image.width)
+                    } else {
+                        DEFAULT_IMAGE_HW
+                    };
+                    if image.retain_images {
+                        let downsample = self.caps.latent_downsample.max(1);
+                        record.logical_lengths.kv_visible_len = (image.height / downsample)
+                            .saturating_mul(image.width / downsample)
+                            .saturating_add(self.caps.commit_marker_tokens.max(1));
+                    }
                     let png_base64 = synthetic_png_b64(width, height)?;
-                    let kv_tokens =
-                        session
-                            .image()
-                            .filter(|image| image.retain_images)
-                            .map(|image| {
-                                let downsample = self.caps.latent_downsample.max(1);
-                                (image.height / downsample)
-                                    .saturating_mul(image.width / downsample)
-                                    .saturating_add(self.caps.commit_marker_tokens.max(1))
-                            });
-                    let sequence = self.commit_token.map(|token| SequenceEffect {
-                        sampled_token_ids: vec![token],
-                        sampled_logprob: Some(0.0),
-                        ..SequenceEffect::default()
+                    products.push(ProductPayload {
+                        product: output_ref(
+                            operation,
+                            ProductKind::Artifact,
+                            StorageClass::HostStaging,
+                        ),
+                        bytes: png_base64.into_bytes(),
                     });
-                    ResultDelta::Materialize(MaterializeDelta {
-                        product: MaterializedProduct::Image(ImageArtifact {
-                            png_base64,
-                            height,
-                            width,
-                            handle: envelope.session_id.0.max(1),
-                            locator: format!("sim-image-{}", envelope.session_id.0),
-                        }),
-                        kv_tokens,
-                        sequence,
-                    })
                 }
-                uniserve_worker_wire::MaterializeKind::Frame => {
-                    ResultDelta::Materialize(MaterializeDelta {
-                        product: MaterializedProduct::Frame { count: 1 },
-                        kv_tokens: None,
-                        sequence: None,
-                    })
-                }
-            },
-            Operation::Transfer(transfer) => ResultDelta::Transfer(TransferDelta {
-                product: (transfer.kind == uniserve_worker_wire::TransferKind::Product)
-                    .then_some(transfer.source.clone()),
-                kv_tokens: (transfer.kind == uniserve_worker_wire::TransferKind::Kv).then_some(1),
-                sequence: None,
-            }),
-        })
+            }
+        }
+
+        // Every declared output surfaces as a resolvable product for the host.
+        // The Artifact/Logprob payloads above carry real bytes; the remaining
+        // declared references (Kv writeback locators, token/latent/feature
+        // handles) surface as presence-only entries addressed by their
+        // reference, since the host consumes those by identity, not by value.
+        for output in &operation.outputs {
+            if products
+                .iter()
+                .any(|payload| payload.product.output_index == output.output_index)
+            {
+                continue;
+            }
+            products.push(ProductPayload {
+                product: output.clone(),
+                bytes: Vec::new(),
+            });
+        }
+
+        record.semantic_digest =
+            record.compute_semantic_digest(&parent_semantic, &operation.plan_digest);
+        Ok((record, products))
     }
 
     pub fn set_pipeline_depth(&mut self, depth: u32) {
@@ -543,10 +538,6 @@ impl SimEngine {
         );
     }
 
-    pub fn set_commit_token(&mut self, token: Option<u32>) {
-        self.commit_token = token;
-    }
-
     pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroupSpec>) {
         self.caps.groups = groups;
     }
@@ -564,31 +555,26 @@ impl SimEngine {
     }
 }
 
-fn merge_sample(
-    mut effect: SequenceEffect,
-    sampling: Option<&SamplingParams>,
-    output: SampleOutput,
-) -> SequenceEffect {
-    effect.sampled_token_ids.push(output.token);
-    effect.sampled_logprob = sampling
-        .is_some_and(SamplingParams::generated_logprobs_requested)
-        .then_some(output.logprob);
-    effect.top_logprobs = output
-        .top
-        .into_iter()
-        .map(|(token, logprob, rank)| TokenLogprob(token, logprob, rank))
-        .collect();
-    effect
-}
-
-fn sample_effect(
-    sampling: Option<&SamplingParams>,
-    output: SampleOutput,
-    kv_tokens: u32,
-) -> SequenceEffect {
-    let mut effect = merge_sample(SequenceEffect::default(), sampling, output);
-    effect.kv_tokens = Some(kv_tokens);
-    effect
+/// The resolved output-product reference for a value the worker packs into the
+/// completion report: the operation's declared output of that kind when present,
+/// otherwise a freshly named completion-arena reference the host can address.
+fn output_ref(operation: &Operation, kind: ProductKind, storage_class: StorageClass) -> ProductRef {
+    operation
+        .outputs
+        .iter()
+        .find(|output| output.kind == kind)
+        .cloned()
+        .unwrap_or_else(|| ProductRef {
+            request_key: operation.request_key,
+            producer_op_id: operation.op_id,
+            output_index: operation.outputs.len() as u16,
+            generation: 0,
+            kind,
+            storage_class,
+            dtype: DType::U8,
+            shape_bound: ShapeBound::default(),
+            point_range: PointRange::default(),
+        })
 }
 
 fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
@@ -624,78 +610,122 @@ impl ModelEngine for SimEngine {
         self.caps.clone()
     }
 
-    fn execute(&mut self, batch: Batch) -> anyhow::Result<ExecutionResult> {
+    fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport> {
         batch.validate()?;
+        let step_id = batch.step_id;
         for admission in batch.admissions {
-            match self.sessions.get(&admission.session_id) {
+            match self.sessions.get(&admission.request_key.session_id) {
                 Some(session) => anyhow::ensure!(
                     session.admission == admission,
                     "session {} was readmitted with a different descriptor",
-                    admission.session_id.0
+                    admission.request_key.session_id.0
                 ),
                 None => {
                     self.sessions
-                        .insert(admission.session_id, SimSession::new(admission));
+                        .insert(admission.request_key.session_id, SimSession::new(admission));
                 }
             }
         }
 
-        let mut results = Vec::with_capacity(batch.operations.len());
-        for envelope in batch.operations {
+        let mut completions = Vec::with_capacity(batch.operations.len());
+        let mut products = Vec::new();
+        for operation in batch.operations {
             let mut session = self
                 .sessions
-                .get(&envelope.session_id)
+                .get(&operation.request_key.session_id)
                 .cloned()
                 .ok_or_else(|| {
-                    anyhow::anyhow!("session {} has no admission", envelope.session_id.0)
+                    anyhow::anyhow!(
+                        "session {} has no admission",
+                        operation.request_key.session_id.0
+                    )
                 })?;
-            if let Some(recorded) = session.terminal.get(&envelope.op_id) {
+            if let Some(recorded) = session.terminal.get(&operation.op_id.0) {
                 anyhow::ensure!(
-                    recorded.digest == envelope.digest,
-                    "operation {} digest conflicts with its terminal record",
-                    envelope.op_id
+                    recorded.plan_digest == operation.plan_digest,
+                    "operation {} plan digest conflicts with its terminal record",
+                    operation.op_id.0
                 );
-                results.push(recorded.result.clone());
+                completions.push(recorded.completion.clone());
+                products.extend(recorded.products.clone());
                 continue;
             }
-            match session.epoch {
-                None => session.epoch = Some(envelope.epoch),
-                Some(epoch) => anyhow::ensure!(
-                    epoch == envelope.epoch,
-                    "operation epoch {} does not match session epoch {epoch}",
-                    envelope.epoch
-                ),
-            }
             anyhow::ensure!(
-                envelope.base_version == session.version,
-                "operation base version {} does not match session version {}",
-                envelope.base_version,
-                session.version
+                operation.request_key == session.admission.request_key,
+                "operation identity {:?} does not match its admitted lineage",
+                operation.request_key
             );
-            let delta = self.execute_operation(&envelope, &mut session)?;
-            let result = OperationResult {
-                session_id: envelope.session_id,
-                epoch: envelope.epoch,
-                op_id: envelope.op_id,
-                base_version: envelope.base_version,
-                result_version: envelope.base_version.saturating_add(1),
-                delta,
-            };
-            result.validate_for(&envelope)?;
-            session.version = result.result_version;
+            match &operation.parent.point {
+                Point::Fixed {
+                    point_index,
+                    semantic_digest,
+                } => {
+                    anyhow::ensure!(
+                        *point_index == session.point_index,
+                        "operation parent point {} does not match session point {}",
+                        point_index,
+                        session.point_index
+                    );
+                    anyhow::ensure!(
+                        *semantic_digest == session.committed_semantic,
+                        "operation parent semantic digest does not match the committed point"
+                    );
+                }
+                Point::Device {
+                    selected_point,
+                    producer_plan_digest,
+                } => {
+                    // A device-relay successor roots on its predecessor's
+                    // selected point before host observation. By the time it
+                    // runs, the predecessor has committed and advanced this
+                    // session, so its point is the current session point and its
+                    // terminal record names the referenced producer. The base
+                    // point is the session's tracked point, not the absent
+                    // device point index.
+                    let producer_op_id = operation.parent.producer_op_id.0;
+                    let recorded = session.terminal.get(&producer_op_id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "device parent names unknown predecessor op {producer_op_id}"
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        recorded.plan_digest == *producer_plan_digest,
+                        "device parent producer plan digest does not match its predecessor"
+                    );
+                    anyhow::ensure!(
+                        selected_point.producer_op_id.0 == producer_op_id,
+                        "device parent selected point is not produced by its named predecessor"
+                    );
+                    anyhow::ensure!(
+                        recorded.completion.selected_point == session.point_index,
+                        "device parent predecessor is not the session's committed point"
+                    );
+                }
+            }
+
+            let (completion, op_products) = self.execute_operation(&operation, &mut session)?;
+            if operation.advances_state {
+                session.point_index = completion.selected_point;
+                session.committed_semantic = completion.semantic_digest.clone();
+            }
             session.terminal.insert(
-                envelope.op_id,
-                RecordedResult {
-                    digest: envelope.digest,
-                    result: result.clone(),
+                operation.op_id.0,
+                RecordedCompletion {
+                    plan_digest: operation.plan_digest.clone(),
+                    completion: completion.clone(),
+                    products: op_products.clone(),
                 },
             );
-            self.sessions.insert(envelope.session_id, session);
-            results.push(result);
+            self.sessions
+                .insert(operation.request_key.session_id, session);
+            completions.push(completion);
+            products.extend(op_products);
         }
-        Ok(ExecutionResult {
-            step_id: batch.step_id,
-            operations: results,
+        Ok(CompletionReport {
+            step_id,
+            completions,
+            products,
+            registration: RegistrationAck { visible: true },
             worker_exec_us: None,
             forward_stats: None,
         })
@@ -711,54 +741,72 @@ impl ModelEngine for SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_wire::{
-        KvAllocation, KvLeaseDelta, SequenceAdmission, SequenceOperation, TokenInput, TokenPolicy,
-        TokenSource,
+        Bounds, Domain, KvAllocation, OpId, RequestKey, RouteId, UndAdmission, VersionRef,
     };
 
-    fn batch(step_id: u64, op_id: u64) -> Batch {
-        let admission = Admission::new(
-            RequestId(9),
-            Some(SequenceAdmission {
+    fn request_key() -> RequestKey {
+        RequestKey::new(0, RequestId(9), 1)
+    }
+
+    fn admission() -> Admission {
+        Admission::new(
+            request_key(),
+            Some(UndAdmission {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
-                kv: KvAllocation {
-                    block_ids: Vec::new(),
-                    prefix_len: 0,
-                    group_id: 0,
-                },
+                kv: KvAllocation::default(),
             }),
             None,
             None,
         )
-        .expect("admission");
-        let mut operation = OperationEnvelope::unsealed(
-            RequestId(9),
-            Operation::Sequence(SequenceOperation {
-                mode: SequenceMode::Extend,
-                lease: KvLeaseDelta::default(),
-                position: (0, 2),
-                policy: TokenPolicy::default(),
-                input: SequenceInput::Tokens(TokenInput {
-                    token_ids: vec![1, 2],
-                    source: TokenSource::Wire,
-                    draft_token_ids: Vec::new(),
-                    return_all_logits: false,
-                }),
-            }),
+        .expect("admission")
+    }
+
+    fn batch(step_id: u64, op_id: u64) -> Batch {
+        let request_key = request_key();
+        let admission = admission();
+        let parent = VersionRef::admission_root(request_key, OpId(1), admission.digest.clone());
+        let operation = Operation::registered(
+            request_key,
+            OpId(op_id),
+            parent,
+            Work::Token(TokenMode::Extend),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_tokens: 2,
+                ..Bounds::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
         );
-        operation.admission_digest = admission.digest.clone();
-        operation.model_spec_digest = "0".repeat(64);
-        operation.weight_digest = "1".repeat(64);
-        operation.seal(3, op_id, 0);
         Batch::new(step_id, vec![admission], vec![operation])
     }
 
     #[test]
-    fn duplicate_operation_replays_one_typed_effect() {
+    fn duplicate_operation_replays_one_committed_record() {
         let mut engine = SimEngine::new();
         let first = engine.execute(batch(4, 17)).expect("first execution");
         let replay = engine.execute(batch(5, 17)).expect("replay execution");
-        assert_eq!(first.operations, replay.operations);
+        assert_eq!(first.completions, replay.completions);
+        assert_eq!(first.products, replay.products);
+    }
+
+    #[test]
+    fn extend_commits_the_greedy_synthetic_token() {
+        // The synthetic distribution's natural token for session 9 at index 0 is
+        // `1000 + (9*7 + 0) % 5000 = 1063`; greedy default sampling commits it.
+        let mut engine = SimEngine::new();
+        let report = engine.execute(batch(1, 3)).expect("execution");
+        assert_eq!(report.completions.len(), 1);
+        assert_eq!(report.completions[0].committed_tokens, vec![1063]);
+        assert_eq!(report.completions[0].selected_point, 1);
+        assert!(report.registration.visible);
     }
 
     #[test]

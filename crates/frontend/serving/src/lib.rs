@@ -33,8 +33,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use uniserve_core::{
-    GenerationBehaviorDescriptor, GenerationConstraint, GenerationRequest,
-    GenerationRuntimeCapabilities, OperationType,
+    GenerationBehaviorDescriptor, GenerationCapabilityNeeds, GenerationConstraint,
+    GenerationRequest, GenerationRuntimeCapabilities,
 };
 use uniserve_engine_gateway::transport::{GenEvent, GenerationEventStream, GenerationFinishReason};
 use uniserve_engine_gateway::{EngineGateway, EngineGatewaySnapshot, GenerationSubmission};
@@ -756,12 +756,20 @@ fn resource_bounds(
         uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
         uniserve_core::ContextSegment::UndTokens { .. } => Vec::new(),
     });
-    let mut required_features = generation
+    let needs = generation
         .behavior
-        .required_operations(&generation.policy, context_steps)
-        .into_iter()
-        .map(|operation| operation.as_str().to_string())
-        .collect::<Vec<_>>();
+        .capability_needs(&generation.policy, context_steps);
+    let mut required_features = [
+        (needs.understanding, "understanding"),
+        (needs.vision_encode, "vision_encode"),
+        (needs.latent_encode, "latent_encode"),
+        (needs.image_generation, "image_generation"),
+        (needs.commit_writeback, "commit_writeback"),
+    ]
+    .into_iter()
+    .filter(|&(needed, _)| needed)
+    .map(|(_, feature)| feature.to_string())
+    .collect::<Vec<_>>();
     if grammar_required {
         required_features.push("grammar_mask".to_string());
     }
@@ -2136,7 +2144,7 @@ impl ServingRuntime {
             request_id: request.request_id.clone(),
             capability,
         };
-        let required = if let Some(dialect) = &self.profile.generation_dialect {
+        let needs = if let Some(dialect) = &self.profile.generation_dialect {
             let behavior = GenerationBehaviorDescriptor::resolve(
                 request.generation.constraint,
                 &dialect.generation_policy,
@@ -2146,30 +2154,14 @@ impl ServingRuntime {
             } else {
                 Vec::new()
             };
-            behavior.required_operations(&dialect.generation_policy, context_steps)
+            behavior.capability_needs(&dialect.generation_policy, context_steps)
         } else {
-            vec![OperationType::SequenceExtend, OperationType::SequenceDecode]
-        };
-        for operation in required {
-            if capabilities.generation_runtime.supports(operation) {
-                continue;
+            GenerationCapabilityNeeds {
+                understanding: true,
+                ..Default::default()
             }
-            let capability = match operation {
-                OperationType::SequenceExtend | OperationType::SequenceDecode => {
-                    "runtime_und_execution"
-                }
-                OperationType::EncodeLatent => "runtime_vae_encode",
-                OperationType::EncodeVision => "runtime_vit_encode",
-                OperationType::Flow => "runtime_gen_denoise",
-                OperationType::MaterializeImage => "runtime_gen_commit",
-                OperationType::TransferKv => "runtime_commit_writeback",
-                OperationType::SequenceVerify
-                | OperationType::SequenceSample
-                | OperationType::MaterializeFrame
-                | OperationType::TransferProduct => {
-                    unreachable!("request compiler does not require staged worker-only operations")
-                }
-            };
+        };
+        if let Err(capability) = capabilities.generation_runtime.covers(&needs) {
             return Err(reject(capability));
         }
         Ok(())

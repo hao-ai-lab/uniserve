@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 import torch
 
-from uniserve_worker.batch import OperationEnvelope, SamplingParams
+from uniserve_worker.batch import Operation, SamplingParams
 from uniserve_worker.execution.executor import (
     _sample_task_batch,
     _SampleTask,
@@ -20,7 +20,7 @@ from uniserve_worker.runtime.rng import sampling_draw_seed, uniform_samples
 
 pytestmark = pytest.mark.unit
 
-_ENVELOPE = cast(OperationEnvelope, None)
+_ENVELOPE = cast(Operation, None)
 
 
 def _row(

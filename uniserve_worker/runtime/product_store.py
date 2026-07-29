@@ -8,7 +8,7 @@ from threading import RLock
 
 import torch
 
-from ..batch import SequenceMode
+from ..batch import TokenMode
 
 
 def encoder_handle_from_content_hash(content_hash: int) -> int:
@@ -47,17 +47,17 @@ class LatentFeatureProduct:
 @dataclass(frozen=True, slots=True)
 class LogitsProduct:
     logits: torch.Tensor
-    source_mode: SequenceMode
+    source_mode: TokenMode
     draft_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.source_mode not in {
-            SequenceMode.EXTEND,
-            SequenceMode.DECODE,
-            SequenceMode.VERIFY,
+            TokenMode.EXTEND,
+            TokenMode.DECODE,
+            TokenMode.VERIFY,
         }:
             raise ValueError("logits product source mode is invalid")
-        if self.source_mode is not SequenceMode.VERIFY and self.draft_token_ids:
+        if self.source_mode is not TokenMode.VERIFY and self.draft_token_ids:
             raise ValueError("only verify logits may carry draft token ids")
 
 
@@ -100,6 +100,12 @@ ProductPayload = (
     | EncodedImageProduct
     | FrameCollectionProduct
 )
+
+
+def _is_encoder_payload(payload: ProductPayload) -> bool:
+    """Whether a payload counts against the scheduler's encoder-cache budget."""
+
+    return isinstance(payload, (VisionFeatureProduct, LatentFeatureProduct))
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +160,10 @@ class ProductStore:
         self._session_handles: dict[int, set[int]] = {}
         self._revisions: dict[int, int] = {}
         self._next_revision = 1
+        # Running count of committed encoder-output records (Vision/Latent) in
+        # ``_records``. Maintained incrementally on every mutation so residency
+        # checks and reporting are O(1) instead of rescanning the whole store.
+        self._encoder_count = 0
         self._lock = RLock()
 
     def get(self, handle: int) -> ProductRecord | None:
@@ -170,10 +180,7 @@ class ProductStore:
         """Return committed encoder products in the scheduler's handle unit."""
 
         with self._lock:
-            return sum(
-                isinstance(record.payload, (VisionFeatureProduct, LatentFeatureProduct))
-                for record in self._records.values()
-            )
+            return self._encoder_count
 
     def release(self, handles: tuple[int, ...]) -> None:
         with self._lock:
@@ -181,6 +188,8 @@ class ProductStore:
                 handle = int(raw)
                 record = self._records.pop(handle, None)
                 if record is not None:
+                    if _is_encoder_payload(record.payload):
+                        self._encoder_count -= 1
                     self._session_handles.get(record.session_id, set()).discard(handle)
                     self._revisions[handle] = self._revision()
 
@@ -257,6 +266,9 @@ class ProductStore:
                 handle for handle, record in self._records.items() if record.session_id in requested
             ]
             self._records = projected
+            # ``projected`` becomes the entire committed set, so its encoder tally
+            # is the new running count.
+            self._encoder_count = used
             self._session_handles = {}
             for handle, record in projected.items():
                 self._session_handles.setdefault(record.session_id, set()).add(handle)
@@ -314,7 +326,11 @@ class ProductTxn:
         try:
             self._validate()
             for handle, record in self._staged.items():
-                self._prior[handle] = self._store._records.get(handle)
+                prior = self._store._records.get(handle)
+                self._prior[handle] = prior
+                self._store._encoder_count += int(_is_encoder_payload(record.payload)) - int(
+                    prior is not None and _is_encoder_payload(prior.payload)
+                )
                 self._store._records[handle] = record
                 self._store._session_handles.setdefault(record.session_id, set()).add(handle)
                 revision = self._store._revision()
@@ -340,6 +356,11 @@ class ProductTxn:
                                 handle
                             )
                         prior = self._prior[handle]
+                        # Reverse the publish delta exactly: back out the published
+                        # record's contribution and restore the prior record's.
+                        self._store._encoder_count += int(
+                            prior is not None and _is_encoder_payload(prior.payload)
+                        ) - int(record is not None and _is_encoder_payload(record.payload))
                         if prior is None:
                             self._store._records.pop(handle, None)
                         else:
@@ -359,12 +380,18 @@ class ProductTxn:
         for handle, revision in self._bases.items():
             if self._store._revisions.get(handle, 0) != revision:
                 raise RuntimeError("product changed during step execution")
-        projected = dict(self._store._records)
-        projected.update(self._staged)
-        used = sum(
-            isinstance(record.payload, (VisionFeatureProduct, LatentFeatureProduct))
-            for record in projected.values()
-        )
+        # Residency of the projected store (committed overlaid with this step's
+        # staged records) without copying ``_records``: start from the committed
+        # running count and, per staged handle, add the staged record's
+        # contribution while removing the committed record it shadows. A staged
+        # record replacing a committed one of the same handle nets to zero, so
+        # nothing double-counts.
+        used = self._store._encoder_count
+        for handle, record in self._staged.items():
+            committed = self._store._records.get(handle)
+            used += int(_is_encoder_payload(record.payload)) - int(
+                committed is not None and _is_encoder_payload(committed.payload)
+            )
         if used > self._store.encoder_cache_budget:
             raise RuntimeError(
                 "encoder-output residency exceeds capacity "

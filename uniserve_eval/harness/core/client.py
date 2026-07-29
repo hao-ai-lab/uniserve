@@ -202,6 +202,9 @@ def _parse_chat_json(
         if isinstance(usage.get("prompt_tokens"), int):
             record.prompt_len = int(usage["prompt_tokens"])
             record.prompt_len_source = "server_usage"
+        image_steps = _image_steps_per_image(usage)
+        if image_steps is not None:
+            record.image_steps = image_steps
     if record.output_len_source != "server_usage":
         record.output_len = output_len_fallback
     if record.prompt_len_source != "server_usage":
@@ -320,10 +323,30 @@ def _parse_openai(
                 completion_tokens_from_usage = True
             if isinstance(usage.get("prompt_tokens"), int):
                 prompt_tokens = int(usage["prompt_tokens"])
+            image_steps = _image_steps_per_image(usage)
+            if image_steps is not None:
+                record.image_steps = image_steps
         _capture_cached_prompt_tokens(record, event)
         content = openai_delta_text(event)
         images = openai_delta_images(event)
         timestamp = event.get("_client_t")
+        if content or images:
+            record.modality_events.append(
+                {
+                    "modalities": [
+                        modality
+                        for modality, present in (("text", bool(content)), ("image", bool(images)))
+                        if present
+                    ],
+                    "client_time": (
+                        float(timestamp)
+                        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+                        else None
+                    ),
+                    "text_bytes": len(content.encode("utf-8")),
+                    "image_count": len(images),
+                }
+            )
         if content:
             if not record.output_modalities or record.output_modalities[-1] != "text":
                 record.output_modalities.append("text")
@@ -405,6 +428,15 @@ def _capture_cached_prompt_tokens(record: RequestRecord, payload: dict[str, Any]
     if present:
         record.cached_prompt_tokens = sum(present)
         record.cached_prompt_tokens_source = "sglang_sglext_cached_tokens_details"
+
+
+def _image_steps_per_image(usage: dict[str, Any]) -> list[int] | None:
+    value = usage.get("image_steps_per_image")
+    if not isinstance(value, list) or any(
+        not _is_token_count(step) for step in value
+    ):
+        return None
+    return [int(step) for step in value]
 
 
 def _is_token_count(value: Any) -> TypeGuard[int]:
