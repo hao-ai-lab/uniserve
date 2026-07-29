@@ -1,16 +1,56 @@
-"""Worker-side counters projected exactly onto the protocol-v3 metrics shape."""
+"""Worker-side counters projected exactly onto the worker-protocol metrics shape."""
 
 from __future__ import annotations
 
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import fields
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable
 
-from ..batch import WorkerForwardStats
+__all__ = ["MetricsService", "WorkerForwardStats"]
 
-__all__ = ["MetricsService"]
+
+@dataclass(frozen=True, slots=True)
+class WorkerForwardStats:
+    """Worker-local forward telemetry, accumulated off the completion path."""
+
+    mode_counts: Mapping[str, int] = field(default_factory=dict)
+    mode_tokens: Mapping[str, int] = field(default_factory=dict)
+    mode_us: Mapping[str, int] = field(default_factory=dict)
+    component_us: Mapping[str, int] = field(default_factory=dict)
+    attention_launches: int = 0
+    attention_us: int = 0
+    attention_backend_counts: Mapping[str, int] = field(default_factory=dict)
+    cuda_graph_captures: int = 0
+    cuda_graph_replays: int = 0
+    cuda_graph_misses: int = 0
+    cuda_graph_fallbacks: int = 0
+    cuda_graph_unpadded_tokens: int = 0
+    cuda_graph_padded_tokens: int = 0
+    cuda_graph_runtime_mode_counts: Mapping[str, int] = field(default_factory=dict)
+    text_decode_token_relay_hits: int = 0
+    text_decode_token_relay_misses: int = 0
+    text_decode_position_relay_hits: int = 0
+    text_decode_position_relay_misses: int = 0
+    flashinfer_decode_plan_calls: int = 0
+    flashinfer_decode_plan_reuses: int = 0
+    flashinfer_decode_plan_rows: int = 0
+    flashinfer_decode_plan_indices: int = 0
+    flashinfer_decode_graph_plan_calls: int = 0
+    flashinfer_decode_graph_plan_reuses: int = 0
+    spec_verify_rows: int = 0
+    spec_verify_draft_tokens: int = 0
+    spec_verify_accepted_tokens: int = 0
+    spec_verify_rejected_tokens: int = 0
+    spec_verify_committed_tokens: int = 0
+    spec_verify_path_counts: Mapping[str, int] = field(default_factory=dict)
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            name: dict(value) if isinstance(value, Mapping) else value
+            for name, value in ((name, getattr(self, name)) for name in self.__dataclass_fields__)
+        }
 
 _MAP_FORWARD_FIELDS = frozenset(
     {

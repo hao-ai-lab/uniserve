@@ -294,9 +294,11 @@ impl ZmqEngineCoreClient {
         let mut combined = first.ready_response.generation_capabilities.clone();
         for engine in &self.engines[1..] {
             let caps = &engine.ready_response.generation_capabilities;
-            combined
-                .supported_operation_types
-                .retain(|operation| caps.supported_operation_types.contains(operation));
+            combined.supports_understanding &= caps.supports_understanding;
+            combined.supports_vision_encode &= caps.supports_vision_encode;
+            combined.supports_latent_encode &= caps.supports_latent_encode;
+            combined.supports_image_generation &= caps.supports_image_generation;
+            combined.supports_commit_writeback &= caps.supports_commit_writeback;
             combined.max_latent_units = combined.max_latent_units.min(caps.max_latent_units);
             combined.latent_downsample = combined.latent_downsample.min(caps.latent_downsample);
             combined.max_vae_grid_tokens =
@@ -317,8 +319,6 @@ impl ZmqEngineCoreClient {
             combined.generated_image_commit.separate_writeback &=
                 caps.generated_image_commit.separate_writeback;
         }
-        combined.supported_operation_types.sort();
-        combined.supported_operation_types.dedup();
         combined
     }
 

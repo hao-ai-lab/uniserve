@@ -1,9 +1,9 @@
-"""Single-authority request sessions and atomic execution steps."""
+"""Single-authority request sessions and atomic register-before-submit steps."""
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from threading import RLock
 from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
@@ -14,10 +14,12 @@ if TYPE_CHECKING:
 from ..batch import (
     Admission,
     Batch,
+    FixedPoint,
     ImageParams,
-    OperationEnvelope,
+    Operation,
+    RequestKey,
     SamplingParams,
-    SessionProjection,
+    VersionRef,
 )
 from ..foundation.errors import invalid_descriptor
 
@@ -58,16 +60,24 @@ class SampledTokenRelay:
 
 @dataclass(slots=True)
 class RequestSession:
-    """All worker-owned scalar state and logical handles for one request."""
+    """All worker-owned scalar state and logical handles for one request.
 
-    session_id: int
-    epoch: int
-    version: int
+    Committed request state is a fixed :class:`VersionRef`. ``version`` is the
+    accounting point index of that committed version, ``committed_op_id`` its
+    producer operation, and ``committed_digest`` its semantic digest; together
+    they reconstruct the committed :class:`VersionRef` a successor's ``parent``
+    must name exactly.
+    """
+
+    request_key: RequestKey
     admission_digest: str
     sampling: SamplingParams | None
     image: ImageParams | None
     negative_token_ids: tuple[int, ...]
     adapter_id: int | None
+    version: int = 0
+    committed_op_id: int = 0
+    committed_digest: str = ""
     latent_handle: int | None = None
     product_handles: set[int] = field(default_factory=set)
     prompt_logits_handle: int | None = None
@@ -75,8 +85,28 @@ class RequestSession:
     flow_step: int = 0
     rng_counter: int = 0
     last_op_id: int | None = None
-    last_digest: str | None = None
     last_step_id: int | None = None
+
+    @property
+    def session_id(self) -> int:
+        return self.request_key.session_id
+
+    @property
+    def epoch(self) -> int:
+        return self.request_key.epoch
+
+    def committed_version(self) -> VersionRef:
+        """The fixed committed version a successor's ``parent`` must equal."""
+
+        # ``committed_digest`` may be a deferred digest while a decode response is
+        # still in flight; ``str`` finalizes it. A fixed-parent successor only
+        # reaches here after a host round-trip, by which point the producing
+        # response has serialized and the digest has landed, so this never stalls.
+        return VersionRef(
+            request_key=self.request_key,
+            producer_op_id=self.committed_op_id,
+            point=FixedPoint(self.version, str(self.committed_digest)),
+        )
 
     def rollback_snapshot(self) -> RequestSession:
         """Copy mutable session-owned state while sharing immutable declarations."""
@@ -109,19 +139,16 @@ class SessionStore:
         return isinstance(session_id, int) and session_id in self._sessions
 
     def prepare(self, batch: Batch) -> None:
-        """Admit new sessions, apply explicit staged projections, and validate work."""
+        """Admit new sessions and validate that every operation names its parent."""
 
-        operations = {operation.session_id: operation for operation in batch.operations}
+        operations = {operation.request_key.session_id: operation for operation in batch.operations}
         session_ids = sorted(operations)
         locks = [self._lock(session_id) for session_id in session_ids]
         for lock in locks:
             lock.acquire()
         try:
             for admission in batch.admissions:
-                operation = operations[admission.session_id]
-                self.admit(admission, epoch=operation.epoch)
-            for projection in batch.projections:
-                self.apply_projection(projection)
+                self.admit(admission)
             self.validate_operations(batch.operations, batch.admissions)
         finally:
             for lock in reversed(locks):
@@ -129,13 +156,14 @@ class SessionStore:
 
     def validate_operations(
         self,
-        operations: Sequence[OperationEnvelope],
+        operations: Sequence[Operation],
         admissions: Sequence[Admission],
     ) -> None:
-        admitted = {value.session_id: value for value in admissions}
+        admitted = {value.request_key.session_id: value for value in admissions}
         for operation in operations:
-            session = self.peek(operation.session_id)
-            admission = admitted.get(operation.session_id)
+            session_id = operation.request_key.session_id
+            session = self.peek(session_id)
+            admission = admitted.get(session_id)
             if session is None:
                 if admission is None:
                     raise invalid_descriptor(
@@ -144,78 +172,61 @@ class SessionStore:
                 continue
             if admission is not None and admission.digest != session.admission_digest:
                 raise invalid_descriptor(
-                    f"session {operation.session_id} admission conflicts with committed state"
+                    f"session {session_id} admission conflicts with committed state"
                 )
-            if operation.admission_digest != session.admission_digest:
+            if operation.request_key.epoch != session.epoch:
                 raise invalid_descriptor(
-                    f"operation {operation.op_id} conflicts with its admission identity"
-                )
-            if operation.epoch != session.epoch:
-                raise invalid_descriptor(
-                    f"operation {operation.op_id} has stale epoch {operation.epoch}; "
+                    f"operation {operation.op_id} has stale epoch {operation.request_key.epoch}; "
                     f"session epoch is {session.epoch}"
                 )
-            if operation.base_version != session.version:
-                raise invalid_descriptor(
-                    f"operation {operation.op_id} expects version {operation.base_version}; "
-                    f"session version is {session.version}"
-                )
+            parent = operation.parent
+            if parent.is_fixed():
+                expected = session.committed_version()
+                if parent != expected:
+                    raise invalid_descriptor(
+                        f"operation {operation.op_id} expects parent version {session.version}; "
+                        f"its declared parent does not match committed state"
+                    )
+            else:
+                # A device-relay successor roots on its predecessor's
+                # not-yet-observed selected point. By the time the worker
+                # registers it, the predecessor has committed and advanced this
+                # session, so the device reference must name the session's
+                # current committed producer.
+                if parent.producer_op_id != session.committed_op_id:
+                    raise invalid_descriptor(
+                        f"operation {operation.op_id} names a device parent whose "
+                        f"producer {parent.producer_op_id} does not match the "
+                        f"session's committed op {session.committed_op_id}"
+                    )
 
-    def admit(self, admission: Admission, *, epoch: int) -> RequestSession:
-        existing = self.peek(admission.session_id)
+    def admit(self, admission: Admission) -> RequestSession:
+        session_id = admission.request_key.session_id
+        existing = self.peek(session_id)
         if existing is not None:
             if existing.admission_digest != admission.digest:
                 raise invalid_descriptor(
-                    f"session {admission.session_id} admission conflicts with committed state"
+                    f"session {session_id} admission conflicts with committed state"
                 )
             return existing
         session = RequestSession(
-            session_id=admission.session_id,
-            epoch=int(epoch),
-            version=0,
+            request_key=admission.request_key,
             admission_digest=admission.digest,
-            sampling=None if admission.sequence is None else admission.sequence.sampling,
-            image=None if admission.flow is None else admission.flow.image,
+            sampling=None if admission.und is None else admission.und.sampling,
+            image=None if admission.gen_admission is None else admission.gen_admission.image,
             negative_token_ids=(
-                () if admission.sequence is None else admission.sequence.negative_token_ids
+                () if admission.und is None else admission.und.negative_token_ids
             ),
             adapter_id=admission.adapter_id,
+            committed_digest=admission.digest,
         )
-        self._sessions[admission.session_id] = session
+        self._sessions[session_id] = session
         return session
-
-    def apply_projection(self, projection: SessionProjection) -> None:
-        session = self.get(projection.session_id)
-        if session.epoch != projection.epoch:
-            raise invalid_descriptor(
-                f"session {projection.session_id} projection has a stale epoch"
-            )
-        if session.admission_digest != projection.admission_digest:
-            raise invalid_descriptor(
-                f"session {projection.session_id} projection has a different admission"
-            )
-        if projection.version < session.version:
-            raise invalid_descriptor(
-                f"session {projection.session_id} projection is older than committed state"
-            )
-        if projection.version == session.version:
-            if (
-                session.last_op_id != projection.last_op_id
-                or session.last_digest != projection.source_digest
-            ):
-                raise invalid_descriptor(
-                    f"session {projection.session_id} projection conflicts with committed state"
-                )
-        else:
-            session.version = projection.version
-            session.last_op_id = projection.last_op_id
-            session.last_digest = projection.source_digest
-        session.last_sampled_token = projection.last_sampled_token
 
     def begin_step(
         self,
         step_id: int,
-        operations: tuple[OperationEnvelope, ...],
+        operations: tuple[Operation, ...],
         stores: Sequence[TransactionalStore],
     ) -> StepTxn:
         return StepTxn(
@@ -299,20 +310,28 @@ class _SessionSnapshot:
 
 
 class StepTxn:
-    """Atomic commit and rollback scope across every touched authority."""
+    """Atomic register-before-submit scope across every touched authority.
+
+    Registration binds and validates before the operation is runnable: the
+    operations' declared parents are checked against committed state and every
+    touched store opens its transaction. Only after device work resolves does
+    :meth:`commit` advance each request to its selected fixed version. A
+    rejection at any point leaves no registered product, storage entry, or
+    committed version.
+    """
 
     def __init__(
         self,
         *,
         sessions: SessionStore,
         step_id: int,
-        operations: tuple[OperationEnvelope, ...],
+        operations: tuple[Operation, ...],
         stores: Sequence[TransactionalStore],
     ) -> None:
         self.sessions = sessions
         self.step_id = int(step_id)
         self.operations = operations
-        self.request_ids = {value.session_id for value in operations}
+        self.request_ids = {value.request_key.session_id for value in operations}
         self._locks = [sessions._lock(value) for value in sorted(self.request_ids)]
         for lock in self._locks:
             lock.acquire()
@@ -338,22 +357,47 @@ class StepTxn:
                 return transaction
         raise RuntimeError("store is not part of this step transaction")
 
-    def commit(self, publish: Callable[[], None] | None = None) -> None:
+    def commit(
+        self,
+        committed: Mapping[int, VersionRef],
+        publish: Callable[[], None] | None = None,
+    ) -> None:
+        """Advance each request to its selected fixed version and publish stores.
+
+        ``committed`` maps each session id to the fixed :class:`VersionRef`
+        selected for its operation. A non-state-advancing operation names its
+        own committed parent, so the version does not move.
+        """
+
         self._require_open()
         for operation in self.operations:
-            session = self.sessions.get(operation.session_id)
-            if session.epoch != operation.epoch or session.version != operation.base_version:
+            session = self.sessions.get(operation.request_key.session_id)
+            parent = operation.parent
+            # A fixed parent must equal the session's committed version. A device
+            # parent names the predecessor that already committed and advanced
+            # this session, so it is checked against that committed producer.
+            parent_matches = (
+                session.committed_version() == parent
+                if parent.is_fixed()
+                else parent.producer_op_id == session.committed_op_id
+            )
+            if session.request_key != operation.request_key or not parent_matches:
                 raise RuntimeError(
-                    f"session {operation.session_id} changed outside its transaction"
+                    f"session {operation.request_key.session_id} changed outside its transaction"
                 )
         try:
             for _store, transaction in self._store_transactions:
                 transaction.prepare()
             for operation in self.operations:
-                session = self.sessions.get(operation.session_id)
-                session.version = operation.base_version + 1
+                session = self.sessions.get(operation.request_key.session_id)
+                selected = committed[operation.request_key.session_id]
+                point = selected.point
+                if not isinstance(point, FixedPoint):
+                    raise RuntimeError("committed version must be fixed")
+                session.version = point.point_index
+                session.committed_op_id = selected.producer_op_id
+                session.committed_digest = point.semantic_digest
                 session.last_op_id = operation.op_id
-                session.last_digest = operation.digest
                 session.last_step_id = self.step_id
             for _store, transaction in self._store_transactions:
                 transaction.publish()

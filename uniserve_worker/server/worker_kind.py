@@ -18,7 +18,9 @@ class WorkerKind(StrEnum):
     GEN = "gen"
 
     @property
-    def supported_operation_types(self) -> frozenset[OperationType]:
+    def allowed_operation_types(self) -> frozenset[OperationType]:
+        """The route operation types this deployment role is admitted to run."""
+
         return _ROUTES[self]
 
     @classmethod

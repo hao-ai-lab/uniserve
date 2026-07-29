@@ -73,6 +73,7 @@ def _launch_server_for_suite(config_path: Path, server: str, timeout_s: float) -
 def _run_workload(args: argparse.Namespace, workload_name: str) -> None:
     workload = workload_spec(load_config(args.config), workload_name)
     sub = argparse.Namespace(config=args.config, workload=workload_name, server=args.server)
+    sub.output_dir = None
     kind = workload.get("type")
     if kind == "verify":
         verify.verify(sub)
@@ -149,6 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("verify")
     p.add_argument("workload")
     p.add_argument("--server", help="override workload server")
+    p.add_argument("--output-dir", type=Path, help="immutable output directory for this invocation")
     p.set_defaults(func=verify.verify)
 
     p = sub.add_parser("script")

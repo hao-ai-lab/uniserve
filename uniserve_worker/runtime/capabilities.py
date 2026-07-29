@@ -9,6 +9,7 @@ from ..capabilities import (
     RankInfo,
     RequestKind,
     ResourceClass,
+    work_variants_for_operation_types,
 )
 from ..foundation.runtime_config import (
     graph_memory_budget_bytes,
@@ -69,7 +70,9 @@ def resolve_capabilities(
         num_blocks=int(capacity.num_blocks),
         num_layers=int(spec.cache.num_layers),
         scratch_capacity_tokens=scratch_capacity,
-        supported_operation_types=tuple(operation.kind for operation in spec.operations),
+        supported_work=work_variants_for_operation_types(
+            tuple(operation.kind for operation in spec.operations)
+        ),
         max_latent_size=max_latent_size,
         latent_downsample=int(flow.latent_downsample) if flow is not None else 1,
         bytes_per_token=bytes_per_token,

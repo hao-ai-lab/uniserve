@@ -16,7 +16,7 @@ use uniserve_worker_ipc_core::{
     ClientEndpoint, Frame, Pending, event_driven_enabled, service_name,
 };
 use uniserve_worker_wire::{
-    Batch, EngineCaps, ExecutionResult, ResponseKind, WorkerRequest, WorkerResponse,
+    Batch, CompletionReport, EngineCaps, ResponseKind, WorkerRequest, WorkerResponse,
 };
 
 use crate::death_watch::DeathWatcher;
@@ -224,7 +224,7 @@ pub struct UniprocExecutor {
     rank: u32,
     tp_size: u32,
     pending: HashMap<u64, PendingRecord>,
-    ready: VecDeque<ExecutionResult>,
+    ready: VecDeque<CompletionReport>,
     acks: HashMap<u64, ControlAck>,
     awaited: Option<u64>,
     next_call_id: u64,
@@ -674,7 +674,9 @@ impl UniprocExecutor {
     fn route_batch(&mut self, step_id: u64, wr: WorkerResponse) -> anyhow::Result<()> {
         match wr.kind {
             ResponseKind::Result => {
-                let r = wr.result.ok_or_else(|| anyhow::anyhow!("result missing"))?;
+                let r = wr
+                    .completion_report
+                    .ok_or_else(|| anyhow::anyhow!("completion report missing"))?;
                 if r.step_id != step_id {
                     bail!(
                         "worker result step id mismatch: expected {step_id}, got {}",
@@ -829,7 +831,7 @@ impl Executor for UniprocExecutor {
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
         self.drain_ready()?;
         Ok(self.ready.pop_front())
     }
@@ -843,7 +845,7 @@ impl Executor for UniprocExecutor {
     fn wait_result_timeout(
         &mut self,
         timeout: Duration,
-    ) -> anyhow::Result<Option<ExecutionResult>> {
+    ) -> anyhow::Result<Option<CompletionReport>> {
         let Some(deadline) = Instant::now().checked_add(timeout) else {
             self.drain_ready()?;
             return Ok(self.ready.pop_front());
@@ -868,7 +870,7 @@ impl Executor for UniprocExecutor {
         }
     }
 
-    fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
         loop {
             self.drain_ready()?;
             if let Some(r) = self.ready.pop_front() {

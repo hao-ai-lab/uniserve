@@ -4,131 +4,12 @@
 //! turns it into worker ops. They are data-only: no channels, worker handles,
 //! scheduler state, or model-local logic belongs here.
 
-use std::{fmt, str::FromStr};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Modality;
 use crate::{ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingParamsError};
-
-/// Top-level member of the closed execution operation algebra.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationKind {
-    Sequence,
-    Flow,
-    Encode,
-    Materialize,
-    Transfer,
-}
-
-impl OperationKind {
-    pub const ALL: [Self; 5] = [
-        Self::Sequence,
-        Self::Flow,
-        Self::Encode,
-        Self::Materialize,
-        Self::Transfer,
-    ];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SequenceMode {
-    Extend,
-    Decode,
-    Verify,
-    Sample,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EncodeKind {
-    Vision,
-    Latent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaterializeKind {
-    Image,
-    Frame,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransferKind {
-    Product,
-    Kv,
-}
-
-/// Complete discriminator used for capability negotiation and routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationType {
-    SequenceExtend,
-    SequenceDecode,
-    SequenceVerify,
-    SequenceSample,
-    Flow,
-    EncodeVision,
-    EncodeLatent,
-    MaterializeImage,
-    MaterializeFrame,
-    TransferProduct,
-    TransferKv,
-}
-
-impl OperationType {
-    pub const ALL: [Self; 11] = [
-        Self::SequenceExtend,
-        Self::SequenceDecode,
-        Self::SequenceVerify,
-        Self::SequenceSample,
-        Self::Flow,
-        Self::EncodeVision,
-        Self::EncodeLatent,
-        Self::MaterializeImage,
-        Self::MaterializeFrame,
-        Self::TransferProduct,
-        Self::TransferKv,
-    ];
-
-    pub const fn kind(self) -> OperationKind {
-        match self {
-            Self::SequenceExtend
-            | Self::SequenceDecode
-            | Self::SequenceVerify
-            | Self::SequenceSample => OperationKind::Sequence,
-            Self::Flow => OperationKind::Flow,
-            Self::EncodeVision | Self::EncodeLatent => OperationKind::Encode,
-            Self::MaterializeImage | Self::MaterializeFrame => OperationKind::Materialize,
-            Self::TransferProduct | Self::TransferKv => OperationKind::Transfer,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::SequenceExtend => "sequence_extend",
-            Self::SequenceDecode => "sequence_decode",
-            Self::SequenceVerify => "sequence_verify",
-            Self::SequenceSample => "sequence_sample",
-            Self::Flow => "flow",
-            Self::EncodeVision => "encode_vision",
-            Self::EncodeLatent => "encode_latent",
-            Self::MaterializeImage => "materialize_image",
-            Self::MaterializeFrame => "materialize_frame",
-            Self::TransferProduct => "transfer_product",
-            Self::TransferKv => "transfer_kv",
-        }
-    }
-}
-
-impl fmt::Display for OperationType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
 
 /// Output constraint applied to the default generation paradigm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -539,40 +420,57 @@ impl GenerationBehaviorDescriptor {
         self.und_tokens == UndTokenAction::Emit
     }
 
-    pub fn required_operations(
+    /// The generation branches this resolved behavior requires a runtime to
+    /// execute, for admission-time capability gating.
+    pub fn capability_needs(
         &self,
         policy: &GenerationPolicyDescriptor,
         context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
-    ) -> Vec<OperationType> {
-        let mut operations = vec![OperationType::SequenceExtend];
-        if self.und_decode {
-            operations.push(OperationType::SequenceDecode);
-        }
+    ) -> GenerationCapabilityNeeds {
+        let mut needs = GenerationCapabilityNeeds {
+            understanding: true,
+            ..GenerationCapabilityNeeds::default()
+        };
         for step in context_image_steps {
-            operations.push(match step {
-                ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
-                ImageIngestStep::VitEncode => OperationType::EncodeVision,
-            });
+            needs.mark_encode(step);
         }
         if self.gen_output {
-            operations.extend([OperationType::Flow, OperationType::MaterializeImage]);
+            needs.image_generation = true;
         }
         if self.generated_image_feedback
             && let Some(feedback) = &policy.feedback
         {
             if feedback.commit == CommitRecipe::CommitGenThenWriteback {
-                operations.push(OperationType::TransferKv);
+                needs.commit_writeback = true;
             }
             if let FeedbackWriteback::Reingest { ingest } = &feedback.writeback {
-                operations.extend(ingest.steps.iter().map(|step| match step {
-                    ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
-                    ImageIngestStep::VitEncode => OperationType::EncodeVision,
-                }));
+                for step in ingest.steps.iter().copied() {
+                    needs.mark_encode(step);
+                }
             }
         }
-        operations.sort_unstable();
-        operations.dedup();
-        operations
+        needs
+    }
+}
+
+/// The generation branches a request needs a runtime to execute. Understanding
+/// (prompt ingestion and decode) is always required; the remaining branches are
+/// set by the resolved behavior, its context image steps, and feedback recipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GenerationCapabilityNeeds {
+    pub understanding: bool,
+    pub vision_encode: bool,
+    pub latent_encode: bool,
+    pub image_generation: bool,
+    pub commit_writeback: bool,
+}
+
+impl GenerationCapabilityNeeds {
+    fn mark_encode(&mut self, step: ImageIngestStep) {
+        match step {
+            ImageIngestStep::VaeEncode => self.latent_encode = true,
+            ImageIngestStep::VitEncode => self.vision_encode = true,
+        }
     }
 }
 
@@ -628,7 +526,11 @@ impl GeneratedImageCommitCapabilities {
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationRuntimeCapabilities {
-    pub supported_operation_types: Vec<OperationType>,
+    pub supports_understanding: bool,
+    pub supports_vision_encode: bool,
+    pub supports_latent_encode: bool,
+    pub supports_image_generation: bool,
+    pub supports_commit_writeback: bool,
     pub max_latent_units: u64,
     pub latent_downsample: u32,
     pub max_vae_grid_tokens: u32,
@@ -644,8 +546,25 @@ pub struct GenerationRuntimeCapabilities {
 }
 
 impl GenerationRuntimeCapabilities {
-    pub fn supports(&self, operation: OperationType) -> bool {
-        self.supported_operation_types.contains(&operation)
+    /// Whether this runtime covers every branch the request needs. On a gap,
+    /// returns the admission-capability name of the first missing branch.
+    pub fn covers(&self, needs: &GenerationCapabilityNeeds) -> Result<(), &'static str> {
+        if needs.understanding && !self.supports_understanding {
+            return Err("runtime_und_execution");
+        }
+        if needs.latent_encode && !self.supports_latent_encode {
+            return Err("runtime_vae_encode");
+        }
+        if needs.vision_encode && !self.supports_vision_encode {
+            return Err("runtime_vit_encode");
+        }
+        if needs.image_generation && !self.supports_image_generation {
+            return Err("runtime_gen_denoise");
+        }
+        if needs.commit_writeback && !self.supports_commit_writeback {
+            return Err("runtime_commit_writeback");
+        }
+        Ok(())
     }
 }
 
@@ -1355,15 +1274,11 @@ mod tests {
 
     fn runtime_capabilities() -> GenerationRuntimeCapabilities {
         GenerationRuntimeCapabilities {
-            supported_operation_types: vec![
-                OperationType::SequenceExtend,
-                OperationType::SequenceDecode,
-                OperationType::EncodeLatent,
-                OperationType::EncodeVision,
-                OperationType::Flow,
-                OperationType::MaterializeImage,
-                OperationType::TransferKv,
-            ],
+            supports_understanding: true,
+            supports_vision_encode: true,
+            supports_latent_encode: true,
+            supports_image_generation: true,
+            supports_commit_writeback: true,
             max_latent_units: 4_096,
             latent_downsample: 16,
             max_vae_grid_tokens: 64,
@@ -1553,12 +1468,12 @@ mod tests {
         assert!(!immediate.und_decode);
         assert!(immediate.finish_after_gen_commit);
         assert_eq!(
-            immediate.required_operations(&immediate_policy, []),
-            vec![
-                OperationType::SequenceExtend,
-                OperationType::Flow,
-                OperationType::MaterializeImage,
-            ]
+            immediate.capability_needs(&immediate_policy, []),
+            GenerationCapabilityNeeds {
+                understanding: true,
+                image_generation: true,
+                ..GenerationCapabilityNeeds::default()
+            }
         );
     }
 

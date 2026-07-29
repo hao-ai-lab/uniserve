@@ -5,10 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError, WorkerLossError};
-use uniserve_worker_wire::{
-    Batch, EngineCaps, ExecutionResult, MaterializedProduct, OperationResult, PublishedKv,
-    PublishedProduct, ResultDelta, SequenceEffect,
-};
+use uniserve_worker_wire::{Batch, CompletionRecord, CompletionReport, EngineCaps, Point};
 
 use crate::WorkerLaunchConfig;
 
@@ -93,7 +90,7 @@ impl MultiprocSpawnSpec {
 /// W worker processes, one iceoryx2 request-response service each.
 pub struct MultiprocExecutor {
     workers: Vec<Box<dyn Executor>>,
-    buffers: Vec<VecDeque<ExecutionResult>>,
+    buffers: Vec<VecDeque<CompletionReport>>,
     caps: EngineCaps,
     depth: usize,
     inflight: usize,
@@ -471,12 +468,15 @@ impl MultiprocExecutor {
             .values()
             .flat_map(|batch| {
                 batch.operations.iter().filter_map(|operation| {
-                    (operation.base_version == 0
+                    // A depth-one admission root: point zero of the request's
+                    // admission operation. Only such operations can be replayed
+                    // from a fresh admission after a rank group is replaced.
+                    (matches!(operation.parent.point, Point::Fixed { point_index: 0, .. })
                         && batch
                             .admissions
                             .iter()
-                            .any(|admission| admission.session_id == operation.session_id))
-                    .then_some(operation.session_id)
+                            .any(|admission| admission.request_key == operation.request_key))
+                    .then_some(operation.request_key.session_id)
                 })
             })
             .collect()
@@ -518,7 +518,7 @@ impl MultiprocExecutor {
         }
     }
 
-    fn try_join(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+    fn try_join(&mut self) -> anyhow::Result<Option<CompletionReport>> {
         if self.buffers.iter().any(|buffer| buffer.is_empty()) {
             return Ok(None);
         }
@@ -530,7 +530,7 @@ impl MultiprocExecutor {
         for buffer in &mut self.buffers {
             let pos = buffer
                 .iter()
-                .position(|result| result.step_id == step_id)
+                .position(|report| report.step_id == step_id)
                 .ok_or_else(|| {
                     anyhow::anyhow!("joinable step {step_id} disappeared from rank buffer")
                 })?;
@@ -540,12 +540,12 @@ impl MultiprocExecutor {
         }
 
         let mut out = per_rank.remove(0);
-        for (rank, result) in per_rank.iter().enumerate() {
-            merge_rank_result(step_id, &mut out, result, rank + 1)?;
+        for (rank, report) in per_rank.iter().enumerate() {
+            merge_rank_report(step_id, &mut out, report, rank + 1)?;
         }
         out.worker_exec_us = per_rank
             .iter()
-            .filter_map(|result| result.worker_exec_us)
+            .filter_map(|report| report.worker_exec_us)
             .chain(out.worker_exec_us)
             .max();
         self.inflight = self.inflight.saturating_sub(1);
@@ -556,8 +556,8 @@ impl MultiprocExecutor {
     fn joinable_step_id(&self) -> Option<u64> {
         self.buffers[0]
             .iter()
-            .filter_map(|result| {
-                let step_id = result.step_id;
+            .filter_map(|report| {
+                let step_id = report.step_id;
                 self.buffers
                     .iter()
                     .all(|buffer| buffer.iter().any(|item| item.step_id == step_id))
@@ -567,207 +567,73 @@ impl MultiprocExecutor {
     }
 }
 
-fn merge_rank_result(
+/// Join one step's per-rank completion reports into rank 0's. Tensor-parallel
+/// ranks run the identical operation set, so every rank must report the same
+/// semantic completion for each operation; only the per-rank product shards
+/// differ and are concatenated in rank order.
+fn merge_rank_report(
     step_id: u64,
-    rank0: &mut ExecutionResult,
-    rankn: &ExecutionResult,
+    rank0: &mut CompletionReport,
+    rankn: &CompletionReport,
     rank: usize,
 ) -> anyhow::Result<()> {
     if rankn.step_id != step_id {
         anyhow::bail!(
-            "rank {rank} result step_id mismatch while joining step {step_id}: got {}",
+            "rank {rank} completion report step_id mismatch while joining step {step_id}: got {}",
             rankn.step_id
         );
     }
-    if rankn.operations.len() != rank0.operations.len() {
+    if rankn.completions.len() != rank0.completions.len() {
         anyhow::bail!(
-            "rank {rank} result for step {step_id} has {} operation results, expected {}",
-            rankn.operations.len(),
-            rank0.operations.len()
+            "rank {rank} report for step {step_id} has {} completions, expected {}",
+            rankn.completions.len(),
+            rank0.completions.len()
         );
     }
-    for (idx, (expected, actual)) in rank0
-        .operations
+    for (idx, (canonical, actual)) in rank0
+        .completions
         .iter_mut()
-        .zip(&rankn.operations)
+        .zip(&rankn.completions)
         .enumerate()
     {
-        if let Err(error) = merge_operation_result(expected, actual, rank) {
+        if let Err(error) = merge_completion_record(canonical, actual) {
             anyhow::bail!(
-                "rank {rank} result for step {step_id} operation {idx} differs from rank 0: {error:#}"
+                "rank {rank} report for step {step_id} completion {idx} differs from rank 0: {error:#}"
             );
         }
     }
+    // Report-level product payloads are per-rank shards; concatenate them in
+    // rank order (rank 0's, then rank 1's, ...).
+    rank0.products.extend(rankn.products.iter().cloned());
     Ok(())
 }
 
-fn merge_operation_result(
-    canonical: &mut OperationResult,
-    rank_result: &OperationResult,
-    rank: usize,
+/// Merge one rank's completion record into rank 0's. Every rank must agree on
+/// the semantic result; only `product_generations` are per-rank shards, which
+/// concatenate in rank order.
+fn merge_completion_record(
+    canonical: &mut CompletionRecord,
+    rank_completion: &CompletionRecord,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        canonical.session_id == rank_result.session_id
-            && canonical.epoch == rank_result.epoch
-            && canonical.op_id == rank_result.op_id
-            && canonical.base_version == rank_result.base_version
-            && canonical.result_version == rank_result.result_version,
-        "operation identity or version diverged"
+        canonical.request_key == rank_completion.request_key
+            && canonical.op_id == rank_completion.op_id
+            && canonical.selected_point == rank_completion.selected_point
+            && canonical.semantic_digest == rank_completion.semantic_digest,
+        "completion identity or selected point diverged"
     );
-    match (&mut canonical.delta, &rank_result.delta) {
-        (ResultDelta::Sequence(left), ResultDelta::Sequence(right)) => {
-            merge_sequence_effect(&mut left.effect, &right.effect, rank)
-        }
-        (ResultDelta::Flow(left), ResultDelta::Flow(right)) => {
-            anyhow::ensure!(left == right, "flow delta diverged");
-            Ok(())
-        }
-        (ResultDelta::Encode(left), ResultDelta::Encode(right)) => {
-            anyhow::ensure!(left == right, "encode delta diverged");
-            Ok(())
-        }
-        (ResultDelta::Materialize(left), ResultDelta::Materialize(right)) => {
-            anyhow::ensure!(
-                left.kv_tokens == right.kv_tokens,
-                "materialize KV length diverged"
-            );
-            merge_materialized_product(&mut left.product, &right.product)?;
-            merge_optional_sequence(&mut left.sequence, &right.sequence, rank)
-        }
-        (ResultDelta::Transfer(left), ResultDelta::Transfer(right)) => {
-            anyhow::ensure!(
-                left.kv_tokens == right.kv_tokens,
-                "transfer KV length diverged"
-            );
-            merge_optional_product(&mut left.product, &right.product)?;
-            merge_optional_sequence(&mut left.sequence, &right.sequence, rank)
-        }
-        _ => anyhow::bail!("result delta variant diverged"),
-    }
-}
-
-fn merge_sequence_effect(
-    canonical: &mut SequenceEffect,
-    rank_effect: &SequenceEffect,
-    rank: usize,
-) -> anyhow::Result<()> {
     anyhow::ensure!(
-        canonical.sampled_token_ids == rank_effect.sampled_token_ids
-            && canonical.sampled_logprob == rank_effect.sampled_logprob
-            && canonical.top_logprobs == rank_effect.top_logprobs
-            && canonical.prompt_logprobs == rank_effect.prompt_logprobs
-            && canonical.accepted_draft_tokens == rank_effect.accepted_draft_tokens
-            && canonical.kv_tokens == rank_effect.kv_tokens,
-        "sequence effect diverged"
+        canonical.committed_tokens == rank_completion.committed_tokens
+            && canonical.status == rank_completion.status
+            && canonical.logical_lengths == rank_completion.logical_lengths
+            && canonical.token_span == rank_completion.token_span
+            && canonical.finish_flags == rank_completion.finish_flags,
+        "completion result fields diverged"
     );
-    merge_optional_product(
-        &mut canonical.published_logits,
-        &rank_effect.published_logits,
-    )?;
-    merge_optional_kv(&mut canonical.published_kv, &rank_effect.published_kv, rank)
-}
-
-fn merge_optional_product(
-    canonical: &mut Option<PublishedProduct>,
-    rank_product: &Option<PublishedProduct>,
-) -> anyhow::Result<()> {
-    match (canonical, rank_product) {
-        (Some(left), Some(right)) => {
-            anyhow::ensure!(
-                left.handle == right.handle,
-                "published product handle diverged"
-            );
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        _ => anyhow::bail!("published product presence diverged"),
-    }
-}
-
-fn merge_optional_kv(
-    canonical: &mut Option<PublishedKv>,
-    rank_kv: &Option<PublishedKv>,
-    rank: usize,
-) -> anyhow::Result<()> {
-    match (canonical, rank_kv) {
-        (Some(left), Some(right)) => merge_published_kv(left, right, rank),
-        (None, None) => Ok(()),
-        _ => anyhow::bail!("published KV presence diverged"),
-    }
-}
-
-fn merge_published_kv(
-    canonical: &mut PublishedKv,
-    rank_kv: &PublishedKv,
-    rank: usize,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        canonical.handle == rank_kv.handle
-            && canonical.source_version == rank_kv.source_version
-            && canonical.kv_tokens == rank_kv.kv_tokens
-            && canonical.block_ids == rank_kv.block_ids
-            && canonical.group_id == rank_kv.group_id
-            && canonical.position == rank_kv.position,
-        "published KV metadata diverged"
-    );
-    if canonical.locators.is_empty() || rank_kv.locators.is_empty() {
-        anyhow::ensure!(
-            canonical.locators.is_empty() && rank_kv.locators.is_empty(),
-            "published KV locator presence diverged"
-        );
-        return Ok(());
-    }
-    anyhow::ensure!(
-        canonical.locators.len() == rank * rank_kv.locators.len(),
-        "published KV locator group width diverged"
-    );
-    canonical.locators.extend(rank_kv.locators.iter().cloned());
+    canonical
+        .product_generations
+        .extend(rank_completion.product_generations.iter().copied());
     Ok(())
-}
-
-fn merge_optional_sequence(
-    canonical: &mut Option<SequenceEffect>,
-    rank_sequence: &Option<SequenceEffect>,
-    rank: usize,
-) -> anyhow::Result<()> {
-    match (canonical, rank_sequence) {
-        (Some(left), Some(right)) => merge_sequence_effect(left, right, rank),
-        (None, None) => Ok(()),
-        _ => anyhow::bail!("materialized sequence effect presence diverged"),
-    }
-}
-
-fn merge_materialized_product(
-    canonical: &mut MaterializedProduct,
-    rank_product: &MaterializedProduct,
-) -> anyhow::Result<()> {
-    match (canonical, rank_product) {
-        (MaterializedProduct::Image(left), MaterializedProduct::Image(right)) => {
-            anyhow::ensure!(
-                left.png_base64 == right.png_base64
-                    && left.height == right.height
-                    && left.width == right.width
-                    && left.handle == right.handle,
-                "materialized image diverged"
-            );
-            Ok(())
-        }
-        (MaterializedProduct::Published(left), MaterializedProduct::Published(right)) => {
-            anyhow::ensure!(
-                left.handle == right.handle,
-                "published product handle diverged"
-            );
-            Ok(())
-        }
-        (
-            MaterializedProduct::Frame { count: left },
-            MaterializedProduct::Frame { count: right },
-        ) => {
-            anyhow::ensure!(left == right, "materialized frame count diverged");
-            Ok(())
-        }
-        _ => anyhow::bail!("materialized product variant diverged"),
-    }
 }
 
 fn validate_replacement_caps(
@@ -823,7 +689,7 @@ impl Executor for MultiprocExecutor {
         let sessions = batch
             .operations
             .iter()
-            .map(|operation| operation.session_id)
+            .map(|operation| operation.request_key.session_id)
             .collect::<Vec<_>>();
         self.pending_batches.insert(step_id, batch.clone());
         self.known_sessions.extend(sessions);
@@ -839,7 +705,7 @@ impl Executor for MultiprocExecutor {
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
         self.pump()?;
         self.try_join()
     }
@@ -891,7 +757,7 @@ impl Executor for MultiprocExecutor {
     fn wait_result_timeout(
         &mut self,
         timeout: Duration,
-    ) -> anyhow::Result<Option<ExecutionResult>> {
+    ) -> anyhow::Result<Option<CompletionReport>> {
         let Some(deadline) = Instant::now().checked_add(timeout) else {
             self.pump()?;
             return self.try_join();
@@ -912,7 +778,7 @@ impl Executor for MultiprocExecutor {
         }
     }
 
-    fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
         if self.inflight == 0 {
             anyhow::bail!("next_result called with no in-flight batches");
         }
@@ -1038,11 +904,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{MultiprocExecutor, device_for_rank};
-    use uniserve_core::{BlockId, RequestId};
+    use uniserve_core::RequestId;
     use uniserve_executor::{ControlAck, ControlOp, Executor};
     use uniserve_worker_wire::{
-        Batch, EngineCaps, ExecutionResult, OperationResult, PublishedKv, ResultDelta,
-        SequenceDelta, SequenceEffect,
+        Batch, CompletionRecord, CompletionReport, DType, EngineCaps, FinishFlags, LogicalLengths,
+        OpId, OpStatus, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck,
+        RequestKey, ShapeBound, StorageClass, TimingCounters, TokenSpan,
     };
 
     #[test]
@@ -1087,39 +954,40 @@ mod tests {
 
         let err = exec.try_join().unwrap_err().to_string();
 
-        assert!(err.contains("operation 0 differs"));
+        assert!(err.contains("completion 0 differs"), "got: {err}");
         assert_eq!(exec.inflight, 1);
     }
 
     #[test]
-    fn multiproc_join_assembles_rank_ordered_kv_locators() {
+    fn multiproc_join_concatenates_rank_ordered_products() {
+        // The tensor-parallel join concatenates each completion's
+        // `product_generations` and the report-level `products` in rank order,
+        // while the semantic completion is required to be identical per rank.
         let mut exec = fake_multiproc(2);
         exec.inflight = 1;
-        exec.buffers[0].push_back(result_with_kv(1, &["rank-0-key", "rank-0-value"]));
-        exec.buffers[1].push_back(result_with_kv(1, &["rank-1-key", "rank-1-value"]));
+        exec.buffers[0].push_back(result_with_products(1, vec![10, 11], 100));
+        exec.buffers[1].push_back(result_with_products(1, vec![20, 21], 200));
 
         let joined = exec.try_join().unwrap().unwrap();
-        let ResultDelta::Sequence(delta) = &joined.operations[0].delta else {
-            panic!("expected sequence delta");
-        };
-        let publication = delta.effect.published_kv.as_ref().unwrap();
 
         assert_eq!(
-            publication.locators,
-            ["rank-0-key", "rank-0-value", "rank-1-key", "rank-1-value"]
+            joined.completions[0].product_generations,
+            vec![10, 11, 20, 21]
         );
-    }
+        assert_eq!(joined.products.len(), 2);
+        assert_eq!(joined.products[0].product.generation, 100);
+        assert_eq!(joined.products[1].product.generation, 200);
 
-    #[test]
-    fn multiproc_join_rejects_different_kv_locator_group_widths() {
+        // Identity / committed-token divergence across ranks is still rejected.
         let mut exec = fake_multiproc(2);
         exec.inflight = 1;
-        exec.buffers[0].push_back(result_with_kv(1, &["rank-0-key", "rank-0-value"]));
-        exec.buffers[1].push_back(result_with_kv(1, &["rank-1-key"]));
+        exec.buffers[0].push_back(result_with_products(1, vec![10], 100));
+        let mut diverged = result_with_products(1, vec![20], 200);
+        diverged.completions[0].committed_tokens = vec![99];
+        exec.buffers[1].push_back(diverged);
 
         let error = exec.try_join().unwrap_err().to_string();
-
-        assert!(error.contains("locator group width diverged"));
+        assert!(error.contains("completion 0 differs"), "got: {error}");
     }
 
     fn fake_multiproc(n: usize) -> MultiprocExecutor {
@@ -1129,47 +997,74 @@ mod tests {
         MultiprocExecutor::new(workers)
     }
 
-    fn result(step_id: u64, sampled_token_id: u32) -> ExecutionResult {
-        ExecutionResult {
+    fn completion(
+        op: u64,
+        committed_tokens: Vec<u32>,
+        product_generations: Vec<u32>,
+    ) -> CompletionRecord {
+        CompletionRecord {
+            request_key: RequestKey::new(1, RequestId(7), 1),
+            op_id: OpId(op.max(1)),
+            completion_slot_generation: 0,
+            status: OpStatus::Ok,
+            selected_point: 0,
+            logical_lengths: LogicalLengths::default(),
+            token_span: TokenSpan::default(),
+            committed_tokens,
+            finish_flags: FinishFlags::default(),
+            product_generations,
+            semantic_digest: "0".repeat(64),
+            error_code: None,
+            timing_counters: TimingCounters::default(),
+        }
+    }
+
+    fn result(step_id: u64, sampled_token_id: u32) -> CompletionReport {
+        CompletionReport {
             step_id,
-            operations: vec![OperationResult {
-                session_id: RequestId(7),
-                epoch: 1,
-                op_id: step_id,
-                base_version: step_id.saturating_sub(1),
-                result_version: step_id,
-                delta: ResultDelta::Sequence(SequenceDelta {
-                    effect: SequenceEffect {
-                        sampled_token_ids: vec![sampled_token_id],
-                        ..SequenceEffect::default()
-                    },
-                }),
-            }],
+            completions: vec![completion(step_id, vec![sampled_token_id], Vec::new())],
+            products: Vec::new(),
+            registration: RegistrationAck::default(),
             worker_exec_us: Some(step_id),
             forward_stats: None,
         }
     }
 
-    fn result_with_kv(step_id: u64, locators: &[&str]) -> ExecutionResult {
-        let mut output = result(step_id, 10);
-        let ResultDelta::Sequence(delta) = &mut output.operations[0].delta else {
-            unreachable!();
-        };
-        delta.effect.published_kv = Some(PublishedKv {
-            handle: 7,
-            locators: locators.iter().map(|value| (*value).to_string()).collect(),
-            source_version: step_id,
-            kv_tokens: 64,
-            block_ids: vec![BlockId(2)],
-            group_id: 0,
-            position: 64,
-        });
-        output
+    fn result_with_products(
+        step_id: u64,
+        product_generations: Vec<u32>,
+        payload_generation: u32,
+    ) -> CompletionReport {
+        CompletionReport {
+            step_id,
+            completions: vec![completion(step_id, vec![10], product_generations)],
+            products: vec![product_payload(payload_generation)],
+            registration: RegistrationAck::default(),
+            worker_exec_us: Some(step_id),
+            forward_stats: None,
+        }
+    }
+
+    fn product_payload(generation: u32) -> ProductPayload {
+        ProductPayload {
+            product: ProductRef {
+                request_key: RequestKey::new(1, RequestId(7), 1),
+                producer_op_id: OpId(1),
+                output_index: 0,
+                generation,
+                kind: ProductKind::Kv,
+                storage_class: StorageClass::PagedKv,
+                dtype: DType::BF16,
+                shape_bound: ShapeBound::default(),
+                point_range: PointRange::default(),
+            },
+            bytes: vec![generation as u8],
+        }
     }
 
     #[derive(Default)]
     struct FakeExec {
-        queued: VecDeque<ExecutionResult>,
+        queued: VecDeque<CompletionReport>,
     }
 
     impl Executor for FakeExec {
@@ -1189,18 +1084,18 @@ mod tests {
             Ok(())
         }
 
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
             Ok(self.queued.pop_front())
         }
 
         fn wait_result_timeout(
             &mut self,
             _timeout: Duration,
-        ) -> anyhow::Result<Option<ExecutionResult>> {
+        ) -> anyhow::Result<Option<CompletionReport>> {
             self.poll()
         }
 
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
             self.queued
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("no fake result"))

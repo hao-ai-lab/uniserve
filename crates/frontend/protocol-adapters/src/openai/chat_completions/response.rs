@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::result::Result;
 
@@ -76,6 +77,7 @@ pub async fn collect_chat_completion(
         images,
         image_count,
         image_steps,
+        image_steps_per_image,
         finish_status,
     } = collected;
     let stop_reason = finish_status_stop_reason(&finish_status);
@@ -124,7 +126,8 @@ pub async fn collect_chat_completion(
         output_token_count as u32,
         image_count,
         image_steps,
-    );
+    )
+    .with_image_steps_per_image(image_steps_per_image);
 
     Ok(ChatCompletionResponse {
         id: request_id,
@@ -168,6 +171,7 @@ struct CollectedChatOutput {
     images: Vec<ContentPart>,
     image_count: u32,
     image_steps: u32,
+    image_steps_per_image: Vec<u32>,
     finish_status: FinishStatus,
 }
 
@@ -185,6 +189,8 @@ async fn collect_chat_events(
     let mut images = Vec::new();
     let mut image_count = 0_u32;
     let mut image_steps = 0_u32;
+    let mut image_step_counts = HashMap::<String, u32>::new();
+    let mut completed_image_ids = Vec::<String>::new();
     let mut finish_status = None;
 
     while let Some(next) = stream.next().await {
@@ -215,11 +221,23 @@ async fn collect_chat_events(
                 }
             }
             Ok(ServeEvent::OutputBlockEnd { block, .. }) => message.push_block(block),
-            Ok(ServeEvent::ImageDone { pixels_png_b64, .. }) => {
+            Ok(ServeEvent::ImageBegin { image_id, .. }) => {
+                image_step_counts.entry(image_id).or_default();
+            }
+            Ok(ServeEvent::ImageStep { image_id, .. }) => {
+                *image_step_counts.entry(image_id).or_default() += 1;
+            }
+            Ok(ServeEvent::ImageDone {
+                image_id,
+                pixels_png_b64,
+                ..
+            }) => {
                 let png_b64 = pixels_png_b64.ok_or_else(|| {
                     server_error!("image completion ended without an inline PNG artifact")
                 })?;
                 images.push(image_content_part(png_b64));
+                image_step_counts.entry(image_id.clone()).or_default();
+                completed_image_ids.push(image_id);
             }
             Ok(ServeEvent::ToolCallEnd {
                 id,
@@ -290,6 +308,10 @@ async fn collect_chat_events(
         images,
         image_count,
         image_steps,
+        image_steps_per_image: completed_image_ids
+            .iter()
+            .map(|image_id| image_step_counts.get(image_id).copied().unwrap_or_default())
+            .collect(),
         finish_status,
     })
 }
@@ -316,6 +338,8 @@ pub async fn chat_completion_chunk_stream(
     let mut output_token_count = 0_usize;
     let mut image_count = 0_u32;
     let mut image_steps = 0_u32;
+    let mut image_step_counts = HashMap::<String, u32>::new();
+    let mut completed_image_ids = Vec::<String>::new();
     // Token metadata is emitted after all semantic deltas for one decoded update.
     // If that update contains hidden reasoning, including delimiter-only block
     // starts or ends, omit its token metadata as well as its visible delta.
@@ -489,7 +513,17 @@ pub async fn chat_completion_chunk_stream(
             Ok(ServeEvent::ToolCallEnd { .. }) => {
                 debug!("ending current tool call");
             }
-            Ok(ServeEvent::ImageDone { pixels_png_b64, .. }) => {
+            Ok(ServeEvent::ImageBegin { image_id, .. }) => {
+                image_step_counts.entry(image_id).or_default();
+            }
+            Ok(ServeEvent::ImageStep { image_id, .. }) => {
+                *image_step_counts.entry(image_id).or_default() += 1;
+            }
+            Ok(ServeEvent::ImageDone {
+                image_id,
+                pixels_png_b64,
+                ..
+            }) => {
                 if let Some(pending_chunk) = pending_chunk.as_mut()
                     && let Some(chunk) =
                         pending_chunk.take_chunk(&request_id, &response_model, created)
@@ -506,6 +540,8 @@ pub async fn chat_completion_chunk_stream(
                     png_b64,
                 ))
                 .await;
+                image_step_counts.entry(image_id.clone()).or_default();
+                completed_image_ids.push(image_id);
             }
             Ok(ServeEvent::Usage {
                 prompt_tokens,
@@ -567,6 +603,14 @@ pub async fn chat_completion_chunk_stream(
                             output_token_count as u32,
                             image_count,
                             image_steps,
+                        )
+                        .with_image_steps_per_image(
+                            completed_image_ids
+                                .iter()
+                                .map(|image_id| {
+                                    image_step_counts.get(image_id).copied().unwrap_or_default()
+                                })
+                                .collect(),
                         ),
                     ))
                     .await;
@@ -1266,6 +1310,38 @@ mod tests {
                 name: "lookup".to_string(),
                 arguments: r#"{"id":1}"#.to_string(),
             }),
+            Ok(ServeEvent::ImageBegin {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                width: Some(64),
+                height: Some(64),
+                steps: Some(4),
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 0,
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 1,
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 2,
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 3,
+                elapsed_us: 1,
+            }),
             Ok(ServeEvent::ImageDone {
                 candidate_id: CandidateId::PRIMARY,
                 image_id: "0".to_string(),
@@ -1322,6 +1398,7 @@ mod tests {
         assert_eq!(usage.completion_tokens, Some(3));
         assert_eq!(usage.image_count, Some(1));
         assert_eq!(usage.image_steps, Some(4));
+        assert_eq!(usage.image_steps_per_image, Some(vec![4]));
     }
 
     #[tokio::test]
@@ -1350,6 +1427,38 @@ mod tests {
                 candidate_id: CandidateId::PRIMARY,
                 index: 0,
                 delta: r#"{"id":1}"#.to_string(),
+            }),
+            Ok(ServeEvent::ImageBegin {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                width: Some(64),
+                height: Some(64),
+                steps: Some(4),
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 0,
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 1,
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 2,
+                elapsed_us: 1,
+            }),
+            Ok(ServeEvent::ImageStep {
+                candidate_id: CandidateId::PRIMARY,
+                image_id: "0".to_string(),
+                step: 3,
+                elapsed_us: 1,
             }),
             Ok(ServeEvent::ImageDone {
                 candidate_id: CandidateId::PRIMARY,
@@ -1423,6 +1532,7 @@ mod tests {
             .unwrap();
         assert_eq!(usage.image_count, Some(1));
         assert_eq!(usage.image_steps, Some(4));
+        assert_eq!(usage.image_steps_per_image, Some(vec![4]));
     }
 
     #[test]

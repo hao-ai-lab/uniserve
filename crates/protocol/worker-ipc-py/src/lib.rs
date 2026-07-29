@@ -9,33 +9,35 @@
 //! 1. The shared-memory wire boundary (iceoryx2), which carries flatbuffer
 //!    bytes. `Frame::decode_request` / `ServerEndpoint::respond` handle this
 //!    via the zero-copy-friendly flatbuffer codec in `worker-wire::flat`.
-//! 2. The Rust↔Python FFI boundary, crossed by a single `pythonize` on the
-//!    inbound path ([`PyServer::recv`] / [`PyServer::try_recv`]) and a single
-//!    `depythonize` on the outbound path ([`PyServer::respond`]).
+//! 2. The Rust↔Python FFI boundary, crossed once on the inbound path
+//!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
+//!    path ([`PyServer::respond`]).
 //!
-//! So per IPC round-trip the bridge does one reflective serde conversion *per
-//! direction* (not two on the same value): the inbound `pythonize` produces the
-//! `WorkerRequest` object the Python worker consumes, and the outbound
-//! `depythonize` consumes the `WorkerResponse` object the Python worker
-//! produces. Each is the minimum needed to materialize a serde-defined type on
-//! the far side of the FFI boundary.
-//!
-//! Eliminating the reflective `pythonize`/`depythonize` would require
-//! hand-written, per-variant `IntoPyObject`/`FromPyObject` impls on every
-//! `WorkerRequest`/`WorkerResponse` field (kept in lockstep with the wire
-//! schema) — a feature, not a behavior-preserving cleanup — so it is
-//! intentionally left as the reflective path here.
+//! The FFI conversion itself is split by frame heat. The steady-state serve
+//! loop exchanges one `execute` batch and one `result` completion report per
+//! step, and at decode batch sizes the reflective serde walk
+//! (`pythonize`/`depythonize`) dominates the boundary cost, so those two frame
+//! shapes take the hand-rolled converters in [`convert`]: interned dict keys
+//! and enum strings, preallocated lists, and direct scalar conversions that
+//! produce values deep-equal to the reflective ones (asserted by the equality
+//! tests in `convert`). Every other frame kind is rare (capabilities, admin,
+//! metrics, errors) and keeps the reflective path: requests that are not
+//! `execute` are pythonized, and any response outside the exact `result`
+//! contract falls back to `depythonize`, preserving reflective values and
+//! errors byte-for-byte.
+
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod convert;
 
 use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyModule};
+use pyo3::types::{PyAny, PyModule};
 use pythonize::{depythonize, pythonize};
 use uniserve_worker_ipc_core::ServerEndpoint;
-use uniserve_worker_wire::{WorkerRequest, WorkerResponse};
-
-const VALIDATED_ENVELOPE_KEY: &str = "_native_envelope_validated";
+use uniserve_worker_wire::{RequestKind, WorkerRequest, WorkerResponse};
 
 #[pyclass(name = "Server")]
 struct PyServer {
@@ -92,8 +94,15 @@ impl PyServer {
     }
 
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
-        let resp: WorkerResponse = depythonize(response)
-            .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?;
+        // Hot path: the per-step completion report, extracted without the
+        // reflective serde walk. Anything else (or any unexpected shape)
+        // falls back to `depythonize` for identical values and errors.
+        let resp: WorkerResponse = match convert::try_completion_response_from_py(response) {
+            Some(resp) => resp,
+            None => depythonize(response).map_err(|err| {
+                PyErr::new::<PyValueError, _>(format!("invalid response: {err}"))
+            })?,
+        };
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
             let result = endpoint.respond(&resp);
@@ -106,15 +115,14 @@ impl PyServer {
 }
 
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
+    // Hot path: `execute` batches take the hand-rolled converter, which
+    // produces an object deep-equal to `pythonize`'s. Rare request kinds keep
+    // the reflective conversion.
+    if request.kind == RequestKind::Execute {
+        return Ok(convert::execute_request_to_py(py, request)?.into_any().unbind());
+    }
     let object = pythonize(py, request)
         .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
-    if request.batch.is_some()
-        && let Ok(request_dict) = object.cast::<PyDict>()
-        && let Some(batch) = request_dict.get_item("batch")?
-        && let Ok(batch_dict) = batch.cast::<PyDict>()
-    {
-        batch_dict.set_item(VALIDATED_ENVELOPE_KEY, true)?;
-    }
     Ok(object.unbind())
 }
 

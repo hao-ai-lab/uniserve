@@ -257,8 +257,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     if points:
         lines.extend(
             [
-                "| Point | Group | Task | Load case | Success | Elapsed (s) | Output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Images/s | Mean image latency (ms) |",
-                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Point | Group | Task | Load case | Success | Elapsed (s) | Output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Images/s | Mean image latency (ms) | Mean transition latency (ms) | Text→image (ms) | Image→text (ms) |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for point in points:
@@ -270,6 +270,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             if isinstance(metrics.get("images"), dict):
                 image_metrics = metrics["images"]
             image_latency = image_metrics.get("image_latency_ms", {})
+            interleave = metrics.get("modality_interleave")
+            transition_timing = (
+                interleave.get("transition_timing") if isinstance(interleave, dict) else {}
+            )
+            transition_timing = transition_timing if isinstance(transition_timing, dict) else {}
+            transition_latency = transition_timing.get("transition_latency_ms", {})
+            text_to_image = transition_timing.get("text_to_image_transition_latency_ms", {})
+            image_to_text = transition_timing.get("image_to_text_transition_latency_ms", {})
             lines.append(
                 f"| {point.get('benchmark')} | {point.get('group')} | {point.get('task')} | "
                 f"{point.get('load_case')} | {point.get('ok_count', 0)}/{point.get('request_count', 0)} | "
@@ -277,7 +285,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{_number(text_metrics.get('mean_ttft_ms'))} | "
                 f"{_number(text_metrics.get('mean_tpot_ms'))} | "
                 f"{_number(image_metrics.get('images_per_second'))} | "
-                f"{_number(image_latency.get('mean') if isinstance(image_latency, dict) else None)} |"
+                f"{_number(image_latency.get('mean') if isinstance(image_latency, dict) else None)} | "
+                f"{_number(transition_latency.get('mean') if isinstance(transition_latency, dict) else None)} | "
+                f"{_number(text_to_image.get('mean') if isinstance(text_to_image, dict) else None)} | "
+                f"{_number(image_to_text.get('mean') if isinstance(image_to_text, dict) else None)} |"
             )
         lines.extend(["", "## Paired comparisons", ""])
     lines.extend(

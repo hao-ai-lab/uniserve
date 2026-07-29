@@ -4,14 +4,14 @@ import copy
 
 import torch
 
-from uniserve_worker.batch import Admission, SequenceAdmission
+from uniserve_worker.batch import Admission, RequestKey, UndAdmission
 from uniserve_worker.runtime.request_session import SampledTokenRelay, SessionStore
 
 
 def test_transaction_snapshot_shares_immutable_sampled_token_relay() -> None:
     sessions = SessionStore()
-    admission = Admission.create(7, sequence=SequenceAdmission())
-    session = sessions.admit(admission, epoch=3)
+    admission = Admission.create(RequestKey(0, 7, 3), und=UndAdmission())
+    session = sessions.admit(admission)
     relay = SampledTokenRelay(torch.tensor([19]))
     session.last_sampled_token = relay
 
@@ -23,8 +23,8 @@ def test_transaction_snapshot_shares_immutable_sampled_token_relay() -> None:
 
 def test_rollback_snapshot_shares_declarations_and_owns_mutable_handles() -> None:
     sessions = SessionStore()
-    admission = Admission.create(7, sequence=SequenceAdmission())
-    session = sessions.admit(admission, epoch=3)
+    admission = Admission.create(RequestKey(0, 7, 3), und=UndAdmission())
+    session = sessions.admit(admission)
     session.product_handles.update({11, 13})
 
     snapshot = session.rollback_snapshot()

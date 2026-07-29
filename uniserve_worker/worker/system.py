@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 
-from ..batch import Batch, ExecutionResult
-from ..capabilities import RequestKind, ResourceClass
+from ..batch import Batch, CompletionReport
+from ..capabilities import RequestKind, ResourceClass, work_variants_for_operation_types
 from ..execution import ModelExecutor
 from ..foundation.errors import unsupported_control
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
@@ -53,8 +53,8 @@ class SystemWorker:
             )
         declared = model_free_capabilities(
             block_size=int(block_size),
-            supported_operation_types=tuple(
-                value for value in OperationType if value in allowed_operation_types
+            supported_work=work_variants_for_operation_types(
+                tuple(value for value in OperationType if value in allowed_operation_types)
             ),
             supported_controls=controls,
             resource_classes=(ResourceClass.ENCODER_OUTPUT,),
@@ -77,7 +77,7 @@ class SystemWorker:
             mooncake_protocol=mooncake_protocol,
             cross_process=True,
         )
-        self.trace = ExecutionTrace(hashlib.sha256(b"uniserve-system-worker-v3").hexdigest())
+        self.trace = ExecutionTrace(hashlib.sha256(b"uniserve-system-worker").hexdigest())
         self.executor = ModelExecutor(
             spec=None,
             deployment=None,
@@ -107,7 +107,7 @@ class SystemWorker:
                 weight_digest="",
                 topology={
                     "rank": caps.rank.to_wire(),
-                    "operation_types": [value.value for value in caps.supported_operation_types],
+                    "supported_work": [value.value for value in caps.supported_work],
                     "block_size": caps.block_size,
                 },
                 device=device,
@@ -136,11 +136,11 @@ class SystemWorker:
     def contract(self) -> WorkerContract:
         return self._contract
 
-    def execute(self, batch: Batch) -> ExecutionResult:
+    def execute(self, batch: Batch) -> CompletionReport:
         result = self.executor.execute(batch)
         if self.snapshot_provider is not None:
             result = self.snapshot_provider.snapshot_execution(
-                {operation.session_id for operation in batch.operations},
+                {operation.request_key.session_id for operation in batch.operations},
                 result,
             )
         return result
@@ -219,7 +219,6 @@ class SystemWorker:
             }
         ]
 
-    def close(self) -> None:
         self.mover.close()
 
     def _release_records(self, records: tuple[ProductRecord, ...]) -> None:

@@ -13,8 +13,7 @@ use uniserve_core::{
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
     GenerationRuntimeCapabilities, ImageIngestRecipe, ImageKvEffect, ImageParams, ImageSegment,
-    OperationType, RequestId, SamplingParams, SegmentPlacement, TriggerPolicyDescriptor,
-    UndVisibility,
+    RequestId, SamplingParams, SegmentPlacement, TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent};
 use uniserve_executor::{ControlAck, ControlOp, Executor};
@@ -90,14 +89,11 @@ fn generation_request(
     let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
     let cache = Default::default();
     let capabilities = GenerationRuntimeCapabilities {
-        supported_operation_types: vec![
-            OperationType::SequenceExtend,
-            OperationType::SequenceDecode,
-            OperationType::EncodeVision,
-            OperationType::Flow,
-            OperationType::MaterializeImage,
-            OperationType::TransferKv,
-        ],
+        supports_understanding: true,
+        supports_vision_encode: true,
+        supports_latent_encode: false,
+        supports_image_generation: true,
+        supports_commit_writeback: true,
         max_latent_units: 1_024,
         latent_downsample: 16,
         max_vae_grid_tokens: 1_024,
@@ -254,11 +250,11 @@ fn text_and_image_requests_complete() {
 #[test]
 fn scheduler_submits_mixed_op_kind_batches() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult, OperationType};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
 
     struct Recording {
         inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Vec<OperationType>>>>,
+        batches: Arc<Mutex<Vec<Vec<WorkVariant>>>>,
     }
 
     impl Executor for Recording {
@@ -278,15 +274,15 @@ fn scheduler_submits_mixed_op_kind_batches() {
             self.batches.lock().unwrap().push(
                 b.operations
                     .iter()
-                    .map(|operation| operation.operation_type())
+                    .map(|operation| operation.work.variant())
                     .collect(),
             );
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -365,14 +361,13 @@ fn scheduler_submits_mixed_op_kind_batches() {
     let batches = batches.lock().unwrap();
     assert!(
         batches.iter().any(|kinds| {
-            kinds.contains(&OperationType::SequenceDecode) && kinds.contains(&OperationType::Flow)
+            kinds.contains(&WorkVariant::TokenDecode) && kinds.contains(&WorkVariant::GenFlow)
         }),
         "expected one batch mixing decode_und and denoise_gen, got {batches:?}",
     );
     assert!(
         batches.iter().any(|kinds| {
-            kinds.contains(&OperationType::SequenceDecode)
-                && kinds.contains(&OperationType::MaterializeImage)
+            kinds.contains(&WorkVariant::TokenDecode) && kinds.contains(&WorkVariant::Materialize)
         }),
         "expected one batch mixing decode_und and commit_gen, got {batches:?}",
     );
@@ -382,10 +377,10 @@ fn scheduler_submits_mixed_op_kind_batches() {
 fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
-        Batch, EngineCaps, ExecutionConstraints, ExecutionResult, OperationType,
+        Batch, CompletionReport, EngineCaps, ExecutionConstraints, WorkVariant,
     };
 
-    type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, OperationType)>>>>;
+    type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, WorkVariant)>>>>;
 
     struct Recording {
         inner: SimExecutor,
@@ -409,15 +404,15 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
             self.batches.lock().unwrap().push(
                 b.operations
                     .iter()
-                    .map(|operation| (operation.session_id, operation.operation_type()))
+                    .map(|operation| (operation.request_key.session_id, operation.work.variant()))
                     .collect(),
             );
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -488,7 +483,7 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
                 batch.len() == 2
                     && batch
                         .iter()
-                        .all(|(_, kind)| *kind == OperationType::SequenceDecode)
+                        .all(|(_, kind)| *kind == WorkVariant::TokenDecode)
             });
             if saw_decode_pressure {
                 break;
@@ -522,14 +517,13 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
         assert!(
             prefill_batch
                 .iter()
-                .any(|(id, kind)| *id == RequestId(3)
-                    && *kind == OperationType::SequenceExtend),
+                .any(|(id, kind)| *id == RequestId(3) && *kind == WorkVariant::TokenExtend),
             "the ready prompt should receive prefill service, got {prefill_batch:?}"
         );
         assert!(
             prefill_batch
                 .iter()
-                .all(|(_, kind)| *kind != OperationType::SequenceDecode),
+                .all(|(_, kind)| *kind != WorkVariant::TokenDecode),
             "prefill service should retain its own execution lane, got {prefill_batch:?}"
         );
     }
@@ -541,12 +535,12 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
 fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
-        Batch, EngineCaps, ExecutionConstraints, ExecutionResult, OperationType, ResourceClass,
+        Batch, CompletionReport, EngineCaps, ExecutionConstraints, ResourceClass, WorkVariant,
     };
 
     struct Recording {
         inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Vec<OperationType>>>>,
+        batches: Arc<Mutex<Vec<Vec<WorkVariant>>>>,
     }
 
     impl Executor for Recording {
@@ -566,15 +560,15 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
             self.batches.lock().unwrap().push(
                 b.operations
                     .iter()
-                    .map(|operation| operation.operation_type())
+                    .map(|operation| operation.work.variant())
                     .collect(),
             );
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -650,10 +644,126 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     assert!(
         batches.iter().all(|kinds| kinds
             .iter()
-            .filter(|kind| **kind == OperationType::Flow)
+            .filter(|kind| **kind == WorkVariant::GenFlow)
             .count()
             <= 1),
         "expected at most one denoise_gen per batch under one-image latent cap, got {batches:?}",
+    );
+}
+
+/// The flow phase runs exactly `image.steps` denoise quanta and then commits —
+/// never `image.steps + 1`. The worker signals no flow-completion, so
+/// termination is host-driven off the committed step count; this guards the
+/// off-by-one that planned a spurious extra denoise operation.
+#[test]
+fn flow_phase_plans_exactly_image_steps_then_commits() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
+
+    struct Recording {
+        inner: SimExecutor,
+        ops: Arc<Mutex<Vec<WorkVariant>>>,
+    }
+    impl Executor for Recording {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .extend(batch.operations.iter().map(|op| op.work.variant()));
+            self.inner.submit(batch)
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            self.inner.poll()
+        }
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.inner.next_result()
+        }
+        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(op)
+        }
+        fn control_wait(
+            &mut self,
+            op: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(op, targets)
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    const STEPS: u16 = 3;
+    let ops = Arc::new(Mutex::new(Vec::new()));
+    let exec = Recording {
+        inner: SimExecutor::new(Box::new(SimEngine::new())),
+        ops: ops.clone(),
+    };
+    let sched = Scheduler::new(Box::new(exec), ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut erx = handle
+        .submit(generation_request(
+            RequestId(1),
+            text_context(vec![4, 5, 6]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: STEPS,
+                ..Default::default()
+            },
+            GenerationConstraint::GenOnly,
+            0,
+        ))
+        .unwrap();
+
+    let mut finished = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !finished && Instant::now() < deadline {
+        while let Ok(event) = erx.try_recv() {
+            if matches!(event, GenEvent::Finished { .. }) {
+                finished = true;
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = jh.join();
+
+    assert!(
+        finished,
+        "gen-only image request never finished — the flow phase did not terminate"
+    );
+    let ops = ops.lock().unwrap();
+    let flow_count = ops
+        .iter()
+        .filter(|kind| **kind == WorkVariant::GenFlow)
+        .count();
+    assert_eq!(
+        flow_count, STEPS as usize,
+        "flow must plan exactly image.steps denoise quanta, got {ops:?}"
+    );
+    let last_flow = ops.iter().rposition(|kind| *kind == WorkVariant::GenFlow);
+    let commit = ops
+        .iter()
+        .position(|kind| *kind == WorkVariant::Materialize);
+    assert!(
+        commit.is_some(),
+        "the flow must be followed by a commit (materialize), got {ops:?}"
+    );
+    assert!(
+        last_flow < commit,
+        "the commit must follow the final flow quantum, got {ops:?}"
     );
 }
 
@@ -694,105 +804,14 @@ fn pipeline_depth_is_token_identical() {
 }
 
 #[test]
-fn ready_completion_refills_the_pipeline_before_resolving_the_next_batch() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult};
-
-    struct Recording {
-        inner: SimExecutor,
-        in_flight_before_submit: Arc<Mutex<Vec<usize>>>,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
-            self.inner.caps()
-        }
-
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            self.in_flight_before_submit
-                .lock()
-                .unwrap()
-                .push(self.inner.in_flight());
-            self.inner.submit(batch)
-        }
-
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
-            self.inner.poll()
-        }
-
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
-            self.inner.next_result()
-        }
-
-        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(operation)
-        }
-
-        fn control_wait(
-            &mut self,
-            operation: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(operation, targets)
-        }
-
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
-    sim.set_text_len(8);
-    let in_flight_before_submit = Arc::new(Mutex::new(Vec::new()));
-    let executor = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        in_flight_before_submit: in_flight_before_submit.clone(),
-    };
-    let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
-    let mut sampling = SamplingParams::default();
-    sampling.ignore_eos = true;
-    let _events = scheduler.submit_for_test(generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        sampling,
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        8,
-    ));
-
-    assert!(scheduler.step());
-    thread::sleep(Duration::from_millis(20));
-    assert!(scheduler.step());
-
-    let observed = in_flight_before_submit.lock().unwrap();
-    assert!(
-        observed.len() >= 3,
-        "expected initial fill plus one replacement, got {observed:?}"
-    );
-    assert_eq!(&observed[..3], &[0, 1, 1]);
-}
-
-#[test]
 fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, EngineCaps, ExecutionResult, Operation, SequenceInput, TokenSource,
-    };
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, Point, WorkVariant};
 
-    type OperationLog = Arc<Mutex<Vec<(OperationType, u64, TokenSource, usize)>>>;
+    // Per submitted operation: its work variant, its parent point (`Some(index)`
+    // for a host-observed fixed point, `None` for a device-rooted successor), and
+    // the executor's in-flight depth at submit time.
+    type OperationLog = Arc<Mutex<Vec<(WorkVariant, Option<u64>, usize)>>>;
 
     struct Recording {
         inner: SimExecutor,
@@ -815,28 +834,24 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
         fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
             let in_flight = self.inner.in_flight();
             for envelope in &batch.operations {
-                let source = match &envelope.operation {
-                    Operation::Sequence(sequence) => match &sequence.input {
-                        SequenceInput::Tokens(tokens) => tokens.source,
-                        SequenceInput::PublishedLogits(_) => TokenSource::Wire,
-                    },
-                    _ => TokenSource::Wire,
+                let parent_point = match &envelope.parent.point {
+                    Point::Fixed { point_index, .. } => Some(u64::from(*point_index)),
+                    Point::Device { .. } => None,
                 };
                 self.operations.lock().unwrap().push((
-                    envelope.operation_type(),
-                    envelope.base_version,
-                    source,
+                    envelope.work.variant(),
+                    parent_point,
                     in_flight,
                 ));
             }
             self.inner.submit(batch)
         }
 
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
             self.inner.poll()
         }
 
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
             self.inner.next_result()
         }
 
@@ -891,27 +906,30 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
         }
     }
 
+    // Serial oracle: pipelining the decode of an image-context request must not
+    // change its committed output or its natural end-of-sequence.
     assert_eq!(finish_reason, Some(FinishReason::Eos));
     assert_eq!(text_tokens, 8);
     let operations = operations.lock().unwrap();
     assert!(operations.len() >= 2);
+    // Once the context image is ingested the decode pipelines: at least one
+    // operation roots on a device-selected point (recorded as `None`) issued
+    // while its predecessor is still in flight.
     assert!(
         operations
             .iter()
-            .filter(|(kind, _, _, _)| *kind == OperationType::SequenceDecode)
-            .all(|(_, _, source, _)| *source == TokenSource::LastSampled),
-        "eligible decode should retain the worker-local relay across host commits"
+            .any(|(kind, parent, _)| *kind == WorkVariant::TokenDecode && parent.is_none()),
+        "image-context decode pipelines via a device-rooted successor"
     );
-    assert!(
-        operations
-            .iter()
-            .any(|(kind, _, source, in_flight)| *kind == OperationType::SequenceDecode
-                && *source == TokenSource::LastSampled
-                && *in_flight > 0),
-        "image-context decode should project a worker-local successor"
-    );
+    // Host-observed (fixed-rooted) operations still form a continuous lineage: a
+    // state-advancing predecessor commits a fresh point the next fixed-rooted
+    // operation reads, while the non-advancing context encode leaves it intact.
+    // Device-rooted successors advance the point between two fixed points, so the
+    // invariant is checked only across operations that are both fixed-rooted.
     for pair in operations.windows(2) {
-        assert_eq!(pair[1].1, pair[0].1 + 1);
+        if let (Some(previous), Some(next)) = (pair[0].1, pair[1].1) {
+            assert_eq!(next, previous + u64::from(pair[0].0.advances_state()));
+        }
     }
 }
 
@@ -2011,22 +2029,25 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     assert_eq!(finished, None);
 }
 
+/// A Gen-only request whose behavior finishes after its first generated-image
+/// commit stops there: the commit terminates the lineage rather than spending
+/// the remaining image budget on hidden images or the understanding budget on
+/// text filler. Internal Und decode discovers the biased trigger, Gen opens,
+/// one image commits, and `finish_after_gen_commit` closes the request.
 #[test]
 fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let control = ControlTokens { ..ctrl() };
-    sim.set_commit_token(Some(control.eos[0]));
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let sched = Scheduler::new(executor, control, 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let req = with_trigger(
+    let mut req = with_trigger(
         generation_request(
             RequestId(1),
-            text_context(vec![1, 2, 3, 2222]),
+            text_context(vec![1, 2, 3]),
             SamplingParams {
                 logit_bias: vec![(2222, 1000.0)],
                 ..Default::default()
@@ -2036,11 +2057,14 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
                 max_images: 3,
                 ..Default::default()
             },
-            GenerationConstraint::Default,
+            GenerationConstraint::GenOnly,
             40,
         ),
         TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
+    req.policy.gen_only_start = uniserve_core::GenOnlyStartPolicyDescriptor::DiscoverTrigger;
+    req.behavior = GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
+    assert!(req.behavior.finish_after_gen_commit);
     let mut erx = handle.submit(req).unwrap();
 
     let mut text = 0usize;
@@ -2059,12 +2083,15 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     handle.shutdown();
     let _ = jh.join();
 
-    assert_eq!(finished, Some(FinishReason::Eos));
+    assert_eq!(finished, Some(FinishReason::ImageDone));
     assert_eq!(
         images, 1,
-        "commit-side EOS should finish instead of starting hidden images"
+        "the gen commit should finish instead of spending the remaining image budget"
     );
-    assert_eq!(text, 0, "commit-side EOS should not emit text filler");
+    assert_eq!(
+        text, 0,
+        "the gen commit should not emit hidden Und text filler"
+    );
 }
 
 /// the async Executor seam fronts a MultiWorkerExecutor (2 ranks) with no
@@ -2139,13 +2166,13 @@ fn fcfs_policy_completes_text() {
 #[test]
 fn admissions_are_reissued_after_preemption() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
 
     #[derive(Default, Clone)]
     struct Log {
         admissions: Vec<RequestId>,
         drops: Vec<RequestId>,
-        blocks_per_op: Vec<(RequestId, usize)>,
+        blocks_per_op: Vec<(RequestId, WorkVariant, usize)>,
     }
 
     struct Recording {
@@ -2165,33 +2192,26 @@ fn admissions_are_reissued_after_preemption() {
         fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
             let mut log = self.log.lock().unwrap();
             for admission in &b.admissions {
-                log.admissions.push(admission.session_id);
+                log.admissions.push(admission.request_key.session_id);
             }
             for operation in &b.operations {
-                let block_count = match &operation.operation {
-                    uniserve_worker_wire::Operation::Sequence(sequence) => {
-                        sequence.lease.new_blocks.len()
-                    }
-                    uniserve_worker_wire::Operation::Encode(encode) => {
-                        encode.lease.new_blocks.len()
-                    }
-                    uniserve_worker_wire::Operation::Materialize(materialize) => {
-                        materialize.lease.new_blocks.len()
-                    }
-                    uniserve_worker_wire::Operation::Transfer(transfer) => {
-                        transfer.lease.new_blocks.len()
-                    }
-                    uniserve_worker_wire::Operation::Flow(_) => 0,
-                };
-                log.blocks_per_op.push((operation.session_id, block_count));
+                // The planner sizes an operation's incremental KV growth into its
+                // page bound. A per-step decode successor stays within the admitted
+                // allocation and grows by zero pages.
+                let block_count = operation.bounds.max_kv_pages as usize;
+                log.blocks_per_op.push((
+                    operation.request_key.session_id,
+                    operation.work.variant(),
+                    block_count,
+                ));
             }
             drop(log);
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -2273,17 +2293,22 @@ fn admissions_are_reissued_after_preemption() {
         "preemption must drop the worker record"
     );
 
-    // Per-step sequence operations carry no new blocks while the request stays
-    // within its admitted allocation.
-    let deltas_1: Vec<usize> = log
+    // Per-step decode successors carry no new blocks while the request stays
+    // within its admitted allocation; only a (re)admitting prefill claims the
+    // incremental pages its recomputed prompt needs.
+    let decode_deltas_1: Vec<usize> = log
         .blocks_per_op
         .iter()
-        .filter(|(r, _)| r.0 == 1)
-        .map(|(_, n)| *n)
+        .filter(|(r, kind, _)| r.0 == 1 && *kind == WorkVariant::TokenDecode)
+        .map(|(_, _, n)| *n)
         .collect();
     assert!(
-        deltas_1.iter().all(|&n| n == 0),
-        "per-op block deltas must be empty within the initial allocation: {deltas_1:?}"
+        !decode_deltas_1.is_empty(),
+        "request 1 must run per-step decode operations"
+    );
+    assert!(
+        decode_deltas_1.iter().all(|&n| n == 0),
+        "per-step decode block deltas must be empty within the admitted allocation: {decode_deltas_1:?}"
     );
 }
 
@@ -2292,7 +2317,7 @@ fn admissions_are_reissued_after_preemption() {
 #[test]
 fn sequence_admission_carries_the_prefix_reuse_boundary() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps};
 
     #[derive(Default)]
     struct Log {
@@ -2316,18 +2341,18 @@ fn sequence_admission_carries_the_prefix_reuse_boundary() {
         fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
             let mut log = self.log.lock().unwrap();
             for admission in &b.admissions {
-                if let Some(sequence) = &admission.sequence {
+                if let Some(und) = &admission.und {
                     log.registrations
-                        .push((admission.session_id, sequence.kv.prefix_len));
+                        .push((admission.request_key.session_id, und.kv.prefix_len));
                 }
             }
             drop(log);
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -2880,8 +2905,8 @@ fn policy_facts_and_decisions_are_recorded() {
 
     // Latency history populated for the op kinds that ran.
     assert!(
-        sched.op_latency_us("sequence_decode").is_some()
-            || sched.op_latency_us("sequence_extend").is_some(),
+        sched.op_latency_us("token_decode").is_some()
+            || sched.op_latency_us("token_extend").is_some(),
         "per-op latency history must be observed"
     );
 
@@ -2936,7 +2961,7 @@ fn lifecycle_trace_and_health_snapshot() {
     assert_eq!(h.resource_invariant_violations, 0);
     assert!(!h.fatal);
     assert!(h.completed_traces >= 1);
-    assert!(!h.supported_operation_types.is_empty());
+    assert!(!h.supported_work.is_empty());
 
     let traces = sched.take_completed_traces();
     assert_eq!(traces.len(), 1);

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from uniserve_eval.harness.comparison import compare_pair, summarize_runs
+from uniserve_eval.harness.comparison import compare_pair, render_markdown, summarize_runs
 
 pytestmark = pytest.mark.unit
 
@@ -229,6 +229,52 @@ def test_run_summary_keeps_each_ratio_and_reports_geometric_mean() -> None:
             "geometric_mean": pytest.approx(1.1),
         }
     ]
+
+
+def test_point_report_exposes_all_interleave_latency_means() -> None:
+    report = {
+        "points": [
+            {
+                "benchmark": "ueval",
+                "group": "sensenova",
+                "task": "interleave",
+                "load_case": "c4",
+                "request_count": 32,
+                "ok_count": 32,
+                "elapsed_s": 120.0,
+                "metrics": {
+                    "output_throughput": 10.0,
+                    "mean_ttft_ms": 20.0,
+                    "mean_tpot_ms": 30.0,
+                    "images": {
+                        "images_per_second": 0.25,
+                        "image_latency_ms": {"mean": 400.0},
+                    },
+                    "modality_interleave": {
+                        "transition_timing": {
+                            "transition_latency_ms": {"mean": 500.0},
+                            "text_to_image_transition_latency_ms": {"mean": 600.0},
+                            "image_to_text_transition_latency_ms": {"mean": 700.0},
+                        }
+                    },
+                },
+            }
+        ],
+        "comparisons": [],
+    }
+
+    markdown = render_markdown(report)
+
+    assert "Mean TTFT (ms)" in markdown
+    assert "Mean TPOT (ms)" in markdown
+    assert "Mean image latency (ms)" in markdown
+    assert "Mean transition latency (ms)" in markdown
+    assert "Text→image (ms)" in markdown
+    assert "Image→text (ms)" in markdown
+    assert (
+        "| ueval | sensenova | interleave | c4 | 32/32 | 120 | 10 | 20 | 30 | 0.25 | 400 | 500 | 600 | 700 |"
+        in markdown
+    )
 
 
 def _image_point(

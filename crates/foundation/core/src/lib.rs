@@ -7,20 +7,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub mod generation;
+pub mod product_blob;
 pub mod program;
 pub mod program_cursor;
 pub mod sampling;
 pub mod semantic;
 pub use generation::{
-    CommitRecipe, ContextSegment, EncodeKind, FeedbackNextToken, FeedbackWriteback,
+    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
     GenOnlyStartPolicyDescriptor, GeneratedImageCommitCapabilities, GeneratedImageFeedbackRecipe,
-    GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor, GenerationConstraint,
-    GenerationConstraintParseError, GenerationPolicyDescriptor, GenerationRequest,
-    GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
+    GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor, GenerationCapabilityNeeds,
+    GenerationConstraint, GenerationConstraintParseError, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
     GenerationRuntimeCapabilities, GrammarSpec, ImageIngestRecipe, ImageIngestStep, ImageKvEffect,
-    ImageSegment, MaterializeKind, OperationKind, OperationType, SegmentPlacement, SequenceMode,
-    TerminationPolicyDescriptor, TransferKind, TriggerPolicyDescriptor, UndTokenAction,
-    UndVisibility, VisibilityPolicyDescriptor, denoise_scratch_tokens, encoder_cache_key,
+    ImageSegment, SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor,
+    UndTokenAction, UndVisibility, VisibilityPolicyDescriptor, denoise_scratch_tokens,
+    encoder_cache_key,
 };
 pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs};
 

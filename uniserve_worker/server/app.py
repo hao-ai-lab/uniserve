@@ -7,8 +7,9 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from ..batch import Batch, ExecutionResult
-from ..capabilities import RequestKind, ResponseKind
+from ..batch import Batch, CompletionReport
+from ..capabilities import RequestKind, ResponseKind, work_operation_type
+from ..execution.executor import completion_report_ready, finalize_completion_report
 from ..foundation.env import env_int
 from ..foundation.errors import (
     WorkerError,
@@ -33,7 +34,7 @@ def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
         "kind": kind.value,
         "call_id": None,
         "capabilities": None,
-        "result": None,
+        "completion_report": None,
         "metrics": None,
         "pressure": None,
         "message": None,
@@ -136,66 +137,49 @@ def _request_kind(request: Mapping[str, Any]) -> RequestKind:
 def _execute(worker: Worker, request: Mapping[str, Any], metrics: MetricsService) -> dict[str, Any]:
     raw_batch = _required(request, "batch", RequestKind.EXECUTE)
     batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_wire(raw_batch)
-    supported = frozenset(worker.contract.capabilities.supported_operation_types)
+    supported = frozenset(worker.contract.capabilities.supported_work)
     unsupported = tuple(
-        operation.operation_type
+        operation.work.variant
         for operation in batch.operations
-        if operation.operation_type not in supported
+        if operation.work.variant not in supported
     )
     if unsupported:
         names = sorted({value.value for value in unsupported})
         raise invalid_descriptor(
-            f"execution batch contains operation types outside worker capabilities: {names!r}"
+            f"execution batch contains work variants outside worker capabilities: {names!r}"
         )
     started = metrics.now_ns()
     result = worker.execute(batch)
     duration = metrics.now_ns() - started
-    result.validate_for(batch)
-    operation_types = [value.operation_type.value for value in batch.operations]
+    operation_types = [work_operation_type(value.work).value for value in batch.operations]
     metrics.record_execute(duration, operation_types)
-    metrics.record_forward_stats(result.forward_stats)
-    return _response(
-        ResponseKind.RESULT,
-        result=result if _result_has_deferred_tokens(result) else result.to_wire(),
-    )
-
-
-def _result_deferred_tokens(result: ExecutionResult) -> tuple[object, ...]:
-    tokens: list[object] = []
-    for operation in result.operations:
-        delta = operation.delta
-        effect = getattr(delta, "effect", None)
-        if effect is None:
-            effect = getattr(delta, "sequence", None)
-        if effect is not None:
-            tokens.extend(
-                token
-                for token in effect.sampled_token_ids
-                if callable(getattr(token, "finalize", None))
-            )
-    return tuple(tokens)
-
-
-def _result_has_deferred_tokens(result: ExecutionResult) -> bool:
-    return bool(_result_deferred_tokens(result))
+    # Carry the report object (not its wire form) so its deferred sampled token
+    # and semantic digest are materialized only when the response is serialized
+    # in respond(); by then the next batch's forward has launched and the
+    # asynchronous token copy has completed, so the read never stalls.
+    return _response(ResponseKind.RESULT, completion_report=result)
 
 
 def _response_ready(response: Mapping[str, Any]) -> bool:
-    result = response.get("result")
-    if not isinstance(result, ExecutionResult):
-        return True
-    return all(
-        bool(ready())
-        for token in _result_deferred_tokens(result)
-        if callable(ready := getattr(token, "ready", None))
-    )
+    """Whether a response can be serialized without stalling on a deferred token.
+
+    A completion report defers its sampled token off the device to overlap the
+    copy with the next batch's forward. Its committed tokens and semantic digest
+    are read only here, once the copy has landed; a response polled before that
+    stays pending (not-ready) rather than blocking the transport thread.
+    """
+
+    result = response.get("completion_report")
+    if isinstance(result, CompletionReport):
+        return completion_report_ready(result)
+    return True
 
 
 def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
     finalized = dict(response)
-    result = finalized.get("result")
-    if isinstance(result, ExecutionResult):
-        finalized["result"] = result.to_wire()
+    result = finalized.get("completion_report")
+    if isinstance(result, CompletionReport):
+        finalized["completion_report"] = finalize_completion_report(result).to_wire()
     return finalized
 
 
@@ -237,7 +221,7 @@ def dispatch(
     request: Mapping[str, Any],
     metrics: MetricsService | None = None,
 ) -> dict[str, Any]:
-    """Dispatch one validated protocol-v3 request without performing transport I/O."""
+    """Dispatch one validated worker-protocol request without performing transport I/O."""
 
     service = metrics or MetricsService()
     kind = _request_kind(request)

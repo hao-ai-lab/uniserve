@@ -7,7 +7,7 @@ from dataclasses import replace
 
 from torch import nn
 
-from ..batch import Batch, ExecutionResult
+from ..batch import Batch, CompletionReport
 from ..capabilities import RequestKind
 from ..execution import ModelExecutor, ModelRunner
 from ..forward import AttentionSelection
@@ -148,9 +148,7 @@ class ModelWorker:
             tokenizer=tokenizer,
             model_spec_digest=self.model_spec_digest,
             weight_digest=self.weight_digest,
-            allowed_operation_types=frozenset(
-                self._contract.capabilities.supported_operation_types
-            ),
+            allowed_operation_types=frozenset(self._contract.effective_operation_types),
             trace=self.trace,
             pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
@@ -215,11 +213,11 @@ class ModelWorker:
         )
         return min(blocks, int(pool.leasable_num_blocks))
 
-    def execute(self, batch: Batch) -> ExecutionResult:
+    def execute(self, batch: Batch) -> CompletionReport:
         result = self.executor.execute(batch)
         if self.snapshot_provider is not None:
             result = self.snapshot_provider.snapshot_execution(
-                {operation.session_id for operation in batch.operations},
+                {operation.request_key.session_id for operation in batch.operations},
                 result,
             )
         return result
@@ -228,12 +226,10 @@ class ModelWorker:
         """Pay first-use kernel JIT before the worker is reachable.
 
         The ``fa4_cute`` attention backend JIT-compiles its CUTLASS kernels the
-        first time each variant runs (prefill/varlen, paged decode, and the
-        flow packed path), costing tens of seconds on the first real request.
-        Running one representative prefill + decode (and, for image models, one
-        flow step) through the real execution path here moves that compilation
-        ahead of readiness, so the first served request is warm. Every failure
-        is swallowed: a warmup problem must never block serving.
+        first time each variant runs, costing tens of seconds on the first real
+        request. Warmup runs representative operations through the real
+        execution path to move that compilation ahead of readiness. Every
+        failure is swallowed: a warmup problem must never block serving.
         """
 
         import torch
@@ -249,23 +245,55 @@ class ModelWorker:
         except Exception:  # noqa: BLE001 - warmup must never block serving.
             logger.warning("flow warmup failed; first flow step stays cold", exc_info=True)
 
+    def _warmup_image_geometry(self) -> tuple[int, int]:
+        """Largest square image whose latent grid fits the declared capacity."""
+
+        import math
+
+        caps = self._contract.capabilities
+        downsample = max(1, int(caps.latent_downsample))
+        capacity = int(caps.max_latent_size)
+        if int(caps.max_vae_grid_tokens) > 0:
+            capacity = min(capacity, int(caps.max_vae_grid_tokens))
+        side = max(1, math.isqrt(max(1, capacity)))
+        return side * downsample, side * downsample
+
     def _warmup_sequence(self) -> None:
+        """Warm the real token forward paths and capture the configured graphs.
+
+        One prompt extend across the largest configured decode batch pays the
+        first-use kernel JIT; the paged-prefill CUDA graph is captured for
+        every configured token bucket; the decode CUDA graph is captured for
+        every configured batch size (two rounds each: capture, then replay).
+        """
+
+        import torch
+
         from ..batch import (
             Admission,
             Batch,
+            Bounds,
+            Domain,
+            DType,
+            FixedPoint,
             KvAllocation,
-            KvLeaseDelta,
-            OperationEnvelope,
+            Operation,
+            PointRange,
+            ProductKind,
+            ProductPayload,
+            ProductRef,
+            RequestKey,
             SamplingParams,
-            SequenceAdmission,
-            SequenceMode,
-            SequenceOperation,
-            TokenInput,
-            TokenPolicy,
-            TokenSource,
+            ShapeBound,
+            StorageClass,
+            TokenMode,
+            UndAdmission,
+            VersionRef,
+            Work,
+            encode_token_product_bytes,
         )
 
-        types = self._contract.capabilities.supported_operation_types
+        types = self._contract.capabilities.operation_types
         if OperationType.SEQUENCE_EXTEND not in types:
             return
         pool = self.kv.pool
@@ -299,110 +327,137 @@ class ModelWorker:
         if not batch_sizes:
             return
         session_ids = tuple(range(1, max(batch_sizes) + 1))
-        admissions = tuple(
-            Admission.create(
-                session_id,
-                sequence=SequenceAdmission(
+        keys = {sid: RequestKey(0, sid, 1) for sid in session_ids}
+        admissions = {
+            sid: Admission.create(
+                keys[sid],
+                und=UndAdmission(
                     sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                    kv=KvAllocation(block_ids=(block_id,), prefix_len=0, group_id=0),
+                    kv=KvAllocation(block_ids=(block_id,)),
                 ),
             )
-            for block_id, session_id in enumerate(session_ids)
-        )
-        by_session = {admission.session_id: admission for admission in admissions}
-        extend = SequenceOperation(
-            SequenceMode.EXTEND,
-            KvLeaseDelta(),
-            (0, 1),
-            TokenPolicy(),
-            TokenInput((0,)),
-        )
-        step_id = 1
-        versions = {session_id: 0 for session_id in session_ids}
+            for block_id, sid in enumerate(session_ids)
+        }
+        token_refs = {
+            sid: ProductRef(
+                request_key=keys[sid],
+                producer_op_id=0,
+                output_index=0,
+                generation=0,
+                kind=ProductKind.TOKEN,
+                storage_class=StorageClass.HOST_STAGING,
+                dtype=DType.U32,
+                shape_bound=ShapeBound(),
+                point_range=PointRange(),
+            )
+            for sid in session_ids
+        }
+
+        def token_op(
+            sid: int,
+            op_id: int,
+            parent: VersionRef,
+            mode: TokenMode,
+            tokens: tuple[int, ...],
+        ) -> tuple[Operation, ProductPayload]:
+            operation = Operation.registered(
+                request_key=keys[sid],
+                op_id=op_id,
+                parent=parent,
+                work=Work.token(mode),
+                route=0,
+                domain=Domain.UND,
+                bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
+                inputs=(token_refs[sid],),
+            )
+            return operation, ProductPayload(
+                product=token_refs[sid], payload=encode_token_product_bytes(tokens)
+            )
+
+        step_id = 0
+        op_ids = {sid: 0 for sid in session_ids}
         try:
+            operations = []
+            payloads = []
+            for sid in session_ids:
+                root = VersionRef(keys[sid], 0, FixedPoint(0, admissions[sid].digest))
+                op_ids[sid] += 1
+                operation, payload = token_op(
+                    sid, op_ids[sid], root, TokenMode.EXTEND, (0,)
+                )
+                operations.append(operation)
+                payloads.append(payload)
+            step_id += 1
             self.executor.execute(
                 Batch(
-                    step_id,
-                    admissions,
-                    (),
-                    tuple(
-                        OperationEnvelope.create(
-                            session_id=session_id,
-                            epoch=1,
-                            op_id=1,
-                            base_version=0,
-                            admission_digest=by_session[session_id].digest,
-                            model_spec_digest=self.model_spec_digest,
-                            weight_digest=self.weight_digest,
-                            operation=extend,
-                        )
-                        for session_id in session_ids
-                    ),
+                    step_id=step_id,
+                    admissions=tuple(admissions[sid] for sid in session_ids),
+                    operations=tuple(operations),
+                    input_products=tuple(payloads),
                 )
             )
-            for session_id in session_ids:
-                versions[session_id] = 1
             if OperationType.SEQUENCE_DECODE not in types:
                 return
-            repeats = 2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
-            decode = SequenceOperation(
-                SequenceMode.DECODE,
-                KvLeaseDelta(),
-                (1, 2),
-                TokenPolicy(),
-                TokenInput((0,), source=TokenSource.LAST_SAMPLED),
+            repeats = (
+                2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
             )
             for batch_size in batch_sizes:
                 selected = session_ids[:batch_size]
                 for _ in range(repeats):
-                    step_id += 1
                     operations = []
-                    for session_id in selected:
-                        version = versions[session_id]
-                        position = version
-                        operations.append(
-                            OperationEnvelope.create(
-                                session_id=session_id,
-                                epoch=1,
-                                op_id=version + 1,
-                                base_version=version,
-                                admission_digest=by_session[session_id].digest,
-                                model_spec_digest=self.model_spec_digest,
-                                weight_digest=self.weight_digest,
-                                operation=replace(
-                                    decode,
-                                    position=(position, position + 1),
-                                ),
-                            )
+                    payloads = []
+                    for sid in selected:
+                        parent = self.sessions.get(sid).committed_version()
+                        op_ids[sid] += 1
+                        operation, payload = token_op(
+                            sid, op_ids[sid], parent, TokenMode.DECODE, (0,)
                         )
-                    self.executor.execute(Batch(step_id, (), (), tuple(operations)))
-                    for session_id in selected:
-                        versions[session_id] += 1
+                        operations.append(operation)
+                        payloads.append(payload)
+                    step_id += 1
+                    self.executor.execute(
+                        Batch(
+                            step_id=step_id,
+                            admissions=(),
+                            operations=tuple(operations),
+                            input_products=tuple(payloads),
+                        )
+                    )
         finally:
-            import torch
-
             device = torch.device(self.deployment.device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-            for session_id in session_ids:
-                if self.sessions.peek(session_id) is not None:
-                    self.drop_session(session_id)
+            for sid in session_ids:
+                if self.sessions.peek(sid) is not None:
+                    self.drop_session(sid)
 
     def _warmup_prefill_graphs(self) -> None:
+        """Capture the paged-prefill CUDA graph for every configured token bucket."""
+
         import torch
 
         from ..batch import (
             Admission,
             Batch,
+            Bounds,
+            Domain,
+            DType,
+            FixedPoint,
             KvAllocation,
-            KvLeaseDelta,
-            OperationEnvelope,
+            Operation,
+            PointRange,
+            ProductKind,
+            ProductPayload,
+            ProductRef,
+            RequestKey,
             SamplingParams,
-            SequenceAdmission,
-            SequenceMode,
-            SequenceOperation,
-            TokenInput,
-            TokenPolicy,
+            ShapeBound,
+            StorageClass,
+            TokenMode,
+            UndAdmission,
+            VersionRef,
+            Work,
+            encode_token_product_bytes,
         )
 
         pool = self.kv.pool
@@ -433,48 +488,57 @@ class ModelWorker:
         if not token_buckets:
             return
         logger.info("warming %d paged-prefill CUDA graph token buckets", len(token_buckets))
-        session_id = 1
-        step_id = 0
         device = torch.device(self.deployment.device)
+        session_id = 0
+        step_id = 0
         for token_count in token_buckets:
             block_count = (token_count + int(pool.block_size) - 1) // int(pool.block_size)
-            allocation = KvAllocation(
-                block_ids=tuple(range(block_count)),
-                prefix_len=0,
-                group_id=0,
-            )
-            operation = SequenceOperation(
-                SequenceMode.EXTEND,
-                KvLeaseDelta(),
-                (0, token_count),
-                TokenPolicy(),
-                TokenInput((0,) * token_count),
-            )
+            tokens = (0,) * token_count
+            # Two rounds per bucket: the first captures the graph, the second
+            # replays it. Every round uses a fresh session and operation id so
+            # no replay or session state carries between rounds.
             for _ in range(2):
+                session_id += 1
+                step_id += 1
+                rk = RequestKey(0, session_id, 1)
                 admission = Admission.create(
-                    session_id,
-                    sequence=SequenceAdmission(
+                    rk,
+                    und=UndAdmission(
                         sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                        kv=allocation,
+                        kv=KvAllocation(block_ids=tuple(range(block_count))),
                     ),
                 )
-                step_id += 1
+                token_ref = ProductRef(
+                    request_key=rk,
+                    producer_op_id=0,
+                    output_index=0,
+                    generation=0,
+                    kind=ProductKind.TOKEN,
+                    storage_class=StorageClass.HOST_STAGING,
+                    dtype=DType.U32,
+                    shape_bound=ShapeBound(),
+                    point_range=PointRange(),
+                )
+                operation = Operation.registered(
+                    request_key=rk,
+                    op_id=1,
+                    parent=VersionRef(rk, 0, FixedPoint(0, admission.digest)),
+                    work=Work.token(TokenMode.EXTEND),
+                    route=0,
+                    domain=Domain.UND,
+                    bounds=Bounds(max_points=1, max_tokens=token_count),
+                    inputs=(token_ref,),
+                )
                 try:
                     self.executor.execute(
                         Batch(
-                            step_id,
-                            (admission,),
-                            (),
-                            (
-                                OperationEnvelope.create(
-                                    session_id=session_id,
-                                    epoch=1,
-                                    op_id=1,
-                                    base_version=0,
-                                    admission_digest=admission.digest,
-                                    model_spec_digest=self.model_spec_digest,
-                                    weight_digest=self.weight_digest,
-                                    operation=operation,
+                            step_id=step_id,
+                            admissions=(admission,),
+                            operations=(operation,),
+                            input_products=(
+                                ProductPayload(
+                                    product=token_ref,
+                                    payload=encode_token_product_bytes(tokens),
                                 ),
                             ),
                         )
@@ -485,78 +549,56 @@ class ModelWorker:
                     if self.sessions.peek(session_id) is not None:
                         self.drop_session(session_id)
 
-    def _warmup_image_geometry(self) -> tuple[int, int]:
-        """Largest square image whose latent grid fits the declared capacity.
-
-        Warmup exercises the real denoise path, so its geometry has to obey the
-        same latent limits a served request does. Deriving it from the resolved
-        capabilities keeps one warmup valid for every image model.
-        """
-
-        import math
-
-        caps = self._contract.capabilities
-        downsample = max(1, int(caps.latent_downsample))
-        capacity = int(caps.max_latent_size)
-        if int(caps.max_vae_grid_tokens) > 0:
-            capacity = min(capacity, int(caps.max_vae_grid_tokens))
-        side = max(1, math.isqrt(max(1, capacity)))
-        return side * downsample, side * downsample
-
     def _warmup_flow(self) -> None:
+        """Drive one denoise quantum through the real flow forward path."""
+
         from ..batch import (
             Admission,
             Batch,
-            FlowAdmission,
-            FlowOperation,
-            Guidance,
+            Bounds,
+            Domain,
+            FixedPoint,
+            GenAdmission,
             ImageParams,
-            OperationEnvelope,
+            Operation,
+            RequestKey,
+            VersionRef,
+            Work,
         )
 
         if (
-            OperationType.FLOW not in self._contract.capabilities.supported_operation_types
+            OperationType.FLOW not in self._contract.capabilities.operation_types
             or self.model_spec.flow is None
         ):
             return
+        if self.sessions.session_ids():
+            return
         session_id = 2
+        rk = RequestKey(0, session_id, 1)
         height, width = self._warmup_image_geometry()
         admission = Admission.create(
-            session_id,
-            flow=FlowAdmission(ImageParams(steps=50, height=height, width=width, seed=0)),
-        )
-        flow = FlowOperation(
-            latent_handle=1,
-            position=0,
-            start_step=0,
-            step_count=1,
-            conditioning_position=0,
-            conditioning=None,
-            guidance=Guidance(
-                int(self.model_spec.flow.max_cfg_branches), 4.0, 1.0, "global", 0.0, (0.0, 1.0)
+            rk,
+            gen_admission=GenAdmission(
+                image=ImageParams(steps=1, height=height, width=width, seed=0)
             ),
-            image_prompt="",
         )
-        self.execute(
-            Batch(
-                3,
-                (admission,),
-                (),
-                (
-                    OperationEnvelope.create(
-                        session_id=session_id,
-                        epoch=1,
-                        op_id=1,
-                        base_version=0,
-                        admission_digest=admission.digest,
-                        model_spec_digest=self.model_spec_digest,
-                        weight_digest=self.weight_digest,
-                        operation=flow,
-                    ),
-                ),
+        try:
+            root = VersionRef(rk, 0, FixedPoint(0, admission.digest))
+            flow = Operation.registered(
+                request_key=rk,
+                op_id=1,
+                parent=root,
+                work=Work("gen", "flow"),
+                route=0,
+                domain=Domain.GEN,
+                bounds=Bounds(max_points=1),
             )
-        )
-        self.drop_session(session_id)
+            self.executor.execute(
+                Batch(step_id=3, admissions=(admission,), operations=(flow,), input_products=())
+            )
+        finally:
+            if self.sessions.peek(session_id) is not None:
+                self.drop_session(session_id)
 
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
@@ -652,7 +694,6 @@ class ModelWorker:
             for value in caps.resource_classes
         ]
 
-    def close(self) -> None:
         self.graphs.close()
         self.mover.close()
 

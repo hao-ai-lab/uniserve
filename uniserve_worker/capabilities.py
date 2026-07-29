@@ -7,8 +7,103 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from .foundation.errors import invalid_descriptor
+from .batch import (
+    AdapterMode as _WireAdapterMode,
+)
+from .batch import (
+    Work,
+    WorkVariant,
+    protocol_layout_digest,
+    route_capability_digest,
+)
+from .foundation.errors import capability_mismatch, invalid_descriptor
 from .spec import OperationType
+
+_WORK_OPERATION_TYPES: dict[tuple[str, str | None], OperationType] = {
+    ("token", "extend"): OperationType.SEQUENCE_EXTEND,
+    ("token", "decode"): OperationType.SEQUENCE_DECODE,
+    ("token", "verify"): OperationType.SEQUENCE_VERIFY,
+    ("encode", "vision"): OperationType.ENCODE_VISION,
+    ("encode", "latent"): OperationType.ENCODE_LATENT,
+    ("transfer", "product"): OperationType.TRANSFER_PRODUCT,
+    ("transfer", "kv_publish"): OperationType.TRANSFER_KV,
+    ("transfer", "kv_install"): OperationType.TRANSFER_KV,
+    ("gen", "transition"): OperationType.FLOW,
+    ("gen", "flow"): OperationType.FLOW,
+    ("materialize", None): OperationType.MATERIALIZE_IMAGE,
+}
+
+
+def work_operation_type(work: Work) -> OperationType:
+    """Map one closed ``Work`` leaf onto the route's internal operation type.
+
+    Sampling is device postprocessing inside ``Token(*)`` and has no route of
+    its own, so no ``Work`` variant maps to ``SEQUENCE_SAMPLE``. ``Draft`` has no
+    depth-one route and is rejected until a later checkpoint introduces one.
+    """
+
+    operation_type = _WORK_OPERATION_TYPES.get((work.kind, work.mode))
+    if operation_type is None:
+        raise capability_mismatch(f"work variant {(work.kind, work.mode)!r} has no route")
+    return operation_type
+
+
+# The route enum an operation runs under maps onto one or more closed work
+# variants. Route selection stays keyed by ``OperationType`` inside the worker;
+# the capability wire and its digests are keyed by ``WorkVariant``, so the two
+# are bridged here. ``SEQUENCE_SAMPLE`` has no variant (sampling is device
+# postprocessing inside the token modes) and contributes no work.
+_OPERATION_TYPE_WORK_VARIANTS: dict[OperationType, tuple[WorkVariant, ...]] = {
+    OperationType.SEQUENCE_EXTEND: (WorkVariant.TOKEN_EXTEND,),
+    OperationType.SEQUENCE_DECODE: (WorkVariant.TOKEN_DECODE,),
+    OperationType.SEQUENCE_VERIFY: (WorkVariant.TOKEN_VERIFY,),
+    OperationType.SEQUENCE_SAMPLE: (),
+    OperationType.FLOW: (WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW),
+    OperationType.ENCODE_VISION: (WorkVariant.ENCODE_VISION,),
+    OperationType.ENCODE_LATENT: (WorkVariant.ENCODE_LATENT,),
+    OperationType.MATERIALIZE_IMAGE: (WorkVariant.MATERIALIZE,),
+    OperationType.MATERIALIZE_FRAME: (WorkVariant.MATERIALIZE,),
+    OperationType.TRANSFER_PRODUCT: (WorkVariant.TRANSFER_PRODUCT,),
+    OperationType.TRANSFER_KV: (WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL),
+}
+
+_WORK_VARIANT_OPERATION_TYPE: dict[WorkVariant, OperationType] = {
+    WorkVariant.TOKEN_EXTEND: OperationType.SEQUENCE_EXTEND,
+    WorkVariant.TOKEN_DECODE: OperationType.SEQUENCE_DECODE,
+    WorkVariant.TOKEN_VERIFY: OperationType.SEQUENCE_VERIFY,
+    WorkVariant.DRAFT: OperationType.SEQUENCE_VERIFY,
+    WorkVariant.ENCODE_VISION: OperationType.ENCODE_VISION,
+    WorkVariant.ENCODE_LATENT: OperationType.ENCODE_LATENT,
+    WorkVariant.TRANSFER_PRODUCT: OperationType.TRANSFER_PRODUCT,
+    WorkVariant.TRANSFER_KV_PUBLISH: OperationType.TRANSFER_KV,
+    WorkVariant.TRANSFER_KV_INSTALL: OperationType.TRANSFER_KV,
+    WorkVariant.GEN_TRANSITION: OperationType.FLOW,
+    WorkVariant.GEN_FLOW: OperationType.FLOW,
+    WorkVariant.MATERIALIZE: OperationType.MATERIALIZE_IMAGE,
+}
+
+
+def work_variants_for_operation_types(
+    operation_types: Sequence[OperationType],
+) -> tuple[WorkVariant, ...]:
+    """The closed work variants a set of route operation types supports.
+
+    The result is deduplicated and ordered by the canonical ``WorkVariant``
+    position, matching the order the route-capability digest folds them in.
+    """
+
+    selected = {
+        variant
+        for operation_type in operation_types
+        for variant in _OPERATION_TYPE_WORK_VARIANTS[operation_type]
+    }
+    return tuple(variant for variant in WorkVariant if variant in selected)
+
+
+def work_variant_operation_type(variant: WorkVariant) -> OperationType:
+    """The route operation type one work variant runs under."""
+
+    return _WORK_VARIANT_OPERATION_TYPE[variant]
 
 
 class RequestKind(StrEnum):
@@ -143,7 +238,7 @@ class EngineCaps:
     num_blocks: int
     num_layers: int
     scratch_capacity_tokens: int
-    supported_operation_types: tuple[OperationType, ...]
+    supported_work: tuple[WorkVariant, ...]
     max_latent_size: int
     latent_downsample: int
     max_vae_grid_tokens: int
@@ -167,6 +262,15 @@ class EngineCaps:
     model_spec_digest: str
     weight_digest: str
     restored_sessions: tuple[int, ...] = ()
+    protocol_layout_digest: str = ""
+    route_capability_digest: str = ""
+
+    @property
+    def operation_types(self) -> tuple[OperationType, ...]:
+        """The route operation types this capability's work variants run under."""
+
+        selected = {work_variant_operation_type(variant) for variant in self.supported_work}
+        return tuple(value for value in OperationType if value in selected)
 
     def __post_init__(self) -> None:
         if self.model_dtype not in {"float16", "bfloat16", "float32"}:
@@ -193,10 +297,10 @@ class EngineCaps:
         ):
             if getattr(self, name) < 0:
                 raise invalid_descriptor(f"capabilities.{name} must not be negative")
-        if not self.supported_operation_types:
-            raise invalid_descriptor("capabilities must support an operation type")
-        if len(set(self.supported_operation_types)) != len(self.supported_operation_types):
-            raise invalid_descriptor("capabilities repeat an operation type")
+        if not self.supported_work:
+            raise invalid_descriptor("capabilities must support a work variant")
+        if len(set(self.supported_work)) != len(self.supported_work):
+            raise invalid_descriptor("capabilities repeat a work variant")
         if len(set(self.supported_controls)) != len(self.supported_controls):
             raise invalid_descriptor("capabilities repeat a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
@@ -210,6 +314,27 @@ class EngineCaps:
             RequestKind.UNLOAD_ADAPTER,
         } <= set(self.supported_controls):
             raise invalid_descriptor("adapter capability requires load and unload controls")
+        # The two agreement digests are a pure function of this capability's own
+        # fields, so they are computed here at the authoritative construction
+        # point. Every construction path (declaration, wire decode, ``replace``)
+        # therefore reports the exact digests the handshake validates.
+        object.__setattr__(self, "protocol_layout_digest", protocol_layout_digest())
+        object.__setattr__(
+            self,
+            "route_capability_digest",
+            route_capability_digest(
+                self.supported_work,
+                self.max_cfg_branches,
+                self.max_latent_size,
+                self.max_vae_grid_tokens,
+                self.max_vit_grid_tokens,
+                _WireAdapterMode(self.adapter_mode.value),
+                self.execution_constraints.max_batch_operations,
+                self.kv_dtype,
+                self.model_dtype,
+                self.attention_backend,
+            ),
+        )
 
     @classmethod
     def from_wire(cls, value: object, where: str = "capabilities") -> EngineCaps:
@@ -221,13 +346,10 @@ class EngineCaps:
             scratch_capacity_tokens=_uint(
                 data.get("scratch_capacity_tokens"), f"{where}.scratch_capacity_tokens"
             ),
-            supported_operation_types=tuple(
-                _enum(OperationType, item, f"{where}.supported_operation_types[{index}]")
+            supported_work=tuple(
+                _enum(WorkVariant, item, f"{where}.supported_work[{index}]")
                 for index, item in enumerate(
-                    _seq(
-                        data.get("supported_operation_types"),
-                        f"{where}.supported_operation_types",
-                    )
+                    _seq(data.get("supported_work"), f"{where}.supported_work")
                 )
             ),
             max_latent_size=_uint(data.get("max_latent_size"), f"{where}.max_latent_size"),
@@ -308,7 +430,7 @@ class EngineCaps:
             "num_blocks": self.num_blocks,
             "num_layers": self.num_layers,
             "scratch_capacity_tokens": self.scratch_capacity_tokens,
-            "supported_operation_types": [value.value for value in self.supported_operation_types],
+            "supported_work": [value.value for value in self.supported_work],
             "max_latent_size": self.max_latent_size,
             "latent_downsample": self.latent_downsample,
             "max_vae_grid_tokens": self.max_vae_grid_tokens,
@@ -333,6 +455,8 @@ class EngineCaps:
             "resource_classes": [value.value for value in self.resource_classes],
             "model_spec_digest": self.model_spec_digest,
             "weight_digest": self.weight_digest,
+            "protocol_layout_digest": self.protocol_layout_digest,
+            "route_capability_digest": self.route_capability_digest,
             "restored_sessions": list(self.restored_sessions),
         }
 

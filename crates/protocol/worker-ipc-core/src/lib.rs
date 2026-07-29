@@ -454,7 +454,7 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
         h.step_id = batch.step_id;
         // Hint only: first op's id. See the doc comment above.
         if let Some(operation) = batch.operations.first() {
-            h.op_id = operation.op_id;
+            h.op_id = operation.op_id.0;
         }
     }
     h
@@ -473,11 +473,11 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
         call_id: resp.call_id.unwrap_or_default(),
         ..Default::default()
     };
-    if let Some(result) = &resp.result {
-        h.step_id = result.step_id;
-        // Hint only: first seq's op id. See the doc comment above.
-        if let Some(operation) = result.operations.first() {
-            h.op_id = operation.op_id;
+    if let Some(report) = &resp.completion_report {
+        h.step_id = report.step_id;
+        // Hint only: first completion's op id. See the doc comment above.
+        if let Some(completion) = report.completions.first() {
+            h.op_id = completion.op_id.0;
         }
     }
     h

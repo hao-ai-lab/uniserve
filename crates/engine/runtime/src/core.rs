@@ -420,12 +420,18 @@ impl EngineCore {
 
     /// Serving-facing projection of post-load worker limits.
     pub fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
+        use uniserve_worker_wire::WorkVariant;
         let caps = &self.caps;
-        let mut supported_operation_types = caps.supported_operation_types.clone();
-        supported_operation_types.sort();
-        supported_operation_types.dedup();
+        let supports = |variant: WorkVariant| caps.supported_work.contains(&variant);
         GenerationRuntimeCapabilities {
-            supported_operation_types,
+            supports_understanding: supports(WorkVariant::TokenExtend)
+                && supports(WorkVariant::TokenDecode),
+            supports_vision_encode: supports(WorkVariant::EncodeVision),
+            supports_latent_encode: supports(WorkVariant::EncodeLatent),
+            supports_image_generation: supports(WorkVariant::GenFlow)
+                && supports(WorkVariant::Materialize),
+            supports_commit_writeback: supports(WorkVariant::TransferKvPublish)
+                || supports(WorkVariant::TransferKvInstall),
             max_latent_units: u64::from(caps.max_latent_size),
             latent_downsample: caps.latent_downsample,
             max_vae_grid_tokens: if caps.max_vae_grid_tokens > 0 {

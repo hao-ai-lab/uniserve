@@ -14,7 +14,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
-from uniserve_worker.batch import EncodeKind
+from uniserve_worker.batch import EncodeMode
 from uniserve_worker.forward import PatchInput, TowerInput
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.spec import ImageInputSpec, ImagePatchSpec, StrideResizeSpec
@@ -32,13 +32,13 @@ class PreparedImage:
 
 def prepare_image(
     spec: ImageInputSpec,
-    kind: EncodeKind,
+    kind: EncodeMode,
     encoded: str,
     *,
     device: torch.device,
 ) -> PreparedImage:
     image = _decode_rgb(encoded)
-    transform = spec.vit if kind is EncodeKind.VISION else spec.vae
+    transform = spec.vit if kind is EncodeMode.VISION else spec.vae
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 
@@ -73,7 +73,7 @@ def prepare_image(
 
 def prepare_tensor_image(
     spec: ImageInputSpec,
-    kind: EncodeKind,
+    kind: EncodeMode,
     image: torch.Tensor,
     *,
     device: torch.device,
@@ -92,7 +92,7 @@ def prepare_tensor_image(
         value = (value + 1.0) * 0.5
     value = value.clamp(0.0, 1.0)
     source_height, source_width = int(value.shape[1]), int(value.shape[2])
-    transform = spec.vit if kind is EncodeKind.VISION else spec.vae
+    transform = spec.vit if kind is EncodeMode.VISION else spec.vae
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 

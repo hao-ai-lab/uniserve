@@ -496,6 +496,7 @@ def artifact_contract(
     plan_evidence: dict[str, Any] | None,
     contract: dict[str, Any] | None,
     generation_conformance: dict[str, Any],
+    interleave_latency_conformance: dict[str, Any] | None,
 ) -> dict[str, Any]:
     expected_plan_source = spec.plan_evidence_policy
     if plan_evidence is None:
@@ -533,8 +534,12 @@ def artifact_contract(
         "contract_fingerprint": benchmark_contract_is_valid(contract, spec, request_count),
         "generation_conformance": generation_conformance.get("valid") is True,
     }
+    if interleave_latency_conformance is not None:
+        checks["interleave_latency_conformance"] = (
+            interleave_latency_conformance.get("valid") is True
+        )
     valid = all(checks.values())
-    return {
+    artifact: dict[str, Any] = {
         "schema_version": 2,
         "valid": valid,
         "valid_marker": "artifact-valid-v2" if valid else None,
@@ -552,6 +557,9 @@ def artifact_contract(
         "contract": contract,
         "generation_conformance": generation_conformance,
     }
+    if interleave_latency_conformance is not None:
+        artifact["interleave_latency_conformance"] = interleave_latency_conformance
+    return artifact
 
 
 def _runtime_plan_matches_declared_contract(
@@ -808,6 +816,7 @@ def build_summary(
         "metric_family": family,
         "metrics": metrics,
     }
+    generation_conformance = _generation_conformance(spec, records)
     summary["artifact"] = artifact_contract(
         spec,
         request_count=summary["request_count"],
@@ -816,7 +825,8 @@ def build_summary(
         total_images=_completed_images(family, metrics),
         plan_evidence=plan_evidence,
         contract=contract,
-        generation_conformance=_generation_conformance(spec, records),
+        generation_conformance=generation_conformance,
+        interleave_latency_conformance=_interleave_latency_conformance(spec, metrics),
     )
     if spec.runtime_profile_id != "unspecified":
         server_info_valid = bool(
@@ -855,6 +865,105 @@ def _generation_conformance(
     if spec.task in IMAGE_TASKS:
         return _image_generation_conformance(spec, records)
     return _text_generation_conformance(spec, records)
+
+
+def _interleave_latency_conformance(
+    spec: BenchmarkSpec,
+    metrics: dict[str, Any],
+) -> dict[str, Any] | None:
+    if spec.task != TaskName.INTERLEAVE:
+        return None
+    interleave = metrics.get("modality_interleave")
+    timing = interleave.get("transition_timing") if isinstance(interleave, dict) else None
+    if not isinstance(timing, dict):
+        return {
+            "valid": False,
+            "checks": {"latency_measurements_present": False},
+        }
+    latency_definition_digest = timing.get("latency_definition_digest")
+    expected_transitions = timing.get("expected_transition_count")
+    measured_transitions = timing.get("measured_transition_count")
+    ttft = metrics.get("ttft_ms")
+    tpot = metrics.get("tpot_ms")
+    images = metrics.get("images")
+    image_latency = images.get("image_latency_ms") if isinstance(images, dict) else None
+    total_images = images.get("total_images") if isinstance(images, dict) else None
+    transition_latency = timing.get("transition_latency_ms")
+    text_to_image = timing.get("text_to_image_transition_latency_ms")
+    image_to_text = timing.get("image_to_text_transition_latency_ms")
+    text_to_image_count = text_to_image.get("count") if isinstance(text_to_image, dict) else None
+    image_to_text_count = image_to_text.get("count") if isinstance(image_to_text, dict) else None
+    checks = {
+        "latency_measurements_present": True,
+        "latency_definition_digest": (
+            isinstance(latency_definition_digest, str)
+            and len(latency_definition_digest) == 64
+            and all(character in "0123456789abcdef" for character in latency_definition_digest)
+        ),
+        "ttft_samples": _complete_latency_distribution(ttft, expected_count=spec.num_prompts),
+        "tpot_samples": _complete_latency_distribution(tpot, expected_count=spec.num_prompts),
+        "image_latency_samples": (
+            isinstance(total_images, int)
+            and not isinstance(total_images, bool)
+            and total_images > 0
+            and _complete_latency_distribution(image_latency, expected_count=total_images)
+        ),
+        "declared_request_count": timing.get("request_count") == spec.num_prompts,
+        "complete_request_count": timing.get("complete_request_count") == spec.num_prompts,
+        "timestamp_coverage": timing.get("timestamp_coverage") == 1.0,
+        "unambiguous_events": timing.get("ambiguous_event_count") == 0,
+        "monotonic_events": timing.get("non_monotonic_event_count") == 0,
+        "positive_transition_work": (
+            isinstance(expected_transitions, int)
+            and not isinstance(expected_transitions, bool)
+            and expected_transitions > 0
+        ),
+        "complete_transition_samples": measured_transitions == expected_transitions,
+        "transition_sample_coverage": timing.get("transition_sample_coverage") == 1.0,
+        "transition_latency_samples": (
+            isinstance(expected_transitions, int)
+            and not isinstance(expected_transitions, bool)
+            and _complete_latency_distribution(
+                transition_latency,
+                expected_count=expected_transitions,
+            )
+        ),
+        "directional_transition_samples": (
+            isinstance(text_to_image_count, int)
+            and not isinstance(text_to_image_count, bool)
+            and isinstance(image_to_text_count, int)
+            and not isinstance(image_to_text_count, bool)
+            and isinstance(expected_transitions, int)
+            and not isinstance(expected_transitions, bool)
+            and text_to_image_count + image_to_text_count == expected_transitions
+            and _complete_latency_distribution(text_to_image, expected_count=text_to_image_count)
+            and _complete_latency_distribution(image_to_text, expected_count=image_to_text_count)
+        ),
+        "transition_summary": timing.get("valid") is True,
+    }
+    return {
+        "valid": all(checks.values()),
+        "checks": checks,
+        "latency_definition_digest": latency_definition_digest,
+        "request_signatures": timing.get("request_signatures"),
+        "expected_transition_count": expected_transitions,
+        "measured_transition_count": measured_transitions,
+    }
+
+
+def _complete_latency_distribution(value: Any, *, expected_count: int) -> bool:
+    if not isinstance(value, dict) or value.get("count") != expected_count:
+        return False
+    if expected_count == 0:
+        return True
+    statistics = ("mean", "std", "min", "p50", "p90", "p95", "p99", "max")
+    return all(
+        isinstance(value.get(statistic), (int, float))
+        and not isinstance(value.get(statistic), bool)
+        and math.isfinite(float(value[statistic]))
+        and float(value[statistic]) >= 0.0
+        for statistic in statistics
+    )
 
 
 def _image_generation_conformance(
@@ -1064,6 +1173,22 @@ def _stream_markdown(metrics: dict[str, Any]) -> list[str]:
             f"- in-response images: {metrics['images']['total_images']} total, "
             f"{_fmt(metrics['images']['images_per_second'])} img/s, "
             f"image E2E p50/p99 = {_fmt(img['p50'])}/{_fmt(img['p99'])} ms",
+        ]
+    interleave = metrics.get("modality_interleave")
+    timing = interleave.get("transition_timing") if isinstance(interleave, dict) else None
+    if isinstance(timing, dict):
+        overall = timing["transition_latency_ms"]
+        text_to_image = timing["text_to_image_transition_latency_ms"]
+        image_to_text = timing["image_to_text_transition_latency_ms"]
+        lines += [
+            "",
+            f"- transition timing: {'valid' if timing.get('valid') else 'invalid'}, "
+            f"coverage={_fmt(timing.get('transition_sample_coverage'))}",
+            f"- transition latency mean/p95 = {_fmt(overall['mean'])}/{_fmt(overall['p95'])} ms",
+            f"- text-to-image mean/p95 = "
+            f"{_fmt(text_to_image['mean'])}/{_fmt(text_to_image['p95'])} ms",
+            f"- image-to-text mean/p95 = "
+            f"{_fmt(image_to_text['mean'])}/{_fmt(image_to_text['p95'])} ms",
         ]
     return lines
 

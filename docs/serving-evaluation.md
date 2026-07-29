@@ -4,7 +4,7 @@
 
 ## Benchmark entry
 
-Run the configured 43-point matrix through one command:
+Run the configured 45-point matrix through one command:
 
 ```bash
 .venv/bin/python scripts/run_benchmarks.py \
@@ -56,8 +56,10 @@ The `uniserve-eval` command runs focused correctness gates:
 ```bash
 uniserve-eval list
 uniserve-eval launch gate/server/sensenova
-uniserve-eval verify gate/sensenova/default-travel
+uniserve-eval verify gate/sensenova/default-travel --output-dir artifacts/eval/sensenova/default-travel
 uniserve-eval run gate/all --manage-servers
 ```
 
-These checks provide implementation feedback and are separate from the benchmark matrix.
+An explicit verification output directory is immutable: the command refuses to replace an existing directory. These checks provide implementation feedback and are separate from the benchmark matrix.
+
+Correctness gates require an error-free terminal response, validate every decoded image and its declared dimensions, and verify the observed denoising-step count for each completed image. The configured image count is reported as an expectation warning because the generated answer may choose a different number of images. OpenAI's `[DONE]` SSE sentinel is retained as transport metadata but is not a model-result acceptance condition.

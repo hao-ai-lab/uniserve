@@ -10,7 +10,7 @@ The benchmark matrix is defined in [`uniserve_eval/profiles.json`](../uniserve_e
   --output-root artifacts/benchmark
 ```
 
-Use `--only` to select complete backend groups, `--dry-run --no-build` to inspect commands without launching servers, and `--formal` to require the canonical clean-source, pinned-revision, fresh-build, accelerator, NUMA, process, GPU, and execution-identity checks.
+Use `--only` to select complete backend groups, `--only-bench` to select exact expanded points, `--dry-run --no-build` to inspect commands without launching servers, and `--formal` to require the canonical clean-source, pinned-revision, fresh-build, accelerator, NUMA, process, GPU, and execution-identity checks.
 
 `--repeat N` executes complete selected matrices serially beneath numbered child roots and produces an aggregate containing every valid per-run ratio and its geometric mean. `--text-canary` and `--image-smoke` enable optional diagnostics; neither changes point validity or the primary metric.
 
@@ -22,6 +22,16 @@ A failed point stops the run and preserves its partial artifacts and logs. The f
 
 `--resume` continues a non-formal output root by skipping only points whose canonical artifact bundle, harness contract, matrix contract, and execution-bundle identity still match the selected profile. A missing, invalid, or stale point runs in place and the aggregate is rebuilt from the complete selected point set. Formal execution requires a fresh root and a complete matrix, so it does not permit `--resume` or point-level filters.
 
+## Decode-runtime acceptance protocol
+
+The benchmark harness executes profile-selected requests and emits measurements and integrity evidence. It does not select checkpoint workloads, classify performance regressions, maintain accepted baselines, or decide whether an implementation checkpoint may commit. Those experiment-control decisions are defined here and in [`specs/decode-runtime-construction.md`](../specs/decode-runtime-construction.md).
+
+Immediately before each decode-runtime checkpoint commit, the experiment controller runs Qwen3 ShareGPT `r16`, SenseNova T2I `c32`, and SenseNova I2T `c32` with the exact profiles in this document. It compares every metric against both the immutable anchor and the immediately preceding accepted checkpoint. A metric meets the target at no more than 5% regression; a checkpoint may consume at most two additional percentage points of measurement allowance, and any regression above 7% blocks the checkpoint. Correctness, work, failure count, profile, hardware, executable, and artifact-integrity mismatches always block and have no allowance.
+
+At the major boundaries defined by [`specs/decode-runtime-construction.md`](../specs/decode-runtime-construction.md), the experiment controller additionally compares SenseNova UEval `c4` TTFT, TPOT, decoded-image latency, aggregate transition latency, each observed transition direction, and default-travel elapsed time against both baselines. Every major-boundary metric must remain within 5%; the additional checkpoint allowance does not apply.
+
+Each acceptance sequence uses one immutable candidate source state and one fresh artifact root, executes points serially, permits no automatic retry, and stops after the first invalid or failing point. A failed point is diagnosed before any affected measurement is repeated; successful evidence remains valid until a source, configuration, workload, model, hardware, or runtime dependency used by that evidence changes. The experiment record binds the source tree, executable, hardware, profile, request work, and input artifact hashes. `uniserve_eval` supplies the measurements and bindings, while the experiment controller applies these acceptance rules.
+
 ## Workload matrix
 
 | Workload | Systems | Requests per point | Load cases | Comparison metrics |
@@ -29,13 +39,15 @@ A failed point stops the run and preserves its partial artifacts and logs. The f
 | Qwen3-32B ShareGPT | UniServe, SGLang | 200 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s, maximize; mean TTFT and mean TPOT, minimize |
 | SenseNova-U1 MJHQ T2I | UniServe, vLLM-Omni | 32 | `c1`, `c32` | `c1`: mean image latency, minimize; `c32`: images/s, maximize |
 | BAGEL MJHQ T2I | UniServe, vLLM-Omni | 32 | `c1`, `c32` | `c1`: mean image latency, minimize; `c32`: images/s, maximize |
-| SenseNova-U1 Beans I2T | UniServe, vLLM-Omni | 32 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s, maximize |
+| SenseNova-U1 Beans I2T | UniServe, vLLM-Omni | 32 | `r1`, `r2`, `r4`, `r8`, `r16`, `c32` | Output tokens/s, maximize |
 | BAGEL Beans I2T | UniServe, vLLM-Omni | 32 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s, maximize |
-| SenseNova-U1 UEval interleaved generation | UniServe | 32 | `c1`, `c2`, `c4`, `c8`, `c16` | Text throughput, TTFT, TPOT, image latency, images/s, modality transitions |
+| SenseNova-U1 UEval interleaved generation | UniServe | 32 | `c1`, `c2`, `c4`, `c8`, `c16` | TTFT, TPOT, image latency, aggregate transition latency, directional transition latency |
 
-The matrix contains 43 serial points. `rN` is an open-loop seed-42 Poisson trace with an offered rate of N requests/s and no client concurrency semaphore. `cN` submits the fixed prompt set immediately under a client concurrency of N, so the server sees exactly N requests in flight until the set is exhausted.
+The matrix contains 45 serial points. `rN` is an open-loop seed-42 Poisson trace with an offered rate of N requests/s and no client concurrency semaphore. `cN` submits the fixed prompt set immediately under a client concurrency of N, so the server sees exactly N requests in flight until the set is exhausted.
 
 Timing covers the complete measured arrival and completion region. TTFT begins at client send and ends at the first non-empty content or reasoning delta. TPOT is calculated per request as `(E2E - TTFT) / (server-reported completion tokens - 1)` and then averaged, matching the SGLang serving definition. Output throughput is server-reported completion tokens divided by the complete timed region. Image latency is measured from request send through decoded output receipt, and image throughput is the number of successfully decoded images divided by the complete timed region. ShareGPT reports output throughput, mean TTFT, and mean TPOT as separate comparison metrics; the protocol defines no composite score.
+
+Every visible UEval SSE event is timestamped with the benchmark client's monotonic clock before parsing. Consecutive visible events of one modality form a segment; transition latency is the destination segment's first event timestamp minus the source segment's last event timestamp. UEval reports complete distributions for TTFT, TPOT, decoded-image latency, aggregate transition latency, text-to-image transition latency, and image-to-text transition latency. A point is invalid unless all 32 requests conform, every visible event has a timestamp, every transition is nonnegative and unambiguous, all expected samples are present, and each request records its ordered modality-segment signature.
 
 ## Capacity parity
 
@@ -103,7 +115,7 @@ Dataset-level text or image quality requires a separately defined evaluation wit
 
 Candidate and reference points use the same selected inputs, semantic request work, load case, accelerator count and model, harness measurement code, and the capacity settings tabulated above. Backend-specific scheduling, batching, kernels, graph capture, cache representation, memory layout, and serialization remain implementation differences.
 
-The profile records model and dataset revisions, backend launch commands, numerical and capacity settings, cache policy, source revisions, environment fingerprints, selected accelerator, host topology, and content digests. If a reference runtime cannot expose an equivalent feature or effective runtime field, the mismatch remains explicit in the artifact.
+The profile records model and dataset revisions, backend launch commands, numerical and capacity settings, cache policy, source revision and change digest, environment fingerprints, selected accelerator, host topology, and content digests. If a reference runtime cannot expose an equivalent feature or effective runtime field, the mismatch remains explicit in the artifact.
 
 Each point retains `run.json`, `requests.jsonl`, `gpu_samples.jsonl`, `summary.json`, `summary.md`, `artifact_manifest.json`, command and log files, and pre/post snapshots. Generated image bytes are content-addressed and bound into the artifact. A comparison is emitted only for a complete candidate/reference pair whose point artifacts, parity contracts, and task work checks are valid.
 

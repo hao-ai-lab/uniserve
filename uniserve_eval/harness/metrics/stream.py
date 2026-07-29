@@ -20,11 +20,37 @@ this against the exact SGLang formulas.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from typing import Any
 
 import numpy as np
 
 from .common import RequestRecord, _max, _mean, _std, distribution, percentile
+
+UEVAL_LATENCY_DEFINITION = {
+    "clock": "time.perf_counter",
+    "event_timestamp": "client_sse_receive_before_parse",
+    "visible_text": "nonempty_content_or_reasoning",
+    "visible_image": "received_image_part_that_decodes_and_conforms",
+    "segment": "maximal_consecutive_visible_events_of_one_modality",
+    "transition": "destination_segment_first_event_minus_source_segment_last_event",
+    "transition_directions": ["text_to_image", "image_to_text"],
+    "ttft": "first_visible_text_event_minus_request_send",
+    "tpot": "request_e2e_minus_ttft_divided_by_server_completion_tokens_minus_one",
+    "image_latency": "decoded_image_event_minus_request_send",
+    "aggregation": "arithmetic_mean_with_complete_distributions",
+    "missing_sample": "invalidate_point",
+}
+UEVAL_LATENCY_DEFINITION_DIGEST = hashlib.sha256(
+    json.dumps(
+        UEVAL_LATENCY_DEFINITION,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+).hexdigest()
 
 
 def summarize_stream(
@@ -83,6 +109,7 @@ def summarize_stream(
         "p90_e2e_latency_ms": percentile(e2e_latencies, 90) * 1000,
         "p95_e2e_latency_ms": percentile(e2e_latencies, 95) * 1000,
         "p99_e2e_latency_ms": percentile(e2e_latencies, 99) * 1000,
+        "e2e_latency_ms": distribution(e2e_latencies, scale=1000),
         # TTFT
         "mean_ttft_ms": _mean(ttfts) * 1000,
         "median_ttft_ms": percentile(ttfts, 50) * 1000,
@@ -91,6 +118,7 @@ def summarize_stream(
         "p90_ttft_ms": percentile(ttfts, 90) * 1000,
         "p95_ttft_ms": percentile(ttfts, 95) * 1000,
         "p99_ttft_ms": percentile(ttfts, 99) * 1000,
+        "ttft_ms": distribution(ttfts, scale=1000),
         # TPOT
         "mean_tpot_ms": _mean(tpots) * 1000,
         "median_tpot_ms": percentile(tpots, 50) * 1000,
@@ -99,6 +127,7 @@ def summarize_stream(
         "p90_tpot_ms": percentile(tpots, 90) * 1000,
         "p95_tpot_ms": percentile(tpots, 95) * 1000,
         "p99_tpot_ms": percentile(tpots, 99) * 1000,
+        "tpot_ms": distribution(tpots, scale=1000),
         # ITL
         "mean_itl_ms": _mean(itls) * 1000,
         "median_itl_ms": percentile(itls, 50) * 1000,
@@ -222,11 +251,30 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
     multimodal = [record for record in successful if record.images > 0]
     if not multimodal:
         return None
-    transitions = [float(max(0, len(record.output_modalities) - 1)) for record in multimodal]
+    timings = [_request_transition_timing(record) for record in multimodal]
+    transitions = [float(timing["expected_transition_count"]) for timing in timings]
     patterns: dict[str, int] = {}
-    for record in multimodal:
-        pattern = "->".join(record.output_modalities)
+    for record, timing in zip(multimodal, timings, strict=True):
+        pattern = str(timing["signature"] or "->".join(record.output_modalities))
         patterns[pattern] = patterns.get(pattern, 0) + 1
+    complete_timings = [timing for timing in timings if timing["valid"] is True]
+    transition_latencies = [
+        float(value) for timing in complete_timings for value in timing["transition_latencies"]
+    ]
+    text_to_image = [
+        float(value)
+        for timing in complete_timings
+        for value in timing["directional_latencies"]["text_to_image"]
+    ]
+    image_to_text = [
+        float(value)
+        for timing in complete_timings
+        for value in timing["directional_latencies"]["image_to_text"]
+    ]
+    visible_event_count = sum(int(timing["visible_event_count"]) for timing in timings)
+    timestamped_event_count = sum(int(timing["timestamped_event_count"]) for timing in timings)
+    expected_transition_count = sum(int(timing["expected_transition_count"]) for timing in timings)
+    measured_transition_count = len(transition_latencies)
     return {
         "requests_with_text_and_image": sum(
             "text" in record.output_modalities and "image" in record.output_modalities
@@ -234,6 +282,124 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
         ),
         "modality_transitions": distribution(transitions),
         "patterns": patterns,
+        "transition_timing": {
+            "valid": bool(timings)
+            and len(complete_timings) == len(timings)
+            and expected_transition_count > 0
+            and measured_transition_count == expected_transition_count,
+            "latency_definition": UEVAL_LATENCY_DEFINITION,
+            "latency_definition_digest": UEVAL_LATENCY_DEFINITION_DIGEST,
+            "request_count": len(timings),
+            "complete_request_count": len(complete_timings),
+            "visible_event_count": visible_event_count,
+            "timestamped_event_count": timestamped_event_count,
+            "timestamp_coverage": (
+                timestamped_event_count / visible_event_count if visible_event_count else 0.0
+            ),
+            "ambiguous_event_count": sum(
+                int(timing["ambiguous_event_count"]) for timing in timings
+            ),
+            "non_monotonic_event_count": sum(
+                int(timing["non_monotonic_event_count"]) for timing in timings
+            ),
+            "expected_transition_count": expected_transition_count,
+            "measured_transition_count": measured_transition_count,
+            "transition_sample_coverage": (
+                measured_transition_count / expected_transition_count
+                if expected_transition_count
+                else 0.0
+            ),
+            "request_signatures": {
+                record.request_id: timing["signature"]
+                for record, timing in zip(multimodal, timings, strict=True)
+            },
+            "transition_latency_ms": distribution(transition_latencies, scale=1000),
+            "text_to_image_transition_latency_ms": distribution(text_to_image, scale=1000),
+            "image_to_text_transition_latency_ms": distribution(image_to_text, scale=1000),
+        },
+    }
+
+
+def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
+    segments: list[dict[str, Any]] = []
+    visible_event_count = len(record.modality_events)
+    timestamped_event_count = 0
+    ambiguous_event_count = 0
+    non_monotonic_event_count = 0
+    previous_timestamp: float | None = None
+
+    for event in record.modality_events:
+        modalities = event.get("modalities")
+        timestamp = event.get("client_time")
+        if not isinstance(modalities, list) or len(modalities) != 1:
+            ambiguous_event_count += 1
+            continue
+        modality = modalities[0]
+        if modality not in {"text", "image"}:
+            ambiguous_event_count += 1
+            continue
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(float(timestamp))
+        ):
+            continue
+        timestamp_f = float(timestamp)
+        timestamped_event_count += 1
+        if previous_timestamp is not None and timestamp_f < previous_timestamp:
+            non_monotonic_event_count += 1
+        previous_timestamp = timestamp_f
+        if segments and segments[-1]["modality"] == modality:
+            segments[-1]["last_timestamp"] = timestamp_f
+            segments[-1]["event_count"] = int(segments[-1]["event_count"]) + 1
+        else:
+            segments.append(
+                {
+                    "modality": modality,
+                    "first_timestamp": timestamp_f,
+                    "last_timestamp": timestamp_f,
+                    "event_count": 1,
+                }
+            )
+
+    signature = "->".join(str(segment["modality"]) for segment in segments)
+    expected_transition_count = max(0, len(record.output_modalities) - 1)
+    transition_latencies: list[float] = []
+    directional_latencies: dict[str, list[float]] = {
+        "text_to_image": [],
+        "image_to_text": [],
+    }
+    for source, destination in zip(segments, segments[1:]):
+        latency = float(destination["first_timestamp"]) - float(source["last_timestamp"])
+        if latency < 0:
+            non_monotonic_event_count += 1
+            continue
+        direction = f"{source['modality']}_to_{destination['modality']}"
+        transition_latencies.append(latency)
+        directional_latencies[direction].append(latency)
+
+    valid = bool(record.modality_events)
+    valid = valid and timestamped_event_count == visible_event_count
+    valid = valid and ambiguous_event_count == 0
+    valid = valid and non_monotonic_event_count == 0
+    valid = valid and len(segments) >= 2
+    valid = valid and signature == "->".join(record.output_modalities)
+    valid = valid and len(transition_latencies) == expected_transition_count
+    return {
+        "valid": valid,
+        "signature": signature,
+        "visible_event_count": visible_event_count,
+        "timestamped_event_count": timestamped_event_count,
+        "ambiguous_event_count": ambiguous_event_count,
+        "non_monotonic_event_count": non_monotonic_event_count,
+        "expected_transition_count": expected_transition_count,
+        "transition_latencies": transition_latencies if valid else [],
+        "directional_latencies": directional_latencies
+        if valid
+        else {
+            "text_to_image": [],
+            "image_to_text": [],
+        },
     }
 
 
@@ -272,9 +438,7 @@ def _timing_attribution_block(successful: list[RequestRecord]) -> dict[str, Any]
                 0.0,
                 r.ttft - (r.server_scheduled_at - r.server_queued_at),
             )
-            if r.ttft
-            and r.server_scheduled_at is not None
-            and r.server_queued_at is not None
+            if r.ttft and r.server_scheduled_at is not None and r.server_queued_at is not None
             else None
         )
     )

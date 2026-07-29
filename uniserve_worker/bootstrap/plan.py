@@ -45,7 +45,7 @@ def resolve_worker_plan(worker_kind: WorkerKind) -> WorkerPlan:
         worker_kind=worker_kind,
         implementation=implementation,
         model_scope=scope,
-        allowed_operation_types=worker_kind.supported_operation_types,
+        allowed_operation_types=worker_kind.allowed_operation_types,
     )
 
 

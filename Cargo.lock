@@ -6148,6 +6148,7 @@ dependencies = [
  "anyhow",
  "pyo3",
  "pythonize",
+ "uniserve-core",
  "uniserve-worker-ipc-core",
  "uniserve-worker-wire",
 ]
@@ -6423,7 +6424,6 @@ dependencies = [
  "tracing",
  "uniserve-core",
  "uniserve-executor",
- "uniserve-testkit",
  "uniserve-worker-ipc-core",
  "uniserve-worker-wire",
 ]
@@ -6448,6 +6448,7 @@ dependencies = [
  "flatbuffers-build",
  "flatc-fork",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "toml",
