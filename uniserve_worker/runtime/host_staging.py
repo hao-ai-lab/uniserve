@@ -10,12 +10,14 @@ two seams share one implementation instead of drifting copies.
 """
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from ..foundation.errors import resource_error
 from ..foundation.torch_compat import torch_is_compiling
 
 _np: Any | None
@@ -39,29 +41,43 @@ __all__ = [
 ]
 
 _NUMPY_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
+_QUERY_BUDGET = 16
 
 
 class TensorStager:
-    """Reusable pinned-host and device buffers for one execution pipeline."""
+    """Bounded generation-safe staging storage for one execution pipeline."""
 
-    def __init__(self, *, ring_depth: int) -> None:
-        self.ring_depth = max(1, int(ring_depth))
-        self._slots: list[dict[str, torch.Tensor]] = [{} for _ in range(self.ring_depth)]
+    def __init__(self, *, capacity: int) -> None:
+        self.capacity = max(1, int(capacity))
+        self._slots: list[dict[str, torch.Tensor]] = [{} for _ in range(self.capacity)]
         self._completion_events: list[dict[str, torch.cuda.Event]] = [
-            {} for _ in range(self.ring_depth)
+            {} for _ in range(self.capacity)
         ]
-        self._cursor = 0
+        self._generations = [0] * self.capacity
+        self._active = [False] * self.capacity
+        self._vacant = deque(range(self.capacity))
+        self._available: deque[int] = deque()
+        self._pending: deque[int] = deque()
         self._pin_memory_supported = True
 
     def acquire(self, device: torch.device | str) -> TensorStagingSlot:
         target = canonical_device(device)
-        index = self._cursor
-        self._cursor = (self._cursor + 1) % self.ring_depth
-        if target.type == "cuda":
-            event = self._completion_events[index].get(str(target))
-            if event is not None:
-                event.synchronize()
-        return TensorStagingSlot(self, self._slots[index], index)
+        self._reclaim_ready(_QUERY_BUDGET)
+        if self._available:
+            index = self._available.popleft()
+        elif self._vacant:
+            index = self._vacant.popleft()
+        else:
+            self._reclaim_ready(len(self._pending))
+            if not self._available:
+                raise resource_error(f"staging storage for {target} has no query-ready generation")
+            index = self._available.popleft()
+        generation = self._generations[index] + 1
+        if generation > (1 << 32) - 1:
+            generation = 1
+        self._generations[index] = generation
+        self._active[index] = True
+        return TensorStagingSlot(self, self._slots[index], index, generation)
 
     def mark_submitted(
         self,
@@ -69,21 +85,35 @@ class TensorStager:
         device: torch.device | str,
     ) -> None:
         target = canonical_device(device)
-        if target.type != "cuda":
-            return
         if (
             slot.stager is not self
             or slot.index < 0
-            or slot.index >= self.ring_depth
+            or slot.index >= self.capacity
             or slot.buffers is not self._slots[slot.index]
+            or not self._active[slot.index]
+            or slot.generation != self._generations[slot.index]
         ):
-            raise ValueError("staging slot does not belong to this stager")
+            raise ValueError("staging slot is not the active generation owned by this stager")
+        self._active[slot.index] = False
+        if target.type != "cuda":
+            self._available.append(slot.index)
+            return
         events = self._completion_events[slot.index]
         event = events.get(str(target))
         if event is None:
-            event = torch.cuda.Event()
+            event = torch.cuda.Event(blocking=False)
             events[str(target)] = event
         event.record(torch.cuda.current_stream(target))
+        self._pending.append(slot.index)
+
+    def _reclaim_ready(self, budget: int) -> None:
+        for _ in range(min(max(0, int(budget)), len(self._pending))):
+            index = self._pending.popleft()
+            events = self._completion_events[index]
+            if all(bool(event.query()) for event in events.values()):
+                self._available.append(index)
+            else:
+                self._pending.append(index)
 
     def _host_buffer(
         self,
@@ -139,6 +169,7 @@ class TensorStagingSlot:
     stager: TensorStager
     buffers: dict[str, torch.Tensor]
     index: int
+    generation: int
 
     def host_buffer(
         self,

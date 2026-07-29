@@ -6,8 +6,7 @@ import hashlib
 import math
 import time
 from collections import defaultdict
-from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
-
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from importlib import import_module
@@ -19,6 +18,7 @@ from uniserve_worker.batch import (
     Batch,
     CompletionRecord,
     CompletionReport,
+    Domain,
     DType,
     EncodeMode,
     FinishFlags,
@@ -101,6 +101,11 @@ from uniserve_worker.nn.diffusion.schedule import (
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.nn.vision.patching import patchify_batch, unpatchify_batch
 from uniserve_worker.runtime.adapter_store import AdapterStore
+from uniserve_worker.runtime.completion_store import (
+    CompletionArena,
+    CompletionCapture,
+    CompletionLease,
+)
 from uniserve_worker.runtime.execution_trace import (
     ExecutionPhase,
     ExecutionTrace,
@@ -244,55 +249,46 @@ class _SampleTask:
 
 @dataclass(frozen=True, slots=True)
 class _SampleResult:
-    token_id: int | _DeferredToken
+    token_id: int | _CompletionToken
     device_token: torch.Tensor | None
     logprob: float | None
     top_logprobs: tuple[tuple[int, float, int], ...] | None
     num_accepted_tokens: int = 0
 
 
-class _DeferredTokenBatch:
-    """One device token vector with one asynchronous pinned-host mirror."""
+class _CompletionTokenSpan:
+    """One token vector backed exclusively by host-observation storage."""
 
-    __slots__ = ("device_tokens", "host_tokens", "event", "count", "_values")
+    __slots__ = ("capture", "count", "_values")
 
-    def __init__(
-        self,
-        device_tokens: torch.Tensor,
-        host_tokens: torch.Tensor,
-        event: torch.cuda.Event | None,
-    ) -> None:
-        self.device_tokens = device_tokens
-        self.host_tokens = host_tokens
-        self.event = event
-        self.count = int(device_tokens.numel())
+    def __init__(self, capture: CompletionCapture) -> None:
+        self.capture = capture
+        self.count = int(capture.count)
         self._values: tuple[int, ...] | None = None
 
     def ready(self) -> bool:
-        return self._values is not None or self.event is None or bool(self.event.query())
+        return self._values is not None or self.capture.ready()
 
     def finalize(self) -> tuple[int, ...]:
         if self._values is None:
-            if self.event is not None:
-                self.event.synchronize()
-            self._values = tuple(int(value) for value in self.host_tokens[: self.count].tolist())
+            self._values = self.capture.values()
         return self._values
 
 
-class _DeferredToken:
+class _CompletionToken:
     """A protocol integer finalized only when the worker serializes its result."""
 
-    __slots__ = ("batch", "index")
+    __slots__ = ("span", "index")
 
-    def __init__(self, batch: _DeferredTokenBatch, index: int) -> None:
-        self.batch = batch
+    def __init__(self, span: _CompletionTokenSpan, index: int) -> None:
+        self.span = span
         self.index = int(index)
 
     def ready(self) -> bool:
-        return self.batch.ready()
+        return self.span.ready()
 
     def finalize(self) -> int:
-        return self.batch.finalize()[self.index]
+        return self.span.finalize()[self.index]
 
     def __int__(self) -> int:
         return self.finalize()
@@ -301,7 +297,7 @@ class _DeferredToken:
         return self.finalize()
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, _DeferredToken):
+        if isinstance(other, _CompletionToken):
             return self.finalize() == other.finalize()
         if isinstance(other, int):
             return self.finalize() == other
@@ -320,6 +316,7 @@ def _record_with_tokens(
     record: CompletionRecord,
     committed_tokens: tuple[int, ...],
     semantic_digest: object | None = None,
+    timing_counters: TimingCounters | None = None,
 ) -> CompletionRecord:
     """A ``CompletionRecord`` copy with concrete tokens (and optional digest).
 
@@ -336,49 +333,65 @@ def _record_with_tokens(
     set_field(copy, "committed_tokens", committed_tokens)
     if semantic_digest is not None:
         set_field(copy, "semantic_digest", semantic_digest)
+    if timing_counters is not None:
+        set_field(copy, "timing_counters", timing_counters)
     return copy
 
 
 class _PendingDigest:
-    """A semantic digest finalized only when its committed tokens are ready.
+    """A semantic digest finalized from a query-ready completion generation.
 
-    The digest hashes ``committed_tokens``, so computing it forces the sampled
-    token off the device (an ``int()`` that blocks on the copy event). Holding
-    it here keeps that host read off the decode critical path: ``execute``
-    returns with the digest deferred, and the worker finalizes it only when it
-    serializes the response -- by which point the next batch's forward has
-    already launched and the asynchronous token copy has completed, so the read
-    is instant. The parent semantic may itself be a :class:`_PendingDigest`
-    (a device-relay successor chains from its predecessor's not-yet-finalized
-    digest); resolution walks that chain, and the whole chain is finalized in
-    submission order as each response is serialized.
+    The digest includes committed tokens copied asynchronously into the pinned
+    completion arena. Resolution reads that host storage only after every copy
+    event reports ready, validates the physical slot generation, and releases
+    the observed row. A device-parent successor may retain its predecessor's
+    pending digest, so resolution follows the request lineage while unrelated
+    completions remain independently dispatchable.
     """
 
-    __slots__ = ("_record", "_parent", "_plan_digest", "_value")
+    __slots__ = (
+        "_record",
+        "_parent",
+        "_plan_digest",
+        "_lease",
+        "_row",
+        "_generation",
+        "_completion_timing",
+        "_value",
+        "_observed",
+    )
 
-    def __init__(self, record: CompletionRecord, parent: object, plan_digest: str) -> None:
+    def __init__(
+        self,
+        record: CompletionRecord,
+        parent: object,
+        plan_digest: str,
+        lease: CompletionLease,
+        row: int,
+    ) -> None:
         self._record = record
         self._parent = parent
         self._plan_digest = plan_digest
+        self._lease: CompletionLease | None = lease
+        self._row = int(row)
+        self._generation = int(record.completion_slot_generation)
+        self._completion_timing: tuple[int, int] | None = None
         self._value: str | None = None
+        self._observed = False
 
     def ready(self) -> bool:
         if self._value is not None:
             return True
         if isinstance(self._parent, _PendingDigest) and not self._parent.ready():
             return False
-        return all(
-            value.ready()
-            for value in self._record.committed_tokens
-            if isinstance(value, _DeferredToken)
-        )
+        return self._lease is not None and self._lease.ready()
 
     def resolve(self) -> str:
         if self._value is None:
+            if not self.ready():
+                raise RuntimeError("completion digest was resolved before query-ready")
             parent = (
-                self._parent.resolve()
-                if isinstance(self._parent, _PendingDigest)
-                else self._parent
+                self._parent.resolve() if isinstance(self._parent, _PendingDigest) else self._parent
             )
             # The digest packs each committed token via ``__index__``, which
             # finalizes a deferred token exactly as ``int(value)`` would, so
@@ -387,10 +400,20 @@ class _PendingDigest:
                 parent_semantic=cast(str, parent),
                 plan_digest=self._plan_digest,
             )
+            lease = self._lease
+            if lease is None:
+                raise RuntimeError("completion digest lost its arena lease")
+            self._completion_timing = lease.observe(self._row, self._generation)
+            self._observed = True
+            self._lease = None
         return self._value
 
     def __str__(self) -> str:
         return self.resolve()
+
+    def completion_timing(self) -> tuple[int, int]:
+        self.resolve()
+        return self._completion_timing or (0, 0)
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, _PendingDigest):
@@ -403,10 +426,15 @@ class _PendingDigest:
         return hash(self.resolve())
 
     def __deepcopy__(self, memo: dict[int, object]) -> _PendingDigest:
-        # A committed session snapshot shares the pending digest rather than
-        # copying its device-resident token mirror, mirroring SampledTokenRelay.
+        # A committed session snapshot shares ownership of the exact pinned
+        # completion generation and its lineage digest.
         memo[id(self)] = self
         return self
+
+    def __del__(self) -> None:
+        lease = self._lease
+        if lease is not None and not self._observed:
+            lease.discard(self._row, self._generation)
 
 
 def _record_ready(record: CompletionRecord) -> bool:
@@ -417,18 +445,28 @@ def _record_ready(record: CompletionRecord) -> bool:
         return digest.ready()
     return all(
         value.ready()
-        for value in record.committed_tokens
-        if isinstance(value, _DeferredToken)
+        for value in cast(tuple[object, ...], record.committed_tokens)
+        if isinstance(value, _CompletionToken)
     )
 
 
 def _finalized_record(record: CompletionRecord) -> CompletionRecord:
     digest = record.semantic_digest
-    resolved = digest.resolve() if isinstance(digest, _PendingDigest) else digest
+    if isinstance(digest, _PendingDigest):
+        resolved = digest.resolve()
+        copy_us, host_us = digest.completion_timing()
+        timing = replace(record.timing_counters, copy_us=copy_us, host_us=host_us)
+    else:
+        resolved = digest
+        timing = record.timing_counters
     tokens = tuple(int(value) for value in record.committed_tokens)
-    if resolved is record.semantic_digest and tokens == tuple(record.committed_tokens):
+    if (
+        resolved is record.semantic_digest
+        and tokens == tuple(record.committed_tokens)
+        and timing is record.timing_counters
+    ):
         return record
-    return _record_with_tokens(record, tokens, resolved)
+    return _record_with_tokens(record, tokens, resolved, timing)
 
 
 def completion_report_ready(report: CompletionReport) -> bool:
@@ -456,50 +494,6 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
     return replace(report, completions=completions)
 
 
-class _PinnedTokenRing:
-    """Bounded pinned mirrors matched to the worker execution pipeline depth."""
-
-    def __init__(self, depth: int, capacity: int) -> None:
-        self.depth = max(1, int(depth))
-        self.capacity = max(1, int(capacity))
-        self._slots: dict[
-            str, list[tuple[torch.Tensor, torch.cuda.Event, _DeferredTokenBatch | None]]
-        ] = {}
-        self._next: dict[str, int] = {}
-
-    def capture(self, tokens: torch.Tensor) -> _DeferredTokenBatch:
-        flat = tokens.reshape(-1)
-        if flat.device.type != "cuda":
-            host = flat.to(device="cpu")
-            return _DeferredTokenBatch(flat, host, None)
-        key = str(flat.device)
-        slots = self._slots.get(key)
-        if slots is None:
-            slots = [
-                (
-                    torch.empty(self.capacity, dtype=torch.long, device="cpu", pin_memory=True),
-                    torch.cuda.Event(blocking=False),
-                    None,
-                )
-                for _ in range(self.depth)
-            ]
-            self._slots[key] = slots
-            self._next[key] = 0
-        index = self._next[key]
-        host, event, owner = slots[index]
-        if owner is not None:
-            owner.finalize()
-        count = int(flat.numel())
-        if count > int(host.numel()):
-            raise RuntimeError("sampled-token mirror capacity is smaller than the sampling batch")
-        host[:count].copy_(flat, non_blocking=True)
-        event.record(torch.cuda.current_stream(flat.device))
-        captured = _DeferredTokenBatch(flat, host, event)
-        slots[index] = (host, event, captured)
-        self._next[key] = (index + 1) % self.depth
-        return captured
-
-
 _ExecutorTask: TypeAlias = _ForwardTask | _SampleTask
 _TaskResult: TypeAlias = tuple[Any, ...]
 _Driver: TypeAlias = Generator[tuple[_ExecutorTask, ...], _TaskResult, "_Outcome"]
@@ -508,6 +502,7 @@ _Driver: TypeAlias = Generator[tuple[_ExecutorTask, ...], _TaskResult, "_Outcome
 @dataclass(slots=True)
 class _ExecutionScope:
     transaction: StepTxn
+    completion: CompletionLease
     kv: KvTxn
     latents: LatentTxn
     latent_view: LatentTxnView
@@ -529,11 +524,11 @@ class _ExecutionScope:
 class _Outcome:
     """The selected result of one operation, projected onto its completion record.
 
-    ``committed_tokens`` are the semantic tokens the sampler actually selected
-    (read host-side through the greedy device relay), which enter the semantic
-    digest. ``products`` are the operation's non-semantic host-facing payloads
-    (a materialized image artifact, requested logprobs) that ride the completion
-    report addressed by their product reference.
+    ``committed_tokens`` are the semantic tokens the sampler selected and copied
+    to completion storage for the semantic digest. ``products`` are the
+    operation's non-semantic host-facing payloads (a materialized image artifact,
+    requested logprobs) carried by the completion report under their product
+    references.
     """
 
     status: OpStatus
@@ -542,7 +537,7 @@ class _Outcome:
     token_span: TokenSpan
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
-    committed_tokens: tuple[int | _DeferredToken, ...] = ()
+    committed_tokens: tuple[int | _CompletionToken, ...] = ()
     products: tuple[ProductPayload, ...] = ()
 
 
@@ -624,8 +619,17 @@ class ModelExecutor:
         self.trace = trace
         self.defer_sampling = bool(defer_sampling)
         max_operations = 1024 if deployment is None else int(deployment.max_batch_operations)
-        self._token_mirrors = _PinnedTokenRing(pipeline_depth, max_operations)
-        self._tensor_stager = TensorStager(ring_depth=pipeline_depth)
+        completion_devices: list[str] = []
+        if deployment is not None:
+            completion_devices.append(deployment.device)
+            if deployment.generation_device is not None:
+                completion_devices.append(deployment.generation_device)
+        self._completions = CompletionArena(
+            depth=pipeline_depth,
+            token_capacity=max_operations,
+            devices=tuple(completion_devices),
+        )
+        self._tensor_stager = TensorStager(capacity=pipeline_depth * max_operations)
         self._routes = {} if spec is None else {route.name: route for route in spec.routes}
 
     def execute(self, batch: Batch) -> CompletionReport:
@@ -670,6 +674,10 @@ class ModelExecutor:
             )
             return report
 
+        completion = self._completions.reserve(
+            len(batch.operations),
+            devices=self._completion_devices(batch.operations),
+        )
         transaction_started = time.perf_counter_ns()
         try:
             transaction = self.sessions.begin_step(
@@ -684,6 +692,7 @@ class ModelExecutor:
                 duration_us=(time.perf_counter_ns() - transaction_started) // 1000,
                 error=error,
             )
+            completion.abandon()
             raise
         self.trace.emit(
             ExecutionPhase.TRANSACTION_OPEN,
@@ -692,6 +701,7 @@ class ModelExecutor:
         )
         scope = _ExecutionScope(
             transaction=transaction,
+            completion=completion,
             kv=cast(KvTxn, transaction.store_transaction(self.kv)),
             latents=cast(LatentTxn, transaction.store_transaction(self.latents)),
             latent_view=cast(LatentTxn, transaction.store_transaction(self.latents)).view(),
@@ -709,6 +719,7 @@ class ModelExecutor:
             self._reserve_outputs(batch.operations, scope)
             self._stage_input_products(batch, scope)
             outcomes = self._execute_operations(batch.operations, scope)
+            completion.seal()
             self.trace.emit(
                 ExecutionPhase.POSTPROCESS,
                 operations,
@@ -718,7 +729,9 @@ class ModelExecutor:
             committed: dict[int, VersionRef] = {}
             report_products: list[ProductPayload] = []
             pending_by_session: dict[int, _PendingDigest] = {}
-            for operation, outcome in zip(batch.operations, outcomes, strict=True):
+            for row, (operation, outcome) in enumerate(
+                zip(batch.operations, outcomes, strict=True)
+            ):
                 report_products.extend(outcome.products)
                 session = self.sessions.get(operation.request_key.session_id)
                 # The base point and parent semantic come from the fixed parent
@@ -729,32 +742,36 @@ class ModelExecutor:
                 placeholder = CompletionRecord(
                     request_key=operation.request_key,
                     op_id=operation.op_id,
-                    completion_slot_generation=0,
+                    completion_slot_generation=completion.generation,
                     status=outcome.status,
                     selected_point=base_point + (1 if operation.advances_state else 0),
                     logical_lengths=outcome.logical_lengths,
                     token_span=outcome.token_span,
-                    committed_tokens=outcome.committed_tokens,
+                    committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
                     finish_flags=outcome.finish_flags,
                     product_generations=outcome.product_generations,
                     semantic_digest="0" * 64,
                     error_code=None,
                     timing_counters=TimingCounters(),
                 )
-                # Defer the digest: computing it hashes ``committed_tokens``,
-                # which forces the sampled token off the device. The pending
-                # digest carries the same inputs (parent semantic, plan digest,
-                # every record field) and computes byte-identical bytes later,
-                # off the decode critical path -- when the response is serialized
-                # (or opportunistically below once the copy has landed).
-                pending = _PendingDigest(placeholder, parent_semantic, operation.plan_digest)
-                record = replace(placeholder, semantic_digest=pending)
+                # The digest includes ``committed_tokens`` and is therefore
+                # finalized from the pinned completion row after query-only
+                # readiness, either opportunistically here or in the progress
+                # loop before response serialization.
+                pending = _PendingDigest(
+                    placeholder,
+                    parent_semantic,
+                    operation.plan_digest,
+                    completion,
+                    row,
+                )
+                record = replace(placeholder, semantic_digest=cast(str, pending))
                 records.append(record)
                 if operation.advances_state:
                     committed[operation.request_key.session_id] = VersionRef(
                         request_key=operation.request_key,
                         producer_op_id=operation.op_id,
-                        point=FixedPoint(base_point + 1, pending),
+                        point=FixedPoint(base_point + 1, cast(str, pending)),
                     )
                     pending_by_session[operation.request_key.session_id] = pending
                 else:
@@ -771,14 +788,9 @@ class ModelExecutor:
                 report,
                 lambda publish: transaction.commit(committed, publish),
             )
-            # transaction.commit set each advancing session's committed digest to
-            # its pending digest. Finalize whatever is already ready so a
-            # synchronous caller -- and any fixed-parent successor reading the
-            # session's committed digest -- observes concrete values without ever
-            # blocking. On the decode critical path nothing is ready yet (the
-            # copy was just launched), so the digest and committed tokens stay
-            # deferred until the worker serializes this response, by which point
-            # the next batch's forward has launched and the copy has landed.
+            # Finalize every row already detected ready. Other rows remain owned
+            # by their completion generations and are revisited by the progress
+            # loop without blocking execution or unrelated response dispatch.
             for session_id, pending in pending_by_session.items():
                 if pending.ready():
                     self.sessions.get(session_id).committed_digest = pending.resolve()
@@ -791,6 +803,7 @@ class ModelExecutor:
             return report
         except BaseException as error:
             transaction.rollback()
+            completion.abandon()
             self._release_locators(scope.published)
             self.trace.emit(
                 ExecutionPhase.ROLLBACK,
@@ -809,9 +822,22 @@ class ModelExecutor:
         for operation in batch.operations:
             operation_type = work_operation_type(operation.work)
             if operation_type not in self.allowed_operation_types:
-                raise unsupported_operation(
-                    operation_type.value, operation.request_key.session_id
-                )
+                raise unsupported_operation(operation_type.value, operation.request_key.session_id)
+
+    def _completion_devices(self, operations: tuple[Operation, ...]) -> tuple[str, ...]:
+        deployment = self.deployment
+        if deployment is None:
+            return ()
+        selected: list[str] = []
+        for operation in operations:
+            device = (
+                deployment.generation_device
+                if operation.domain is Domain.GEN and deployment.generation_device is not None
+                else deployment.device
+            )
+            if device not in selected:
+                selected.append(device)
+        return tuple(selected)
 
     def _reserve_outputs(
         self,
@@ -844,9 +870,7 @@ class ModelExecutor:
 
         for operation in operations:
             if operation.new_kv_blocks:
-                scope.kv.append_kv_blocks(
-                    operation.request_key.session_id, operation.new_kv_blocks
-                )
+                scope.kv.append_kv_blocks(operation.request_key.session_id, operation.new_kv_blocks)
 
     def _stage_input_products(self, batch: Batch, scope: _ExecutionScope) -> None:
         """Bind host-supplied input product values into the step product store.
@@ -959,7 +983,7 @@ class ModelExecutor:
                 strict=True,
             )
         )
-        samples = _sample_task_batch(sample_tasks, self._token_mirrors)
+        samples = _sample_task_batch(sample_tasks, scope.completion)
         _record_component(scope, "text_sample", sample_started)
         finalize_started = time.perf_counter_ns()
         outcomes: list[_Outcome] = []
@@ -982,9 +1006,7 @@ class ModelExecutor:
         _record_component(scope, "text_finalize", finalize_started)
         return tuple(outcomes)
 
-    def _drive(
-        self, drivers: tuple[_Driver, ...], scope: _ExecutionScope
-    ) -> tuple[_Outcome, ...]:
+    def _drive(self, drivers: tuple[_Driver, ...], scope: _ExecutionScope) -> tuple[_Outcome, ...]:
         active: dict[int, tuple[_Driver, tuple[_ExecutorTask, ...]]] = {}
         completed: dict[int, _Outcome] = {}
         for index, driver in enumerate(drivers):
@@ -1042,7 +1064,7 @@ class ModelExecutor:
             indexes, sample_tasks = zip(*sampling, strict=True)
             for index, sample_output in zip(
                 indexes,
-                _sample_task_batch(tuple(sample_tasks), self._token_mirrors),
+                _sample_task_batch(tuple(sample_tasks), scope.completion),
                 strict=True,
             ):
                 result[index] = sample_output
@@ -1109,16 +1131,14 @@ class ModelExecutor:
         route = tasks[0].route
         device = self._route_device(route)
         target = torch.device(device)
-        staging_slot = self._tensor_stager.acquire(target)
+        scope.completion.register_device(target)
         weights = self._weights(self.sessions.get(tasks[0].operation.request_key.session_id))
         if any(
             self._weights(self.sessions.get(task.operation.request_key.session_id)) is not weights
             for task in tasks
         ):
             if any(
-                self._weights(
-                    self.sessions.get(task.operation.request_key.session_id)
-                ).digest
+                self._weights(self.sessions.get(task.operation.request_key.session_id)).digest
                 != weights.digest
                 or self._weights(self.sessions.get(task.operation.request_key.session_id)).version
                 != weights.version
@@ -1129,9 +1149,10 @@ class ModelExecutor:
         kv_tasks = tuple(task for task in tasks if task.write_kv)
         if kv_tasks and len(kv_tasks) != len(tasks):
             raise invalid_descriptor("one physical route cannot mix KV and non-KV rows")
-        kv_view: KvView | EmptyKvView
-        attention: AttnPlan
+        staging_slot = self._tensor_stager.acquire(target)
         try:
+            kv_view: KvView | EmptyKvView
+            attention: AttnPlan
             if kv_tasks:
                 kv_view, attention = self._attention_plan(
                     tasks,
@@ -1142,75 +1163,75 @@ class ModelExecutor:
             else:
                 kv_view = EmptyKvView()
                 attention = NoAttention(backends=self._attention_selection())
+            mesh = EmptyMeshView() if self.mesh is None else self.mesh.view(route.topology_axes)
+            context = ForwardContext(
+                kv=kv_view,
+                latent=scope.latent_view
+                if any(isinstance(task.row, FlowRow) for task in tasks)
+                else EmptyLatentView(),
+                attention=attention,
+                mesh=mesh,
+                output=EmptyOutputView(),
+            )
+            graph_shape = self._hard_shape_key(route, tasks[0].row)
+            graph_key = GraphKey(
+                model_revision=cast(ModelSpec, self.spec).revision or cast(str, self.weight_digest),
+                spec_digest=cast(str, self.model_spec_digest),
+                route=RouteId(route.name),
+                shape=graph_shape,
+                dtype=route.dtype,
+                backend=self._attention_selection().identity,
+                topology=self._topology_key(route),
+            )
+            slots = tuple(
+                OutputSlot(
+                    task.row.row_id,
+                    task.row.output_slot,
+                    _output_kind(task.row),
+                    (
+                        cast(FlowSpec, cast(ModelSpec, self.spec).flow).prediction_dtype
+                        if isinstance(task.row, FlowRow)
+                        else route.dtype
+                    ),
+                )
+                for task in tasks
+            )
+            plan = ForwardPlan(
+                route=RouteId(route.name),
+                rows=tuple(task.row for task in tasks),
+                context=context,
+                outputs=slots,
+                transaction=TransactionId(
+                    tuple(
+                        (
+                            task.operation.request_key.session_id,
+                            task.operation.request_key.epoch,
+                            task.operation.op_id,
+                        )
+                        for task in tasks
+                    ),
+                    tuple(task.base_point for task in tasks),
+                ),
+                graph_key=graph_key,
+                graph_eligible=route.graph_eligible,
+                device=device,
+                weights=weights,
+                staging_slot=staging_slot,
+            )
+            row_counts: dict[str, int] = {}
+            for task in tasks:
+                name = task.row_kind.value
+                row_counts[name] = row_counts.get(name, 0) + 1
+            self.trace.emit(
+                ExecutionPhase.PLAN_CREATION,
+                _trace_envelopes(tuple(task.operation for task in tasks)),
+                route=route.name,
+                row_kind_counts=row_counts,
+            )
+            return plan
         except BaseException:
             self._tensor_stager.mark_submitted(staging_slot, target)
             raise
-        mesh = EmptyMeshView() if self.mesh is None else self.mesh.view(route.topology_axes)
-        context = ForwardContext(
-            kv=kv_view,
-            latent=scope.latent_view
-            if any(isinstance(task.row, FlowRow) for task in tasks)
-            else EmptyLatentView(),
-            attention=attention,
-            mesh=mesh,
-            output=EmptyOutputView(),
-        )
-        graph_shape = self._hard_shape_key(route, tasks[0].row)
-        graph_key = GraphKey(
-            model_revision=cast(ModelSpec, self.spec).revision or cast(str, self.weight_digest),
-            spec_digest=cast(str, self.model_spec_digest),
-            route=RouteId(route.name),
-            shape=graph_shape,
-            dtype=route.dtype,
-            backend=self._attention_selection().identity,
-            topology=self._topology_key(route),
-        )
-        slots = tuple(
-            OutputSlot(
-                task.row.row_id,
-                task.row.output_slot,
-                _output_kind(task.row),
-                (
-                    cast(FlowSpec, cast(ModelSpec, self.spec).flow).prediction_dtype
-                    if isinstance(task.row, FlowRow)
-                    else route.dtype
-                ),
-            )
-            for task in tasks
-        )
-        plan = ForwardPlan(
-            route=RouteId(route.name),
-            rows=tuple(task.row for task in tasks),
-            context=context,
-            outputs=slots,
-            transaction=TransactionId(
-                tuple(
-                    (
-                        task.operation.request_key.session_id,
-                        task.operation.request_key.epoch,
-                        task.operation.op_id,
-                    )
-                    for task in tasks
-                ),
-                tuple(task.base_point for task in tasks),
-            ),
-            graph_key=graph_key,
-            graph_eligible=route.graph_eligible,
-            device=device,
-            weights=weights,
-            staging_slot=staging_slot,
-        )
-        row_counts: dict[str, int] = {}
-        for task in tasks:
-            name = task.row_kind.value
-            row_counts[name] = row_counts.get(name, 0) + 1
-        self.trace.emit(
-            ExecutionPhase.PLAN_CREATION,
-            _trace_envelopes(tuple(task.operation for task in tasks)),
-            route=route.name,
-            row_kind_counts=row_counts,
-        )
-        return plan
 
     def _attention_plan(
         self,
@@ -1638,7 +1659,7 @@ class ModelExecutor:
         *,
         base: int,
         tokens: int,
-        committed_tokens: tuple[int, ...],
+        committed_tokens: tuple[int | _CompletionToken, ...],
     ) -> _Outcome:
         length = self.kv.get(operation.request_key.session_id).length
         return _Outcome(
@@ -1827,9 +1848,7 @@ class ModelExecutor:
         image = session.image
         if image is None:
             raise invalid_descriptor("flow operation has no admitted image parameters")
-        latent_handle = _stable_handle(
-            session_id, operation.request_key.epoch, 0, "latent"
-        )
+        latent_handle = _stable_handle(session_id, operation.request_key.epoch, 0, "latent")
         start_step = session.flow_step
         remaining = int(image.steps) - start_step
         step_count = (
@@ -2947,9 +2966,7 @@ class ModelExecutor:
             ProductRecord(
                 handle=handle,
                 session_id=session_id,
-                payload=FrameCollectionProduct(
-                    (*frames, EncodedImageProduct(png_base64))
-                ),
+                payload=FrameCollectionProduct((*frames, EncodedImageProduct(png_base64))),
             )
         )
         self.sessions.get(session_id).product_handles.add(handle)
@@ -3363,11 +3380,10 @@ def _plain_greedy_row(row: _SamplingRow) -> bool:
 @torch.inference_mode()
 def _sample_task_batch(
     tasks: Sequence[_SampleTask],
-    token_mirrors: _PinnedTokenRing | None = None,
+    completion: CompletionLease | None = None,
 ) -> tuple[_SampleResult, ...]:
     """Shape and draw every compatible sampling row in each device batch."""
 
-    mirrors = token_mirrors or _PinnedTokenRing(1, max(1, len(tasks)))
     grouped: dict[tuple[torch.device, int, int, int], list[tuple[int, _SampleTask]]] = defaultdict(
         list
     )
@@ -3444,7 +3460,7 @@ def _sample_task_batch(
     for (_device, _vocab, sampling_path, _penalty_width), compatible in grouped.items():
         indexes, group = zip(*compatible, strict=True)
         if sampling_path == -1:
-            sampled_group = _sample_plain_greedy_group(tuple(group), mirrors)
+            sampled_group = _sample_plain_greedy_group(tuple(group), completion)
         elif sampling_path > 0:
             sampled_group = _sample_fused_top_k_group(tuple(group), sampling_path)
         else:
@@ -3456,7 +3472,7 @@ def _sample_task_batch(
 
 def _sample_plain_greedy_group(
     tasks: tuple[_SampleTask, ...],
-    token_mirrors: _PinnedTokenRing,
+    completion: CompletionLease | None,
 ) -> tuple[_SampleResult, ...]:
     logits = packed_tensor_views(tuple(task.logits for task in tasks))
     if logits is None:
@@ -3464,13 +3480,28 @@ def _sample_plain_greedy_group(
     else:
         logits = logits.reshape(len(tasks), -1)
     device_tokens = torch.argmax(logits, dim=-1)
-    mirror = token_mirrors.capture(device_tokens)
-    host_tokens = mirror.finalize() if any(not task.defer_host_token for task in tasks) else None
+    defer = all(task.defer_host_token for task in tasks)
+    if defer:
+        owns_completion = completion is None
+        if completion is None:
+            arena = CompletionArena(
+                depth=1,
+                token_capacity=max(1, len(tasks)),
+                devices=((device_tokens.device,) if device_tokens.device.type == "cuda" else ()),
+            )
+            completion = arena.reserve(len(tasks))
+        span = _CompletionTokenSpan(completion.capture(device_tokens))
+        if owns_completion:
+            completion.seal()
+        host_tokens = None
+    else:
+        span = None
+        host_tokens = tuple(int(value) for value in device_tokens.to(device="cpu").tolist())
     return tuple(
         _SampleResult(
             token_id=(
-                _DeferredToken(mirror, index)
-                if task.defer_host_token
+                _CompletionToken(cast(_CompletionTokenSpan, span), index)
+                if defer
                 else cast(tuple[int, ...], host_tokens)[index]
             ),
             device_token=device_tokens[index : index + 1],

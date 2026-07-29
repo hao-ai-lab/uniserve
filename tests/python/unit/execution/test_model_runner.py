@@ -43,7 +43,7 @@ from uniserve_worker.forward import (
     packed_token_ids,
     packed_token_positions,
 )
-from uniserve_worker.foundation.errors import ComputeError, InputError
+from uniserve_worker.foundation.errors import ComputeError, InputError, ResourceError
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.runtime.execution_trace import ExecutionTrace
 from uniserve_worker.runtime.graph_store import (
@@ -487,7 +487,7 @@ def test_token_staging_packs_mixed_host_and_device_rows():
             selection=TokenSelection.HIDDEN,
         ),
     )
-    stager = TensorStager(ring_depth=2)
+    stager = TensorStager(capacity=2)
 
     staged = _stage_rows(rows, device, stager.acquire(device))
     token_rows = tuple(row for row in staged if isinstance(row, TokenRow))
@@ -498,6 +498,36 @@ def test_token_staging_packs_mixed_host_and_device_rows():
     assert positions is not None
     torch.testing.assert_close(ids.cpu(), torch.tensor([11, 17]), rtol=0, atol=0)
     torch.testing.assert_close(positions.cpu(), torch.tensor([3, 9]), rtol=0, atol=0)
+
+
+def test_staging_capacity_becomes_available_after_event_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[SimpleNamespace] = []
+
+    def event_factory(*, blocking: bool) -> SimpleNamespace:
+        event = SimpleNamespace(
+            blocking=blocking,
+            ready=False,
+            record=lambda _stream: None,
+        )
+        event.query = lambda: event.ready
+        events.append(event)
+        return event
+
+    monkeypatch.setattr(torch.cuda, "Event", event_factory)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: object())
+    device = torch.device("cuda:0")
+    stager = TensorStager(capacity=1)
+    first = stager.acquire(device)
+    stager.mark_submitted(first, device)
+
+    with pytest.raises(ResourceError):
+        stager.acquire(device)
+
+    events[0].ready = True
+    successor = stager.acquire(device)
+    assert successor.generation != first.generation
 
 
 def test_graph_residency_stops_growing_with_batch_shape_diversity(monkeypatch):

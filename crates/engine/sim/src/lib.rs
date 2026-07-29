@@ -379,7 +379,7 @@ impl SimEngine {
         let mut record = CompletionRecord {
             request_key: operation.request_key,
             op_id: operation.op_id,
-            completion_slot_generation: 0,
+            completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
             status: OpStatus::Ok,
             selected_point,
             logical_lengths: LogicalLengths::default(),

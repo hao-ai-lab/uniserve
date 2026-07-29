@@ -117,7 +117,6 @@ class ModelRunner:
             if input_failure is error:
                 raise
             raise input_failure from error
-        _mark_staging_submitted(plan)
         calls = 0
 
         def invoke(value: ForwardBatch) -> ForwardOutput:
@@ -153,6 +152,7 @@ class ModelRunner:
                 output = graph_run.output
                 graph_path = graph_run.path
         except Exception as error:
+            _mark_staging_submitted(plan)
             self.trace.emit(
                 ExecutionPhase.FORWARD_COMPLETION,
                 operations,
@@ -165,6 +165,7 @@ class ModelRunner:
             if execution_failure is error:
                 raise
             raise execution_failure from error
+        _mark_staging_submitted(plan)
         try:
             output.validate_for(batch)
             _validate_tensors(batch, output, plan.outputs, torch.device(plan.device))

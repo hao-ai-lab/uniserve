@@ -2241,6 +2241,8 @@ impl Scheduler {
                     "transition_encoder_pins": transition.resources.encoder_pins.len(),
                     "transition_replayability": transition.resources.replayability_after_apply.as_str(),
                     "roundtrip_us": roundtrip_us,
+                    "completion_copy_us": record.timing_counters.copy_us,
+                    "completion_ready_to_observed_us": record.timing_counters.host_us,
                     "sampled_token": sampled_token_ids_last.is_some(),
                     "sampled_token_ids_len": sampled_token_ids_len,
                     "sampled_token_ids_last": sampled_token_ids_last,
@@ -2264,6 +2266,8 @@ impl Scheduler {
                 ev.op_kind = Some(operation_variant.as_wire_str());
                 ev.roundtrip_us = roundtrip_us;
                 ev.worker_us = worker_us;
+                ev.completion_copy_us = record.timing_counters.copy_us;
+                ev.completion_ready_to_observed_us = record.timing_counters.host_us;
                 st.trace.push(ev);
             }
             if let Err(error) = transition.validate_result(&record, &products) {

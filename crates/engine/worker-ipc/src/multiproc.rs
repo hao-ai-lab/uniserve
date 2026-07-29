@@ -1005,7 +1005,7 @@ mod tests {
         CompletionRecord {
             request_key: RequestKey::new(1, RequestId(7), 1),
             op_id: OpId(op.max(1)),
-            completion_slot_generation: 0,
+            completion_slot_generation: 1,
             status: OpStatus::Ok,
             selected_point: 0,
             logical_lengths: LogicalLengths::default(),

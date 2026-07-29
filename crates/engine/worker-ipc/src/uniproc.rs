@@ -21,6 +21,10 @@ use uniserve_worker_wire::{
 
 use crate::death_watch::DeathWatcher;
 
+fn enqueue_ready(ready: &mut VecDeque<CompletionReport>, report: CompletionReport) {
+    ready.push_back(report);
+}
+
 /// Deadline for the initial worker connect / caps handshake, where the worker may still
 /// be loading a large model and the IPC server may not yet be connected.
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -683,12 +687,7 @@ impl UniprocExecutor {
                         r.step_id
                     );
                 }
-                let pos = self
-                    .ready
-                    .iter()
-                    .position(|ready| ready.step_id > r.step_id)
-                    .unwrap_or(self.ready.len());
-                self.ready.insert(pos, r);
+                enqueue_ready(&mut self.ready, r);
                 Ok(())
             }
             ResponseKind::Error => {
@@ -1018,8 +1017,20 @@ fn effective_worker_pipeline_depth(requested: usize, tp_size: u32) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_worker_pipeline_depth, nano_id};
-    use std::collections::HashSet;
+    use super::{effective_worker_pipeline_depth, enqueue_ready, nano_id};
+    use std::collections::{HashSet, VecDeque};
+    use uniserve_worker_wire::{CompletionReport, RegistrationAck};
+
+    fn report(step_id: u64) -> CompletionReport {
+        CompletionReport {
+            step_id,
+            completions: Vec::new(),
+            products: Vec::new(),
+            registration: RegistrationAck::default(),
+            worker_exec_us: None,
+            forward_stats: None,
+        }
+    }
 
     #[test]
     fn nano_id_is_unique_within_a_tight_loop() {
@@ -1040,5 +1051,15 @@ mod tests {
         assert_eq!(effective_worker_pipeline_depth(0, 1), 1);
         assert_eq!(effective_worker_pipeline_depth(4, 2), 1);
         assert_eq!(effective_worker_pipeline_depth(4, 8), 1);
+    }
+
+    #[test]
+    fn ready_reports_preserve_worker_readiness_order() {
+        let mut ready = VecDeque::new();
+        enqueue_ready(&mut ready, report(9));
+        enqueue_ready(&mut ready, report(4));
+
+        assert_eq!(ready.pop_front().map(|value| value.step_id), Some(9));
+        assert_eq!(ready.pop_front().map(|value| value.step_id), Some(4));
     }
 }

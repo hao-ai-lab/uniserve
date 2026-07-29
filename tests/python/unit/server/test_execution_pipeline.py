@@ -84,3 +84,25 @@ def test_pipeline_launches_to_depth_before_finalizing_the_oldest_response() -> N
         "respond:2",
         "respond:3",
     ]
+
+
+def test_pipeline_dispatches_a_later_query_ready_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[str] = []
+    server = _Server(actions)
+    loop = WorkerServeLoop(server, _Endpoint(()))  # type: ignore[arg-type]
+    loop.inflight.extend(
+        (
+            ({"call_id": 1}, {"call_id": 1, "ready": False}),
+            ({"call_id": 2}, {"call_id": 2, "ready": True}),
+        )
+    )
+    monkeypatch.setattr(
+        "uniserve_worker.server.app._response_ready",
+        lambda response: bool(response["ready"]),
+    )
+
+    assert loop._respond_ready()
+    assert actions == ["respond:2"]
+    assert [int(response["call_id"]) for _request, response in loop.inflight] == [1]
