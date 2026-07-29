@@ -694,6 +694,10 @@ impl CompletionRecord {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.op_id.0 > 0, "completion op id must be positive");
         anyhow::ensure!(
+            self.completion_slot_generation > 0,
+            "completion slot generation must be positive"
+        );
+        anyhow::ensure!(
             is_digest(&self.semantic_digest),
             "completion semantic digest is not a lowercase SHA-256 digest"
         );

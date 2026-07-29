@@ -1276,6 +1276,8 @@ class CompletionRecord:
     def validate(self) -> None:
         if self.op_id < 1:
             raise invalid_descriptor("completion op id must be positive")
+        if self.completion_slot_generation < 1:
+            raise invalid_descriptor("completion slot generation must be positive")
         if not _is_digest(self.semantic_digest):
             raise invalid_descriptor("completion semantic digest is not a lowercase SHA-256 digest")
         if self.status is OpStatus.ERROR:

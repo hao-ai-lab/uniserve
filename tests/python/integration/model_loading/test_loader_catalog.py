@@ -33,6 +33,11 @@ from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.nn.layer import LayerSpec
 from uniserve_worker.nn.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear
 from uniserve_worker.nn.mesh import TensorParallelSpec
+from uniserve_worker.nn.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+    zero_vocab_padding,
+)
 from uniserve_worker.spec import (
     ModelLoadScope,
     Quantize,
@@ -110,6 +115,24 @@ def test_qwen_checkpoint_load_resolves_immutable_weight_and_spec_identity(tmp_pa
         config,
         layer_spec=LayerSpec(parallel=_parallel(), quantization=None),
     )
+    with torch.no_grad():
+        for index, parameter in enumerate(reference.parameters(), start=1):
+            parameter.fill_(index / 16)
+        for module in reference.modules():
+            if isinstance(module, VocabParallelEmbedding):
+                zero_vocab_padding(
+                    module.num_embeddings,
+                    module.vocab_start_index,
+                    module.num_embeddings_per_partition,
+                    module.weight,
+                )
+            elif isinstance(module, ParallelLMHead):
+                zero_vocab_padding(
+                    module.vocab_size,
+                    module.vocab_start_index,
+                    module.output_size,
+                    module.weight,
+                )
     checkpoint = {name: value.detach().contiguous() for name, value in reference.state_dict().items()}
     save_file(checkpoint, tmp_path / "model.safetensors")
     request = WorkerModelLoadRequest(

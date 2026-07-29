@@ -27,6 +27,10 @@ pub struct TraceEvent {
     pub roundtrip_us: u64,
     /// Worker-reported compute time for the op's batch, microseconds.
     pub worker_us: u64,
+    /// Device-to-pinned-host completion copy readiness, microseconds.
+    pub completion_copy_us: u64,
+    /// Query-ready detection to host observation, microseconds.
+    pub completion_ready_to_observed_us: u64,
     pub finish_reason: Option<&'static str>,
 }
 
@@ -39,6 +43,8 @@ impl TraceEvent {
             step_id: 0,
             roundtrip_us: 0,
             worker_us: 0,
+            completion_copy_us: 0,
+            completion_ready_to_observed_us: 0,
             finish_reason: None,
         }
     }

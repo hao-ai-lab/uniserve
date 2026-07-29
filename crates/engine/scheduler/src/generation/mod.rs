@@ -2215,7 +2215,7 @@ mod tests {
         CompletionRecord {
             request_key,
             op_id: OpId(op_id),
-            completion_slot_generation: 0,
+            completion_slot_generation: 1,
             status: OpStatus::Ok,
             selected_point,
             logical_lengths: LogicalLengths {

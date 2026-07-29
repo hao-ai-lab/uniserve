@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 
 from torch import nn
@@ -10,6 +11,7 @@ from torch import nn
 from ..batch import Batch, CompletionReport
 from ..capabilities import RequestKind
 from ..execution import ModelExecutor, ModelRunner
+from ..execution.executor import completion_report_ready, finalize_completion_report
 from ..forward import AttentionSelection
 from ..foundation.errors import capability_mismatch
 from ..foundation.runtime_config import ExecutionConfig, graph_memory_budget_bytes
@@ -176,16 +178,12 @@ class ModelWorker:
                 adapters=self.adapter_store,
                 transport=self.mover.transport,
             )
-            restored = (
-                self.snapshot_provider.restore_latest() if restore_snapshots else ()
-            )
+            restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
             self._contract = replace(
                 self._contract,
                 capabilities=replace(
                     self._contract.capabilities,
-                    restored_sessions=tuple(
-                        sorted(reference.session_id for reference in restored)
-                    ),
+                    restored_sessions=tuple(sorted(reference.session_id for reference in restored)),
                 ),
             )
             logger.info("restored %d durable worker sessions", len(restored))
@@ -221,6 +219,12 @@ class ModelWorker:
                 result,
             )
         return result
+
+    def _execute_warmup(self, batch: Batch) -> CompletionReport:
+        report = self.executor.execute(batch)
+        while not completion_report_ready(report):
+            time.sleep(0.00005)
+        return finalize_completion_report(report)
 
     def warmup(self) -> None:
         """Pay first-use kernel JIT before the worker is reachable.
@@ -382,13 +386,11 @@ class ModelWorker:
             for sid in session_ids:
                 root = VersionRef(keys[sid], 0, FixedPoint(0, admissions[sid].digest))
                 op_ids[sid] += 1
-                operation, payload = token_op(
-                    sid, op_ids[sid], root, TokenMode.EXTEND, (0,)
-                )
+                operation, payload = token_op(sid, op_ids[sid], root, TokenMode.EXTEND, (0,))
                 operations.append(operation)
                 payloads.append(payload)
             step_id += 1
-            self.executor.execute(
+            self._execute_warmup(
                 Batch(
                     step_id=step_id,
                     admissions=tuple(admissions[sid] for sid in session_ids),
@@ -398,9 +400,7 @@ class ModelWorker:
             )
             if OperationType.SEQUENCE_DECODE not in types:
                 return
-            repeats = (
-                2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
-            )
+            repeats = 2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
             for batch_size in batch_sizes:
                 selected = session_ids[:batch_size]
                 for _ in range(repeats):
@@ -415,7 +415,7 @@ class ModelWorker:
                         operations.append(operation)
                         payloads.append(payload)
                     step_id += 1
-                    self.executor.execute(
+                    self._execute_warmup(
                         Batch(
                             step_id=step_id,
                             admissions=(),
@@ -433,8 +433,6 @@ class ModelWorker:
 
     def _warmup_prefill_graphs(self) -> None:
         """Capture the paged-prefill CUDA graph for every configured token bucket."""
-
-        import torch
 
         from ..batch import (
             Admission,
@@ -488,7 +486,6 @@ class ModelWorker:
         if not token_buckets:
             return
         logger.info("warming %d paged-prefill CUDA graph token buckets", len(token_buckets))
-        device = torch.device(self.deployment.device)
         session_id = 0
         step_id = 0
         for token_count in token_buckets:
@@ -530,7 +527,7 @@ class ModelWorker:
                     inputs=(token_ref,),
                 )
                 try:
-                    self.executor.execute(
+                    self._execute_warmup(
                         Batch(
                             step_id=step_id,
                             admissions=(admission,),
@@ -543,8 +540,6 @@ class ModelWorker:
                             ),
                         )
                     )
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
                 finally:
                     if self.sessions.peek(session_id) is not None:
                         self.drop_session(session_id)
@@ -593,7 +588,7 @@ class ModelWorker:
                 domain=Domain.GEN,
                 bounds=Bounds(max_points=1),
             )
-            self.executor.execute(
+            self._execute_warmup(
                 Batch(step_id=3, admissions=(admission,), operations=(flow,), input_products=())
             )
         finally:

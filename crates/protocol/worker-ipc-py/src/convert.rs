@@ -1358,7 +1358,7 @@ mod tests {
         CompletionRecord {
             request_key: request_key(seed),
             op_id: OpId(700 + seed),
-            completion_slot_generation: seed as u32 % 4,
+            completion_slot_generation: seed as u32 % 4 + 1,
             status,
             selected_point: seed as u32 % 3,
             logical_lengths: LogicalLengths {

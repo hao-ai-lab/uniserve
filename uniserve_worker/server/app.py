@@ -153,20 +153,17 @@ def _execute(worker: Worker, request: Mapping[str, Any], metrics: MetricsService
     duration = metrics.now_ns() - started
     operation_types = [work_operation_type(value.work).value for value in batch.operations]
     metrics.record_execute(duration, operation_types)
-    # Carry the report object (not its wire form) so its deferred sampled token
-    # and semantic digest are materialized only when the response is serialized
-    # in respond(); by then the next batch's forward has launched and the
-    # asynchronous token copy has completed, so the read never stalls.
+    # Carry the report object so the progress loop can query its completion
+    # events and serialize only records whose pinned copies are ready.
     return _response(ResponseKind.RESULT, completion_report=result)
 
 
 def _response_ready(response: Mapping[str, Any]) -> bool:
     """Whether a response can be serialized without stalling on a deferred token.
 
-    A completion report defers its sampled token off the device to overlap the
-    copy with the next batch's forward. Its committed tokens and semantic digest
-    are read only here, once the copy has landed; a response polled before that
-    stays pending (not-ready) rather than blocking the transport thread.
+    A completion report's committed tokens and semantic digest are read only
+    after its pinned copy events report ready. A response polled before that
+    stays pending rather than blocking the transport thread.
     """
 
     result = response.get("completion_report")
