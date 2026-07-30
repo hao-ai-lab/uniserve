@@ -1197,6 +1197,25 @@ class Operation:
         plan_digest = get("plan_digest")
         if type(plan_digest) is not str:
             plan_digest = _str(plan_digest, f"{where}.plan_digest")
+        if _validated_wire:
+            operation = object.__new__(cls)
+            set_field = object.__setattr__
+            set_field(operation, "request_key", request_key)
+            set_field(operation, "op_id", op_id)
+            set_field(operation, "parent", parent)
+            set_field(operation, "work", work)
+            set_field(operation, "route", route)
+            set_field(operation, "domain", domain)
+            set_field(operation, "advances_state", advances_state)
+            set_field(operation, "bounds", bounds)
+            set_field(operation, "inputs", inputs)
+            set_field(operation, "outputs", outputs)
+            set_field(operation, "new_kv_blocks", new_kv_blocks)
+            set_field(operation, "predicate", predicate)
+            set_field(operation, "rng", rng)
+            set_field(operation, "control_seq", control_seq)
+            set_field(operation, "plan_digest", plan_digest)
+            return operation
         operation = cls(
             request_key=request_key,
             op_id=op_id,
@@ -1214,8 +1233,7 @@ class Operation:
             control_seq=control_seq,
             plan_digest=plan_digest,
         )
-        if not _validated_wire:
-            operation.validate()
+        operation.validate()
         return operation
 
     def to_wire(self) -> dict[str, object]:

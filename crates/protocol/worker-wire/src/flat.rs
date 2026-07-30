@@ -28,7 +28,7 @@ pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
 
 pub fn decode_request(bytes: &[u8]) -> anyhow::Result<WorkerRequest> {
     let root = fbs::root_as_worker_request(bytes).context("invalid WorkerRequest flatbuffer")?;
-    request_from_fb(root.unpack())
+    request_from_table(root)
 }
 
 pub fn encode_response(response: &WorkerResponse) -> anyhow::Result<Vec<u8>> {
@@ -42,7 +42,875 @@ pub fn encode_response(response: &WorkerResponse) -> anyhow::Result<Vec<u8>> {
 pub fn decode_response(bytes: &[u8]) -> anyhow::Result<WorkerResponse> {
     let root = flatbuffers::root::<fbs::WorkerResponse>(bytes)
         .context("invalid WorkerResponse flatbuffer")?;
+    response_from_table(root)
+}
+
+/// The original object-API (`unpack`) request decode, retained only so tests
+/// can prove the accessor-based decode is behaviorally identical.
+#[cfg(test)]
+pub(crate) fn decode_request_unpack(bytes: &[u8]) -> anyhow::Result<WorkerRequest> {
+    let root = fbs::root_as_worker_request(bytes).context("invalid WorkerRequest flatbuffer")?;
+    request_from_fb(root.unpack())
+}
+
+/// The original object-API (`unpack`) response decode, retained only so tests
+/// can prove the accessor-based decode is behaviorally identical.
+#[cfg(test)]
+pub(crate) fn decode_response_unpack(bytes: &[u8]) -> anyhow::Result<WorkerResponse> {
+    let root = flatbuffers::root::<fbs::WorkerResponse>(bytes)
+        .context("invalid WorkerResponse flatbuffer")?;
     response_from_fb(root.unpack())
+}
+
+// ---------------------------------------------------------------------------
+// Accessor-based decode. Each `*_from_table` function mirrors its unpack-based
+// `*_from_fb` counterpart field for field (same defaults, enum mappings, error
+// messages, and evaluation order) but reads the verified flatbuffer tables
+// directly: no intermediate object tree, one allocation per owned field, and
+// byte vectors are copied with a single memcpy off the accessor slice.
+// ---------------------------------------------------------------------------
+
+fn request_from_table(request: fbs::WorkerRequest<'_>) -> anyhow::Result<WorkerRequest> {
+    let request = WorkerRequest {
+        kind: request_kind_from_fb(request.kind())?,
+        call_id: request.call_id(),
+        batch: request.batch().map(batch_from_table).transpose()?,
+        session_id: request.session_id().map(RequestId),
+        copies: request.copies().map(|items| {
+            items
+                .iter()
+                .map(|pair| (BlockId(pair.src()), BlockId(pair.dst())))
+                .collect()
+        }),
+        adapter_id: request.adapter_id(),
+        adapter_path: request.adapter_path().map(str::to_string),
+        product_handles: request
+            .product_handles()
+            .map(|items| items.iter().collect()),
+        snapshot: request.snapshot().map(snapshot_from_table).transpose()?,
+    };
+    validate_request_shape(&request)?;
+    Ok(request)
+}
+
+fn response_from_table(response: fbs::WorkerResponse<'_>) -> anyhow::Result<WorkerResponse> {
+    let response = WorkerResponse {
+        kind: response_kind_from_fb(response.kind())?,
+        call_id: response.call_id(),
+        capabilities: response
+            .capabilities()
+            .map(capabilities_from_table)
+            .transpose()?,
+        completion_report: response
+            .completion_report()
+            .map(completion_report_from_table)
+            .transpose()?,
+        metrics: response.metrics().map(metrics_from_table),
+        pressure: response
+            .pressure()
+            .map(|items| items.iter().map(pressure_from_table).collect())
+            .transpose()?,
+        message: response.message().map(str::to_string),
+        code: response.code().map(str::to_string),
+        retryable: response.retryable(),
+        fatal: response.fatal(),
+        phase: response.phase().map(str::to_string),
+        route: response.route().map(str::to_string),
+        operations: response
+            .operations()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(error_operation_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        snapshot: response.snapshot().map(snapshot_from_table).transpose()?,
+    };
+    validate_response_shape(&response)?;
+    Ok(response)
+}
+
+fn batch_from_table(batch: fbs::Batch<'_>) -> anyhow::Result<Batch> {
+    let batch = Batch {
+        step_id: batch.step_id(),
+        admissions: batch
+            .admissions()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(admission_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        operations: batch
+            .operations()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(operation_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        controls: batch
+            .controls()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(control_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        input_products: batch
+            .input_products()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(product_payload_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    batch.validate()?;
+    Ok(batch)
+}
+
+fn admission_from_table(admission: fbs::Admission<'_>) -> anyhow::Result<Admission> {
+    let admission = Admission {
+        request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
+        digest: required_str(admission.digest(), "admission.digest")?,
+        und: admission.und().map(und_admission_from_table).transpose()?,
+        gen_admission: admission
+            .gen_admission()
+            .map(gen_admission_from_table)
+            .transpose()?,
+        adapter_id: admission.adapter_id(),
+    };
+    admission.validate()?;
+    Ok(admission)
+}
+
+fn und_admission_from_table(admission: fbs::UndAdmission<'_>) -> anyhow::Result<UndAdmission> {
+    Ok(UndAdmission {
+        sampling: sampling_from_table(
+            admission
+                .sampling()
+                .context("und admission has no sampling spec")?,
+        )?,
+        negative_token_ids: admission
+            .negative_token_ids()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        finish_token_ids: admission
+            .finish_token_ids()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        kv: kv_allocation_from_table(
+            admission
+                .kv()
+                .context("und admission has no KV allocation")?,
+        ),
+    })
+}
+
+fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> anyhow::Result<GenAdmission> {
+    Ok(GenAdmission {
+        image: image_from_table(
+            admission
+                .image()
+                .context("gen admission has no image spec")?,
+        )?,
+    })
+}
+
+fn kv_allocation_from_table(allocation: fbs::KvAllocation<'_>) -> KvAllocation {
+    KvAllocation {
+        block_ids: allocation
+            .block_ids()
+            .map(|items| items.iter().map(BlockId).collect())
+            .unwrap_or_default(),
+        prefix_len: allocation.prefix_len(),
+        group_id: allocation.group_id(),
+    }
+}
+
+fn operation_from_table(operation: fbs::Operation<'_>) -> anyhow::Result<Operation> {
+    let operation = Operation {
+        request_key: request_key_from_table(operation.request_key(), "operation.request_key")?,
+        op_id: OpId(operation.op_id()),
+        parent: version_ref_from_table(operation.parent().context("operation has no parent")?)?,
+        work: Work::from_variant(work_from_fb(operation.work())?),
+        route: RouteId(operation.route()),
+        domain: domain_from_fb(operation.domain())?,
+        advances_state: operation.advances_state(),
+        bounds: bounds_from_table(operation.bounds().context("operation has no bounds")?),
+        inputs: operation
+            .inputs()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(product_ref_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        outputs: operation
+            .outputs()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(product_ref_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        new_kv_blocks: operation
+            .new_kv_blocks()
+            .map(|items| items.iter().map(BlockId).collect())
+            .unwrap_or_default(),
+        predicate: operation
+            .predicate()
+            .map(product_ref_from_table)
+            .transpose()?,
+        rng: operation.rng().map(rng_from_table).transpose()?,
+        control_seq: operation.control_seq(),
+        plan_digest: required_str(operation.plan_digest(), "operation.plan_digest")?,
+    };
+    // No per-operation validate() here: the worker's Python `from_wire` is the
+    // authoritative ingress validator and recomputes the plan digest for every
+    // operation (forged-digest rejection unchanged); running the SHA-256
+    // recompute here too made the wire decode do the same work twice per op.
+    Ok(operation)
+}
+
+fn control_from_table(envelope: fbs::ControlEnvelope<'_>) -> anyhow::Result<Control> {
+    let control = match envelope.control_type() {
+        fbs::Control::ControlCommit => {
+            let commit = envelope
+                .control_as_control_commit()
+                .context("commit control table is missing")?;
+            Control::Commit {
+                request_key: request_key_from_table(
+                    commit.request_key(),
+                    "control.commit.request_key",
+                )?,
+                control_seq: commit.control_seq(),
+                expected_parent: version_ref_from_table(
+                    commit
+                        .expected_parent()
+                        .context("commit control has no expected parent")?,
+                )?,
+                selected: version_ref_from_table(
+                    commit
+                        .selected()
+                        .context("commit control has no selected version")?,
+                )?,
+                public_event_limit: commit.public_event_limit(),
+                disposition: disposition_from_fb(commit.disposition())?,
+            }
+        }
+        fbs::Control::ControlClose => {
+            let close = envelope
+                .control_as_control_close()
+                .context("close control table is missing")?;
+            Control::Close {
+                request_key: request_key_from_table(
+                    close.request_key(),
+                    "control.close.request_key",
+                )?,
+                control_seq: close.control_seq(),
+                cutoff: version_ref_from_table(
+                    close.cutoff().context("close control has no cutoff")?,
+                )?,
+                reason: close_reason_from_fb(close.reason())?,
+            }
+        }
+        fbs::Control::ControlRelease => {
+            let release = envelope
+                .control_as_control_release()
+                .context("release control table is missing")?;
+            Control::Release {
+                request_key: request_key_from_table(
+                    release.request_key(),
+                    "control.release.request_key",
+                )?,
+                op_id: OpId(release.op_id()),
+            }
+        }
+        _ => bail!("control union is empty"),
+    };
+    control.validate()?;
+    Ok(control)
+}
+
+fn request_key_from_table(
+    request_key: Option<fbs::RequestKey<'_>>,
+    label: &str,
+) -> anyhow::Result<RequestKey> {
+    let request_key = request_key.with_context(|| format!("{label} is missing"))?;
+    Ok(RequestKey {
+        authority_id: request_key.authority_id(),
+        session_id: RequestId(request_key.session_id()),
+        epoch: request_key.epoch(),
+    })
+}
+
+fn version_ref_from_table(version: fbs::VersionRef<'_>) -> anyhow::Result<VersionRef> {
+    let point = match version.point_type() {
+        fbs::Point::PointFixed => {
+            let fixed = version
+                .point_as_point_fixed()
+                .context("fixed point table is missing")?;
+            Point::Fixed {
+                point_index: fixed.point_index(),
+                semantic_digest: required_str(
+                    fixed.semantic_digest(),
+                    "point.fixed.semantic_digest",
+                )?,
+            }
+        }
+        fbs::Point::PointDevice => {
+            let device = version
+                .point_as_point_device()
+                .context("device point table is missing")?;
+            Point::Device {
+                selected_point: product_ref_from_table(
+                    device
+                        .selected_point()
+                        .context("device point has no selected product")?,
+                )?,
+                producer_plan_digest: required_str(
+                    device.producer_plan_digest(),
+                    "point.device.producer_plan_digest",
+                )?,
+            }
+        }
+        _ => bail!("version reference point union is empty"),
+    };
+    Ok(VersionRef {
+        request_key: request_key_from_table(version.request_key(), "version_ref.request_key")?,
+        producer_op_id: OpId(version.producer_op_id()),
+        point,
+    })
+}
+
+fn product_ref_from_table(product: fbs::ProductRef<'_>) -> anyhow::Result<ProductRef> {
+    let point_range = product
+        .point_range()
+        .context("product reference has no point range")?;
+    Ok(ProductRef {
+        request_key: request_key_from_table(product.request_key(), "product_ref.request_key")?,
+        producer_op_id: OpId(product.producer_op_id()),
+        output_index: product.output_index(),
+        generation: product.generation(),
+        kind: product_kind_from_fb(product.kind())?,
+        storage_class: storage_class_from_fb(product.storage_class())?,
+        dtype: dtype_from_fb(product.dtype())?,
+        shape_bound: shape_bound_from_table(
+            product
+                .shape_bound()
+                .context("product reference has no shape bound")?,
+        ),
+        point_range: PointRange {
+            base_point: point_range.base_point(),
+            max_points: point_range.max_points(),
+        },
+    })
+}
+
+fn shape_bound_from_table(shape: fbs::ShapeBound<'_>) -> ShapeBound {
+    ShapeBound {
+        dims: shape
+            .dims()
+            .map(|dims| {
+                dims.iter()
+                    .map(|dim| {
+                        if dim.device() {
+                            DimBound::Device { max: dim.value() }
+                        } else {
+                            DimBound::Static(dim.value())
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn bounds_from_table(bounds: fbs::Bounds<'_>) -> Bounds {
+    Bounds {
+        max_points: bounds.max_points(),
+        max_tokens: bounds.max_tokens(),
+        max_kv_pages: bounds.max_kv_pages(),
+        max_latent_bytes: bounds.max_latent_bytes(),
+        max_completion_bytes: bounds.max_completion_bytes(),
+        max_transfer_bytes: bounds.max_transfer_bytes(),
+    }
+}
+
+fn rng_from_table(rng: fbs::Rng<'_>) -> anyhow::Result<Rng> {
+    Ok(Rng {
+        seed: rng.seed(),
+        semantic_index_base: rng.semantic_index_base(),
+        draw_layout: draw_layout_from_fb(rng.draw_layout())?,
+    })
+}
+
+fn completion_report_from_table(
+    report: fbs::CompletionReport<'_>,
+) -> anyhow::Result<CompletionReport> {
+    let report = CompletionReport {
+        step_id: report.step_id(),
+        completions: report
+            .completions()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(completion_record_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        products: report
+            .products()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(product_payload_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        registration: RegistrationAck {
+            visible: report
+                .registration()
+                .map(|ack| ack.visible())
+                .context("completion report has no registration acknowledgement")?,
+        },
+        worker_exec_us: report.worker_exec_us(),
+        forward_stats: report.forward_stats().map(forward_stats_from_table),
+    };
+    report.validate()?;
+    Ok(report)
+}
+
+fn completion_record_from_table(
+    record: fbs::CompletionRecord<'_>,
+) -> anyhow::Result<CompletionRecord> {
+    let logical_lengths = record
+        .logical_lengths()
+        .context("completion record has no logical lengths")?;
+    let token_span = record
+        .token_span()
+        .context("completion record has no token span")?;
+    let finish_flags = record
+        .finish_flags()
+        .context("completion record has no finish flags")?;
+    let timing_counters = record
+        .timing_counters()
+        .context("completion record has no timing counters")?;
+    let record = CompletionRecord {
+        request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
+        op_id: OpId(record.op_id()),
+        completion_slot_generation: record.completion_slot_generation(),
+        status: op_status_from_fb(record.status())?,
+        selected_point: record.selected_point(),
+        logical_lengths: LogicalLengths {
+            token_len: logical_lengths.token_len(),
+            kv_visible_len: logical_lengths.kv_visible_len(),
+            latent_len: logical_lengths.latent_len(),
+        },
+        token_span: TokenSpan {
+            base: token_span.base(),
+            len: token_span.len(),
+        },
+        committed_tokens: record
+            .committed_tokens()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        finish_flags: FinishFlags {
+            eos: finish_flags.eos(),
+            length: finish_flags.length(),
+            stop: finish_flags.stop(),
+        },
+        product_generations: record
+            .product_generations()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        semantic_digest: required_str(record.semantic_digest(), "completion.semantic_digest")?,
+        error_code: record.error_code().map(error_code_from_fb).transpose()?,
+        timing_counters: TimingCounters {
+            queued_us: timing_counters.queued_us(),
+            device_us: timing_counters.device_us(),
+            copy_us: timing_counters.copy_us(),
+            host_us: timing_counters.host_us(),
+        },
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+fn product_payload_from_table(payload: fbs::ProductPayload<'_>) -> anyhow::Result<ProductPayload> {
+    let payload = ProductPayload {
+        product: product_ref_from_table(
+            payload
+                .product()
+                .context("product payload has no product reference")?,
+        )?,
+        bytes: payload
+            .bytes()
+            .map(|bytes| bytes.bytes().to_vec())
+            .unwrap_or_default(),
+    };
+    payload.validate()?;
+    Ok(payload)
+}
+
+fn error_operation_from_table(
+    operation: fbs::ErrorOperationIdentity<'_>,
+) -> anyhow::Result<ErrorOperationIdentity> {
+    Ok(ErrorOperationIdentity {
+        request_key: request_key_from_table(
+            operation.request_key(),
+            "error operation.request_key",
+        )?,
+        op_id: OpId(operation.op_id()),
+    })
+}
+
+fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCaps> {
+    let caps = EngineCaps {
+        block_size: caps.block_size(),
+        num_blocks: caps.num_blocks(),
+        num_layers: caps.num_layers(),
+        scratch_capacity_tokens: caps.scratch_capacity_tokens(),
+        supported_work: caps
+            .supported_work()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(work_from_fb)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        max_latent_size: caps.max_latent_size(),
+        latent_downsample: caps.latent_downsample(),
+        bytes_per_token: caps.bytes_per_token(),
+        max_vae_grid_tokens: caps.max_vae_grid_tokens(),
+        max_vit_grid_tokens: caps.max_vit_grid_tokens(),
+        max_latent_feature_bytes: caps.max_latent_feature_bytes(),
+        max_vision_feature_bytes: caps.max_vision_feature_bytes(),
+        commit_marker_tokens: caps.commit_marker_tokens(),
+        gen_rope_advance: caps.gen_rope_advance(),
+        max_cfg_branches: caps.max_cfg_branches(),
+        groups: caps
+            .groups()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(kv_group_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        kv_dtype: required_str(caps.kv_dtype(), "capabilities.kv_dtype")?,
+        model_dtype: canonical_model_dtype(required_str(
+            caps.model_dtype(),
+            "capabilities.model_dtype",
+        )?)?,
+        attention_backend: required_str(
+            caps.attention_backend(),
+            "capabilities.attention_backend",
+        )?,
+        quantization: caps.quantization().map(str::to_string),
+        rank: caps
+            .rank()
+            .map(rank_from_table)
+            .context("capabilities have no rank")?,
+        pipeline_depth: caps.pipeline_depth(),
+        encoder_cache_budget: caps.encoder_cache_budget(),
+        supported_controls: caps
+            .supported_controls()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(request_kind_from_fb)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        adapter_mode: adapter_mode_from_fb(caps.adapter_mode())?,
+        execution_constraints: caps
+            .execution_constraints()
+            .map(|constraints| ExecutionConstraints {
+                max_batch_operations: constraints.max_batch_operations(),
+            })
+            .context("capabilities have no execution constraints")?,
+        resource_classes: caps
+            .resource_classes()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(resource_class_from_fb)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        model_spec_digest: caps
+            .model_spec_digest()
+            .map(str::to_string)
+            .context("capabilities.model_spec_digest is missing")?,
+        weight_digest: caps
+            .weight_digest()
+            .map(str::to_string)
+            .context("capabilities.weight_digest is missing")?,
+        protocol_layout_digest: caps
+            .protocol_layout_digest()
+            .map(str::to_string)
+            .context("capabilities.protocol_layout_digest is missing")?,
+        route_capability_digest: caps
+            .route_capability_digest()
+            .map(str::to_string)
+            .context("capabilities.route_capability_digest is missing")?,
+        restored_sessions: caps
+            .restored_sessions()
+            .map(|items| items.iter().map(RequestId).collect())
+            .unwrap_or_default(),
+    };
+    caps.validate()?;
+    Ok(caps)
+}
+
+fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> anyhow::Result<SamplingParams> {
+    let sampling = SamplingParams {
+        temperature: sampling.temperature(),
+        top_k: sampling.top_k(),
+        top_p: sampling.top_p(),
+        ignore_eos: sampling.ignore_eos(),
+        seed: sampling.seed(),
+        min_p: sampling.min_p(),
+        repetition_penalty: sampling.repetition_penalty(),
+        frequency_penalty: sampling.frequency_penalty(),
+        presence_penalty: sampling.presence_penalty(),
+        logit_bias: sampling
+            .logit_bias()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| (item.token_id(), item.bias()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        min_tokens: usize::try_from(sampling.min_tokens())
+            .context("sampling.min_tokens does not fit usize")?,
+        n_logprobs: sampling.n_logprobs(),
+        bad_words_ids: sampling
+            .bad_words_ids()
+            .map(|lists| {
+                lists
+                    .iter()
+                    .map(|list| {
+                        list.items()
+                            .map(|items| items.iter().collect())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        allowed_token_ids: sampling
+            .allowed_token_ids()
+            .map(|items| items.iter().collect()),
+        return_logprobs: sampling.return_logprobs(),
+        return_prompt_logprobs: sampling.return_prompt_logprobs(),
+        n_prompt_logprobs: sampling.n_prompt_logprobs(),
+        logprob_token_ids: sampling
+            .logprob_token_ids()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+    };
+    validate_sampling(&sampling)?;
+    Ok(sampling)
+}
+
+fn image_from_table(image: fbs::ImageParams<'_>) -> anyhow::Result<uniserve_core::ImageParams> {
+    for value in [
+        image.cfg_text_scale(),
+        image.cfg_img_scale(),
+        image.cfg_renorm_min(),
+        image.cfg_interval_lo(),
+        image.cfg_interval_hi(),
+        image.timestep_shift(),
+    ] {
+        anyhow::ensure!(value.is_finite(), "image parameters must be finite");
+    }
+    Ok(uniserve_core::ImageParams {
+        steps: image.steps(),
+        cfg_text_scale: image.cfg_text_scale(),
+        cfg_img_scale: image.cfg_img_scale(),
+        cfg_renorm_type: required_str(image.cfg_renorm_type(), "image.cfg_renorm_type")?,
+        cfg_renorm_min: image.cfg_renorm_min(),
+        cfg_interval: (image.cfg_interval_lo(), image.cfg_interval_hi()),
+        timestep_shift: image.timestep_shift(),
+        height: image.height(),
+        width: image.width(),
+        seed: image.seed(),
+        negative_prompt: image
+            .negative_prompt()
+            .map(str::to_string)
+            .unwrap_or_default(),
+        max_images: image.max_images(),
+        image_prompts: image
+            .image_prompts()
+            .map(|items| items.iter().map(str::to_string).collect())
+            .unwrap_or_default(),
+        retain_images: image.retain_images(),
+    })
+}
+
+fn forward_stats_from_table(stats: fbs::WorkerForwardStats<'_>) -> WorkerForwardStats {
+    WorkerForwardStats {
+        mode_counts: map_from_table(stats.mode_counts()),
+        mode_tokens: map_from_table(stats.mode_tokens()),
+        mode_us: map_from_table(stats.mode_us()),
+        component_us: map_from_table(stats.component_us()),
+        attention_launches: stats.attention_launches(),
+        attention_us: stats.attention_us(),
+        attention_backend_counts: map_from_table(stats.attention_backend_counts()),
+        cuda_graph_captures: stats.cuda_graph_captures(),
+        cuda_graph_replays: stats.cuda_graph_replays(),
+        cuda_graph_misses: stats.cuda_graph_misses(),
+        cuda_graph_fallbacks: stats.cuda_graph_fallbacks(),
+        cuda_graph_unpadded_tokens: stats.cuda_graph_unpadded_tokens(),
+        cuda_graph_padded_tokens: stats.cuda_graph_padded_tokens(),
+        cuda_graph_runtime_mode_counts: map_from_table(stats.cuda_graph_runtime_mode_counts()),
+        text_decode_token_relay_hits: stats.text_decode_token_relay_hits(),
+        text_decode_token_relay_misses: stats.text_decode_token_relay_misses(),
+        text_decode_position_relay_hits: stats.text_decode_position_relay_hits(),
+        text_decode_position_relay_misses: stats.text_decode_position_relay_misses(),
+        flashinfer_decode_plan_calls: stats.flashinfer_decode_plan_calls(),
+        flashinfer_decode_plan_reuses: stats.flashinfer_decode_plan_reuses(),
+        flashinfer_decode_plan_rows: stats.flashinfer_decode_plan_rows(),
+        flashinfer_decode_plan_indices: stats.flashinfer_decode_plan_indices(),
+        flashinfer_decode_graph_plan_calls: stats.flashinfer_decode_graph_plan_calls(),
+        flashinfer_decode_graph_plan_reuses: stats.flashinfer_decode_graph_plan_reuses(),
+        spec_verify_rows: stats.spec_verify_rows(),
+        spec_verify_draft_tokens: stats.spec_verify_draft_tokens(),
+        spec_verify_accepted_tokens: stats.spec_verify_accepted_tokens(),
+        spec_verify_rejected_tokens: stats.spec_verify_rejected_tokens(),
+        spec_verify_committed_tokens: stats.spec_verify_committed_tokens(),
+        spec_verify_path_counts: map_from_table(stats.spec_verify_path_counts()),
+    }
+}
+
+fn metrics_from_table(metrics: fbs::WorkerMetrics<'_>) -> WorkerMetrics {
+    WorkerMetrics {
+        executes: metrics.executes(),
+        operations_total: metrics.operations_total(),
+        exec_us_total: metrics.exec_us_total(),
+        last_exec_us: metrics.last_exec_us(),
+        operation_counts: map_from_table(metrics.operation_counts()),
+        operation_us: map_from_table(metrics.operation_us()),
+        control_ok: map_from_table(metrics.control_ok()),
+        control_err: map_from_table(metrics.control_err()),
+        error_counts: map_from_table(metrics.error_counts()),
+        cuda_graph_captures: metrics.cuda_graph_captures(),
+        cuda_graph_replays: metrics.cuda_graph_replays(),
+        cuda_graph_misses: metrics.cuda_graph_misses(),
+        cuda_graph_fallbacks: metrics.cuda_graph_fallbacks(),
+        cuda_graph_unpadded_tokens: metrics.cuda_graph_unpadded_tokens(),
+        cuda_graph_padded_tokens: metrics.cuda_graph_padded_tokens(),
+        cuda_graph_runtime_mode_counts: map_from_table(metrics.cuda_graph_runtime_mode_counts()),
+        forward: metrics.forward().map(forward_stats_from_table),
+    }
+}
+
+fn map_from_table(
+    items: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<fbs::StringU64Pair<'_>>>>,
+) -> BTreeMap<String, u64> {
+    items
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.key().map(|key| (key.to_string(), item.value())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn kv_group_from_table(group: fbs::KvGroupSpec<'_>) -> anyhow::Result<KvCacheGroupSpec> {
+    let kind = if group.kind() == fbs::KvGroupKind::Full {
+        KvGroupKind::Full
+    } else if group.kind() == fbs::KvGroupKind::SlidingWindow {
+        KvGroupKind::SlidingWindow {
+            window: group.window(),
+            sink: group.sink(),
+        }
+    } else {
+        bail!("unknown KV group kind {}", group.kind().0)
+    };
+    Ok(KvCacheGroupSpec {
+        group_id: group.group_id(),
+        block_offset: group.block_offset(),
+        num_blocks: group.num_blocks(),
+        kind,
+    })
+}
+
+fn rank_from_table(rank: fbs::RankInfo<'_>) -> RankInfo {
+    RankInfo {
+        tp_rank: rank.tp_rank(),
+        tp_size: rank.tp_size(),
+        pp_rank: rank.pp_rank(),
+        pp_size: rank.pp_size(),
+        dp_rank: rank.dp_rank(),
+        dp_size: rank.dp_size(),
+    }
+}
+
+fn pressure_from_table(pressure: fbs::ResourcePressure<'_>) -> anyhow::Result<ResourcePressure> {
+    Ok(ResourcePressure {
+        class: resource_class_from_fb(pressure.class())?,
+        total: pressure.total(),
+        used: pressure.used(),
+        evictable: pressure.evictable(),
+        free: pressure.free(),
+    })
+}
+
+fn required_str(value: Option<&str>, label: &str) -> anyhow::Result<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("{label} is missing"))
+}
+
+fn snapshot_from_table(snapshot: fbs::SnapshotRef<'_>) -> anyhow::Result<SnapshotRef> {
+    let snapshot = SnapshotRef {
+        session_id: RequestId(snapshot.session_id()),
+        epoch: snapshot.epoch(),
+        version: snapshot.version(),
+        digest: required_str(snapshot.digest(), "snapshot digest")?,
+        locator: required_str(snapshot.locator(), "snapshot locator")?,
+    };
+    anyhow::ensure!(
+        snapshot.digest.len() == 64
+            && snapshot
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "snapshot digest must be a lowercase SHA-256 digest"
+    );
+    anyhow::ensure!(
+        snapshot.locator == snapshot.digest,
+        "snapshot locator must equal its content digest"
+    );
+    Ok(snapshot)
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +944,7 @@ fn request_to_fb(request: &WorkerRequest) -> anyhow::Result<fbs::WorkerRequestT>
     })
 }
 
+#[cfg(test)]
 fn request_from_fb(request: fbs::WorkerRequestT) -> anyhow::Result<WorkerRequest> {
     let request = WorkerRequest {
         kind: request_kind_from_fb(request.kind)?,
@@ -205,6 +1074,7 @@ fn response_to_fb(response: &WorkerResponse) -> anyhow::Result<fbs::WorkerRespon
     })
 }
 
+#[cfg(test)]
 fn response_from_fb(response: fbs::WorkerResponseT) -> anyhow::Result<WorkerResponse> {
     let response = WorkerResponse {
         kind: response_kind_from_fb(response.kind)?,
@@ -340,6 +1210,7 @@ fn batch_to_fb(batch: &Batch) -> anyhow::Result<fbs::BatchT> {
     })
 }
 
+#[cfg(test)]
 fn batch_from_fb(batch: fbs::BatchT) -> anyhow::Result<Batch> {
     let batch = Batch {
         step_id: batch.step_id,
@@ -392,6 +1263,7 @@ fn admission_to_fb(admission: &Admission) -> anyhow::Result<fbs::AdmissionT> {
     })
 }
 
+#[cfg(test)]
 fn admission_from_fb(admission: fbs::AdmissionT) -> anyhow::Result<Admission> {
     let admission = Admission {
         request_key: request_key_from_fb(admission.request_key, "admission.request_key")?,
@@ -419,6 +1291,7 @@ fn und_admission_to_fb(admission: &UndAdmission) -> anyhow::Result<fbs::UndAdmis
     })
 }
 
+#[cfg(test)]
 fn und_admission_from_fb(admission: fbs::UndAdmissionT) -> anyhow::Result<UndAdmission> {
     Ok(UndAdmission {
         sampling: sampling_from_fb(
@@ -438,6 +1311,7 @@ fn gen_admission_to_fb(admission: &GenAdmission) -> fbs::GenAdmissionT {
     }
 }
 
+#[cfg(test)]
 fn gen_admission_from_fb(admission: fbs::GenAdmissionT) -> anyhow::Result<GenAdmission> {
     Ok(GenAdmission {
         image: image_from_fb(*admission.image.context("gen admission has no image spec")?)?,
@@ -452,6 +1326,7 @@ fn kv_allocation_to_fb(allocation: &KvAllocation) -> fbs::KvAllocationT {
     }
 }
 
+#[cfg(test)]
 fn kv_allocation_from_fb(allocation: fbs::KvAllocationT) -> KvAllocation {
     KvAllocation {
         block_ids: allocation
@@ -496,6 +1371,7 @@ fn operation_to_fb(operation: &Operation) -> anyhow::Result<fbs::OperationT> {
     })
 }
 
+#[cfg(test)]
 fn operation_from_fb(operation: fbs::OperationT) -> anyhow::Result<Operation> {
     let operation = Operation {
         request_key: request_key_from_fb(operation.request_key, "operation.request_key")?,
@@ -573,6 +1449,7 @@ fn control_to_fb(control: &Control) -> fbs::ControlT {
     }
 }
 
+#[cfg(test)]
 fn control_from_fb(control: fbs::ControlT) -> anyhow::Result<Control> {
     let control = match control {
         fbs::ControlT::ControlCommit(commit) => Control::Commit {
@@ -619,6 +1496,7 @@ fn request_key_to_fb(request_key: RequestKey) -> fbs::RequestKeyT {
     }
 }
 
+#[cfg(test)]
 fn request_key_from_fb(
     request_key: Option<Box<fbs::RequestKeyT>>,
     label: &str,
@@ -654,6 +1532,7 @@ fn version_ref_to_fb(version: &VersionRef) -> fbs::VersionRefT {
     }
 }
 
+#[cfg(test)]
 fn version_ref_from_fb(version: fbs::VersionRefT) -> anyhow::Result<VersionRef> {
     let point = match version.point {
         fbs::PointT::PointFixed(fixed) => Point::Fixed {
@@ -697,6 +1576,7 @@ fn product_ref_to_fb(product: &ProductRef) -> fbs::ProductRefT {
     }
 }
 
+#[cfg(test)]
 fn product_ref_from_fb(product: fbs::ProductRefT) -> anyhow::Result<ProductRef> {
     let point_range = product
         .point_range
@@ -742,6 +1622,7 @@ fn shape_bound_to_fb(shape: &ShapeBound) -> fbs::ShapeBoundT {
     }
 }
 
+#[cfg(test)]
 fn shape_bound_from_fb(shape: fbs::ShapeBoundT) -> ShapeBound {
     ShapeBound {
         dims: shape
@@ -770,6 +1651,7 @@ fn bounds_to_fb(bounds: &Bounds) -> fbs::BoundsT {
     }
 }
 
+#[cfg(test)]
 fn bounds_from_fb(bounds: fbs::BoundsT) -> Bounds {
     Bounds {
         max_points: bounds.max_points,
@@ -789,6 +1671,7 @@ fn rng_to_fb(rng: &Rng) -> fbs::RngT {
     }
 }
 
+#[cfg(test)]
 fn rng_from_fb(rng: fbs::RngT) -> anyhow::Result<Rng> {
     Ok(Rng {
         seed: rng.seed,
@@ -825,6 +1708,7 @@ fn completion_report_to_fb(report: &CompletionReport) -> anyhow::Result<fbs::Com
     })
 }
 
+#[cfg(test)]
 fn completion_report_from_fb(report: fbs::CompletionReportT) -> anyhow::Result<CompletionReport> {
     let report = CompletionReport {
         step_id: report.step_id,
@@ -889,6 +1773,7 @@ fn completion_record_to_fb(record: &CompletionRecord) -> fbs::CompletionRecordT 
     }
 }
 
+#[cfg(test)]
 fn completion_record_from_fb(record: fbs::CompletionRecordT) -> anyhow::Result<CompletionRecord> {
     let logical_lengths = record
         .logical_lengths
@@ -944,6 +1829,7 @@ fn product_payload_to_fb(payload: &ProductPayload) -> fbs::ProductPayloadT {
     }
 }
 
+#[cfg(test)]
 fn product_payload_from_fb(payload: fbs::ProductPayloadT) -> anyhow::Result<ProductPayload> {
     let payload = ProductPayload {
         product: product_ref_from_fb(
@@ -964,6 +1850,7 @@ fn error_operation_to_fb(operation: &ErrorOperationIdentity) -> fbs::ErrorOperat
     }
 }
 
+#[cfg(test)]
 fn error_operation_from_fb(
     operation: fbs::ErrorOperationIdentityT,
 ) -> anyhow::Result<ErrorOperationIdentity> {
@@ -1040,6 +1927,7 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
     })
 }
 
+#[cfg(test)]
 fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
     let caps = EngineCaps {
         block_size: caps.block_size,
@@ -1179,6 +2067,7 @@ fn sampling_to_fb(sampling: &SamplingParams) -> anyhow::Result<fbs::SamplingPara
     })
 }
 
+#[cfg(test)]
 fn sampling_from_fb(sampling: fbs::SamplingParamsT) -> anyhow::Result<SamplingParams> {
     let sampling = SamplingParams {
         temperature: sampling.temperature,
@@ -1252,6 +2141,7 @@ fn image_to_fb(image: &uniserve_core::ImageParams) -> fbs::ImageParamsT {
     }
 }
 
+#[cfg(test)]
 fn image_from_fb(image: fbs::ImageParamsT) -> anyhow::Result<uniserve_core::ImageParams> {
     for value in [
         image.cfg_text_scale,
@@ -1316,6 +2206,7 @@ fn forward_stats_to_fb(stats: &WorkerForwardStats) -> fbs::WorkerForwardStatsT {
     }
 }
 
+#[cfg(test)]
 fn forward_stats_from_fb(stats: fbs::WorkerForwardStatsT) -> WorkerForwardStats {
     WorkerForwardStats {
         mode_counts: map_from_fb(stats.mode_counts),
@@ -1377,6 +2268,7 @@ fn metrics_to_fb(metrics: &WorkerMetrics) -> fbs::WorkerMetricsT {
     }
 }
 
+#[cfg(test)]
 fn metrics_from_fb(metrics: fbs::WorkerMetricsT) -> WorkerMetrics {
     WorkerMetrics {
         executes: metrics.executes,
@@ -1408,6 +2300,7 @@ fn map_to_fb(map: &BTreeMap<String, u64>) -> Vec<fbs::StringU64PairT> {
         .collect()
 }
 
+#[cfg(test)]
 fn map_from_fb(items: Option<Vec<fbs::StringU64PairT>>) -> BTreeMap<String, u64> {
     items
         .unwrap_or_default()
@@ -1437,6 +2330,7 @@ fn kv_group_to_fb(group: &KvCacheGroupSpec) -> fbs::KvGroupSpecT {
     }
 }
 
+#[cfg(test)]
 fn kv_group_from_fb(group: fbs::KvGroupSpecT) -> anyhow::Result<KvCacheGroupSpec> {
     let kind = if group.kind == fbs::KvGroupKind::Full {
         KvGroupKind::Full
@@ -1467,6 +2361,7 @@ fn rank_to_fb(rank: RankInfo) -> fbs::RankInfoT {
     }
 }
 
+#[cfg(test)]
 fn rank_from_fb(rank: fbs::RankInfoT) -> RankInfo {
     RankInfo {
         tp_rank: rank.tp_rank,
@@ -1488,6 +2383,7 @@ fn pressure_to_fb(pressure: &ResourcePressure) -> fbs::ResourcePressureT {
     }
 }
 
+#[cfg(test)]
 fn pressure_from_fb(pressure: fbs::ResourcePressureT) -> anyhow::Result<ResourcePressure> {
     Ok(ResourcePressure {
         class: resource_class_from_fb(pressure.class)?,
@@ -1498,6 +2394,7 @@ fn pressure_from_fb(pressure: fbs::ResourcePressureT) -> anyhow::Result<Resource
     })
 }
 
+#[cfg(test)]
 fn required_string(value: Option<String>, label: &str) -> anyhow::Result<String> {
     value
         .filter(|value| !value.is_empty())
@@ -1514,6 +2411,7 @@ fn snapshot_to_fb(snapshot: &SnapshotRef) -> fbs::SnapshotRefT {
     }
 }
 
+#[cfg(test)]
 fn snapshot_from_fb(snapshot: fbs::SnapshotRefT) -> anyhow::Result<SnapshotRef> {
     let snapshot = SnapshotRef {
         session_id: RequestId(snapshot.session_id),
