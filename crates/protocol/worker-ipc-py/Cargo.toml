@@ -12,7 +12,6 @@ crate-type = ["cdylib", "rlib"]
 anyhow.workspace = true
 pyo3.workspace = true
 pythonize.workspace = true
-uniserve-core.workspace = true
 uniserve-worker-ipc-core.workspace = true
 uniserve-worker-wire.workspace = true
 

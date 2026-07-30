@@ -4552,18 +4552,6 @@ def _sample_plain_greedy_group(
     else:
         device_tokens = packed_output
         torch.argmax(logits, dim=-1, out=device_tokens)
-    valid = (
-        ~torch.isnan(logits).any(dim=-1)
-        & ~torch.isposinf(logits).any(dim=-1)
-        & torch.isfinite(logits).any(dim=-1)
-    )
-    device_finish, producer_event = _resolve_sampled_finish_values(
-        tasks,
-        device_tokens,
-        valid,
-        device_products,
-        device_reads,
-    )
     published = product_table is not None
     if product_table is not None:
         if device_continuation is not None:
@@ -4571,20 +4559,26 @@ def _sample_plain_greedy_group(
                 device_continuation,
                 None if product_batch is not None else device_tokens,
                 after_reads=device_reads,
-                producer_event=producer_event,
             )
         elif product_batch is None:
-            product_table.publish_writes(
-                product_writes,
-                device_tokens,
-                producer_event=producer_event,
-            )
+            product_table.publish_writes(product_writes, device_tokens)
         else:
             product_table.publish_scalar_batch(
                 product_batch,
                 after_reads=device_reads,
-                producer_event=producer_event,
             )
+    valid = (
+        ~torch.isnan(logits).any(dim=-1)
+        & ~torch.isposinf(logits).any(dim=-1)
+        & torch.isfinite(logits).any(dim=-1)
+    )
+    device_finish = _resolve_sampled_finish_values(
+        tasks,
+        device_tokens,
+        valid,
+        device_products,
+        device_reads,
+    )
     span = _capture_sample_span(
         valid,
         device_tokens,
@@ -4658,20 +4652,19 @@ def _sample_fused_top_k_group(
         parameters,
         top_k,
     )
-    device_finish, producer_event = _resolve_sampled_finish_values(
-        tasks,
-        tokens,
-        valid,
-        device_products,
-        device_reads,
-    )
     published = _publish_sampled_device_values(
         tasks,
         "token_product",
         tokens,
         device_products,
         device_reads,
-        producer_event=producer_event,
+    )
+    device_finish = _resolve_sampled_finish_values(
+        tasks,
+        tokens,
+        valid,
+        device_products,
+        device_reads,
     )
     span = _capture_sample_span(valid, tokens, torch.zeros_like(tokens), completion)
     return tuple(
@@ -4835,20 +4828,19 @@ def _sample_task_group(
             for index, task in enumerate(tasks)
         )
     )
-    device_finish, producer_event = _resolve_sampled_finish_values(
-        tasks,
-        task_tokens,
-        task_valid,
-        device_products,
-        device_reads,
-    )
     published = _publish_sampled_device_values(
         tasks,
         "token_product",
         task_tokens,
         device_products,
         device_reads,
-        producer_event=producer_event,
+    )
+    device_finish = _resolve_sampled_finish_values(
+        tasks,
+        task_tokens,
+        task_valid,
+        device_products,
+        device_reads,
     )
     span = _capture_sample_span(task_valid, task_tokens, counts, completion)
     speculative_values: dict[int, tuple[int, int]] = {}
@@ -5002,20 +4994,12 @@ def _publish_sampled_device_values(
     device_values: torch.Tensor,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
-    *,
-    producer_event: torch.cuda.Event | None = None,
 ) -> bool:
     products = tuple(getattr(task, product_field) for task in tasks)
     if device_products is None or not all(product is not None for product in products):
         return False
     writes = tuple(cast(DeviceProductWrite, product) for product in products)
-    _publish_device_writes(
-        writes,
-        device_values.reshape(-1),
-        device_products,
-        device_reads,
-        producer_event=producer_event,
-    )
+    _publish_device_writes(writes, device_values.reshape(-1), device_products, device_reads)
     return True
 
 
@@ -5025,16 +5009,16 @@ def _resolve_sampled_finish_values(
     valid: torch.Tensor,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
-) -> tuple[torch.Tensor | None, torch.cuda.Event | None]:
+) -> torch.Tensor | None:
     if device_products is None:
-        return _device_finish_values(tasks, device_tokens, valid), None
+        return _device_finish_values(tasks, device_tokens, valid)
     selected = tuple(
         (index, task, task.finish_product)
         for index, task in enumerate(tasks)
         if task.finish_product is not None
     )
     if not selected:
-        return None, None
+        return None
     indexes = tuple(index for index, _task, _write in selected)
     finish_tasks = tuple(task for _index, task, _write in selected)
     writes = tuple(write for _index, _task, write in selected)
@@ -5049,13 +5033,8 @@ def _resolve_sampled_finish_values(
             finish_tokens,
             finish_valid,
         )
-    producer_event = _publish_device_writes(
-        writes,
-        finish_values,
-        device_products,
-        device_reads,
-    )
-    return None, producer_event
+    _publish_device_writes(writes, finish_values, device_products, device_reads)
+    return None
 
 
 def _select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torch.Tensor:
@@ -5076,25 +5055,14 @@ def _publish_device_writes(
     device_values: torch.Tensor,
     device_products: DeviceProductTable,
     device_reads: tuple[DeviceProductRead, ...],
-    *,
-    producer_event: torch.cuda.Event | None = None,
-) -> torch.cuda.Event | None:
+) -> None:
     values = device_values.reshape(-1)
     product_batch = device_products.producer_scalar_batch(writes)
     if product_batch is not None and int(product_batch.tensor.numel()) == len(writes):
         product_batch.tensor.reshape(-1).copy_(values)
-        device_products.publish_scalar_batch(
-            product_batch,
-            after_reads=device_reads,
-            producer_event=producer_event,
-        )
+        device_products.publish_scalar_batch(product_batch, after_reads=device_reads)
     else:
-        device_products.publish_writes(
-            writes,
-            values,
-            producer_event=producer_event,
-        )
-    return writes[0].producer_event
+        device_products.publish_writes(writes, values)
 
 
 def _semantic_sampling_draws(

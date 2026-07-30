@@ -6148,7 +6148,6 @@ dependencies = [
  "anyhow",
  "pyo3",
  "pythonize",
- "uniserve-core",
  "uniserve-worker-ipc-core",
  "uniserve-worker-wire",
 ]
