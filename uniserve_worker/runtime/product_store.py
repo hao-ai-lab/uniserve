@@ -364,6 +364,32 @@ class DeviceProductTable:
                 raise
             return DeviceProductBindingBatch(tuple(writes))
 
+    def bind_output_groups(
+        self,
+        groups: tuple[
+            tuple[tuple[ProductRef, str, torch.device | str], ...],
+            ...,
+        ],
+    ) -> tuple[DeviceProductBindingBatch, ...]:
+        """Atomically bind output groups while preserving direct producer ranges."""
+
+        bindings: list[DeviceProductBindingBatch] = []
+        with self._lock:
+            try:
+                for group in groups:
+                    if group:
+                        bindings.append(self.bind_output_batch(group))
+            except BaseException:
+                self.abandon_writes(
+                    tuple(
+                        write
+                        for binding in bindings
+                        for write in binding.writes
+                    )
+                )
+                raise
+        return tuple(bindings)
+
     def _prefer_compatible_slots_locked(
         self,
         device_name: str,
@@ -675,7 +701,15 @@ class DeviceProductTable:
             linked = writes[0]._scalar_batch
             if (
                 linked is not None
-                and linked.writes is writes
+                and len(linked.writes) == len(writes)
+                and all(
+                    linked_write is write
+                    for linked_write, write in zip(
+                        linked.writes,
+                        writes,
+                        strict=True,
+                    )
+                )
                 and linked._table_token is self._binding_token
             ):
                 self._require_live_scalar_batch_locked(linked)

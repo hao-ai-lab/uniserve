@@ -22,6 +22,7 @@ from uniserve_worker.batch import (
     DevicePoint,
     Domain,
     DrawLayout,
+    DType,
     EncodeMode,
     FinishFlags,
     FixedPoint,
@@ -36,6 +37,7 @@ from uniserve_worker.batch import (
     Release,
     SamplingParams,
     SamplingState,
+    ShapeBound,
     StorageClass,
     TimingCounters,
     TokenMode,
@@ -1303,14 +1305,32 @@ class ModelExecutor:
             if scope.device_continuation is not None
             else frozenset()
         )
-        bindings: list[tuple[ProductRef, str, torch.device | str]] = []
+        scalar_groups: dict[
+            tuple[torch.device, ProductKind, DType, ShapeBound],
+            list[tuple[ProductRef, str, torch.device | str]],
+        ] = {}
+        general_bindings: list[tuple[ProductRef, str, torch.device | str]] = []
         for operation in operations:
             device = self._operation_device(operation)
             for output in operation.outputs:
                 if _requires_device_product_binding(output) and output not in continuation_outputs:
-                    bindings.append((output, operation.plan_digest, device))
-        writes = self.products.device_products.bind_outputs(tuple(bindings))
-        scope.device_writes.extend(writes)
+                    binding = (output, operation.plan_digest, device)
+                    if output.shape_bound.max_elements == 1:
+                        scalar_groups.setdefault(
+                            (device, output.kind, output.dtype, output.shape_bound),
+                            [],
+                        ).append(binding)
+                    else:
+                        general_bindings.append(binding)
+        groups = tuple(tuple(group) for group in scalar_groups.values())
+        if general_bindings:
+            groups = (*groups, tuple(general_bindings))
+        bound_groups = self.products.device_products.bind_output_groups(groups)
+        scope.device_writes.extend(
+            write
+            for binding in bound_groups
+            for write in binding.writes
+        )
         for write in scope.device_writes:
             operation_id = int(write.reference.producer_op_id)
             if write.reference.kind is ProductKind.TOKEN:
@@ -1429,12 +1449,28 @@ class ModelExecutor:
         self,
         scope: _ExecutionScope,
     ) -> None:
-        for write in scope.device_writes:
-            if write.reference.kind is ProductKind.COMPLETION:
-                self.products.device_products.publish_scalar_write(
-                    write,
-                    True,
-                )
+        writes = tuple(
+            write
+            for write in scope.device_writes
+            if write.reference.kind is ProductKind.COMPLETION
+        )
+        if not writes:
+            return
+        batch = self.products.device_products.producer_scalar_batch(writes)
+        if batch is not None:
+            batch.tensor.fill_(1)
+            self.products.device_products.publish_scalar_batch(batch)
+            return
+        views = self.products.device_products.producer_write_views(writes)
+        first = views[0]
+        self.products.device_products.publish_writes(
+            writes,
+            torch.ones(
+                (len(writes),),
+                dtype=first.dtype,
+                device=first.device,
+            ),
+        )
 
     def _finish_device_reads(
         self,
@@ -4893,22 +4929,45 @@ def _device_finish_values(
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
+    count = len(tasks)
+    tokens = device_tokens.reshape(-1)
+    validity = valid.reshape(-1)
+    if int(tokens.numel()) != count or int(validity.numel()) != count:
+        raise RuntimeError("sampling finish vectors do not align")
+    if count == 0:
+        return validity.to(dtype=torch.bool)
+
+    rows = tuple(task.rows[0] for task in tasks)
+    first = rows[0]
+    if all(
+        row.force_finish == first.force_finish
+        and row.finish_token_ids == first.finish_token_ids
+        for row in rows[1:]
+    ):
+        if first.force_finish:
+            return validity.to(dtype=torch.bool)
+        if not first.finish_token_ids:
+            return torch.zeros_like(validity, dtype=torch.bool)
+        matched = tokens == first.finish_token_ids[0]
+        for token_id in first.finish_token_ids[1:]:
+            matched |= tokens == token_id
+        return matched & validity
+
     values: list[torch.Tensor] = []
-    for index, task in enumerate(tasks):
-        row = task.rows[0]
-        selected = device_tokens[index]
+    for index, row in enumerate(rows):
+        selected = tokens[index]
         if row.force_finish:
-            finish = torch.ones((), dtype=torch.bool, device=device_tokens.device)
+            finish = torch.ones((), dtype=torch.bool, device=tokens.device)
         elif row.finish_token_ids:
             finish_ids = torch.tensor(
                 row.finish_token_ids,
-                dtype=device_tokens.dtype,
-                device=device_tokens.device,
+                dtype=tokens.dtype,
+                device=tokens.device,
             )
             finish = (finish_ids == selected).any()
         else:
-            finish = torch.zeros((), dtype=torch.bool, device=device_tokens.device)
-        values.append(finish & valid[index])
+            finish = torch.zeros((), dtype=torch.bool, device=tokens.device)
+        values.append(finish & validity[index])
     return torch.stack(values)
 
 
