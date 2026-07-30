@@ -13,12 +13,22 @@
 //!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
 //!    path ([`PyServer::respond`]).
 //!
-//! Each direction uses the serde-defined wire type directly. Inbound requests
-//! are converted with `pythonize`, and outbound responses are converted with
-//! `depythonize`. Execute batches carry process-local validation provenance
-//! after their Rust wire contract has been validated.
+//! The FFI conversion itself is split by frame heat. The steady-state serve
+//! loop exchanges one `execute` batch and one `result` completion report per
+//! step, and at decode batch sizes the reflective serde walk
+//! (`pythonize`/`depythonize`) dominates the boundary cost, so those two frame
+//! shapes take the hand-rolled converters in [`convert`]: interned dict keys
+//! and enum strings, preallocated lists, and direct scalar conversions that
+//! produce values deep-equal to the reflective ones (asserted by the equality
+//! tests in `convert`). Every other frame kind is rare (capabilities, admin,
+//! metrics, errors) and keeps the reflective path: requests that are not
+//! `execute` are pythonized, and any response outside the exact `result`
+//! contract falls back to `depythonize`, preserving reflective values and
+//! errors byte-for-byte.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod convert;
 
 use std::sync::Mutex;
 
@@ -84,8 +94,14 @@ impl PyServer {
     }
 
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
-        let resp: WorkerResponse = depythonize(response)
-            .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?;
+        // Hot path: the per-step completion report, extracted without the
+        // reflective serde walk. Anything else (or any unexpected shape)
+        // falls back to `depythonize` for identical values and errors.
+        let resp: WorkerResponse = match convert::try_completion_response_from_py(response) {
+            Some(resp) => resp,
+            None => depythonize(response)
+                .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?,
+        };
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
             let result = endpoint.respond(&resp);
@@ -98,11 +114,18 @@ impl PyServer {
 }
 
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
+    // Hot path: `execute` batches take the hand-rolled converter, which
+    // produces an object deep-equal to `pythonize`'s. The decoded Rust batch has
+    // already passed `Batch::validate`, so a process-local token lets the Python
+    // decoder preserve that validation result instead of hashing every operation
+    // again. Rare request kinds keep the reflective conversion.
+    if request.kind == RequestKind::Execute {
+        let request = convert::execute_request_to_py(py, request)?;
+        mark_validated_batch(py, &request)?;
+        return Ok(request.into_any().unbind());
+    }
     let object = pythonize(py, request)
         .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
-    if request.kind == RequestKind::Execute {
-        mark_validated_batch(py, object.cast::<PyDict>()?)?;
-    }
     Ok(object.unbind())
 }
 
