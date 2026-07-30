@@ -243,6 +243,44 @@ def test_compatible_product_batch_binds_one_contiguous_producer_range() -> None:
     assert producer_batch.tensor.shape == (2,)
 
 
+def test_scalar_output_groups_retain_independent_direct_producer_ranges() -> None:
+    table = DeviceProductTable(capacity=6)
+    finish = tuple(
+        _device_ref(
+            op_id=71 + index,
+            generation=40 + index,
+            dtype=DType.U8,
+            output_index=1,
+            kind=ProductKind.FINISH,
+        )
+        for index in range(3)
+    )
+    completion = tuple(
+        _device_ref(
+            op_id=71 + index,
+            generation=50 + index,
+            dtype=DType.U8,
+            output_index=2,
+            kind=ProductKind.COMPLETION,
+        )
+        for index in range(3)
+    )
+
+    groups = table.bind_output_groups(
+        (
+            tuple((reference, "ab" * 32, "cpu") for reference in finish),
+            tuple((reference, "ab" * 32, "cpu") for reference in completion),
+        )
+    )
+
+    assert len(groups) == 2
+    assert all(group.scalar is not None for group in groups)
+    assert tuple(group.scalar.tensor.shape for group in groups if group.scalar is not None) == (
+        (3,),
+        (3,),
+    )
+
+
 def test_operation_release_covers_continuation_and_regular_outputs() -> None:
     table = DeviceProductTable(capacity=3)
     parent = _device_ref(op_id=71, generation=40)
