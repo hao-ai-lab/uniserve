@@ -586,6 +586,16 @@ fn finish_reason_str(r: &FinishReason) -> &'static str {
     }
 }
 
+fn canonical_finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
+    let mut finish_token_ids = request.stop_token_ids.clone();
+    if !request.sampling.ignore_eos {
+        finish_token_ids.extend(eos.iter().copied());
+    }
+    finish_token_ids.sort_unstable();
+    finish_token_ids.dedup();
+    finish_token_ids
+}
+
 fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<uniserve_engine_api::TokenLogprob> {
     entries
         .into_iter()
@@ -2994,6 +3004,11 @@ impl Scheduler {
                         // Stateful-diff contract: a request's static state and
                         // initial block allocation cross once, ahead of its
                         // first op; the op then carries only deltas.
+                        let finish_token_ids = self
+                            .running
+                            .get(&id)
+                            .map(|state| canonical_finish_token_ids(&state.req, &self.ctrl.eos))
+                            .unwrap_or_default();
                         if let Some(st) = self.running.get_mut(&id)
                             && !st.resources.worker_registered
                         {
@@ -3005,6 +3020,7 @@ impl Scheduler {
                                 Some(UndAdmission {
                                     sampling: st.req.sampling.clone(),
                                     negative_token_ids: st.context.negative_prompt_ids.clone(),
+                                    finish_token_ids,
                                     kv: KvAllocation {
                                         block_ids: initial_blocks,
                                         prefix_len: st.ingest.prompt_cursor,
@@ -3826,7 +3842,16 @@ impl Scheduler {
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let tok = if relay_input { 0 } else { st.und.next_token };
                 let sampling_state = if projected_successor {
-                    SamplingState::default()
+                    SamplingState {
+                        finish_token_ids: canonical_finish_token_ids(&st.req, &self.ctrl.eos),
+                        force_finish: st
+                            .und
+                            .tokens_emitted
+                            .saturating_add(self.inflight_len(id))
+                            .saturating_add(1)
+                            >= st.req.max_und_tokens,
+                        ..SamplingState::default()
+                    }
                 } else {
                     self.sampling_state(id)
                 };
@@ -4241,12 +4266,7 @@ impl Scheduler {
                 counts.into_iter().collect()
             })
             .unwrap_or_default();
-        let mut finish_token_ids = state.req.stop_token_ids.clone();
-        if !state.req.sampling.ignore_eos {
-            finish_token_ids.extend(self.ctrl.eos.iter().copied());
-        }
-        finish_token_ids.sort_unstable();
-        finish_token_ids.dedup();
+        let finish_token_ids = canonical_finish_token_ids(&state.req, &self.ctrl.eos);
         SamplingState {
             recent_counts,
             allowed_token_ids,

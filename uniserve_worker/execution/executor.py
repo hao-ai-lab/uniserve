@@ -2776,6 +2776,24 @@ class ModelExecutor:
     ) -> _SampleTask:
         sampling = _require_sampling(session)
         state = scope.sampling_states.get(int(operation.op_id), SamplingState())
+        allowed_token_ids = (
+            state.allowed_token_ids
+            if state.allowed_token_ids is not None
+            else sampling.allowed_token_ids
+        )
+        if not state.finish_token_ids:
+            finish_token_ids = session.finish_token_ids
+        elif not session.finish_token_ids:
+            finish_token_ids = state.finish_token_ids
+        else:
+            finish_token_ids = tuple(
+                sorted(
+                    {
+                        *session.finish_token_ids,
+                        *state.finish_token_ids,
+                    }
+                )
+            )
         rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
         if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
             raise invalid_descriptor("sampling task positions do not align with its logits")
@@ -2799,9 +2817,9 @@ class ModelExecutor:
             _SamplingRow(
                 parameters=sampling,
                 recent_counts=state.recent_counts,
-                allowed=state.allowed_token_ids,
+                allowed=allowed_token_ids,
                 suppress=state.suppressed_token_ids,
-                finish_token_ids=state.finish_token_ids,
+                finish_token_ids=finish_token_ids,
                 force_finish=state.force_finish,
                 draw_seed=(
                     semantic_sampling_seed(
@@ -4974,20 +4992,35 @@ def _device_finish_values(
 def _publish_sampled_device_values(
     tasks: tuple[_SampleTask, ...],
     product_field: str,
-    device_tokens: torch.Tensor,
+    device_values: torch.Tensor,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
 ) -> bool:
     products = tuple(getattr(task, product_field) for task in tasks)
-    if device_products is None or not all(product is not None for product in products):
+    if device_products is None:
         return False
-    writes = tuple(cast(DeviceProductWrite, product) for product in products)
+    if all(product is not None for product in products):
+        writes = tuple(cast(DeviceProductWrite, product) for product in products)
+        values = device_values.reshape(-1)
+    else:
+        selected = tuple(
+            (index, cast(DeviceProductWrite, product))
+            for index, product in enumerate(products)
+            if product is not None
+        )
+        if not selected:
+            return False
+        indexes, writes = zip(*selected, strict=True)
+        values = device_values.reshape(-1).index_select(
+            0,
+            torch.tensor(indexes, dtype=torch.long, device=device_values.device),
+        )
     product_batch = device_products.producer_scalar_batch(writes)
-    if product_batch is not None and int(product_batch.tensor.numel()) == len(tasks):
-        product_batch.tensor.reshape(-1).copy_(device_tokens.reshape(-1))
+    if product_batch is not None and int(product_batch.tensor.numel()) == len(writes):
+        product_batch.tensor.reshape(-1).copy_(values)
         device_products.publish_scalar_batch(product_batch, after_reads=device_reads)
     else:
-        device_products.publish_writes(writes, device_tokens.reshape(-1))
+        device_products.publish_writes(writes, values)
     return True
 
 

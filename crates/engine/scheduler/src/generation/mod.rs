@@ -187,12 +187,14 @@ fn logprob_blob_bound(
     Ok(Some(bytes))
 }
 
-/// The declared outputs of a token operation: a committed-token product, an
-/// optional bounded logprob product, and an optional KV product when the
-/// operation publishes generation conditioning.
+/// The declared outputs of a token operation: a committed-token product, a
+/// finish predicate when this operation can terminate its lineage, an optional
+/// bounded logprob product, and an optional KV product when the operation
+/// publishes generation conditioning.
 fn token_outputs(
     logprob_bound: Option<u64>,
     publishes_conditioning: bool,
+    produces_finish_candidate: bool,
 ) -> Result<Vec<ProductRef>, PlanningError> {
     let mut outputs = vec![output_product(
         0,
@@ -200,12 +202,14 @@ fn token_outputs(
         StorageClass::DeviceTensor,
         DType::U32,
     )];
-    outputs.push(output_product(
-        1,
-        ProductKind::Finish,
-        StorageClass::DeviceTensor,
-        DType::U8,
-    ));
+    if produces_finish_candidate {
+        outputs.push(output_product(
+            1,
+            ProductKind::Finish,
+            StorageClass::DeviceTensor,
+            DType::U8,
+        ));
+    }
     if let Some(bytes) = logprob_bound {
         outputs.push(bounded_product(
             2,
@@ -232,6 +236,7 @@ fn token_outputs(
 fn feedback_state_outputs(
     logprob_bound: Option<u64>,
     sample_continuation: bool,
+    produces_finish_candidate: bool,
 ) -> Result<Vec<ProductRef>, PlanningError> {
     let mut outputs = vec![output_product(
         0,
@@ -246,12 +251,14 @@ fn feedback_state_outputs(
             StorageClass::DeviceTensor,
             DType::U32,
         ));
-        outputs.push(output_product(
-            2,
-            ProductKind::Finish,
-            StorageClass::DeviceTensor,
-            DType::U8,
-        ));
+        if produces_finish_candidate {
+            outputs.push(output_product(
+                2,
+                ProductKind::Finish,
+                StorageClass::DeviceTensor,
+                DType::U8,
+            ));
+        }
         if let Some(bytes) = logprob_bound {
             outputs.push(bounded_product(
                 3,
@@ -263,6 +270,22 @@ fn feedback_state_outputs(
         }
     }
     Ok(outputs)
+}
+
+fn produces_finish_candidate(state: &SamplingState) -> bool {
+    state.force_finish || !state.finish_token_ids.is_empty()
+}
+
+fn operation_sampling_delta(
+    sampling: &SamplingParams,
+    state: &SamplingState,
+) -> Option<SamplingState> {
+    let mut delta = state.clone();
+    delta.finish_token_ids.clear();
+    if delta.allowed_token_ids == sampling.allowed_token_ids {
+        delta.allowed_token_ids = None;
+    }
+    (delta != SamplingState::default()).then_some(delta)
 }
 
 /// Scheduler-private flattened context derived once at admission from ordered
@@ -979,6 +1002,9 @@ impl GenerationPlanner {
                     }
                     tokens
                 });
+                let finish_candidate = produces_finish_candidate(&sampling_state);
+                let allowed_text_tokens = sampling_state.allowed_token_ids.clone();
+                let sampling_delta = operation_sampling_delta(&request.sampling, &sampling_state);
                 (
                     Wire {
                         work: Work::Token(TokenMode::Extend),
@@ -992,16 +1018,17 @@ impl GenerationPlanner {
                                     .map_or(0, |tokens| tokens.len().min(u32::MAX as usize) as u32),
                             )?,
                             request.behavior.gen_output,
+                            finish_candidate,
                         )?,
                         new_blocks,
                         draft_token_ids: Vec::new(),
                         token_cost: token_count as usize,
                         cfg_branches: 1,
-                        allowed_text_tokens: sampling_state.allowed_token_ids.clone(),
+                        allowed_text_tokens,
                         expected_prompt_token_ids,
                         input_tokens: token_ids,
                         input_image_bytes: None,
-                        sampling_state: Some(sampling_state),
+                        sampling_state: sampling_delta,
                     },
                     TransitionDelta::IngestText {
                         segment_index,
@@ -1140,6 +1167,9 @@ impl GenerationPlanner {
                 } else {
                     vec![input_token]
                 };
+                let finish_candidate = produces_finish_candidate(&sampling_state);
+                let allowed_text_tokens = sampling_state.allowed_token_ids.clone();
+                let sampling_delta = operation_sampling_delta(&request.sampling, &sampling_state);
                 (
                     Wire {
                         work: Work::Token(mode),
@@ -1148,16 +1178,17 @@ impl GenerationPlanner {
                         outputs: token_outputs(
                             logprob_blob_bound(&request.sampling, 0)?,
                             publishes_conditioning,
+                            finish_candidate,
                         )?,
                         new_blocks,
                         draft_token_ids,
                         token_cost,
                         cfg_branches: 1,
-                        allowed_text_tokens: sampling_state.allowed_token_ids.clone(),
+                        allowed_text_tokens,
                         expected_prompt_token_ids: None,
                         input_tokens,
                         input_image_bytes: None,
-                        sampling_state: Some(sampling_state),
+                        sampling_state: sampling_delta,
                     },
                     TransitionDelta::DecodeUnd {
                         logical_position: position,
@@ -1303,12 +1334,21 @@ impl GenerationPlanner {
                         actual: position,
                     });
                 }
+                let finish_candidate =
+                    sample_continuation && produces_finish_candidate(&sampling_state);
+                let allowed_text_tokens = sample_continuation
+                    .then(|| sampling_state.allowed_token_ids.clone())
+                    .flatten();
+                let sampling_delta = sample_continuation
+                    .then(|| operation_sampling_delta(&request.sampling, &sampling_state))
+                    .flatten();
                 let outputs = feedback_state_outputs(
                     sample_continuation
                         .then(|| logprob_blob_bound(&request.sampling, 0))
                         .transpose()?
                         .flatten(),
                     sample_continuation,
+                    finish_candidate,
                 )?;
                 (
                     Wire {
@@ -1320,13 +1360,11 @@ impl GenerationPlanner {
                         draft_token_ids: Vec::new(),
                         token_cost: 1,
                         cfg_branches: 1,
-                        allowed_text_tokens: sample_continuation
-                            .then(|| sampling_state.allowed_token_ids.clone())
-                            .flatten(),
+                        allowed_text_tokens,
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
                         input_image_bytes: None,
-                        sampling_state: sample_continuation.then_some(sampling_state),
+                        sampling_state: sampling_delta,
                     },
                     TransitionDelta::FeedbackState {
                         image_id,
@@ -2404,12 +2442,6 @@ mod tests {
         };
         assert_eq!((start, end), (0, 2));
         assert_eq!(transition.token_cost, 2);
-        assert!(
-            transition
-                .outputs
-                .iter()
-                .any(|output| output.kind == ProductKind::Finish)
-        );
         assert_eq!(
             transition.rng,
             Some(Rng {
@@ -2418,6 +2450,40 @@ mod tests {
                 draw_layout: DrawLayout::TargetSampling,
             })
         );
+    }
+
+    #[test]
+    fn planner_declares_a_device_finish_product_for_a_finish_candidate() {
+        let transition = GenerationPlanner::new()
+            .plan(
+                &request(15, vec![11, 12]),
+                CursorProjection {
+                    phase: GenerationPhase::Prefill,
+                    prompt_cursor: 0,
+                    logical_pos: 0,
+                    physical_kv_len: 0,
+                    replayability: Replayability::Replayable,
+                },
+                TransitionIntent::IngestText {
+                    segment_index: 0,
+                    prompt_start: 0,
+                    token_ids: vec![11, 12],
+                    new_blocks: Vec::new(),
+                    sampling_state: SamplingState {
+                        finish_token_ids: vec![2, 7],
+                        ..SamplingState::default()
+                    },
+                },
+            )
+            .expect("plan finish-aware extension");
+
+        let finish = transition
+            .outputs
+            .iter()
+            .find(|output| output.kind == ProductKind::Finish)
+            .expect("device finish output");
+        assert_eq!(finish.storage_class, StorageClass::DeviceTensor);
+        assert_eq!(finish.dtype, DType::U8);
     }
 
     #[test]

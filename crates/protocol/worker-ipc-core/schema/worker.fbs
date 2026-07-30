@@ -358,6 +358,7 @@ table KvAllocation {
 table UndAdmission {
   sampling:SamplingParams;
   negative_token_ids:[uint];
+  finish_token_ids:[uint];
   kv:KvAllocation;
 }
 

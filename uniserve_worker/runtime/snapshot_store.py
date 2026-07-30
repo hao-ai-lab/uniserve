@@ -43,7 +43,7 @@ from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, SessionStore
 from .transfer import Locator, Transport, fetch_locator
 
-SNAPSHOT_FORMAT_VERSION = 1
+SNAPSHOT_FORMAT_VERSION = 2
 _ASSET_PREFIX = "asset:"
 
 
@@ -649,6 +649,7 @@ class SnapshotProvider:
             "sampling": None if session.sampling is None else session.sampling.to_wire(),
             "image": None if session.image is None else session.image.to_wire(),
             "negative_token_ids": list(session.negative_token_ids),
+            "finish_token_ids": list(session.finish_token_ids),
             "adapter_id": session.adapter_id,
             "committed_op_id": session.committed_op_id,
             # ``str`` finalizes a digest still deferred behind an in-flight decode
@@ -688,6 +689,9 @@ class SnapshotProvider:
             ),
             negative_token_ids=_uint_tuple(
                 data.get("negative_token_ids"), "snapshot session.negative_token_ids"
+            ),
+            finish_token_ids=_uint_tuple(
+                data.get("finish_token_ids"), "snapshot session.finish_token_ids"
             ),
             adapter_id=_optional_uint(data.get("adapter_id"), "snapshot session.adapter_id"),
             version=_uint(data.get("version"), "snapshot session.version"),
@@ -1275,7 +1279,7 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _snapshot_digest(manifest: bytes, tensor_path: Path) -> str:
-    digest = hashlib.sha256(b"uniserve-worker-snapshot-v1\0")
+    digest = hashlib.sha256(b"uniserve-worker-snapshot-v2\0")
     digest.update(len(manifest).to_bytes(8, "little"))
     digest.update(manifest)
     with tensor_path.open("rb") as source:

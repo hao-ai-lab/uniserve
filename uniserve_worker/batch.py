@@ -1569,7 +1569,19 @@ def control_to_wire(control: Control) -> dict[str, object]:
 class UndAdmission:
     sampling: SamplingParams = field(default_factory=SamplingParams)
     negative_token_ids: tuple[int, ...] = ()
+    finish_token_ids: tuple[int, ...] = ()
     kv: KvAllocation = field(default_factory=KvAllocation)
+
+    def __post_init__(self) -> None:
+        if any(
+            left >= right
+            for left, right in zip(
+                self.finish_token_ids,
+                self.finish_token_ids[1:],
+                strict=False,
+            )
+        ):
+            raise invalid_descriptor("und admission finish token ids are not canonical")
 
     @classmethod
     def from_wire(cls, value: object, where: str = "und admission") -> UndAdmission:
@@ -1579,6 +1591,9 @@ class UndAdmission:
             negative_token_ids=_uints(
                 data.get("negative_token_ids", ()), f"{where}.negative_token_ids"
             ),
+            finish_token_ids=_uints(
+                data.get("finish_token_ids", ()), f"{where}.finish_token_ids"
+            ),
             kv=KvAllocation.from_wire(data.get("kv", {}), f"{where}.kv"),
         )
 
@@ -1586,6 +1601,7 @@ class UndAdmission:
         return {
             "sampling": self.sampling.to_wire(),
             "negative_token_ids": list(self.negative_token_ids),
+            "finish_token_ids": list(self.finish_token_ids),
             "kv": self.kv.to_wire(),
         }
 
@@ -2137,6 +2153,7 @@ def _digest_image(digest: _Digest, value: ImageParams) -> None:
 def _digest_und_admission(digest: _Digest, value: UndAdmission) -> None:
     _digest_sampling(digest, value.sampling)
     digest.u32s(value.negative_token_ids)
+    digest.u32s(value.finish_token_ids)
     digest.u32s(value.kv.block_ids)
     digest.u32(value.kv.prefix_len)
     digest.u32(value.kv.group_id)
