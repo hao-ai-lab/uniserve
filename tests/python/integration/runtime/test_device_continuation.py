@@ -11,20 +11,10 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Batch,
-    Bounds,
     DevicePoint,
-    Domain,
-    DType,
-    Operation,
-    PointRange,
-    ProductKind,
-    ProductRef,
     Release,
-    ShapeBound,
-    StorageClass,
     TokenMode,
     VersionRef,
-    Work,
 )
 from uniserve_worker.execution.executor import (
     completion_report_ready,
@@ -94,26 +84,12 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         parent.op_id,
         DevicePoint(parent.outputs[0], parent.plan_digest),
     )
-    successor_output = ProductRef(
-        request_key=admission.request_key,
-        producer_op_id=2,
-        output_index=0,
-        generation=7,
-        kind=ProductKind.TOKEN,
-        storage_class=StorageClass.DEVICE_TENSOR,
-        dtype=DType.U32,
-        shape_bound=ShapeBound(),
-        point_range=PointRange(),
-    )
-    successor = Operation.registered(
-        request_key=admission.request_key,
+    successor, successor_input = token_operation(
+        admission.request_key,
         op_id=2,
         parent=device_parent,
-        work=Work.token(TokenMode.DECODE),
-        route=0,
-        domain=Domain.UND,
-        bounds=Bounds(max_points=1, max_tokens=1),
-        outputs=(successor_output,),
+        mode=TokenMode.DECODE,
+        tokens=(0,),
         predicate=parent.outputs[1],
     )
     successor_report = worker.execute(
@@ -122,6 +98,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
             admissions=(),
             operations=(successor,),
             controls=(Release(admission.request_key, parent.op_id),),
+            input_products=(successor_input,),
         )
     )
 

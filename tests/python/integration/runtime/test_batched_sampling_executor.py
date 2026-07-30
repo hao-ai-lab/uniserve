@@ -23,21 +23,13 @@ def _observe_sample_batches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, 
     observed: list[tuple[int, int]] = []
     implementation = executor_module._sample_task_batch
 
-    def wrapped(
-        tasks,
-        completion=None,
-        *,
-        device_products=None,
-        device_reads=(),
-        device_continuation=None,
-    ):
+    def wrapped(tasks, completion=None, *, device_products=None, device_reads=()):
         observed.append((len(tasks), sum(len(task.rows) for task in tasks)))
         return implementation(
             tasks,
             completion,
             device_products=device_products,
             device_reads=device_reads,
-            device_continuation=device_continuation,
         )
 
     monkeypatch.setattr(executor_module, "_sample_task_batch", wrapped)

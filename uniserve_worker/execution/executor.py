@@ -124,7 +124,6 @@ from uniserve_worker.runtime.kv_store import KvEntry, KvStore, KvTxn
 from uniserve_worker.runtime.latent_store import LatentRecord, LatentStore, LatentTxn, LatentTxnView
 from uniserve_worker.runtime.mesh_store import MeshStore
 from uniserve_worker.runtime.product_store import (
-    DeviceProductContinuationBatch,
     DeviceProductRead,
     DeviceProductTable,
     DeviceProductWrite,
@@ -517,7 +516,6 @@ class _ExecutionScope:
     device_reads: list[DeviceProductRead] = field(default_factory=list)
     device_writes: list[DeviceProductWrite] = field(default_factory=list)
     operation_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
-    device_continuation: DeviceProductContinuationBatch | None = None
     next_row_id: int = 0
 
     def row_id(self) -> int:
@@ -651,16 +649,16 @@ class ModelExecutor:
         self._tensor_stager = TensorStager(capacity=pipeline_depth * max_operations)
         self._routes = {} if spec is None else {route.name: route for route in spec.routes}
         self._operation_stages = (
-            {}
-            if spec is None
-            else {operation.kind: operation.stages for operation in spec.operations}
+            {} if spec is None else {operation.kind: operation.stages for operation in spec.operations}
         )
         self._primary_stages = {
             operation_type: primary[0]
             for operation_type, stages in self._operation_stages.items()
             if len(
                 primary := tuple(
-                    stage for stage in stages if stage.purpose is OperationStagePurpose.PRIMARY
+                    stage
+                    for stage in stages
+                    if stage.purpose is OperationStagePurpose.PRIMARY
                 )
             )
             == 1
@@ -764,10 +762,7 @@ class ModelExecutor:
             outcomes = self._execute_operations(batch.operations, scope)
             self._finish_device_reads(scope)
             self._publish_predicates(scope)
-            if scope.device_continuation is None:
-                self.products.device_products.validate_writes(tuple(scope.device_writes))
-            else:
-                self.products.device_products.validate_continuation(scope.device_continuation)
+            self.products.device_products.validate_writes(tuple(scope.device_writes))
             completion.seal()
             self.trace.emit(
                 ExecutionPhase.POSTPROCESS,
@@ -903,13 +898,19 @@ class ModelExecutor:
         registration unwinds every bound handle and leaves no product behind.
         """
 
-        if self._reserve_device_continuation(operations, scope):
-            return
         bindings: list[tuple[ProductRef, str, torch.device | str]] = []
         for operation in operations:
             device = self._operation_device(operation)
             for output in operation.outputs:
-                if _requires_device_product_binding(output):
+                if output.storage_class is StorageClass.DEVICE_TENSOR or (
+                    output.storage_class is StorageClass.LATENT_ARENA
+                    and output.kind
+                    in {
+                        ProductKind.ARTIFACT,
+                        ProductKind.LATENT_FEATURE,
+                        ProductKind.VISION_FEATURE,
+                    }
+                ):
                     bindings.append((output, operation.plan_digest, device))
         writes = self.products.device_products.bind_outputs(tuple(bindings))
         scope.device_writes.extend(writes)
@@ -919,60 +920,6 @@ class ModelExecutor:
                 scope.operation_writes[operation_id] = write
             else:
                 scope.operation_writes.setdefault(operation_id, write)
-
-    def _reserve_device_continuation(
-        self,
-        operations: tuple[Operation, ...],
-        scope: _ExecutionScope,
-    ) -> bool:
-        if not operations:
-            return False
-        device = self._operation_device(operations[0])
-        outputs: list[tuple[ProductRef, str]] = []
-        parents: list[tuple[ProductRef, int, str]] = []
-        for operation in operations:
-            if (
-                operation.work.kind != "token"
-                or operation.work.mode != TokenMode.DECODE.value
-                or self._operation_device(operation) != device
-                or operation.inputs
-                or not isinstance(operation.parent.point, DevicePoint)
-            ):
-                return False
-            device_outputs = tuple(
-                output for output in operation.outputs if _requires_device_product_binding(output)
-            )
-            if (
-                len(device_outputs) != 1
-                or device_outputs[0].kind is not ProductKind.TOKEN
-                or device_outputs[0].storage_class is not StorageClass.DEVICE_TENSOR
-                or device_outputs[0].shape_bound.max_elements != 1
-            ):
-                return False
-            point = operation.parent.point
-            parent = point.selected_point
-            if (
-                parent.kind is not ProductKind.TOKEN
-                or parent.storage_class is not StorageClass.DEVICE_TENSOR
-                or parent.shape_bound.max_elements != 1
-            ):
-                return False
-            outputs.append((device_outputs[0], operation.plan_digest))
-            parents.append(
-                (
-                    parent,
-                    int(operation.op_id),
-                    point.producer_plan_digest,
-                )
-            )
-        continuation = self.products.device_products.bind_scalar_continuation(
-            outputs=tuple(outputs),
-            parents=tuple(parents),
-            device=device,
-        )
-        scope.device_continuation = continuation
-        scope.device_writes.extend(continuation.writes)
-        return True
 
     def _operation_device(self, operation: Operation) -> torch.device:
         return self._generation_device if operation.domain is Domain.GEN else self._device
@@ -992,7 +939,9 @@ class ModelExecutor:
             if reference.storage_class is StorageClass.COMPLETION_ARENA and len(
                 product.payload
             ) > int(operation.bounds.max_completion_bytes):
-                raise invalid_descriptor("completion product exceeds its registered byte bound")
+                raise invalid_descriptor(
+                    "completion product exceeds its registered byte bound"
+                )
 
     def _consume_predicates(
         self,
@@ -1025,8 +974,6 @@ class ModelExecutor:
         self,
         scope: _ExecutionScope,
     ) -> None:
-        if scope.device_continuation is not None:
-            self.products.device_products.finish_continuation(scope.device_continuation)
         if not scope.device_reads:
             return
         reads = tuple(read for read in scope.device_reads if not read._recorded)
@@ -1188,7 +1135,6 @@ class ModelExecutor:
             scope.completion,
             device_products=self.products.device_products,
             device_reads=tuple(scope.device_reads),
-            device_continuation=scope.device_continuation,
         )
         _record_component(scope, "text_sample", sample_started)
         finalize_started = time.perf_counter_ns()
@@ -1814,8 +1760,12 @@ class ModelExecutor:
         scope.device_reads.append(read)
         payload = record.payload
         position = session.logical_position
-        closes_feedback = any(output.kind is ProductKind.COMPLETION for output in operation.outputs)
-        samples_continuation = any(output.kind is ProductKind.TOKEN for output in operation.outputs)
+        closes_feedback = any(
+            output.kind is ProductKind.COMPLETION for output in operation.outputs
+        )
+        samples_continuation = any(
+            output.kind is ProductKind.TOKEN for output in operation.outputs
+        )
         if reference.kind is ProductKind.VISION_FEATURE:
             if not isinstance(payload, VisionFeatureProduct):
                 raise invalid_descriptor("vision feature product has the wrong resident payload")
@@ -2097,8 +2047,6 @@ class ModelExecutor:
         operations: tuple[Operation, ...],
         scope: _ExecutionScope,
     ) -> tuple[int | torch.Tensor, ...]:
-        if scope.device_continuation is not None:
-            return scope.device_continuation.inputs
         resolved: list[int | torch.Tensor | None] = [None] * len(operations)
         device_indexes: list[int] = []
         requests: list[tuple[ProductRef, int, str | None, torch.device | str | None]] = []
@@ -2162,25 +2110,7 @@ class ModelExecutor:
         samples: tuple[_SampleResult, ...],
         scope: _ExecutionScope,
     ) -> None:
-        continuation = scope.device_continuation
-        if continuation is not None and continuation.published:
-            return
         if all(sample.device_product_published for sample in samples):
-            return
-        if continuation is not None:
-            continuation_tokens = tuple(
-                sample.device_token for sample in samples if sample.device_token is not None
-            )
-            if len(continuation_tokens) != len(samples):
-                raise RuntimeError("device continuation sampling lost a device token")
-            packed = packed_tensor_views(continuation_tokens)
-            if packed is None:
-                packed = torch.cat(continuation_tokens, dim=0)
-            self.products.device_products.publish_continuation(
-                continuation,
-                packed,
-                after_reads=tuple(scope.device_reads),
-            )
             return
         writes: list[DeviceProductWrite] = []
         device_tokens: list[torch.Tensor] = []
@@ -2258,11 +2188,7 @@ class ModelExecutor:
                 vocab=int(rows.shape[1]),
                 device=rows.device,
             )
-        device_product = (
-            None
-            if scope.device_continuation is not None
-            else scope.operation_writes.get(int(operation.op_id))
-        )
+        device_product = scope.operation_writes.get(int(operation.op_id))
         return _SampleTask(
             operation=operation,
             logits=rows,
@@ -2844,7 +2770,9 @@ class ModelExecutor:
         features = _encode_features(outputs[0]).detach()
         if mode is EncodeMode.VISION:
             grid = (
-                prepared.inputs.grid.detach() if isinstance(prepared.inputs, PatchInput) else None
+                prepared.inputs.grid.detach()
+                if isinstance(prepared.inputs, PatchInput)
+                else None
             )
             payload = VisionFeatureProduct(
                 features=features,
@@ -3780,7 +3708,6 @@ def _sample_task_batch(
     *,
     device_products: DeviceProductTable | None = None,
     device_reads: tuple[DeviceProductRead, ...] = (),
-    device_continuation: DeviceProductContinuationBatch | None = None,
 ) -> tuple[_SampleResult, ...]:
     """Shape and draw every compatible sampling row in each device batch."""
 
@@ -3865,9 +3792,6 @@ def _sample_task_batch(
                 completion,
                 device_products=device_products,
                 device_reads=device_reads,
-                device_continuation=(
-                    device_continuation if len(compatible) == len(tasks) else None
-                ),
             )
         elif sampling_path > 0:
             sampled_group = _sample_fused_top_k_group(tuple(group), sampling_path)
@@ -3884,51 +3808,34 @@ def _sample_plain_greedy_group(
     *,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
-    device_continuation: DeviceProductContinuationBatch | None,
 ) -> tuple[_SampleResult, ...]:
     logits = packed_tensor_views(tuple(task.logits for task in tasks))
     if logits is None:
         logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     else:
         logits = logits.reshape(len(tasks), -1)
-    product_table: DeviceProductTable | None
-    if device_continuation is not None:
-        if device_products is None:
-            raise RuntimeError("device continuation has no product table")
-        product_table = device_products
-        product_writes = device_continuation.writes
-        product_batch = device_continuation.scalar
-    else:
-        products = tuple(task.device_product for task in tasks)
-        bound_products = device_products is not None and all(
-            product is not None for product in products
-        )
-        product_table = cast(DeviceProductTable, device_products) if bound_products else None
-        product_writes = (
-            tuple(cast(DeviceProductWrite, product) for product in products)
-            if product_table is not None
-            else ()
-        )
-        product_batch = (
-            product_table.producer_scalar_batch(product_writes)
-            if product_table is not None
-            else None
-        )
+    products = tuple(task.device_product for task in tasks)
+    bound_products = device_products is not None and all(
+        product is not None for product in products
+    )
+    product_table = cast(DeviceProductTable, device_products) if bound_products else None
+    product_writes = (
+        tuple(cast(DeviceProductWrite, product) for product in products)
+        if product_table is not None
+        else ()
+    )
+    product_batch = (
+        product_table.producer_scalar_batch(product_writes) if product_table is not None else None
+    )
     packed_output = product_batch.tensor if product_batch is not None else None
     if packed_output is None or int(packed_output.numel()) != len(tasks):
         device_tokens = torch.argmax(logits, dim=-1)
     else:
-        device_tokens = packed_output
+        device_tokens = packed_output.reshape(len(tasks))
         torch.argmax(logits, dim=-1, out=device_tokens)
     published = product_table is not None
     if product_table is not None:
-        if device_continuation is not None:
-            product_table.publish_continuation(
-                device_continuation,
-                None if product_batch is not None else device_tokens,
-                after_reads=device_reads,
-            )
-        elif product_batch is None:
+        if product_batch is None:
             product_table.publish_writes(product_writes, device_tokens)
         else:
             product_table.publish_scalar_batch(
@@ -4580,24 +4487,14 @@ def _bound_device_write(
     scope: _ExecutionScope,
     reference: ProductRef,
 ) -> DeviceProductWrite:
-    matches = tuple(write for write in scope.device_writes if write.reference == reference)
+    matches = tuple(
+        write for write in scope.device_writes if write.reference == reference
+    )
     if len(matches) != 1:
         raise invalid_descriptor(
             "resident product does not have exactly one atomic registration binding"
         )
     return matches[0]
-
-
-def _requires_device_product_binding(reference: ProductRef) -> bool:
-    return reference.storage_class is StorageClass.DEVICE_TENSOR or (
-        reference.storage_class is StorageClass.LATENT_ARENA
-        and reference.kind
-        in {
-            ProductKind.ARTIFACT,
-            ProductKind.LATENT_FEATURE,
-            ProductKind.VISION_FEATURE,
-        }
-    )
 
 
 def _encode_features(output: ForwardRowOutput) -> torch.Tensor:
