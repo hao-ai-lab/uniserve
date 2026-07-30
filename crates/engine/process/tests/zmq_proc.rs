@@ -9,11 +9,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::{
-    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
-    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
-    GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor,
-    UndVisibility,
+    ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
+    GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
+    ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine_gateway::transport::protocol::{EngineCoreFinishReason, EngineCoreRequest};
 use uniserve_engine_gateway::transport::{
@@ -80,11 +79,10 @@ fn generation_request(
         },
         gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
         feedback: Some(GeneratedImageFeedbackRecipe {
-            commit: CommitRecipe::CommitGenThenWriteback,
-            writeback: FeedbackWriteback::DirectKv,
+            source: FeedbackSource::DeviceProduct,
             next_und_token: FeedbackNextToken::EndOfImage,
-            logical_positions: 2,
-            physical_kv_tokens: uniserve_core::ImageKvEffect::WorkerDefined,
+            ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
+            sample_continuation: true,
         }),
         ..GenerationPolicyDescriptor::default()
     };

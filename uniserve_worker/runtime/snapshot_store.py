@@ -40,7 +40,7 @@ from .product_store import (
     VisionFeatureProduct,
 )
 from .replay import ReplayRecord, ReplayStore
-from .request_session import RequestSession, SampledTokenRelay, SessionStore
+from .request_session import RequestSession, SessionStore
 from .transfer import Locator, Transport, fetch_locator
 
 SNAPSHOT_FORMAT_VERSION = 1
@@ -657,7 +657,7 @@ class SnapshotProvider:
             "latent_handle": session.latent_handle,
             "product_handles": sorted(session.product_handles),
             "prompt_logits_handle": session.prompt_logits_handle,
-            "last_sampled_token": _host_token(session.last_sampled_token),
+            "logical_position": session.logical_position,
             "flow_step": session.flow_step,
             "rng_counter": session.rng_counter,
             "last_op_id": session.last_op_id,
@@ -705,9 +705,8 @@ class SnapshotProvider:
                 data.get("prompt_logits_handle"),
                 "snapshot session.prompt_logits_handle",
             ),
-            last_sampled_token=_optional_uint(
-                data.get("last_sampled_token"),
-                "snapshot session.last_sampled_token",
+            logical_position=_uint(
+                data.get("logical_position"), "snapshot session.logical_position"
             ),
             flow_step=_uint(data.get("flow_step"), "snapshot session.flow_step"),
             rng_counter=_uint(data.get("rng_counter"), "snapshot session.rng_counter"),
@@ -817,7 +816,6 @@ class SnapshotProvider:
             "handle": record.handle,
             "session_id": record.session_id,
             "locator": locator(record.locator, base),
-            "content_hash": record.content_hash,
             "payload": _product_payload_to_json(record.payload, base, tensor),
         }
 
@@ -834,7 +832,6 @@ class SnapshotProvider:
             session_id=_uint(data.get("session_id"), "snapshot product.session_id"),
             payload=_product_payload_from_json(data.get("payload"), tensors, self.device),
             locator=_resolve_asset(raw_locator, assets),
-            content_hash=_optional_uint(data.get("content_hash"), "snapshot product.content_hash"),
         )
 
     @staticmethod
@@ -1248,16 +1245,6 @@ def _uint(value: object, where: str) -> int:
 
 def _optional_uint(value: object, where: str) -> int | None:
     return None if value is None else _uint(value, where)
-
-
-def _host_token(value: int | SampledTokenRelay | None) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, SampledTokenRelay):
-        if value.tensor.numel() != 1:
-            raise invalid_descriptor("session sampled-token relay must contain one token")
-        return int(value.tensor.reshape(-1)[0].item())
-    return int(value)
 
 
 def _uint_tuple(value: object, where: str) -> tuple[int, ...]:

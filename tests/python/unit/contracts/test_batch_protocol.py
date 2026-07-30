@@ -1,4 +1,4 @@
-"""Checkpoint 1 protocol conformance for the Python record mirror.
+"""Worker protocol conformance for the Python record mirror.
 
 The digest-parity case reads the canonical fixture emitted by the Rust
 ``worker-wire`` crate test ``emit_digest_parity_fixture`` (run
@@ -104,7 +104,7 @@ def _token_output() -> ProductRef:
     )
 
 
-def _decode_operation() -> Operation:
+def _decode_operation(input_product: ProductRef | None = None) -> Operation:
     return Operation.registered(
         request_key=_request_key(),
         op_id=11,
@@ -113,6 +113,7 @@ def _decode_operation() -> Operation:
         route=1,
         domain=Domain.UND,
         bounds=Bounds(max_points=1, max_tokens=1, max_kv_pages=1),
+        inputs=(() if input_product is None else (input_product,)),
         outputs=(_token_output(),),
         new_kv_blocks=(7,),
         rng=Rng(seed=99, semantic_index_base=4, draw_layout=DrawLayout.TARGET_SAMPLING),
@@ -162,6 +163,8 @@ def test_route_capability_digest_matches_rust() -> None:
         sample["max_latent_size"],
         sample["max_vae_grid_tokens"],
         sample["max_vit_grid_tokens"],
+        sample["max_latent_feature_bytes"],
+        sample["max_vision_feature_bytes"],
         AdapterMode(sample["adapter_mode"]),
         sample["max_batch_operations"],
         sample["kv_dtype"],
@@ -370,11 +373,11 @@ def test_token_product_bytes_round_trip() -> None:
 def test_batch_carries_host_supplied_input_products() -> None:
     token_input = ProductRef(
         request_key=_request_key(),
-        producer_op_id=1,
+        producer_op_id=11,
         output_index=0,
         generation=1,
         kind=ProductKind.TOKEN,
-        storage_class=StorageClass.DEVICE_TENSOR,
+        storage_class=StorageClass.HOST_STAGING,
         dtype=DType.I32,
         shape_bound=ShapeBound((StaticDim(3),)),
         point_range=PointRange(base_point=0, max_points=1),
@@ -384,7 +387,7 @@ def test_batch_carries_host_supplied_input_products() -> None:
     batch = Batch(
         step_id=1,
         admissions=(admission,),
-        operations=(_decode_operation(),),
+        operations=(_decode_operation(token_input),),
         input_products=(payload,),
     )
     restored = Batch.from_wire(batch.to_wire())

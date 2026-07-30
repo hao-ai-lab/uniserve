@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 uniserve-core.workspace = true
+uniserve-worker-wire.workspace = true
 sha2.workspace = true

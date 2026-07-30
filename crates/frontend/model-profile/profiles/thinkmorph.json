@@ -34,11 +34,15 @@
     "gen_only_start": "immediate",
     "trigger": {"kind": "round_close_then_image_start_suffix"},
     "feedback": {
-      "commit": "commit_gen",
-      "writeback": {"kind": "direct_kv"},
+      "source": {"kind": "device_product"},
       "next_und_token": {"kind": "bos"},
-      "logical_positions": 2,
-      "physical_kv_tokens": {"kind": "worker_defined"}
+      "ingest": {
+        "steps": ["vae_encode"],
+        "logical_positions": 2,
+        "step_kv_tokens": [{"kind": "worker_defined"}],
+        "modality": "und"
+      },
+      "sample_continuation": false
     }
   },
   "image_defaults": {

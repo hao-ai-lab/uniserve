@@ -3,7 +3,18 @@ from __future__ import annotations
 import pytest
 import torch
 
+from uniserve_worker.batch import (
+    DeviceDim,
+    DType,
+    PointRange,
+    ProductKind,
+    ProductRef,
+    RequestKey,
+    ShapeBound,
+    StorageClass,
+)
 from uniserve_worker.runtime.product_store import (
+    DeviceProductTable,
     ProductRecord,
     ProductStore,
     VisionFeatureProduct,
@@ -23,7 +34,6 @@ def _vision_record(handle: int, session_id: int) -> ProductRecord:
             width=32,
             source_base64=f"image-{handle}",
         ),
-        content_hash=handle,
     )
 
 
@@ -35,18 +45,199 @@ def _commit(store: ProductStore, record: ProductRecord) -> None:
     transaction.finalize()
 
 
+def _device_ref(
+    *,
+    op_id: int,
+    generation: int,
+    dtype: DType = DType.U32,
+) -> ProductRef:
+    return ProductRef(
+        request_key=RequestKey(1, 7, 3),
+        producer_op_id=op_id,
+        output_index=0,
+        generation=generation,
+        kind=ProductKind.TOKEN,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=dtype,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(),
+    )
+
+
 def test_encoder_product_lifetime_is_owned_by_explicit_handle_release() -> None:
-    store = ProductStore(encoder_cache_budget=1)
+    store = ProductStore(encoder_cache_budget=1, device_product_capacity=1)
+    reference = ProductRef(
+        request_key=RequestKey(1, 1, 3),
+        producer_op_id=11,
+        output_index=0,
+        generation=11,
+        kind=ProductKind.VISION_FEATURE,
+        storage_class=StorageClass.LATENT_ARENA,
+        dtype=DType.BF16,
+        shape_bound=ShapeBound((DeviceDim(6),)),
+        point_range=PointRange(),
+    )
+    (write,) = store.device_products.bind_outputs(((reference, "ab" * 32, "cpu"),))
+    resident = store.device_products.publish_write(
+        write,
+        torch.full((2, 3), 11.0, dtype=torch.bfloat16),
+    )
     cached = _vision_record(11, 1)
+    cached = ProductRecord(
+        handle=cached.handle,
+        session_id=cached.session_id,
+        payload=VisionFeatureProduct(
+            features=resident,
+            grid=cached.payload.grid,
+            height=cached.payload.height,
+            width=cached.payload.width,
+            source_base64=cached.payload.source_base64,
+        ),
+    )
     _commit(store, cached)
+    original_physical_generation = store.device_products.physical_generation(reference)
 
     store.drop(1)
 
     assert store.require(11) == cached
+    read = store.device_products.consume(reference, consumer_op_id=12)
+    store.device_products.record_reader(read)
+    assert read.tensor.reshape(-1).tolist() == [11.0] * 6
 
     store.release((11,))
+    replacement_reference = ProductRef(
+        request_key=RequestKey(1, 2, 3),
+        producer_op_id=12,
+        output_index=0,
+        generation=12,
+        kind=ProductKind.VISION_FEATURE,
+        storage_class=StorageClass.LATENT_ARENA,
+        dtype=DType.BF16,
+        shape_bound=ShapeBound((DeviceDim(6),)),
+        point_range=PointRange(),
+    )
+    store.device_products.bind_outputs(
+        ((replacement_reference, "cd" * 32, "cpu"),)
+    )
+    store.device_products.publish(
+        replacement_reference,
+        torch.full((2, 3), 12.0, dtype=torch.bfloat16),
+    )
     replacement = _vision_record(12, 2)
     _commit(store, replacement)
 
     assert store.require(12) == replacement
     assert store.encoder_output_count() == 1
+    assert (
+        store.device_products.physical_generation(replacement_reference)
+        != original_physical_generation
+    )
+
+
+def test_device_product_access_validates_logical_and_physical_generations() -> None:
+    table = DeviceProductTable(capacity=1)
+    reference = _device_ref(op_id=11, generation=5)
+    table.bind_outputs(((reference, "ab" * 32, "cpu"),))
+    published = table.publish(reference, torch.tensor([41], dtype=torch.long))
+
+    read = table.consume(
+        reference,
+        consumer_op_id=12,
+        producer_plan_digest="ab" * 32,
+    )
+    table.record_reader(read)
+
+    assert published.tolist() == [41]
+    assert read.tensor.tolist() == [41]
+    assert table.physical_generation(reference) == read.physical_generation
+
+    stale = ProductRef(
+        request_key=reference.request_key,
+        producer_op_id=reference.producer_op_id,
+        output_index=reference.output_index,
+        generation=reference.generation + 1,
+        kind=reference.kind,
+        storage_class=reference.storage_class,
+        dtype=reference.dtype,
+        shape_bound=reference.shape_bound,
+        point_range=reference.point_range,
+    )
+    with pytest.raises(Exception, match="stale device-product logical generation"):
+        table.consume(stale, consumer_op_id=12)
+
+
+def test_device_product_slot_reuse_advances_the_physical_generation() -> None:
+    table = DeviceProductTable(capacity=1)
+    first = _device_ref(op_id=21, generation=8)
+    (first_write,) = table.bind_outputs(((first, "cd" * 32, "cpu"),))
+    table.publish(first, torch.tensor([7], dtype=torch.long))
+    first_generation = table.physical_generation(first)
+    table.release_operation(first.request_key, first.producer_op_id)
+
+    second = _device_ref(op_id=22, generation=9)
+    table.bind_outputs(((second, "ef" * 32, "cpu"),))
+    table.publish(second, torch.tensor([13], dtype=torch.long))
+
+    assert table.physical_generation(second) != first_generation
+    assert table.consume(second, consumer_op_id=23).tensor.tolist() == [13]
+    with pytest.raises(Exception, match="stale device-product physical generation"):
+        table.producer_write_views((first_write,))
+
+
+def test_device_product_registration_failure_preserves_atomic_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = DeviceProductTable(capacity=2)
+    first = _device_ref(op_id=31, generation=10)
+    second = _device_ref(op_id=32, generation=11, dtype=DType.U8)
+    allocate = torch.empty
+    calls = 0
+
+    def fail_second_allocation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise torch.OutOfMemoryError("injected allocation failure")
+        return allocate(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_second_allocation)
+    with pytest.raises(torch.OutOfMemoryError):
+        table.bind_outputs(
+            (
+                (first, "ab" * 32, "cpu"),
+                (second, "cd" * 32, "cpu"),
+            )
+        )
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    table.bind_outputs(
+        (
+            (first, "ab" * 32, "cpu"),
+            (second, "cd" * 32, "cpu"),
+        )
+    )
+    table.publish(first, torch.tensor([17], dtype=torch.long))
+    table.publish(second, torch.tensor([1], dtype=torch.uint8))
+
+    assert table.consume(first, consumer_op_id=41).tensor.tolist() == [17]
+    assert table.consume(second, consumer_op_id=42).tensor.tolist() == [1]
+
+
+def test_compatible_product_batch_binds_one_contiguous_producer_range() -> None:
+    table = DeviceProductTable(capacity=6)
+    retained = tuple(_device_ref(op_id=51 + index, generation=20 + index) for index in range(4))
+    table.bind_outputs(tuple((reference, "ab" * 32, "cpu") for reference in retained))
+    table.publish_batch(retained, torch.tensor([1, 2, 3, 4], dtype=torch.long))
+    table.release_operations(
+        (
+            (retained[0].request_key, retained[0].producer_op_id),
+            (retained[2].request_key, retained[2].producer_op_id),
+        )
+    )
+
+    current = tuple(_device_ref(op_id=61 + index, generation=30 + index) for index in range(2))
+    writes = table.bind_outputs(tuple((reference, "cd" * 32, "cpu") for reference in current))
+    producer_batch = table.producer_scalar_batch(writes)
+
+    assert producer_batch is not None
+    assert producer_batch.tensor.shape == (2,)

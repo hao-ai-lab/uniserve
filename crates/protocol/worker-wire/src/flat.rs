@@ -216,7 +216,11 @@ fn und_admission_from_table(admission: fbs::UndAdmission<'_>) -> anyhow::Result<
 
 fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> anyhow::Result<GenAdmission> {
     Ok(GenAdmission {
-        image: image_from_table(admission.image().context("gen admission has no image spec")?)?,
+        image: image_from_table(
+            admission
+                .image()
+                .context("gen admission has no image spec")?,
+        )?,
     })
 }
 
@@ -596,6 +600,8 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
         bytes_per_token: caps.bytes_per_token(),
         max_vae_grid_tokens: caps.max_vae_grid_tokens(),
         max_vit_grid_tokens: caps.max_vit_grid_tokens(),
+        max_latent_feature_bytes: caps.max_latent_feature_bytes(),
+        max_vision_feature_bytes: caps.max_vision_feature_bytes(),
         commit_marker_tokens: caps.commit_marker_tokens(),
         gen_rope_advance: caps.gen_rope_advance(),
         max_cfg_branches: caps.max_cfg_branches(),
@@ -1871,6 +1877,8 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         bytes_per_token: caps.bytes_per_token,
         max_vae_grid_tokens: caps.max_vae_grid_tokens,
         max_vit_grid_tokens: caps.max_vit_grid_tokens,
+        max_latent_feature_bytes: caps.max_latent_feature_bytes,
+        max_vision_feature_bytes: caps.max_vision_feature_bytes,
         commit_marker_tokens: caps.commit_marker_tokens,
         gen_rope_advance: caps.gen_rope_advance,
         max_cfg_branches: caps.max_cfg_branches,
@@ -1931,6 +1939,8 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
         bytes_per_token: caps.bytes_per_token,
         max_vae_grid_tokens: caps.max_vae_grid_tokens,
         max_vit_grid_tokens: caps.max_vit_grid_tokens,
+        max_latent_feature_bytes: caps.max_latent_feature_bytes,
+        max_vision_feature_bytes: caps.max_vision_feature_bytes,
         commit_marker_tokens: caps.commit_marker_tokens,
         gen_rope_advance: caps.gen_rope_advance,
         max_cfg_branches: caps.max_cfg_branches,

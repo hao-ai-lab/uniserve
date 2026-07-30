@@ -412,21 +412,13 @@ fn profile_from_manifest(
     if supported_constraints.contains(&GenerationConstraint::Default)
         && !matches!(generation_policy.trigger, TriggerPolicyDescriptor::Disabled)
         && generation_policy.termination.gen_commit_continues_default
-        && generation_policy.feedback.as_ref().is_none_or(|feedback| {
-            matches!(
-                feedback.writeback,
-                uniserve_core::FeedbackWriteback::Disabled
-            )
-        })
+        && generation_policy.feedback.is_none()
     {
         return Err(AssetError::message(format!(
             "generation profile {id:?} enables default Gen continuation without feedback"
         )));
     }
-    if let Some(GeneratedImageFeedbackRecipe {
-        writeback: uniserve_core::FeedbackWriteback::Reingest { ingest },
-        ..
-    }) = generation_policy.feedback.as_ref()
+    if let Some(GeneratedImageFeedbackRecipe { ingest, .. }) = generation_policy.feedback.as_ref()
         && ingest.steps.is_empty()
     {
         return Err(AssetError::message(format!(
@@ -1345,8 +1337,8 @@ mod tests {
                 .generation_policy
                 .feedback
                 .as_ref()
-                .map(|feedback| feedback.commit),
-            Some(uniserve_core::CommitRecipe::CommitGenThenWriteback)
+                .map(|feedback| feedback.source.clone()),
+            Some(uniserve_core::FeedbackSource::DeviceProduct)
         );
 
         let thinkmorph = profile_from_key("thinkmorph", &tok).expect("ThinkMorph profile");
@@ -1375,8 +1367,8 @@ mod tests {
                 .generation_policy
                 .feedback
                 .as_ref()
-                .map(|feedback| feedback.commit),
-            Some(uniserve_core::CommitRecipe::CommitGen)
+                .map(|feedback| feedback.source.clone()),
+            Some(uniserve_core::FeedbackSource::DeviceProduct)
         );
 
         let bagel = profile_from_key("bagel", &tok).expect("BAGEL profile");
@@ -1385,8 +1377,8 @@ mod tests {
                 .generation_policy
                 .feedback
                 .as_ref()
-                .map(|feedback| feedback.commit),
-            Some(uniserve_core::CommitRecipe::CommitGen)
+                .map(|feedback| feedback.source.clone()),
+            Some(uniserve_core::FeedbackSource::DeviceProduct)
         );
     }
 

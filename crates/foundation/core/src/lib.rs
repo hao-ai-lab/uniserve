@@ -13,15 +13,14 @@ pub mod program_cursor;
 pub mod sampling;
 pub mod semantic;
 pub use generation::{
-    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
-    GenOnlyStartPolicyDescriptor, GeneratedImageCommitCapabilities, GeneratedImageFeedbackRecipe,
-    GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor, GenerationCapabilityNeeds,
-    GenerationConstraint, GenerationConstraintParseError, GenerationPolicyDescriptor,
-    GenerationRequest, GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
-    GenerationRuntimeCapabilities, GrammarSpec, ImageIngestRecipe, ImageIngestStep, ImageKvEffect,
-    ImageSegment, SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor,
-    UndTokenAction, UndVisibility, VisibilityPolicyDescriptor, denoise_scratch_tokens,
-    encoder_cache_key,
+    ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,
+    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,
+    GenerationCapabilityNeeds, GenerationConstraint, GenerationConstraintParseError,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
+    GenerationResourceBounds, GenerationResourceError, GenerationRuntimeCapabilities, GrammarSpec,
+    ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPlacement,
+    TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction, UndVisibility,
+    VisibilityPolicyDescriptor, denoise_scratch_tokens, encoder_cache_key,
 };
 pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs};
 
@@ -115,6 +114,7 @@ pub struct OpId(pub u64);
 
 /// The two modality branches of the MoT model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Modality {
     Und, // understanding / text
     Gen, // generation / image latents

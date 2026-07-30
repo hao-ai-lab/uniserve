@@ -18,10 +18,10 @@ use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling};
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
-    Admission, Batch, CompletionRecord, CompletionReport, DType, Digest, EngineCaps, FinishFlags,
-    GenMode, LogicalLengths, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, RegistrationAck, RequestKind, ShapeBound, StorageClass, TimingCounters, TokenMode,
-    TokenSpan, TransferMode, Work, WorkVariant,
+    Admission, Batch, CompletionRecord, CompletionReport, Digest, EngineCaps, FinishFlags, GenMode,
+    LogicalLengths, OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef,
+    RegistrationAck, RequestKind, TimingCounters, TokenMode, TokenSpan, TransferMode, Work,
+    WorkVariant,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -125,15 +125,6 @@ impl Executor for SimExecutor {
 
     fn in_flight(&self) -> usize {
         self.in_flight
-    }
-
-    fn generated_image_commit_capabilities(
-        &self,
-    ) -> uniserve_core::GeneratedImageCommitCapabilities {
-        uniserve_core::GeneratedImageCommitCapabilities {
-            inline: true,
-            separate_writeback: true,
-        }
     }
 
     fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
@@ -295,6 +286,8 @@ impl SimEngine {
             latent_downsample: 16,
             max_vae_grid_tokens: 1_024,
             max_vit_grid_tokens: 64,
+            max_latent_feature_bytes: 1 << 20,
+            max_vision_feature_bytes: 1 << 20,
             encoder_cache_budget: 256,
             supported_controls: vec![
                 RequestKind::DropSession,
@@ -395,58 +388,71 @@ impl SimEngine {
 
         match operation.work {
             Work::Token(mode) => {
-                let index = session.emitted;
-                let output = self.sample(operation.request_key.session_id, session, index);
-                // A committed EOS reproduces the natural-termination behavior the
-                // synthetic distribution enforces past `text_len`.
-                record.finish_flags.eos = output.token == self.fake_eos;
-                record.token_span = TokenSpan {
-                    base: index as u32,
-                    len: 1,
-                };
-                record.logical_lengths = LogicalLengths {
-                    token_len: 1,
-                    kv_visible_len: operation.bounds.max_tokens,
-                    latent_len: 0,
-                };
-                match mode {
-                    TokenMode::Extend => session.emitted = session.emitted.max(1),
-                    TokenMode::Decode | TokenMode::Verify => {
-                        session.emitted = session.emitted.saturating_add(1)
+                let visual_state = operation.inputs.iter().any(|input| {
+                    matches!(
+                        input.kind,
+                        ProductKind::VisionFeature | ProductKind::LatentFeature
+                    )
+                });
+                let samples_token = operation
+                    .outputs
+                    .iter()
+                    .any(|output| output.kind == ProductKind::Token);
+                if visual_state {
+                    record.logical_lengths.kv_visible_len = operation.bounds.max_tokens.max(1);
+                    if operation
+                        .outputs
+                        .iter()
+                        .any(|output| output.kind == ProductKind::Completion)
+                    {
+                        session.emitted = 0;
                     }
                 }
-                record.committed_tokens = vec![output.token];
-                let blob = LogprobBlob {
-                    sampled_logprob: session
-                        .sampling()
-                        .is_some_and(SamplingParams::generated_logprobs_requested)
-                        .then_some(output.logprob),
-                    top_logprobs: output
-                        .top
-                        .iter()
-                        .map(|(token_id, logprob, rank)| RankedToken {
-                            token_id: *token_id,
-                            logprob: *logprob,
-                            rank: *rank,
-                        })
-                        .collect(),
-                    prompt_logprobs: Vec::new(),
-                };
-                if !blob.is_empty() {
-                    products.push(ProductPayload {
-                        product: output_ref(
-                            operation,
-                            ProductKind::Logprob,
-                            StorageClass::CompletionArena,
-                        ),
-                        bytes: blob.encode(),
-                    });
+                if !visual_state || samples_token {
+                    let index = session.emitted;
+                    let output = self.sample(operation.request_key.session_id, session, index);
+                    record.finish_flags.eos = output.token == self.fake_eos;
+                    record.token_span = TokenSpan {
+                        base: index as u32,
+                        len: 1,
+                    };
+                    record.logical_lengths.token_len = 1;
+                    if !visual_state {
+                        record.logical_lengths.kv_visible_len = operation.bounds.max_tokens;
+                    }
+                    match mode {
+                        TokenMode::Extend => session.emitted = session.emitted.max(1),
+                        TokenMode::Decode | TokenMode::Verify => {
+                            session.emitted = session.emitted.saturating_add(1)
+                        }
+                    }
+                    record.committed_tokens = vec![output.token];
+                    let blob = LogprobBlob {
+                        sampled_logprob: session
+                            .sampling()
+                            .is_some_and(SamplingParams::generated_logprobs_requested)
+                            .then_some(output.logprob),
+                        top_logprobs: output
+                            .top
+                            .iter()
+                            .map(|(token_id, logprob, rank)| RankedToken {
+                                token_id: *token_id,
+                                logprob: *logprob,
+                                rank: *rank,
+                            })
+                            .collect(),
+                        prompt_logprobs: Vec::new(),
+                    };
+                    if !blob.is_empty() {
+                        products.push(ProductPayload {
+                            product: output_ref(operation, ProductKind::Logprob)?,
+                            bytes: blob.encode(),
+                        });
+                    }
                 }
             }
             Work::Draft => {}
-            Work::Encode(_) => {
-                record.logical_lengths.kv_visible_len = 1;
-            }
+            Work::Encode(_) => {}
             Work::Transfer(mode) => {
                 record.logical_lengths.kv_visible_len =
                     matches!(mode, TransferMode::KvPublish | TransferMode::KvInstall) as u32;
@@ -466,26 +472,15 @@ impl SimEngine {
             }
             Work::Materialize => {
                 session.flow_step = 0;
-                session.emitted = 0;
                 if let Some(image) = session.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
                         (image.height, image.width)
                     } else {
                         DEFAULT_IMAGE_HW
                     };
-                    if image.retain_images {
-                        let downsample = self.caps.latent_downsample.max(1);
-                        record.logical_lengths.kv_visible_len = (image.height / downsample)
-                            .saturating_mul(image.width / downsample)
-                            .saturating_add(self.caps.commit_marker_tokens.max(1));
-                    }
                     let png_base64 = synthetic_png_b64(width, height)?;
                     products.push(ProductPayload {
-                        product: output_ref(
-                            operation,
-                            ProductKind::Artifact,
-                            StorageClass::HostStaging,
-                        ),
+                        product: output_ref(operation, ProductKind::Artifact)?,
                         bytes: png_base64.into_bytes(),
                     });
                 }
@@ -494,9 +489,9 @@ impl SimEngine {
 
         // Every declared output surfaces as a resolvable product for the host.
         // The Artifact/Logprob payloads above carry real bytes; the remaining
-        // declared references (Kv writeback locators, token/latent/feature
-        // handles) surface as presence-only entries addressed by their
-        // reference, since the host consumes those by identity, not by value.
+        // declared KV, token, latent, and feature references surface as
+        // presence-only entries addressed by identity, since the host does not
+        // consume their values.
         for output in &operation.outputs {
             if products
                 .iter()
@@ -555,25 +550,18 @@ impl SimEngine {
     }
 }
 
-/// The resolved output-product reference for a value the worker packs into the
-/// completion report: the operation's declared output of that kind when present,
-/// otherwise a freshly named completion-arena reference the host can address.
-fn output_ref(operation: &Operation, kind: ProductKind, storage_class: StorageClass) -> ProductRef {
+/// The declared output-product reference for a value packed into a completion.
+fn output_ref(operation: &Operation, kind: ProductKind) -> anyhow::Result<ProductRef> {
     operation
         .outputs
         .iter()
         .find(|output| output.kind == kind)
         .cloned()
-        .unwrap_or_else(|| ProductRef {
-            request_key: operation.request_key,
-            producer_op_id: operation.op_id,
-            output_index: operation.outputs.len() as u16,
-            generation: 0,
-            kind,
-            storage_class,
-            dtype: DType::U8,
-            shape_bound: ShapeBound::default(),
-            point_range: PointRange::default(),
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "operation {:?} has no declared {kind:?} output",
+                operation.op_id
+            )
         })
 }
 

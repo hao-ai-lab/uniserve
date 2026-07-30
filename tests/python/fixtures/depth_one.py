@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from uniserve_worker.batch import (
     Admission,
     Bounds,
+    DeviceDim,
     Domain,
     DType,
     EncodeMode,
@@ -28,6 +29,7 @@ from uniserve_worker.batch import (
     RequestKey,
     SamplingParams,
     ShapeBound,
+    StaticDim,
     StorageClass,
     TokenMode,
     UndAdmission,
@@ -73,16 +75,16 @@ def root_parent(admission: Admission) -> VersionRef:
     return VersionRef(admission.request_key, 0, FixedPoint(0, admission.digest))
 
 
-def _token_input_ref(rk: RequestKey) -> ProductRef:
+def _token_input_ref(rk: RequestKey, op_id: int, token_count: int) -> ProductRef:
     return ProductRef(
         request_key=rk,
-        producer_op_id=0,
-        output_index=0,
-        generation=0,
+        producer_op_id=op_id,
+        output_index=(1 << 16) - 1,
+        generation=op_id * 3,
         kind=ProductKind.TOKEN,
         storage_class=StorageClass.HOST_STAGING,
         dtype=DType.U32,
-        shape_bound=ShapeBound(),
+        shape_bound=ShapeBound((StaticDim(max(1, int(token_count))),)),
         point_range=PointRange(),
     )
 
@@ -95,6 +97,7 @@ def token_operation(
     mode: TokenMode,
     tokens: Sequence[int],
     new_kv_blocks: Sequence[int] = (),
+    predicate: ProductRef | None = None,
 ) -> tuple[Operation, ProductPayload]:
     """A token operation plus the input token product the worker decodes for it.
 
@@ -103,7 +106,29 @@ def token_operation(
     boundary.
     """
 
-    reference = _token_input_ref(rk)
+    reference = _token_input_ref(rk, op_id, len(tokens))
+    token_output = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=0,
+        generation=op_id * 3 + 1,
+        kind=ProductKind.TOKEN,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.U32,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(),
+    )
+    predicate_output = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=1,
+        generation=op_id * 3 + 2,
+        kind=ProductKind.COMPLETION,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.U8,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(),
+    )
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -113,7 +138,9 @@ def token_operation(
         domain=Domain.UND,
         bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
         inputs=(reference,),
+        outputs=(token_output, predicate_output),
         new_kv_blocks=tuple(int(value) for value in new_kv_blocks),
+        predicate=predicate,
     )
     payload = ProductPayload(
         product=reference,
@@ -127,10 +154,11 @@ def encode_operation(
     *,
     op_id: int,
     parent: VersionRef,
-    image_base64: str,
+    image_base64: str | None,
     encoder_handle: int,
     mode: EncodeMode = EncodeMode.VISION,
-) -> tuple[Operation, ProductPayload]:
+    source_product: ProductRef | None = None,
+) -> tuple[Operation, ProductPayload | None]:
     """An encode operation plus its input image product.
 
     The scheduler stamps the encode output reference's ``generation`` with the
@@ -139,15 +167,18 @@ def encode_operation(
     """
 
     kind = ProductKind.VISION_FEATURE if mode is EncodeMode.VISION else ProductKind.LATENT_FEATURE
-    image_ref = ProductRef(
+    if (image_base64 is None) == (source_product is None):
+        raise ValueError("encode operation requires exactly one image source")
+    image_bytes = None if image_base64 is None else image_base64.encode("utf-8")
+    image_ref = source_product or ProductRef(
         request_key=rk,
-        producer_op_id=0,
-        output_index=1,
-        generation=0,
-        kind=kind,
+        producer_op_id=op_id,
+        output_index=0xFFFF,
+        generation=op_id * 3 + 2,
+        kind=ProductKind.ARTIFACT,
         storage_class=StorageClass.HOST_STAGING,
         dtype=DType.U8,
-        shape_bound=ShapeBound(),
+        shape_bound=ShapeBound((StaticDim(len(image_bytes)),)),
         point_range=PointRange(),
     )
     output_ref = ProductRef(
@@ -156,9 +187,9 @@ def encode_operation(
         output_index=0,
         generation=int(encoder_handle),
         kind=kind,
-        storage_class=StorageClass.DEVICE_TENSOR,
+        storage_class=StorageClass.LATENT_ARENA,
         dtype=DType.BF16,
-        shape_bound=ShapeBound(),
+        shape_bound=ShapeBound((DeviceDim(4_096),)),
         point_range=PointRange(),
     )
     operation = Operation.registered(
@@ -168,11 +199,16 @@ def encode_operation(
         work=Work("encode", mode.value),
         route=0,
         domain=Domain.UND,
-        bounds=Bounds(max_points=1, max_tokens=64),
+        bounds=Bounds(max_points=1, max_tokens=64, max_latent_bytes=8_192),
         inputs=(image_ref,),
         outputs=(output_ref,),
     )
-    return operation, ProductPayload(product=image_ref, payload=image_base64.encode("utf-8"))
+    payload = (
+        None
+        if image_base64 is None
+        else ProductPayload(product=image_ref, payload=image_bytes)
+    )
+    return operation, payload
 
 
 def flow_operation(rk: RequestKey, *, op_id: int, parent: VersionRef, steps: int) -> Operation:
@@ -187,7 +223,40 @@ def flow_operation(rk: RequestKey, *, op_id: int, parent: VersionRef, steps: int
     )
 
 
-def materialize_operation(rk: RequestKey, *, op_id: int, parent: VersionRef) -> Operation:
+def materialize_operation(
+    rk: RequestKey,
+    *,
+    op_id: int,
+    parent: VersionRef,
+    feedback_source: bool = False,
+) -> Operation:
+    outputs = (
+        ProductRef(
+            request_key=rk,
+            producer_op_id=op_id,
+            output_index=0,
+            generation=op_id * 3,
+            kind=ProductKind.ARTIFACT,
+            storage_class=StorageClass.COMPLETION_ARENA,
+            dtype=DType.U8,
+            shape_bound=ShapeBound((DeviceDim(65_536),)),
+            point_range=PointRange(),
+        ),
+    )
+    if feedback_source:
+        outputs += (
+            ProductRef(
+                request_key=rk,
+                producer_op_id=op_id,
+                output_index=1,
+                generation=op_id * 3 + 1,
+                kind=ProductKind.ARTIFACT,
+                storage_class=StorageClass.LATENT_ARENA,
+                dtype=DType.BF16,
+                shape_bound=ShapeBound((DeviceDim(3 * 16 * 16),)),
+                point_range=PointRange(),
+            ),
+        )
     return Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -195,7 +264,59 @@ def materialize_operation(rk: RequestKey, *, op_id: int, parent: VersionRef) -> 
         work=Work("materialize", None),
         route=0,
         domain=Domain.GEN,
-        bounds=Bounds(),
+        bounds=Bounds(
+            max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
+            max_completion_bytes=65_536,
+        ),
+        outputs=outputs,
+    )
+
+
+def visual_state_operation(
+    rk: RequestKey,
+    *,
+    op_id: int,
+    parent: VersionRef,
+    feature: ProductRef,
+    sample_continuation: bool,
+) -> Operation:
+    outputs = (
+        ProductRef(
+            request_key=rk,
+            producer_op_id=op_id,
+            output_index=0,
+            generation=op_id * 3,
+            kind=ProductKind.COMPLETION,
+            storage_class=StorageClass.DEVICE_TENSOR,
+            dtype=DType.U8,
+            shape_bound=ShapeBound(),
+            point_range=PointRange(),
+        ),
+    )
+    if sample_continuation:
+        outputs += (
+            ProductRef(
+                request_key=rk,
+                producer_op_id=op_id,
+                output_index=1,
+                generation=op_id * 3 + 1,
+                kind=ProductKind.TOKEN,
+                storage_class=StorageClass.DEVICE_TENSOR,
+                dtype=DType.U32,
+                shape_bound=ShapeBound(),
+                point_range=PointRange(),
+            ),
+        )
+    return Operation.registered(
+        request_key=rk,
+        op_id=op_id,
+        parent=parent,
+        work=Work.token(TokenMode.EXTEND),
+        route=0,
+        domain=Domain.UND,
+        bounds=Bounds(max_points=1, max_tokens=1),
+        inputs=(feature,),
+        outputs=outputs,
     )
 
 
@@ -209,4 +330,5 @@ __all__ = [
     "root_parent",
     "token_operation",
     "und_admission",
+    "visual_state_operation",
 ]

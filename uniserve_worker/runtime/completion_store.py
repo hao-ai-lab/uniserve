@@ -9,6 +9,7 @@ from typing import Final
 import torch
 
 from ..foundation.errors import ErrorCode, WorkerError, resource_error
+from .device_events import DeviceEventPool
 from .host_staging import canonical_device
 
 __all__ = ["CompletionArena", "CompletionCapture", "CompletionLease"]
@@ -104,6 +105,24 @@ class CompletionLease:
             raise _invariant("completion slot has no device readiness set")
         slot.devices.add(target)
 
+    def device_event(self, device: torch.device | str) -> torch.cuda.Event | None:
+        """Return this generation's completion fence before it is recorded."""
+
+        slot = self._arena._require_slot(self)
+        if slot.sealed:
+            raise _invariant("completion event was requested after its slot was sealed")
+        target = canonical_device(device)
+        if target.type != "cuda":
+            return None
+        self.register_device(target)
+        device_name = str(target)
+        event = slot.events.get(device_name)
+        if event is None:
+            event = self._arena.event_pool.acquire(target)
+            self._arena.event_pool.retain(event, target)
+            slot.events[device_name] = event
+        return event
+
     def capture(self, tokens: torch.Tensor) -> CompletionCapture:
         flat = tokens.reshape(-1)
         count = int(flat.numel())
@@ -135,9 +154,10 @@ class CompletionLease:
         for device in slot.devices or ():
             event = slot.events.get(str(device))
             if event is None:
-                event = torch.cuda.Event(blocking=False)
+                event = self._arena.event_pool.acquire(device)
+                self._arena.event_pool.retain(event, device)
                 slot.events[str(device)] = event
-            event.record(torch.cuda.current_stream(device))
+            self._arena.event_pool.record(event, device)
         slot.sealed = True
         slot.sealed_ns = time.perf_counter_ns()
 
@@ -193,6 +213,7 @@ class CompletionArena:
         depth: int,
         token_capacity: int,
         devices: tuple[torch.device | str, ...] = (),
+        event_pool: DeviceEventPool | None = None,
     ) -> None:
         self.depth = max(1, int(depth))
         self.token_capacity = max(1, int(token_capacity))
@@ -202,6 +223,7 @@ class CompletionArena:
             if device.type == "cuda" and device not in normalized:
                 normalized.append(device)
         self.devices = tuple(normalized)
+        self.event_pool = DeviceEventPool() if event_pool is None else event_pool
         pin = bool(self.devices)
         self._slots = [
             _CompletionSlot(
@@ -319,8 +341,10 @@ class CompletionArena:
         else:
             slot.abandoned = True
 
-    @staticmethod
-    def _release(slot: _CompletionSlot) -> None:
+    def _release(self, slot: _CompletionSlot) -> None:
+        for event in slot.events.values():
+            self.event_pool.release(event)
+        slot.events.clear()
         slot.owner = 0
         slot.rows = 0
         slot.observed = None

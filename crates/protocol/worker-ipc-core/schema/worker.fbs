@@ -171,6 +171,8 @@ table EngineCaps {
   bytes_per_token:ulong;
   max_vae_grid_tokens:uint;
   max_vit_grid_tokens:uint;
+  max_latent_feature_bytes:ulong;
+  max_vision_feature_bytes:ulong;
   commit_marker_tokens:uint;
   gen_rope_advance:uint;
   max_cfg_branches:uint;

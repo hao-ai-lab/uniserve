@@ -3,7 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::time::{Duration, Instant};
 
-use uniserve_core::{BlockId, CommandWaker, GeneratedImageCommitCapabilities, RequestId};
+use uniserve_core::{BlockId, CommandWaker, RequestId};
 use uniserve_worker_wire::{
     Batch, CompletionReport, EngineCaps, Operation, RequestKind, SnapshotRef, WorkVariant,
     WorkerRequest,
@@ -424,26 +424,20 @@ pub trait Executor: Send {
         self.in_flight() < self.pipeline_depth()
     }
 
-    /// Generated-image commit shapes executable on this topology.
-    /// Non-disaggregated pools append image KV inside `commit_gen`.
-    fn generated_image_commit_capabilities(&self) -> GeneratedImageCommitCapabilities {
-        GeneratedImageCommitCapabilities {
-            inline: true,
-            separate_writeback: false,
-        }
-    }
-
     fn submit(&mut self, batch: Batch) -> anyhow::Result<()>;
     fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>>;
 
-    /// Data-plane causality gate: whether every data-plane tensor the request's
-    /// next op depends on is reachable on the worker that would run it. The
-    /// run it. The scheduler consults this in `next_op()` before emitting an op
-    /// for `req_id`.
-    ///
-    /// Non-disaggregated executors (Uniproc/Multiproc) have no inter-stage
-    /// transfer, so the default is always `true`. The `StageRouter` overrides it
-    /// to report cross-stage transfer readiness from its `TensorMover`.
+    /// Whether a producer's resident device products are directly addressable
+    /// by the worker that executes the consumer. A staged executor returns
+    /// `false` across pool boundaries until an explicit `Transfer(Product)`
+    /// produces a destination-owned reference.
+    fn device_products_reachable(&self, _producer: WorkVariant, _consumer: WorkVariant) -> bool {
+        true
+    }
+
+    /// Data-plane causality gate for an explicit asynchronous transfer already
+    /// registered for the request. Executors without staged transfer state are
+    /// always ready.
     fn stage_ready(&self, _req_id: RequestId) -> bool {
         true
     }

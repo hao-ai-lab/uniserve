@@ -298,13 +298,18 @@ impl ZmqEngineCoreClient {
             combined.supports_vision_encode &= caps.supports_vision_encode;
             combined.supports_latent_encode &= caps.supports_latent_encode;
             combined.supports_image_generation &= caps.supports_image_generation;
-            combined.supports_commit_writeback &= caps.supports_commit_writeback;
             combined.max_latent_units = combined.max_latent_units.min(caps.max_latent_units);
             combined.latent_downsample = combined.latent_downsample.min(caps.latent_downsample);
             combined.max_vae_grid_tokens =
                 combined.max_vae_grid_tokens.max(caps.max_vae_grid_tokens);
             combined.max_vit_grid_tokens =
                 combined.max_vit_grid_tokens.max(caps.max_vit_grid_tokens);
+            combined.max_latent_feature_bytes = combined
+                .max_latent_feature_bytes
+                .min(caps.max_latent_feature_bytes);
+            combined.max_vision_feature_bytes = combined
+                .max_vision_feature_bytes
+                .min(caps.max_vision_feature_bytes);
             combined.commit_marker_tokens =
                 combined.commit_marker_tokens.max(caps.commit_marker_tokens);
             combined.max_cfg_branches = combined.max_cfg_branches.min(caps.max_cfg_branches);
@@ -315,9 +320,6 @@ impl ZmqEngineCoreClient {
             combined.encoder_cache_entries = combined
                 .encoder_cache_entries
                 .min(caps.encoder_cache_entries);
-            combined.generated_image_commit.inline &= caps.generated_image_commit.inline;
-            combined.generated_image_commit.separate_writeback &=
-                caps.generated_image_commit.separate_writeback;
         }
         combined
     }

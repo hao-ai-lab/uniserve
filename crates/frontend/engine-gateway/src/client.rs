@@ -338,20 +338,17 @@ impl EngineCoreClient {
                 supports_vision_encode: true,
                 supports_latent_encode: true,
                 supports_image_generation: true,
-                supports_commit_writeback: true,
                 max_latent_units: 1 << 20,
                 latent_downsample: 16,
                 max_vae_grid_tokens: 4096,
                 max_vit_grid_tokens: 4096,
+                max_latent_feature_bytes: 1 << 28,
+                max_vision_feature_bytes: 1 << 28,
                 commit_marker_tokens: 2,
                 max_cfg_branches: 3,
                 scratch_capacity_tokens: 1 << 20,
                 scratch_block_size: 64,
                 encoder_cache_entries: 256,
-                generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
-                    inline: true,
-                    separate_writeback: true,
-                },
             },
         }
     }

@@ -5,11 +5,10 @@ use std::thread;
 use std::time::Duration;
 
 use uniserve_core::{
-    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
-    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
-    GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor,
-    UndVisibility,
+    ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
+    GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
+    ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine_api::{EngineHandle, GenEvent};
 use uniserve_scheduler::{ControlTokens, Scheduler};
@@ -34,11 +33,10 @@ fn main() {
             trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
             gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
             feedback: Some(GeneratedImageFeedbackRecipe {
-                commit: CommitRecipe::CommitGenThenWriteback,
-                writeback: FeedbackWriteback::DirectKv,
+                source: FeedbackSource::DeviceProduct,
                 next_und_token: FeedbackNextToken::EndOfImage,
-                logical_positions: 2,
-                physical_kv_tokens: uniserve_core::ImageKvEffect::WorkerDefined,
+                ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
+                sample_continuation: true,
             }),
             ..GenerationPolicyDescriptor::default()
         };
@@ -65,20 +63,17 @@ fn main() {
                 supports_vision_encode: false,
                 supports_latent_encode: false,
                 supports_image_generation: true,
-                supports_commit_writeback: true,
                 max_latent_units: 64,
                 latent_downsample: 16,
                 max_vae_grid_tokens: 64,
                 max_vit_grid_tokens: 64,
+                max_latent_feature_bytes: 1 << 20,
+                max_vision_feature_bytes: 1 << 20,
                 commit_marker_tokens: 2,
                 max_cfg_branches: 3,
                 scratch_capacity_tokens: 1 << 20,
                 scratch_block_size: 64,
                 encoder_cache_entries: 256,
-                generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
-                    inline: true,
-                    separate_writeback: true,
-                },
             },
         )
         .expect("bounded simulation request");

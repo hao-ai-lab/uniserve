@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from torch import nn
 
 from uniserve_worker.backends.attention import resolve_attention_selection
@@ -16,12 +18,14 @@ def execution_worker(
     *,
     defer_sampling: bool = False,
     block_size: int = 16,
+    device: str = "cpu",
+    pipeline_depth: int = 1,
 ) -> ModelWorker:
     ready = StubModel() if model is None else model
-    deployment = stub_deployment(block_size)
+    deployment = replace(stub_deployment(block_size), device=device)
     return ModelWorker(
         ready,
-        mesh=DeviceMesh.trivial("cpu"),
+        mesh=DeviceMesh.trivial(device),
         model_spec=ready.spec,
         deployment=deployment,
         attention=resolve_attention_selection(
@@ -35,7 +39,7 @@ def execution_worker(
         defer_sampling=defer_sampling,
         mooncake_device="",
         mooncake_protocol="rdma",
-        pipeline_depth=1,
+        pipeline_depth=pipeline_depth,
     )
 
 
