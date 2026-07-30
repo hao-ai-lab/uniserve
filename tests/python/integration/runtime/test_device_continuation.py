@@ -13,7 +13,6 @@ from uniserve_worker.batch import (
     Batch,
     DevicePoint,
     DrawLayout,
-    Operation,
     ProductKind,
     Release,
     Rng,
@@ -90,7 +89,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         parent.op_id,
         DevicePoint(parent.outputs[0], parent.plan_digest),
     )
-    successor_template, _ = token_operation(
+    successor, successor_input = token_operation(
         admission.request_key,
         op_id=2,
         parent=device_parent,
@@ -100,24 +99,13 @@ def test_same_request_continues_from_device_products_before_parent_observation(
             output for output in parent.outputs if output.kind is ProductKind.COMPLETION
         ),
     )
-    successor = Operation.registered(
-        request_key=successor_template.request_key,
-        op_id=successor_template.op_id,
-        parent=device_parent,
-        work=successor_template.work,
-        route=successor_template.route,
-        domain=successor_template.domain,
-        bounds=successor_template.bounds,
-        outputs=successor_template.outputs,
-        predicate=successor_template.predicate,
-        rng=successor_template.rng,
-    )
     successor_report = worker.execute(
         Batch(
             step_id=2,
             admissions=(),
             operations=(successor,),
             controls=(Release(admission.request_key, parent.op_id),),
+            input_products=(successor_input,),
         )
     )
 
@@ -189,7 +177,9 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
     observe["enabled"] = True
     torch.cuda.synchronize()
     parent_tokens = finalize_completion_report(parent_report).completions[0].committed_tokens
-    successor_tokens = finalize_completion_report(successor_report).completions[0].committed_tokens
+    successor_tokens = finalize_completion_report(successor_report).completions[
+        0
+    ].committed_tokens
 
     serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
     serial = und_admission(41, block_ids=(2,), sampling=sampling)
