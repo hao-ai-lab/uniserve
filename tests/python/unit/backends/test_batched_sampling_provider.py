@@ -13,7 +13,7 @@ pytestmark = pytest.mark.unit
 
 def _reference(
     logits: torch.Tensor,
-    noise: torch.Tensor,
+    draws: torch.Tensor,
     penalty_token_ids: torch.Tensor,
     penalty_counts: torch.Tensor,
     parameters: torch.Tensor,
@@ -46,9 +46,12 @@ def _reference(
         drop[1:] = drop[:-1].clone()
         drop[0] = False
         candidate_values[row, drop] = float("-inf")
-    gumbel = -torch.log(-torch.log(noise.gather(1, candidate_ids)))
-    gumbel = torch.where(parameters[:, :1] > 0, gumbel, 0)
-    selected = torch.argmax(candidate_values + gumbel, dim=-1)
+    candidate_probabilities = torch.softmax(candidate_values, dim=-1)
+    token_order = torch.argsort(candidate_ids, dim=-1)
+    cumulative = candidate_probabilities.gather(1, token_order).cumsum(dim=-1)
+    sampled_order = (cumulative < draws.unsqueeze(1)).sum(dim=-1).clamp_max(top_k - 1)
+    sampled = token_order.gather(1, sampled_order.unsqueeze(1))[:, 0]
+    selected = torch.where(parameters[:, 0] > 0, sampled, torch.zeros_like(sampled))
     return candidate_ids.gather(1, selected.unsqueeze(1))[:, 0]
 
 
@@ -61,14 +64,7 @@ def _inputs(device: torch.device) -> tuple[torch.Tensor, ...]:
         dtype=torch.bfloat16,
         device=device,
     )
-    noise = torch.tensor(
-        [
-            [0.13, 0.72, 0.41, 0.25, 0.91, 0.54],
-            [0.61, 0.18, 0.83, 0.32, 0.47, 0.76],
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
+    draws = torch.tensor([0.25, 0.76], dtype=torch.float32, device=device)
     penalty_token_ids = torch.tensor(
         [
             [1, 3],
@@ -86,7 +82,7 @@ def _inputs(device: torch.device) -> tuple[torch.Tensor, ...]:
         dtype=torch.float32,
         device=device,
     )
-    return logits, noise, penalty_token_ids, penalty_counts, parameters
+    return logits, draws, penalty_token_ids, penalty_counts, parameters
 
 
 def test_top_k_provider_matches_the_full_expression() -> None:
@@ -131,8 +127,8 @@ def test_top_k_provider_accepts_every_serving_wave_row_count() -> None:
             device=device,
             generator=generator,
         )
-        noise = torch.rand(
-            (row_count, 257),
+        draws = torch.rand(
+            (row_count,),
             dtype=torch.float32,
             device=device,
             generator=generator,
@@ -147,7 +143,7 @@ def test_top_k_provider_accepts_every_serving_wave_row_count() -> None:
 
         tokens, valid = sample_top_k(
             logits,
-            noise,
+            draws,
             penalty_token_ids,
             penalty_counts,
             parameters,

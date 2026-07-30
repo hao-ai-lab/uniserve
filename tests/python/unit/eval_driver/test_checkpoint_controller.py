@@ -1,10 +1,9 @@
-"""Unit tests for the decode-runtime checkpoint acceptance controller.
+"""Behavioral tests for the decode-runtime checkpoint acceptance controller.
 
-These derive the controller's behavior from the acceptance rules in
-``specs/decode-runtime-construction.md`` and ``docs/benchmark-protocol.md``:
-the regression formulas, the 5% target / 7% grace bands, the worse-of-two-baselines
-rule, the checkpoint-only availability of the grace band, and the hard gates for
-failures, artifact validity, interleave conformance, and provenance.
+The protocol uses the worse regression against the immutable anchor and previous
+accepted checkpoint, admits every required performance metric through a single 20%
+limit, and retains correctness, work, artifact-validity, interleave-conformance,
+and provenance checks as hard gates.
 """
 
 from __future__ import annotations
@@ -35,10 +34,6 @@ def _load_controller():
 
 cc = _load_controller()
 
-
-# --------------------------------------------------------------------------- #
-# Synthetic point fixtures
-# --------------------------------------------------------------------------- #
 
 def _base_checks() -> dict[str, bool]:
     return {
@@ -125,10 +120,8 @@ def _interleave_metrics(
     tpot: float,
     image_latency: float,
     transition: float,
-    t2i: float,
-    i2t: float,
-    t2i_count: int = 1,
-    i2t_count: int = 1,
+    text_to_image: float,
+    image_to_text: float,
     coverage: float = 1.0,
     signatures: dict[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -139,8 +132,14 @@ def _interleave_metrics(
         "modality_interleave": {
             "transition_timing": {
                 "transition_latency_ms": {"mean": transition, "count": 32},
-                "text_to_image_transition_latency_ms": {"mean": t2i, "count": t2i_count},
-                "image_to_text_transition_latency_ms": {"mean": i2t, "count": i2t_count},
+                "text_to_image_transition_latency_ms": {
+                    "mean": text_to_image,
+                    "count": 16,
+                },
+                "image_to_text_transition_latency_ms": {
+                    "mean": image_to_text,
+                    "count": 16,
+                },
                 "timestamp_coverage": coverage,
                 "transition_sample_coverage": coverage,
                 "expected_transition_count": 2,
@@ -150,278 +149,420 @@ def _interleave_metrics(
     }
 
 
-# --------------------------------------------------------------------------- #
-# regression + band
-# --------------------------------------------------------------------------- #
-
-def test_regression_maximize():
-    assert cc.regression(95.0, 100.0, "maximize") == pytest.approx(0.05)
-    assert cc.regression(100.0, 100.0, "maximize") == 0.0
-    assert cc.regression(110.0, 100.0, "maximize") == 0.0  # improvement clamps to 0
-
-
-def test_regression_minimize():
-    assert cc.regression(105.0, 100.0, "minimize") == pytest.approx(0.05)
-    assert cc.regression(100.0, 100.0, "minimize") == 0.0
-    assert cc.regression(90.0, 100.0, "minimize") == 0.0  # improvement clamps to 0
-
-
-def test_regression_missing_or_nonpositive_baseline():
-    assert cc.regression(None, 100.0, "maximize") is None
-    assert cc.regression(100.0, None, "maximize") is None
-    assert cc.regression(100.0, 0.0, "maximize") is None
-    assert cc.regression(100.0, -1.0, "minimize") is None
-
-
-def test_band_boundaries():
-    assert cc._band(0.0) == "target"
-    assert cc._band(0.05) == "target"
-    assert cc._band(0.0500001) == "grace"
-    assert cc._band(0.07) == "grace"
-    assert cc._band(0.0700001) == "block"
-    assert cc._band(None) == "unavailable"
-
-
-# --------------------------------------------------------------------------- #
-# dual-baseline worst-case
-# --------------------------------------------------------------------------- #
-
-def test_evaluate_metric_takes_worse_of_two_baselines(tmp_path):
-    spec = ("output_throughput", ("output_throughput",), "maximize")
-    cand = cc.load_point(_write_point(tmp_path / "c", task="i2t", metrics={"output_throughput": 94.0}))
-    anchor = cc.load_point(_write_point(tmp_path / "a", task="i2t", metrics={"output_throughput": 100.0}))
-    prev = cc.load_point(_write_point(tmp_path / "p", task="i2t", metrics={"output_throughput": 96.0}))
-    out = cc.evaluate_metric(spec, cand, anchor, prev)
-    # vs anchor: 6% regression; vs previous: ~2.08%. Worse (effective) is vs anchor.
-    assert out.regression_anchor == pytest.approx(0.06)
-    assert out.regression_previous == pytest.approx(1 - 94.0 / 96.0)
-    assert out.effective_regression == pytest.approx(0.06)
-    assert out.band == "grace"
-
-
-def test_evaluate_metric_unavailable_when_candidate_missing(tmp_path):
-    spec = ("output_throughput", ("output_throughput",), "maximize")
-    cand = cc.load_point(_write_point(tmp_path / "c", task="i2t", metrics={}))
-    anchor = cc.load_point(_write_point(tmp_path / "a", task="i2t", metrics={"output_throughput": 100.0}))
-    out = cc.evaluate_metric(spec, cand, anchor, None)
-    assert out.effective_regression is None
-    assert out.band == "unavailable"
-
-
-# --------------------------------------------------------------------------- #
-# classify
-# --------------------------------------------------------------------------- #
-
-def _mo(band: str):
-    return cc.MetricOutcome("m", "maximize", 1.0, 1.0, None, 0.0, None, 0.0, band)
-
-
-def test_classify_all_target():
-    assert cc.classify([_mo("target"), _mo("target")], allow_grace=True) == "target-pass"
-
-
-def test_classify_grace_allowed():
-    assert cc.classify([_mo("target"), _mo("grace")], allow_grace=True) == "grace-pass"
-
-
-def test_classify_grace_forbidden_blocks():
-    # Major boundary: a grace-band metric is a block.
-    assert cc.classify([_mo("target"), _mo("grace")], allow_grace=False) == "block"
-
-
-def test_classify_block_band():
-    assert cc.classify([_mo("target"), _mo("block")], allow_grace=True) == "block"
-
-
-def test_classify_unavailable_blocks():
-    assert cc.classify([_mo("unavailable")], allow_grace=True) == "block"
-
-
-# --------------------------------------------------------------------------- #
-# hard gates
-# --------------------------------------------------------------------------- #
-
-def test_hard_gate_clean_point_passes(tmp_path):
-    p = cc.load_point(_write_point(tmp_path / "p", task="i2t", metrics={"output_throughput": 100.0}))
-    assert cc.hard_gate_failures(p, None, interleave=False) == []
-
-
-def test_hard_gate_failed_requests(tmp_path):
-    p = cc.load_point(_write_point(tmp_path / "p", task="i2t", metrics={}, failed_count=1, ok_count=31))
-    failures = cc.hard_gate_failures(p, None, interleave=False)
-    assert any("failed_requests" in f for f in failures)
-    assert any("incomplete_success" in f for f in failures)
-
-
-def test_hard_gate_invalid_artifact_and_check(tmp_path):
-    checks = _base_checks()
-    checks["request_records"] = False
-    p = cc.load_point(_write_point(tmp_path / "p", task="i2t", metrics={}, valid=False, checks=checks))
-    failures = cc.hard_gate_failures(p, None, interleave=False)
-    assert "artifact_invalid" in failures
-    assert "check:request_records" in failures
-
-
-def test_hard_gate_dirty_tree(tmp_path):
-    p = cc.load_point(_write_point(tmp_path / "p", task="i2t", metrics={}, dirty=True))
-    assert "source_tree_dirty" in cc.hard_gate_failures(p, None, interleave=False)
-
-
-def test_hard_gate_generation_conformance(tmp_path):
-    p = cc.load_point(_write_point(tmp_path / "p", task="t2i", metrics={}, generation_valid=False))
-    assert "generation_conformance_invalid" in cc.hard_gate_failures(p, None, interleave=False)
-
-
-def test_hard_gate_interleave_coverage_and_signature(tmp_path):
-    cand = cc.load_point(
-        _write_point(
-            tmp_path / "c",
-            task="interleave",
-            metrics=_interleave_metrics(
-                ttft=1, tpot=1, image_latency=1, transition=1, t2i=1, i2t=1,
-                coverage=0.5, signatures={"r0": "text->image"},
-            ),
-            interleave_valid=False,
-        )
-    )
-    anchor = cc.load_point(
-        _write_point(
-            tmp_path / "a",
-            task="interleave",
-            metrics=_interleave_metrics(
-                ttft=1, tpot=1, image_latency=1, transition=1, t2i=1, i2t=1,
-                signatures={"r0": "text->image->text"},
-            ),
-            interleave_valid=True,
-        )
-    )
-    failures = cc.hard_gate_failures(cand, anchor, interleave=True)
-    assert "interleave_latency_invalid" in failures
-    assert any("timestamp_coverage" in f for f in failures)
-    assert any("transition_sample_coverage" in f for f in failures)
-    assert "modality_signature_mismatch" in failures
-
-
-# --------------------------------------------------------------------------- #
-# end-to-end evaluate_checkpoint
-# --------------------------------------------------------------------------- #
-
-def _triplet(root: Path, *, throughput: float, ttft: float, tpot: float, images_per_s: float, head: str = "0" * 40, dirty: bool = False):
+def _triplet(
+    root: Path,
+    *,
+    throughput: float,
+    ttft: float,
+    tpot: float,
+    images_per_s: float,
+    head: str,
+    dirty: bool = False,
+) -> None:
     _write_point(
         root / "qwen3_sharegpt" / "uniserve_r16",
         task="text",
-        metrics={"output_throughput": throughput, "mean_ttft_ms": ttft, "mean_tpot_ms": tpot},
-        request_count=200, load_case="r16", head=head, dirty=dirty,
+        metrics={
+            "output_throughput": throughput,
+            "mean_ttft_ms": ttft,
+            "mean_tpot_ms": tpot,
+        },
+        request_count=200,
+        load_case="r16",
+        head=head,
+        dirty=dirty,
     )
     _write_point(
         root / "sensenova_mjhq_t2i" / "uniserve_c32",
         task="t2i",
         metrics={"images_per_second": images_per_s},
-        head=head, dirty=dirty,
+        head=head,
+        dirty=dirty,
     )
     _write_point(
         root / "sensenova_beans_i2t" / "uniserve_c32",
         task="i2t",
         metrics={"output_throughput": throughput},
-        head=head, dirty=dirty,
+        head=head,
+        dirty=dirty,
     )
 
 
-def test_checkpoint_target_pass(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    # Candidate within 5% on every metric (throughput 97 -> 3% down; ttft 103 -> 3% up).
-    _triplet(tmp_path / "cand", throughput=97, ttft=103, tpot=20.5, images_per_s=0.98, head="b" * 40)
+@pytest.mark.parametrize(
+    ("candidate", "baseline", "objective", "expected"),
+    [
+        (80.0, 100.0, "maximize", 0.20),
+        (100.0, 100.0, "maximize", 0.0),
+        (120.0, 100.0, "maximize", 0.0),
+        (120.0, 100.0, "minimize", 0.20),
+        (100.0, 100.0, "minimize", 0.0),
+        (80.0, 100.0, "minimize", 0.0),
+    ],
+)
+def test_regression_formula(
+    candidate: float,
+    baseline: float,
+    objective: str,
+    expected: float,
+) -> None:
+    assert cc.regression(candidate, baseline, objective) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "baseline"),
+    [(None, 100.0), (100.0, None), (100.0, 0.0), (100.0, -1.0)],
+)
+def test_regression_requires_positive_values(
+    candidate: float | None,
+    baseline: float | None,
+) -> None:
+    assert cc.regression(candidate, baseline, "maximize") is None
+
+
+@pytest.mark.parametrize(
+    ("regression", "expected"),
+    [
+        (0.0, "pass"),
+        (0.20, "pass"),
+        (0.200001, "block"),
+        (None, "unavailable"),
+    ],
+)
+def test_performance_band(regression: float | None, expected: str) -> None:
+    assert cc._band(regression) == expected
+
+
+def test_metric_uses_worse_regression_against_both_baselines(tmp_path: Path) -> None:
+    spec = ("output_throughput", ("output_throughput",), "maximize")
+    candidate = cc.load_point(
+        _write_point(
+            tmp_path / "candidate",
+            task="i2t",
+            metrics={"output_throughput": 82.0},
+        )
+    )
+    anchor = cc.load_point(
+        _write_point(
+            tmp_path / "anchor",
+            task="i2t",
+            metrics={"output_throughput": 100.0},
+        )
+    )
+    previous = cc.load_point(
+        _write_point(
+            tmp_path / "previous",
+            task="i2t",
+            metrics={"output_throughput": 90.0},
+        )
+    )
+
+    outcome = cc.evaluate_metric(spec, candidate, anchor, previous)
+
+    assert outcome.regression_anchor == pytest.approx(0.18)
+    assert outcome.regression_previous == pytest.approx(1.0 - 82.0 / 90.0)
+    assert outcome.effective_regression == pytest.approx(0.18)
+    assert outcome.band == "pass"
+
+
+def _metric_outcome(band: str) -> Any:
+    return cc.MetricOutcome(
+        "metric",
+        "maximize",
+        1.0,
+        1.0,
+        None,
+        0.0,
+        None,
+        0.0,
+        band,
+    )
+
+
+def test_classification_requires_every_metric_to_pass() -> None:
+    assert cc.classify([_metric_outcome("pass"), _metric_outcome("pass")]) == "pass"
+    assert cc.classify([_metric_outcome("pass"), _metric_outcome("block")]) == "block"
+    assert cc.classify([_metric_outcome("unavailable")]) == "block"
+
+
+def test_hard_gate_accepts_complete_valid_point(tmp_path: Path) -> None:
+    point = cc.load_point(
+        _write_point(
+            tmp_path / "point",
+            task="i2t",
+            metrics={"output_throughput": 100.0},
+        )
+    )
+    assert cc.hard_gate_failures(point, None, interleave=False) == []
+
+
+@pytest.mark.parametrize(
+    ("point_kwargs", "expected"),
+    [
+        ({"failed_count": 1, "ok_count": 31}, "failed_requests=1"),
+        ({"valid": False}, "artifact_invalid"),
+        ({"generation_valid": False}, "generation_conformance_invalid"),
+        ({"dirty": True}, "source_tree_dirty"),
+    ],
+)
+def test_hard_gate_rejects_invalid_candidate_evidence(
+    tmp_path: Path,
+    point_kwargs: dict[str, Any],
+    expected: str,
+) -> None:
+    point = cc.load_point(
+        _write_point(
+            tmp_path / "point",
+            task="i2t",
+            metrics={"output_throughput": 100.0},
+            **point_kwargs,
+        )
+    )
+    assert expected in cc.hard_gate_failures(point, None, interleave=False)
+
+
+def test_interleave_hard_gate_requires_complete_timestamped_conformance(
+    tmp_path: Path,
+) -> None:
+    signatures = {"r0": "text->image->text"}
+    anchor = cc.load_point(
+        _write_point(
+            tmp_path / "anchor",
+            task="interleave",
+            metrics=_interleave_metrics(
+                ttft=100.0,
+                tpot=10.0,
+                image_latency=1000.0,
+                transition=2000.0,
+                text_to_image=3000.0,
+                image_to_text=5.0,
+                signatures=signatures,
+            ),
+            interleave_valid=True,
+        )
+    )
+    candidate = cc.load_point(
+        _write_point(
+            tmp_path / "candidate",
+            task="interleave",
+            metrics=_interleave_metrics(
+                ttft=100.0,
+                tpot=10.0,
+                image_latency=1000.0,
+                transition=2000.0,
+                text_to_image=3000.0,
+                image_to_text=5.0,
+                coverage=0.5,
+                signatures=signatures,
+            ),
+            interleave_valid=False,
+        )
+    )
+
+    failures = cc.hard_gate_failures(candidate, anchor, interleave=True)
+
+    assert "interleave_latency_invalid" in failures
+    assert "timestamp_coverage=0.5" in failures
+    assert "transition_sample_coverage=0.5" in failures
+
+
+def test_checkpoint_passes_at_the_performance_limit(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=80.0,
+        ttft=120.0,
+        tpot=24.0,
+        images_per_s=0.8,
+        head="b" * 40,
+    )
+
     report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp1", major_boundary=False
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        None,
+        checkpoint="cp1",
+        major_boundary=False,
     )
-    assert report.verdict == "target-pass"
+
+    assert report.verdict == "pass"
+    assert {metric.band for point in report.points for metric in point.metrics} == {"pass"}
 
 
-def test_checkpoint_grace_pass(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    # One metric at 6% (grace band); others within target.
-    _triplet(tmp_path / "cand", throughput=94, ttft=103, tpot=20.5, images_per_s=0.99, head="b" * 40)
+def test_checkpoint_blocks_when_one_metric_exceeds_limit(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=79.9,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="b" * 40,
+    )
+
     report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp2", major_boundary=False
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        None,
+        checkpoint="cp2",
+        major_boundary=False,
     )
-    assert report.verdict == "grace-pass"
 
-
-def test_checkpoint_block_on_regression(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    # 8% throughput regression exceeds the 7% hard boundary.
-    _triplet(tmp_path / "cand", throughput=92, ttft=100, tpot=20, images_per_s=1.0, head="b" * 40)
-    report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp2", major_boundary=False
-    )
     assert report.verdict == "block"
 
 
-def test_checkpoint_block_on_hard_gate(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    _triplet(tmp_path / "cand", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="b" * 40)
-    # Corrupt one candidate point with a failed request.
+def test_previous_checkpoint_comparison_can_block_candidate(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "previous",
+        throughput=120.0,
+        ttft=80.0,
+        tpot=16.0,
+        images_per_s=1.2,
+        head="b" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=95.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="c" * 40,
+    )
+
+    report = cc.evaluate_checkpoint(
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        tmp_path / "previous",
+        checkpoint="cp2",
+        major_boundary=False,
+    )
+
+    assert report.verdict == "block"
+
+
+def test_major_boundary_uses_the_same_performance_limit(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="b" * 40,
+    )
+    anchor_interleave = _interleave_metrics(
+        ttft=100.0,
+        tpot=10.0,
+        image_latency=1000.0,
+        transition=2000.0,
+        text_to_image=3000.0,
+        image_to_text=5.0,
+    )
+    candidate_interleave = _interleave_metrics(
+        ttft=120.0,
+        tpot=12.0,
+        image_latency=1200.0,
+        transition=2400.0,
+        text_to_image=3600.0,
+        image_to_text=6.0,
+    )
     _write_point(
-        tmp_path / "cand" / "sensenova_beans_i2t" / "uniserve_c32",
-        task="i2t", metrics={"output_throughput": 100.0}, failed_count=1, ok_count=31, head="b" * 40,
+        tmp_path / "anchor" / "sensenova_ueval_interleave" / "uniserve_c4",
+        task="interleave",
+        metrics=anchor_interleave,
+        interleave_valid=True,
+        head="a" * 40,
+        load_case="c4",
+    )
+    _write_point(
+        tmp_path / "candidate" / "sensenova_ueval_interleave" / "uniserve_c4",
+        task="interleave",
+        metrics=candidate_interleave,
+        interleave_valid=True,
+        head="b" * 40,
+        load_case="c4",
+    )
+
+    report = cc.evaluate_checkpoint(
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        None,
+        checkpoint="cp3",
+        major_boundary=True,
+    )
+
+    assert report.verdict == "pass"
+    interleave_names = {
+        metric.name
+        for point in report.points
+        if point.task == "interleave"
+        for metric in point.metrics
+    }
+    assert interleave_names == {
+        "ttft_mean_ms",
+        "tpot_mean_ms",
+        "image_latency_mean_ms",
+        "transition_latency_mean_ms",
+        "text_to_image_transition_mean_ms",
+        "image_to_text_transition_mean_ms",
+    }
+
+
+def test_acceptance_artifact_declares_the_fixed_limit(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=90.0,
+        ttft=110.0,
+        tpot=22.0,
+        images_per_s=0.9,
+        head="b" * 40,
     )
     report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp2", major_boundary=False
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        None,
+        checkpoint="cp1",
+        major_boundary=False,
     )
-    assert report.verdict == "block"
 
+    artifact = cc._report_to_dict(report)
 
-def test_major_boundary_requires_interleave_and_no_grace(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    _triplet(tmp_path / "cand", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="b" * 40)
-    anchor_il = _interleave_metrics(ttft=100, tpot=10, image_latency=1000, transition=2000, t2i=3000, i2t=5)
-    # Candidate transition latency 6% worse -> grace band, but major boundary forbids grace -> block.
-    cand_il = _interleave_metrics(ttft=100, tpot=10, image_latency=1000, transition=2120, t2i=3000, i2t=5)
-    _write_point(tmp_path / "anchor" / "sensenova_ueval_interleave" / "uniserve_c4", task="interleave", metrics=anchor_il, interleave_valid=True, head="a" * 40, load_case="c4")
-    _write_point(tmp_path / "cand" / "sensenova_ueval_interleave" / "uniserve_c4", task="interleave", metrics=cand_il, interleave_valid=True, head="b" * 40, load_case="c4")
-    report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp3", major_boundary=True
-    )
-    assert report.verdict == "block"
-    tasks = {p.task for p in report.points}
-    assert "interleave" in tasks
-
-
-def test_major_boundary_target_pass(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    _triplet(tmp_path / "cand", throughput=98, ttft=102, tpot=20.5, images_per_s=0.99, head="b" * 40)
-    il = _interleave_metrics(ttft=100, tpot=10, image_latency=1000, transition=2000, t2i=3000, i2t=5)
-    _write_point(tmp_path / "anchor" / "iv" / "c4", task="interleave", metrics=il, interleave_valid=True, head="a" * 40, load_case="c4")
-    _write_point(tmp_path / "cand" / "iv" / "c4", task="interleave", metrics=il, interleave_valid=True, head="b" * 40, load_case="c4")
-    report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp3", major_boundary=True
-    )
-    assert report.verdict == "target-pass"
-
-
-def test_missing_required_point_blocks(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    # Candidate missing the t2i point entirely.
-    _write_point(tmp_path / "cand" / "qwen3_sharegpt" / "uniserve_r16", task="text", metrics={"output_throughput": 100, "mean_ttft_ms": 100, "mean_tpot_ms": 20}, request_count=200, load_case="r16", head="b" * 40)
-    _write_point(tmp_path / "cand" / "sensenova_beans_i2t" / "uniserve_c32", task="i2t", metrics={"output_throughput": 100}, head="b" * 40)
-    report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp1", major_boundary=False
-    )
-    assert report.verdict == "block"
-
-
-def test_directional_transition_skipped_when_baseline_count_zero(tmp_path):
-    _triplet(tmp_path / "anchor", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="a" * 40)
-    _triplet(tmp_path / "cand", throughput=100, ttft=100, tpot=20, images_per_s=1.0, head="b" * 40)
-    # Anchor has zero image_to_text samples: that directional metric must be skipped,
-    # so a large candidate i2t value cannot block.
-    anchor_il = _interleave_metrics(ttft=100, tpot=10, image_latency=1000, transition=2000, t2i=3000, i2t=0, i2t_count=0)
-    cand_il = _interleave_metrics(ttft=100, tpot=10, image_latency=1000, transition=2000, t2i=3000, i2t=99999, i2t_count=1)
-    _write_point(tmp_path / "anchor" / "iv" / "c4", task="interleave", metrics=anchor_il, interleave_valid=True, head="a" * 40, load_case="c4")
-    _write_point(tmp_path / "cand" / "iv" / "c4", task="interleave", metrics=cand_il, interleave_valid=True, head="b" * 40, load_case="c4")
-    report = cc.evaluate_checkpoint(
-        tmp_path / "cand", tmp_path / "anchor", None, checkpoint="cp3", major_boundary=True
-    )
-    names = {m.name for p in report.points for m in p.metrics}
-    assert "image_to_text_transition_mean_ms" not in names
-    assert report.verdict == "target-pass"
+    assert artifact["schema_version"] == 2
+    assert artifact["regression_limit"] == pytest.approx(0.20)
+    assert artifact["verdict"] == "pass"

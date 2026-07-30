@@ -182,7 +182,7 @@ use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, Batch, CompletionRecord, CompletionReport, Control, EngineCaps, GenAdmission,
     KvAllocation, OpId, Point, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass,
-    UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
+    SamplingState, UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
 };
 
 use crate::grammar::{GrammarCompiler, GrammarMatcher, grammar_allowed_tokens};
@@ -599,6 +599,7 @@ fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<uniserve_engine_api::TokenL
 
 fn transition_validation_error_str(error: &TransitionValidationError) -> &'static str {
     match error {
+        TransitionValidationError::OperationFailed => "operation_failed",
         TransitionValidationError::OpIdMismatch { .. } => "op_id_mismatch",
         TransitionValidationError::SessionMismatch { .. } => "session_mismatch",
         TransitionValidationError::VersionMismatch { .. } => "version_mismatch",
@@ -619,6 +620,9 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
             "text_token_count_inconsistent"
         }
         TransitionValidationError::TextTokenCountMismatch { .. } => "text_token_count_mismatch",
+        TransitionValidationError::SampledTokenOutsideAllowedSet { .. } => {
+            "sampled_token_outside_allowed_set"
+        }
         TransitionValidationError::UnexpectedPromptLogprobs { .. } => "unexpected_prompt_logprobs",
         TransitionValidationError::PromptLogprobCountMismatch { .. } => {
             "prompt_logprob_count_mismatch"
@@ -3619,7 +3623,7 @@ impl Scheduler {
         // ingest image bytes) the operations reference through their inputs.
         let input_products = transitions
             .iter()
-            .filter_map(|transition| transition.input_product())
+            .flat_map(|transition| transition.input_products())
             .collect();
         let releases = wire_ops
             .iter()
@@ -3796,7 +3800,7 @@ impl Scheduler {
                     return None;
                 }
                 let chunk: Vec<u32> = prompt[cursor..end].to_vec();
-                let (allowed, _) = self.token_masks(id);
+                let sampling_state = self.sampling_state(id);
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
@@ -3806,7 +3810,7 @@ impl Scheduler {
                         prompt_start: cursor as u32,
                         token_ids: chunk,
                         new_blocks,
-                        allowed_tokens: allowed,
+                        sampling_state,
                     },
                 )
             }
@@ -3821,10 +3825,10 @@ impl Scheduler {
                 let projected_successor = self.has_inflight(id);
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let tok = if relay_input { 0 } else { st.und.next_token };
-                let (allowed, suppress) = if projected_successor {
-                    (None, None)
+                let sampling_state = if projected_successor {
+                    SamplingState::default()
                 } else {
-                    self.token_masks(id)
+                    self.sampling_state(id)
                 };
                 let spec_token_ids =
                     if !projected_successor && budget > 1 && self.supports_spec_decode() {
@@ -3832,8 +3836,9 @@ impl Scheduler {
                             self.spec_decode.draft_tokens(
                                 st,
                                 tok,
-                                allowed.as_deref(),
-                                suppress.as_deref(),
+                                sampling_state.allowed_token_ids.as_deref(),
+                                Some(sampling_state.suppressed_token_ids.as_slice())
+                                    .filter(|tokens| !tokens.is_empty()),
                             )
                         })
                     } else {
@@ -3852,7 +3857,7 @@ impl Scheduler {
                         position: pos,
                         new_blocks,
                         spec_token_ids,
-                        allowed_tokens: allowed,
+                        sampling_state,
                         input_token,
                         relay_input,
                     },
@@ -3953,7 +3958,7 @@ impl Scheduler {
                 };
                 let projection = self.projected_cursor(id)?;
                 let new_blocks = self.take_new_blocks(id);
-                let (allowed, _) = self.token_masks(id);
+                let sampling_state = self.sampling_state(id);
                 self.plan_intent(
                     id,
                     projection,
@@ -3967,7 +3972,7 @@ impl Scheduler {
                         feature,
                         sample_continuation,
                         new_blocks,
-                        allowed_tokens: allowed,
+                        sampling_state,
                     },
                 )
             }
@@ -4097,7 +4102,7 @@ impl Scheduler {
         {
             return None;
         }
-        let (allowed, _) = self.token_masks(id);
+        let sampling_state = self.sampling_state(id);
         let new_blocks = self.take_new_blocks(id);
         self.plan_intent(
             id,
@@ -4107,7 +4112,7 @@ impl Scheduler {
                 prompt_start: cursor as u32,
                 token_ids: prompt[cursor..end].to_vec(),
                 new_blocks,
-                allowed_tokens: allowed,
+                sampling_state,
             },
         )
     }
@@ -4211,6 +4216,44 @@ impl Scheduler {
             });
         }
         (allowed, suppress)
+    }
+
+    fn sampling_state(&mut self, id: RequestId) -> SamplingState {
+        let (allowed_token_ids, suppressed_token_ids) = self.token_masks(id);
+        let Some(state) = self.running.get(&id) else {
+            return SamplingState::default();
+        };
+        let recent_counts = Some(state)
+            .filter(|state| {
+                let sampling = &state.req.sampling;
+                sampling.repetition_penalty != 1.0
+                    || sampling.frequency_penalty != 0.0
+                    || sampling.presence_penalty != 0.0
+            })
+            .map(|state| {
+                let mut counts = std::collections::BTreeMap::<u32, u32>::new();
+                for &token in &state.replay.generated_ids {
+                    counts
+                        .entry(token)
+                        .and_modify(|count| *count = count.saturating_add(1))
+                        .or_insert(1);
+                }
+                counts.into_iter().collect()
+            })
+            .unwrap_or_default();
+        let mut finish_token_ids = state.req.stop_token_ids.clone();
+        if !state.req.sampling.ignore_eos {
+            finish_token_ids.extend(self.ctrl.eos.iter().copied());
+        }
+        finish_token_ids.sort_unstable();
+        finish_token_ids.dedup();
+        SamplingState {
+            recent_counts,
+            allowed_token_ids,
+            suppressed_token_ids: suppressed_token_ids.unwrap_or_default(),
+            finish_token_ids,
+            force_finish: state.und.tokens_emitted.saturating_add(1) >= state.req.max_und_tokens,
+        }
     }
 
     fn advance_grammar(&mut self, id: RequestId, token_id: u32) -> bool {
@@ -4367,21 +4410,6 @@ impl Scheduler {
         draft_token_ids: Vec<u32>,
     ) {
         let operation_variant = transition.operation_variant;
-        // Structured-output / guided decode is host-owned: a committed token
-        // outside the operation's grammar-allowed set is replaced by an allowed
-        // token so the emitted sequence stays grammar-valid.
-        if let Some(allowed) = transition
-            .validation
-            .allowed_text_tokens
-            .as_deref()
-            .filter(|allowed| !allowed.is_empty())
-        {
-            for token in view.committed_tokens.iter_mut() {
-                if !allowed.contains(token) {
-                    *token = allowed[0];
-                }
-            }
-        }
         // A token operation that publishes a KV product supplies the conditioning
         // a later denoise operation lists among its inputs.
         if matches!(
@@ -5357,7 +5385,7 @@ mod tests {
                 prompt_start: 3,
                 token_ids: vec![7; 8],
                 new_blocks: Vec::new(),
-                allowed_tokens: None,
+                sampling_state: SamplingState::default(),
             },
         );
         assert_eq!(planned_op_token_cost(&extend), 8);
@@ -5369,7 +5397,7 @@ mod tests {
                 position: 11,
                 new_blocks: Vec::new(),
                 spec_token_ids: None,
-                allowed_tokens: None,
+                sampling_state: SamplingState::default(),
                 input_token: 5,
                 relay_input: false,
             },
@@ -5383,7 +5411,7 @@ mod tests {
                 position: 11,
                 new_blocks: Vec::new(),
                 spec_token_ids: Some(vec![8, 9, 10]),
-                allowed_tokens: None,
+                sampling_state: SamplingState::default(),
                 input_token: 5,
                 relay_input: false,
             },
@@ -5402,7 +5430,7 @@ mod tests {
                 prompt_start: 0,
                 token_ids: vec![7],
                 new_blocks: vec![BlockId(4), BlockId(5)],
-                allowed_tokens: None,
+                sampling_state: SamplingState::default(),
             },
         );
         assert_eq!(

@@ -124,7 +124,7 @@ class CompletionLease:
         return event
 
     def capture(self, tokens: torch.Tensor) -> CompletionCapture:
-        flat = tokens.reshape(-1)
+        flat = tokens.reshape(-1).to(dtype=torch.long)
         count = int(flat.numel())
         offset = self._token_cursor
         end = offset + count

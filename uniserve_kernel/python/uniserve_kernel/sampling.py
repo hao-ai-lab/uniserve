@@ -22,7 +22,7 @@ _SamplingKernel = Callable[
 
 def _sample_top_k_tensor(
     logits: torch.Tensor,
-    noise: torch.Tensor,
+    draws: torch.Tensor,
     penalty_token_ids: torch.Tensor,
     penalty_counts: torch.Tensor,
     parameters: torch.Tensor,
@@ -88,16 +88,27 @@ def _sample_top_k_tensor(
     over = cumulative > parameters[:, 1].unsqueeze(1)
     drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
     candidates = torch.where(drop, float("-inf"), candidates)
-    candidate_noise = noise.gather(1, token_indexes)
-    gumbel = -torch.log(-torch.log(candidate_noise))
-    semantic_noise = torch.where(
-        temperatures.unsqueeze(1) > 0.0,
-        gumbel,
-        torch.zeros_like(gumbel),
+    probabilities = torch.softmax(candidates, dim=-1)
+    token_order = torch.argsort(token_indexes, dim=-1)
+    ordered_probabilities = probabilities.gather(1, token_order)
+    cumulative = ordered_probabilities.cumsum(dim=-1)
+    sampled_order = (
+        (cumulative < draws.to(dtype=cumulative.dtype).unsqueeze(1))
+        .sum(dim=-1)
+        .clamp_max(top_k - 1)
     )
-    selected = torch.argmax(candidates + semantic_noise, dim=-1)
+    sampled = token_order.gather(1, sampled_order.unsqueeze(1))[:, 0]
+    selected = torch.where(
+        temperatures > 0.0,
+        sampled,
+        torch.zeros_like(sampled),
+    )
     tokens = token_indexes.gather(1, selected.unsqueeze(1))[:, 0]
-    valid = ~torch.isnan(candidates).any(dim=-1) & torch.isfinite(candidates).any(dim=-1)
+    valid = (
+        ~torch.isnan(candidates).any(dim=-1)
+        & ~torch.isposinf(candidates).any(dim=-1)
+        & torch.isfinite(candidates).any(dim=-1)
+    )
     return tokens, valid
 
 
@@ -107,14 +118,14 @@ def _compiled_sampling(top_k: int, has_penalties: bool) -> _SamplingKernel:
 
     def kernel(
         logits: torch.Tensor,
-        noise: torch.Tensor,
+        draws: torch.Tensor,
         penalty_token_ids: torch.Tensor,
         penalty_counts: torch.Tensor,
         parameters: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return _sample_top_k_tensor(
             logits,
-            noise,
+            draws,
             penalty_token_ids,
             penalty_counts,
             parameters,
@@ -133,7 +144,7 @@ def _compiled_sampling(top_k: int, has_penalties: bool) -> _SamplingKernel:
 
 def sample_top_k(
     logits: torch.Tensor,
-    noise: torch.Tensor,
+    draws: torch.Tensor,
     penalty_token_ids: torch.Tensor,
     penalty_counts: torch.Tensor,
     parameters: torch.Tensor,
@@ -141,8 +152,8 @@ def sample_top_k(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draw exact tokens from rows whose top-k candidate bound is at most 128."""
 
-    if logits.ndim != 2 or noise.shape != logits.shape:
-        raise ValueError("sampling provider logits and noise must be aligned matrices")
+    if logits.ndim != 2 or draws.shape != logits.shape[:1]:
+        raise ValueError("sampling provider draws must align with logits rows")
     if parameters.shape != (logits.shape[0], 6):
         raise ValueError("sampling provider parameter vectors do not align with logits")
     if (
@@ -156,7 +167,7 @@ def sample_top_k(
     if logits.device.type != "cuda":
         return _sample_top_k_tensor(
             logits,
-            noise,
+            draws,
             penalty_token_ids,
             penalty_counts,
             parameters,
@@ -166,7 +177,7 @@ def sample_top_k(
         int(top_k),
         int(penalty_token_ids.shape[1]) > 0,
     )
-    return implementation(logits, noise, penalty_token_ids, penalty_counts, parameters)
+    return implementation(logits, draws, penalty_token_ids, penalty_counts, parameters)
 
 
 __all__ = ["sample_top_k"]

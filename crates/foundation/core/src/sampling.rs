@@ -10,6 +10,8 @@
 //! small descriptor lists the host computed (recent tokens, allowed/suppress
 //! masks). No logits tensor crosses the wire — this runs inside the worker.
 
+use std::collections::BTreeMap;
+
 use crate::SamplingParams;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,7 +35,41 @@ pub fn apply_sampling(
     suppress: Option<&[u32]>,
     n_logprobs: usize,
 ) -> SampleOutput {
+    let mut counts = BTreeMap::<u32, u32>::new();
+    for &token in recent {
+        let count = counts.entry(token).or_default();
+        *count = count.saturating_add(1);
+    }
+    try_apply_sampling_counts(
+        logits,
+        p,
+        &counts.into_iter().collect::<Vec<_>>(),
+        allowed,
+        suppress,
+        n_logprobs,
+        seed_from(p, recent),
+    )
+    .expect("sampling inputs must leave a valid distribution")
+}
+
+/// Apply the full sampling pipeline from canonical branch-local token counts.
+///
+/// `draw_seed` names one semantic sampling coordinate. `None` represents a
+/// deterministic invalid distribution: empty logits, NaNs, infinities, or a
+/// transform sequence that masks every vocabulary entry.
+pub fn try_apply_sampling_counts(
+    logits: &mut [f32],
+    p: &SamplingParams,
+    recent_counts: &[(u32, u32)],
+    allowed: Option<&[u32]>,
+    suppress: Option<&[u32]>,
+    n_logprobs: usize,
+    draw_seed: u64,
+) -> Option<SampleOutput> {
     let v = logits.len();
+    if !valid_distribution(logits) {
+        return None;
+    }
 
     // 1. allowed-token whitelist: mask everything else.
     if let Some(allow) = allowed {
@@ -65,16 +101,12 @@ pub fn apply_sampling(
     }
     // 4. penalties over the recent output window.
     if p.repetition_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0 {
-        // counts of each recent token
-        let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
-        for &t in recent {
-            *counts.entry(t).or_insert(0.0) += 1.0;
-        }
-        for (&t, &c) in &counts {
+        for &(t, count) in recent_counts {
             let i = t as usize;
-            if i >= v || logits[i] == NEG_INF {
+            if count == 0 || i >= v || logits[i] == NEG_INF {
                 continue;
             }
+            let c = count as f32;
             // repetition penalty (multiplicative, sign-aware — reference semantics)
             if p.repetition_penalty != 1.0 {
                 logits[i] = if logits[i] > 0.0 {
@@ -87,6 +119,9 @@ pub fn apply_sampling(
             logits[i] -= p.frequency_penalty * c;
             logits[i] -= p.presence_penalty;
         }
+    }
+    if !valid_distribution(logits) {
+        return None;
     }
     // 5. temperature (0 == greedy; applied at sample time).
     let greedy = p.temperature <= 0.0;
@@ -142,13 +177,16 @@ pub fn apply_sampling(
             logits[i] = NEG_INF;
         }
     }
+    if !valid_distribution(logits) {
+        return None;
+    }
 
     // 9. sample.
     let token = if greedy {
         argmax(logits)
     } else {
         let probs = softmax(logits);
-        sample_categorical(&probs, seed_from(p, recent))
+        sample_categorical(&probs, draw_seed)
     };
 
     // 10. gather logprobs (softmax of the final, masked logits).
@@ -159,11 +197,11 @@ pub fn apply_sampling(
     } else {
         Vec::new()
     };
-    SampleOutput {
+    Some(SampleOutput {
         token,
         logprob: sampled_lp,
         top,
-    }
+    })
 }
 
 /// Score one known token against a vocabulary-logits row and return ranked candidates.
@@ -233,6 +271,14 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+fn valid_distribution(logits: &[f32]) -> bool {
+    !logits.is_empty()
+        && logits
+            .iter()
+            .all(|value| value.is_finite() || *value == NEG_INF)
+        && logits.iter().any(|value| value.is_finite())
+}
+
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let m = logits.iter().cloned().fold(NEG_INF, f32::max);
     if m == NEG_INF {
@@ -293,6 +339,38 @@ fn splitmix64(seed: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Derive one random seed from request identity and semantic sampling
+/// coordinates. The mapping is independent of batching, launch order, and
+/// completion order and mirrors the production worker's coordinate function.
+#[allow(clippy::too_many_arguments)]
+pub fn semantic_sampling_seed(
+    session_seed: u64,
+    authority_id: u64,
+    session_id: u64,
+    epoch: u64,
+    semantic_token_index: u64,
+    processor_stage: u64,
+    draw_index: u64,
+) -> u64 {
+    [
+        authority_id,
+        session_id,
+        epoch,
+        semantic_token_index,
+        processor_stage,
+        draw_index,
+    ]
+    .into_iter()
+    .fold(session_seed, splitmix_coordinate)
+}
+
+fn splitmix_coordinate(seed: u64, coordinate: u64) -> u64 {
+    let mut value = seed.wrapping_add(coordinate.wrapping_add(1).wrapping_mul(0x9E3779B97F4A7C15));
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+    value ^ (value >> 31)
+}
+
 fn seed_from(p: &SamplingParams, recent: &[u32]) -> u64 {
     let mut s = p.seed.unwrap_or(0x9E3779B97F4A7C15);
     s = s.wrapping_add(recent.len() as u64);
@@ -347,6 +425,47 @@ mod tests {
         let mut l = base_logits();
         let out = apply_sampling(&mut l, &SamplingParams::default(), &[], None, Some(&[3]), 0);
         assert_eq!(out.token, 2, "token 3 suppressed; next is 2");
+    }
+
+    #[test]
+    fn canonical_recent_counts_drive_penalties() {
+        let mut logits = base_logits();
+        let output = try_apply_sampling_counts(
+            &mut logits,
+            &SamplingParams {
+                frequency_penalty: 2.0,
+                ..Default::default()
+            },
+            &[(3, 2)],
+            None,
+            None,
+            0,
+            0,
+        )
+        .expect("valid distribution");
+        assert_ne!(output.token, 3);
+        assert_eq!(logits[3], -1.0);
+    }
+
+    #[test]
+    fn all_masked_and_non_finite_distributions_are_invalid() {
+        let params = SamplingParams::default();
+        let mut all_masked = base_logits();
+        assert!(
+            try_apply_sampling_counts(&mut all_masked, &params, &[], Some(&[]), None, 0, 0,)
+                .is_none()
+        );
+
+        let mut nan = vec![0.0, f32::NAN];
+        assert!(try_apply_sampling_counts(&mut nan, &params, &[], None, None, 0, 0).is_none());
+    }
+
+    #[test]
+    fn semantic_sampling_coordinate_matches_worker_mapping() {
+        assert_eq!(
+            semantic_sampling_seed(11, 3, 5, 7, 13, 17, 19),
+            13_207_301_388_388_605_805
+        );
     }
 
     #[test]

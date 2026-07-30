@@ -15,13 +15,16 @@ use std::time::Duration;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::product_blob::{LogprobBlob, RankedToken};
-use uniserve_core::{ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling};
+use uniserve_core::{
+    ImageParams, RequestId, SampleOutput, SamplingParams, semantic_sampling_seed,
+    try_apply_sampling_counts,
+};
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
-    Admission, Batch, CompletionRecord, CompletionReport, Digest, EngineCaps, FinishFlags, GenMode,
-    LogicalLengths, OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef,
-    RegistrationAck, RequestKind, TimingCounters, TokenMode, TokenSpan, TransferMode, Work,
-    WorkVariant,
+    Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, EngineCaps,
+    ErrorCode, FinishFlags, GenMode, LogicalLengths, OpStatus, Operation, Point, ProductKind,
+    ProductPayload, ProductRef, RegistrationAck, RequestKind, SamplingState, TimingCounters,
+    TokenMode, TokenSpan, TransferMode, Work, WorkVariant, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -331,18 +334,64 @@ impl SimEngine {
         logits
     }
 
-    fn sample(&self, session_id: RequestId, session: &SimSession, index: usize) -> SampleOutput {
+    fn sample(
+        &self,
+        operation: &Operation,
+        session: &SimSession,
+        index: usize,
+        state: Option<&SamplingState>,
+    ) -> anyhow::Result<Option<SampleOutput>> {
+        let session_id = operation.request_key.session_id;
         let mut logits = self.synth_logits(session_id, index);
         match session.sampling() {
-            Some(sampling) => apply_sampling(
-                &mut logits,
-                sampling,
-                &[],
-                sampling.allowed_token_ids.as_deref(),
-                None,
-                sampling.n_logprobs as usize,
-            ),
-            None => SampleOutput {
+            Some(sampling) => {
+                let draw_seed = if sampling.temperature > 0.0 {
+                    let rng = operation.rng.ok_or_else(|| {
+                        anyhow::anyhow!("stochastic sampling operation has no RNG coordinates")
+                    })?;
+                    anyhow::ensure!(
+                        rng.draw_layout == DrawLayout::TargetSampling,
+                        "stochastic sampling operation uses the wrong RNG layout"
+                    );
+                    anyhow::ensure!(
+                        rng.seed == sampling.seed.unwrap_or(0),
+                        "operation RNG seed disagrees with admitted sampling"
+                    );
+                    semantic_sampling_seed(
+                        rng.seed,
+                        operation.request_key.authority_id,
+                        session_id.0,
+                        operation.request_key.epoch,
+                        rng.semantic_index_base,
+                        0,
+                        0,
+                    )
+                } else {
+                    0
+                };
+                let recent_counts = state.map_or(&[][..], |value| value.recent_counts.as_slice());
+                let allowed = state
+                    .and_then(|value| value.allowed_token_ids.as_deref())
+                    .or_else(|| {
+                        state
+                            .is_none()
+                            .then_some(sampling.allowed_token_ids.as_deref())
+                            .flatten()
+                    });
+                let suppress = state
+                    .map(|value| value.suppressed_token_ids.as_slice())
+                    .filter(|tokens| !tokens.is_empty());
+                Ok(try_apply_sampling_counts(
+                    &mut logits,
+                    sampling,
+                    recent_counts,
+                    allowed,
+                    suppress,
+                    sampling.n_logprobs as usize,
+                    draw_seed,
+                ))
+            }
+            None => Ok(Some(SampleOutput {
                 token: if index >= self.text_len {
                     self.fake_eos
                 } else {
@@ -350,7 +399,7 @@ impl SimEngine {
                 },
                 logprob: 0.0,
                 top: Vec::new(),
-            },
+            })),
         }
     }
 
@@ -360,6 +409,7 @@ impl SimEngine {
         &self,
         operation: &Operation,
         session: &mut SimSession,
+        input_products: &[ProductPayload],
     ) -> anyhow::Result<(CompletionRecord, Vec<ProductPayload>)> {
         let point_index = session.point_index;
         let selected_point = if operation.advances_state {
@@ -410,8 +460,25 @@ impl SimEngine {
                 }
                 if !visual_state || samples_token {
                     let index = session.emitted;
-                    let output = self.sample(operation.request_key.session_id, session, index);
+                    let sampling_state = operation_sampling_state(operation, input_products)?;
+                    let Some(output) =
+                        self.sample(operation, session, index, sampling_state.as_ref())?
+                    else {
+                        record.status = OpStatus::Error;
+                        record.selected_point = point_index;
+                        record.product_generations.clear();
+                        record.error_code = Some(ErrorCode::InvalidOperation);
+                        record.semantic_digest = record
+                            .compute_semantic_digest(&parent_semantic, &operation.plan_digest);
+                        return Ok((record, Vec::new()));
+                    };
                     record.finish_flags.eos = output.token == self.fake_eos;
+                    if let Some(state) = sampling_state {
+                        record.finish_flags.stop =
+                            state.finish_token_ids.binary_search(&output.token).is_ok()
+                                && !record.finish_flags.eos;
+                        record.finish_flags.length = state.force_finish;
+                    }
                     record.token_span = TokenSpan {
                         base: index as u32,
                         len: 1,
@@ -550,6 +617,29 @@ impl SimEngine {
     }
 }
 
+/// Decode the branch-local state declared for one sampling operation.
+fn operation_sampling_state(
+    operation: &Operation,
+    input_products: &[ProductPayload],
+) -> anyhow::Result<Option<SamplingState>> {
+    let mut references = operation
+        .inputs
+        .iter()
+        .filter(|input| input.kind == ProductKind::SamplingState);
+    let Some(reference) = references.next() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        references.next().is_none(),
+        "operation has multiple sampling-state inputs"
+    );
+    let payload = input_products
+        .iter()
+        .find(|payload| payload.product == *reference)
+        .ok_or_else(|| anyhow::anyhow!("operation sampling-state input has no payload"))?;
+    decode_sampling_state_bytes(&payload.bytes).map(Some)
+}
+
 /// The declared output-product reference for a value packed into a completion.
 fn output_ref(operation: &Operation, kind: ProductKind) -> anyhow::Result<ProductRef> {
     operation
@@ -614,6 +704,7 @@ impl ModelEngine for SimEngine {
                 }
             }
         }
+        let input_products = batch.input_products;
 
         let mut completions = Vec::with_capacity(batch.operations.len());
         let mut products = Vec::new();
@@ -691,8 +782,9 @@ impl ModelEngine for SimEngine {
                 }
             }
 
-            let (completion, op_products) = self.execute_operation(&operation, &mut session)?;
-            if operation.advances_state {
+            let (completion, op_products) =
+                self.execute_operation(&operation, &mut session, &input_products)?;
+            if operation.advances_state && completion.status != OpStatus::Error {
                 session.point_index = completion.selected_point;
                 session.committed_semantic = completion.semantic_digest.clone();
             }

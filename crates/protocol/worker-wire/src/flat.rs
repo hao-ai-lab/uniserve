@@ -1593,6 +1593,8 @@ fn product_kind_to_fb(kind: ProductKind) -> fbs::ProductKind {
         ProductKind::Latent => fbs::ProductKind::Latent,
         ProductKind::Artifact => fbs::ProductKind::Artifact,
         ProductKind::Completion => fbs::ProductKind::Completion,
+        ProductKind::SamplingState => fbs::ProductKind::SamplingState,
+        ProductKind::Finish => fbs::ProductKind::Finish,
     }
 }
 
@@ -1607,6 +1609,8 @@ fn product_kind_from_fb(kind: fbs::ProductKind) -> anyhow::Result<ProductKind> {
         fbs::ProductKind::Latent => ProductKind::Latent,
         fbs::ProductKind::Artifact => ProductKind::Artifact,
         fbs::ProductKind::Completion => ProductKind::Completion,
+        fbs::ProductKind::SamplingState => ProductKind::SamplingState,
+        fbs::ProductKind::Finish => ProductKind::Finish,
         other => bail!("unknown product kind {}", other.0),
     })
 }

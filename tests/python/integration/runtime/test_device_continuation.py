@@ -12,7 +12,11 @@ from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Batch,
     DevicePoint,
+    DrawLayout,
+    ProductKind,
     Release,
+    Rng,
+    SamplingParams,
     TokenMode,
     VersionRef,
 )
@@ -60,6 +64,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         parent=root_parent(admission),
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
+        publishes_predicate=True,
     )
 
     observe = {"enabled": False}
@@ -90,7 +95,9 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         parent=device_parent,
         mode=TokenMode.DECODE,
         tokens=(0,),
-        predicate=parent.outputs[1],
+        predicate=next(
+            output for output in parent.outputs if output.kind is ProductKind.COMPLETION
+        ),
     )
     successor_report = worker.execute(
         Batch(
@@ -110,3 +117,109 @@ def test_same_request_continues_from_device_products_before_parent_observation(
     first = _next_token(4)
     assert parent_report.completions[0].committed_tokens == (first,)
     assert successor_report.completions[0].committed_tokens == (_next_token(first),)
+
+
+def test_stochastic_device_continuation_matches_depth_one_serial_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = execution_worker(device="cuda:0", pipeline_depth=2)
+    sampling = SamplingParams(temperature=0.8, top_k=32, top_p=0.93, seed=917)
+    pipelined = und_admission(41, block_ids=(2,), sampling=sampling)
+    parent, parent_input = token_operation(
+        pipelined.request_key,
+        op_id=1,
+        parent=root_parent(pipelined),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+        publishes_predicate=True,
+    )
+    observe = {"enabled": False}
+    ready = CompletionLease.ready
+
+    def gated_ready(self: CompletionLease) -> bool:
+        return observe["enabled"] and ready(self)
+
+    monkeypatch.setattr(CompletionLease, "ready", gated_ready)
+    parent_report = worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(pipelined,),
+            operations=(parent,),
+            input_products=(parent_input,),
+        )
+    )
+    assert not completion_report_ready(parent_report)
+    successor, successor_input = token_operation(
+        pipelined.request_key,
+        op_id=2,
+        parent=VersionRef(
+            pipelined.request_key,
+            parent.op_id,
+            DevicePoint(parent.outputs[0], parent.plan_digest),
+        ),
+        mode=TokenMode.DECODE,
+        tokens=(0,),
+        predicate=next(
+            output for output in parent.outputs if output.kind is ProductKind.COMPLETION
+        ),
+        rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
+    )
+    successor_report = worker.execute(
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(successor,),
+            input_products=(successor_input,),
+        )
+    )
+
+    observe["enabled"] = True
+    torch.cuda.synchronize()
+    parent_tokens = finalize_completion_report(parent_report).completions[0].committed_tokens
+    successor_tokens = finalize_completion_report(successor_report).completions[
+        0
+    ].committed_tokens
+
+    serial_worker = execution_worker(device="cuda:0", pipeline_depth=1)
+    serial = und_admission(41, block_ids=(2,), sampling=sampling)
+    serial_parent, serial_parent_input = token_operation(
+        serial.request_key,
+        op_id=11,
+        parent=root_parent(serial),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+    )
+    serial_parent_report = serial_worker.execute(
+        Batch(
+            step_id=11,
+            admissions=(serial,),
+            operations=(serial_parent,),
+            input_products=(serial_parent_input,),
+        )
+    )
+    torch.cuda.synchronize()
+    serial_parent_report = finalize_completion_report(serial_parent_report)
+    serial_first = serial_parent_report.completions[0].committed_tokens[0]
+    serial_successor, serial_successor_input = token_operation(
+        serial.request_key,
+        op_id=12,
+        parent=serial_worker.sessions.get(41).committed_version(),
+        mode=TokenMode.DECODE,
+        tokens=(serial_first,),
+        rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
+    )
+    serial_successor_report = serial_worker.execute(
+        Batch(
+            step_id=12,
+            admissions=(),
+            operations=(serial_successor,),
+            input_products=(serial_successor_input,),
+        )
+    )
+    torch.cuda.synchronize()
+    serial_successor_report = finalize_completion_report(serial_successor_report)
+
+    assert parent_tokens == serial_parent_report.completions[0].committed_tokens
+    assert successor_tokens == serial_successor_report.completions[0].committed_tokens

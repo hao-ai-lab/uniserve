@@ -27,6 +27,7 @@ from uniserve_worker.batch import (
     ProductPayload,
     ProductRef,
     RequestKey,
+    Rng,
     SamplingParams,
     ShapeBound,
     StaticDim,
@@ -98,6 +99,9 @@ def token_operation(
     tokens: Sequence[int],
     new_kv_blocks: Sequence[int] = (),
     predicate: ProductRef | None = None,
+    publishes_predicate: bool = False,
+    logprobs: bool = False,
+    rng: Rng | None = None,
 ) -> tuple[Operation, ProductPayload]:
     """A token operation plus the input token product the worker decodes for it.
 
@@ -111,24 +115,53 @@ def token_operation(
         request_key=rk,
         producer_op_id=op_id,
         output_index=0,
-        generation=op_id * 3 + 1,
+        generation=op_id * 4 + 1,
         kind=ProductKind.TOKEN,
         storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.U32,
         shape_bound=ShapeBound(),
         point_range=PointRange(),
     )
-    predicate_output = ProductRef(
+    finish_output = ProductRef(
         request_key=rk,
         producer_op_id=op_id,
         output_index=1,
-        generation=op_id * 3 + 2,
-        kind=ProductKind.COMPLETION,
+        generation=op_id * 4 + 2,
+        kind=ProductKind.FINISH,
         storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
         point_range=PointRange(),
     )
+    outputs = [token_output, finish_output]
+    if publishes_predicate:
+        outputs.append(
+            ProductRef(
+                request_key=rk,
+                producer_op_id=op_id,
+                output_index=2,
+                generation=op_id * 4 + 3,
+                kind=ProductKind.COMPLETION,
+                storage_class=StorageClass.DEVICE_TENSOR,
+                dtype=DType.U8,
+                shape_bound=ShapeBound(),
+                point_range=PointRange(),
+            )
+        )
+    if logprobs:
+        outputs.append(
+            ProductRef(
+                request_key=rk,
+                producer_op_id=op_id,
+                output_index=3,
+                generation=op_id * 4 + 4,
+                kind=ProductKind.LOGPROB,
+                storage_class=StorageClass.HOST_STAGING,
+                dtype=DType.U8,
+                shape_bound=ShapeBound((StaticDim((1 << 16) - 1),)),
+                point_range=PointRange(),
+            )
+        )
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -136,11 +169,16 @@ def token_operation(
         work=Work.token(mode),
         route=0,
         domain=Domain.UND,
-        bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
+        bounds=Bounds(
+            max_points=1,
+            max_tokens=max(1, len(tokens)),
+            max_completion_bytes=((1 << 16) - 1 if logprobs else 0),
+        ),
         inputs=(reference,),
-        outputs=(token_output, predicate_output),
+        outputs=tuple(outputs),
         new_kv_blocks=tuple(int(value) for value in new_kv_blocks),
         predicate=predicate,
+        rng=rng,
     )
     payload = ProductPayload(
         product=reference,

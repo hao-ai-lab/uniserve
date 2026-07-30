@@ -248,6 +248,31 @@ fn completion_report_round_trips_records_and_product_payloads() {
 }
 
 #[test]
+fn completion_product_value_respects_its_registered_bound() {
+    let mut logprob = output_product(OpId(11));
+    logprob.output_index = 2;
+    logprob.kind = ProductKind::Logprob;
+    logprob.storage_class = StorageClass::HostStaging;
+    logprob.dtype = DType::U8;
+    logprob.shape_bound = ShapeBound {
+        dims: vec![DimBound::Static(3)],
+    };
+    let report = CompletionReport {
+        step_id: 5,
+        completions: vec![completion_record()],
+        products: vec![ProductPayload {
+            product: logprob,
+            bytes: vec![1, 2, 3, 4],
+        }],
+        registration: RegistrationAck { visible: true },
+        worker_exec_us: Some(10),
+        forward_stats: None,
+    };
+
+    assert!(report.validate().is_err());
+}
+
+#[test]
 fn error_completion_round_trips_with_its_error_code() {
     let mut record = completion_record();
     record.status = OpStatus::Error;
@@ -401,6 +426,29 @@ fn token_product_bytes_round_trip() {
     assert!(decode_token_product_bytes(&[0, 0]).is_err());
     // A length that disagrees with the declared count is a fault.
     assert!(decode_token_product_bytes(&[2, 0, 0, 0, 9, 0, 0, 0]).is_err());
+}
+
+#[test]
+fn sampling_state_bytes_preserve_empty_allowed_and_canonical_sets() {
+    let state = SamplingState {
+        recent_counts: vec![(9, 1), (3, 2), (9, 4)],
+        allowed_token_ids: Some(Vec::new()),
+        suppressed_token_ids: vec![7, 2, 7],
+        finish_token_ids: vec![11, 5, 11],
+        force_finish: true,
+    };
+    let decoded =
+        decode_sampling_state_bytes(&encode_sampling_state_bytes(&state)).expect("decode state");
+    assert_eq!(
+        decoded,
+        SamplingState {
+            recent_counts: vec![(3, 2), (9, 5)],
+            allowed_token_ids: Some(Vec::new()),
+            suppressed_token_ids: vec![2, 7],
+            finish_token_ids: vec![5, 11],
+            force_finish: true,
+        }
+    );
 }
 
 #[test]
