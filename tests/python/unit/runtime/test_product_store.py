@@ -50,13 +50,15 @@ def _device_ref(
     op_id: int,
     generation: int,
     dtype: DType = DType.U32,
+    output_index: int = 0,
+    kind: ProductKind = ProductKind.TOKEN,
 ) -> ProductRef:
     return ProductRef(
         request_key=RequestKey(1, 7, 3),
         producer_op_id=op_id,
-        output_index=0,
+        output_index=output_index,
         generation=generation,
-        kind=ProductKind.TOKEN,
+        kind=kind,
         storage_class=StorageClass.DEVICE_TENSOR,
         dtype=dtype,
         shape_bound=ShapeBound(),
@@ -116,9 +118,7 @@ def test_encoder_product_lifetime_is_owned_by_explicit_handle_release() -> None:
         shape_bound=ShapeBound((DeviceDim(6),)),
         point_range=PointRange(),
     )
-    store.device_products.bind_outputs(
-        ((replacement_reference, "cd" * 32, "cpu"),)
-    )
+    store.device_products.bind_outputs(((replacement_reference, "cd" * 32, "cpu"),))
     store.device_products.publish(
         replacement_reference,
         torch.full((2, 3), 12.0, dtype=torch.bfloat16),
@@ -241,3 +241,31 @@ def test_compatible_product_batch_binds_one_contiguous_producer_range() -> None:
 
     assert producer_batch is not None
     assert producer_batch.tensor.shape == (2,)
+
+
+def test_operation_release_covers_continuation_and_regular_outputs() -> None:
+    table = DeviceProductTable(capacity=3)
+    parent = _device_ref(op_id=71, generation=40)
+    (parent_write,) = table.bind_outputs(((parent, "ab" * 32, "cpu"),))
+    table.publish_write(parent_write, torch.tensor([5], dtype=torch.long))
+
+    token = _device_ref(op_id=72, generation=41)
+    finish = _device_ref(
+        op_id=72,
+        generation=42,
+        dtype=DType.U8,
+        output_index=1,
+        kind=ProductKind.FINISH,
+    )
+    continuation = table.bind_scalar_continuation(
+        outputs=((token, "cd" * 32),),
+        parents=((parent, token.producer_op_id, "ab" * 32),),
+        device="cpu",
+    )
+    (finish_write,) = table.bind_outputs(((finish, "cd" * 32, "cpu"),))
+    table.publish_continuation(continuation, torch.tensor([7], dtype=torch.long))
+    table.publish_scalar_write(finish_write, False)
+
+    table.release_operation(token.request_key, token.producer_op_id)
+
+    assert table.reclaim_ready() == 2
