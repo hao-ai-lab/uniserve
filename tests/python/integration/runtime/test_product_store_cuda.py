@@ -107,7 +107,7 @@ def test_slot_reuse_waits_for_every_recorded_reader_event() -> None:
 def test_batched_producer_writes_registered_scalar_storage_directly() -> None:
     configured_device = torch.device("cuda")
     device = torch.device("cuda", torch.cuda.current_device())
-    table = DeviceProductTable(capacity=8)
+    table = DeviceProductTable(capacity=4)
     references = tuple(_reference(31 + index, 11 + index) for index in range(4))
     writes = table.bind_outputs(
         tuple((reference, "ab" * 32, configured_device) for reference in references)
@@ -138,33 +138,20 @@ def test_batched_producer_writes_registered_scalar_storage_directly() -> None:
     torch.cuda.synchronize(device)
     assert tuple(int(read.tensor.item()) for read in reads) == (2, 0, 1, 3)
 
-    recycled = tuple(_reference(51 + index, 21 + index) for index in range(4))
-    continuation = table.bind_scalar_continuation(
-        outputs=tuple((reference, "cd" * 32) for reference in recycled),
-        parents=tuple(
-            (
-                reference,
-                recycled_reference.producer_op_id,
-                "ab" * 32,
-            )
-            for reference, recycled_reference in zip(
-                references,
-                recycled,
-                strict=True,
-            )
-        ),
-        device=configured_device,
+    table.release_operations(
+        tuple((reference.request_key, reference.producer_op_id) for reference in references)
     )
-    recycled_batch = continuation.scalar
+    recycled = tuple(_reference(51 + index, 21 + index) for index in range(4))
+    recycled_writes = table.bind_outputs(
+        tuple((reference, "cd" * 32, configured_device) for reference in recycled)
+    )
+    recycled_batch = table.producer_scalar_batch(recycled_writes)
     assert recycled_batch is not None
     recycled_destination = recycled_batch.tensor
     recycled_logits = logits.flip(1)
 
     torch.argmax(recycled_logits, dim=-1, out=recycled_destination)
-    table.publish_continuation(continuation)
-    table.release_operations(
-        tuple((reference.request_key, reference.producer_op_id) for reference in references)
-    )
+    table.publish_scalar_batch(recycled_batch)
     recycled_reads = table.consume_batch(
         tuple(
             (reference, 61 + index, "cd" * 32, configured_device)
