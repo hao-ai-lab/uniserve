@@ -4809,33 +4809,23 @@ def _device_finish_values(
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
-    count = len(tasks)
-    tokens = device_tokens.reshape(-1)
-    validity = valid.reshape(-1)
-    if int(tokens.numel()) != count or int(validity.numel()) != count:
-        raise RuntimeError("sampling finish vectors do not align")
-    if count == 0:
-        return validity.to(dtype=torch.bool)
-
-    rows = tuple(task.rows[0] for task in tasks)
-    finish_width = max((len(row.finish_token_ids) for row in rows), default=0)
-    descriptors = torch.tensor(
-        tuple(
-            (
-                int(row.force_finish),
-                *row.finish_token_ids,
-                *((-1,) * (finish_width - len(row.finish_token_ids))),
+    values: list[torch.Tensor] = []
+    for index, task in enumerate(tasks):
+        row = task.rows[0]
+        selected = device_tokens[index]
+        if row.force_finish:
+            finish = torch.ones((), dtype=torch.bool, device=device_tokens.device)
+        elif row.finish_token_ids:
+            finish_ids = torch.tensor(
+                row.finish_token_ids,
+                dtype=device_tokens.dtype,
+                device=device_tokens.device,
             )
-            for row in rows
-        ),
-        dtype=tokens.dtype,
-        device=tokens.device,
-    )
-    forced = descriptors[:, 0].to(dtype=torch.bool)
-    if finish_width:
-        matched = (descriptors[:, 1:] == tokens.unsqueeze(1)).any(dim=1)
-        forced = forced | matched
-    return forced & validity
+            finish = (finish_ids == selected).any()
+        else:
+            finish = torch.zeros((), dtype=torch.bool, device=device_tokens.device)
+        values.append(finish & valid[index])
+    return torch.stack(values)
 
 
 def _publish_sampled_device_values(
