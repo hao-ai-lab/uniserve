@@ -4548,10 +4548,15 @@ def _sample_plain_greedy_group(
         )
     packed_output = product_batch.tensor if product_batch is not None else None
     if packed_output is None or int(packed_output.numel()) != len(tasks):
-        device_tokens = torch.argmax(logits, dim=-1)
+        maximums, device_tokens = torch.max(logits, dim=-1)
     else:
         device_tokens = packed_output
-        torch.argmax(logits, dim=-1, out=device_tokens)
+        maximums = torch.empty(
+            (len(tasks),),
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        torch.max(logits, dim=-1, out=(maximums, device_tokens))
     published = product_table is not None
     if product_table is not None:
         if device_continuation is not None:
@@ -4567,11 +4572,7 @@ def _sample_plain_greedy_group(
                 product_batch,
                 after_reads=device_reads,
             )
-    valid = (
-        ~torch.isnan(logits).any(dim=-1)
-        & ~torch.isposinf(logits).any(dim=-1)
-        & torch.isfinite(logits).any(dim=-1)
-    )
+    valid = torch.isfinite(maximums)
     device_finish = _resolve_sampled_finish_values(
         tasks,
         device_tokens,

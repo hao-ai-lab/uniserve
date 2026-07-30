@@ -265,6 +265,30 @@ def test_host_visible_greedy_rows_share_the_batched_argmax_result() -> None:
     assert tuple(int(value.device_token.item()) for value in sampled) == (1, 2)
 
 
+@pytest.mark.parametrize(
+    "logits",
+    (
+        torch.tensor([0.2, float("nan"), 0.7]),
+        torch.tensor([0.2, float("inf"), 0.7]),
+        torch.tensor([float("-inf"), float("-inf"), float("-inf")]),
+    ),
+)
+def test_greedy_sampling_requires_a_finite_distribution(logits: torch.Tensor) -> None:
+    row = _row(SamplingParams(), session_seed=23, position=7)
+
+    with pytest.raises(WorkerError, match="masked every vocabulary entry"):
+        _sample_task_batch((_task(logits, row),))
+
+
+def test_greedy_sampling_accepts_finite_logits_among_negative_infinity() -> None:
+    row = _row(SamplingParams(), session_seed=29, position=11)
+    sampled = _sample_task_batch(
+        (_task(torch.tensor([float("-inf"), 2.5, float("-inf")]), row),)
+    )
+
+    assert sampled[0].token_id == 1
+
+
 def test_logprob_values_ranks_and_entry_sets_match_full_vocab_reference() -> None:
     parameters = SamplingParams(
         temperature=0.8,
