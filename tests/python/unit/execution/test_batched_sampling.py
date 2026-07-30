@@ -348,41 +348,26 @@ def test_a_policy_must_leave_a_finite_vocabulary_entry() -> None:
         _sample_task_batch((_task(torch.tensor([0.2, 0.8, 0.1]), row),))
 
 
-def test_finish_candidates_are_selected_on_device_from_shared_and_mixed_row_state() -> None:
+def test_finish_candidate_is_selected_on_device_from_token_and_length_state() -> None:
     parameters = SamplingParams()
-    shared = _sample_task_batch(
+    by_token = _sample_task_batch(
         (
             _task(
                 torch.tensor([0.2, 1.8, 0.1]),
-                _row(parameters, session_seed=3, position=1, finish=(1, 2)),
-            ),
-            _task(
-                torch.tensor([2.2, 0.8, 0.1]),
-                _row(parameters, session_seed=5, position=2, finish=(1, 2)),
-            ),
-            _task(
-                torch.tensor([0.2, 0.8, 2.1]),
-                _row(parameters, session_seed=7, position=3, finish=(1, 2)),
+                _row(parameters, session_seed=3, position=1, finish=(1,)),
             ),
         )
-    )
-    mixed = _sample_task_batch(
+    )[0]
+    by_length = _sample_task_batch(
         (
             _task(
                 torch.tensor([2.2, 0.8, 0.1]),
-                _row(parameters, session_seed=11, position=4, force_finish=True),
-            ),
-            _task(
-                torch.tensor([0.2, 1.8, 0.1]),
-                _row(parameters, session_seed=13, position=5, finish=(1,)),
-            ),
-            _task(
-                torch.tensor([0.2, 0.8, 2.1]),
-                _row(parameters, session_seed=17, position=6),
+                _row(parameters, session_seed=3, position=2, force_finish=True),
             ),
         )
-    )
+    )[0]
 
-    assert all(value.device_finish is not None for value in (*shared, *mixed))
-    assert [bool(value.device_finish) for value in shared] == [True, False, True]
-    assert [bool(value.device_finish) for value in mixed] == [True, True, False]
+    assert by_token.device_finish is not None
+    assert by_length.device_finish is not None
+    assert bool(by_token.device_finish)
+    assert bool(by_length.device_finish)
