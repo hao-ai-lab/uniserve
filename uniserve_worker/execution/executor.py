@@ -274,7 +274,6 @@ class _SampleResult:
     ] = ()
     device_finish: torch.Tensor | None = None
     device_product_published: bool = False
-    finish_product_published: bool = False
 
 
 class _CompletionTokenSpan:
@@ -4573,11 +4572,10 @@ def _sample_plain_greedy_group(
         & ~torch.isposinf(logits).any(dim=-1)
         & torch.isfinite(logits).any(dim=-1)
     )
-    device_finish = _device_finish_values(tasks, device_tokens, valid)
-    finish_published = _publish_sampled_device_values(
+    device_finish = _resolve_sampled_finish_values(
         tasks,
-        "finish_product",
-        device_finish,
+        device_tokens,
+        valid,
         device_products,
         device_reads,
     )
@@ -4593,9 +4591,10 @@ def _sample_plain_greedy_group(
             device_token=device_tokens[index : index + 1],
             logprob=None,
             top_logprobs=None,
-            device_finish=device_finish[index : index + 1],
+            device_finish=(
+                None if device_finish is None else device_finish[index : index + 1]
+            ),
             device_product_published=published,
-            finish_product_published=finish_published,
         )
         for index, task in enumerate(tasks)
     )
@@ -4660,11 +4659,10 @@ def _sample_fused_top_k_group(
         device_products,
         device_reads,
     )
-    device_finish = _device_finish_values(tasks, tokens, valid)
-    finish_published = _publish_sampled_device_values(
+    device_finish = _resolve_sampled_finish_values(
         tasks,
-        "finish_product",
-        device_finish,
+        tokens,
+        valid,
         device_products,
         device_reads,
     )
@@ -4675,9 +4673,10 @@ def _sample_fused_top_k_group(
             tokens[index : index + 1],
             None,
             None,
-            device_finish=device_finish[index : index + 1],
+            device_finish=(
+                None if device_finish is None else device_finish[index : index + 1]
+            ),
             device_product_published=published,
-            finish_product_published=finish_published,
         )
         for index in range(len(rows))
     )
@@ -4836,11 +4835,10 @@ def _sample_task_group(
         device_products,
         device_reads,
     )
-    device_finish = _device_finish_values(tasks, task_tokens, task_valid)
-    finish_published = _publish_sampled_device_values(
+    device_finish = _resolve_sampled_finish_values(
         tasks,
-        "finish_product",
-        device_finish,
+        task_tokens,
+        task_valid,
         device_products,
         device_reads,
     )
@@ -4896,9 +4894,10 @@ def _sample_task_group(
                 if index in speculative_values
                 else _CompletionInteger(span, index)
             ),
-            device_finish=device_finish[index : index + 1],
+            device_finish=(
+                None if device_finish is None else device_finish[index : index + 1]
+            ),
             device_product_published=published,
-            finish_product_published=finish_published,
         )
         for index in range(len(tasks))
     )
@@ -4997,31 +4996,73 @@ def _publish_sampled_device_values(
     device_reads: tuple[DeviceProductRead, ...],
 ) -> bool:
     products = tuple(getattr(task, product_field) for task in tasks)
-    if device_products is None:
+    if device_products is None or not all(product is not None for product in products):
         return False
-    if all(product is not None for product in products):
-        writes = tuple(cast(DeviceProductWrite, product) for product in products)
-        values = device_values.reshape(-1)
+    writes = tuple(cast(DeviceProductWrite, product) for product in products)
+    _publish_device_writes(writes, device_values.reshape(-1), device_products, device_reads)
+    return True
+
+
+def _resolve_sampled_finish_values(
+    tasks: tuple[_SampleTask, ...],
+    device_tokens: torch.Tensor,
+    valid: torch.Tensor,
+    device_products: DeviceProductTable | None,
+    device_reads: tuple[DeviceProductRead, ...],
+) -> torch.Tensor | None:
+    if device_products is None:
+        return _device_finish_values(tasks, device_tokens, valid)
+    selected = tuple(
+        (index, task, task.finish_product)
+        for index, task in enumerate(tasks)
+        if task.finish_product is not None
+    )
+    if not selected:
+        return None
+    indexes = tuple(index for index, _task, _write in selected)
+    finish_tasks = tuple(task for _index, task, _write in selected)
+    writes = tuple(write for _index, _task, write in selected)
+    finish_valid = _select_device_values(valid, indexes)
+    rows = tuple(task.rows[0] for task in finish_tasks)
+    if all(row.force_finish for row in rows):
+        finish_values = finish_valid.to(dtype=torch.bool)
     else:
-        selected = tuple(
-            (index, cast(DeviceProductWrite, product))
-            for index, product in enumerate(products)
-            if product is not None
+        finish_tokens = _select_device_values(device_tokens, indexes)
+        finish_values = _device_finish_values(
+            finish_tasks,
+            finish_tokens,
+            finish_valid,
         )
-        if not selected:
-            return False
-        indexes, writes = zip(*selected, strict=True)
-        values = device_values.reshape(-1).index_select(
-            0,
-            torch.tensor(indexes, dtype=torch.long, device=device_values.device),
-        )
+    _publish_device_writes(writes, finish_values, device_products, device_reads)
+    return None
+
+
+def _select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torch.Tensor:
+    flat = values.reshape(-1)
+    if len(indexes) == int(flat.numel()) and all(
+        index == expected for expected, index in enumerate(indexes)
+    ):
+        return flat
+    views = tuple(flat[index : index + 1] for index in indexes)
+    if len(views) == 1:
+        return views[0]
+    packed = packed_tensor_views(views)
+    return torch.cat(views, dim=0) if packed is None else packed.reshape(-1)
+
+
+def _publish_device_writes(
+    writes: tuple[DeviceProductWrite, ...],
+    device_values: torch.Tensor,
+    device_products: DeviceProductTable,
+    device_reads: tuple[DeviceProductRead, ...],
+) -> None:
+    values = device_values.reshape(-1)
     product_batch = device_products.producer_scalar_batch(writes)
     if product_batch is not None and int(product_batch.tensor.numel()) == len(writes):
         product_batch.tensor.reshape(-1).copy_(values)
         device_products.publish_scalar_batch(product_batch, after_reads=device_reads)
     else:
         device_products.publish_writes(writes, values)
-    return True
 
 
 def _semantic_sampling_draws(
