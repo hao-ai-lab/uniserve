@@ -116,6 +116,8 @@ def model_free_capabilities(
         latent_downsample=latent_downsample,
         max_vae_grid_tokens=0,
         max_vit_grid_tokens=0,
+        max_latent_feature_bytes=0,
+        max_vision_feature_bytes=0,
         commit_marker_tokens=2,
         gen_rope_advance=2,
         max_cfg_branches=1,

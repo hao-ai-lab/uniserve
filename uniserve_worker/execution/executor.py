@@ -18,8 +18,8 @@ from uniserve_worker.batch import (
     Batch,
     CompletionRecord,
     CompletionReport,
+    DevicePoint,
     Domain,
-    DType,
     EncodeMode,
     FinishFlags,
     FixedPoint,
@@ -27,13 +27,12 @@ from uniserve_worker.batch import (
     LogicalLengths,
     Operation,
     OpStatus,
-    PointRange,
     ProductKind,
     ProductPayload,
     ProductRef,
     RegistrationAck,
+    Release,
     SamplingParams,
-    ShapeBound,
     StorageClass,
     TimingCounters,
     TokenMode,
@@ -114,6 +113,7 @@ from uniserve_worker.runtime.execution_trace import (
 from uniserve_worker.runtime.host_staging import (
     TensorStager,
     TensorStagingSlot,
+    canonical_device,
     copy_cpu_to_device,
     cpu_int_staging_buffer,
     fill_cpu_ints,
@@ -124,6 +124,9 @@ from uniserve_worker.runtime.kv_store import KvEntry, KvStore, KvTxn
 from uniserve_worker.runtime.latent_store import LatentRecord, LatentStore, LatentTxn, LatentTxnView
 from uniserve_worker.runtime.mesh_store import MeshStore
 from uniserve_worker.runtime.product_store import (
+    DeviceProductRead,
+    DeviceProductTable,
+    DeviceProductWrite,
     EncodedImageProduct,
     FrameCollectionProduct,
     ImageRange,
@@ -135,12 +138,10 @@ from uniserve_worker.runtime.product_store import (
     ProductTxn,
     ProductView,
     VisionFeatureProduct,
-    encoder_handle_from_content_hash,
 )
 from uniserve_worker.runtime.replay import ReplayStore
 from uniserve_worker.runtime.request_session import (
     RequestSession,
-    SampledTokenRelay,
     SessionStore,
     StepTxn,
 )
@@ -160,7 +161,6 @@ from uniserve_worker.spec import (
     ImagePatchSpec,
     LatentLayout,
     MaterializationKind,
-    ModelLoadScope,
     ModelSpec,
     NoiseScaleMode,
     OperationStageCondition,
@@ -245,6 +245,7 @@ class _SampleTask:
     defer_host_token: bool = False
     draft_token_ids: tuple[int, ...] = ()
     acceptance_uniforms: torch.Tensor | None = None
+    device_product: DeviceProductWrite | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +255,7 @@ class _SampleResult:
     logprob: float | None
     top_logprobs: tuple[tuple[int, float, int], ...] | None
     num_accepted_tokens: int = 0
+    device_product_published: bool = False
 
 
 class _CompletionTokenSpan:
@@ -511,7 +513,9 @@ class _ExecutionScope:
     published: list[Locator] = field(default_factory=list)
     observations: list[RunObservation] = field(default_factory=list)
     component_us: dict[str, int] = field(default_factory=dict)
-    output_handles: dict[tuple[int, int, int, int], int] = field(default_factory=dict)
+    device_reads: list[DeviceProductRead] = field(default_factory=list)
+    device_writes: list[DeviceProductWrite] = field(default_factory=list)
+    operation_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
     next_row_id: int = 0
 
     def row_id(self) -> int:
@@ -543,10 +547,14 @@ class _Outcome:
 
 @dataclass(frozen=True, slots=True)
 class _StateOutcome:
-    """KV growth and any sampled-token count produced while publishing image state."""
+    """KV growth and semantic tokens committed while publishing image state."""
 
     kv_tokens: int
-    sampled_tokens: int = 0
+    committed_tokens: tuple[int | _CompletionToken, ...] = ()
+
+    @property
+    def sampled_tokens(self) -> int:
+        return len(self.committed_tokens)
 
 
 class ModelExecutor:
@@ -618,6 +626,14 @@ class ModelExecutor:
         self.allowed_operation_types = allowed_operation_types
         self.trace = trace
         self.defer_sampling = bool(defer_sampling)
+        self._device = (
+            torch.device("cpu") if deployment is None else canonical_device(deployment.device)
+        )
+        self._generation_device = (
+            self._device
+            if deployment is None or deployment.generation_device is None
+            else canonical_device(deployment.generation_device)
+        )
         max_operations = 1024 if deployment is None else int(deployment.max_batch_operations)
         completion_devices: list[str] = []
         if deployment is not None:
@@ -628,9 +644,25 @@ class ModelExecutor:
             depth=pipeline_depth,
             token_capacity=max_operations,
             devices=tuple(completion_devices),
+            event_pool=products.device_events,
         )
         self._tensor_stager = TensorStager(capacity=pipeline_depth * max_operations)
         self._routes = {} if spec is None else {route.name: route for route in spec.routes}
+        self._operation_stages = (
+            {} if spec is None else {operation.kind: operation.stages for operation in spec.operations}
+        )
+        self._primary_stages = {
+            operation_type: primary[0]
+            for operation_type, stages in self._operation_stages.items()
+            if len(
+                primary := tuple(
+                    stage
+                    for stage in stages
+                    if stage.purpose is OperationStagePurpose.PRIMARY
+                )
+            )
+            == 1
+        }
 
     def execute(self, batch: Batch) -> CompletionReport:
         """Execute one canonical batch with replay-before-mutation semantics."""
@@ -639,7 +671,6 @@ class ModelExecutor:
         operations = _trace_envelopes(batch.operations)
         validation_started = time.perf_counter_ns()
         try:
-            batch.validate()
             self._validate_batch_identity(batch)
         except BaseException as error:
             self.trace.emit(
@@ -654,12 +685,21 @@ class ModelExecutor:
             operations,
             duration_us=(time.perf_counter_ns() - validation_started) // 1000,
         )
+        if not batch.operations:
+            self._apply_release_controls(batch)
+            return CompletionReport(
+                step_id=batch.step_id,
+                completions=(),
+                registration=RegistrationAck(visible=True),
+                worker_exec_us=(time.perf_counter_ns() - started) // 1000,
+            )
         try:
             replayed = self.replay.lookup(batch.operations)
         except BaseException as error:
             self.trace.emit(ExecutionPhase.REPLAY, operations, error=error)
             raise
         if replayed is not None:
+            self._apply_release_controls(batch)
             report = finalize_completion_report(
                 replace(
                     replayed,
@@ -718,7 +758,11 @@ class ModelExecutor:
             self._apply_new_kv_blocks(batch.operations, scope)
             self._reserve_outputs(batch.operations, scope)
             self._stage_input_products(batch, scope)
+            self._consume_predicates(batch.operations, scope)
             outcomes = self._execute_operations(batch.operations, scope)
+            self._finish_device_reads(scope)
+            self._publish_predicates(scope)
+            self.products.device_products.validate_writes(tuple(scope.device_writes))
             completion.seal()
             self.trace.emit(
                 ExecutionPhase.POSTPROCESS,
@@ -732,6 +776,7 @@ class ModelExecutor:
             for row, (operation, outcome) in enumerate(
                 zip(batch.operations, outcomes, strict=True)
             ):
+                self._validate_completion_products(operation, outcome.products)
                 report_products.extend(outcome.products)
                 session = self.sessions.get(operation.request_key.session_id)
                 # The base point and parent semantic come from the fixed parent
@@ -788,6 +833,7 @@ class ModelExecutor:
                 report,
                 lambda publish: transaction.commit(committed, publish),
             )
+            self._apply_release_controls(batch)
             # Finalize every row already detected ready. Other rows remain owned
             # by their completion generations and are revisited by the progress
             # loop without blocking execution or unrelated response dispatch.
@@ -797,17 +843,19 @@ class ModelExecutor:
             report = finalize_completion_report(report)
             self.trace.emit(
                 ExecutionPhase.COMMIT,
-                _trace_envelopes(batch.operations),
+                operations,
                 duration_us=(time.perf_counter_ns() - started) // 1000,
             )
             return report
         except BaseException as error:
+            self._finish_device_reads(scope)
             transaction.rollback()
             completion.abandon()
+            self.products.device_products.abandon_writes(tuple(scope.device_writes))
             self._release_locators(scope.published)
             self.trace.emit(
                 ExecutionPhase.ROLLBACK,
-                _trace_envelopes(batch.operations),
+                operations,
                 duration_us=(time.perf_counter_ns() - started) // 1000,
                 error=error,
             )
@@ -850,9 +898,107 @@ class ModelExecutor:
         registration unwinds every bound handle and leaves no product behind.
         """
 
+        bindings: list[tuple[ProductRef, str, torch.device | str]] = []
         for operation in operations:
+            device = self._operation_device(operation)
             for output in operation.outputs:
-                scope.output_handles[_product_ref_key(output)] = self._input_product_handle(output)
+                if output.storage_class is StorageClass.DEVICE_TENSOR or (
+                    output.storage_class is StorageClass.LATENT_ARENA
+                    and output.kind
+                    in {
+                        ProductKind.ARTIFACT,
+                        ProductKind.LATENT_FEATURE,
+                        ProductKind.VISION_FEATURE,
+                    }
+                ):
+                    bindings.append((output, operation.plan_digest, device))
+        writes = self.products.device_products.bind_outputs(tuple(bindings))
+        scope.device_writes.extend(writes)
+        for write in writes:
+            operation_id = int(write.reference.producer_op_id)
+            if write.reference.kind is ProductKind.TOKEN:
+                scope.operation_writes[operation_id] = write
+            else:
+                scope.operation_writes.setdefault(operation_id, write)
+
+    def _operation_device(self, operation: Operation) -> torch.device:
+        return self._generation_device if operation.domain is Domain.GEN else self._device
+
+    def _validate_completion_products(
+        self,
+        operation: Operation,
+        products: tuple[ProductPayload, ...],
+    ) -> None:
+        declared = {output: output for output in operation.outputs}
+        for product in products:
+            reference = declared.get(product.product)
+            if reference is None:
+                raise invalid_descriptor(
+                    "completion carries a product not declared by its operation"
+                )
+            if reference.storage_class is StorageClass.COMPLETION_ARENA and len(
+                product.payload
+            ) > int(operation.bounds.max_completion_bytes):
+                raise invalid_descriptor(
+                    "completion product exceeds its registered byte bound"
+                )
+
+    def _consume_predicates(
+        self,
+        operations: tuple[Operation, ...],
+        scope: _ExecutionScope,
+    ) -> None:
+        for operation in operations:
+            predicate = operation.predicate
+            if predicate is None:
+                continue
+            read = self.products.device_products.consume(
+                predicate,
+                consumer_op_id=operation.op_id,
+                device=self._operation_device(operation),
+            )
+            scope.device_reads.append(read)
+
+    def _publish_predicates(
+        self,
+        scope: _ExecutionScope,
+    ) -> None:
+        for write in scope.device_writes:
+            if write.reference.kind is ProductKind.COMPLETION:
+                self.products.device_products.publish_scalar_write(
+                    write,
+                    True,
+                )
+
+    def _finish_device_reads(
+        self,
+        scope: _ExecutionScope,
+    ) -> None:
+        if not scope.device_reads:
+            return
+        reads = tuple(read for read in scope.device_reads if not read._recorded)
+        if not reads:
+            scope.device_reads.clear()
+            return
+        after_writes: list[DeviceProductWrite] = []
+        for read in reads:
+            write = scope.operation_writes.get(read.consumer_op_id)
+            if write is None:
+                after_writes.clear()
+                break
+            after_writes.append(write)
+        self.products.device_products.record_readers(
+            reads,
+            after_writes=tuple(after_writes),
+        )
+        scope.device_reads.clear()
+
+    def _apply_release_controls(self, batch: Batch) -> None:
+        self.products.device_products.release_operations(
+            (control.request_key, control.op_id)
+            for control in batch.controls
+            if isinstance(control, Release)
+        )
 
     def _apply_new_kv_blocks(
         self,
@@ -940,12 +1086,12 @@ class ModelExecutor:
         sessions: list[RequestSession] = []
         starts: list[int] = []
         tasks: list[_ForwardTask] = []
-        for operation in operations:
+        current_tokens = self._resolve_decode_tokens(operations, scope)
+        for operation, current in zip(operations, current_tokens, strict=True):
             session = self.sessions.get(operation.request_key.session_id)
             if session.sampling is None:
                 raise invalid_descriptor("sequence operation has no admitted sampling state")
-            current = self._resolve_decode_token(operation, session, scope)
-            start = _parent_base_point(operation, session)
+            start = session.logical_position
             sessions.append(session)
             starts.append(start)
             tasks.append(
@@ -973,6 +1119,7 @@ class ModelExecutor:
                 operation,
                 row_logits,
                 session,
+                scope,
                 positions=(start + 1,),
             )
             for operation, session, start, row_logits in zip(
@@ -983,14 +1130,20 @@ class ModelExecutor:
                 strict=True,
             )
         )
-        samples = _sample_task_batch(sample_tasks, scope.completion)
+        samples = _sample_task_batch(
+            sample_tasks,
+            scope.completion,
+            device_products=self.products.device_products,
+            device_reads=tuple(scope.device_reads),
+        )
         _record_component(scope, "text_sample", sample_started)
         finalize_started = time.perf_counter_ns()
+        self._publish_token_products(operations, samples, scope)
         outcomes: list[_Outcome] = []
         for operation, start, sampled in zip(operations, starts, samples, strict=True):
             session = self.sessions.get(operation.request_key.session_id)
             session.rng_counter += 1
-            session.last_sampled_token = _sample_relay_token(sampled)
+            session.logical_position = start + 1
             # Keep the sampled token deferred: materializing it here (``int()``)
             # blocks on the copy event and stalls the decode pipeline. It is
             # finalized when the response is serialized, after the next forward
@@ -1064,7 +1217,12 @@ class ModelExecutor:
             indexes, sample_tasks = zip(*sampling, strict=True)
             for index, sample_output in zip(
                 indexes,
-                _sample_task_batch(tuple(sample_tasks), scope.completion),
+                _sample_task_batch(
+                    tuple(sample_tasks),
+                    scope.completion,
+                    device_products=self.products.device_products,
+                    device_reads=tuple(scope.device_reads),
+                ),
                 strict=True,
             ):
                 result[index] = sample_output
@@ -1244,7 +1402,11 @@ class ModelExecutor:
         pure_token_decode = all(
             isinstance(task.row, TokenRow) and task.query_tokens == 1 for task in tasks
         )
-        if RouteRowKind.FLOW in route.row_kinds and not pure_token_decode:
+        image_capable = any(
+            self.sessions.get(task.operation.request_key.session_id).image is not None
+            for task in tasks
+        )
+        if RouteRowKind.FLOW in route.row_kinds and (not pure_token_decode or image_capable):
             return self._packed_attention_plan(tasks, scope, device, staging_slot)
         sessions = tuple(task.operation.request_key.session_id for task in tasks)
         query_lens = tuple(task.query_tokens for task in tasks)
@@ -1453,21 +1615,20 @@ class ModelExecutor:
             ) from None
 
     def _stages(self, operation_type: OperationType) -> tuple[OperationStageSpec, ...]:
-        if self.spec is None:
-            return ()
-        return self.spec.operation(operation_type).stages
+        stages = self._operation_stages.get(operation_type)
+        if stages is None:
+            if self.spec is None:
+                return ()
+            raise invalid_descriptor(f"model does not declare operation {operation_type.value!r}")
+        return stages
 
     def _primary_stage(self, operation_type: OperationType) -> OperationStageSpec:
-        stages = tuple(
-            stage
-            for stage in self._stages(operation_type)
-            if stage.purpose is OperationStagePurpose.PRIMARY
-        )
-        if len(stages) != 1:
+        stage = self._primary_stages.get(operation_type)
+        if stage is None:
             raise invalid_descriptor(
                 f"operation {operation_type.value!r} requires exactly one primary neural stage"
             )
-        return stages[0]
+        return stage
 
     def _state_stages(
         self,
@@ -1525,6 +1686,11 @@ class ModelExecutor:
             raise invalid_descriptor("sequence operation has no admitted sampling state")
         mode = operation.work.mode
         if mode == TokenMode.EXTEND.value:
+            if any(
+                reference.kind in {ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE}
+                for reference in operation.inputs
+            ):
+                return (yield from self._visual_extend(operation, session, scope))
             return (yield from self._extend(operation, session, scope))
         if mode == TokenMode.DECODE.value:
             return (yield from self._decode(operation, session, scope))
@@ -1537,7 +1703,7 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> _Driver:
         tokens = self._operation_token_ids(operation, scope)
-        start = _fixed_parent(operation).point_index
+        start = session.logical_position
         task = self._token_task(
             operation,
             tokens,
@@ -1552,11 +1718,13 @@ class ModelExecutor:
             operation,
             logits[-1],
             session,
+            scope,
             positions=(start + len(tokens),),
         )
         sample = _sample_result((yield (sample_task,))[0])
-        session.last_sampled_token = _sample_relay_token(sample)
+        self._publish_token_product(operation, sample, scope)
         session.rng_counter += 1
+        session.logical_position = start + len(tokens)
         # Keep the sampled token deferred (see _decode_batch): a plain-greedy
         # extend still copies its token asynchronously, and forcing it here
         # would reintroduce the per-step host stall.
@@ -1567,6 +1735,78 @@ class ModelExecutor:
             committed_tokens=(sample.token_id,),
         )
 
+    def _visual_extend(
+        self,
+        operation: Operation,
+        session: RequestSession,
+        scope: _ExecutionScope,
+    ) -> _Driver:
+        references = tuple(
+            reference
+            for reference in operation.inputs
+            if reference.kind in {ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE}
+        )
+        if len(references) != 1:
+            raise invalid_descriptor("visual extend requires exactly one feature product")
+        reference = references[0]
+        record = scope.product_view.get(self._input_product_handle(reference))
+        if record is None:
+            raise invalid_descriptor("visual extend feature product is not resident")
+        read = self.products.device_products.consume(
+            reference,
+            consumer_op_id=operation.op_id,
+            device=self._operation_device(operation),
+        )
+        scope.device_reads.append(read)
+        payload = record.payload
+        position = session.logical_position
+        closes_feedback = any(
+            output.kind is ProductKind.COMPLETION for output in operation.outputs
+        )
+        samples_continuation = any(
+            output.kind is ProductKind.TOKEN for output in operation.outputs
+        )
+        if reference.kind is ProductKind.VISION_FEATURE:
+            if not isinstance(payload, VisionFeatureProduct):
+                raise invalid_descriptor("vision feature product has the wrong resident payload")
+            outcome = yield from self._state_driver(
+                operation,
+                OperationType.ENCODE_VISION,
+                scope,
+                height=payload.height,
+                width=payload.width,
+                conditioning_position=position,
+                features=read.tensor,
+                grid=payload.grid,
+                sample_token=samples_continuation,
+                close_image=closes_feedback,
+                retain_image=True,
+            )
+        else:
+            if not isinstance(payload, LatentFeatureProduct):
+                raise invalid_descriptor("latent feature product has the wrong resident payload")
+            outcome = yield from self._state_driver(
+                operation,
+                OperationType.ENCODE_LATENT,
+                scope,
+                height=payload.height,
+                width=payload.width,
+                conditioning_position=position,
+                latent=read.tensor,
+                sample_token=samples_continuation,
+                close_image=closes_feedback,
+                retain_image=True,
+            )
+        if closes_feedback:
+            flow = cast(ModelSpec, self.spec).flow
+            session.logical_position = position + max(
+                1,
+                1 if flow is None else int(flow.rope_advance),
+            )
+        elif reference.kind is ProductKind.VISION_FEATURE:
+            session.logical_position = position + 1
+        return self._state_outcome(operation, outcome, base=position)
+
     def _decode(
         self,
         operation: Operation,
@@ -1574,7 +1814,7 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> _Driver:
         current = self._resolve_decode_token(operation, session, scope)
-        start = _parent_base_point(operation, session)
+        start = session.logical_position
         task = self._token_task(
             operation,
             (current,),
@@ -1589,11 +1829,13 @@ class ModelExecutor:
             operation,
             logits,
             session,
+            scope,
             positions=(start + 1,),
         )
         sampled = _sample_result((yield (sample_task,))[0])
         session.rng_counter += 1
-        session.last_sampled_token = _sample_relay_token(sampled)
+        session.logical_position = start + 1
+        self._publish_token_product(operation, sampled, scope)
         # Keep the sampled token deferred (see _decode_batch): finalized when the
         # response is serialized, off the decode critical path.
         return self._token_outcome(
@@ -1609,9 +1851,18 @@ class ModelExecutor:
         session: RequestSession,
         scope: _ExecutionScope,
     ) -> _Driver:
-        current = self._resolve_decode_token(operation, session, scope)
-        draft = self._operation_token_ids(operation, scope)
-        start = _fixed_parent(operation).point_index
+        if isinstance(operation.parent.point, DevicePoint):
+            current = self._resolve_decode_token(operation, session, scope)
+            draft = self._operation_token_ids(operation, scope)
+        else:
+            input_tokens = self._operation_token_ids(operation, scope)
+            if len(input_tokens) < 2:
+                raise invalid_descriptor(
+                    "fixed-parent verification requires current and draft tokens"
+                )
+            current = int(input_tokens[0])
+            draft = input_tokens[1:]
+        start = session.logical_position
         tokens: tuple[int | torch.Tensor, ...] = (current, *draft)
         task = self._token_task(
             operation,
@@ -1633,6 +1884,7 @@ class ModelExecutor:
             operation,
             logits,
             session,
+            scope,
             positions=tuple(range(start + 1, start + len(draft) + 2)),
             draft_token_ids=draft,
             acceptance_uniforms=coins,
@@ -1641,8 +1893,9 @@ class ModelExecutor:
         accepted = int(sampled.num_accepted_tokens)
         committed = 1 + accepted
         self._commit_task_kv(task, committed, scope)
-        session.last_sampled_token = _sample_relay_token(sampled)
+        self._publish_token_product(operation, sampled, scope)
         session.rng_counter += len(draft) + 1
+        session.logical_position = start + committed
         committed_tokens = tuple(int(value) for value in draft[:accepted]) + (
             int(sampled.token_id),
         )
@@ -1661,11 +1914,14 @@ class ModelExecutor:
         tokens: int,
         committed_tokens: tuple[int | _CompletionToken, ...],
     ) -> _Outcome:
-        length = self.kv.get(operation.request_key.session_id).length
+        session = self.sessions.get(operation.request_key.session_id)
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1,
-            logical_lengths=LogicalLengths(token_len=length, kv_visible_len=length),
+            logical_lengths=LogicalLengths(
+                token_len=session.logical_position,
+                kv_visible_len=self.kv.get(operation.request_key.session_id).length,
+            ),
             token_span=TokenSpan(base=base, len=int(tokens)),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
@@ -1734,10 +1990,9 @@ class ModelExecutor:
     ) -> tuple[int, ...]:
         """Read the token id values a token operation names as an input product.
 
-        Depth-one operations carry their prompt and draft token payloads on their
-        greedy device relay; the input token product is the durable channel that
-        arrives with the product-backed token store, so an operation without one
-        is rejected here.
+        Host-known prompt and draft tokens arrive through a declared host-staging
+        product. Device-rooted decode tokens are resolved separately through the
+        generation-tagged device product table.
         """
 
         for reference in operation.inputs:
@@ -1751,6 +2006,11 @@ class ModelExecutor:
     def _input_product_handle(self, reference: ProductRef) -> int:
         """Bind one declared product identity to a stable worker-local handle."""
 
+        if reference.storage_class is StorageClass.LATENT_ARENA:
+            generation = int(reference.generation)
+            if generation < 1:
+                raise invalid_descriptor("resident product requires a positive generation")
+            return generation
         return _stable_handle(
             reference.request_key.session_id,
             reference.request_key.epoch,
@@ -1764,21 +2024,128 @@ class ModelExecutor:
         session: RequestSession,
         scope: _ExecutionScope,
     ) -> int | torch.Tensor:
-        relay = session.last_sampled_token
-        if relay is not None:
-            if isinstance(relay, SampledTokenRelay):
-                return relay.tensor
-            return int(relay)
+        point = operation.parent.point
+        if isinstance(point, DevicePoint):
+            reference = point.selected_point
+            if reference.kind is not ProductKind.TOKEN:
+                raise invalid_descriptor("device parent selected point is not a token product")
+            read = self.products.device_products.consume(
+                reference,
+                consumer_op_id=operation.op_id,
+                producer_plan_digest=point.producer_plan_digest,
+                device=self._operation_device(operation),
+            )
+            scope.device_reads.append(read)
+            return read.tensor
         tokens = self._operation_token_ids(operation, scope)
         if not tokens:
             raise invalid_descriptor("last-sampled token source has no committed token")
         return int(tokens[0])
+
+    def _resolve_decode_tokens(
+        self,
+        operations: tuple[Operation, ...],
+        scope: _ExecutionScope,
+    ) -> tuple[int | torch.Tensor, ...]:
+        resolved: list[int | torch.Tensor | None] = [None] * len(operations)
+        device_indexes: list[int] = []
+        requests: list[tuple[ProductRef, int, str | None, torch.device | str | None]] = []
+        for index, operation in enumerate(operations):
+            point = operation.parent.point
+            if isinstance(point, DevicePoint):
+                reference = point.selected_point
+                if reference.kind is not ProductKind.TOKEN:
+                    raise invalid_descriptor("device parent selected point is not a token product")
+                device_indexes.append(index)
+                requests.append(
+                    (
+                        reference,
+                        operation.op_id,
+                        point.producer_plan_digest,
+                        None,
+                    )
+                )
+                continue
+            tokens = self._operation_token_ids(operation, scope)
+            if not tokens:
+                raise invalid_descriptor("last-sampled token source has no committed token")
+            resolved[index] = int(tokens[0])
+        reads = self.products.device_products.consume_batch(
+            tuple(requests),
+            device=self._operation_device(operations[0]),
+        )
+        scope.device_reads.extend(reads)
+        for index, read in zip(device_indexes, reads, strict=True):
+            resolved[index] = read.tensor
+        if any(value is None for value in resolved):
+            raise RuntimeError("decode token resolution left an operation without input")
+        return tuple(cast(int | torch.Tensor, value) for value in resolved)
+
+    def _publish_token_product(
+        self,
+        operation: Operation,
+        sample: _SampleResult,
+        scope: _ExecutionScope,
+    ) -> None:
+        if sample.device_product_published:
+            return
+        write = scope.operation_writes.get(int(operation.op_id))
+        if write is None:
+            return
+        device_token = sample.device_token
+        if device_token is None:
+            device_token = torch.tensor(
+                (int(sample.token_id),),
+                dtype=torch.long,
+                device=self._operation_device(operation),
+            )
+        self.products.device_products.publish_write(
+            write,
+            device_token,
+        )
+
+    def _publish_token_products(
+        self,
+        operations: tuple[Operation, ...],
+        samples: tuple[_SampleResult, ...],
+        scope: _ExecutionScope,
+    ) -> None:
+        if all(sample.device_product_published for sample in samples):
+            return
+        writes: list[DeviceProductWrite] = []
+        device_tokens: list[torch.Tensor] = []
+        for operation, sample in zip(operations, samples, strict=True):
+            write = scope.operation_writes.get(int(operation.op_id))
+            if write is None or sample.device_token is None:
+                for candidate_operation, candidate_sample in zip(
+                    operations,
+                    samples,
+                    strict=True,
+                ):
+                    self._publish_token_product(
+                        candidate_operation,
+                        candidate_sample,
+                        scope,
+                    )
+                return
+            writes.append(write)
+            device_tokens.append(sample.device_token)
+        packed = packed_tensor_views(tuple(device_tokens))
+        if packed is None:
+            for operation, sample in zip(operations, samples, strict=True):
+                self._publish_token_product(operation, sample, scope)
+            return
+        self.products.device_products.publish_writes(
+            tuple(writes),
+            packed,
+        )
 
     def _sample_task(
         self,
         operation: Operation,
         logits: torch.Tensor,
         session: RequestSession,
+        scope: _ExecutionScope,
         *,
         positions: tuple[int, ...],
         draft_token_ids: tuple[int, ...] = (),
@@ -1821,6 +2188,7 @@ class ModelExecutor:
                 vocab=int(rows.shape[1]),
                 device=rows.device,
             )
+        device_product = scope.operation_writes.get(int(operation.op_id))
         return _SampleTask(
             operation=operation,
             logits=rows,
@@ -1832,6 +2200,7 @@ class ModelExecutor:
             defer_host_token=defer_host_token,
             draft_token_ids=tuple(int(value) for value in draft_token_ids),
             acceptance_uniforms=acceptance_uniforms,
+            device_product=device_product,
         )
 
     def _flow_driver(
@@ -1858,7 +2227,7 @@ class ModelExecutor:
         )
         if step_count < 0 or start_step + step_count > image.steps:
             raise invalid_descriptor("flow operation exceeds the declared schedule")
-        conditioning_position = self.kv.get(session_id).length
+        conditioning_position = session.logical_position
         image_prompt = image.image_prompts[0] if image.image_prompts else ""
         record = scope.latents.read(latent_handle)
         if record is None:
@@ -1982,14 +2351,14 @@ class ModelExecutor:
             status=OpStatus.OK,
             selected_point=1,
             logical_lengths=LogicalLengths(
-                token_len=length,
+                token_len=session.logical_position,
                 kv_visible_len=length,
                 # The cumulative denoise steps this lineage has advanced to after
                 # the quantum (start_step + step_count), which the ordered-commit
                 # validator matches against the request's expected denoise step.
                 latent_len=record.step,
             ),
-            token_span=TokenSpan(base=_fixed_parent(operation).point_index, len=0),
+            token_span=TokenSpan(base=session.logical_position, len=0),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
         )
@@ -2305,33 +2674,48 @@ class ModelExecutor:
         operation: Operation,
         outcome: _StateOutcome,
         *,
+        base: int | None = None,
         products: tuple[ProductPayload, ...] = (),
     ) -> _Outcome:
-        base = _fixed_parent(operation).point_index
-        length = self.kv.get(operation.request_key.session_id).length
+        session = self.sessions.get(operation.request_key.session_id)
+        span_base = session.logical_position if base is None else int(base)
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1 if operation.advances_state else 0,
             # The image KV tokens this encode/ingest/feedback operation actually
             # wrote (its state-driver forward query span), which the validator
-            # matches against the request's expected image KV extent. ``token_len``
-            # stays the session's committed token length for accounting.
-            logical_lengths=LogicalLengths(token_len=length, kv_visible_len=outcome.kv_tokens),
-            token_span=TokenSpan(base=base, len=outcome.sampled_tokens),
+            # matches against the request's expected image KV extent.
+            logical_lengths=LogicalLengths(
+                token_len=session.logical_position,
+                kv_visible_len=outcome.kv_tokens,
+            ),
+            token_span=TokenSpan(base=span_base, len=outcome.sampled_tokens),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
+            committed_tokens=outcome.committed_tokens,
             products=products,
         )
 
-    def _non_state_outcome(self, operation: Operation, *, kv_len: int) -> _Outcome:
-        base = _fixed_parent(operation).point_index
+    def _non_state_outcome(
+        self,
+        operation: Operation,
+        *,
+        kv_len: int,
+        products: tuple[ProductPayload, ...] = (),
+    ) -> _Outcome:
+        session = self.sessions.get(operation.request_key.session_id)
+        base = session.logical_position
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1 if operation.advances_state else 0,
-            logical_lengths=LogicalLengths(token_len=kv_len, kv_visible_len=kv_len),
+            logical_lengths=LogicalLengths(
+                token_len=session.logical_position,
+                kv_visible_len=kv_len,
+            ),
             token_span=TokenSpan(base=base, len=0),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
+            products=products,
         )
 
     def _encode_driver(
@@ -2346,89 +2730,86 @@ class ModelExecutor:
         operation_type = work_operation_type(operation.work)
         mode = EncodeMode(cast(str, operation.work.mode))
         session_id = operation.request_key.session_id
-        content = _stable_handle(
-            session_id, operation.request_key.epoch, operation.op_id, "encode-source"
+        feature_outputs = tuple(
+            output
+            for output in operation.outputs
+            if output.storage_class is StorageClass.LATENT_ARENA
+            and output.kind in {ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE}
         )
-        handle = encoder_handle_from_content_hash(content)
-        record = scope.product_view.get(handle)
+        if len(feature_outputs) != 1:
+            raise invalid_descriptor("encode operation requires one resident feature output")
+        feature_output = feature_outputs[0]
+        handle = int(feature_output.generation)
+        if handle < 1:
+            raise invalid_descriptor("encode feature output requires a positive generation")
         payload: VisionFeatureProduct | LatentFeatureProduct
-        cached: VisionFeatureProduct | LatentFeatureProduct | None = None
-        if record is not None:
-            if mode is EncodeMode.VISION and isinstance(record.payload, VisionFeatureProduct):
-                cached = record.payload
-            elif mode is EncodeMode.LATENT and isinstance(record.payload, LatentFeatureProduct):
-                cached = record.payload
-        if cached is not None:
-            payload = cached
+        source = self._encode_source(operation, scope)
+        stage = self._primary_stage(operation_type)
+        if stage.row is not RouteRowKind.ENCODE:
+            raise invalid_descriptor("encode primary stage is not an encode row")
+        target_device = torch.device(self._route_device(self._route(stage)))
+        if isinstance(source, ImageTensorProduct):
+            prepared = prepare_tensor_image(
+                image_spec,
+                mode,
+                source.image,
+                device=target_device,
+                signed_unit=source.value_range is ImageRange.SIGNED_UNIT,
+            )
+            source_base64 = None
         else:
-            source = self._encode_source(operation, scope)
-            stage = self._primary_stage(operation_type)
-            if stage.row is not RouteRowKind.ENCODE:
-                raise invalid_descriptor("encode primary stage is not an encode row")
             prepared = prepare_image(
                 image_spec,
                 mode,
                 source,
-                device=torch.device(self._route_device(self._route(stage))),
+                device=target_device,
             )
-            task = self._encode_task(operation, mode, prepared, stage, scope)
-            outputs = yield (task,)
-            features = _encode_features(outputs[0]).detach()
-            if mode is EncodeMode.VISION:
-                grid = (
-                    prepared.inputs.grid.detach()
-                    if isinstance(prepared.inputs, PatchInput)
-                    else None
-                )
-                payload = VisionFeatureProduct(
-                    features=features,
-                    grid=grid,
-                    height=prepared.height,
-                    width=prepared.width,
-                    source_base64=source,
-                )
-            else:
-                payload = LatentFeatureProduct(
-                    latent=features,
-                    height=prepared.height,
-                    width=prepared.width,
-                    source_base64=source,
-                )
-            scope.product_view.put(
-                ProductRecord(
-                    handle=handle,
-                    session_id=session_id,
-                    payload=payload,
-                    content_hash=content,
-                )
+            source_base64 = source
+        task = self._encode_task(operation, mode, prepared, stage, scope)
+        outputs = yield (task,)
+        features = _encode_features(outputs[0]).detach()
+        if mode is EncodeMode.VISION:
+            grid = (
+                prepared.inputs.grid.detach()
+                if isinstance(prepared.inputs, PatchInput)
+                else None
             )
-        session = self.sessions.get(session_id)
-        session.product_handles.add(handle)
-        conditioning_position = _fixed_parent(operation).point_index
-        if isinstance(payload, VisionFeatureProduct):
-            outcome = yield from self._state_driver(
-                operation,
-                operation_type,
-                scope,
-                height=payload.height,
-                width=payload.width,
-                conditioning_position=conditioning_position,
-                features=payload.features,
-                grid=payload.grid,
-                retain_image=True,
+            payload = VisionFeatureProduct(
+                features=features,
+                grid=grid,
+                height=prepared.height,
+                width=prepared.width,
+                source_base64=source_base64,
             )
         else:
-            outcome = yield from self._state_driver(
-                operation,
-                operation_type,
-                scope,
-                height=payload.height,
-                width=payload.width,
-                conditioning_position=conditioning_position,
-                latent=payload.latent,
-                retain_image=True,
+            payload = LatentFeatureProduct(
+                latent=features,
+                height=prepared.height,
+                width=prepared.width,
+                source_base64=source_base64,
             )
-        return self._state_outcome(operation, outcome)
+        value = payload.features if isinstance(payload, VisionFeatureProduct) else payload.latent
+        write = _bound_device_write(scope, feature_output)
+        resident = self.products.device_products.publish_write(
+            write,
+            value,
+        )
+        scope.operation_writes.setdefault(int(operation.op_id), write)
+        payload = (
+            replace(payload, features=resident)
+            if isinstance(payload, VisionFeatureProduct)
+            else replace(payload, latent=resident)
+        )
+        scope.product_view.put(
+            ProductRecord(
+                handle=handle,
+                session_id=session_id,
+                payload=payload,
+            )
+        )
+        session = self.sessions.get(session_id)
+        session.product_handles.add(handle)
+        return self._non_state_outcome(operation, kv_len=0)
 
     def _materialize_driver(
         self,
@@ -2487,96 +2868,65 @@ class ModelExecutor:
         else:
             raise invalid_descriptor("model declares an unknown image materialization kind")
 
-        # The PNG+base64 encode runs eagerly here, matching the anchor: at the
-        # c32 closed loop a deferred encode (finalized at respond time on a
-        # background thread) freed the device but inflated the materialize
-        # round-trip from ~270 ms to ~690 ms per image -- the encode ran ~3x
-        # slower under GIL contention, and in a closed loop completion latency
-        # directly delays the next admission (measured: +14 s over the 32-image
-        # run, the entire t2i gap). The ~220 ms eager encode is instead hidden
-        # by the pipeline's next in-flight batch.
+        # Materialize owns the bounded PNG/base64 artifact as well as the
+        # independently fenced resident image used by a later feedback encode.
         png = tensor_to_png_b64(
             image_tensor,
             value_range=(-1.0, 1.0) if image_range is ImageRange.SIGNED_UNIT else (0.0, 1.0),
         )
-        image_handle = _stable_handle(
-            session_id, operation.request_key.epoch, operation.op_id, "image"
+        resident_outputs = tuple(
+            output
+            for output in operation.outputs
+            if output.storage_class is StorageClass.LATENT_ARENA
+            and output.kind is ProductKind.ARTIFACT
         )
-        conditioning_position = _fixed_parent(operation).point_index
-        locator_text = ""
-        if (
-            ModelLoadScope(cast(DeploymentOverlay, self.deployment).model_scope)
-            is ModelLoadScope.GENERATION
-        ):
-            source = (
-                latent_record.value
-                if flow.latent_layout is LatentLayout.PATCH_TOKENS
-                else image_tensor
+        if len(resident_outputs) > 1:
+            raise invalid_descriptor("materialize operation repeats its resident image product")
+        if resident_outputs:
+            resident_output = resident_outputs[0]
+            image_handle = int(resident_output.generation)
+            if image_handle < 1:
+                raise invalid_descriptor(
+                    "materialized resident image requires a positive generation"
+                )
+            write = _bound_device_write(scope, resident_output)
+            resident_image = self.products.device_products.publish_write(
+                write,
+                image_tensor,
             )
-            locator_text = self._publish_tensor(
-                source,
-                scope,
-                payload_kind=flow.latent_layout.value,
-                height=latent_record.height,
-                width=latent_record.width,
-                value_range=image_range.value,
+            scope.operation_writes.setdefault(int(operation.op_id), write)
+            scope.product_view.put(
+                ProductRecord(
+                    handle=image_handle,
+                    session_id=session_id,
+                    payload=ImageTensorProduct(
+                        image=resident_image,
+                        height=latent_record.height,
+                        width=latent_record.width,
+                        value_range=image_range,
+                    ),
+                )
             )
-            outcome = _StateOutcome(0)
-        else:
-            outcome = yield from self._state_driver(
-                operation,
-                operation_type,
-                scope,
-                height=latent_record.height,
-                width=latent_record.width,
-                conditioning_position=conditioning_position,
-                image=image_tensor,
-                image_range=image_range,
-                latent=latent_record.value,
-                sample_token=True,
-                close_image=True,
-                retain_image=image_params.retain_images,
-            )
-
-        scope.product_view.put(
-            ProductRecord(
-                handle=image_handle,
-                session_id=session_id,
-                payload=ImageTensorProduct(
-                    image=image_tensor,
-                    height=latent_record.height,
-                    width=latent_record.width,
-                    value_range=image_range,
-                ),
-                locator=locator_text,
-            )
-        )
-        session.product_handles.add(image_handle)
+            session.product_handles.add(image_handle)
         self._append_frame(operation, png, scope)
         scope.latents.delete(latent_handle)
         scope.kv.release_generation(session_id, latent_handle)
         session.latent_handle = None
         session.flow_step = 0
-        products = [
+        products = (
             ProductPayload(
                 product=_artifact_product_ref(operation),
                 # The Artifact product carries the base64 PNG string as bytes: the
                 # scheduler recovers it via String::from_utf8 and hands it to
                 # validate_png_artifact, which base64-decodes it back to the PNG.
                 payload=png.encode("ascii"),
-            )
-        ]
-        if locator_text:
-            # A commit-writeback materialization also publishes its committed
-            # image-KV view as a locator the destination installs, addressed by a
-            # Kv product reference.
-            products.append(
-                ProductPayload(
-                    product=_kv_locator_product_ref(operation),
-                    payload=locator_text.encode("utf-8"),
-                )
-            )
-        return self._state_outcome(operation, outcome, products=tuple(products))
+            ),
+        )
+        return self._non_state_outcome(
+            operation,
+            kv_len=0,
+            products=products,
+        )
 
     def _transfer_driver(
         self,
@@ -2621,14 +2971,26 @@ class ModelExecutor:
         self,
         operation: Operation,
         scope: _ExecutionScope,
-    ) -> str:
+    ) -> str | ImageTensorProduct:
         for reference in operation.inputs:
             record = scope.product_view.get(self._input_product_handle(reference))
             if record is None:
                 continue
             payload = record.payload
             if isinstance(payload, (VisionFeatureProduct, LatentFeatureProduct)):
-                return payload.source_base64
+                if payload.source_base64 is not None:
+                    return payload.source_base64
+                continue
+            if isinstance(payload, ImageTensorProduct):
+                if reference.storage_class is StorageClass.LATENT_ARENA:
+                    read = self.products.device_products.consume(
+                        reference,
+                        consumer_op_id=operation.op_id,
+                        device=self._operation_device(operation),
+                    )
+                    scope.device_reads.append(read)
+                    return replace(payload, image=read.tensor)
+                return payload
             if isinstance(payload, EncodedImageProduct):
                 return payload.base64
         raise invalid_descriptor("encode operation has no source image product")
@@ -2671,7 +3033,7 @@ class ModelExecutor:
         retain_image: bool,
     ) -> Generator[tuple[_ExecutorTask, ...], _TaskResult, _StateOutcome]:
         total = 0
-        sampled_tokens = 0
+        committed_tokens: tuple[int | _CompletionToken, ...] = ()
         for stage in self._state_stages(operation_type, retain_image=retain_image):
             if stage.row is RouteRowKind.ENCODE:
                 if image is None:
@@ -2719,6 +3081,7 @@ class ModelExecutor:
                         operation,
                         value[-1],
                         session,
+                        scope,
                         positions=(
                             conditioning_position
                             + max(
@@ -2728,9 +3091,9 @@ class ModelExecutor:
                         ),
                     )
                     sampled = _sample_result((yield (sample_task,))[0])
-                    session.last_sampled_token = _sample_relay_token(sampled)
+                    self._publish_token_product(operation, sampled, scope)
                     session.rng_counter += 1
-                    sampled_tokens = 1
+                    committed_tokens = (sampled.token_id,)
                 continue
             if stage.row is RouteRowKind.FLOW:
                 if latent is None:
@@ -2750,7 +3113,7 @@ class ModelExecutor:
                 total += task.query_tokens
                 continue
             raise invalid_descriptor("state publication cannot use a decode row")
-        return _StateOutcome(total, sampled_tokens)
+        return _StateOutcome(total, committed_tokens)
 
     def _vision_state_task(
         self,
@@ -2999,6 +3362,14 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> tuple[torch.Tensor, Mapping[str, object]]:
         for reference in operation.inputs:
+            if reference.storage_class is StorageClass.DEVICE_TENSOR:
+                read = self.products.device_products.consume(
+                    reference,
+                    consumer_op_id=operation.op_id,
+                    device=self._operation_device(operation),
+                )
+                scope.device_reads.append(read)
+                return read.tensor, {"payload_kind": reference.kind.value}
             record = scope.product_view.get(self._input_product_handle(reference))
             if record is None:
                 continue
@@ -3186,56 +3557,15 @@ def _output_generations(operation: Operation) -> tuple[int, ...]:
 
 
 def _artifact_product_ref(operation: Operation) -> ProductRef:
-    """The declared artifact output an operation materializes into, or a fresh one.
-
-    The materialized image is a non-semantic host payload addressed by its
-    product reference; when the operation declares an ``Artifact`` output the
-    payload adopts that identity, otherwise it is rooted at the operation.
-    """
+    """The declared host-visible artifact output of image materialization."""
 
     for output in operation.outputs:
-        if output.kind is ProductKind.ARTIFACT:
+        if (
+            output.kind is ProductKind.ARTIFACT
+            and output.storage_class is StorageClass.COMPLETION_ARENA
+        ):
             return output
-    return ProductRef(
-        request_key=operation.request_key,
-        producer_op_id=operation.op_id,
-        output_index=len(operation.outputs),
-        generation=0,
-        kind=ProductKind.ARTIFACT,
-        storage_class=StorageClass.HOST_STAGING,
-        dtype=DType.U8,
-        shape_bound=ShapeBound(),
-        point_range=PointRange(),
-    )
-
-
-def _kv_locator_product_ref(operation: Operation) -> ProductRef:
-    """The declared committed-KV output a materialization writes back, or a fresh one.
-
-    A commit-writeback materialization publishes its committed image KV view as a
-    locator the destination installs; it is addressed by a ``Kv`` product
-    reference the scheduler resolves to that transfer.
-    """
-
-    for output in operation.outputs:
-        if output.kind is ProductKind.KV:
-            return output
-    return ProductRef(
-        request_key=operation.request_key,
-        producer_op_id=operation.op_id,
-        output_index=len(operation.outputs) + 1,
-        generation=0,
-        kind=ProductKind.KV,
-        storage_class=StorageClass.PAGED_KV,
-        dtype=DType.U8,
-        shape_bound=ShapeBound(),
-        point_range=PointRange(),
-    )
-
-
-def _product_ref_key(reference: ProductRef) -> tuple[int, int, int, int]:
-    key = reference.request_key
-    return (key.session_id, key.epoch, reference.producer_op_id, reference.output_index)
+    raise invalid_descriptor("materialize operation has no host-visible artifact output")
 
 
 def _record_component(scope: _ExecutionScope, name: str, started_ns: int) -> None:
@@ -3294,12 +3624,6 @@ def _sample_result(value: object) -> _SampleResult:
     if not isinstance(value, _SampleResult):
         raise RuntimeError("sampling task returned an invalid result")
     return value
-
-
-def _sample_relay_token(sample: _SampleResult) -> int | SampledTokenRelay:
-    if sample.device_token is not None:
-        return SampledTokenRelay(sample.device_token)
-    return int(sample.token_id)
 
 
 def _sampling_task_tensors(
@@ -3381,6 +3705,9 @@ def _plain_greedy_row(row: _SamplingRow) -> bool:
 def _sample_task_batch(
     tasks: Sequence[_SampleTask],
     completion: CompletionLease | None = None,
+    *,
+    device_products: DeviceProductTable | None = None,
+    device_reads: tuple[DeviceProductRead, ...] = (),
 ) -> tuple[_SampleResult, ...]:
     """Shape and draw every compatible sampling row in each device batch."""
 
@@ -3460,7 +3787,12 @@ def _sample_task_batch(
     for (_device, _vocab, sampling_path, _penalty_width), compatible in grouped.items():
         indexes, group = zip(*compatible, strict=True)
         if sampling_path == -1:
-            sampled_group = _sample_plain_greedy_group(tuple(group), completion)
+            sampled_group = _sample_plain_greedy_group(
+                tuple(group),
+                completion,
+                device_products=device_products,
+                device_reads=device_reads,
+            )
         elif sampling_path > 0:
             sampled_group = _sample_fused_top_k_group(tuple(group), sampling_path)
         else:
@@ -3473,13 +3805,43 @@ def _sample_task_batch(
 def _sample_plain_greedy_group(
     tasks: tuple[_SampleTask, ...],
     completion: CompletionLease | None,
+    *,
+    device_products: DeviceProductTable | None,
+    device_reads: tuple[DeviceProductRead, ...],
 ) -> tuple[_SampleResult, ...]:
     logits = packed_tensor_views(tuple(task.logits for task in tasks))
     if logits is None:
         logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     else:
         logits = logits.reshape(len(tasks), -1)
-    device_tokens = torch.argmax(logits, dim=-1)
+    products = tuple(task.device_product for task in tasks)
+    bound_products = device_products is not None and all(
+        product is not None for product in products
+    )
+    product_table = cast(DeviceProductTable, device_products) if bound_products else None
+    product_writes = (
+        tuple(cast(DeviceProductWrite, product) for product in products)
+        if product_table is not None
+        else ()
+    )
+    product_batch = (
+        product_table.producer_scalar_batch(product_writes) if product_table is not None else None
+    )
+    packed_output = product_batch.tensor if product_batch is not None else None
+    if packed_output is None or int(packed_output.numel()) != len(tasks):
+        device_tokens = torch.argmax(logits, dim=-1)
+    else:
+        device_tokens = packed_output.reshape(len(tasks))
+        torch.argmax(logits, dim=-1, out=device_tokens)
+    published = product_table is not None
+    if product_table is not None:
+        if product_batch is None:
+            product_table.publish_writes(product_writes, device_tokens)
+        else:
+            product_table.publish_scalar_batch(
+                product_batch,
+                after_reads=device_reads,
+            )
     defer = all(task.defer_host_token for task in tasks)
     if defer:
         owns_completion = completion is None
@@ -3507,6 +3869,7 @@ def _sample_plain_greedy_group(
             device_token=device_tokens[index : index + 1],
             logprob=None,
             top_logprobs=None,
+            device_product_published=published,
         )
         for index, task in enumerate(tasks)
     )
@@ -4118,6 +4481,20 @@ def _sample_logprob_details(
             seen.add(candidate)
         result[result_index] = (selected_value, tuple(entries))
     return result
+
+
+def _bound_device_write(
+    scope: _ExecutionScope,
+    reference: ProductRef,
+) -> DeviceProductWrite:
+    matches = tuple(
+        write for write in scope.device_writes if write.reference == reference
+    )
+    if len(matches) != 1:
+        raise invalid_descriptor(
+            "resident product does not have exactly one atomic registration binding"
+        )
+    return matches[0]
 
 
 def _encode_features(output: ForwardRowOutput) -> torch.Tensor:

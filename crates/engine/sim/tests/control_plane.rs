@@ -9,11 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use uniserve_core::{
-    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
-    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
-    GenerationRuntimeCapabilities, ImageIngestRecipe, ImageKvEffect, ImageParams, ImageSegment,
-    RequestId, SamplingParams, SegmentPlacement, TriggerPolicyDescriptor, UndVisibility,
+    ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
+    GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
+    ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPlacement,
+    TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent};
 use uniserve_executor::{ControlAck, ControlOp, Executor};
@@ -78,11 +78,10 @@ fn generation_request(
         trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
         gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
         feedback: Some(GeneratedImageFeedbackRecipe {
-            commit: CommitRecipe::CommitGenThenWriteback,
-            writeback: FeedbackWriteback::DirectKv,
+            source: FeedbackSource::DeviceProduct,
             next_und_token: FeedbackNextToken::EndOfImage,
-            logical_positions: 2,
-            physical_kv_tokens: ImageKvEffect::WorkerDefined,
+            ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
+            sample_continuation: true,
         }),
         ..GenerationPolicyDescriptor::default()
     };
@@ -93,20 +92,17 @@ fn generation_request(
         supports_vision_encode: true,
         supports_latent_encode: false,
         supports_image_generation: true,
-        supports_commit_writeback: true,
         max_latent_units: 1_024,
         latent_downsample: 16,
         max_vae_grid_tokens: 1_024,
         max_vit_grid_tokens: 64,
+        max_latent_feature_bytes: 1 << 20,
+        max_vision_feature_bytes: 1 << 20,
         commit_marker_tokens: 2,
         max_cfg_branches: 3,
         scratch_capacity_tokens: 1 << 20,
         scratch_block_size: 64,
         encoder_cache_entries: 256,
-        generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
-            inline: true,
-            separate_writeback: true,
-        },
     };
     let resources = GenerationResourceBounds::conservative(
         &context,
@@ -806,12 +802,12 @@ fn pipeline_depth_is_token_identical() {
 #[test]
 fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, Point, WorkVariant};
+    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, Point, WorkVariant};
 
     // Per submitted operation: its work variant, its parent point (`Some(index)`
     // for a host-observed fixed point, `None` for a device-rooted successor), and
     // the executor's in-flight depth at submit time.
-    type OperationLog = Arc<Mutex<Vec<(WorkVariant, Option<u64>, usize)>>>;
+    type OperationLog = Arc<Mutex<Vec<(WorkVariant, Option<u64>, usize, bool)>>>;
 
     struct Recording {
         inner: SimExecutor,
@@ -838,10 +834,22 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
                     Point::Fixed { point_index, .. } => Some(u64::from(*point_index)),
                     Point::Device { .. } => None,
                 };
+                let releases_parent = envelope.parent.producer_op_id.0 == 0
+                    || batch.controls.iter().any(|control| {
+                        matches!(
+                            control,
+                            Control::Release {
+                                request_key,
+                                op_id,
+                            } if *request_key == envelope.request_key
+                                && *op_id == envelope.parent.producer_op_id
+                        )
+                    });
                 self.operations.lock().unwrap().push((
                     envelope.work.variant(),
                     parent_point,
                     in_flight,
+                    releases_parent,
                 ));
             }
             self.inner.submit(batch)
@@ -872,65 +880,195 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
         }
     }
 
+    let mut runs = Vec::new();
+    for pipeline_depth in [1, 2] {
+        let mut sim = SimEngine::new();
+        sim.set_pipeline_depth(pipeline_depth);
+        sim.set_text_len(8);
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let executor = Recording {
+            inner: SimExecutor::new(Box::new(sim)),
+            operations: operations.clone(),
+        };
+        let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+        let mut request = generation_request(
+            RequestId(1),
+            context_with_image(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            16,
+        );
+        if pipeline_depth == 1 {
+            request.stop_token_ids = vec![u32::MAX];
+        }
+        let mut events = scheduler.submit_for_test(request);
+
+        let mut finish_reason = None;
+        let mut text_tokens = 0;
+        for _ in 0..256 {
+            scheduler.step();
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    GenEvent::TextToken { .. } => text_tokens += 1,
+                    GenEvent::Finished { reason, .. } => finish_reason = Some(reason),
+                    _ => {}
+                }
+            }
+            if finish_reason.is_some() {
+                break;
+            }
+        }
+        drop(scheduler);
+        runs.push((
+            pipeline_depth,
+            finish_reason,
+            text_tokens,
+            Arc::try_unwrap(operations).unwrap().into_inner().unwrap(),
+        ));
+    }
+
+    for (_, finish_reason, text_tokens, operations) in &runs {
+        assert_eq!(*finish_reason, Some(FinishReason::Eos));
+        assert_eq!(*text_tokens, 8);
+        assert!(operations.len() >= 2);
+        assert!(
+            operations
+                .iter()
+                .all(|(_, _, _, releases_parent)| *releases_parent),
+            "every successor retires its parent after submission"
+        );
+        // Host-observed fixed roots form a continuous lineage. Device roots
+        // advance the point between two fixed points, so only adjacent fixed
+        // operations can be compared directly.
+        for pair in operations.windows(2) {
+            if let (Some(previous), Some(next)) = (pair[0].1, pair[1].1) {
+                assert_eq!(next, previous + u64::from(pair[0].0.advances_state()));
+            }
+        }
+    }
+
+    let serial = &runs[0].3;
+    assert!(
+        serial.iter().any(|(kind, parent, in_flight, _)| {
+            *kind == WorkVariant::TokenDecode && parent.is_none() && *in_flight == 0
+        }),
+        "a resolved selected-point product remains the next decode parent"
+    );
+    let pipelined = &runs[1].3;
+    assert!(
+        pipelined.iter().any(|(kind, parent, in_flight, _)| {
+            *kind == WorkVariant::TokenDecode && parent.is_none() && *in_flight > 0
+        }),
+        "an in-flight selected-point product feeds the next decode"
+    );
+}
+
+#[test]
+fn staged_product_reachability_uses_a_fixed_handoff_then_same_pool_device_lineage() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, Point, WorkVariant};
+
+    struct StagedReachability {
+        inner: SimExecutor,
+        operations: Arc<Mutex<Vec<(WorkVariant, Point)>>>,
+    }
+
+    impl Executor for StagedReachability {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            self.operations.lock().unwrap().extend(
+                batch
+                    .operations
+                    .iter()
+                    .map(|operation| (operation.work.variant(), operation.parent.point.clone())),
+            );
+            self.inner.submit(batch)
+        }
+
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            self.inner.poll()
+        }
+
+        fn device_products_reachable(&self, producer: WorkVariant, consumer: WorkVariant) -> bool {
+            producer == WorkVariant::TokenDecode && consumer == WorkVariant::TokenDecode
+        }
+
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.inner.next_result()
+        }
+
+        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(operation)
+        }
+
+        fn control_wait(
+            &mut self,
+            operation: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(operation, targets)
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
-    sim.set_text_len(8);
+    sim.set_text_len(6);
     let operations = Arc::new(Mutex::new(Vec::new()));
-    let executor = Recording {
+    let executor = StagedReachability {
         inner: SimExecutor::new(Box::new(sim)),
         operations: operations.clone(),
     };
     let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
     let mut events = scheduler.submit_for_test(generation_request(
         RequestId(1),
-        context_with_image(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
+        text_context(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
-        16,
+        12,
     ));
 
-    let mut finish_reason = None;
-    let mut text_tokens = 0;
+    let mut finished = false;
     for _ in 0..256 {
         scheduler.step();
         while let Ok(event) = events.try_recv() {
-            match event {
-                GenEvent::TextToken { .. } => text_tokens += 1,
-                GenEvent::Finished { reason, .. } => finish_reason = Some(reason),
-                _ => {}
+            if matches!(event, GenEvent::Finished { .. }) {
+                finished = true;
             }
         }
-        if finish_reason.is_some() {
+        if finished {
             break;
         }
     }
-
-    // Serial oracle: pipelining the decode of an image-context request must not
-    // change its committed output or its natural end-of-sequence.
-    assert_eq!(finish_reason, Some(FinishReason::Eos));
-    assert_eq!(text_tokens, 8);
+    assert!(finished);
     let operations = operations.lock().unwrap();
-    assert!(operations.len() >= 2);
-    // Once the context image is ingested the decode pipelines: at least one
-    // operation roots on a device-selected point (recorded as `None`) issued
-    // while its predecessor is still in flight.
+    let decode_parents = operations
+        .iter()
+        .filter_map(|(variant, point)| (*variant == WorkVariant::TokenDecode).then_some(point))
+        .collect::<Vec<_>>();
+    assert!(matches!(decode_parents.first(), Some(Point::Fixed { .. })));
     assert!(
-        operations
+        decode_parents
             .iter()
-            .any(|(kind, parent, _)| *kind == WorkVariant::TokenDecode && parent.is_none()),
-        "image-context decode pipelines via a device-rooted successor"
+            .skip(1)
+            .any(|point| matches!(point, Point::Device { .. }))
     );
-    // Host-observed (fixed-rooted) operations still form a continuous lineage: a
-    // state-advancing predecessor commits a fresh point the next fixed-rooted
-    // operation reads, while the non-advancing context encode leaves it intact.
-    // Device-rooted successors advance the point between two fixed points, so the
-    // invariant is checked only across operations that are both fixed-rooted.
-    for pair in operations.windows(2) {
-        if let (Some(previous), Some(next)) = (pair[0].1, pair[1].1) {
-            assert_eq!(next, previous + u64::from(pair[0].0.advances_state()));
-        }
-    }
 }
 
 /// an explicit stop token id terminates the request with FinishReason::Stop.
@@ -1576,6 +1714,63 @@ fn multimodal_encode_then_cache_hit() {
 }
 
 #[test]
+fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(6);
+    sim.set_pipeline_depth(2);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let request = |request_id| {
+        generation_request(
+            RequestId(request_id),
+            context_with_image(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            12,
+        )
+    };
+    let mut first = scheduler.submit_for_test(request(1));
+    let mut second = scheduler.submit_for_test(request(2));
+    let mut reasons = [None, None];
+    let mut text_tokens = [0_usize, 0_usize];
+    let mut seen = [Vec::new(), Vec::new()];
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while Instant::now() < deadline {
+        scheduler.step();
+        for (index, events) in [&mut first, &mut second].into_iter().enumerate() {
+            while let Ok(event) = events.try_recv() {
+                seen[index].push(format!("{event:?}"));
+                match event {
+                    GenEvent::TextToken { .. } => text_tokens[index] += 1,
+                    GenEvent::Finished { reason, .. } => reasons[index] = Some(reason),
+                    _ => {}
+                }
+            }
+        }
+        if reasons.iter().all(Option::is_some) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        reasons,
+        [Some(FinishReason::Eos), Some(FinishReason::Eos)],
+        "events={seen:?}, health={:?}",
+        scheduler.health_snapshot()
+    );
+    assert!(text_tokens.iter().all(|count| *count > 0));
+    assert_eq!(
+        scheduler
+            .stats_handle()
+            .encoder
+            .cached
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
 fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     use std::sync::atomic::Ordering;
 
@@ -1715,16 +1910,10 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
         TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
     request.policy.feedback = Some(GeneratedImageFeedbackRecipe {
-        commit: CommitRecipe::CommitGen,
-        writeback: FeedbackWriteback::Reingest {
-            ingest: Box::new(ImageIngestRecipe::vit_only(
-                1,
-                ImageKvEffect::Exact { tokens: 1 },
-            )),
-        },
+        source: FeedbackSource::ArtifactProduct,
         next_und_token: FeedbackNextToken::Bos,
-        logical_positions: 1,
-        physical_kv_tokens: ImageKvEffect::Exact { tokens: 1 },
+        ingest: ImageIngestRecipe::vit_only(1, ImageKvEffect::Exact { tokens: 1 }),
+        sample_continuation: false,
     });
     request.behavior = GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
     let mut events = handle.submit(request).unwrap();

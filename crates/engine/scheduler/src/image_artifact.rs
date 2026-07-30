@@ -18,7 +18,9 @@ pub(crate) struct ImageArtifactMetadata {
 /// first 24 bytes.
 pub(crate) fn png_artifact_dims_b64(pixels_png_b64: &str) -> Option<(u32, u32)> {
     let prefix = &pixels_png_b64.as_bytes()[..pixels_png_b64.len().min(44) & !3];
-    let head = base64::engine::general_purpose::STANDARD.decode(prefix).ok()?;
+    let head = base64::engine::general_purpose::STANDARD
+        .decode(prefix)
+        .ok()?;
     if head.len() < 24 || &head[..8] != b"\x89PNG\r\n\x1a\n" || &head[12..16] != b"IHDR" {
         return None;
     }

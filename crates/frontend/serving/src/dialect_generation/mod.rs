@@ -587,36 +587,7 @@ pub(crate) fn compile_generation_request(
         GenerationRequestCompiler::new(std::sync::Arc::clone(&tokenizer), profile).build(&input)?;
     let prompt_tokens = u32::try_from(lowered.prompt_ids.len())
         .map_err(|_| BuildError::new("generation prompt exceeds the supported token count"))?;
-    let mut policy = profile.generation_policy.clone();
-    let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, &policy);
-    if behavior.generated_image_feedback
-        && let Some(feedback) = policy.feedback.as_mut()
-        && matches!(
-            feedback.writeback,
-            uniserve_core::FeedbackWriteback::DirectKv
-        )
-        && !capabilities
-            .generated_image_commit
-            .supports(feedback.commit)
-    {
-        feedback.commit = match feedback.commit {
-            uniserve_core::CommitRecipe::CommitGen
-                if capabilities.generated_image_commit.separate_writeback =>
-            {
-                uniserve_core::CommitRecipe::CommitGenThenWriteback
-            }
-            uniserve_core::CommitRecipe::CommitGenThenWriteback
-                if capabilities.generated_image_commit.inline =>
-            {
-                uniserve_core::CommitRecipe::CommitGen
-            }
-            _ => {
-                return Err(BuildError::new(
-                    "runtime exposes no compatible generated-image commit mode",
-                ));
-            }
-        };
-    }
+    let policy = profile.generation_policy.clone();
     let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, &policy);
     let mut max_tokens = if behavior.und_decode {
         crate::text::resolve_max_tokens(
@@ -706,15 +677,7 @@ pub(crate) fn compile_generation_request(
         })
         .into_iter()
         .collect();
-    let mut image = lowered.image;
-    if policy.feedback.as_ref().is_some_and(|feedback| {
-        matches!(
-            feedback.writeback,
-            uniserve_core::FeedbackWriteback::Reingest { .. }
-        )
-    }) {
-        image.retain_images = false;
-    }
+    let image = lowered.image;
     let mut resources = GenerationResourceBounds::conservative(
         &context,
         &negative_context,
@@ -1045,20 +1008,17 @@ mod tests {
             supports_vision_encode: true,
             supports_latent_encode: true,
             supports_image_generation: true,
-            supports_commit_writeback: true,
             max_latent_units: 65_536,
             latent_downsample: 16,
             max_vae_grid_tokens: 4_096,
             max_vit_grid_tokens: 2_048,
+            max_latent_feature_bytes: 1 << 28,
+            max_vision_feature_bytes: 1 << 28,
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
             scratch_capacity_tokens: 65_536,
             scratch_block_size: 64,
             encoder_cache_entries: 256,
-            generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
-                inline: true,
-                separate_writeback: true,
-            },
         }
     }
 
@@ -1322,81 +1282,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_lowering_resolves_direct_kv_commit_to_runtime_topology() {
-        let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
-        let profile = resolve_generation_dialect_for_model("sensenova-u1", &*tok)
-            .expect("profile resolution")
-            .expect("SenseNova profile");
-        let mut request = ServeRequest::text("commit-topology", "Render a travel image");
-        request.generation.constraint = GenerationConstraint::Default;
-        request.generation.max_tokens = Some(8);
-        request.generation.image.max_images = Some(1);
-        request.modalities.output_image = true;
-
-        let mut inline = test_capabilities();
-        inline.generated_image_commit = uniserve_core::GeneratedImageCommitCapabilities {
-            inline: true,
-            separate_writeback: false,
-        };
-        let inline_request =
-            compile_generation_request(&request, Arc::clone(&tok), &profile, &inline, None, 32_768)
-                .expect("inline commit plan");
-        assert_eq!(
-            inline_request
-                .policy
-                .feedback
-                .as_ref()
-                .map(|feedback| feedback.commit),
-            Some(uniserve_core::CommitRecipe::CommitGen)
-        );
-        assert!(
-            !inline_request
-                .behavior
-                .capability_needs(&inline_request.policy, std::iter::empty())
-                .commit_writeback
-        );
-
-        let mut separate = test_capabilities();
-        separate.generated_image_commit = uniserve_core::GeneratedImageCommitCapabilities {
-            inline: false,
-            separate_writeback: true,
-        };
-        let separate_request = compile_generation_request(
-            &request,
-            Arc::clone(&tok),
-            &profile,
-            &separate,
-            None,
-            32_768,
-        )
-        .expect("separate commit plan");
-        assert_eq!(
-            separate_request
-                .policy
-                .feedback
-                .as_ref()
-                .map(|feedback| feedback.commit),
-            Some(uniserve_core::CommitRecipe::CommitGenThenWriteback)
-        );
-        assert!(
-            separate_request
-                .behavior
-                .capability_needs(&separate_request.policy, std::iter::empty())
-                .commit_writeback
-        );
-
-        let mut unsupported = test_capabilities();
-        unsupported.generated_image_commit = Default::default();
-        let error = compile_generation_request(&request, tok, &profile, &unsupported, None, 32_768)
-            .expect_err("missing commit mode must fail compilation");
-        assert!(
-            error
-                .message()
-                .contains("no compatible generated-image commit mode")
-        );
-    }
-
-    #[test]
     fn unsupported_sensenova_preview_resolution_is_rejected() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
         let profile = resolve_generation_dialect_for_model("sensenova-u1", &*tok)
@@ -1572,12 +1457,7 @@ mod tests {
             .context_tokens
             .saturating_add(lowered.max_und_tokens)
             .saturating_add(256)
-            .saturating_add(
-                capabilities
-                    .max_vae_grid_tokens
-                    .saturating_add(capabilities.commit_marker_tokens)
-                    .saturating_mul(2) as usize,
-            );
+            .saturating_add(capabilities.max_vit_grid_tokens.saturating_mul(2) as usize);
 
         assert!(lowered.behavior.generated_image_feedback);
         assert_eq!(lowered.resources.max_kv_tokens, expected);

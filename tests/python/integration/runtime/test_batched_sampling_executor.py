@@ -23,9 +23,14 @@ def _observe_sample_batches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, 
     observed: list[tuple[int, int]] = []
     implementation = executor_module._sample_task_batch
 
-    def wrapped(tasks, token_mirrors=None):
+    def wrapped(tasks, completion=None, *, device_products=None, device_reads=()):
         observed.append((len(tasks), sum(len(task.rows) for task in tasks)))
-        return implementation(tasks, token_mirrors)
+        return implementation(
+            tasks,
+            completion,
+            device_products=device_products,
+            device_reads=device_reads,
+        )
 
     monkeypatch.setattr(executor_module, "_sample_task_batch", wrapped)
     return observed
@@ -69,7 +74,7 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
     for index, admission in enumerate(admissions):
         extend, extend_input = token_operation(
             admission.request_key,
-            op_id=1,
+            op_id=1 + index,
             parent=root_parent(admission),
             mode=TokenMode.EXTEND,
             tokens=(3, 4),
@@ -85,21 +90,26 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
 
     decode_ops = []
     decode_inputs = []
-    for admission in admissions:
+    for index, admission in enumerate(admissions):
         session_id = admission.request_key.session_id
         operation, payload = token_operation(
             admission.request_key,
-            op_id=2,
+            op_id=3 + index,
             parent=worker.sessions.get(session_id).committed_version(),
             mode=TokenMode.DECODE,
-            tokens=(worker.sessions.get(session_id).version,),
+            tokens=(_next_token(4),),
         )
         decode_ops.append(operation)
         decode_inputs.append(payload)
     observed = _observe_sample_batches(monkeypatch)
 
     result = worker.execute(
-        Batch(step_id=9, admissions=(), operations=tuple(decode_ops), input_products=tuple(decode_inputs))
+        Batch(
+            step_id=9,
+            admissions=(),
+            operations=tuple(decode_ops),
+            input_products=tuple(decode_inputs),
+        )
     )
 
     assert observed == [(2, 2)]
@@ -115,7 +125,7 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
     admission = und_admission(
         4, block_ids=(3,), sampling=SamplingParams(return_logprobs=True, n_logprobs=2, seed=31)
     )
-    # Prime the request so the verifier's current token is the last sampled one.
+    # Prime the request, then carry its selected token explicitly with the draft.
     extend, extend_input = token_operation(
         admission.request_key,
         op_id=1,
@@ -124,17 +134,16 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
         tokens=(3, 4),
     )
     worker.execute(
-        Batch(step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,))
+        Batch(
+            step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+        )
     )
-    current = worker.sessions.get(4).last_sampled_token
-    assert int(current) == _next_token(4) == 1000
-
     verify, verify_input = token_operation(
         admission.request_key,
         op_id=2,
         parent=worker.sessions.get(4).committed_version(),
         mode=TokenMode.VERIFY,
-        tokens=(1001, STUB_IMG_START_TOKEN_ID),
+        tokens=(1000, 1001, STUB_IMG_START_TOKEN_ID),
     )
     observed = _observe_sample_batches(monkeypatch)
 

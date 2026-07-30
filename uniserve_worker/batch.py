@@ -174,6 +174,12 @@ _DISPOSITION_INDEX = {member: index for index, member in enumerate(Disposition)}
 _CLOSE_REASON_INDEX = {member: index for index, member in enumerate(CloseReason)}
 _ADAPTER_MODE_INDEX = {member: index for index, member in enumerate(AdapterMode)}
 
+# The native worker transport attaches this process-local token only after the
+# decoded Rust Batch has passed its complete wire validation. Direct Python
+# mappings never carry the token and retain the full decoder validation path.
+_WIRE_VALIDATION_TOKEN = object()
+_WIRE_VALIDATION_KEY = "_uniserve_wire_validation"
+
 # Precompiled little-endian packers. Multi-field formats fuse the fixed-width
 # runs of the record digests into single calls; `<` guarantees no padding, so
 # the produced bytes are identical to packing each field separately.
@@ -325,6 +331,8 @@ def route_capability_digest(
     max_latent_size: int,
     max_vae_grid_tokens: int,
     max_vit_grid_tokens: int,
+    max_latent_feature_bytes: int,
+    max_vision_feature_bytes: int,
     adapter_mode: AdapterMode,
     max_batch_operations: int,
     kv_dtype: str,
@@ -346,6 +354,8 @@ def route_capability_digest(
     digest.u32(max_latent_size)
     digest.u32(max_vae_grid_tokens)
     digest.u32(max_vit_grid_tokens)
+    digest.u64(max_latent_feature_bytes)
+    digest.u64(max_vision_feature_bytes)
     digest.u8(_ADAPTER_MODE_INDEX[AdapterMode(adapter_mode)])
     digest.u32(max_batch_operations)
     digest.string(kv_dtype)
@@ -657,6 +667,18 @@ class ShapeBound:
         device_dims = sum(1 for dim in self.dims if isinstance(dim, DeviceDim))
         if device_dims > 1:
             raise invalid_descriptor("a shape bound carries more than one device-actual dimension")
+        if any(
+            (dim.extent if isinstance(dim, StaticDim) else dim.bound) < 1
+            for dim in self.dims
+        ):
+            raise invalid_descriptor("a shape bound contains a zero extent")
+
+    @property
+    def max_elements(self) -> int:
+        elements = 1
+        for dim in self.dims:
+            elements *= dim.extent if isinstance(dim, StaticDim) else dim.bound
+        return elements
 
     @classmethod
     def from_wire(cls, value: object, where: str = "shape_bound") -> ShapeBound:
@@ -716,7 +738,23 @@ class ProductRef:
     point_range: PointRange
 
     def __post_init__(self) -> None:
+        if self.generation < 1:
+            raise invalid_descriptor("product reference has no logical generation")
         self.shape_bound.__post_init__()
+
+    @property
+    def max_bytes(self) -> int:
+        element_bytes = {
+            DType.U8: 1,
+            DType.U16: 2,
+            DType.U32: 4,
+            DType.I32: 4,
+            DType.I64: 8,
+            DType.F16: 2,
+            DType.BF16: 2,
+            DType.F32: 4,
+        }[self.dtype]
+        return self.shape_bound.max_elements * element_bytes
 
     @classmethod
     def from_wire(cls, value: object, where: str = "product_ref") -> ProductRef:
@@ -1035,20 +1073,65 @@ class Operation:
         output_indices: set[int] = set()
         for product in self.outputs:
             if product.request_key != self.request_key or product.producer_op_id != self.op_id:
-                raise invalid_descriptor("an output product is not owned by its producing operation")
+                raise invalid_descriptor(
+                    "an output product is not owned by its producing operation"
+                )
+            if product.generation < 1:
+                raise invalid_descriptor("an output product has no logical generation")
+            if product.point_range.max_points > max(1, self.bounds.max_points):
+                raise invalid_descriptor("an output product exceeds the operation point bound")
+            if (
+                product.storage_class is StorageClass.LATENT_ARENA
+                and product.max_bytes > self.bounds.max_latent_bytes
+            ):
+                raise invalid_descriptor(
+                    "a latent-arena output exceeds the operation latent-byte bound"
+                )
+            if (
+                product.storage_class is StorageClass.COMPLETION_ARENA
+                and product.max_bytes > self.bounds.max_completion_bytes
+            ):
+                raise invalid_descriptor(
+                    "a completion-arena output exceeds the operation completion-byte bound"
+                )
             if product.output_index in output_indices:
                 raise invalid_descriptor("operation repeats an output index")
             output_indices.add(product.output_index)
+        if isinstance(self.parent.point, DevicePoint):
+            selected = self.parent.point.selected_point
+            if (
+                selected.request_key != self.parent.request_key
+                or selected.producer_op_id != self.parent.producer_op_id
+            ):
+                raise invalid_descriptor(
+                    "device version selected point is not owned by its producer"
+                )
+            if selected.generation < 1:
+                raise invalid_descriptor("device version selected point has no logical generation")
+        if self.predicate is not None and (
+            self.predicate.generation < 1
+            or self.predicate.storage_class is not StorageClass.DEVICE_TENSOR
+            or self.predicate.kind is not ProductKind.COMPLETION
+        ):
+            raise invalid_descriptor(
+                "operation predicate is not a generation-tagged device completion product"
+            )
         if not _is_digest(self.plan_digest):
             raise invalid_descriptor("operation plan digest is not a lowercase SHA-256 digest")
         if self.plan_digest != self.compute_plan_digest():
             raise invalid_descriptor("operation plan digest does not match its registration fields")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "operation") -> Operation:
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "operation",
+        *,
+        _validated_wire: bool = False,
+    ) -> Operation:
         # Field decoding follows declaration order with a no-allocation fast
-        # path per field; the fallback branches reproduce the original decode
-        # (and therefore the original error) for anything anomalous.
+        # path per field. Irregular values use the validating field decoders so
+        # diagnostics identify the first invalid declaration.
         data = _map(value, where)
         get = data.get
         request_key = _fast_request_key(get("request_key"))
@@ -1128,7 +1211,8 @@ class Operation:
             control_seq=control_seq,
             plan_digest=plan_digest,
         )
-        operation.validate()
+        if not _validated_wire:
+            operation.validate()
         return operation
 
     def to_wire(self) -> dict[str, object]:
@@ -1301,9 +1385,7 @@ class CompletionRecord:
                 data.get("logical_lengths"), f"{where}.logical_lengths"
             ),
             token_span=TokenSpan.from_wire(data.get("token_span"), f"{where}.token_span"),
-            committed_tokens=_uints(
-                data.get("committed_tokens", ()), f"{where}.committed_tokens"
-            ),
+            committed_tokens=_uints(data.get("committed_tokens", ()), f"{where}.committed_tokens"),
             finish_flags=FinishFlags.from_wire(data.get("finish_flags"), f"{where}.finish_flags"),
             product_generations=_uints(
                 data.get("product_generations", ()), f"{where}.product_generations"
@@ -1604,10 +1686,14 @@ class Batch:
 
     def validate(self) -> None:
         if not self.operations and not self.controls:
-            raise invalid_descriptor("a submission batch must carry at least one operation or control")
+            raise invalid_descriptor(
+                "a submission batch must carry at least one operation or control"
+            )
         request_keys = [operation.request_key for operation in self.operations]
         if len(set(request_keys)) != len(request_keys):
-            raise invalid_descriptor("a submission batch carries multiple operations for one request")
+            raise invalid_descriptor(
+                "a submission batch carries multiple operations for one request"
+            )
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
             raise invalid_descriptor("a submission batch carries a duplicate admission")
@@ -1615,47 +1701,114 @@ class Batch:
             admission.validate()
             if admission.request_key not in request_keys:
                 raise invalid_descriptor("a submission batch admits a request without an operation")
-        identities: dict[tuple[RequestKey, int | None, int], str] = {}
+        identities: dict[tuple[RequestKey, int | None, int], Control] = {}
         for control in self.controls:
             seq = control.control_seq if isinstance(control, (Commit, Close)) else None
             identity = (control.request_key, seq, _control_variant_index(control))
-            content = control_content_digest(control)
             existing = identities.get(identity)
-            if existing is not None and existing != content:
+            if existing is not None and existing != control:
                 raise invalid_descriptor(
                     "a submission batch reuses a control identity with different content"
                 )
-            identities[identity] = content
+            identities[identity] = control
+        declared_inputs = {
+            product for operation in self.operations for product in operation.inputs
+        }
+        for operation in self.operations:
+            for product in operation.inputs:
+                if (
+                    product.storage_class is StorageClass.HOST_STAGING
+                    and (
+                        product.request_key != operation.request_key
+                        or product.producer_op_id != operation.op_id
+                    )
+                ):
+                    raise invalid_descriptor(
+                        "a host-staging input is not owned by its consuming operation"
+                    )
+        supplied_inputs: set[ProductRef] = set()
+        for payload in self.input_products:
+            product = payload.product
+            if product not in declared_inputs:
+                raise invalid_descriptor(
+                    "an input product payload is not declared by any operation"
+                )
+            if product.storage_class is not StorageClass.HOST_STAGING:
+                raise invalid_descriptor(
+                    "an input product payload does not name host-staging storage"
+                )
+            if product in supplied_inputs:
+                raise invalid_descriptor(
+                    "a submission batch repeats an input product payload"
+                )
+            supplied_inputs.add(product)
+            if product.kind is ProductKind.TOKEN:
+                if len(decode_token_product_bytes(payload.payload)) > product.shape_bound.max_elements:
+                    raise invalid_descriptor(
+                        "token input product exceeds its registered element bound"
+                    )
+            elif len(payload.payload) > product.max_bytes:
+                raise invalid_descriptor(
+                    "input product payload exceeds its registered byte bound"
+                )
+        for product in declared_inputs:
+            if (
+                product.storage_class is StorageClass.HOST_STAGING
+                and product not in supplied_inputs
+            ):
+                raise invalid_descriptor(
+                    "a host-staging operation input has no product payload"
+                )
 
     @classmethod
     def from_wire(cls, value: object) -> Batch:
         data = _map(value, "execute batch")
+        validated_wire = data.get(_WIRE_VALIDATION_KEY) is _WIRE_VALIDATION_TOKEN
+        step_id = _uint(data.get("step_id"), "execute batch.step_id")
+        admissions = tuple(
+            Admission.from_wire(item, f"execute batch.admissions[{index}]")
+            for index, item in enumerate(
+                _seq(data.get("admissions", ()), "execute batch.admissions")
+            )
+        )
+        operations = tuple(
+            Operation.from_wire(
+                item,
+                f"execute batch.operations[{index}]",
+                _validated_wire=validated_wire,
+            )
+            for index, item in enumerate(
+                _seq(data.get("operations", ()), "execute batch.operations")
+            )
+        )
+        controls = tuple(
+            _fast_release_control(item)
+            or control_from_wire(item, f"execute batch.controls[{index}]")
+            for index, item in enumerate(
+                _seq(data.get("controls", ()), "execute batch.controls")
+            )
+        )
+        input_products = tuple(
+            ProductPayload.from_wire(item, f"execute batch.input_products[{index}]")
+            for index, item in enumerate(
+                _seq(data.get("input_products", ()), "execute batch.input_products")
+            )
+        )
+        if validated_wire:
+            batch = object.__new__(cls)
+            set_field = object.__setattr__
+            set_field(batch, "step_id", step_id)
+            set_field(batch, "admissions", admissions)
+            set_field(batch, "operations", operations)
+            set_field(batch, "controls", controls)
+            set_field(batch, "input_products", input_products)
+            return batch
         return cls(
-            step_id=_uint(data.get("step_id"), "execute batch.step_id"),
-            admissions=tuple(
-                Admission.from_wire(item, f"execute batch.admissions[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("admissions", ()), "execute batch.admissions")
-                )
-            ),
-            operations=tuple(
-                Operation.from_wire(item, f"execute batch.operations[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("operations", ()), "execute batch.operations")
-                )
-            ),
-            controls=tuple(
-                control_from_wire(item, f"execute batch.controls[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("controls", ()), "execute batch.controls")
-                )
-            ),
-            input_products=tuple(
-                ProductPayload.from_wire(item, f"execute batch.input_products[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("input_products", ()), "execute batch.input_products")
-                )
-            ),
+            step_id=step_id,
+            admissions=admissions,
+            operations=operations,
+            controls=controls,
+            input_products=input_products,
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1943,7 +2096,7 @@ def _map(value: object, where: str) -> Mapping[str, Any]:
 def _seq(value: object, where: str) -> Sequence[Any]:
     kind = type(value)
     if kind is list or kind is tuple:
-        return value
+        return cast(Sequence[Any], value)
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise invalid_descriptor(f"{where} must be a list")
     return value
@@ -1990,7 +2143,7 @@ def _float(value: object, where: str) -> float:
     if kind is not float and kind is not int:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise invalid_descriptor(f"{where} must be a number")
-    result = float(value)
+    result = float(cast(int | float, value))
     if not math.isfinite(result):
         raise invalid_descriptor(f"{where} must be finite")
     return result
@@ -2000,9 +2153,7 @@ def _uints(value: object, where: str) -> tuple[int, ...]:
     items = _seq(value, where)
     for item in items:
         if not (type(item) is int and item >= 0):
-            return tuple(
-                _uint(item, f"{where}[{index}]") for index, item in enumerate(items)
-            )
+            return tuple(_uint(item, f"{where}[{index}]") for index, item in enumerate(items))
     return tuple(items)
 
 
@@ -2021,8 +2172,8 @@ def _is_digest(value: object) -> bool:
 # Allocation-light record decoders for the per-batch hot path
 #
 # Each returns the decoded record for a well-formed wire value and ``None``
-# otherwise; the caller falls back to the original decode, which re-parses in
-# declaration order and raises the original error for the first bad field.
+# otherwise; the caller uses validating decoders in declaration order so the
+# first invalid field receives a precise diagnostic.
 # Construction bypasses ``__init__``/``__post_init__`` only where the fast
 # path itself enforces everything those validators check.
 # ---------------------------------------------------------------------------
@@ -2055,17 +2206,54 @@ def _fast_request_key(value: object) -> RequestKey | None:
     return None
 
 
+def _fast_release_control(value: object) -> Release | None:
+    if type(value) is not dict or value.get("kind") != "release":
+        return None
+    payload = value.get("value")
+    if type(payload) is not dict:
+        return None
+    request_key = _fast_request_key(payload.get("request_key"))
+    op_id = payload.get("op_id")
+    if request_key is None or not (type(op_id) is int and op_id >= 0):
+        return None
+    control = object.__new__(Release)
+    object.__setattr__(control, "request_key", request_key)
+    object.__setattr__(control, "op_id", op_id)
+    return control
+
+
+@lru_cache(maxsize=1024)
+def _interned_point_range(base_point: int, max_points: int) -> PointRange:
+    point_range = object.__new__(PointRange)
+    object.__setattr__(point_range, "base_point", base_point)
+    object.__setattr__(point_range, "max_points", max_points)
+    return point_range
+
+
 def _fast_point_range(value: object) -> PointRange | None:
     if type(value) is not dict:
         return None
     base_point = value.get("base_point")
     max_points = value.get("max_points")
     if type(base_point) is int and base_point >= 0 and type(max_points) is int and max_points >= 0:
-        point_range = object.__new__(PointRange)
-        object.__setattr__(point_range, "base_point", base_point)
-        object.__setattr__(point_range, "max_points", max_points)
-        return point_range
+        return _interned_point_range(base_point, max_points)
     return None
+
+
+@lru_cache(maxsize=1024)
+def _interned_shape_bound(
+    encoded_dims: tuple[tuple[bool, int], ...],
+) -> ShapeBound:
+    shape = object.__new__(ShapeBound)
+    object.__setattr__(
+        shape,
+        "dims",
+        tuple(
+            DeviceDim(extent) if device_actual else StaticDim(extent)
+            for device_actual, extent in encoded_dims
+        ),
+    )
+    return shape
 
 
 def _fast_shape_bound(value: object) -> ShapeBound | None:
@@ -2075,7 +2263,7 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
     kind = type(raw_dims)
     if kind is not list and kind is not tuple:
         return None
-    dims: list[DimBound] = []
+    dims: list[tuple[bool, int]] = []
     device_dims = 0
     for item in raw_dims:
         if type(item) is not dict:
@@ -2085,23 +2273,21 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
         if tag == "static" and type(tag) is str:
             if not (type(payload) is int and payload >= 0):
                 return None
-            dims.append(StaticDim(payload))
+            dims.append((False, payload))
         elif tag == "device" and type(tag) is str:
             if type(payload) is not dict:
                 return None
             bound = payload.get("max")
             if not (type(bound) is int and bound >= 0):
                 return None
-            dims.append(DeviceDim(bound))
+            dims.append((True, bound))
             device_dims += 1
         else:
             return None
     if device_dims > 1:
-        # Fall back so the original decode raises the canonical error.
+        # Delegate the invalid shape to the validating decoder.
         return None
-    shape = object.__new__(ShapeBound)
-    object.__setattr__(shape, "dims", tuple(dims))
-    return shape
+    return _interned_shape_bound(tuple(dims))
 
 
 def _fast_product_ref(value: object) -> ProductRef | None:
@@ -2119,7 +2305,7 @@ def _fast_product_ref(value: object) -> ProductRef | None:
         and type(output_index) is int
         and output_index >= 0
         and type(generation) is int
-        and generation >= 0
+        and generation > 0
     ):
         return None
     raw_kind = value.get("kind")
@@ -2156,8 +2342,9 @@ def _fast_product_refs(value: object) -> tuple[ProductRef, ...] | None:
     kind = type(value)
     if kind is not list and kind is not tuple:
         return None
+    items = cast(list[object] | tuple[object, ...], value)
     references: list[ProductRef] = []
-    for item in value:
+    for item in items:
         reference = _fast_product_ref(item)
         if reference is None:
             return None
@@ -2203,17 +2390,46 @@ def _fast_version_ref(value: object) -> VersionRef | None:
     return reference
 
 
+@lru_cache(maxsize=len(_WORK_VARIANTS))
+def _interned_work(kind: str, mode: str | None) -> Work:
+    work = object.__new__(Work)
+    object.__setattr__(work, "kind", kind)
+    object.__setattr__(work, "mode", mode)
+    return work
+
+
 def _fast_work(value: object) -> Work | None:
     if type(value) is not dict:
         return None
     kind = value.get("kind")
     mode = value.get("value")
-    if type(kind) is str and (mode is None or type(mode) is str) and (kind, mode) in _WORK_PAIR_INDEX:
-        work = object.__new__(Work)
-        object.__setattr__(work, "kind", kind)
-        object.__setattr__(work, "mode", mode)
-        return work
+    if (
+        type(kind) is str
+        and (mode is None or type(mode) is str)
+        and (kind, mode) in _WORK_PAIR_INDEX
+    ):
+        return _interned_work(kind, mode)
     return None
+
+
+@lru_cache(maxsize=256)
+def _interned_bounds(
+    max_points: int,
+    max_tokens: int,
+    max_kv_pages: int,
+    max_latent_bytes: int,
+    max_completion_bytes: int,
+    max_transfer_bytes: int,
+) -> Bounds:
+    bounds = object.__new__(Bounds)
+    set_field = object.__setattr__
+    set_field(bounds, "max_points", max_points)
+    set_field(bounds, "max_tokens", max_tokens)
+    set_field(bounds, "max_kv_pages", max_kv_pages)
+    set_field(bounds, "max_latent_bytes", max_latent_bytes)
+    set_field(bounds, "max_completion_bytes", max_completion_bytes)
+    set_field(bounds, "max_transfer_bytes", max_transfer_bytes)
+    return bounds
 
 
 def _fast_bounds(value: object) -> Bounds | None:
@@ -2239,15 +2455,14 @@ def _fast_bounds(value: object) -> Bounds | None:
         and type(max_transfer_bytes) is int
         and max_transfer_bytes >= 0
     ):
-        bounds = object.__new__(Bounds)
-        set_field = object.__setattr__
-        set_field(bounds, "max_points", max_points)
-        set_field(bounds, "max_tokens", max_tokens)
-        set_field(bounds, "max_kv_pages", max_kv_pages)
-        set_field(bounds, "max_latent_bytes", max_latent_bytes)
-        set_field(bounds, "max_completion_bytes", max_completion_bytes)
-        set_field(bounds, "max_transfer_bytes", max_transfer_bytes)
-        return bounds
+        return _interned_bounds(
+            max_points,
+            max_tokens,
+            max_kv_pages,
+            max_latent_bytes,
+            max_completion_bytes,
+            max_transfer_bytes,
+        )
     return None
 
 
@@ -2279,10 +2494,11 @@ def _fast_uints(value: object) -> tuple[int, ...] | None:
     kind = type(value)
     if kind is not list and kind is not tuple:
         return None
-    for item in value:
+    items = cast(list[object] | tuple[object, ...], value)
+    for item in items:
         if not (type(item) is int and item >= 0):
             return None
-    return tuple(value)
+    return cast(tuple[int, ...], tuple(items))
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

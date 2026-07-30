@@ -184,28 +184,18 @@ pub enum ImageKvEffect {
 /// Generated-image feedback recipe supplied by the dialect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeneratedImageFeedbackRecipe {
-    pub commit: CommitRecipe,
-    pub writeback: FeedbackWriteback,
+    pub source: FeedbackSource,
     pub next_und_token: FeedbackNextToken,
-    pub logical_positions: u32,
-    pub physical_kv_tokens: ImageKvEffect,
+    pub ingest: ImageIngestRecipe,
+    pub sample_continuation: bool,
 }
 
-/// Worker op sequence used to commit a generated image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommitRecipe {
-    CommitGen,
-    CommitGenThenWriteback,
-}
-
-/// How a committed Gen image becomes continued context.
+/// Product channel through which a materialized image reaches feedback encode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-pub enum FeedbackWriteback {
-    Disabled,
-    DirectKv,
-    Reingest { ingest: Box<ImageIngestRecipe> },
+pub enum FeedbackSource {
+    DeviceProduct,
+    ArtifactProduct,
 }
 
 /// Und token used to continue after generated-image feedback.
@@ -407,10 +397,7 @@ impl GenerationBehaviorDescriptor {
             start_gen_after_context,
             generated_image_feedback: gen_output
                 && continue_after_gen_commit
-                && policy
-                    .feedback
-                    .as_ref()
-                    .is_some_and(|feedback| feedback.writeback != FeedbackWriteback::Disabled),
+                && policy.feedback.is_some(),
             continue_after_gen_commit,
             finish_after_gen_commit,
         }
@@ -440,13 +427,8 @@ impl GenerationBehaviorDescriptor {
         if self.generated_image_feedback
             && let Some(feedback) = &policy.feedback
         {
-            if feedback.commit == CommitRecipe::CommitGenThenWriteback {
-                needs.commit_writeback = true;
-            }
-            if let FeedbackWriteback::Reingest { ingest } = &feedback.writeback {
-                for step in ingest.steps.iter().copied() {
-                    needs.mark_encode(step);
-                }
+            for step in feedback.ingest.steps.iter().copied() {
+                needs.mark_encode(step);
             }
         }
         needs
@@ -462,7 +444,6 @@ pub struct GenerationCapabilityNeeds {
     pub vision_encode: bool,
     pub latent_encode: bool,
     pub image_generation: bool,
-    pub commit_writeback: bool,
 }
 
 impl GenerationCapabilityNeeds {
@@ -496,31 +477,13 @@ pub struct GenerationResourceBounds {
     pub context_tokens: usize,
     pub max_kv_tokens: usize,
     pub max_image_latent_units: u64,
+    pub max_image_latent_bytes: u64,
+    pub max_latent_feature_bytes: u64,
+    pub max_vision_feature_bytes: u64,
     pub max_scratch_units: u64,
     pub max_host_scratch_tokens: u64,
     pub encoder_cache_keys: Vec<u64>,
     pub generated_feedback_makes_non_replayable: bool,
-}
-
-/// Generated-image commit shapes executable on a runtime topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct GeneratedImageCommitCapabilities {
-    /// Image materialization appends generated-image KV on the same worker.
-    #[serde(default)]
-    pub inline: bool,
-    /// Image materialization publishes a locator and a transfer appends KV on
-    /// a distinct worker pool.
-    #[serde(default)]
-    pub separate_writeback: bool,
-}
-
-impl GeneratedImageCommitCapabilities {
-    pub fn supports(self, recipe: CommitRecipe) -> bool {
-        match recipe {
-            CommitRecipe::CommitGen => self.inline,
-            CommitRecipe::CommitGenThenWriteback => self.separate_writeback,
-        }
-    }
 }
 
 /// Worker and scheduler limits needed to compile a bounded generation graph.
@@ -530,19 +493,18 @@ pub struct GenerationRuntimeCapabilities {
     pub supports_vision_encode: bool,
     pub supports_latent_encode: bool,
     pub supports_image_generation: bool,
-    pub supports_commit_writeback: bool,
     pub max_latent_units: u64,
     pub latent_downsample: u32,
     pub max_vae_grid_tokens: u32,
     pub max_vit_grid_tokens: u32,
+    pub max_latent_feature_bytes: u64,
+    pub max_vision_feature_bytes: u64,
     pub commit_marker_tokens: u32,
     pub max_cfg_branches: u32,
     pub scratch_capacity_tokens: u64,
     #[serde(default)]
     pub scratch_block_size: u32,
     pub encoder_cache_entries: u32,
-    #[serde(default)]
-    pub generated_image_commit: GeneratedImageCommitCapabilities,
 }
 
 impl GenerationRuntimeCapabilities {
@@ -560,9 +522,6 @@ impl GenerationRuntimeCapabilities {
         }
         if needs.image_generation && !self.supports_image_generation {
             return Err("runtime_gen_denoise");
-        }
-        if needs.commit_writeback && !self.supports_commit_writeback {
-            return Err("runtime_commit_writeback");
         }
         Ok(())
     }
@@ -639,39 +598,39 @@ impl GenerationResourceBounds {
             0
         };
         let feedback_kv_per_image = if behavior.generated_image_feedback {
-            match policy.feedback.as_ref().map(|feedback| &feedback.writeback) {
-                Some(FeedbackWriteback::DirectKv) => {
-                    let feedback = policy
-                        .feedback
-                        .as_ref()
-                        .ok_or(GenerationResourceError::MissingFeedback)?;
-                    if feedback.physical_kv_tokens == ImageKvEffect::WorkerDefined
-                        && capabilities.max_vae_grid_tokens == 0
-                    {
-                        return Err(GenerationResourceError::UnboundedImageKv {
-                            operation: "generated image feedback",
-                        });
-                    }
-                    kv_effect_bound(
-                        feedback.physical_kv_tokens,
-                        capabilities
-                            .max_vae_grid_tokens
-                            .saturating_add(capabilities.commit_marker_tokens),
-                        "generated image feedback",
-                    )?
-                }
-                Some(FeedbackWriteback::Reingest { ingest }) => {
-                    ingest_kv_bound(ingest, capabilities)?
-                }
-                Some(FeedbackWriteback::Disabled) | None => {
-                    return Err(GenerationResourceError::MissingFeedback);
-                }
+            match policy.feedback.as_ref() {
+                Some(feedback) => ingest_kv_bound(&feedback.ingest, capabilities)?,
+                None => return Err(GenerationResourceError::MissingFeedback),
             }
         } else {
             0
         };
         let generated_feedback_kv_tokens =
             feedback_kv_per_image.saturating_mul(image.max_images as usize);
+        let feedback_ingest = behavior
+            .generated_image_feedback
+            .then(|| policy.feedback.as_ref().map(|feedback| &feedback.ingest))
+            .flatten();
+        let uses_ingest_step = |step| {
+            context.iter().any(|segment| {
+                matches!(
+                    segment,
+                    ContextSegment::Image { ingest, .. } if ingest.steps.contains(&step)
+                )
+            }) || feedback_ingest.is_some_and(|ingest| ingest.steps.contains(&step))
+        };
+        let uses_latent_features = uses_ingest_step(ImageIngestStep::VaeEncode);
+        let uses_vision_features = uses_ingest_step(ImageIngestStep::VitEncode);
+        if uses_latent_features && capabilities.max_latent_feature_bytes == 0 {
+            return Err(GenerationResourceError::MissingRuntimeBound {
+                resource: "max_latent_feature_bytes",
+            });
+        }
+        if uses_vision_features && capabilities.max_vision_feature_bytes == 0 {
+            return Err(GenerationResourceError::MissingRuntimeBound {
+                resource: "max_vision_feature_bytes",
+            });
+        }
         let encoder_cache_keys = if cache.read || cache.write {
             context
                 .iter()
@@ -737,6 +696,19 @@ impl GenerationResourceBounds {
                 available: capabilities.max_latent_units,
             });
         }
+        let image_latent_bytes = if behavior.gen_output {
+            if capabilities.max_vae_grid_tokens == 0 || capabilities.max_latent_feature_bytes == 0 {
+                return Err(GenerationResourceError::MissingRuntimeBound {
+                    resource: "max_latent_feature_bytes",
+                });
+            }
+            let bytes_per_unit = capabilities
+                .max_latent_feature_bytes
+                .div_ceil(u64::from(capabilities.max_vae_grid_tokens));
+            requested_latent_units.saturating_mul(bytes_per_unit)
+        } else {
+            0
+        };
         let requested_scratch_units = u64::from(image.cfg_branch_count());
         if behavior.gen_output && requested_scratch_units > u64::from(capabilities.max_cfg_branches)
         {
@@ -777,6 +749,17 @@ impl GenerationResourceBounds {
             } else {
                 0
             },
+            max_image_latent_bytes: image_latent_bytes,
+            max_latent_feature_bytes: if uses_latent_features {
+                capabilities.max_latent_feature_bytes
+            } else {
+                0
+            },
+            max_vision_feature_bytes: if uses_vision_features {
+                capabilities.max_vision_feature_bytes
+            } else {
+                0
+            },
             max_scratch_units: if behavior.gen_output {
                 requested_scratch_units
             } else {
@@ -799,6 +782,21 @@ impl GenerationResourceBounds {
                 "max_image_latent_units",
                 self.max_image_latent_units,
                 required.max_image_latent_units,
+            ),
+            (
+                "max_image_latent_bytes",
+                self.max_image_latent_bytes,
+                required.max_image_latent_bytes,
+            ),
+            (
+                "max_latent_feature_bytes",
+                self.max_latent_feature_bytes,
+                required.max_latent_feature_bytes,
+            ),
+            (
+                "max_vision_feature_bytes",
+                self.max_vision_feature_bytes,
+                required.max_vision_feature_bytes,
             ),
             (
                 "max_scratch_units",
@@ -913,8 +911,6 @@ pub enum GenerationResourceError {
     },
     #[error("generated image feedback must be declared non-replayable")]
     MissingNonReplayableDeclaration,
-    #[error("runtime does not support generated image commit recipe {recipe:?}")]
-    UnsupportedImageCommitRecipe { recipe: CommitRecipe },
 }
 
 /// Scheduler-relevant prefix-cache behavior resolved during compilation.
@@ -1040,20 +1036,12 @@ impl GenerationRequest {
                 .feedback
                 .as_ref()
                 .ok_or(GenerationRequestError::MissingFeedbackRecipe)?;
-            if feedback.writeback == FeedbackWriteback::Disabled
-                || feedback.next_und_token == FeedbackNextToken::None
-            {
+            if feedback.next_und_token == FeedbackNextToken::None {
                 return Err(GenerationRequestError::IncompleteFeedbackRecipe);
             }
         }
         if let Some(feedback) = &self.policy.feedback {
-            validate_kv_effect(feedback.physical_kv_tokens)?;
-            if feedback.logical_positions == 0 {
-                return Err(GenerationRequestError::ZeroImageLogicalPositions);
-            }
-            if let FeedbackWriteback::Reingest { ingest } = &feedback.writeback {
-                validate_ingest_recipe(ingest)?;
-            }
+            validate_ingest_recipe(&feedback.ingest)?;
         }
         let context_tokens = self.prompt_token_count();
         let mut seen_tokens = 0usize;
@@ -1136,17 +1124,6 @@ impl GenerationRequest {
         &self,
         capabilities: &GenerationRuntimeCapabilities,
     ) -> Result<(), GenerationResourceError> {
-        if self.behavior.generated_image_feedback
-            && let Some(feedback) = &self.policy.feedback
-            && matches!(feedback.writeback, FeedbackWriteback::DirectKv)
-            && !capabilities
-                .generated_image_commit
-                .supports(feedback.commit)
-        {
-            return Err(GenerationResourceError::UnsupportedImageCommitRecipe {
-                recipe: feedback.commit,
-            });
-        }
         let required = GenerationResourceBounds::conservative(
             &self.context,
             &self.negative_context,
@@ -1221,7 +1198,7 @@ pub enum GenerationRequestError {
     GenOnlyCannotProduceImage,
     #[error("default generation continuation requires a feedback recipe")]
     MissingFeedbackRecipe,
-    #[error("default generation feedback requires writeback and a continuation token")]
+    #[error("default generation feedback requires a continuation token")]
     IncompleteFeedbackRecipe,
     #[error("max-token policy must terminate at the declared request bound")]
     NonTerminalMaxTokensPolicy,
@@ -1278,20 +1255,17 @@ mod tests {
             supports_vision_encode: true,
             supports_latent_encode: true,
             supports_image_generation: true,
-            supports_commit_writeback: true,
             max_latent_units: 4_096,
             latent_downsample: 16,
             max_vae_grid_tokens: 64,
             max_vit_grid_tokens: 64,
+            max_latent_feature_bytes: 1 << 20,
+            max_vision_feature_bytes: 1 << 20,
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
             scratch_capacity_tokens: 8_192,
             scratch_block_size: 64,
             encoder_cache_entries: 4,
-            generated_image_commit: GeneratedImageCommitCapabilities {
-                inline: true,
-                separate_writeback: true,
-            },
         }
     }
 
@@ -1308,17 +1282,14 @@ mod tests {
             },
             termination: TerminationPolicyDescriptor::default(),
             feedback: Some(GeneratedImageFeedbackRecipe {
-                commit: CommitRecipe::CommitGenThenWriteback,
-                writeback: FeedbackWriteback::Reingest {
-                    ingest: Box::new(ImageIngestRecipe::vae_then_vit(
-                        1,
-                        ImageKvEffect::Bounded { max_tokens: 64 },
-                        ImageKvEffect::Bounded { max_tokens: 64 },
-                    )),
-                },
+                source: FeedbackSource::ArtifactProduct,
                 next_und_token: FeedbackNextToken::Token { token_id: 12 },
-                logical_positions: 1,
-                physical_kv_tokens: ImageKvEffect::Bounded { max_tokens: 64 },
+                ingest: ImageIngestRecipe::vae_then_vit(
+                    1,
+                    ImageKvEffect::Bounded { max_tokens: 64 },
+                    ImageKvEffect::Bounded { max_tokens: 64 },
+                ),
+                sample_continuation: false,
             }),
             ..GenerationPolicyDescriptor::default()
         };
@@ -1430,11 +1401,10 @@ mod tests {
         let policy = GenerationPolicyDescriptor {
             trigger: TriggerPolicyDescriptor::Token { token_id: 42 },
             feedback: Some(GeneratedImageFeedbackRecipe {
-                commit: CommitRecipe::CommitGenThenWriteback,
-                writeback: FeedbackWriteback::DirectKv,
+                source: FeedbackSource::DeviceProduct,
                 next_und_token: FeedbackNextToken::EndOfImage,
-                logical_positions: 2,
-                physical_kv_tokens: ImageKvEffect::WorkerDefined,
+                ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
+                sample_continuation: true,
             }),
             ..GenerationPolicyDescriptor::default()
         };
@@ -1646,39 +1616,6 @@ mod tests {
                 width: request.image.width,
                 height: request.image.height,
                 latent_downsample: 24,
-            })
-        );
-    }
-
-    #[test]
-    fn resource_validation_rejects_commit_recipe_topology_mismatch() {
-        let mut request = complete_request();
-        let feedback = request.policy.feedback.as_mut().expect("feedback recipe");
-        feedback.commit = CommitRecipe::CommitGenThenWriteback;
-        feedback.writeback = FeedbackWriteback::DirectKv;
-        request.behavior =
-            GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
-        request.resources = GenerationResourceBounds::conservative(
-            &request.context,
-            &request.negative_context,
-            &request.behavior,
-            &request.policy,
-            &request.image,
-            request.max_und_tokens,
-            &request.cache,
-            &runtime_capabilities(),
-        )
-        .expect("bounded direct-KV request");
-
-        let mut inline_only = runtime_capabilities();
-        inline_only.generated_image_commit = GeneratedImageCommitCapabilities {
-            inline: true,
-            separate_writeback: false,
-        };
-        assert_eq!(
-            request.validate_resources(&inline_only),
-            Err(GenerationResourceError::UnsupportedImageCommitRecipe {
-                recipe: CommitRecipe::CommitGenThenWriteback,
             })
         );
     }

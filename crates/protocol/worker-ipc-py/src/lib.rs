@@ -34,7 +34,7 @@ use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyModule};
+use pyo3::types::{PyAny, PyDict, PyModule};
 use pythonize::{depythonize, pythonize};
 use uniserve_worker_ipc_core::ServerEndpoint;
 use uniserve_worker_wire::{RequestKind, WorkerRequest, WorkerResponse};
@@ -99,9 +99,8 @@ impl PyServer {
         // falls back to `depythonize` for identical values and errors.
         let resp: WorkerResponse = match convert::try_completion_response_from_py(response) {
             Some(resp) => resp,
-            None => depythonize(response).map_err(|err| {
-                PyErr::new::<PyValueError, _>(format!("invalid response: {err}"))
-            })?,
+            None => depythonize(response)
+                .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?,
         };
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
@@ -116,14 +115,30 @@ impl PyServer {
 
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
     // Hot path: `execute` batches take the hand-rolled converter, which
-    // produces an object deep-equal to `pythonize`'s. Rare request kinds keep
-    // the reflective conversion.
+    // produces an object deep-equal to `pythonize`'s. The decoded Rust batch has
+    // already passed `Batch::validate`, so a process-local token lets the Python
+    // decoder preserve that validation result instead of hashing every operation
+    // again. Rare request kinds keep the reflective conversion.
     if request.kind == RequestKind::Execute {
-        return Ok(convert::execute_request_to_py(py, request)?.into_any().unbind());
+        let request = convert::execute_request_to_py(py, request)?;
+        mark_validated_batch(py, &request)?;
+        return Ok(request.into_any().unbind());
     }
     let object = pythonize(py, request)
         .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
     Ok(object.unbind())
+}
+
+fn mark_validated_batch(py: Python<'_>, request: &Bound<'_, PyDict>) -> PyResult<()> {
+    if let Some(batch) = request.get_item("batch")? {
+        let batch = batch.cast::<PyDict>()?;
+        let module = py.import("uniserve_worker.batch")?;
+        batch.set_item(
+            module.getattr("_WIRE_VALIDATION_KEY")?,
+            module.getattr("_WIRE_VALIDATION_TOKEN")?,
+        )?;
+    }
+    Ok(())
 }
 
 impl PyServer {
@@ -155,4 +170,34 @@ fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn py_runtime(message: impl ToString) -> PyErr {
     PyErr::new::<PyRuntimeError, _>(message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_batch_carries_validated_wire_provenance() {
+        Python::initialize();
+        Python::attach(|py| {
+            let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .canonicalize()
+                .unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("path")
+                .unwrap()
+                .call_method1("insert", (0, repo_root.to_str().unwrap()))
+                .unwrap();
+            let request = PyDict::new(py);
+            let batch = PyDict::new(py);
+            request.set_item("batch", &batch).unwrap();
+            mark_validated_batch(py, &request).unwrap();
+            let module = py.import("uniserve_worker.batch").unwrap();
+            let key = module.getattr("_WIRE_VALIDATION_KEY").unwrap();
+            let token = module.getattr("_WIRE_VALIDATION_TOKEN").unwrap();
+            assert!(batch.get_item(key).unwrap().unwrap().is(&token));
+        });
+    }
 }

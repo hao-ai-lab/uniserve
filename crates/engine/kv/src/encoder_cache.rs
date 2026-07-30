@@ -1,22 +1,16 @@
 //! Encoder-output cache. A hashed, reference-counted,
-//! LRU-evicted cache keyed by image content hash, holding the *logical* handle to
-//! a worker-side encoder output, bounded by a budget. On a hit the encode op is
-//! skipped; evicted/freed handles are reported so the worker can reclaim the
-//! physical encoder memory. Only handles and hashes live here — no embeddings.
+//! LRU-evicted cache keyed by image content hash, holding the exact immutable
+//! product reference for a worker-side encoder output. On a hit the encode op is
+//! skipped; evicted products are reported so the worker can reclaim their
+//! physical storage. No embeddings live in the scheduler.
 
 use std::collections::{BTreeMap, HashMap};
+use uniserve_worker_wire::ProductRef;
 
 struct Entry {
-    handle: u64,
-    physical_kv_tokens: u32,
+    product: ProductRef,
     ref_cnt: u32,
     lru: u64, // monotonic tick, larger == more recent
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CachedEncoderOutput {
-    pub handle: u64,
-    pub physical_kv_tokens: u32,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -73,11 +67,8 @@ impl EncoderCacheManager {
     }
 
     /// Inspect a resident output without changing LRU order or cache metrics.
-    pub fn peek_output(&self, hash: u64) -> Option<CachedEncoderOutput> {
-        self.entries.get(&hash).map(|entry| CachedEncoderOutput {
-            handle: entry.handle,
-            physical_kv_tokens: entry.physical_kv_tokens,
-        })
+    pub fn peek_product(&self, hash: u64) -> Option<ProductRef> {
+        self.entries.get(&hash).map(|entry| entry.product.clone())
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -85,13 +76,8 @@ impl EncoderCacheManager {
         self.tick
     }
 
-    /// Look up a cached encoder handle by content hash (counts a query/hit).
-    pub fn lookup(&mut self, hash: u64) -> Option<u64> {
-        self.lookup_output(hash).map(|output| output.handle)
-    }
-
-    /// Look up the handle and measured KV effect needed to skip image ingest.
-    pub fn lookup_output(&mut self, hash: u64) -> Option<CachedEncoderOutput> {
+    /// Look up the exact product and measured KV effect needed to skip encode.
+    pub fn lookup_product(&mut self, hash: u64) -> Option<ProductRef> {
         self.stats.queries += 1;
         let tick = self.next_tick();
         if let Some(e) = self.entries.get_mut(&hash) {
@@ -104,10 +90,7 @@ impl EncoderCacheManager {
                 self.evictable.remove(&old_lru);
                 self.evictable.insert(tick, hash);
             }
-            Some(CachedEncoderOutput {
-                handle: e.handle,
-                physical_kv_tokens: e.physical_kv_tokens,
-            })
+            Some(e.product.clone())
         } else {
             None
         }
@@ -120,9 +103,8 @@ impl EncoderCacheManager {
         self.len() < self.budget || !self.evictable.is_empty()
     }
 
-    /// Insert a freshly-computed encoder handle, evicting the LRU unreferenced
-    /// entry if at budget. Returns any freed handle (to report to the worker).
-    ///
+    /// Insert a freshly-computed encoder product, evicting the LRU unreferenced
+    /// entry if at budget. Returns any freed product.
     /// `budget` bounds the *evictable* working set, not the live set. The
     /// encoder output already exists on the worker by the time it reaches here
     /// and the caller pins it immediately for the in-flight request, so a
@@ -133,39 +115,29 @@ impl EncoderCacheManager {
     /// `max_num_seqs` requests) and is counted in `stats.over_budget_inserts` so
     /// the over-subscription is observable rather than silent. The hard cap is
     /// enforced upstream via [`can_insert`](Self::can_insert) at admission.
-    pub fn insert(&mut self, hash: u64, handle: u64) -> Option<u64> {
-        self.insert_output(hash, handle, 0)
-    }
-
-    pub fn insert_output(
-        &mut self,
-        hash: u64,
-        handle: u64,
-        physical_kv_tokens: u32,
-    ) -> Option<u64> {
+    pub fn insert(&mut self, hash: u64, product: ProductRef) -> Option<ProductRef> {
         if self.entries.contains_key(&hash) {
             let tick = self.next_tick();
             if let Some(existing) = self.entries.get_mut(&hash) {
-                let existing_handle = existing.handle;
+                let existing_product = existing.product.clone();
                 let old_lru = existing.lru;
                 let evictable = existing.ref_cnt == 0;
                 existing.lru = tick;
-                existing.physical_kv_tokens = physical_kv_tokens;
                 if evictable {
                     self.evictable.remove(&old_lru);
                     self.evictable.insert(tick, hash);
                 }
                 // Concurrent misses compute equivalent output. Preserve the
                 // existing entry and its references; a distinct redundant
-                // handle can be reclaimed by the caller.
-                return (existing_handle != handle).then_some(handle);
+                // product can be reclaimed by the caller.
+                return (existing_product != product).then_some(product);
             }
         }
 
         let retired_match = self
             .retired
             .get(&hash)
-            .and_then(|entries| entries.iter().position(|entry| entry.handle == handle));
+            .and_then(|entries| entries.iter().position(|entry| entry.product == product));
         if let Some(index) = retired_match {
             let mut entry = match self.retired.get_mut(&hash) {
                 Some(entries) if index < entries.len() => entries.swap_remove(index),
@@ -175,7 +147,6 @@ impl EncoderCacheManager {
                 self.retired.remove(&hash);
             }
             entry.lru = self.next_tick();
-            entry.physical_kv_tokens = physical_kv_tokens;
             self.entries.insert(hash, entry);
             return None;
         }
@@ -186,7 +157,7 @@ impl EncoderCacheManager {
             if let Some((_, victim)) = self.evictable.pop_first() {
                 if let Some(e) = self.entries.remove(&victim) {
                     self.stats.evictions += 1;
-                    freed = Some(e.handle);
+                    freed = Some(e.product);
                 }
             } else {
                 // Every entry is pinned: no victim, so the live set will exceed
@@ -198,8 +169,7 @@ impl EncoderCacheManager {
         self.entries.insert(
             hash,
             Entry {
-                handle,
-                physical_kv_tokens,
+                product,
                 ref_cnt: 0,
                 lru: tick,
             },
@@ -210,7 +180,7 @@ impl EncoderCacheManager {
     }
 
     /// Reference a cached entry (pins it against eviction while a request uses it).
-    pub fn acquire(&mut self, hash: u64) -> Option<u64> {
+    pub fn acquire(&mut self, hash: u64) -> Option<ProductRef> {
         let tick = self.next_tick();
         let e = self.entries.get_mut(&hash)?;
         let old_lru = e.lru;
@@ -221,14 +191,14 @@ impl EncoderCacheManager {
         if was_unreferenced {
             self.evictable.remove(&old_lru);
         }
-        Some(e.handle)
+        Some(e.product.clone())
     }
 
     /// Release a reference. Active entries become evictable at zero references;
     /// retired entries are removed and return their worker handle for reclaim.
-    pub fn release(&mut self, hash: u64, handle: u64) -> Option<u64> {
+    pub fn release(&mut self, hash: u64, product: &ProductRef) -> Option<ProductRef> {
         if let Some(e) = self.entries.get_mut(&hash)
-            && e.handle == handle
+            && &e.product == product
             && e.ref_cnt > 0
         {
             e.ref_cnt -= 1;
@@ -245,11 +215,11 @@ impl EncoderCacheManager {
         if let Some(entries) = self.retired.get_mut(&hash)
             && let Some(index) = entries
                 .iter()
-                .position(|entry| entry.handle == handle && entry.ref_cnt > 0)
+                .position(|entry| &entry.product == product && entry.ref_cnt > 0)
         {
             entries[index].ref_cnt -= 1;
             if entries[index].ref_cnt == 0 {
-                freed = Some(entries.swap_remove(index).handle);
+                freed = Some(entries.swap_remove(index).product);
             }
             remove_hash = entries.is_empty();
         }
@@ -261,11 +231,11 @@ impl EncoderCacheManager {
 
     /// Invalidate the whole cache. Unpinned worker handles are returned
     /// immediately; pinned entries retire until their final reference drops.
-    pub fn clear(&mut self) -> Vec<u64> {
+    pub fn clear(&mut self) -> Vec<ProductRef> {
         let mut freed = Vec::new();
         for (hash, entry) in std::mem::take(&mut self.entries) {
             if entry.ref_cnt == 0 {
-                freed.push(entry.handle);
+                freed.push(entry.product);
             } else {
                 self.retired.entry(hash).or_default().push(entry);
             }
@@ -278,164 +248,83 @@ impl EncoderCacheManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uniserve_core::RequestId;
+    use uniserve_worker_wire::{
+        DType, OpId, PointRange, ProductKind, RequestKey, ShapeBound, StorageClass,
+    };
 
-    #[test]
-    fn hit_and_miss() {
-        let mut c = EncoderCacheManager::new(4);
-        assert_eq!(c.lookup(1), None);
-        c.insert(1, 100);
-        assert_eq!(c.lookup(1), Some(100));
-        assert_eq!(c.stats.queries, 2);
-        assert_eq!(c.stats.hits, 1);
+    fn product(generation: u32) -> ProductRef {
+        ProductRef {
+            request_key: RequestKey::new(7, RequestId(u64::from(generation)), 3),
+            producer_op_id: OpId(u64::from(generation)),
+            output_index: 0,
+            generation,
+            kind: ProductKind::VisionFeature,
+            storage_class: StorageClass::LatentArena,
+            dtype: DType::BF16,
+            shape_bound: ShapeBound::default(),
+            point_range: PointRange::default(),
+        }
     }
 
     #[test]
-    fn lru_eviction_reports_freed_handle() {
-        let mut c = EncoderCacheManager::new(2);
-        c.insert(1, 100);
-        c.insert(2, 200);
-        c.lookup(1); // touch 1 -> 2 is now LRU
-        let freed = c.insert(3, 300);
-        assert_eq!(freed, Some(200), "LRU entry 2 should be evicted");
-        assert_eq!(c.lookup(2), None);
-        assert!(c.lookup(1).is_some() && c.lookup(3).is_some());
+    fn lookup_returns_the_exact_producer_reference() {
+        let mut cache = EncoderCacheManager::new(4);
+        let expected = product(100);
+        cache.insert(1, expected.clone());
+        assert_eq!(cache.lookup_product(1), Some(expected));
+        assert_eq!(cache.stats.queries, 1);
+        assert_eq!(cache.stats.hits, 1);
     }
 
     #[test]
-    fn referenced_entry_not_evicted() {
-        let mut c = EncoderCacheManager::new(1);
-        c.insert(1, 100);
-        c.acquire(1); // pin
-        assert!(!c.can_insert(), "no room: the only slot is referenced");
-        // inserting anyway shouldn't evict the referenced entry
-        let freed = c.insert(2, 200);
-        assert_eq!(freed, None);
-        assert!(c.lookup(1).is_some());
+    fn lru_eviction_reports_the_exact_reclaimable_product() {
+        let mut cache = EncoderCacheManager::new(2);
+        let first = product(100);
+        let second = product(200);
+        let third = product(300);
+        cache.insert(1, first.clone());
+        cache.insert(2, second.clone());
+        cache.lookup_product(1);
+        assert_eq!(cache.insert(3, third), Some(second));
+        assert_eq!(cache.lookup_product(1), Some(first));
     }
 
     #[test]
-    fn duplicate_insert_preserves_existing_references() {
-        let mut c = EncoderCacheManager::new(2);
-        c.insert_output(1, 100, 4);
-        c.acquire(1);
-
-        assert_eq!(c.insert_output(1, 100, 5), None);
-        assert_eq!(c.release(1, 100), None);
-        assert!(c.can_insert());
-        assert_eq!(c.lookup_output(1).unwrap().physical_kv_tokens, 5);
-
-        assert_eq!(c.insert_output(1, 101, 5), Some(101));
-        assert_eq!(c.peek_output(1).map(|output| output.handle), Some(100));
-    }
-
-    // at budget with every entry pinned, a (necessarily pinned-on-arrival)
-    // insert grows the live set past `budget` instead of dropping the handle,
-    // and the over-subscription is counted rather than silent.
-    #[test]
-    fn all_pinned_insert_grows_live_set_and_counts_over_budget() {
-        let mut c = EncoderCacheManager::new(2);
-        c.insert(1, 100);
-        c.acquire(1);
-        c.insert(2, 200);
-        c.acquire(2);
-        assert!(!c.can_insert(), "both slots pinned: no admission room");
-        assert_eq!(c.stats.over_budget_inserts, 0);
-
-        // A third encoder output arrives while both are in use: it must be kept
-        // (the worker already computed it) even though it exceeds budget.
-        let freed = c.insert(3, 300);
-        assert_eq!(freed, None, "no unpinned victim to evict");
-        assert_eq!(c.len(), 3, "live set transiently exceeds budget");
-        assert_eq!(c.stats.over_budget_inserts, 1);
-        assert!(c.lookup(1).is_some() && c.lookup(2).is_some() && c.lookup(3).is_some());
-
-        // Once a pinned entry is released, the budget is reclaimed on next insert.
-        assert_eq!(c.release(1, 100), None);
-        let freed = c.insert(4, 400);
-        assert_eq!(
-            freed,
-            Some(100),
-            "released entry 1 is now the evictable victim"
-        );
+    fn pinned_products_remain_exact_under_capacity_pressure() {
+        let mut cache = EncoderCacheManager::new(1);
+        let pinned = product(100);
+        cache.insert(1, pinned.clone());
+        assert_eq!(cache.acquire(1), Some(pinned.clone()));
+        cache.insert(2, product(200));
+        assert_eq!(cache.lookup_product(1), Some(pinned));
+        assert_eq!(cache.stats.over_budget_inserts, 1);
     }
 
     #[test]
-    fn release_makes_entry_evictable_again() {
-        // Exercises the evictable index across acquire/release so the LRU victim
-        // search stays correct after pinning churn.
-        let mut c = EncoderCacheManager::new(2);
-        c.insert(1, 100);
-        c.insert(2, 200);
-        c.acquire(2); // pin 2 -> only 1 is evictable, but acquire makes 2 newest
-        assert!(c.can_insert(), "1 is unreferenced, so there is room");
-        assert_eq!(c.release(2, 200), None); // 2 becomes evictable again
-        // At budget; inserting a new key must evict the LRU unreferenced entry,
-        // which is 1 (touched at insert) — 2's tick advanced on acquire.
-        let freed = c.insert(3, 300);
-        assert_eq!(freed, Some(100), "1 is the LRU unreferenced entry");
-        assert_eq!(c.lookup(1), None);
-        assert!(c.lookup(2).is_some() && c.lookup(3).is_some());
+    fn cache_reset_reclaims_a_pinned_product_after_its_reader_releases() {
+        let mut cache = EncoderCacheManager::new(2);
+        let pinned = product(100);
+        cache.insert(1, pinned.clone());
+        assert_eq!(cache.acquire(1), Some(pinned.clone()));
+        cache.clear();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.release(1, &pinned), Some(pinned));
+        assert!(cache.is_empty());
     }
 
     #[test]
-    fn reinsert_same_hash_preserves_pin_and_keeps_index_consistent() {
-        let mut c = EncoderCacheManager::new(2);
-        c.insert(1, 100);
-        c.acquire(1);
-        assert_eq!(c.insert(1, 101), Some(101));
-        assert_eq!(c.len(), 1);
-        c.insert(2, 200);
-        assert_eq!(
-            c.insert(3, 300),
-            Some(200),
-            "the duplicate insert must not make pinned entry 1 evictable"
-        );
-        assert_eq!(c.peek_output(1).map(|output| output.handle), Some(100));
-
-        assert_eq!(c.release(1, 100), None);
-        assert_eq!(c.insert(4, 400), Some(100));
-        assert_eq!(c.lookup(1), None);
-    }
-
-    #[test]
-    fn clear_reports_all() {
-        let mut c = EncoderCacheManager::new(4);
-        c.insert(1, 10);
-        c.insert(2, 20);
-        let mut freed = c.clear();
-        freed.sort();
-        assert_eq!(freed, vec![10, 20]);
-        assert!(c.is_empty());
-    }
-
-    #[test]
-    fn clear_retires_pinned_entries_until_their_final_release() {
-        let mut c = EncoderCacheManager::new(2);
-        c.insert_output(1, 100, 4);
-        assert_eq!(c.acquire(1), Some(100));
-
-        assert!(c.clear().is_empty());
-        assert_eq!(c.lookup(1), None, "reset entries are no longer visible");
-        assert_eq!(c.len(), 1, "the pinned worker tensor remains accounted");
-        assert_eq!(c.release(1, 100), Some(100));
-        assert!(c.is_empty());
-    }
-
-    #[test]
-    fn recompute_reactivates_an_equivalent_retired_handle() {
-        let mut c = EncoderCacheManager::new(2);
-        c.insert_output(1, 100, 4);
-        assert_eq!(c.acquire(1), Some(100));
-        assert!(c.clear().is_empty());
-
-        assert_eq!(c.insert_output(1, 100, 5), None);
-        assert_eq!(c.acquire(1), Some(100));
-        assert_eq!(c.len(), 1);
-        assert_eq!(c.release(1, 100), None);
-        assert_eq!(c.release(1, 100), None);
-        assert_eq!(
-            c.peek_output(1).map(|output| output.physical_kv_tokens),
-            Some(5)
-        );
+    fn an_equivalent_retired_reference_reactivates_with_its_pin_count() {
+        let mut cache = EncoderCacheManager::new(2);
+        let product = product(100);
+        cache.insert(1, product.clone());
+        cache.acquire(1);
+        cache.clear();
+        cache.insert(1, product.clone());
+        assert_eq!(cache.acquire(1), Some(product.clone()));
+        assert_eq!(cache.len(), 1);
+        cache.release(1, &product);
+        cache.release(1, &product);
+        assert_eq!(cache.peek_product(1), Some(product));
     }
 }

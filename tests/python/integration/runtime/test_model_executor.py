@@ -1,15 +1,11 @@
-"""Depth-one forward behavior at the canonical ModelExecutor boundary.
-
-These tests run the real forward through the new four-record protocol and assert
-that committed tokens, KV growth, latent trajectory, image artifacts, replay, and
-rollback reproduce the serial depth-one oracle.
-"""
+"""Serial-oracle behavior at the canonical ModelExecutor boundary."""
 
 from __future__ import annotations
 
 import base64
 import io
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 import torch
@@ -24,11 +20,37 @@ from tests.python.fixtures.depth_one import (
     root_parent,
     token_operation,
     und_admission,
+    visual_state_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.batch import Batch, ImageParams, ProductKind, TokenMode
-from uniserve_worker.forward import FlowRow, ForwardBatch, ForwardOutput, PagedDecodePlan
+from uniserve_worker.batch import (
+    Admission,
+    Batch,
+    GenAdmission,
+    ImageParams,
+    ProductKind,
+    TokenMode,
+)
+from uniserve_worker.forward import (
+    FlowRow,
+    ForwardBatch,
+    ForwardOutput,
+    PackedAttentionPlan,
+    PagedDecodePlan,
+    TokenRow,
+)
 from uniserve_worker.server.stub import _next_token
+from uniserve_worker.spec import (
+    FeatureInjectionSpec,
+    FeatureLayout,
+    OperationSpec,
+    OperationStageCondition,
+    OperationStagePurpose,
+    OperationStageSpec,
+    OperationType,
+    PositionLayout,
+    RouteRowKind,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -44,6 +66,7 @@ class _ObservedModel(nn.Module):
         self.spec = self.neural.spec
         self.calls: list[tuple[str, tuple[str, ...]]] = []
         self.flow_inputs: list[torch.Tensor] = []
+        self.token_positions: list[tuple[int, ...]] = []
         self.attention_plans: list[object] = []
         self.fault: str | None = None
 
@@ -53,6 +76,11 @@ class _ObservedModel(nn.Module):
         self.flow_inputs.extend(
             row.latent.detach().clone() for row in batch.rows if isinstance(row, FlowRow)
         )
+        self.token_positions.extend(
+            tuple(int(value) for value in row.positions.reshape(-1).tolist())
+            for row in batch.rows
+            if isinstance(row, TokenRow)
+        )
         output = self.neural(batch)
         if self.fault == "raise":
             raise RuntimeError("injected neural failure")
@@ -61,8 +89,49 @@ class _ObservedModel(nn.Module):
         return output
 
 
+class _RetainedImageStateModel(_ObservedModel):
+    def __init__(self) -> None:
+        super().__init__()
+        images = self.spec.inputs.images
+        assert images is not None
+        inputs = replace(
+            self.spec.inputs,
+            images=replace(
+                images,
+                feature_injection=FeatureInjectionSpec(
+                    layout=FeatureLayout.DIRECT,
+                    positions=PositionLayout.TEMPORAL_SPATIAL,
+                    end_token_id=1007,
+                ),
+            ),
+        )
+        operations = tuple(
+            OperationSpec(
+                OperationType.ENCODE_VISION,
+                (
+                    OperationStageSpec(
+                        "encode",
+                        RouteRowKind.ENCODE,
+                        OperationStagePurpose.PRIMARY,
+                    ),
+                    OperationStageSpec(
+                        "stub",
+                        RouteRowKind.TOKEN,
+                        OperationStagePurpose.STATE,
+                        OperationStageCondition.RETAIN_IMAGE,
+                    ),
+                ),
+            )
+            if operation.kind is OperationType.ENCODE_VISION
+            else operation
+            for operation in self.spec.operations
+        )
+        self.spec = replace(self.spec, operations=operations, inputs=inputs)
+
+
 def test_extend_then_decode_commit_the_serial_oracle_tokens():
-    worker = execution_worker(_ObservedModel())
+    model = _ObservedModel()
+    worker = execution_worker(model)
     admission = und_admission(1, block_ids=(0,))
     extend, extend_input = token_operation(
         admission.request_key,
@@ -78,6 +147,7 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     assert extended.completions[0].committed_tokens == (_next_token(4),)
     assert worker.kv.get(1).length == 2
     assert worker.sessions.get(1).version == 1
+    assert worker.sessions.get(1).logical_position == 2
 
     first_token = extended.completions[0].committed_tokens[0]
     decode, decode_input = token_operation(
@@ -94,6 +164,8 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     assert decoded.completions[0].committed_tokens == (_next_token(first_token),)
     assert worker.kv.get(1).length == 3
     assert worker.sessions.get(1).version == 2
+    assert worker.sessions.get(1).logical_position == 3
+    assert model.token_positions == [(0, 1), (2,)]
 
 
 def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
@@ -194,7 +266,7 @@ def test_token_decode_uses_the_homogeneous_paged_plan():
             op_id=60 + index,
             parent=worker.sessions.get(session_id).committed_version(),
             mode=TokenMode.DECODE,
-            tokens=(worker.sessions.get(session_id).version,),
+            tokens=(_next_token(4),),
         )
         decode_ops.append(operation)
         decode_inputs.append(payload)
@@ -207,6 +279,45 @@ def test_token_decode_uses_the_homogeneous_paged_plan():
     assert tuple(plan.query_lens.tolist()) == (1, 1)
     assert decoded.completions[0].committed_tokens == (_next_token(_next_token(4)),)
     assert decoded.completions[1].committed_tokens == (_next_token(_next_token(4)),)
+
+
+def test_image_capable_token_decode_uses_mixed_route_attention():
+    model = _ObservedModel()
+    worker = execution_worker(model)
+    understanding = und_admission(43, block_ids=(0,))
+    admission = Admission.create(
+        understanding.request_key,
+        und=understanding.und,
+        gen_admission=GenAdmission(ImageParams(steps=1, height=16, width=16, seed=29)),
+    )
+    prefill, prefill_input = token_operation(
+        admission.request_key,
+        op_id=70,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    extended = worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(prefill,),
+            input_products=(prefill_input,),
+        )
+    )
+    decode, decode_input = token_operation(
+        admission.request_key,
+        op_id=71,
+        parent=worker.sessions.get(43).committed_version(),
+        mode=TokenMode.DECODE,
+        tokens=(extended.completions[0].committed_tokens[0],),
+    )
+
+    worker.execute(
+        Batch(step_id=2, admissions=(), operations=(decode,), input_products=(decode_input,))
+    )
+
+    assert isinstance(model.attention_plans[-1], PackedAttentionPlan)
 
 
 def test_replay_is_idempotent_and_conflicts_or_stale_work_do_not_mutate_state():
@@ -282,7 +393,7 @@ def test_output_validation_failure_rolls_back_every_authority():
         op_id=32,
         parent=worker.sessions.get(4).committed_version(),
         mode=TokenMode.DECODE,
-        tokens=(worker.sessions.get(4).version,),
+        tokens=(_next_token(13),),
     )
     retry_batch = Batch(step_id=12, admissions=(), operations=(retry,), input_products=(retry_input,))
     model.fault = "misaligned"
@@ -357,7 +468,7 @@ def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
             op_id=2 + step,
             parent=worker.sessions.get(1).committed_version(),
             mode=TokenMode.DECODE,
-            tokens=(0,),
+            tokens=(committed[-1],),
             new_kv_blocks=new_kv_blocks,
         )
         report = worker.execute(
@@ -400,10 +511,7 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
     assert second_report.completions[0].logical_lengths.latent_len == 2
 
 
-def test_encode_reports_per_op_image_kv_and_echoes_the_encoder_handle():
-    # kv_visible_len is the image KV this encode wrote (its state-driver forward
-    # span), not the session's committed total, and product_generations echoes the
-    # scheduler-assigned nonzero encoder handle from the encode output reference.
+def test_encode_publishes_an_immutable_feature_without_advancing_state():
     worker = execution_worker(_ObservedModel())
     admission = und_admission(3, block_ids=(0,))
     extend, extend_input = token_operation(
@@ -434,31 +542,80 @@ def test_encode_reports_per_op_image_kv_and_echoes_the_encoder_handle():
         Batch(step_id=2, admissions=(), operations=(encode,), input_products=(encode_input,))
     )
     completion = report.completions[0]
-    image_kv_written = worker.kv.get(3).length - session_kv_before
-
-    # The real per-op image KV the forward wrote — not the session total (2).
-    assert completion.logical_lengths.kv_visible_len == image_kv_written
-    assert completion.logical_lengths.kv_visible_len != session_kv_before
-    # The nonzero encoder handle echoed from the encode output reference.
+    assert completion.logical_lengths.kv_visible_len == 0
+    assert worker.kv.get(3).length == session_kv_before
+    assert worker.sessions.get(3).logical_position == 2
+    assert completion.selected_point == 1
     assert completion.product_generations
     assert completion.product_generations[0] == handle
     assert completion.product_generations[0] != 0
 
 
-def test_flow_then_materialize_emits_a_png_image_artifact():
-    worker = execution_worker(_ObservedModel())
-    admission = gen_admission(6, ImageParams(steps=2, height=16, width=16, seed=29))
+def test_generated_feedback_advances_state_only_in_visual_token_extend():
+    worker = execution_worker(_RetainedImageStateModel())
+    understanding = und_admission(6, block_ids=(0,))
+    admission = Admission.create(
+        understanding.request_key,
+        und=understanding.und,
+        gen_admission=GenAdmission(
+            ImageParams(steps=2, height=16, width=16, seed=29, retain_images=True)
+        ),
+    )
     flow = flow_operation(admission.request_key, op_id=1, parent=root_parent(admission), steps=2)
     worker.execute(Batch(step_id=1, admissions=(admission,), operations=(flow,), input_products=()))
+    assert worker.sessions.get(6).version == 1
 
     materialize = materialize_operation(
-        admission.request_key, op_id=2, parent=worker.sessions.get(6).committed_version()
+        admission.request_key,
+        op_id=2,
+        parent=worker.sessions.get(6).committed_version(),
+        feedback_source=True,
     )
-    report = worker.execute(
+    materialize_report = worker.execute(
         Batch(step_id=2, admissions=(), operations=(materialize,), input_products=())
     )
+    assert materialize_report.completions[0].logical_lengths.kv_visible_len == 0
+    assert materialize_report.completions[0].selected_point == 1
+    assert worker.sessions.get(6).version == 1
+    assert worker.sessions.get(6).logical_position == 0
 
-    artifacts = [p for p in report.products if p.product.kind is ProductKind.ARTIFACT]
+    encode, _ = encode_operation(
+        admission.request_key,
+        op_id=3,
+        parent=worker.sessions.get(6).committed_version(),
+        image_base64=None,
+        encoder_handle=10,
+        source_product=materialize.outputs[1],
+    )
+    encode_report = worker.execute(
+        Batch(step_id=3, admissions=(), operations=(encode,), input_products=())
+    )
+    assert encode_report.completions[0].logical_lengths.kv_visible_len == 0
+    assert encode_report.completions[0].selected_point == 1
+    assert worker.sessions.get(6).version == 1
+    assert worker.sessions.get(6).logical_position == 0
+
+    state = visual_state_operation(
+        admission.request_key,
+        op_id=4,
+        parent=worker.sessions.get(6).committed_version(),
+        feature=encode.outputs[0],
+        sample_continuation=True,
+    )
+    report = worker.execute(Batch(step_id=4, admissions=(), operations=(state,), input_products=()))
+
+    completion = report.completions[0]
+    assert completion.committed_tokens == (_next_token(1007),)
+    assert completion.token_span.base == 0
+    assert completion.token_span.len == 1
+    assert completion.logical_lengths.token_len == 2
+    assert completion.selected_point == 2
+    assert worker.sessions.get(6).version == 2
+    assert worker.sessions.get(6).logical_position == 2
+
+    artifacts = [
+        p for p in materialize_report.products if p.product.kind is ProductKind.ARTIFACT
+    ]
     assert len(artifacts) == 1
     # The Artifact product carries the base64 PNG string as bytes: the scheduler
     # recovers it with String::from_utf8 and hands it to validate_png_artifact,

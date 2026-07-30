@@ -181,6 +181,8 @@ fn emit_digest_parity_fixture() {
         max_latent_size: 4096,
         max_vae_grid_tokens: 64,
         max_vit_grid_tokens: 64,
+        max_latent_feature_bytes: 1 << 20,
+        max_vision_feature_bytes: 1 << 21,
         adapter_mode: AdapterMode::PerRequest,
         execution_constraints: ExecutionConstraints {
             max_batch_operations: 16,
@@ -209,6 +211,8 @@ fn emit_digest_parity_fixture() {
             "max_latent_size": caps.max_latent_size,
             "max_vae_grid_tokens": caps.max_vae_grid_tokens,
             "max_vit_grid_tokens": caps.max_vit_grid_tokens,
+            "max_latent_feature_bytes": caps.max_latent_feature_bytes,
+            "max_vision_feature_bytes": caps.max_vision_feature_bytes,
             "adapter_mode": "per_request",
             "max_batch_operations": caps.execution_constraints.max_batch_operations,
             "kv_dtype": caps.kv_dtype,

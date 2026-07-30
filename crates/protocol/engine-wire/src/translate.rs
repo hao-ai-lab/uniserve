@@ -560,10 +560,9 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
 mod tests {
     use super::*;
     use uniserve_core::{
-        CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
-        GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
-        GenerationPolicyDescriptor, GenerationResourceBounds, ImageKvEffect, ImageParams,
-        UndVisibility,
+        ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
+        GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+        GenerationResourceBounds, ImageIngestRecipe, ImageKvEffect, ImageParams, UndVisibility,
     };
 
     fn canonical_generation_request() -> GenerationRequest {
@@ -571,11 +570,10 @@ mod tests {
         let policy = GenerationPolicyDescriptor {
             trigger: uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 },
             feedback: Some(GeneratedImageFeedbackRecipe {
-                commit: CommitRecipe::CommitGenThenWriteback,
-                writeback: FeedbackWriteback::DirectKv,
+                source: FeedbackSource::DeviceProduct,
                 next_und_token: FeedbackNextToken::EndOfImage,
-                logical_positions: 2,
-                physical_kv_tokens: ImageKvEffect::Bounded { max_tokens: 64 },
+                ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::Bounded { max_tokens: 64 }),
+                sample_continuation: true,
             }),
             ..GenerationPolicyDescriptor::default()
         };

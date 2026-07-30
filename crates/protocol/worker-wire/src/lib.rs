@@ -299,7 +299,23 @@ impl ShapeBound {
             device_dims <= 1,
             "a shape bound carries more than one device-actual dimension"
         );
+        anyhow::ensure!(
+            self.dims.iter().all(|dim| match dim {
+                DimBound::Static(value) => *value > 0,
+                DimBound::Device { max } => *max > 0,
+            }),
+            "a shape bound contains a zero extent"
+        );
         Ok(())
+    }
+
+    fn max_elements(&self) -> u64 {
+        self.dims.iter().fold(1_u64, |elements, dim| {
+            elements.saturating_mul(u64::from(match dim {
+                DimBound::Static(value) => *value,
+                DimBound::Device { max } => *max,
+            }))
+        })
     }
 }
 
@@ -327,7 +343,23 @@ pub struct ProductRef {
 
 impl ProductRef {
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.generation > 0,
+            "product reference has no logical generation"
+        );
         self.shape_bound.validate()
+    }
+
+    fn max_bytes(&self) -> u64 {
+        let element_bytes = match self.dtype {
+            DType::U8 => 1,
+            DType::U16 | DType::F16 | DType::BF16 => 2,
+            DType::U32 | DType::I32 | DType::F32 => 4,
+            DType::I64 => 8,
+        };
+        self.shape_bound
+            .max_elements()
+            .saturating_mul(element_bytes)
     }
 }
 
@@ -393,6 +425,15 @@ impl VersionRef {
                 producer_plan_digest,
             } => {
                 selected_point.validate()?;
+                anyhow::ensure!(
+                    selected_point.request_key == self.request_key
+                        && selected_point.producer_op_id == self.producer_op_id,
+                    "device version selected point is not owned by its producer"
+                );
+                anyhow::ensure!(
+                    selected_point.generation > 0,
+                    "device version selected point has no logical generation"
+                );
                 anyhow::ensure!(
                     is_digest(producer_plan_digest),
                     "device version reference has an invalid producer plan digest"
@@ -549,9 +590,24 @@ impl Operation {
                 "an output product is not owned by its producing operation"
             );
             anyhow::ensure!(
+                output.generation > 0,
+                "an output product has no logical generation"
+            );
+            anyhow::ensure!(
                 output.point_range.max_points <= self.bounds.max_points.max(1),
                 "an output product exceeds the operation point bound"
             );
+            match output.storage_class {
+                StorageClass::LatentArena => anyhow::ensure!(
+                    output.max_bytes() <= self.bounds.max_latent_bytes,
+                    "a latent-arena output exceeds the operation latent-byte bound"
+                ),
+                StorageClass::CompletionArena => anyhow::ensure!(
+                    output.max_bytes() <= self.bounds.max_completion_bytes,
+                    "a completion-arena output exceeds the operation completion-byte bound"
+                ),
+                _ => {}
+            }
             anyhow::ensure!(
                 output_indices.insert(output.output_index),
                 "operation repeats an output index"
@@ -562,6 +618,12 @@ impl Operation {
         }
         if let Some(predicate) = &self.predicate {
             predicate.validate()?;
+            anyhow::ensure!(
+                predicate.generation > 0
+                    && predicate.storage_class == StorageClass::DeviceTensor
+                    && predicate.kind == ProductKind::Completion,
+                "operation predicate is not a generation-tagged device completion product"
+            );
         }
         anyhow::ensure!(
             is_digest(&self.plan_digest),
@@ -1064,6 +1126,48 @@ impl Batch {
         for payload in &self.input_products {
             payload.validate()?;
         }
+        let declared_inputs = self
+            .operations
+            .iter()
+            .flat_map(|operation| operation.inputs.iter())
+            .collect::<HashSet<_>>();
+        for operation in &self.operations {
+            for input in operation
+                .inputs
+                .iter()
+                .filter(|input| input.storage_class == StorageClass::HostStaging)
+            {
+                anyhow::ensure!(
+                    input.request_key == operation.request_key
+                        && input.producer_op_id == operation.op_id,
+                    "a host-staging input is not owned by its consuming operation"
+                );
+            }
+        }
+        let mut supplied_inputs = HashSet::with_capacity(self.input_products.len());
+        for payload in &self.input_products {
+            anyhow::ensure!(
+                declared_inputs.contains(&payload.product),
+                "an input product payload is not declared by any operation"
+            );
+            anyhow::ensure!(
+                payload.product.storage_class == StorageClass::HostStaging,
+                "an input product payload does not name host-staging storage"
+            );
+            anyhow::ensure!(
+                supplied_inputs.insert(&payload.product),
+                "a submission batch repeats an input product payload"
+            );
+            payload.validate_input_value()?;
+        }
+        for input in declared_inputs {
+            if input.storage_class == StorageClass::HostStaging {
+                anyhow::ensure!(
+                    supplied_inputs.contains(input),
+                    "a host-staging operation input has no product payload"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -1137,6 +1241,22 @@ pub struct ProductPayload {
 impl ProductPayload {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.product.validate()
+    }
+
+    fn validate_input_value(&self) -> anyhow::Result<()> {
+        if self.product.kind == ProductKind::Token {
+            let tokens = decode_token_product_bytes(&self.bytes)?;
+            anyhow::ensure!(
+                tokens.len() as u64 <= self.product.shape_bound.max_elements(),
+                "token input product exceeds its registered element bound"
+            );
+        } else {
+            anyhow::ensure!(
+                self.bytes.len() as u64 <= self.product.max_bytes(),
+                "input product payload exceeds its registered byte bound"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1229,6 +1349,8 @@ pub struct EngineCaps {
     pub latent_downsample: u32,
     pub max_vae_grid_tokens: u32,
     pub max_vit_grid_tokens: u32,
+    pub max_latent_feature_bytes: u64,
+    pub max_vision_feature_bytes: u64,
     pub commit_marker_tokens: u32,
     pub gen_rope_advance: u32,
     pub max_cfg_branches: u32,
@@ -1278,6 +1400,8 @@ impl EngineCaps {
         digest.u32(self.max_latent_size);
         digest.u32(self.max_vae_grid_tokens);
         digest.u32(self.max_vit_grid_tokens);
+        digest.u64(self.max_latent_feature_bytes);
+        digest.u64(self.max_vision_feature_bytes);
         digest.u8(self.adapter_mode as u8);
         digest.u32(self.execution_constraints.max_batch_operations);
         digest.string(&self.kv_dtype);
@@ -1326,6 +1450,8 @@ impl Default for EngineCaps {
             latent_downsample: 1,
             max_vae_grid_tokens: 0,
             max_vit_grid_tokens: 0,
+            max_latent_feature_bytes: 0,
+            max_vision_feature_bytes: 0,
             commit_marker_tokens: 2,
             gen_rope_advance: 2,
             max_cfg_branches: 3,

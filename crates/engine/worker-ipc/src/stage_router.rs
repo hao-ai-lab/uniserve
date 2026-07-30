@@ -3,9 +3,9 @@
 //! A staged topology partitions each execution batch by exact [`WorkVariant`],
 //! sends every session admission to a pool before that pool's first operation
 //! for the session, and restores the scheduler's original operation order when
-//! pool completions arrive. Tensor payloads remain in the worker data plane;
-//! cross-pool dependencies are named by the operation's declared input
-//! [`ProductRef`](uniserve_worker_wire::ProductRef)s.
+//! pool completions arrive. A worker-local device product is directly reachable
+//! only within its producing pool. Cross-pool movement requires a declared
+//! `Transfer(Product)` whose destination reference belongs to the consumer.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -42,7 +42,6 @@ pub struct StageRouter {
     ready: VecDeque<CompletionReport>,
     admissions: HashMap<RequestKey, Admission>,
     admitted_pools: HashSet<(usize, RequestKey)>,
-    separate_image_writeback: bool,
     next_call_id: u64,
 }
 
@@ -94,14 +93,6 @@ impl StageRouter {
             .min()
             .unwrap_or(1)
             .max(1);
-        let separate_image_writeback = matches!(
-            (
-                routing.get(&WorkVariant::Materialize),
-                routing.get(&WorkVariant::TransferKvPublish),
-            ),
-            (Some(materialize), Some(transfer)) if materialize != transfer
-        );
-
         Ok(Self {
             routing,
             pools,
@@ -111,7 +102,6 @@ impl StageRouter {
             ready: VecDeque::new(),
             admissions: HashMap::new(),
             admitted_pools: HashSet::new(),
-            separate_image_writeback,
             next_call_id: 1,
         })
     }
@@ -225,6 +215,12 @@ impl StageRouter {
         merged.max_vit_grid_tokens = routed_caps(WorkVariant::EncodeVision)
             .as_ref()
             .map_or(0, |caps| caps.max_vit_grid_tokens);
+        merged.max_latent_feature_bytes = routed_caps(WorkVariant::EncodeLatent)
+            .as_ref()
+            .map_or(0, |caps| caps.max_latent_feature_bytes);
+        merged.max_vision_feature_bytes = routed_caps(WorkVariant::EncodeVision)
+            .as_ref()
+            .map_or(0, |caps| caps.max_vision_feature_bytes);
         if let Some(materialize) = routed_caps(WorkVariant::Materialize) {
             merged.commit_marker_tokens = materialize.commit_marker_tokens;
             merged.gen_rope_advance = materialize.gen_rope_advance;
@@ -309,6 +305,7 @@ impl StageRouter {
         step_id: u64,
         operations: Vec<Operation>,
         controls: Vec<Control>,
+        input_products: Vec<ProductPayload>,
     ) -> anyhow::Result<bool> {
         if operations.is_empty() && controls.is_empty() {
             return Ok(false);
@@ -318,7 +315,9 @@ impl StageRouter {
             .iter()
             .map(|admission| admission.request_key)
             .collect::<Vec<_>>();
-        let partition = Batch::new(step_id, admissions, operations).with_controls(controls);
+        let partition = Batch::new(step_id, admissions, operations)
+            .with_controls(controls)
+            .with_input_products(input_products);
         partition.validate()?;
         self.pools[pool_index].exec.submit(partition)?;
         self.admitted_pools
@@ -464,13 +463,9 @@ impl Executor for StageRouter {
         self.pending.len() + self.ready.len()
     }
 
-    fn generated_image_commit_capabilities(
-        &self,
-    ) -> uniserve_core::GeneratedImageCommitCapabilities {
-        uniserve_core::GeneratedImageCommitCapabilities {
-            inline: !self.separate_image_writeback,
-            separate_writeback: self.separate_image_writeback,
-        }
+    fn device_products_reachable(&self, producer: WorkVariant, consumer: WorkVariant) -> bool {
+        self.routing.contains_key(&producer)
+            && self.routing.get(&producer) == self.routing.get(&consumer)
     }
 
     fn can_submit(&self) -> bool {
@@ -490,7 +485,11 @@ impl Executor for StageRouter {
         let mut partitions = (0..self.pools.len())
             .map(|_| Vec::new())
             .collect::<Vec<Vec<Operation>>>();
+        let mut partition_inputs = (0..self.pools.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<ProductPayload>>>();
         let mut routes = Vec::with_capacity(batch.operations.len());
+        let mut input_routes = HashMap::new();
         for operation in &batch.operations {
             let variant = operation.work.variant();
             let pool_index = self.routing.get(&variant).copied().ok_or_else(|| {
@@ -516,8 +515,20 @@ impl Executor for StageRouter {
                     );
                 }
             }
+            for input in &operation.inputs {
+                input_routes.insert(input.clone(), pool_index);
+            }
             routes.push(pool_index);
             partitions[pool_index].push(operation.clone());
+        }
+        for payload in &batch.input_products {
+            let pool_index = input_routes.get(&payload.product).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "StageRouter cannot route undeclared input product {:?}",
+                    payload.product
+                )
+            })?;
+            partition_inputs[pool_index].push(payload.clone());
         }
 
         let mut pool_controls = (0..self.pools.len())
@@ -536,10 +547,19 @@ impl Executor for StageRouter {
         }
 
         let mut expected_pools = 0;
-        for (pool_index, (operations, controls)) in
-            partitions.into_iter().zip(pool_controls).enumerate()
+        for (pool_index, ((operations, controls), input_products)) in partitions
+            .into_iter()
+            .zip(pool_controls)
+            .zip(partition_inputs)
+            .enumerate()
         {
-            if self.submit_partition(pool_index, batch.step_id, operations, controls)? {
+            if self.submit_partition(
+                pool_index,
+                batch.step_id,
+                operations,
+                controls,
+                input_products,
+            )? {
                 expected_pools |= Self::pool_bit(pool_index);
             }
         }
@@ -666,5 +686,242 @@ impl Executor for StageRouter {
         for pool in &mut self.pools {
             pool.exec.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use uniserve_core::{RequestId, SamplingParams};
+    use uniserve_worker_wire::{
+        Bounds, DType, DimBound, Domain, KvAllocation, OpId, PointRange, ProductKind, ProductRef,
+        RouteId, ShapeBound, StorageClass, TokenMode, UndAdmission, VersionRef, Work,
+        encode_token_product_bytes,
+    };
+
+    use super::*;
+
+    struct RecordingExecutor {
+        caps: EngineCaps,
+        submissions: Arc<Mutex<Vec<Batch>>>,
+    }
+
+    impl Executor for RecordingExecutor {
+        fn caps(&self) -> EngineCaps {
+            self.caps.clone()
+        }
+
+        fn pipeline_depth(&self) -> usize {
+            1
+        }
+
+        fn in_flight(&self) -> usize {
+            0
+        }
+
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            batch.validate()?;
+            self.submissions.lock().unwrap().push(batch);
+            Ok(())
+        }
+
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            Ok(None)
+        }
+
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            anyhow::bail!("recording executor has no completion source")
+        }
+
+        fn control(&mut self, _operation: ControlOp) -> anyhow::Result<u64> {
+            Ok(1)
+        }
+
+        fn control_wait(
+            &mut self,
+            _operation: ControlOp,
+            _targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn caps(work: WorkVariant) -> EngineCaps {
+        let mut caps = EngineCaps {
+            supported_work: vec![work],
+            max_vit_grid_tokens: 64,
+            max_vision_feature_bytes: 1 << 20,
+            ..EngineCaps::default()
+        };
+        caps.route_capability_digest = caps.compute_route_capability_digest();
+        caps
+    }
+
+    fn request_key(session_id: u64) -> RequestKey {
+        RequestKey::new(1, RequestId(session_id), 1)
+    }
+
+    fn admission(request_key: RequestKey) -> Admission {
+        Admission::new(
+            request_key,
+            Some(UndAdmission {
+                sampling: SamplingParams::default(),
+                negative_token_ids: Vec::new(),
+                kv: KvAllocation::default(),
+            }),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn host_input(
+        request_key: RequestKey,
+        op_id: OpId,
+        generation: u32,
+        kind: ProductKind,
+        dtype: DType,
+        elements: u32,
+    ) -> ProductRef {
+        ProductRef {
+            request_key,
+            producer_op_id: op_id,
+            output_index: 0,
+            generation,
+            kind,
+            storage_class: StorageClass::HostStaging,
+            dtype,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(elements)],
+            },
+            point_range: PointRange::default(),
+        }
+    }
+
+    #[test]
+    fn host_inputs_follow_their_consuming_operations_to_each_stage() {
+        let encoder_submissions = Arc::new(Mutex::new(Vec::new()));
+        let prefill_submissions = Arc::new(Mutex::new(Vec::new()));
+        let encoder = RecordingExecutor {
+            caps: caps(WorkVariant::EncodeVision),
+            submissions: Arc::clone(&encoder_submissions),
+        };
+        let prefill = RecordingExecutor {
+            caps: caps(WorkVariant::TokenExtend),
+            submissions: Arc::clone(&prefill_submissions),
+        };
+        let mut router = StageRouter::try_new(vec![
+            (WorkerKind::Encoder, Box::new(encoder)),
+            (WorkerKind::Prefill, Box::new(prefill)),
+        ])
+        .unwrap();
+
+        let encode_key = request_key(11);
+        let encode_op_id = OpId(21);
+        let image = host_input(
+            encode_key,
+            encode_op_id,
+            31,
+            ProductKind::Artifact,
+            DType::U8,
+            4,
+        );
+        let encode = Operation::registered(
+            encode_key,
+            encode_op_id,
+            VersionRef::admission_root(encode_key, OpId(1), "0".repeat(64)),
+            Work::Encode(uniserve_worker_wire::EncodeMode::Vision),
+            RouteId(0),
+            Domain::Und,
+            Bounds::default(),
+            vec![image.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
+        );
+
+        let prefill_key = request_key(12);
+        let prefill_op_id = OpId(22);
+        let tokens = host_input(
+            prefill_key,
+            prefill_op_id,
+            32,
+            ProductKind::Token,
+            DType::U32,
+            3,
+        );
+        let prefill = Operation::registered(
+            prefill_key,
+            prefill_op_id,
+            VersionRef::admission_root(prefill_key, OpId(1), "1".repeat(64)),
+            Work::Token(TokenMode::Extend),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_tokens: 3,
+                ..Bounds::default()
+            },
+            vec![tokens.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
+        );
+
+        router
+            .submit(
+                Batch::new(
+                    7,
+                    vec![admission(encode_key), admission(prefill_key)],
+                    vec![encode, prefill],
+                )
+                .with_input_products(vec![
+                    ProductPayload {
+                        product: image.clone(),
+                        bytes: vec![1, 2, 3, 4],
+                    },
+                    ProductPayload {
+                        product: tokens.clone(),
+                        bytes: encode_token_product_bytes(&[7, 8, 9]),
+                    },
+                ]),
+            )
+            .unwrap();
+
+        let encoder_batches = encoder_submissions.lock().unwrap();
+        assert_eq!(encoder_batches.len(), 1);
+        assert_eq!(
+            encoder_batches[0].operations[0].work.variant(),
+            WorkVariant::EncodeVision
+        );
+        assert_eq!(
+            encoder_batches[0].input_products,
+            vec![ProductPayload {
+                product: image,
+                bytes: vec![1, 2, 3, 4],
+            }]
+        );
+
+        let prefill_batches = prefill_submissions.lock().unwrap();
+        assert_eq!(prefill_batches.len(), 1);
+        assert_eq!(
+            prefill_batches[0].operations[0].work.variant(),
+            WorkVariant::TokenExtend
+        );
+        assert_eq!(
+            prefill_batches[0].input_products,
+            vec![ProductPayload {
+                product: tokens,
+                bytes: encode_token_product_bytes(&[7, 8, 9]),
+            }]
+        );
+        assert!(
+            router.device_products_reachable(WorkVariant::EncodeVision, WorkVariant::EncodeVision)
+        );
     }
 }

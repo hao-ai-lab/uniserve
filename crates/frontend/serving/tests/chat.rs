@@ -818,7 +818,8 @@ async fn multimodal_plan_inspection_records_rendered_scaffold_and_image_placemen
         .feedback
         .as_mut()
         .unwrap()
-        .physical_kv_tokens = uniserve_core::ImageKvEffect::Exact { tokens: 8 };
+        .ingest
+        .step_kv_tokens = vec![uniserve_core::ImageKvEffect::Exact { tokens: 8 }];
     let runtime =
         serving_runtime_from_mock_client(client, backend).with_generation_dialect(dialect);
     let mut request = ServeRequest::chat(

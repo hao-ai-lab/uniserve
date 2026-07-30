@@ -180,9 +180,9 @@ use uniserve_core::{HashAlgo, RequestId};
 use uniserve_engine_api::{Command, EventTx, FinishReason, GenEvent, GenerationSubmission};
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
-    Admission, Batch, CompletionRecord, CompletionReport, EngineCaps, GenAdmission, KvAllocation,
-    OpId, Point, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, UndAdmission,
-    VersionRef, WorkVariant, WorkerForwardStats,
+    Admission, Batch, CompletionRecord, CompletionReport, Control, EngineCaps, GenAdmission,
+    KvAllocation, OpId, Point, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass,
+    UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
 };
 
 use crate::grammar::{GrammarCompiler, GrammarMatcher, grammar_allowed_tokens};
@@ -367,6 +367,10 @@ pub struct ReqState {
     /// (the reserved admission-root id until the first state-advancing op).
     pub(crate) committed_semantic: String,
     pub(crate) committed_producer_op_id: u64,
+    /// Exact worker-local selected-point product for the latest resolved state,
+    /// together with the work variant that owns its physical pool. The scheduler
+    /// retains this logical ownership until it submits a reachable consumer.
+    pub(crate) latest_device_version: Option<ResidentDeviceVersion>,
     pub(crate) context: SchedulerContext,
     pub(crate) event_tx: EventTx,
     pub(crate) cursor: GenerationCursor,
@@ -378,6 +382,12 @@ pub struct ReqState {
     pub(crate) grammar: Option<GrammarMatcher>,
     /// This request's lifecycle trace.
     pub(crate) trace: crate::trace::RequestTrace,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResidentDeviceVersion {
+    version: VersionRef,
+    producer: WorkVariant,
 }
 
 impl ReqState {
@@ -502,6 +512,7 @@ pub struct Scheduler {
     authority_id: u64,
     /// Monotonic op ids and archived lifecycle traces.
     next_op_id: u64,
+    next_product_generation: u64,
     next_epoch: u64,
     completed_traces: VecDeque<crate::trace::RequestTrace>,
     trace_sink: Option<crate::bench_trace::SchedulerTraceSink>,
@@ -593,7 +604,6 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
         TransitionValidationError::VersionMismatch { .. } => "version_mismatch",
         TransitionValidationError::DenoiseStepMismatch { .. } => "denoise_step_mismatch",
         TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
-        TransitionValidationError::EncoderHandleMismatch { .. } => "encoder_handle_mismatch",
         TransitionValidationError::MissingImageArtifact => "missing_image_artifact",
         TransitionValidationError::InvalidImageArtifact => "invalid_image_artifact",
         TransitionValidationError::MissingImageLocator => "missing_image_locator",
@@ -645,12 +655,13 @@ fn cursor_apply_error_str(error: &CursorApplyError) -> &'static str {
 fn phase_str(phase: Phase) -> &'static str {
     match phase {
         Phase::Encode => "encode",
+        Phase::IngestState => "ingest_state",
         Phase::Prefill => "prefill",
         Phase::DecodeUnd => "decode_und",
         Phase::DenoiseGen => "denoise_gen",
         Phase::CommitGen => "commit_gen",
-        Phase::CommitWriteback => "commit_writeback",
-        Phase::FeedbackIngest => "feedback_ingest",
+        Phase::FeedbackEncode => "feedback_encode",
+        Phase::FeedbackState => "feedback_state",
     }
 }
 
@@ -842,6 +853,7 @@ impl Scheduler {
             batch_started: HashMap::new(),
             authority_id: 1,
             next_op_id: 1,
+            next_product_generation: 1,
             next_epoch: 1,
             completed_traces: VecDeque::new(),
             trace_sink,
@@ -1524,6 +1536,7 @@ impl Scheduler {
             admission_digest: None,
             committed_semantic: String::new(),
             committed_producer_op_id: 0,
+            latest_device_version: None,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
             context,
             event_tx,
@@ -1586,17 +1599,17 @@ impl Scheduler {
             supports_latent_encode: supports(WorkVariant::EncodeLatent),
             supports_image_generation: supports(WorkVariant::GenFlow)
                 && supports(WorkVariant::Materialize),
-            supports_commit_writeback: supports(WorkVariant::TransferKvInstall),
             max_latent_units: u64::from(self.caps.max_latent_size),
             latent_downsample: self.caps.latent_downsample,
             max_vae_grid_tokens: self.cap_max_vae_grid_tokens() as u32,
             max_vit_grid_tokens: self.caps.max_vit_grid_tokens,
+            max_latent_feature_bytes: self.caps.max_latent_feature_bytes,
+            max_vision_feature_bytes: self.caps.max_vision_feature_bytes,
             commit_marker_tokens: self.caps.commit_marker_tokens,
             max_cfg_branches: self.caps.max_cfg_branches,
             scratch_capacity_tokens: self.caps.scratch_capacity_tokens,
             scratch_block_size: self.caps.block_size,
             encoder_cache_entries: self.caps.encoder_cache_budget,
-            generated_image_commit: self.executor.generated_image_commit_capabilities(),
         }
     }
 
@@ -1671,52 +1684,12 @@ impl Scheduler {
     fn reserve_transition_resources(&mut self, transition: &PlannedTransition) -> bool {
         let id = transition.request_id;
         let resources = &transition.resources;
-        let cached_encoder_key = match transition.delta {
-            crate::generation::TransitionDelta::IngestImageStep {
-                encoder_cache_key: Some(key),
-                cache_hit: true,
-                ..
-            } => Some(key),
-            _ => None,
-        };
-        if let Some(key) = cached_encoder_key {
-            let Some(handle) = self.enc_cache.acquire(key) else {
-                return false;
-            };
-            if transition.validation.expected_encoder_handle != Some(handle) {
-                if let Some(freed) = self.enc_cache.release(key, handle) {
-                    self.gated_control(ControlOp::ReleaseProducts(vec![freed]));
-                }
-                return false;
-            }
-            let Some(st) = self.running.get_mut(&id) else {
-                if let Some(freed) = self.enc_cache.release(key, handle) {
-                    self.gated_control(ControlOp::ReleaseProducts(vec![freed]));
-                }
-                return false;
-            };
-            st.ingest
-                .acquired_encoder_pins
-                .push(EncoderCachePin { key, handle });
-        }
         let needs_host_scratch = self
             .running
             .get(&id)
             .is_some_and(|st| st.resources.host_scratch_tokens == 0)
             && resources.host_scratch_tokens > 0;
         if needs_host_scratch && !self.bm.reserve_scratch(id, resources.host_scratch_tokens) {
-            if let Some(key) = cached_encoder_key {
-                let pin = self
-                    .running
-                    .get_mut(&id)
-                    .and_then(|st| st.ingest.acquired_encoder_pins.pop());
-                if let Some(pin) = pin {
-                    debug_assert_eq!(pin.key, key);
-                    if let Some(freed) = self.enc_cache.release(pin.key, pin.handle) {
-                        self.gated_control(ControlOp::ReleaseProducts(vec![freed]));
-                    }
-                }
-            }
             return false;
         }
         if resources.latent_units > 0 {
@@ -1992,6 +1965,15 @@ impl Scheduler {
         {
             return false;
         }
+        let Some(predecessor) = queue.back() else {
+            return false;
+        };
+        if !self.executor.device_products_reachable(
+            predecessor.transition.operation_variant,
+            WorkVariant::TokenDecode,
+        ) {
+            return false;
+        }
         if matches!(
             state.req.policy.trigger,
             uniserve_core::TriggerPolicyDescriptor::RoundCloseThenSuffix { .. }
@@ -2014,11 +1996,7 @@ impl Scheduler {
         };
         projected.prompt_cursor as usize >= state.effective_prompt().len()
             && state.ingest.mm_cursor >= state.context.images.len()
-            && state
-                .und
-                .tokens_emitted
-                .saturating_add(queue.len())
-                < state.req.max_und_tokens
+            && state.und.tokens_emitted.saturating_add(queue.len()) < state.req.max_und_tokens
     }
 
     fn device_token_relay_eligible(state: &ReqState) -> bool {
@@ -2038,12 +2016,25 @@ impl Scheduler {
             && sampling.logit_bias.is_empty()
     }
 
-    fn can_reuse_committed_token_relay(&self, id: RequestId) -> bool {
+    /// Whether the latest host-resolved token may remain the exact device input
+    /// to the next decode. CPU stop and EOS decisions are complete before this
+    /// check; a continuing request therefore names the same sampled token.
+    fn can_reuse_resolved_token_product(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|state| {
             state.resources.worker_registered
                 && state.und.tokens_emitted > 0
+                && state
+                    .latest_device_version
+                    .as_ref()
+                    .is_some_and(|resident| {
+                        self.executor
+                            .device_products_reachable(resident.producer, WorkVariant::TokenDecode)
+                    })
                 && state.is_replayable_text()
-                && Self::device_token_relay_eligible(state)
+                && state.lifecycle.phase == Phase::DecodeUnd
+                && !state.ingest.round_closing
+                && !state.req.behavior.gen_output
+                && state.grammar.is_none()
         })
     }
 
@@ -2306,10 +2297,8 @@ impl Scheduler {
             // A state-advancing op commits a new authoritative point; its selected
             // point becomes the request version and its semantic digest and op id
             // become the committed lineage. Non-advancing ops leave lineage intact.
-            let advanced = transition
-                .operation
-                .as_ref()
-                .is_some_and(|operation| match operation.parent.point {
+            let advanced = transition.operation.as_ref().is_some_and(|operation| {
+                match operation.parent.point {
                     // A fixed-parent op advanced when its selected point moved
                     // past the host-observed parent point.
                     Point::Fixed { point_index, .. } => record.selected_point > point_index,
@@ -2320,12 +2309,45 @@ impl Scheduler {
                     // the committed lineage goes stale once the pipeline drains and
                     // the next fixed-parent op roots on the wrong digest.
                     Point::Device { .. } => operation.advances_state,
-                });
+                }
+            });
+            let latest_device_version = if advanced {
+                transition.operation.as_ref().and_then(|operation| {
+                    operation
+                        .outputs
+                        .iter()
+                        .find(|output| {
+                            output.kind == ProductKind::Token
+                                && output.storage_class
+                                    == uniserve_worker_wire::StorageClass::DeviceTensor
+                        })
+                        .cloned()
+                        .map(|selected_point| ResidentDeviceVersion {
+                            producer: operation.work.variant(),
+                            version: VersionRef {
+                                request_key: operation.request_key,
+                                producer_op_id: operation.op_id,
+                                point: Point::Device {
+                                    selected_point,
+                                    producer_plan_digest: operation.plan_digest.clone(),
+                                },
+                            },
+                        })
+                })
+            } else {
+                None
+            };
+            let retain_device_version = !self.has_inflight(id);
             if let Some(state) = self.running.get_mut(&id) {
                 state.version = u64::from(record.selected_point);
                 if advanced {
                     state.committed_semantic = record.semantic_digest.clone();
                     state.committed_producer_op_id = record.op_id.0;
+                    state.latest_device_version = if retain_device_version {
+                        latest_device_version
+                    } else {
+                        None
+                    };
                 }
             }
             self.release_transition_resources(id, &transition);
@@ -2997,6 +3019,7 @@ impl Scheduler {
                             // operation's fixed parent matches the worker's committed state.
                             st.committed_semantic = admission.digest.clone();
                             st.committed_producer_op_id = 0;
+                            st.latest_device_version = None;
                             st.admission_digest = Some(admission.digest.clone());
                             admissions.push(admission);
                         }
@@ -3144,6 +3167,7 @@ impl Scheduler {
                 ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
                 ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
             },
+            Phase::IngestState => WorkVariant::TokenExtend,
             Phase::Prefill
                 if self.has_inflight(id)
                     && self.can_queue_decode_successor(id)
@@ -3157,18 +3181,14 @@ impl Scheduler {
             Phase::DecodeUnd => WorkVariant::TokenDecode,
             Phase::DenoiseGen => WorkVariant::GenFlow,
             Phase::CommitGen => WorkVariant::Materialize,
-            Phase::CommitWriteback => WorkVariant::TransferKvInstall,
-            Phase::FeedbackIngest => {
+            Phase::FeedbackEncode => {
                 let feedback = st.req.policy.feedback.as_ref()?;
-                let uniserve_core::FeedbackWriteback::Reingest { ingest } = &feedback.writeback
-                else {
-                    return None;
-                };
-                match ingest.steps.get(st.feedback.ingest_step)? {
+                match feedback.ingest.steps.get(st.feedback.ingest_step)? {
                     ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
                     ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
                 }
             }
+            Phase::FeedbackState => WorkVariant::TokenExtend,
         })
     }
 
@@ -3270,8 +3290,8 @@ impl Scheduler {
         }
         let mut free_encoder_handles = std::mem::take(&mut st.ingest.transient_encoder_handles);
         for pin in &st.ingest.acquired_encoder_pins {
-            if let Some(handle) = self.enc_cache.release(pin.key, pin.handle) {
-                free_encoder_handles.push(handle);
+            if let Some(product) = self.enc_cache.release(pin.key, &pin.product) {
+                free_encoder_handles.push(u64::from(product.generation));
             }
         }
         if !free_encoder_handles.is_empty() {
@@ -3305,6 +3325,7 @@ impl Scheduler {
         st.admission_digest = None;
         st.committed_semantic = String::new();
         st.committed_producer_op_id = 0;
+        st.latest_device_version = None;
         self.next_epoch = self.next_epoch.saturating_add(1);
         st.replay.generated_ids = generated_ids;
         st.replay.recompute_ids = Some(recompute);
@@ -3350,13 +3371,14 @@ impl Scheduler {
             let oid = self.next_op_id;
             self.next_op_id += 1;
             let request_id = transition.request_id;
-            let Some((epoch, committed_semantic, committed_producer_op_id)) =
+            let Some((epoch, committed_semantic, committed_producer_op_id, latest_device_version)) =
                 self.running.get(&request_id).and_then(|state| {
                     state.admission_digest.as_ref().map(|_| {
                         (
                             state.epoch,
                             state.committed_semantic.clone(),
                             state.committed_producer_op_id,
+                            state.latest_device_version.clone(),
                         )
                     })
                 })
@@ -3381,13 +3403,18 @@ impl Scheduler {
                 return;
             };
             let request_key = RequestKey::new(self.authority_id, request_id, epoch);
-            // A projected successor roots on its predecessor's not-yet-observed
-            // selected point: op N's semantic digest is unknown until it runs,
-            // but its plan digest and Token-output reference are host-known, so
-            // the parent is a `Point::Device` naming that predecessor. The first
-            // op of a request roots on the committed host-observed fixed point.
+            // A device successor roots on the exact selected-point product of
+            // either its in-flight predecessor or the latest resolved operation.
+            // The first operation and CPU-gated transitions use the fixed
+            // semantically committed parent.
             let projected_successor = self.has_inflight(request_id);
-            let parent = if projected_successor {
+            let reusable_device_version =
+                if !projected_successor && self.can_reuse_resolved_token_product(request_id) {
+                    latest_device_version.map(|resident| resident.version)
+                } else {
+                    None
+                };
+            let (parent, predicate) = if projected_successor {
                 let Some(predecessor) = self
                     .inflight_ops
                     .get(&request_id)
@@ -3401,35 +3428,64 @@ impl Scheduler {
                     self.fatal = true;
                     return;
                 };
-                VersionRef {
-                    request_key,
-                    producer_op_id: predecessor.op_id,
-                    point: Point::Device {
-                        // The predecessor's declared Token output is its
-                        // selected-point product; the successor's device relay
-                        // reads the sampled token this reference resolves.
-                        selected_point: predecessor.outputs[0].clone(),
-                        producer_plan_digest: predecessor.plan_digest.clone(),
+                (
+                    VersionRef {
+                        request_key,
+                        producer_op_id: predecessor.op_id,
+                        point: Point::Device {
+                            // The predecessor's declared Token output is its
+                            // selected-point product; the successor's device relay
+                            // reads the sampled token this reference resolves.
+                            selected_point: predecessor.outputs[0].clone(),
+                            producer_plan_digest: predecessor.plan_digest.clone(),
+                        },
                     },
-                }
+                    predecessor
+                        .outputs
+                        .iter()
+                        .find(|output| output.kind == ProductKind::Completion)
+                        .cloned(),
+                )
+            } else if let Some(parent) = reusable_device_version {
+                (parent, None)
             } else {
-                VersionRef {
-                    request_key,
-                    producer_op_id: OpId(committed_producer_op_id),
-                    point: Point::Fixed {
-                        point_index: version as u32,
-                        semantic_digest: committed_semantic,
+                (
+                    VersionRef {
+                        request_key,
+                        producer_op_id: OpId(committed_producer_op_id),
+                        point: Point::Fixed {
+                            point_index: version as u32,
+                            semantic_digest: committed_semantic,
+                        },
                     },
-                }
+                    None,
+                )
             };
-            // A device parent carries no host-known point index; validation of
-            // its result reconstructs the expected point from the projected
-            // parent point (the predecessor's committed-and-advanced version).
-            transition.projected_parent_point = projected_successor.then_some(version as u32);
-            transition.assign_operation(request_key, OpId(oid), parent);
+            // A device parent carries no embedded host point index. The
+            // scheduler-owned resolved/projected cursor supplies it for result
+            // validation without reading the device product.
+            let device_parent = matches!(parent.point, Point::Device { .. });
+            transition.device_parent_point = device_parent.then_some(version as u32);
+            transition.predicate = predicate;
+            if let Err(error) = transition.assign_operation(
+                request_key,
+                OpId(oid),
+                parent,
+                &mut self.next_product_generation,
+            ) {
+                tracing::error!(
+                    request_id = request_id.0,
+                    ?error,
+                    "scheduler authority exhausted product identity space"
+                );
+                self.fatal = true;
+                self.fail_all_running("scheduler authority exhausted product identity space");
+                return;
+            }
             let operation_variant = transition.operation_variant.as_wire_str();
             self.register_inflight(transition.clone(), submit_at);
             if let Some(st) = self.running.get_mut(&request_id) {
+                st.latest_device_version = None;
                 let mut ev =
                     crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpSubmitted);
                 ev.op_id = Some(oid);
@@ -3555,7 +3611,7 @@ impl Scheduler {
             .map(|transition| transition.draft_token_ids.len())
             .filter(|count| *count > 0)
             .collect();
-        let wire_ops = transitions
+        let wire_ops: Vec<uniserve_worker_wire::Operation> = transitions
             .iter()
             .filter_map(|transition| transition.operation.clone())
             .collect();
@@ -3565,8 +3621,17 @@ impl Scheduler {
             .iter()
             .filter_map(|transition| transition.input_product())
             .collect();
-        let batch =
-            Batch::new(self.step_id, admissions, wire_ops).with_input_products(input_products);
+        let releases = wire_ops
+            .iter()
+            .filter(|operation| operation.parent.producer_op_id.0 > 0)
+            .map(|operation| Control::Release {
+                request_key: operation.request_key,
+                op_id: operation.parent.producer_op_id,
+            })
+            .collect();
+        let batch = Batch::new(self.step_id, admissions, wire_ops)
+            .with_controls(releases)
+            .with_input_products(input_products);
         if let Err(e) = self.executor.submit(batch) {
             self.batch_started.remove(&step);
             self.trace_record(json!({
@@ -3622,27 +3687,6 @@ impl Scheduler {
             uniserve_core::FeedbackNextToken::EndOfImage => Some(self.ctrl.end_of_image),
             uniserve_core::FeedbackNextToken::Token { token_id } => Some(token_id),
         }
-    }
-
-    fn commit_requires_writeback(st: &ReqState) -> bool {
-        st.req.behavior.generated_image_feedback
-            && st.req.policy.feedback.as_ref().is_some_and(|feedback| {
-                feedback.commit == uniserve_core::CommitRecipe::CommitGenThenWriteback
-                    && matches!(
-                        feedback.writeback,
-                        uniserve_core::FeedbackWriteback::DirectKv
-                    )
-            })
-    }
-
-    fn reingests_generated_image(st: &ReqState) -> bool {
-        st.req.behavior.generated_image_feedback
-            && st.req.policy.feedback.as_ref().is_some_and(|feedback| {
-                matches!(
-                    feedback.writeback,
-                    uniserve_core::FeedbackWriteback::Reingest { .. }
-                )
-            })
     }
 
     fn prefilled_gen_trigger(&self, id: RequestId) -> bool {
@@ -3769,14 +3813,13 @@ impl Scheduler {
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
                 // The prior committed token this decode continues from. It is
-                // attached as the host input for the first/committed decode; a
-                // projected successor ignores it and reads the predecessor's
-                // on-device sampled token via the device relay instead.
+                // attached as a host input only when no exact selected-point
+                // product is eligible for device continuation.
                 let input_token = st.und.next_token;
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
                 let projected_successor = self.has_inflight(id);
-                let relay_input = projected_successor || self.can_reuse_committed_token_relay(id);
+                let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let tok = if relay_input { 0 } else { st.und.next_token };
                 let (allowed, suppress) = if projected_successor {
                     (None, None)
@@ -3811,11 +3854,7 @@ impl Scheduler {
                         spec_token_ids,
                         allowed_tokens: allowed,
                         input_token,
-                        // A projected successor roots on the predecessor's
-                        // device-selected point and reads its on-device sampled
-                        // token; the committed-relay/first op keeps its host
-                        // token as before.
-                        relay_input: projected_successor,
+                        relay_input,
                     },
                 )
             }
@@ -3871,85 +3910,68 @@ impl Scheduler {
             }
             Phase::CommitGen => {
                 let st = self.running.get(&id)?;
-                let cond_pos = st.image_gen.cond_pos;
                 let image_id = st.image_gen.image_id;
-                let (allowed, _) = self.token_masks(id);
                 let projection = self.projected_cursor(id)?;
-                let new_blocks = self.take_new_blocks(id);
-                self.plan_intent(
-                    id,
-                    projection,
-                    TransitionIntent::CommitGen {
-                        image_id,
-                        position: cond_pos,
-                        new_blocks,
-                        allowed_tokens: allowed,
-                    },
-                )
+                self.plan_intent(id, projection, TransitionIntent::CommitGen { image_id })
             }
-            Phase::CommitWriteback => {
-                let st = self.running.get(&id)?;
-                let cond_pos = st.image_gen.cond_pos;
-                let image_id = st.image_gen.image_id;
-                let locator = st.feedback.locator.clone();
-                let (allowed, _) = self.token_masks(id);
-                let Some(locator) = locator else {
-                    self.finish(id, FinishReason::Error);
-                    return None;
-                };
-                let projection = self.projected_cursor(id)?;
-                let new_blocks = self.take_new_blocks(id);
-                self.plan_intent(
-                    id,
-                    projection,
-                    TransitionIntent::Feedback {
-                        image_id,
-                        position: cond_pos,
-                        locator,
-                        new_blocks,
-                        allowed_tokens: allowed,
-                    },
-                )
-            }
-            Phase::FeedbackIngest => {
+            Phase::FeedbackEncode => {
                 let st = self.running.get(&id)?;
                 let feedback = st.req.policy.feedback.as_ref()?;
-                let uniserve_core::FeedbackWriteback::Reingest { ingest } = &feedback.writeback
-                else {
-                    self.finish(id, FinishReason::Error);
-                    return None;
-                };
                 let step_index = st.feedback.ingest_step;
-                let step = ingest.steps.get(step_index).copied()?;
-                let is_final_step = step_index + 1 == ingest.steps.len();
+                let step = feedback.ingest.steps.get(step_index).copied()?;
                 let image_id = st.image_gen.image_id;
-                let image_b64 = st.feedback.image_b64.clone();
-                let staged_image = st.feedback.staged_image;
-                let logical_positions = ingest.logical_positions;
-                let physical_kv_tokens = ingest.kv_effect(step_index)?;
-                let Some(image_b64) = image_b64 else {
-                    self.finish(id, FinishReason::Error);
-                    return None;
-                };
+                let source = (feedback.source == uniserve_core::FeedbackSource::DeviceProduct)
+                    .then(|| st.feedback.source_product.clone())
+                    .flatten();
+                let image_b64 = st.feedback.image_b64.clone().unwrap_or_default();
                 let projection = self.projected_cursor(id)?;
-                let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
                     projection,
-                    TransitionIntent::FeedbackIngest {
+                    TransitionIntent::EncodeFeedback {
                         image_id,
                         step_index,
                         step,
+                        source,
+                        image_b64,
+                    },
+                )
+            }
+            Phase::FeedbackState => {
+                let st = self.running.get(&id)?;
+                let feedback = st.req.policy.feedback.as_ref()?;
+                let step_index = st.feedback.ingest_step;
+                let is_final_step = step_index + 1 == feedback.ingest.steps.len();
+                let image_id = st.image_gen.image_id;
+                let logical_positions = feedback.ingest.logical_positions;
+                let physical_kv_tokens = feedback.ingest.kv_effect(step_index)?;
+                let feature = st.feedback.encoded_product.clone();
+                let sample_continuation = is_final_step && feedback.sample_continuation;
+                let Some(feature) = feature else {
+                    self.finish(id, FinishReason::Error);
+                    return None;
+                };
+                let projection = self.projected_cursor(id)?;
+                let new_blocks = self.take_new_blocks(id);
+                let (allowed, _) = self.token_masks(id);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::FeedbackState {
+                        image_id,
+                        step_index,
                         is_final_step,
                         position: projection.logical_pos,
                         logical_positions,
                         physical_kv_tokens,
-                        image_b64,
-                        staged_image,
+                        feature,
+                        sample_continuation,
                         new_blocks,
+                        allowed_tokens: allowed,
                     },
                 )
             }
+            Phase::IngestState => self.next_context_ingest_transition(id, budget, projection),
         }
     }
 
@@ -3974,35 +3996,77 @@ impl Scheduler {
             let step_index = state.ingest.pending_image_step;
             let step = image.ingest.steps.get(step_index).copied()?;
             let is_final_step = step_index + 1 == image.ingest.steps.len();
-            let staged_image = state.ingest.staged_image;
+            if state.lifecycle.phase == Phase::IngestState {
+                let feature = state.ingest.encoded_product.clone()?;
+                let physical_kv_tokens = image.ingest.kv_effect(step_index)?;
+                let physical_bound = match physical_kv_tokens {
+                    uniserve_core::ImageKvEffect::Exact { tokens } => tokens,
+                    uniserve_core::ImageKvEffect::Bounded { max_tokens } => max_tokens,
+                    uniserve_core::ImageKvEffect::WorkerDefined => match step {
+                        uniserve_core::ImageIngestStep::VaeEncode => {
+                            self.cap_max_vae_grid_tokens().min(u32::MAX as usize) as u32
+                        }
+                        uniserve_core::ImageIngestStep::VitEncode => self.caps.max_vit_grid_tokens,
+                    },
+                };
+                if !self.bm.ensure_capacity(
+                    id,
+                    projection.physical_kv_len.saturating_add(physical_bound) as usize,
+                ) {
+                    return None;
+                }
+                let new_blocks = self.take_new_blocks(id);
+                return self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::IngestImageState {
+                        segment_index: image.segment_index,
+                        step_index,
+                        is_final_step,
+                        position: projection.logical_pos,
+                        logical_positions: image.ingest.logical_positions,
+                        physical_kv_tokens,
+                        feature,
+                        new_blocks,
+                    },
+                );
+            }
             let cache_read = state.req.cache.read;
             let cache_write = state.req.cache.write;
             let cache_key = encoder_cache_key(image.hash, step_index, step);
             let cached = if cache_read {
-                self.enc_cache.lookup_output(cache_key)
+                self.enc_cache.lookup_product(cache_key)
             } else {
                 None
             };
-            let cache_hit = cached.is_some();
-            let persistent_cache_key = (cache_hit || cache_write).then_some(cache_key);
-            let encoder_input = cached.map(|output| output.handle).or(staged_image);
-            let new_blocks = self.take_new_blocks(id);
+            if let Some(cached_product) = cached {
+                let product = self.enc_cache.acquire(cache_key)?;
+                if product != cached_product {
+                    return None;
+                }
+                let Some(state) = self.running.get_mut(&id) else {
+                    let _ = self.enc_cache.release(cache_key, &product);
+                    return None;
+                };
+                state.ingest.acquired_encoder_pins.push(EncoderCachePin {
+                    key: cache_key,
+                    product: product.clone(),
+                });
+                state.ingest.encoded_product = Some(product);
+                state.lifecycle.phase = Phase::IngestState;
+                return self.next_context_ingest_transition(id, budget, projection);
+            }
+            let persistent_cache_key = cache_write.then_some(cache_key);
             return self.plan_intent(
                 id,
                 projection,
-                TransitionIntent::IngestImage {
+                TransitionIntent::EncodeImage {
                     segment_index: image.segment_index,
                     step_index,
                     step,
-                    is_final_step,
-                    position: projection.logical_pos,
-                    logical_positions: image.ingest.logical_positions,
-                    physical_kv_tokens: image.ingest.kv_effect(step_index)?,
                     encoder_cache_key: persistent_cache_key,
-                    cache_hit,
                     image_b64: image.b64.clone(),
-                    staged_image: encoder_input,
-                    new_blocks,
+                    source_product: None,
                 },
             );
         }
@@ -4341,6 +4405,108 @@ impl Scheduler {
         match operation_variant {
             WorkVariant::TokenExtend => {
                 self.bm.activate(id);
+                match &transition.delta {
+                    crate::generation::TransitionDelta::IngestImageState {
+                        is_final_step, ..
+                    } => {
+                        if *is_final_step {
+                            self.release_transient_products(id);
+                        }
+                        if *is_final_step
+                            && self.running.get(&id).is_some_and(|st| {
+                                st.ingest.mm_cursor >= st.context.images.len()
+                                    && st.ingest.prompt_cursor >= st.context.prompt_ids.len() as u32
+                            })
+                        {
+                            let bos = self.ctrl.bos;
+                            if let Some(st) = self.running.get_mut(&id) {
+                                st.und.next_token = bos;
+                                st.und.round_tokens.clear();
+                                st.lifecycle.phase = Phase::DecodeUnd;
+                            }
+                        }
+                        return;
+                    }
+                    crate::generation::TransitionDelta::FeedbackState { is_final_step, .. } => {
+                        if !is_final_step {
+                            return;
+                        }
+                        self.release_transient_products(id);
+                        let sample_continuation = self
+                            .running
+                            .get(&id)
+                            .and_then(|st| st.req.policy.feedback.as_ref())
+                            .is_some_and(|feedback| feedback.sample_continuation);
+                        if let Some(st) = self.running.get_mut(&id) {
+                            st.image_gen.images_done += 1;
+                            st.und.text_since_image = 0;
+                            st.und.round_tokens.clear();
+                        }
+                        if !sample_continuation {
+                            let Some(next_token) = self.feedback_next_token(id) else {
+                                return self.finish(id, FinishReason::Error);
+                            };
+                            if let Some(st) = self.running.get_mut(&id) {
+                                st.und.next_token = next_token;
+                                st.lifecycle.phase = Phase::DecodeUnd;
+                            }
+                            return;
+                        }
+                        let Some(tok) = view.committed_tokens.last().copied() else {
+                            return self.finish(id, FinishReason::Error);
+                        };
+                        let (can_open_gen_branch, images_done, max_images) = {
+                            let st = self.running.get_mut(&id).unwrap();
+                            st.und.tokens_emitted += 1;
+                            (
+                                st.can_open_gen_branch(),
+                                st.image_gen.images_done,
+                                st.req.image.max_images as usize,
+                            )
+                        };
+                        let direct_trigger = self
+                            .running
+                            .get(&id)
+                            .is_some_and(|state| Self::direct_trigger_matches(state, tok));
+                        if direct_trigger && can_open_gen_branch && images_done < max_images {
+                            self.begin_image(id);
+                            return;
+                        }
+                        let tok = if direct_trigger {
+                            tok.wrapping_add(1)
+                        } else {
+                            tok
+                        };
+                        if self.emit_or_finish_und_token(
+                            id,
+                            tok,
+                            view.sampled_logprob,
+                            Some(view.top_logprobs.clone()),
+                            true,
+                        ) {
+                            return;
+                        }
+                        if let Some(st) = self.running.get_mut(&id) {
+                            st.und.next_token = tok;
+                            st.lifecycle.phase = Phase::DecodeUnd;
+                            st.und.round_tokens.push(tok);
+                        }
+                        if !self.advance_grammar(id, tok) {
+                            return;
+                        }
+                        if can_open_gen_branch
+                            && images_done < max_images
+                            && self
+                                .running
+                                .get(&id)
+                                .is_some_and(Self::generated_trigger_matches)
+                        {
+                            self.begin_image(id);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 // chunked prefill: a prefill op may only have consumed part of
                 // the prompt; if so, advance the cursor and stay in Prefill.
                 let (cursor, prompt_len) = {
@@ -4479,251 +4645,156 @@ impl Scheduler {
                 // count reaches `image.steps` (see the `Phase::DenoiseGen`
                 // planner); a worker completion flag does not drive termination.
             }
-            WorkVariant::Materialize | WorkVariant::TransferKvInstall => {
-                if operation_variant == WorkVariant::TransferKvInstall
-                    && let Some(st) = self.running.get_mut(&id)
-                {
-                    if view.committed_tokens.is_empty()
-                        && let Some(token) = st.feedback.sampled_token.take()
-                    {
-                        view.committed_tokens.push(token);
-                    }
-                    view.sampled_logprob =
-                        view.sampled_logprob.or(st.feedback.sampled_logprob.take());
-                    if view.top_logprobs.is_empty()
-                        && let Some(top_logprobs) = st.feedback.top_logprobs.take()
-                    {
-                        view.top_logprobs = top_logprobs;
-                    }
-                }
-                if operation_variant == WorkVariant::Materialize {
-                    let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
-                    self.emit(id, GenEvent::ImageCommit { image_id });
-                }
+            WorkVariant::Materialize => {
+                let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
+                self.emit(id, GenEvent::ImageCommit { image_id });
                 let image = view.image_png.clone();
-                if operation_variant == WorkVariant::Materialize
-                    && self
-                        .running
-                        .get(&id)
-                        .is_some_and(Self::reingests_generated_image)
-                {
-                    let Some(image_b64) = image.clone() else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
-                    let Some(event) = image_done_event(image_id, image_b64.clone()) else {
+                if let Some(image_b64) = image.clone() {
+                    let Some(event) = image_done_event(image_id, image_b64) else {
                         return self.finish(id, FinishReason::Error);
                     };
                     self.emit(id, event);
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.feedback.image_b64 = Some(image_b64);
-                        st.feedback.ingest_step = 0;
-                        st.feedback.staged_image = None;
-                        st.lifecycle.phase = Phase::FeedbackIngest;
-                    }
-                    return;
-                }
-                if operation_variant == WorkVariant::Materialize
-                    && self
-                        .running
-                        .get(&id)
-                        .is_some_and(Self::commit_requires_writeback)
-                {
-                    let Some(locator) = view.kv_product.clone() else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.feedback.locator = Some(locator);
-                        st.feedback.sampled_token = view.committed_tokens.last().copied();
-                        st.feedback.sampled_logprob = view.sampled_logprob;
-                        st.feedback.top_logprobs =
-                            (!view.top_logprobs.is_empty()).then(|| view.top_logprobs.clone());
-                        st.lifecycle.phase = Phase::CommitWriteback;
-                    }
-                    if let Some(b64) = image {
-                        let image_id = self
-                            .running
-                            .get(&id)
-                            .map(|st| st.image_gen.image_id)
-                            .unwrap_or(0);
-                        let Some(event) = image_done_event(image_id, b64) else {
-                            return self.finish(id, FinishReason::Error);
-                        };
-                        self.emit(id, event);
-                    }
-                    return;
                 }
                 self.bm.activate(id);
-                let (image_id, continues_after_gen_commit) = {
+                let (continues_after_gen_commit, feedback_source) = {
                     let st = self.running.get(&id).unwrap();
-                    (st.image_gen.image_id, st.continues_after_gen_commit())
+                    (
+                        st.continues_after_gen_commit(),
+                        st.req
+                            .policy
+                            .feedback
+                            .as_ref()
+                            .map(|feedback| feedback.source.clone()),
+                    )
                 };
-                if let Some(b64) = image {
-                    let Some(event) = image_done_event(image_id, b64) else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    self.emit(id, event);
-                }
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.image_gen.images_done += 1;
-                    st.und.text_since_image = 0;
-                }
-                // pure t2i finishes after one image; generated branch round-trips
-                // back to text (text → image → text → image …). Termination then
-                // happens in DecodeUnd on a genuine terminal condition (EOS or
-                // max_tokens) or from a commit-side EOS reported by the worker.
                 if continues_after_gen_commit {
-                    if let Some(tok) = view.committed_tokens.last().copied() {
-                        let (can_open_gen_branch, images_done, max_images) = {
-                            let st = self.running.get_mut(&id).unwrap();
-                            st.und.tokens_emitted += 1;
-                            (
-                                st.can_open_gen_branch(),
-                                st.image_gen.images_done,
-                                st.req.image.max_images as usize,
-                            )
-                        };
-                        if self
-                            .running
-                            .get(&id)
-                            .is_some_and(|state| Self::direct_trigger_matches(state, tok))
-                            && can_open_gen_branch
-                            && images_done < max_images
-                        {
-                            self.begin_image(id);
-                            return;
-                        }
-                        if self.emit_or_finish_und_token(
-                            id,
-                            tok,
-                            view.sampled_logprob,
-                            Some(view.top_logprobs.clone()),
-                            true,
-                        ) {
-                            return;
-                        }
-                        if let Some(st) = self.running.get_mut(&id) {
-                            st.und.next_token = tok;
-                            st.lifecycle.phase = Phase::DecodeUnd;
-                            st.und.round_tokens.push(tok);
-                        }
-                        if !self.advance_grammar(id, tok) {
-                            return;
-                        }
-                        if can_open_gen_branch
-                            && images_done < max_images
-                            && self
-                                .running
-                                .get(&id)
-                                .is_some_and(Self::generated_trigger_matches)
-                        {
-                            self.begin_image(id);
-                        }
-                        return;
-                    }
-                    let next_token = self.feedback_next_token(id);
-                    let Some(next_token) = next_token else {
+                    let Some(feedback_source) = feedback_source else {
                         return self.finish(id, FinishReason::Error);
                     };
+                    let source_product = transition.operation.as_ref().and_then(|operation| {
+                        operation
+                            .outputs
+                            .iter()
+                            .find(|product| {
+                                product.storage_class
+                                    == uniserve_worker_wire::StorageClass::LatentArena
+                                    && product.kind == uniserve_worker_wire::ProductKind::Artifact
+                            })
+                            .cloned()
+                    });
+                    if feedback_source == uniserve_core::FeedbackSource::DeviceProduct
+                        && source_product.is_none()
+                    {
+                        return self.finish(id, FinishReason::Error);
+                    }
+                    if feedback_source == uniserve_core::FeedbackSource::ArtifactProduct
+                        && image.is_none()
+                    {
+                        return self.finish(id, FinishReason::Error);
+                    }
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.lifecycle.phase = Phase::DecodeUnd;
-                        st.und.next_token = next_token;
+                        st.feedback.image_b64 = image;
+                        st.feedback.ingest_step = 0;
+                        st.feedback.source_product = source_product;
+                        st.feedback.encoded_product = None;
+                        st.lifecycle.phase = Phase::FeedbackEncode;
+                        if let Some(generation) = st
+                            .feedback
+                            .source_product
+                            .as_ref()
+                            .map(|source| source.generation)
+                        {
+                            st.ingest
+                                .transient_encoder_handles
+                                .push(u64::from(generation));
+                        }
                     }
                 } else {
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.image_gen.images_done += 1;
+                        st.und.text_since_image = 0;
+                    }
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
             WorkVariant::EncodeVision | WorkVariant::EncodeLatent => match &transition.delta {
-                crate::generation::TransitionDelta::IngestImageStep {
-                    is_final_step,
-                    encoder_cache_key,
-                    cache_hit,
-                    ..
+                crate::generation::TransitionDelta::EncodeImageStep {
+                    encoder_cache_key, ..
                 } => {
-                    let result_handle = view.encode_generation.map(u64::from).unwrap_or(0);
-                    if result_handle == 0 {
+                    let Some(feature) = transition.operation.as_ref().and_then(|operation| {
+                        operation
+                            .outputs
+                            .iter()
+                            .find(|product| {
+                                matches!(
+                                    product.kind,
+                                    uniserve_worker_wire::ProductKind::VisionFeature
+                                        | uniserve_worker_wire::ProductKind::LatentFeature
+                                )
+                            })
+                            .cloned()
+                    }) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    let result_handle = u64::from(feature.generation);
+                    if result_handle == 0
+                        || view.encode_generation.map(u64::from) != Some(result_handle)
+                    {
                         return self.finish(id, FinishReason::Error);
                     }
-                    let mut active_handle = result_handle;
                     let mut free_handles = Vec::new();
-                    if !cache_hit {
-                        if let Some(cache_key) = encoder_cache_key {
-                            if let Some(freed) = self.enc_cache.insert_output(
-                                *cache_key,
-                                result_handle,
-                                view.kv_visible_len,
-                            ) {
-                                free_handles.push(freed);
-                            }
-                            let Some(handle) = self.enc_cache.acquire(*cache_key) else {
-                                return self.finish(id, FinishReason::Error);
-                            };
-                            active_handle = handle;
-                            if let Some(st) = self.running.get_mut(&id) {
-                                st.ingest.acquired_encoder_pins.push(EncoderCachePin {
-                                    key: *cache_key,
-                                    handle,
-                                });
-                            }
-                        } else if let Some(st) = self.running.get_mut(&id) {
-                            st.ingest.transient_encoder_handles.push(result_handle);
+                    let selected_product = if let Some(cache_key) = encoder_cache_key {
+                        if let Some(freed) = self.enc_cache.insert(*cache_key, feature.clone()) {
+                            free_handles.push(u64::from(freed.generation));
                         }
-                    }
-                    let bos = self.ctrl.bos;
+                        let Some(product) = self.enc_cache.acquire(*cache_key) else {
+                            return self.finish(id, FinishReason::Error);
+                        };
+                        if let Some(st) = self.running.get_mut(&id) {
+                            st.ingest.acquired_encoder_pins.push(EncoderCachePin {
+                                key: *cache_key,
+                                product: product.clone(),
+                            });
+                        }
+                        product
+                    } else if let Some(st) = self.running.get_mut(&id) {
+                        st.ingest.transient_encoder_handles.push(result_handle);
+                        feature.clone()
+                    } else {
+                        feature.clone()
+                    };
                     if let Some(st) = self.running.get_mut(&id) {
-                        if *is_final_step {
-                            st.ingest.staged_image = None;
-                            free_handles.append(&mut st.ingest.transient_encoder_handles);
-                            if st.ingest.mm_cursor >= st.context.images.len()
-                                && st.ingest.prompt_cursor >= st.context.prompt_ids.len() as u32
-                            {
-                                st.und.next_token = bos;
-                                st.und.round_tokens.clear();
-                                st.lifecycle.phase = Phase::DecodeUnd;
-                            }
-                        } else {
-                            st.ingest.staged_image = Some(active_handle);
-                        }
+                        st.ingest.encoded_product = Some(selected_product);
+                        st.lifecycle.phase = Phase::IngestState;
                     }
                     if !free_handles.is_empty() {
                         self.gated_control(ControlOp::ReleaseProducts(free_handles));
                     }
                 }
-                crate::generation::TransitionDelta::FeedbackIngestStep {
-                    is_final_step, ..
-                } => {
-                    let Some(handle) = view
-                        .encode_generation
-                        .map(u64::from)
-                        .filter(|handle| *handle != 0)
-                    else {
+                crate::generation::TransitionDelta::EncodeFeedbackStep { .. } => {
+                    let Some(feature) = transition.operation.as_ref().and_then(|operation| {
+                        operation
+                            .outputs
+                            .iter()
+                            .find(|product| {
+                                matches!(
+                                    product.kind,
+                                    uniserve_worker_wire::ProductKind::VisionFeature
+                                        | uniserve_worker_wire::ProductKind::LatentFeature
+                                )
+                            })
+                            .cloned()
+                    }) else {
                         return self.finish(id, FinishReason::Error);
                     };
-                    let mut free_handles = Vec::new();
+                    let handle = u64::from(feature.generation);
+                    if handle == 0 || view.encode_generation.map(u64::from) != Some(handle) {
+                        return self.finish(id, FinishReason::Error);
+                    }
                     if let Some(st) = self.running.get_mut(&id) {
                         st.ingest.transient_encoder_handles.push(handle);
-                        if *is_final_step {
-                            st.feedback.staged_image = None;
-                            free_handles.append(&mut st.ingest.transient_encoder_handles);
-                        } else {
-                            st.feedback.staged_image = Some(handle);
-                        }
-                    }
-                    if !free_handles.is_empty() {
-                        self.gated_control(ControlOp::ReleaseProducts(free_handles));
-                    }
-                    if !is_final_step {
-                        return;
-                    }
-                    let Some(next_token) = self.feedback_next_token(id) else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.image_gen.images_done += 1;
-                        st.und.text_since_image = 0;
-                        st.und.next_token = next_token;
-                        st.und.round_tokens.clear();
-                        st.lifecycle.phase = Phase::DecodeUnd;
+                        st.feedback.encoded_product = Some(feature);
+                        st.lifecycle.phase = Phase::FeedbackState;
                     }
                 }
                 _ => self.finish(id, FinishReason::Error),
@@ -4733,7 +4804,8 @@ impl Scheduler {
             | WorkVariant::Draft
             | WorkVariant::GenTransition
             | WorkVariant::TransferProduct
-            | WorkVariant::TransferKvPublish => {}
+            | WorkVariant::TransferKvPublish
+            | WorkVariant::TransferKvInstall => {}
         }
     }
 
@@ -4764,6 +4836,17 @@ impl Scheduler {
                     .collect(),
             },
         );
+    }
+
+    fn release_transient_products(&mut self, id: RequestId) {
+        let handles = self
+            .running
+            .get_mut(&id)
+            .map(|state| std::mem::take(&mut state.ingest.transient_encoder_handles))
+            .unwrap_or_default();
+        if !handles.is_empty() {
+            self.gated_control(ControlOp::ReleaseProducts(handles));
+        }
     }
 
     fn record_gen_trigger_for_replay(&mut self, id: RequestId) {
@@ -5022,8 +5105,8 @@ impl Scheduler {
             }
             let mut free_encoder_handles = std::mem::take(&mut st.ingest.transient_encoder_handles);
             for pin in &st.ingest.acquired_encoder_pins {
-                if let Some(handle) = self.enc_cache.release(pin.key, pin.handle) {
-                    free_encoder_handles.push(handle);
+                if let Some(product) = self.enc_cache.release(pin.key, &pin.product) {
+                    free_encoder_handles.push(u64::from(product.generation));
                 }
             }
             if !free_encoder_handles.is_empty() {
@@ -5067,7 +5150,12 @@ impl Scheduler {
     fn reset_encoder_cache(&mut self) {
         let freed = self.enc_cache.clear();
         if !freed.is_empty() {
-            self.gated_control(ControlOp::ReleaseProducts(freed));
+            self.gated_control(ControlOp::ReleaseProducts(
+                freed
+                    .into_iter()
+                    .map(|product| u64::from(product.generation))
+                    .collect(),
+            ));
         }
     }
 
@@ -5148,9 +5236,18 @@ fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
 }
 
 fn operation_trace(transition: &PlannedTransition) -> serde_json::Value {
+    let parent_kind = transition
+        .operation
+        .as_ref()
+        .map(|operation| match operation.parent.point {
+            Point::Fixed { .. } => "fixed",
+            Point::Device { .. } => "device",
+        });
     json!({
         "work": transition.operation_variant.as_wire_str(),
         "domain": format!("{:?}", transition.domain),
+        "parent_kind": parent_kind,
+        "predicated": transition.predicate.is_some(),
         "token_cost": transition.token_cost,
         "draft_count": transition.draft_token_ids.len(),
         "new_blocks": transition.new_blocks.len(),

@@ -6,10 +6,7 @@ import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from threading import RLock
-from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
-
-if TYPE_CHECKING:
-    import torch
+from typing import Protocol, TypeAlias, cast
 
 from ..batch import (
     Admission,
@@ -47,17 +44,6 @@ class ScratchStore(Protocol):
 TransactionalStore: TypeAlias = SnapshotStore | ScratchStore
 
 
-@dataclass(frozen=True, slots=True)
-class SampledTokenRelay:
-    """Immutable device-resident token shared by transactional session snapshots."""
-
-    tensor: torch.Tensor
-
-    def __deepcopy__(self, memo: dict[int, object]) -> SampledTokenRelay:
-        memo[id(self)] = self
-        return self
-
-
 @dataclass(slots=True)
 class RequestSession:
     """All worker-owned scalar state and logical handles for one request.
@@ -66,7 +52,9 @@ class RequestSession:
     accounting point index of that committed version, ``committed_op_id`` its
     producer operation, and ``committed_digest`` its semantic digest; together
     they reconstruct the committed :class:`VersionRef` a successor's ``parent``
-    must name exactly.
+    must name exactly. ``logical_position`` is independent model accounting: it
+    is the absolute semantic position consumed by token and multimodal RoPE and
+    is never used as lineage identity.
     """
 
     request_key: RequestKey
@@ -81,7 +69,7 @@ class RequestSession:
     latent_handle: int | None = None
     product_handles: set[int] = field(default_factory=set)
     prompt_logits_handle: int | None = None
-    last_sampled_token: int | SampledTokenRelay | None = None
+    logical_position: int = 0
     flow_step: int = 0
     rng_counter: int = 0
     last_op_id: int | None = None
@@ -451,7 +439,6 @@ def cast_snapshot_store(value: object) -> SnapshotStore:
 
 __all__ = [
     "RequestSession",
-    "SampledTokenRelay",
     "SessionStore",
     "StepTxn",
     "TransactionalStore",

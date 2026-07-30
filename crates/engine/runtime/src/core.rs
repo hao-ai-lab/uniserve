@@ -162,7 +162,6 @@ pub struct EngineCore {
     model_name: String,
     model_dtype: ModelDtype,
     max_model_len: u32,
-    generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities,
     sleeping: Arc<AtomicBool>,
     /// Engine-dead latch: set when the scheduler loop exits fatally (worker
     /// death) or panics.
@@ -350,7 +349,6 @@ impl EngineCore {
 
     fn assemble(config: EngineCoreConfig, executor: Box<dyn Executor>) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
-        let generated_image_commit = executor.generated_image_commit_capabilities();
         // Capture the command waker before the executor moves into the
         // scheduler: when the executor is event-driven this fires its park's
         // command notifier; otherwise it is the no-op waker.
@@ -400,7 +398,6 @@ impl EngineCore {
             model_name: config.model,
             model_dtype,
             max_model_len: config.max_model_len,
-            generated_image_commit,
             sleeping: Arc::new(AtomicBool::new(false)),
             dead,
             next_id: AtomicU64::new(1),
@@ -430,8 +427,6 @@ impl EngineCore {
             supports_latent_encode: supports(WorkVariant::EncodeLatent),
             supports_image_generation: supports(WorkVariant::GenFlow)
                 && supports(WorkVariant::Materialize),
-            supports_commit_writeback: supports(WorkVariant::TransferKvPublish)
-                || supports(WorkVariant::TransferKvInstall),
             max_latent_units: u64::from(caps.max_latent_size),
             latent_downsample: caps.latent_downsample,
             max_vae_grid_tokens: if caps.max_vae_grid_tokens > 0 {
@@ -440,12 +435,13 @@ impl EngineCore {
                 caps.max_latent_size
             },
             max_vit_grid_tokens: caps.max_vit_grid_tokens,
+            max_latent_feature_bytes: caps.max_latent_feature_bytes,
+            max_vision_feature_bytes: caps.max_vision_feature_bytes,
             commit_marker_tokens: caps.commit_marker_tokens,
             max_cfg_branches: caps.max_cfg_branches,
             scratch_capacity_tokens: caps.scratch_capacity_tokens,
             scratch_block_size: caps.block_size,
             encoder_cache_entries: caps.encoder_cache_budget,
-            generated_image_commit: self.generated_image_commit,
         }
     }
 

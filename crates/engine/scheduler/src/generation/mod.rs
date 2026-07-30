@@ -1,15 +1,14 @@
 use std::collections::HashSet;
 
-use uniserve_core::product_blob::{LogprobBlob, RankedToken};
+use uniserve_core::product_blob::LogprobBlob;
 use uniserve_core::{
     BlockId, CfgParams, ContextSegment, GenerationRequest, ImageIngestRecipe, ImageIngestStep,
     ImageKvEffect, RequestId, SegmentPlacement, UndTokenAction,
 };
 use uniserve_worker_wire::{
-    Bounds, CompletionRecord, DType, Domain, EncodeMode, GenMode, OpId, Operation, Point,
+    Bounds, CompletionRecord, DType, DimBound, Domain, EncodeMode, GenMode, OpId, Operation, Point,
     PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, Rng, RouteId,
-    ShapeBound, StorageClass, TokenMode, TransferMode, VersionRef, Work, WorkVariant,
-    encode_token_product_bytes,
+    ShapeBound, StorageClass, TokenMode, VersionRef, Work, WorkVariant, encode_token_product_bytes,
 };
 
 use crate::image_artifact::png_artifact_dims_b64;
@@ -41,6 +40,64 @@ fn output_product(
     }
 }
 
+fn bounded_product(
+    output_index: u16,
+    kind: ProductKind,
+    storage_class: StorageClass,
+    dtype: DType,
+    shape_bound: ShapeBound,
+) -> ProductRef {
+    let mut product = output_product(output_index, kind, storage_class, dtype);
+    product.shape_bound = shape_bound;
+    product
+}
+
+fn dtype_bytes(dtype: DType) -> u64 {
+    match dtype {
+        DType::U8 => 1,
+        DType::U16 | DType::F16 | DType::BF16 => 2,
+        DType::U32 | DType::I32 | DType::F32 => 4,
+        DType::I64 => 8,
+    }
+}
+
+fn product_bound_bytes(product: &ProductRef) -> u64 {
+    product
+        .shape_bound
+        .dims
+        .iter()
+        .fold(1_u64, |elements, dim| {
+            elements.saturating_mul(u64::from(match dim {
+                DimBound::Static(value) => *value,
+                DimBound::Device { max } => *max,
+            }))
+        })
+        .saturating_mul(dtype_bytes(product.dtype))
+}
+
+fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, PlanningError> {
+    let elements = bytes.div_ceil(dtype_bytes(dtype));
+    let max = u32::try_from(elements)
+        .map_err(|_| PlanningError::ProductBoundExceedsProtocol { bytes })?;
+    if max == 0 {
+        return Err(PlanningError::MissingProductBound);
+    }
+    Ok(ShapeBound {
+        dims: vec![DimBound::Device { max }],
+    })
+}
+
+fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
+    let raw = u64::from(height)
+        .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
+        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+    let png = raw
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1 << 20))
+        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+    Ok(png.div_ceil(3).saturating_mul(4))
+}
+
 /// A host-supplied input product reference for an operation's forward, owned by
 /// the consuming operation's identity at a reserved input index so it never
 /// collides with the operation's declared outputs. Its value is carried in the
@@ -50,8 +107,16 @@ fn host_input_product(
     op_id: OpId,
     kind: ProductKind,
     dtype: DType,
-) -> ProductRef {
-    ProductRef {
+    elements: usize,
+) -> Result<ProductRef, PlanningError> {
+    let extent =
+        u32::try_from(elements).map_err(|_| PlanningError::ProductBoundExceedsProtocol {
+            bytes: (elements as u64).saturating_mul(dtype_bytes(dtype)),
+        })?;
+    if extent == 0 {
+        return Err(PlanningError::MissingProductBound);
+    }
+    Ok(ProductRef {
         request_key,
         producer_op_id: op_id,
         output_index: HOST_INPUT_OUTPUT_INDEX,
@@ -59,9 +124,11 @@ fn host_input_product(
         kind,
         storage_class: StorageClass::HostStaging,
         dtype,
-        shape_bound: ShapeBound::default(),
+        shape_bound: ShapeBound {
+            dims: vec![DimBound::Static(extent)],
+        },
         point_range: PointRange::default(),
-    }
+    })
 }
 
 /// The declared outputs of a token operation: a committed-token product, an
@@ -89,6 +156,35 @@ fn token_outputs(logprobs: bool, publishes_conditioning: bool) -> Vec<ProductRef
             StorageClass::PagedKv,
             DType::BF16,
         ));
+    }
+    outputs
+}
+
+/// Products emitted by the state-advancing feedback extend. The completion
+/// predicate identifies the final feedback state transition independently of
+/// whether the dialect also requests a sampled continuation token.
+fn feedback_state_outputs(logprobs: bool, sample_continuation: bool) -> Vec<ProductRef> {
+    let mut outputs = vec![output_product(
+        0,
+        ProductKind::Completion,
+        StorageClass::DeviceTensor,
+        DType::U8,
+    )];
+    if sample_continuation {
+        outputs.push(output_product(
+            1,
+            ProductKind::Token,
+            StorageClass::DeviceTensor,
+            DType::U32,
+        ));
+        if logprobs {
+            outputs.push(output_product(
+                2,
+                ProductKind::Logprob,
+                StorageClass::HostStaging,
+                DType::U8,
+            ));
+        }
     }
     outputs
 }
@@ -195,12 +291,13 @@ pub(crate) enum ContextLoweringError {
 pub enum GenerationPhase {
     /// Encode staged input images before continuing text prefill.
     Encode,
+    IngestState,
     Prefill,
     DecodeUnd,
     DenoiseGen,
     CommitGen,
-    CommitWriteback,
-    FeedbackIngest,
+    FeedbackEncode,
+    FeedbackState,
 }
 
 /// Scheduler-owned cursor for one running request. Each mutable concern has a
@@ -234,7 +331,7 @@ impl GenerationCursor {
                 acquired_encoder_pins: Vec::new(),
                 transient_encoder_handles: Vec::new(),
                 pending_image_step: 0,
-                staged_image: None,
+                encoded_product: None,
                 round_closing: false,
             },
             und: UndCursor {
@@ -255,13 +352,10 @@ impl GenerationCursor {
                 conditioning: None,
             },
             feedback: FeedbackCursor {
-                locator: None,
-                sampled_token: None,
-                sampled_logprob: None,
-                top_logprobs: None,
                 image_b64: None,
                 ingest_step: 0,
-                staged_image: None,
+                source_product: None,
+                encoded_product: None,
             },
             resources: ResourceCursor {
                 worker_registered: false,
@@ -290,7 +384,7 @@ impl GenerationCursor {
         &mut self,
         transition: &PlannedTransition,
         record: &CompletionRecord,
-        products: &[ProductPayload],
+        _products: &[ProductPayload],
     ) -> Result<(), CursorApplyError> {
         let op_id = transition.operation.as_ref().map_or(0, |op| op.op_id.0);
         if op_id == 0 {
@@ -318,7 +412,8 @@ impl GenerationCursor {
                     .physical_kv_len
                     .max(physical_start.saturating_add(count));
             }
-            TransitionDelta::IngestImageStep {
+            TransitionDelta::EncodeImageStep { .. } => {}
+            TransitionDelta::IngestImageState {
                 step_index,
                 is_final_step,
                 position,
@@ -336,10 +431,11 @@ impl GenerationCursor {
                         .max(position.saturating_add(logical_positions));
                     self.ingest.mm_cursor = self.ingest.mm_cursor.saturating_add(1);
                     self.ingest.pending_image_step = 0;
-                    self.ingest.staged_image = None;
+                    self.ingest.encoded_product = None;
                     self.lifecycle.phase = GenerationPhase::Prefill;
                 } else {
                     self.ingest.pending_image_step = step_index.saturating_add(1);
+                    self.ingest.encoded_product = None;
                     self.lifecycle.phase = GenerationPhase::Encode;
                 }
             }
@@ -369,47 +465,8 @@ impl GenerationCursor {
                     .steps_done
                     .max(steps_completed.max(start_step.saturating_add(step_count)));
             }
-            TransitionDelta::CommitGen {
-                logical_position,
-                physical_position,
-                logical_positions,
-                physical_kv_tokens,
-                ..
-            } => {
-                // A commit that writes its image KV back publishes a KV product;
-                // that defers the KV advance to the writeback transfer, so it is
-                // only applied here for a direct commit that publishes no KV.
-                let has_locator = find_product(products, record.op_id, ProductKind::Kv).is_some();
-                if !has_locator && physical_kv_tokens.is_some() {
-                    let added = record.logical_lengths.kv_visible_len;
-                    self.und.logical_pos = self
-                        .und
-                        .logical_pos
-                        .max(logical_position.saturating_add(logical_positions));
-                    self.und.physical_kv_len = self
-                        .und
-                        .physical_kv_len
-                        .max(physical_position.saturating_add(added));
-                }
-            }
-            TransitionDelta::Feedback {
-                logical_position,
-                physical_position,
-                logical_positions,
-                ..
-            } => {
-                let added = record.logical_lengths.kv_visible_len;
-                self.und.logical_pos = self
-                    .und
-                    .logical_pos
-                    .max(logical_position.saturating_add(logical_positions));
-                self.und.physical_kv_len = self
-                    .und
-                    .physical_kv_len
-                    .max(physical_position.saturating_add(added));
-                self.feedback.locator = None;
-            }
-            TransitionDelta::FeedbackIngestStep {
+            TransitionDelta::CommitGen { .. } | TransitionDelta::EncodeFeedbackStep { .. } => {}
+            TransitionDelta::FeedbackState {
                 step_index,
                 is_final_step,
                 position,
@@ -427,11 +484,13 @@ impl GenerationCursor {
                         .max(position.saturating_add(logical_positions));
                     self.feedback.image_b64 = None;
                     self.feedback.ingest_step = 0;
-                    self.feedback.staged_image = None;
+                    self.feedback.source_product = None;
+                    self.feedback.encoded_product = None;
                     self.lifecycle.phase = GenerationPhase::DecodeUnd;
                 } else {
                     self.feedback.ingest_step = step_index.saturating_add(1);
-                    self.lifecycle.phase = GenerationPhase::FeedbackIngest;
+                    self.feedback.encoded_product = None;
+                    self.lifecycle.phase = GenerationPhase::FeedbackEncode;
                 }
             }
         }
@@ -516,14 +575,14 @@ pub struct ContextCursor {
     pub(crate) acquired_encoder_pins: Vec<EncoderCachePin>,
     pub(crate) transient_encoder_handles: Vec<u64>,
     pub(crate) pending_image_step: usize,
-    pub(crate) staged_image: Option<u64>,
+    pub(crate) encoded_product: Option<ProductRef>,
     pub(crate) round_closing: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncoderCachePin {
     pub(crate) key: u64,
-    pub(crate) handle: u64,
+    pub(crate) product: ProductRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,15 +610,10 @@ pub struct GenCursor {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedbackCursor {
-    /// The committed KV product the writeback transfer installs, captured from
-    /// the commit operation's completion products.
-    pub(crate) locator: Option<ProductRef>,
-    pub(crate) sampled_token: Option<u32>,
-    pub(crate) sampled_logprob: Option<f32>,
-    pub(crate) top_logprobs: Option<Vec<RankedToken>>,
     pub(crate) image_b64: Option<String>,
     pub(crate) ingest_step: usize,
-    pub(crate) staged_image: Option<u64>,
+    pub(crate) source_product: Option<ProductRef>,
+    pub(crate) encoded_product: Option<ProductRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -609,7 +663,8 @@ impl CursorProjection {
                     .physical_kv_len
                     .max(physical_start.saturating_add(count));
             }
-            TransitionDelta::IngestImageStep {
+            TransitionDelta::EncodeImageStep { .. } => {}
+            TransitionDelta::IngestImageState {
                 position,
                 logical_positions,
                 physical_kv_tokens,
@@ -638,35 +693,8 @@ impl CursorProjection {
                     .max(physical_position.saturating_add(1));
             }
             TransitionDelta::DenoiseGen { .. } => {}
-            TransitionDelta::CommitGen {
-                logical_position,
-                physical_position,
-                logical_positions,
-                physical_kv_tokens,
-                ..
-            }
-            | TransitionDelta::Feedback {
-                logical_position,
-                physical_position,
-                logical_positions,
-                physical_kv_tokens,
-                ..
-            } => {
-                self.logical_pos = self
-                    .logical_pos
-                    .max(logical_position.saturating_add(logical_positions));
-                if let Some(effect) = physical_kv_tokens {
-                    let physical = match effect {
-                        ImageKvEffect::Exact { tokens } => tokens,
-                        ImageKvEffect::Bounded { max_tokens } => max_tokens,
-                        ImageKvEffect::WorkerDefined => 0,
-                    };
-                    self.physical_kv_len = self
-                        .physical_kv_len
-                        .max(physical_position.saturating_add(physical));
-                }
-            }
-            TransitionDelta::FeedbackIngestStep {
+            TransitionDelta::CommitGen { .. } | TransitionDelta::EncodeFeedbackStep { .. } => {}
+            TransitionDelta::FeedbackState {
                 position,
                 logical_positions,
                 physical_kv_tokens,
@@ -704,18 +732,22 @@ pub(crate) enum TransitionIntent {
         new_blocks: Vec<BlockId>,
         allowed_tokens: Option<Vec<u32>>,
     },
-    IngestImage {
+    EncodeImage {
         segment_index: usize,
         step_index: usize,
         step: ImageIngestStep,
+        encoder_cache_key: Option<u64>,
+        image_b64: String,
+        source_product: Option<ProductRef>,
+    },
+    IngestImageState {
+        segment_index: usize,
+        step_index: usize,
         is_final_step: bool,
         position: u32,
         logical_positions: u32,
         physical_kv_tokens: ImageKvEffect,
-        encoder_cache_key: Option<u64>,
-        cache_hit: bool,
-        image_b64: String,
-        staged_image: Option<u64>,
+        feature: ProductRef,
         new_blocks: Vec<BlockId>,
     },
     DecodeUnd {
@@ -743,35 +775,32 @@ pub(crate) enum TransitionIntent {
     },
     CommitGen {
         image_id: u32,
-        position: u32,
-        new_blocks: Vec<BlockId>,
-        allowed_tokens: Option<Vec<u32>>,
     },
-    Feedback {
-        image_id: u32,
-        position: u32,
-        locator: ProductRef,
-        new_blocks: Vec<BlockId>,
-        allowed_tokens: Option<Vec<u32>>,
-    },
-    FeedbackIngest {
+    EncodeFeedback {
         image_id: u32,
         step_index: usize,
         step: ImageIngestStep,
+        source: Option<ProductRef>,
+        image_b64: String,
+    },
+    FeedbackState {
+        image_id: u32,
+        step_index: usize,
         is_final_step: bool,
         position: u32,
         logical_positions: u32,
         physical_kv_tokens: ImageKvEffect,
-        image_b64: String,
-        staged_image: Option<u64>,
+        feature: ProductRef,
+        sample_continuation: bool,
         new_blocks: Vec<BlockId>,
+        allowed_tokens: Option<Vec<u32>>,
     },
 }
 
 /// The wire-operation ingredients a planned intent lowers to. The host-side
 /// bookkeeping (`cfg_branches`, `allowed_text_tokens`, `expected_prompt_token_ids`)
-/// rides alongside because the flat wire operation no longer carries guidance,
-/// token policy, or scored prompt tokens.
+/// rides alongside because guidance, token policy, and scored prompt tokens are
+/// scheduler-owned rather than flat-wire fields.
 struct Wire {
     work: Work,
     domain: Domain,
@@ -802,22 +831,30 @@ fn filter_allowed(allowed_tokens: Option<Vec<u32>>) -> Option<Vec<u32>> {
 }
 
 /// The immutable auxiliary feature product an encode operation produces.
-fn encode_outputs(step: ImageIngestStep, handle: u32) -> Vec<ProductRef> {
-    let kind = match step {
-        ImageIngestStep::VaeEncode => ProductKind::LatentFeature,
-        ImageIngestStep::VitEncode => ProductKind::VisionFeature,
+fn encode_outputs(
+    step: ImageIngestStep,
+    handle: u32,
+    resources: &uniserve_core::GenerationResourceBounds,
+) -> Result<Vec<ProductRef>, PlanningError> {
+    let (kind, bytes) = match step {
+        ImageIngestStep::VaeEncode => (
+            ProductKind::LatentFeature,
+            resources.max_latent_feature_bytes,
+        ),
+        ImageIngestStep::VitEncode => (
+            ProductKind::VisionFeature,
+            resources.max_vision_feature_bytes,
+        ),
     };
-    let mut feature = output_product(0, kind, StorageClass::LatentArena, DType::BF16);
+    let mut feature = bounded_product(
+        0,
+        kind,
+        StorageClass::LatentArena,
+        DType::BF16,
+        dynamic_element_bound(bytes, DType::BF16)?,
+    );
     feature.generation = handle;
-    vec![feature]
-}
-
-/// The nonzero handle identifying an encode operation's feature product. A step
-/// that reuses a staged feature echoes its handle so the successor validates
-/// against the same content identity; a fresh step derives a stable nonzero
-/// handle from the content-scoped fallback (encoder cache key or image id).
-fn encode_handle(staged: Option<u64>, fallback: u64) -> u32 {
-    (staged.unwrap_or(fallback) as u32) | 1
+    Ok(vec![feature])
 }
 
 /// Side-effect-free planner for scheduler-local worker transitions.
@@ -901,18 +938,57 @@ impl GenerationPlanner {
                     0,
                 )
             }
-            TransitionIntent::IngestImage {
+            TransitionIntent::EncodeImage {
                 segment_index,
                 step_index,
                 step,
+                encoder_cache_key,
+                image_b64,
+                source_product,
+            } => {
+                if source_product.is_none() && image_b64.is_empty() {
+                    return Err(PlanningError::MissingImageInput);
+                }
+                let work = match step {
+                    ImageIngestStep::VaeEncode => Work::Encode(EncodeMode::Latent),
+                    ImageIngestStep::VitEncode => Work::Encode(EncodeMode::Vision),
+                };
+                let has_source_product = source_product.is_some();
+                (
+                    Wire {
+                        work,
+                        domain: Domain::Und,
+                        inputs: source_product.into_iter().collect(),
+                        outputs: encode_outputs(step, 0, &request.resources)?,
+                        new_blocks: Vec::new(),
+                        draft_token_ids: Vec::new(),
+                        token_cost: 1,
+                        cfg_branches: 1,
+                        allowed_text_tokens: None,
+                        expected_prompt_token_ids: None,
+                        input_tokens: Vec::new(),
+                        input_image_bytes: (!has_source_product && !image_b64.is_empty())
+                            .then(|| image_b64.clone().into_bytes()),
+                    },
+                    TransitionDelta::EncodeImageStep {
+                        segment_index,
+                        step_index,
+                        encoder_cache_key,
+                    },
+                    encoder_cache_key.into_iter().collect(),
+                    cursor.replayability,
+                    0,
+                    0,
+                )
+            }
+            TransitionIntent::IngestImageState {
+                segment_index,
+                step_index,
                 is_final_step,
                 position,
                 logical_positions,
                 physical_kv_tokens,
-                encoder_cache_key,
-                cache_hit,
-                image_b64,
-                staged_image,
+                feature,
                 new_blocks,
             } => {
                 if position != cursor.logical_pos {
@@ -921,23 +997,12 @@ impl GenerationPlanner {
                         actual: position,
                     });
                 }
-                if !cache_hit && staged_image.is_none() && image_b64.is_empty() {
-                    return Err(PlanningError::MissingImageInput);
-                }
-                let work = match step {
-                    ImageIngestStep::VaeEncode => Work::Encode(EncodeMode::Latent),
-                    ImageIngestStep::VitEncode => Work::Encode(EncodeMode::Vision),
-                };
-                let handle = encode_handle(
-                    staged_image,
-                    encoder_cache_key.unwrap_or_else(|| u64::from(position)),
-                );
                 (
                     Wire {
-                        work,
+                        work: Work::Token(TokenMode::Extend),
                         domain: Domain::Und,
-                        inputs: Vec::new(),
-                        outputs: encode_outputs(step, handle),
+                        inputs: vec![feature],
+                        outputs: Vec::new(),
                         new_blocks,
                         draft_token_ids: Vec::new(),
                         token_cost: 1,
@@ -945,10 +1010,9 @@ impl GenerationPlanner {
                         allowed_text_tokens: None,
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
-                        input_image_bytes: (!image_b64.is_empty())
-                            .then(|| image_b64.clone().into_bytes()),
+                        input_image_bytes: None,
                     },
-                    TransitionDelta::IngestImageStep {
+                    TransitionDelta::IngestImageState {
                         segment_index,
                         step_index,
                         is_final_step,
@@ -956,11 +1020,8 @@ impl GenerationPlanner {
                         physical_start: cursor.physical_kv_len,
                         logical_positions,
                         physical_kv_tokens,
-                        encoder_cache_key,
-                        cache_hit,
-                        expected_encoder_handle: staged_image,
                     },
-                    encoder_cache_key.into_iter().collect(),
+                    Vec::new(),
                     cursor.replayability,
                     0,
                     0,
@@ -1045,12 +1106,7 @@ impl GenerationPlanner {
                         work: Work::Gen(GenMode::Flow),
                         domain: Domain::Gen,
                         inputs: conditioning.into_iter().collect(),
-                        outputs: vec![output_product(
-                            0,
-                            ProductKind::Latent,
-                            StorageClass::LatentArena,
-                            DType::BF16,
-                        )],
+                        outputs: Vec::new(),
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: usize::from(step_count),
@@ -1071,12 +1127,7 @@ impl GenerationPlanner {
                     host_scratch_tokens,
                 )
             }
-            TransitionIntent::CommitGen {
-                image_id,
-                position,
-                new_blocks,
-                allowed_tokens,
-            } => {
+            TransitionIntent::CommitGen { image_id } => {
                 if !request.behavior.gen_output {
                     return Err(PlanningError::GenerationBranchDisabled);
                 }
@@ -1084,91 +1135,62 @@ impl GenerationPlanner {
                     .behavior
                     .generated_image_feedback
                     .then_some(request.policy.feedback.as_ref())
-                    .flatten()
-                    .filter(|recipe| {
-                        matches!(recipe.writeback, uniserve_core::FeedbackWriteback::DirectKv)
-                    });
+                    .flatten();
                 (
                     Wire {
                         work: Work::Materialize,
                         domain: Domain::Gen,
                         inputs: Vec::new(),
-                        outputs: materialize_outputs(
-                            request.sampling.generated_logprobs_requested(),
-                            commit_writeback_required(request),
-                        ),
-                        new_blocks,
+                        outputs: materialize_outputs(request, feedback)?,
+                        new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: 1,
                         cfg_branches: 1,
-                        allowed_text_tokens: filter_allowed(allowed_tokens),
+                        allowed_text_tokens: None,
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
                         input_image_bytes: None,
                     },
-                    TransitionDelta::CommitGen {
-                        image_id,
-                        logical_position: position,
-                        physical_position: cursor.physical_kv_len,
-                        logical_positions: feedback.map_or(0, |recipe| recipe.logical_positions),
-                        physical_kv_tokens: feedback.map(|recipe| recipe.physical_kv_tokens),
-                    },
+                    TransitionDelta::CommitGen { image_id },
                     Vec::new(),
                     Replayability::NotReplayable,
                     0,
                     0,
                 )
             }
-            TransitionIntent::Feedback {
+            TransitionIntent::EncodeFeedback {
                 image_id,
-                position,
-                locator,
-                new_blocks,
-                allowed_tokens,
+                step_index,
+                step,
+                source,
+                image_b64,
             } => {
                 if !request.behavior.generated_image_feedback || request.policy.feedback.is_none() {
                     return Err(PlanningError::FeedbackDisabled);
                 }
-                if !request.policy.feedback.as_ref().is_some_and(|feedback| {
-                    matches!(
-                        feedback.writeback,
-                        uniserve_core::FeedbackWriteback::DirectKv
-                    )
-                }) {
-                    return Err(PlanningError::FeedbackDisabled);
-                }
+                let work = match step {
+                    ImageIngestStep::VaeEncode => Work::Encode(EncodeMode::Latent),
+                    ImageIngestStep::VitEncode => Work::Encode(EncodeMode::Vision),
+                };
                 (
                     Wire {
-                        work: Work::Transfer(TransferMode::KvInstall),
+                        work,
                         domain: Domain::Und,
-                        inputs: vec![locator],
-                        outputs: token_outputs(
-                            request.sampling.generated_logprobs_requested(),
-                            false,
-                        ),
-                        new_blocks,
+                        inputs: source.clone().into_iter().collect(),
+                        outputs: encode_outputs(step, 0, &request.resources)?,
+                        new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: 1,
                         cfg_branches: 1,
-                        allowed_text_tokens: filter_allowed(allowed_tokens),
+                        allowed_text_tokens: None,
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
-                        input_image_bytes: None,
+                        input_image_bytes: (source.is_none() && !image_b64.is_empty())
+                            .then(|| image_b64.clone().into_bytes()),
                     },
-                    TransitionDelta::Feedback {
+                    TransitionDelta::EncodeFeedbackStep {
                         image_id,
-                        logical_position: position,
-                        physical_position: cursor.physical_kv_len,
-                        logical_positions: request
-                            .policy
-                            .feedback
-                            .as_ref()
-                            .map_or(0, |recipe| recipe.logical_positions),
-                        physical_kv_tokens: request
-                            .policy
-                            .feedback
-                            .as_ref()
-                            .map(|recipe| recipe.physical_kv_tokens),
+                        step_index,
                     },
                     Vec::new(),
                     Replayability::NotReplayable,
@@ -1176,26 +1198,20 @@ impl GenerationPlanner {
                     0,
                 )
             }
-            TransitionIntent::FeedbackIngest {
+            TransitionIntent::FeedbackState {
                 image_id,
                 step_index,
-                step,
                 is_final_step,
                 position,
                 logical_positions,
                 physical_kv_tokens,
-                image_b64,
-                staged_image,
+                feature,
+                sample_continuation,
                 new_blocks,
+                allowed_tokens,
             } => {
-                let Some(feedback) = request.policy.feedback.as_ref() else {
+                if request.policy.feedback.is_none() {
                     return Err(PlanningError::FeedbackDisabled);
-                };
-                if !matches!(
-                    feedback.writeback,
-                    uniserve_core::FeedbackWriteback::Reingest { .. }
-                ) {
-                    return Err(PlanningError::FeedbackIngestDisabled);
                 }
                 if position != cursor.logical_pos {
                     return Err(PlanningError::LogicalCursorMismatch {
@@ -1203,31 +1219,28 @@ impl GenerationPlanner {
                         actual: position,
                     });
                 }
-                if staged_image.is_none() && image_b64.is_empty() {
-                    return Err(PlanningError::MissingImageInput);
-                }
-                let work = match step {
-                    ImageIngestStep::VaeEncode => Work::Encode(EncodeMode::Latent),
-                    ImageIngestStep::VitEncode => Work::Encode(EncodeMode::Vision),
-                };
-                let handle = encode_handle(staged_image, u64::from(image_id));
+                let outputs = feedback_state_outputs(
+                    request.sampling.generated_logprobs_requested(),
+                    sample_continuation,
+                );
                 (
                     Wire {
-                        work,
+                        work: Work::Token(TokenMode::Extend),
                         domain: Domain::Und,
-                        inputs: Vec::new(),
-                        outputs: encode_outputs(step, handle),
+                        inputs: vec![feature],
+                        outputs,
                         new_blocks,
                         draft_token_ids: Vec::new(),
                         token_cost: 1,
                         cfg_branches: 1,
-                        allowed_text_tokens: None,
+                        allowed_text_tokens: sample_continuation
+                            .then(|| filter_allowed(allowed_tokens))
+                            .flatten(),
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
-                        input_image_bytes: (!image_b64.is_empty())
-                            .then(|| image_b64.clone().into_bytes()),
+                        input_image_bytes: None,
                     },
-                    TransitionDelta::FeedbackIngestStep {
+                    TransitionDelta::FeedbackState {
                         image_id,
                         step_index,
                         is_final_step,
@@ -1235,7 +1248,6 @@ impl GenerationPlanner {
                         physical_start: cursor.physical_kv_len,
                         logical_positions,
                         physical_kv_tokens,
-                        expected_encoder_handle: staged_image,
                     },
                     Vec::new(),
                     Replayability::NotReplayable,
@@ -1247,6 +1259,10 @@ impl GenerationPlanner {
         let operation_variant = wire.work.variant();
         let is_flow = operation_variant == WorkVariant::GenFlow;
         let is_materialize = operation_variant == WorkVariant::Materialize;
+        let produces_token = wire
+            .outputs
+            .iter()
+            .any(|output| output.kind == ProductKind::Token);
         let draft_count = (!wire.draft_token_ids.is_empty())
             .then(|| wire.draft_token_ids.len().min(u32::MAX as usize) as u32);
         let kv_target_tokens = transition_kv_target(&delta).or_else(|| {
@@ -1254,6 +1270,23 @@ impl GenerationPlanner {
                 .then_some(request.resources.max_kv_tokens)
         });
         let new_blocks_len = wire.new_blocks.len();
+        let max_latent_bytes = if is_flow {
+            request.resources.max_image_latent_bytes
+        } else {
+            wire.outputs
+                .iter()
+                .filter(|output| output.storage_class == StorageClass::LatentArena)
+                .map(product_bound_bytes)
+                .max()
+                .unwrap_or(0)
+        };
+        let max_completion_bytes = wire
+            .outputs
+            .iter()
+            .filter(|output| output.storage_class == StorageClass::CompletionArena)
+            .map(product_bound_bytes)
+            .max()
+            .unwrap_or(0);
         let resources = TransitionResources {
             new_blocks: new_blocks_len,
             kv_target_tokens,
@@ -1281,77 +1314,43 @@ impl GenerationPlanner {
                 operation_variant,
                 WorkVariant::EncodeLatent | WorkVariant::EncodeVision
             ),
-            expected_encoder_handle: match delta {
-                TransitionDelta::IngestImageStep {
-                    cache_hit: true,
-                    expected_encoder_handle,
-                    ..
-                }
-                | TransitionDelta::FeedbackIngestStep {
-                    expected_encoder_handle,
-                    ..
-                } => expected_encoder_handle,
-                _ => None,
-            },
             expects_image_artifact: is_materialize,
             expected_image_hw: is_materialize
                 .then_some((request.image.height, request.image.width)),
-            requires_image_locator: is_materialize && commit_writeback_required(request),
+            requires_image_locator: false,
             expected_image_kv: match delta {
-                TransitionDelta::IngestImageStep {
+                TransitionDelta::IngestImageState {
                     physical_kv_tokens, ..
                 }
-                | TransitionDelta::FeedbackIngestStep {
+                | TransitionDelta::FeedbackState {
                     physical_kv_tokens, ..
                 } => Some(bounded_worker_kv(
                     physical_kv_tokens,
                     request.resources.max_kv_tokens,
                     cursor.physical_kv_len,
                 )),
-                TransitionDelta::CommitGen {
-                    physical_kv_tokens, ..
-                }
-                | TransitionDelta::Feedback {
-                    physical_kv_tokens, ..
-                } => physical_kv_tokens.map(|effect| {
-                    bounded_worker_kv(
-                        effect,
-                        request.resources.max_kv_tokens,
-                        cursor.physical_kv_len,
-                    )
-                }),
                 _ => None,
             },
-            allows_sampled_tokens: matches!(
-                operation_variant,
-                WorkVariant::TokenExtend
-                    | WorkVariant::TokenDecode
-                    | WorkVariant::TokenVerify
-                    | WorkVariant::Materialize
-                    | WorkVariant::TransferKvInstall
-            ),
-            expects_sampled_token: matches!(
-                operation_variant,
-                WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
-            ),
+            allows_sampled_tokens: produces_token,
+            expects_sampled_token: produces_token,
             expected_text_tokens: match &delta {
                 TransitionDelta::IngestText { .. } => Some(TextTokenCountRange { min: 1, max: 1 }),
                 TransitionDelta::DecodeUnd { .. } => {
                     let max = draft_count.map_or(1, |count| count.saturating_add(1));
                     Some(TextTokenCountRange { min: 1, max })
                 }
+                TransitionDelta::FeedbackState { .. } if produces_token => {
+                    Some(TextTokenCountRange { min: 1, max: 1 })
+                }
                 _ => None,
             },
             max_accepted_draft_tokens: draft_count,
             allowed_text_tokens: wire.allowed_text_tokens,
-            generated_logprobs_requested: request.sampling.generated_logprobs_requested()
+            generated_logprobs_requested: produces_token
+                && request.sampling.generated_logprobs_requested()
                 && matches!(
                     operation_variant,
-                    WorkVariant::TokenExtend
-                        | WorkVariant::TokenDecode
-                        | WorkVariant::TokenVerify
-                        | WorkVariant::Materialize
-                        | WorkVariant::TransferKvInstall
+                    WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
                 ),
             expected_prompt_token_ids: wire.expected_prompt_token_ids,
         };
@@ -1359,8 +1358,8 @@ impl GenerationPlanner {
             max_points: 1,
             max_tokens: wire.token_cost.min(u32::MAX as usize) as u32,
             max_kv_pages: new_blocks_len.min(u32::MAX as usize) as u32,
-            max_latent_bytes: if is_flow { latent_units } else { 0 },
-            max_completion_bytes: 0,
+            max_latent_bytes,
+            max_completion_bytes,
             max_transfer_bytes: 0,
         };
         Ok(PlannedTransition {
@@ -1370,6 +1369,7 @@ impl GenerationPlanner {
             bounds,
             inputs: wire.inputs,
             outputs: wire.outputs,
+            predicate: None,
             rng: None,
             control_seq: 0,
             operation: None,
@@ -1381,7 +1381,7 @@ impl GenerationPlanner {
             input_tokens: wire.input_tokens,
             input_image_bytes: wire.input_image_bytes,
             host_input: None,
-            projected_parent_point: None,
+            device_parent_point: None,
             delta,
             resources,
             validation,
@@ -1413,54 +1413,41 @@ fn conditioning_trigger_tokens(request: &GenerationRequest) -> Vec<u32> {
     tokens
 }
 
-/// Whether a commit operation writes its committed image KV back into the
-/// understanding lineage, producing a KV product the writeback transfer installs.
-fn commit_writeback_required(request: &GenerationRequest) -> bool {
-    request.behavior.generated_image_feedback
-        && request.policy.feedback.as_ref().is_some_and(|feedback| {
-            feedback.commit == uniserve_core::CommitRecipe::CommitGenThenWriteback
-                && matches!(
-                    feedback.writeback,
-                    uniserve_core::FeedbackWriteback::DirectKv
-                )
-        })
-}
-
-/// The declared outputs of a commit (materialize) operation: an image artifact,
-/// a committed continuation token, an optional logprob product, and an optional
-/// KV product when the commit writes its image KV back.
-fn materialize_outputs(logprobs: bool, writeback: bool) -> Vec<ProductRef> {
-    let mut outputs = vec![
-        output_product(
-            0,
-            ProductKind::Artifact,
-            StorageClass::CompletionArena,
-            DType::U8,
-        ),
-        output_product(
+/// The immutable products of image materialization.
+///
+/// Public PNG bytes and a device-resident feedback source are independent
+/// products. The latter is present only for the device-product feedback route;
+/// it is consumed by a later non-state encode operation.
+fn materialize_outputs(
+    request: &GenerationRequest,
+    feedback: Option<&uniserve_core::GeneratedImageFeedbackRecipe>,
+) -> Result<Vec<ProductRef>, PlanningError> {
+    let public_bytes = png_base64_bound(request.image.width, request.image.height)?;
+    let mut outputs = vec![bounded_product(
+        0,
+        ProductKind::Artifact,
+        StorageClass::CompletionArena,
+        DType::U8,
+        dynamic_element_bound(public_bytes, DType::U8)?,
+    )];
+    if let Some(feedback) = feedback
+        && feedback.source == uniserve_core::FeedbackSource::DeviceProduct
+    {
+        outputs.push(bounded_product(
             1,
-            ProductKind::Token,
-            StorageClass::DeviceTensor,
-            DType::U32,
-        ),
-    ];
-    if logprobs {
-        outputs.push(output_product(
-            2,
-            ProductKind::Logprob,
-            StorageClass::HostStaging,
-            DType::U8,
-        ));
-    }
-    if writeback {
-        outputs.push(output_product(
-            3,
-            ProductKind::Kv,
-            StorageClass::PagedKv,
+            ProductKind::Artifact,
+            StorageClass::LatentArena,
             DType::BF16,
+            dynamic_element_bound(
+                u64::from(request.image.height)
+                    .saturating_mul(u64::from(request.image.width))
+                    .saturating_mul(3)
+                    .saturating_mul(dtype_bytes(DType::BF16)),
+                DType::BF16,
+            )?,
         ));
     }
-    outputs
+    Ok(outputs)
 }
 
 fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
@@ -1471,7 +1458,7 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             physical_start,
             ..
         } => physical_start.saturating_add(end.saturating_sub(*start)),
-        TransitionDelta::IngestImageStep {
+        TransitionDelta::IngestImageState {
             physical_start,
             physical_kv_tokens,
             ..
@@ -1480,7 +1467,7 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             ImageKvEffect::Bounded { max_tokens } => *max_tokens,
             ImageKvEffect::WorkerDefined => return None,
         }),
-        TransitionDelta::FeedbackIngestStep {
+        TransitionDelta::FeedbackState {
             physical_start,
             physical_kv_tokens,
             ..
@@ -1492,23 +1479,10 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
         TransitionDelta::DecodeUnd {
             physical_position, ..
         } => physical_position.saturating_add(1),
-        TransitionDelta::CommitGen {
-            physical_position,
-            physical_kv_tokens: Some(effect),
-            ..
-        }
-        | TransitionDelta::Feedback {
-            physical_position,
-            physical_kv_tokens: Some(effect),
-            ..
-        } => physical_position.saturating_add(match effect {
-            ImageKvEffect::Exact { tokens } => *tokens,
-            ImageKvEffect::Bounded { max_tokens } => *max_tokens,
-            ImageKvEffect::WorkerDefined => return None,
-        }),
-        TransitionDelta::DenoiseGen { .. }
+        TransitionDelta::EncodeImageStep { .. }
+        | TransitionDelta::DenoiseGen { .. }
         | TransitionDelta::CommitGen { .. }
-        | TransitionDelta::Feedback { .. } => return None,
+        | TransitionDelta::EncodeFeedbackStep { .. } => return None,
     };
     Some(target as usize)
 }
@@ -1516,16 +1490,7 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
 fn transition_may_write_worker_defined_kv(delta: &TransitionDelta) -> bool {
     matches!(
         delta,
-        TransitionDelta::IngestImageStep { .. }
-            | TransitionDelta::FeedbackIngestStep { .. }
-            | TransitionDelta::CommitGen {
-                physical_kv_tokens: Some(ImageKvEffect::WorkerDefined),
-                ..
-            }
-            | TransitionDelta::Feedback {
-                physical_kv_tokens: Some(ImageKvEffect::WorkerDefined),
-                ..
-            }
+        TransitionDelta::IngestImageState { .. } | TransitionDelta::FeedbackState { .. }
     )
 }
 
@@ -1550,18 +1515,19 @@ pub(crate) enum PlanningError {
     LogicalCursorMismatch { expected: u32, actual: u32 },
     GenerationBranchDisabled,
     FeedbackDisabled,
-    FeedbackIngestDisabled,
     MissingImageInput,
+    MissingProductBound,
+    ProductBoundExceedsProtocol { bytes: u64 },
+    ProductGenerationExhausted,
 }
 
 /// Scheduler-local transition associated with one submitted worker op.
-/// Scheduler-local transition associated with one submitted worker operation.
 /// The wire-operation ingredients (`work`, `route`, `domain`, `bounds`,
 /// `inputs`, `outputs`, `rng`, `control_seq`) are lowered by the planner; the
 /// flat [`Operation`] is stamped with request and lineage identity at submit
 /// time by [`PlannedTransition::assign_operation`]. The host-side
-/// `draft_token_ids`, `new_blocks`, and `token_cost` carry accounting the wire
-/// operation no longer transports.
+/// `draft_token_ids`, `new_blocks`, and `token_cost` carry scheduler-owned
+/// accounting outside the wire operation.
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedTransition {
     pub(crate) work: Work,
@@ -1570,6 +1536,7 @@ pub(crate) struct PlannedTransition {
     pub(crate) bounds: Bounds,
     pub(crate) inputs: Vec<ProductRef>,
     pub(crate) outputs: Vec<ProductRef>,
+    pub(crate) predicate: Option<ProductRef>,
     pub(crate) rng: Option<Rng>,
     pub(crate) control_seq: u64,
     pub(crate) operation: Option<Operation>,
@@ -1586,12 +1553,11 @@ pub(crate) struct PlannedTransition {
     /// operation identity at [`PlannedTransition::assign_operation`]. Its value
     /// is transported in the batch's `input_products` under the same identity.
     pub(crate) host_input: Option<ProductRef>,
-    /// For a `Point::Device`-rooted projected successor, the host-known point
-    /// index of its (not-yet-observed) parent — the predecessor's committed and
-    /// advanced version. `None` for a fixed-parent op, whose parent point is
-    /// carried directly on the parent `Point::Fixed`. Used by
+    /// For a `Point::Device`-rooted successor, the scheduler-owned point index
+    /// selected by its parent. `None` for a fixed-parent op, whose parent point
+    /// is carried directly on the parent `Point::Fixed`. Used by
     /// [`PlannedTransition::validate_result`] to reconstruct the expected point.
-    pub(crate) projected_parent_point: Option<u32>,
+    pub(crate) device_parent_point: Option<u32>,
     pub(crate) delta: TransitionDelta,
     pub(crate) resources: TransitionResources,
     pub(crate) validation: TransitionValidation,
@@ -1606,7 +1572,48 @@ impl PlannedTransition {
         request_key: RequestKey,
         op_id: OpId,
         parent: VersionRef,
-    ) {
+        next_product_generation: &mut u64,
+    ) -> Result<(), PlanningError> {
+        let required_generations = self
+            .outputs
+            .iter()
+            .filter(|product| product.generation == 0)
+            .count()
+            + usize::from(!self.input_tokens.is_empty() || self.input_image_bytes.is_some());
+        let first_generation = (*next_product_generation).max(1);
+        if required_generations > 0 {
+            let last_generation = first_generation
+                .checked_add(required_generations as u64 - 1)
+                .ok_or(PlanningError::ProductGenerationExhausted)?;
+            if last_generation > u64::from(u32::MAX) {
+                return Err(PlanningError::ProductGenerationExhausted);
+            }
+        }
+        let host_input = if !self.input_tokens.is_empty() {
+            Some(host_input_product(
+                request_key,
+                op_id,
+                ProductKind::Token,
+                DType::U32,
+                self.input_tokens.len(),
+            )?)
+        } else if self.input_image_bytes.is_some() {
+            Some(host_input_product(
+                request_key,
+                op_id,
+                ProductKind::Artifact,
+                DType::U8,
+                self.input_image_bytes.as_ref().map_or(0, Vec::len),
+            )?)
+        } else {
+            None
+        };
+        let mut acquire_generation = || {
+            let generation =
+                u32::try_from((*next_product_generation).max(1)).expect("generation preflight");
+            *next_product_generation = u64::from(generation) + 1;
+            generation
+        };
         let outputs = self
             .outputs
             .iter()
@@ -1614,6 +1621,9 @@ impl PlannedTransition {
             .map(|mut product| {
                 product.request_key = request_key;
                 product.producer_op_id = op_id;
+                if product.generation == 0 {
+                    product.generation = acquire_generation();
+                }
                 product
             })
             .collect();
@@ -1621,12 +1631,8 @@ impl PlannedTransition {
         // Stamp the host-supplied input product with the operation identity and
         // list it among the operation's inputs; its value travels in the batch's
         // `input_products` under this same identity.
-        if !self.input_tokens.is_empty() {
-            let product = host_input_product(request_key, op_id, ProductKind::Token, DType::U32);
-            self.host_input = Some(product.clone());
-            inputs.push(product);
-        } else if self.input_image_bytes.is_some() {
-            let product = host_input_product(request_key, op_id, ProductKind::Artifact, DType::U8);
+        if let Some(mut product) = host_input {
+            product.generation = acquire_generation();
             self.host_input = Some(product.clone());
             inputs.push(product);
         }
@@ -1643,10 +1649,11 @@ impl PlannedTransition {
             // The KV blocks this step appends travel on the wire so the worker's
             // forward addresses the newly allocated pages at a block boundary.
             self.new_blocks.clone(),
-            None,
+            self.predicate.clone(),
             self.rng,
             self.control_seq,
         ));
+        Ok(())
     }
 
     /// The host-supplied input product value for this operation's forward, keyed
@@ -1690,18 +1697,17 @@ impl PlannedTransition {
                 point_index: parent_point,
                 ..
             } => parent_point,
-            // A device parent carries no host-known point index. The projected
-            // parent point threaded onto the transition at submit (the
-            // predecessor's committed-and-advanced version) reconstructs it.
+            // A device parent carries no host-known point index. The scheduler
+            // threads its selected point onto the transition at submit.
             Point::Device { .. } => {
-                let Some(projected_parent_point) = self.projected_parent_point else {
+                let Some(device_parent_point) = self.device_parent_point else {
                     return Err(TransitionValidationError::VersionMismatch {
                         expected_base: 0,
                         actual_base: 0,
                         actual_result: u64::from(record.selected_point),
                     });
                 };
-                projected_parent_point
+                device_parent_point
             }
         };
         let expected_point = parent_point.saturating_add(u32::from(operation.advances_state));
@@ -1732,7 +1738,12 @@ pub(crate) enum TransitionDelta {
         logical_start: u32,
         physical_start: u32,
     },
-    IngestImageStep {
+    EncodeImageStep {
+        segment_index: usize,
+        step_index: usize,
+        encoder_cache_key: Option<u64>,
+    },
+    IngestImageState {
         segment_index: usize,
         step_index: usize,
         is_final_step: bool,
@@ -1740,9 +1751,6 @@ pub(crate) enum TransitionDelta {
         physical_start: u32,
         logical_positions: u32,
         physical_kv_tokens: ImageKvEffect,
-        encoder_cache_key: Option<u64>,
-        cache_hit: bool,
-        expected_encoder_handle: Option<u64>,
     },
     DecodeUnd {
         logical_position: u32,
@@ -1755,19 +1763,12 @@ pub(crate) enum TransitionDelta {
     },
     CommitGen {
         image_id: u32,
-        logical_position: u32,
-        physical_position: u32,
-        logical_positions: u32,
-        physical_kv_tokens: Option<ImageKvEffect>,
     },
-    Feedback {
+    EncodeFeedbackStep {
         image_id: u32,
-        logical_position: u32,
-        physical_position: u32,
-        logical_positions: u32,
-        physical_kv_tokens: Option<ImageKvEffect>,
+        step_index: usize,
     },
-    FeedbackIngestStep {
+    FeedbackState {
         image_id: u32,
         step_index: usize,
         is_final_step: bool,
@@ -1775,7 +1776,6 @@ pub(crate) enum TransitionDelta {
         physical_start: u32,
         logical_positions: u32,
         physical_kv_tokens: ImageKvEffect,
-        expected_encoder_handle: Option<u64>,
     },
 }
 
@@ -1783,12 +1783,13 @@ impl TransitionDelta {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::IngestText { .. } => "ingest_text",
-            Self::IngestImageStep { .. } => "ingest_image_step",
+            Self::EncodeImageStep { .. } => "encode_image_step",
+            Self::IngestImageState { .. } => "ingest_image_state",
             Self::DecodeUnd { .. } => "decode_und",
             Self::DenoiseGen { .. } => "denoise_gen",
             Self::CommitGen { .. } => "commit_gen",
-            Self::Feedback { .. } => "feedback",
-            Self::FeedbackIngestStep { .. } => "feedback_ingest_step",
+            Self::EncodeFeedbackStep { .. } => "encode_feedback_step",
+            Self::FeedbackState { .. } => "feedback_state",
         }
     }
 }
@@ -1826,7 +1827,6 @@ impl Replayability {
 pub(crate) struct TransitionValidation {
     pub(crate) expected_denoise_step: Option<u16>,
     pub(crate) expects_encoder_handle: bool,
-    pub(crate) expected_encoder_handle: Option<u64>,
     pub(crate) expects_image_artifact: bool,
     pub(crate) expected_image_hw: Option<(u32, u32)>,
     pub(crate) requires_image_locator: bool,
@@ -1867,14 +1867,6 @@ impl TransitionValidation {
         let encoder_handle = record.product_generations.first().map(|g| u64::from(*g));
         if self.expects_encoder_handle && encoder_handle.filter(|handle| *handle != 0).is_none() {
             return Err(TransitionValidationError::MissingEncoderHandle);
-        }
-        if let Some(expected) = self.expected_encoder_handle
-            && encoder_handle != Some(expected)
-        {
-            return Err(TransitionValidationError::EncoderHandleMismatch {
-                expected,
-                actual: encoder_handle,
-            });
         }
         // The artifact rides as a base64 PNG string; dimension validation reads
         // only the IHDR header from the base64 prefix. Decoding the full frame
@@ -2080,10 +2072,6 @@ pub(crate) enum TransitionValidationError {
         actual: u16,
     },
     MissingEncoderHandle,
-    EncoderHandleMismatch {
-        expected: u64,
-        actual: Option<u64>,
-    },
     MissingImageArtifact,
     InvalidImageArtifact,
     MissingImageLocator,
@@ -2292,6 +2280,60 @@ mod tests {
     }
 
     #[test]
+    fn materialize_declares_public_and_resident_immutable_products() {
+        let mut request = request(12, vec![11, 12]);
+        request.constraint = GenerationConstraint::Default;
+        request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 };
+        request.policy.feedback = Some(uniserve_core::GeneratedImageFeedbackRecipe {
+            source: uniserve_core::FeedbackSource::DeviceProduct,
+            next_und_token: uniserve_core::FeedbackNextToken::EndOfImage,
+            ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
+            sample_continuation: true,
+        });
+        request.behavior =
+            GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+
+        let transition = GenerationPlanner::new()
+            .plan(
+                &request,
+                CursorProjection {
+                    phase: GenerationPhase::CommitGen,
+                    prompt_cursor: 2,
+                    logical_pos: 2,
+                    physical_kv_len: 2,
+                    replayability: Replayability::NotReplayable,
+                },
+                TransitionIntent::CommitGen { image_id: 1 },
+            )
+            .expect("plan image materialization");
+        assert_eq!(transition.outputs.len(), 2);
+        assert_eq!(
+            (
+                transition.outputs[0].kind,
+                transition.outputs[0].storage_class,
+                transition.outputs[0].dtype,
+            ),
+            (
+                ProductKind::Artifact,
+                StorageClass::CompletionArena,
+                DType::U8,
+            )
+        );
+        assert_eq!(
+            (
+                transition.outputs[1].kind,
+                transition.outputs[1].storage_class,
+                transition.outputs[1].dtype,
+            ),
+            (
+                ProductKind::Artifact,
+                StorageClass::LatentArena,
+                DType::BF16,
+            )
+        );
+    }
+
+    #[test]
     fn transition_accepts_only_the_registered_completion() {
         let mut transition = prefill_transition();
         let request_key = RequestKey::new(1, RequestId(9), 3);
@@ -2303,7 +2345,22 @@ mod tests {
                 semantic_digest: digest(),
             },
         };
-        transition.assign_operation(request_key, OpId(17), parent);
+        let mut next_product_generation = 1_u64;
+        transition
+            .assign_operation(request_key, OpId(17), parent, &mut next_product_generation)
+            .expect("generation space");
+        let operation = transition.operation.as_ref().expect("assigned operation");
+        let mut generations = operation
+            .outputs
+            .iter()
+            .chain(operation.inputs.iter())
+            .map(|product| product.generation)
+            .collect::<Vec<_>>();
+        assert!(generations.iter().all(|generation| *generation > 0));
+        let generation_count = generations.len();
+        generations.sort_unstable();
+        generations.dedup();
+        assert_eq!(generations.len(), generation_count);
 
         let record = completion(request_key, 17, 6);
         assert_eq!(transition.validate_result(&record, &[]), Ok(()));
@@ -2313,5 +2370,49 @@ mod tests {
             transition.validate_result(&stale, &[]),
             Err(TransitionValidationError::VersionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn product_generation_space_exhausts_without_reusing_an_identity() {
+        let mut transition = prefill_transition();
+        transition.outputs.truncate(1);
+        transition.input_tokens.clear();
+        let request_key = RequestKey::new(1, RequestId(9), 3);
+        let parent = VersionRef {
+            request_key,
+            producer_op_id: OpId(1),
+            point: Point::Fixed {
+                point_index: 5,
+                semantic_digest: digest(),
+            },
+        };
+        let mut next_product_generation = u64::from(u32::MAX);
+        transition
+            .assign_operation(
+                request_key,
+                OpId(17),
+                parent.clone(),
+                &mut next_product_generation,
+            )
+            .expect("last generation");
+        assert_eq!(
+            transition
+                .operation
+                .as_ref()
+                .expect("assigned operation")
+                .outputs[0]
+                .generation,
+            u32::MAX
+        );
+
+        let mut exhausted = prefill_transition();
+        exhausted.outputs.truncate(1);
+        exhausted.input_tokens.clear();
+        assert_eq!(
+            exhausted
+                .assign_operation(request_key, OpId(18), parent, &mut next_product_generation,),
+            Err(PlanningError::ProductGenerationExhausted)
+        );
+        assert_eq!(next_product_generation, u64::from(u32::MAX) + 1);
     }
 }

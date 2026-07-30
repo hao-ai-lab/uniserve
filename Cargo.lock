@@ -6159,6 +6159,7 @@ version = "0.2.0"
 dependencies = [
  "sha2",
  "uniserve-core",
+ "uniserve-worker-wire",
 ]
 
 [[package]]

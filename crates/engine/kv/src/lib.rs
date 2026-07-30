@@ -24,7 +24,7 @@ use uniserve_core::{BlockId, HashAlgo, KvGroupKind, Modality, RequestId};
 
 mod encoder_cache;
 mod freeq;
-pub use encoder_cache::{CachedEncoderOutput, EncoderCacheManager, EncoderCacheStats};
+pub use encoder_cache::{EncoderCacheManager, EncoderCacheStats};
 use freeq::BlockMeta;
 
 /// Incremental per-block prefix hash, chained as

@@ -6,8 +6,8 @@ use uniserve_core::{BlockId, KvGroupKind, RequestId};
 
 use super::*;
 use crate::flat::{
-    decode_request, decode_request_unpack, decode_response, decode_response_unpack,
-    encode_request, encode_response,
+    decode_request, decode_request_unpack, decode_response, decode_response_unpack, encode_request,
+    encode_response,
 };
 
 fn digest_string(seed: u8) -> String {
@@ -373,8 +373,11 @@ fn validation_rejects_an_output_owned_by_another_operation() {
 }
 
 #[test]
-fn validation_rejects_more_than_one_device_dimension() {
+fn product_validation_enforces_generation_and_shape_bounds() {
     let mut product = output_product(OpId(11));
+    product.generation = 0;
+    assert!(product.validate().is_err());
+    product.generation = 1;
     product.shape_bound.dims = vec![DimBound::Device { max: 2 }, DimBound::Device { max: 4 }];
     assert!(product.validate().is_err());
 }
@@ -405,14 +408,21 @@ fn token_product_bytes_round_trip() {
 
 #[test]
 fn batch_carries_host_supplied_input_product_values() {
-    let mut token_input = output_product(OpId(1));
+    let mut token_input = output_product(OpId(11));
     token_input.output_index = 0;
     token_input.kind = ProductKind::Token;
+    token_input.storage_class = StorageClass::HostStaging;
+    token_input.shape_bound = ShapeBound {
+        dims: vec![DimBound::Static(3)],
+    };
     let payload = ProductPayload {
-        product: token_input,
+        product: token_input.clone(),
         bytes: encode_token_product_bytes(&[7, 8, 9]),
     };
-    let batch = Batch::new(1, vec![admission()], vec![token_decode_operation()])
+    let mut operation = token_decode_operation();
+    operation.inputs.push(token_input);
+    operation.plan_digest = operation.compute_plan_digest();
+    let batch = Batch::new(1, vec![admission()], vec![operation])
         .with_input_products(vec![payload.clone()]);
     let decoded = execute_round_trip(batch);
     assert_eq!(decoded.input_products, vec![payload.clone()]);
@@ -536,13 +546,14 @@ fn product_for(key: RequestKey, op: OpId, output_index: u16, kind: ProductKind) 
         storage_class: match kind {
             ProductKind::Kv => StorageClass::PagedKv,
             ProductKind::Latent | ProductKind::LatentFeature => StorageClass::LatentArena,
-            ProductKind::Completion => StorageClass::CompletionArena,
+            ProductKind::Completion => StorageClass::DeviceTensor,
             _ => StorageClass::DeviceTensor,
         },
         dtype: match kind {
             ProductKind::Token => DType::I32,
             ProductKind::Kv => DType::BF16,
             ProductKind::Logprob => DType::F32,
+            ProductKind::Completion => DType::U8,
             _ => DType::F16,
         },
         shape_bound: ShapeBound {
@@ -651,13 +662,23 @@ fn comprehensive_batch() -> Batch {
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
             },
-            vec![product_for(session_key(50), OpId(2), 0, ProductKind::VisionFeature)],
+            vec![product_for(
+                session_key(50),
+                OpId(2),
+                0,
+                ProductKind::VisionFeature,
+            )],
             vec![
                 product_for(key, op_id, 0, ProductKind::Token),
                 product_for(key, op_id, 1, ProductKind::Kv),
             ],
             vec![BlockId(70 + index as u32), BlockId(90 + index as u32)],
-            Some(product_for(session_key(51), OpId(3), 0, ProductKind::Completion)),
+            Some(product_for(
+                session_key(51),
+                OpId(3),
+                0,
+                ProductKind::Completion,
+            )),
             Some(Rng {
                 seed: 99 + index as u64,
                 semantic_index_base: 4,
@@ -688,7 +709,9 @@ fn comprehensive_batch() -> Batch {
     let gen_admission = Admission::new(
         session_key(110),
         None,
-        Some(GenAdmission { image: full_image() }),
+        Some(GenAdmission {
+            image: full_image(),
+        }),
         None,
     )
     .unwrap();
@@ -696,7 +719,11 @@ fn comprehensive_batch() -> Batch {
         Control::Commit {
             request_key: session_key(200),
             control_seq: 1,
-            expected_parent: VersionRef::admission_root(session_key(200), OpId(1), digest_string(0xaa)),
+            expected_parent: VersionRef::admission_root(
+                session_key(200),
+                OpId(1),
+                digest_string(0xaa),
+            ),
             selected: VersionRef::admission_root(session_key(200), OpId(2), digest_string(0xab)),
             public_event_limit: 7,
             disposition: Disposition::Retain,
@@ -712,8 +739,20 @@ fn comprehensive_batch() -> Batch {
             op_id: OpId(33),
         },
     ];
+    let mut input_product = product_for(
+        operations[0].request_key,
+        operations[0].op_id,
+        2,
+        ProductKind::Token,
+    );
+    input_product.storage_class = StorageClass::HostStaging;
+    input_product.shape_bound = ShapeBound {
+        dims: vec![DimBound::Static(4)],
+    };
+    operations[0].inputs.push(input_product.clone());
+    operations[0].plan_digest = operations[0].compute_plan_digest();
     let input_products = vec![ProductPayload {
-        product: product_for(session_key(50), OpId(2), 0, ProductKind::Token),
+        product: input_product,
         bytes: encode_token_product_bytes(&[7, 8, 9, 10]),
     }];
     Batch::new(42, vec![und_admission, gen_admission], operations)
@@ -1020,7 +1059,11 @@ fn accessor_decode_round_trips_and_matches_unpack_for_every_request_kind() {
         let accessor = decode_request(&bytes).unwrap();
         let unpack = decode_request_unpack(&bytes).unwrap();
         assert_eq!(accessor, request, "round trip for {:?}", request.kind);
-        assert_eq!(accessor, unpack, "accessor vs unpack for {:?}", request.kind);
+        assert_eq!(
+            accessor, unpack,
+            "accessor vs unpack for {:?}",
+            request.kind
+        );
     }
 }
 
@@ -1115,12 +1158,29 @@ fn decode_step_batch(operations: usize) -> Batch {
 fn bench_decode_unpack_vs_accessor() {
     let request = WorkerRequest::execute(decode_step_batch(35));
     let request_bytes = encode_request(&request).unwrap();
-    let payload_request = WorkerRequest::execute(decode_step_batch(35).with_input_products(vec![
-        ProductPayload {
-            product: product_for(session_key(50), OpId(2), 0, ProductKind::VisionFeature),
+    let mut payload_batch = decode_step_batch(35);
+    let payload_operation = payload_batch
+        .operations
+        .first_mut()
+        .expect("decode benchmark has operations");
+    let mut input_product = product_for(
+        payload_operation.request_key,
+        payload_operation.op_id,
+        2,
+        ProductKind::Artifact,
+    );
+    input_product.storage_class = StorageClass::HostStaging;
+    input_product.dtype = DType::U8;
+    input_product.shape_bound = ShapeBound {
+        dims: vec![DimBound::Static(1 << 20)],
+    };
+    payload_operation.inputs.push(input_product.clone());
+    payload_operation.plan_digest = payload_operation.compute_plan_digest();
+    let payload_request =
+        WorkerRequest::execute(payload_batch.with_input_products(vec![ProductPayload {
+            product: input_product,
             bytes: vec![0x5a; 1 << 20],
-        },
-    ]));
+        }]));
     let payload_request_bytes = encode_request(&payload_request).unwrap();
     let mut report = full_completion_report();
     report.products[1].bytes = vec![0xa5; 4 << 20];

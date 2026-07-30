@@ -41,6 +41,21 @@ def resolve_capabilities(
         if flow is not None
         else 0
     )
+    hidden_elements = int(spec.cache.num_attention_heads) * int(spec.cache.head_dim)
+    max_vision_feature_bytes = (
+        int(spec.inputs.max_vit_grid_tokens) * hidden_elements * 2
+    )
+    max_latent_feature_bytes = (
+        0
+        if flow is None
+        else (
+            int(flow.max_vae_grid_tokens)
+            * int(flow.latent_channels)
+            * int(flow.latent_patch_size)
+            * int(flow.latent_patch_size)
+            * 2
+        )
+    )
     resident_copies, co_resident_blocks = _kv_residency_shape(
         deployment,
         max_latent_size=max_latent_size,
@@ -88,6 +103,8 @@ def resolve_capabilities(
         encoder_cache_budget=int(spec.inputs.encoder_cache_budget),
         max_vae_grid_tokens=int(flow.max_vae_grid_tokens) if flow is not None else 0,
         max_vit_grid_tokens=int(spec.inputs.max_vit_grid_tokens),
+        max_latent_feature_bytes=max_latent_feature_bytes,
+        max_vision_feature_bytes=max_vision_feature_bytes,
         commit_marker_tokens=int(flow.commit_marker_tokens) if flow is not None else 2,
         gen_rope_advance=int(flow.rope_advance) if flow is not None else 2,
         max_cfg_branches=int(flow.max_cfg_branches) if flow is not None else 1,

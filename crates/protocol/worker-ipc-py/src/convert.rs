@@ -17,6 +17,8 @@
 //! response extractor returns `None` on any unexpected shape so the caller
 //! falls back to `depythonize` (identical values, identical errors).
 
+use std::collections::HashMap;
+
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
@@ -27,8 +29,8 @@ use uniserve_worker_wire::{
     FinishFlags, GenAdmission, GenMode, KvAllocation, LogicalLengths, OpId, OpStatus, Operation,
     Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
     RequestKind, ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
-    TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, WorkerRequest, WorkerResponse,
-    Work,
+    TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, Work, WorkerRequest,
+    WorkerResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -82,48 +84,112 @@ pub(crate) fn execute_request_to_py<'py>(
 }
 
 fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyDict>> {
+    let mut context = RequestConversion::new(py);
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "step_id"), batch.step_id)?;
     dict.set_item(
         intern!(py, "admissions"),
-        dict_list(py, &batch.admissions, admission_to_py)?,
+        dict_list(py, &batch.admissions, |admission| {
+            admission_to_py(py, admission, &mut context)
+        })?,
     )?;
     dict.set_item(
         intern!(py, "operations"),
-        dict_list(py, &batch.operations, operation_to_py)?,
+        dict_list(py, &batch.operations, |operation| {
+            operation_to_py(py, operation, &mut context)
+        })?,
     )?;
     dict.set_item(
         intern!(py, "controls"),
-        dict_list(py, &batch.controls, control_to_py)?,
+        dict_list(py, &batch.controls, |control| {
+            control_to_py(py, control, &mut context)
+        })?,
     )?;
     dict.set_item(
         intern!(py, "input_products"),
-        dict_list(py, &batch.input_products, product_payload_to_py)?,
+        dict_list(py, &batch.input_products, |payload| {
+            product_payload_to_py(py, payload, &mut context)
+        })?,
     )?;
     Ok(dict)
 }
 
-fn dict_list<'py, T>(
+fn dict_list<'py, T, F>(
     py: Python<'py>,
     items: &[T],
-    convert: fn(Python<'py>, &T) -> PyResult<Bound<'py, PyDict>>,
-) -> PyResult<Bound<'py, PyList>> {
+    mut convert: F,
+) -> PyResult<Bound<'py, PyList>>
+where
+    F: FnMut(&T) -> PyResult<Bound<'py, PyDict>>,
+{
     let converted = items
         .iter()
-        .map(|item| convert(py, item))
+        .map(&mut convert)
         .collect::<PyResult<Vec<_>>>()?;
     PyList::new(py, converted)
+}
+
+struct RequestConversion<'py> {
+    py: Python<'py>,
+    request_keys: HashMap<RequestKey, Bound<'py, PyDict>>,
+    shape_bounds: HashMap<ShapeBound, Bound<'py, PyDict>>,
+    point_ranges: HashMap<PointRange, Bound<'py, PyDict>>,
+}
+
+impl<'py> RequestConversion<'py> {
+    fn new(py: Python<'py>) -> Self {
+        Self {
+            py,
+            request_keys: HashMap::new(),
+            shape_bounds: HashMap::new(),
+            point_ranges: HashMap::new(),
+        }
+    }
+
+    fn request_key(&mut self, key: RequestKey) -> PyResult<Bound<'py, PyDict>> {
+        if let Some(value) = self.request_keys.get(&key) {
+            return Ok(value.clone());
+        }
+        let dict = PyDict::new(self.py);
+        dict.set_item(intern!(self.py, "authority_id"), key.authority_id)?;
+        dict.set_item(intern!(self.py, "session_id"), key.session_id.0)?;
+        dict.set_item(intern!(self.py, "epoch"), key.epoch)?;
+        self.request_keys.insert(key, dict.clone());
+        Ok(dict)
+    }
+
+    fn shape_bound(&mut self, shape: &ShapeBound) -> PyResult<Bound<'py, PyDict>> {
+        if let Some(value) = self.shape_bounds.get(shape) {
+            return Ok(value.clone());
+        }
+        let dict = shape_bound_to_py(self.py, shape)?;
+        self.shape_bounds.insert(shape.clone(), dict.clone());
+        Ok(dict)
+    }
+
+    fn point_range(&mut self, range: PointRange) -> PyResult<Bound<'py, PyDict>> {
+        if let Some(value) = self.point_ranges.get(&range) {
+            return Ok(value.clone());
+        }
+        let dict = point_range_to_py(self.py, range)?;
+        self.point_ranges.insert(range, dict.clone());
+        Ok(dict)
+    }
 }
 
 fn u32_list<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyList>> {
     PyList::new(py, values.iter().copied())
 }
 
-fn admission_to_py<'py>(py: Python<'py>, admission: &Admission) -> PyResult<Bound<'py, PyDict>> {
+fn admission_to_py<'py>(
+    py: Python<'py>,
+    admission: &Admission,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
-        request_key_to_py(py, admission.request_key)?,
+        context.request_key(admission.request_key)?,
     )?;
     dict.set_item(intern!(py, "digest"), admission.digest.as_str())?;
     dict.set_item(
@@ -157,7 +223,10 @@ fn und_admission_to_py<'py>(py: Python<'py>, und: &UndAdmission) -> PyResult<Bou
     Ok(dict)
 }
 
-fn gen_admission_to_py<'py>(py: Python<'py>, branch: &GenAdmission) -> PyResult<Bound<'py, PyDict>> {
+fn gen_admission_to_py<'py>(
+    py: Python<'py>,
+    branch: &GenAdmission,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "image"), image_to_py(py, &branch.image)?)?;
     Ok(dict)
@@ -174,10 +243,7 @@ fn kv_allocation_to_py<'py>(py: Python<'py>, kv: &KvAllocation) -> PyResult<Boun
     Ok(dict)
 }
 
-fn sampling_to_py<'py>(
-    py: Python<'py>,
-    sampling: &SamplingParams,
-) -> PyResult<Bound<'py, PyDict>> {
+fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "temperature"), sampling.temperature)?;
     dict.set_item(intern!(py, "top_k"), sampling.top_k)?;
@@ -194,7 +260,13 @@ fn sampling_to_py<'py>(
     // `(u32, f32)` pairs pythonize as Python tuples, not lists.
     dict.set_item(
         intern!(py, "logit_bias"),
-        PyList::new(py, sampling.logit_bias.iter().map(|(token, bias)| (*token, *bias)))?,
+        PyList::new(
+            py,
+            sampling
+                .logit_bias
+                .iter()
+                .map(|(token, bias)| (*token, *bias)),
+        )?,
     )?;
     dict.set_item(intern!(py, "min_tokens"), sampling.min_tokens)?;
     dict.set_item(intern!(py, "return_logprobs"), sampling.return_logprobs)?;
@@ -230,7 +302,10 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     dict.set_item(intern!(py, "steps"), image.steps)?;
     dict.set_item(intern!(py, "cfg_text_scale"), image.cfg_text_scale)?;
     dict.set_item(intern!(py, "cfg_img_scale"), image.cfg_img_scale)?;
-    dict.set_item(intern!(py, "cfg_renorm_type"), image.cfg_renorm_type.as_str())?;
+    dict.set_item(
+        intern!(py, "cfg_renorm_type"),
+        image.cfg_renorm_type.as_str(),
+    )?;
     dict.set_item(intern!(py, "cfg_renorm_min"), image.cfg_renorm_min)?;
     // `(f32, f32)` pythonizes as a Python tuple.
     dict.set_item(intern!(py, "cfg_interval"), image.cfg_interval)?;
@@ -238,7 +313,10 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     dict.set_item(intern!(py, "height"), image.height)?;
     dict.set_item(intern!(py, "width"), image.width)?;
     dict.set_item(intern!(py, "seed"), image.seed)?;
-    dict.set_item(intern!(py, "negative_prompt"), image.negative_prompt.as_str())?;
+    dict.set_item(
+        intern!(py, "negative_prompt"),
+        image.negative_prompt.as_str(),
+    )?;
     dict.set_item(intern!(py, "max_images"), image.max_images)?;
     dict.set_item(
         intern!(py, "image_prompts"),
@@ -248,14 +326,21 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     Ok(dict)
 }
 
-fn operation_to_py<'py>(py: Python<'py>, operation: &Operation) -> PyResult<Bound<'py, PyDict>> {
+fn operation_to_py<'py>(
+    py: Python<'py>,
+    operation: &Operation,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
-        request_key_to_py(py, operation.request_key)?,
+        context.request_key(operation.request_key)?,
     )?;
     dict.set_item(intern!(py, "op_id"), operation.op_id.0)?;
-    dict.set_item(intern!(py, "parent"), version_ref_to_py(py, &operation.parent)?)?;
+    dict.set_item(
+        intern!(py, "parent"),
+        version_ref_to_py(py, &operation.parent, context)?,
+    )?;
     dict.set_item(intern!(py, "work"), work_to_py(py, operation.work)?)?;
     dict.set_item(intern!(py, "route"), operation.route.0)?;
     dict.set_item(intern!(py, "domain"), domain_py(py, operation.domain))?;
@@ -263,11 +348,15 @@ fn operation_to_py<'py>(py: Python<'py>, operation: &Operation) -> PyResult<Boun
     dict.set_item(intern!(py, "bounds"), bounds_to_py(py, &operation.bounds)?)?;
     dict.set_item(
         intern!(py, "inputs"),
-        dict_list(py, &operation.inputs, product_ref_to_py)?,
+        dict_list(py, &operation.inputs, |product| {
+            product_ref_to_py(py, product, context)
+        })?,
     )?;
     dict.set_item(
         intern!(py, "outputs"),
-        dict_list(py, &operation.outputs, product_ref_to_py)?,
+        dict_list(py, &operation.outputs, |product| {
+            product_ref_to_py(py, product, context)
+        })?,
     )?;
     dict.set_item(
         intern!(py, "new_kv_blocks"),
@@ -278,27 +367,27 @@ fn operation_to_py<'py>(py: Python<'py>, operation: &Operation) -> PyResult<Boun
         operation
             .predicate
             .as_ref()
-            .map(|predicate| product_ref_to_py(py, predicate))
+            .map(|predicate| product_ref_to_py(py, predicate, context))
             .transpose()?,
     )?;
     dict.set_item(
         intern!(py, "rng"),
-        operation.rng.as_ref().map(|rng| rng_to_py(py, rng)).transpose()?,
+        operation
+            .rng
+            .as_ref()
+            .map(|rng| rng_to_py(py, rng))
+            .transpose()?,
     )?;
     dict.set_item(intern!(py, "control_seq"), operation.control_seq)?;
     dict.set_item(intern!(py, "plan_digest"), operation.plan_digest.as_str())?;
     Ok(dict)
 }
 
-fn request_key_to_py<'py>(py: Python<'py>, key: RequestKey) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "authority_id"), key.authority_id)?;
-    dict.set_item(intern!(py, "session_id"), key.session_id.0)?;
-    dict.set_item(intern!(py, "epoch"), key.epoch)?;
-    Ok(dict)
-}
-
-fn version_ref_to_py<'py>(py: Python<'py>, version: &VersionRef) -> PyResult<Bound<'py, PyDict>> {
+fn version_ref_to_py<'py>(
+    py: Python<'py>,
+    version: &VersionRef,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
     let point = PyDict::new(py);
     match &version.point {
         Point::Fixed {
@@ -319,7 +408,7 @@ fn version_ref_to_py<'py>(py: Python<'py>, version: &VersionRef) -> PyResult<Bou
             let value = PyDict::new(py);
             value.set_item(
                 intern!(py, "selected_point"),
-                product_ref_to_py(py, selected_point)?,
+                product_ref_to_py(py, selected_point, context)?,
             )?;
             value.set_item(
                 intern!(py, "producer_plan_digest"),
@@ -331,18 +420,22 @@ fn version_ref_to_py<'py>(py: Python<'py>, version: &VersionRef) -> PyResult<Bou
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
-        request_key_to_py(py, version.request_key)?,
+        context.request_key(version.request_key)?,
     )?;
     dict.set_item(intern!(py, "producer_op_id"), version.producer_op_id.0)?;
     dict.set_item(intern!(py, "point"), point)?;
     Ok(dict)
 }
 
-fn product_ref_to_py<'py>(py: Python<'py>, product: &ProductRef) -> PyResult<Bound<'py, PyDict>> {
+fn product_ref_to_py<'py>(
+    py: Python<'py>,
+    product: &ProductRef,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
-        request_key_to_py(py, product.request_key)?,
+        context.request_key(product.request_key)?,
     )?;
     dict.set_item(intern!(py, "producer_op_id"), product.producer_op_id.0)?;
     dict.set_item(intern!(py, "output_index"), product.output_index)?;
@@ -355,11 +448,11 @@ fn product_ref_to_py<'py>(py: Python<'py>, product: &ProductRef) -> PyResult<Bou
     dict.set_item(intern!(py, "dtype"), dtype_py(py, product.dtype))?;
     dict.set_item(
         intern!(py, "shape_bound"),
-        shape_bound_to_py(py, &product.shape_bound)?,
+        context.shape_bound(&product.shape_bound)?,
     )?;
     dict.set_item(
         intern!(py, "point_range"),
-        point_range_to_py(py, product.point_range)?,
+        context.point_range(product.point_range)?,
     )?;
     Ok(dict)
 }
@@ -415,7 +508,10 @@ fn rng_to_py<'py>(py: Python<'py>, rng: &Rng) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "seed"), rng.seed)?;
     dict.set_item(intern!(py, "semantic_index_base"), rng.semantic_index_base)?;
-    dict.set_item(intern!(py, "draw_layout"), draw_layout_py(py, rng.draw_layout))?;
+    dict.set_item(
+        intern!(py, "draw_layout"),
+        draw_layout_py(py, rng.draw_layout),
+    )?;
     Ok(dict)
 }
 
@@ -464,7 +560,11 @@ fn work_to_py<'py>(py: Python<'py>, work: Work) -> PyResult<Bound<'py, PyDict>> 
     Ok(dict)
 }
 
-fn control_to_py<'py>(py: Python<'py>, control: &Control) -> PyResult<Bound<'py, PyDict>> {
+fn control_to_py<'py>(
+    py: Python<'py>,
+    control: &Control,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     let value = PyDict::new(py);
     match control {
@@ -477,13 +577,19 @@ fn control_to_py<'py>(py: Python<'py>, control: &Control) -> PyResult<Bound<'py,
             disposition,
         } => {
             dict.set_item(intern!(py, "kind"), intern!(py, "commit"))?;
-            value.set_item(intern!(py, "request_key"), request_key_to_py(py, *request_key)?)?;
+            value.set_item(
+                intern!(py, "request_key"),
+                context.request_key(*request_key)?,
+            )?;
             value.set_item(intern!(py, "control_seq"), *control_seq)?;
             value.set_item(
                 intern!(py, "expected_parent"),
-                version_ref_to_py(py, expected_parent)?,
+                version_ref_to_py(py, expected_parent, context)?,
             )?;
-            value.set_item(intern!(py, "selected"), version_ref_to_py(py, selected)?)?;
+            value.set_item(
+                intern!(py, "selected"),
+                version_ref_to_py(py, selected, context)?,
+            )?;
             value.set_item(intern!(py, "public_event_limit"), *public_event_limit)?;
             let disposition = match disposition {
                 Disposition::Publish => intern!(py, "publish"),
@@ -499,9 +605,15 @@ fn control_to_py<'py>(py: Python<'py>, control: &Control) -> PyResult<Bound<'py,
             reason,
         } => {
             dict.set_item(intern!(py, "kind"), intern!(py, "close"))?;
-            value.set_item(intern!(py, "request_key"), request_key_to_py(py, *request_key)?)?;
+            value.set_item(
+                intern!(py, "request_key"),
+                context.request_key(*request_key)?,
+            )?;
             value.set_item(intern!(py, "control_seq"), *control_seq)?;
-            value.set_item(intern!(py, "cutoff"), version_ref_to_py(py, cutoff)?)?;
+            value.set_item(
+                intern!(py, "cutoff"),
+                version_ref_to_py(py, cutoff, context)?,
+            )?;
             let reason = match reason {
                 CloseReason::Completed => intern!(py, "completed"),
                 CloseReason::Cancelled => intern!(py, "cancelled"),
@@ -512,7 +624,10 @@ fn control_to_py<'py>(py: Python<'py>, control: &Control) -> PyResult<Bound<'py,
         }
         Control::Release { request_key, op_id } => {
             dict.set_item(intern!(py, "kind"), intern!(py, "release"))?;
-            value.set_item(intern!(py, "request_key"), request_key_to_py(py, *request_key)?)?;
+            value.set_item(
+                intern!(py, "request_key"),
+                context.request_key(*request_key)?,
+            )?;
             value.set_item(intern!(py, "op_id"), op_id.0)?;
         }
     }
@@ -523,9 +638,13 @@ fn control_to_py<'py>(py: Python<'py>, control: &Control) -> PyResult<Bound<'py,
 fn product_payload_to_py<'py>(
     py: Python<'py>,
     payload: &ProductPayload,
+    context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "product"), product_ref_to_py(py, &payload.product)?)?;
+    dict.set_item(
+        intern!(py, "product"),
+        product_ref_to_py(py, &payload.product, context)?,
+    )?;
     // `serde_bytes` pythonizes to `bytes`; one buffer copy, no per-element walk.
     dict.set_item(intern!(py, "bytes"), PyBytes::new(py, &payload.bytes))?;
     Ok(dict)
@@ -757,10 +876,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionRecor
     Some(CompletionRecord {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
         op_id: OpId(u64_of(&get(dict, intern!(py, "op_id"))?)?),
-        completion_slot_generation: u32_of(&get(
-            dict,
-            intern!(py, "completion_slot_generation"),
-        )?)?,
+        completion_slot_generation: u32_of(&get(dict, intern!(py, "completion_slot_generation"))?)?,
         status,
         selected_point: u32_of(&get(dict, intern!(py, "selected_point"))?)?,
         logical_lengths,
@@ -1023,7 +1139,12 @@ mod tests {
 
     fn product_ref(seed: u64) -> ProductRef {
         let dims = match seed % 3 {
-            0 => vec![DimBound::Static(4), DimBound::Device { max: 64 + seed as u32 }],
+            0 => vec![
+                DimBound::Static(4),
+                DimBound::Device {
+                    max: 64 + seed as u32,
+                },
+            ],
             1 => vec![DimBound::Static(seed as u32)],
             _ => Vec::new(),
         };
@@ -1031,7 +1152,7 @@ mod tests {
             request_key: request_key(seed),
             producer_op_id: OpId(300 + seed),
             output_index: (seed % 7) as u16,
-            generation: (seed % 5) as u32,
+            generation: (seed % 5) as u32 + 1,
             kind: PRODUCT_KINDS[seed as usize % PRODUCT_KINDS.len()],
             storage_class: STORAGE_CLASSES[seed as usize % STORAGE_CLASSES.len()],
             dtype: DTYPES[seed as usize % DTYPES.len()],
@@ -1055,11 +1176,14 @@ mod tests {
     }
 
     fn device_parent(seed: u64) -> VersionRef {
+        let producer_op_id = OpId(500 + seed);
+        let mut selected_point = product_ref(seed);
+        selected_point.producer_op_id = producer_op_id;
         VersionRef {
             request_key: request_key(seed),
-            producer_op_id: OpId(500 + seed),
+            producer_op_id,
             point: Point::Device {
-                selected_point: product_ref(seed),
+                selected_point,
                 producer_plan_digest: digest(seed + 1),
             },
         }
@@ -1108,11 +1232,19 @@ mod tests {
     }
 
     fn operation(seed: u64, work: Work) -> Operation {
-        let inputs = match seed % 3 {
+        let key = request_key(seed);
+        let op_id = OpId(600 + seed);
+        let mut inputs = match seed % 3 {
             0 => vec![product_ref(seed + 10), product_ref(seed + 11)],
             1 => vec![product_ref(seed + 12)],
             _ => Vec::new(),
         };
+        for input in &mut inputs {
+            if input.storage_class == StorageClass::HostStaging {
+                input.request_key = key;
+                input.producer_op_id = op_id;
+            }
+        }
         let parent = if seed.is_multiple_of(2) {
             fixed_parent(seed)
         } else {
@@ -1123,25 +1255,34 @@ mod tests {
             semantic_index_base: seed * 17,
             draw_layout: DRAW_LAYOUTS[seed as usize % DRAW_LAYOUTS.len()],
         });
-        let predicate = (seed.is_multiple_of(4)).then(|| product_ref(seed + 20));
+        let predicate = (seed.is_multiple_of(4)).then(|| {
+            let mut predicate = product_ref(seed + 20);
+            predicate.kind = ProductKind::Completion;
+            predicate.storage_class = StorageClass::DeviceTensor;
+            predicate
+        });
         let new_kv_blocks = if seed.is_multiple_of(2) {
             vec![BlockId(seed as u32), BlockId(seed as u32 + 1)]
         } else {
             Vec::new()
         };
-        let key = request_key(seed);
         let mut outputs = vec![product_ref(seed + 30), product_ref(seed + 31)];
         for output in &mut outputs {
             output.request_key = key;
-            output.producer_op_id = OpId(600 + seed);
+            output.producer_op_id = op_id;
+            output.point_range.max_points = 4;
         }
         Operation::registered(
             key,
-            OpId(600 + seed),
+            op_id,
             parent,
             work,
             uniserve_worker_wire::RouteId(seed as u32 % 4),
-            if seed.is_multiple_of(2) { Domain::Und } else { Domain::Gen },
+            if seed.is_multiple_of(2) {
+                Domain::Und
+            } else {
+                Domain::Gen
+            },
             Bounds {
                 max_points: 4,
                 max_tokens: 16,
@@ -1183,7 +1324,9 @@ mod tests {
             Admission::new(
                 request_key(1),
                 None,
-                Some(GenAdmission { image: full_image() }),
+                Some(GenAdmission {
+                    image: full_image(),
+                }),
                 None,
             )
             .unwrap(),
@@ -1194,7 +1337,9 @@ mod tests {
                     negative_token_ids: Vec::new(),
                     kv: KvAllocation::default(),
                 }),
-                Some(GenAdmission { image: full_image() }),
+                Some(GenAdmission {
+                    image: full_image(),
+                }),
                 None,
             )
             .unwrap(),
@@ -1203,13 +1348,25 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, variant)| operation(index as u64, Work::from_variant(*variant)))
+            .collect::<Vec<_>>();
+        let input_products = operations
+            .iter()
+            .flat_map(|operation| operation.inputs.iter())
+            .filter(|product| product.storage_class == StorageClass::HostStaging)
+            .enumerate()
+            .map(|(index, product)| ProductPayload {
+                product: product.clone(),
+                bytes: if product.kind == ProductKind::Token {
+                    uniserve_worker_wire::encode_token_product_bytes(&[index as u32])
+                } else {
+                    vec![index as u8]
+                },
+            })
             .collect();
-        let mut controls = vec![
-            Control::Release {
-                request_key: request_key(3),
-                op_id: OpId(77),
-            },
-        ];
+        let mut controls = vec![Control::Release {
+            request_key: request_key(3),
+            op_id: OpId(77),
+        }];
         for (index, disposition) in [
             Disposition::Publish,
             Disposition::Retain,
@@ -1247,16 +1404,7 @@ mod tests {
         }
         Batch::new(11, admissions, operations)
             .with_controls(controls)
-            .with_input_products(vec![
-                ProductPayload {
-                    product: product_ref(90),
-                    bytes: (0..=255).collect(),
-                },
-                ProductPayload {
-                    product: product_ref(91),
-                    bytes: Vec::new(),
-                },
-            ])
+            .with_input_products(input_products)
     }
 
     fn assert_matches_pythonize(py: Python<'_>, request: &WorkerRequest) {
@@ -1457,16 +1605,17 @@ mod tests {
     fn result_extractor_matches_depythonize() {
         Python::initialize();
         Python::attach(|py| {
-            for response in [completion_response(6), WorkerResponse::completion_report(
-                CompletionReport {
+            for response in [
+                completion_response(6),
+                WorkerResponse::completion_report(CompletionReport {
                     step_id: 0,
                     completions: Vec::new(),
                     products: Vec::new(),
                     registration: RegistrationAck::default(),
                     worker_exec_us: None,
                     forward_stats: None,
-                },
-            )] {
+                }),
+            ] {
                 for dict in [
                     pythonize(py, &response).unwrap(),
                     python_worker_shaped_dict(py, &response),
@@ -1591,7 +1740,10 @@ mod tests {
 
             // A missing required key goes reflective (which then errors).
             let dict = pythonize(py, &response).unwrap();
-            dict.cast::<PyDict>().unwrap().del_item("operations").unwrap();
+            dict.cast::<PyDict>()
+                .unwrap()
+                .del_item("operations")
+                .unwrap();
             assert!(try_completion_response_from_py(&dict).is_none());
             assert!(depythonize::<WorkerResponse>(&dict).is_err());
 

@@ -243,6 +243,8 @@ class EngineCaps:
     latent_downsample: int
     max_vae_grid_tokens: int
     max_vit_grid_tokens: int
+    max_latent_feature_bytes: int
+    max_vision_feature_bytes: int
     commit_marker_tokens: int
     gen_rope_advance: int
     max_cfg_branches: int
@@ -293,6 +295,8 @@ class EngineCaps:
             "max_latent_size",
             "max_vae_grid_tokens",
             "max_vit_grid_tokens",
+            "max_latent_feature_bytes",
+            "max_vision_feature_bytes",
             "encoder_cache_budget",
         ):
             if getattr(self, name) < 0:
@@ -328,6 +332,8 @@ class EngineCaps:
                 self.max_latent_size,
                 self.max_vae_grid_tokens,
                 self.max_vit_grid_tokens,
+                self.max_latent_feature_bytes,
+                self.max_vision_feature_bytes,
                 _WireAdapterMode(self.adapter_mode.value),
                 self.execution_constraints.max_batch_operations,
                 self.kv_dtype,
@@ -361,6 +367,12 @@ class EngineCaps:
             ),
             max_vit_grid_tokens=_uint(
                 data.get("max_vit_grid_tokens"), f"{where}.max_vit_grid_tokens"
+            ),
+            max_latent_feature_bytes=_uint(
+                data.get("max_latent_feature_bytes"), f"{where}.max_latent_feature_bytes"
+            ),
+            max_vision_feature_bytes=_uint(
+                data.get("max_vision_feature_bytes"), f"{where}.max_vision_feature_bytes"
             ),
             commit_marker_tokens=_uint(
                 data.get("commit_marker_tokens"), f"{where}.commit_marker_tokens"
@@ -435,6 +447,8 @@ class EngineCaps:
             "latent_downsample": self.latent_downsample,
             "max_vae_grid_tokens": self.max_vae_grid_tokens,
             "max_vit_grid_tokens": self.max_vit_grid_tokens,
+            "max_latent_feature_bytes": self.max_latent_feature_bytes,
+            "max_vision_feature_bytes": self.max_vision_feature_bytes,
             "commit_marker_tokens": self.commit_marker_tokens,
             "gen_rope_advance": self.gen_rope_advance,
             "max_cfg_branches": self.max_cfg_branches,

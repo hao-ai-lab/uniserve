@@ -764,7 +764,6 @@ fn resource_bounds(
         (needs.vision_encode, "vision_encode"),
         (needs.latent_encode, "latent_encode"),
         (needs.image_generation, "image_generation"),
-        (needs.commit_writeback, "commit_writeback"),
     ]
     .into_iter()
     .filter(|&(needed, _)| needed)

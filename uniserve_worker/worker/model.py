@@ -113,7 +113,13 @@ class ModelWorker:
             capacity_tokens=int(self._contract.capabilities.max_latent_size),
             downsample=(1 if model_spec.flow is None else int(model_spec.flow.latent_downsample)),
         )
-        self.products = ProductStore(encoder_cache_budget=model_spec.inputs.encoder_cache_budget)
+        self.products = ProductStore(
+            encoder_cache_budget=model_spec.inputs.encoder_cache_budget,
+            device_product_capacity=max(
+                2,
+                2 * int(pipeline_depth) * int(deployment.max_batch_operations),
+            ),
+        )
         self.replay = ReplayStore()
         self.mover = Mover(
             transfer_backend=transfer_backend,
@@ -289,6 +295,7 @@ class ModelWorker:
             RequestKey,
             SamplingParams,
             ShapeBound,
+            StaticDim,
             StorageClass,
             TokenMode,
             UndAdmission,
@@ -342,21 +349,6 @@ class ModelWorker:
             )
             for block_id, sid in enumerate(session_ids)
         }
-        token_refs = {
-            sid: ProductRef(
-                request_key=keys[sid],
-                producer_op_id=0,
-                output_index=0,
-                generation=0,
-                kind=ProductKind.TOKEN,
-                storage_class=StorageClass.HOST_STAGING,
-                dtype=DType.U32,
-                shape_bound=ShapeBound(),
-                point_range=PointRange(),
-            )
-            for sid in session_ids
-        }
-
         def token_op(
             sid: int,
             op_id: int,
@@ -364,6 +356,17 @@ class ModelWorker:
             mode: TokenMode,
             tokens: tuple[int, ...],
         ) -> tuple[Operation, ProductPayload]:
+            token_ref = ProductRef(
+                request_key=keys[sid],
+                producer_op_id=op_id,
+                output_index=(1 << 16) - 1,
+                generation=op_id,
+                kind=ProductKind.TOKEN,
+                storage_class=StorageClass.HOST_STAGING,
+                dtype=DType.U32,
+                shape_bound=ShapeBound((StaticDim(max(1, len(tokens))),)),
+                point_range=PointRange(),
+            )
             operation = Operation.registered(
                 request_key=keys[sid],
                 op_id=op_id,
@@ -372,10 +375,10 @@ class ModelWorker:
                 route=0,
                 domain=Domain.UND,
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
-                inputs=(token_refs[sid],),
+                inputs=(token_ref,),
             )
             return operation, ProductPayload(
-                product=token_refs[sid], payload=encode_token_product_bytes(tokens)
+                product=token_ref, payload=encode_token_product_bytes(tokens)
             )
 
         step_id = 0
@@ -450,6 +453,7 @@ class ModelWorker:
             RequestKey,
             SamplingParams,
             ShapeBound,
+            StaticDim,
             StorageClass,
             TokenMode,
             UndAdmission,
@@ -507,13 +511,13 @@ class ModelWorker:
                 )
                 token_ref = ProductRef(
                     request_key=rk,
-                    producer_op_id=0,
-                    output_index=0,
-                    generation=0,
+                    producer_op_id=1,
+                    output_index=(1 << 16) - 1,
+                    generation=1,
                     kind=ProductKind.TOKEN,
                     storage_class=StorageClass.HOST_STAGING,
                     dtype=DType.U32,
-                    shape_bound=ShapeBound(),
+                    shape_bound=ShapeBound((StaticDim(token_count),)),
                     point_range=PointRange(),
                 )
                 operation = Operation.registered(

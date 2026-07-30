@@ -37,6 +37,8 @@ def _recompute_route_digest(wire: dict) -> str:
         wire["max_latent_size"],
         wire["max_vae_grid_tokens"],
         wire["max_vit_grid_tokens"],
+        wire["max_latent_feature_bytes"],
+        wire["max_vision_feature_bytes"],
         AdapterMode(wire["adapter_mode"]),
         wire["execution_constraints"]["max_batch_operations"],
         wire["kv_dtype"],

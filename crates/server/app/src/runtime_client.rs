@@ -345,9 +345,9 @@ impl InProcessEngineClient for RuntimeEngineClient {
 mod tests {
     use futures::StreamExt as _;
     use uniserve_core::{
-        CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
-        GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
-        GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
+        ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
+        GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+        GenerationRequest, GenerationResourceBounds, ImageIngestRecipe, ImageKvEffect, ImageParams,
         RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
     };
     use uniserve_engine_gateway::transport::protocol::{EngineCoreFinishReason, EngineCoreRequest};
@@ -440,11 +440,10 @@ mod tests {
             trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
             gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
             feedback: Some(GeneratedImageFeedbackRecipe {
-                commit: CommitRecipe::CommitGenThenWriteback,
-                writeback: FeedbackWriteback::DirectKv,
+                source: FeedbackSource::DeviceProduct,
                 next_und_token: FeedbackNextToken::EndOfImage,
-                logical_positions: 2,
-                physical_kv_tokens: uniserve_core::ImageKvEffect::WorkerDefined,
+                ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
+                sample_continuation: true,
             }),
             ..GenerationPolicyDescriptor::default()
         };
