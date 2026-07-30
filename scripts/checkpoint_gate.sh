@@ -37,10 +37,15 @@ if [ -n "$(git status --porcelain | grep -vE 'artifacts/|specs/tasks.md')" ]; th
 fi
 echo "candidate tree: $(git rev-parse --short HEAD) (clean)"
 
-# Rebuild the pyo3 worker extension (_uniserve_ipc) from the candidate source. run_benchmarks builds
-# the release binary but not the Python-facing setuptools-rust extension; a stale .so silently
-# serves the previous protocol layout on the worker IPC wire.
+# Provision the declared GPU provider pack and rebuild the pyo3 worker extension from the candidate
+# source. The benchmark requires the visible-end FA4 provider and the candidate IPC wire layout.
+uv pip install --python .venv/bin/python -e uniserve_kernel >/dev/null
 uv pip install --python .venv/bin/python -e . --no-deps >/dev/null
+.venv/bin/python - <<'PY'
+from uniserve_kernel import mm_attn_varlen
+
+mm_attn_varlen.require_available()
+PY
 
 BENCHES="qwen-uniserve-sharegpt-r16,sensenova-uniserve-t2i-c32,sensenova-uniserve-i2t-c32"
 # NB: not GROUPS -- that is a read-only bash special array (the caller's unix groups);
