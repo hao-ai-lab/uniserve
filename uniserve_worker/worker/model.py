@@ -58,6 +58,7 @@ class ModelWorker:
         model_spec_digest: str | None = None,
         weight_digest: str | None = None,
         pipeline_depth: int,
+        completion_payload_bytes: int,
         snapshot_dir: str | None = None,
         restore_snapshots: bool = False,
     ) -> None:
@@ -160,6 +161,7 @@ class ModelWorker:
             trace=self.trace,
             pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
+            completion_payload_bytes=completion_payload_bytes,
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:

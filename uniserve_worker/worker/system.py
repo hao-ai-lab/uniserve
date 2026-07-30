@@ -34,6 +34,7 @@ class SystemWorker:
         mooncake_device: str,
         mooncake_protocol: str,
         pipeline_depth: int,
+        completion_payload_bytes: int,
         device: str,
         snapshot_dir: str | None = None,
         restore_snapshots: bool = False,
@@ -97,6 +98,7 @@ class SystemWorker:
             allowed_operation_types=allowed_operation_types,
             trace=self.trace,
             pipeline_depth=pipeline_depth,
+            completion_payload_bytes=completion_payload_bytes,
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:

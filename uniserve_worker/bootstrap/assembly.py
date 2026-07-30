@@ -28,6 +28,7 @@ def assemble_worker(config: WorkerLaunchConfig):
             mooncake_device=config.execution.mooncake_device,
             mooncake_protocol=config.execution.mooncake_protocol,
             pipeline_depth=config.ipc.pipeline_depth,
+            completion_payload_bytes=config.ipc.max_payload_bytes,
             device=config.placement.device,
             snapshot_dir=config.snapshot_dir,
             restore_snapshots=config.restore_snapshots,
@@ -134,6 +135,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         model_spec_digest=model_spec_digest,
         weight_digest=weight_digest,
         pipeline_depth=config.ipc.pipeline_depth,
+        completion_payload_bytes=config.ipc.max_payload_bytes,
         snapshot_dir=config.snapshot_dir,
         restore_snapshots=config.restore_snapshots,
     )

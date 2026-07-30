@@ -10,6 +10,7 @@ byte-identical to the Rust-computed digests.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,7 @@ from uniserve_worker.batch import (
     Release,
     RequestKey,
     Rng,
+    SamplingState,
     ShapeBound,
     StaticDim,
     StorageClass,
@@ -57,7 +59,9 @@ from uniserve_worker.batch import (
     control_content_digest,
     control_from_wire,
     control_to_wire,
+    decode_sampling_state_bytes,
     decode_token_product_bytes,
+    encode_sampling_state_bytes,
     encode_token_product_bytes,
     protocol_layout_digest,
     route_capability_digest,
@@ -141,8 +145,6 @@ def test_semantic_digest_matches_rust() -> None:
     assert completion.semantic_digest == fixture["semantic_digest"]
     # Token values are lineage identity: a different committed token at the same
     # span changes the semantic digest.
-    from dataclasses import replace
-
     shifted = replace(completion, committed_tokens=(completion.committed_tokens[0] + 1,))
     assert shifted.compute_semantic_digest(
         fixture["parent_semantic_digest"], fixture["plan_digest"]
@@ -370,6 +372,26 @@ def test_token_product_bytes_round_trip() -> None:
         decode_token_product_bytes(bytes([2, 0, 0, 0, 9, 0, 0, 0]))
 
 
+def test_sampling_state_bytes_preserve_branch_local_processor_semantics() -> None:
+    encoded = encode_sampling_state_bytes(
+        SamplingState(
+            recent_counts=((9, 1), (3, 2), (9, 4)),
+            allowed_token_ids=(),
+            suppressed_token_ids=(7, 2, 7),
+            finish_token_ids=(11, 5, 11),
+            force_finish=True,
+        )
+    )
+
+    assert decode_sampling_state_bytes(encoded) == SamplingState(
+        recent_counts=((3, 2), (9, 5)),
+        allowed_token_ids=(),
+        suppressed_token_ids=(2, 7),
+        finish_token_ids=(5, 11),
+        force_finish=True,
+    )
+
+
 def test_batch_carries_host_supplied_input_products() -> None:
     token_input = ProductRef(
         request_key=_request_key(),
@@ -431,3 +453,27 @@ def test_completion_report_round_trips_with_product_payloads() -> None:
         worker_exec_us=10,
     )
     assert CompletionReport.from_wire(report.to_wire()) == report
+
+
+def test_host_visible_output_fits_the_operation_completion_bound() -> None:
+    operation = _decode_operation()
+    logprob = ProductRef(
+        request_key=operation.request_key,
+        producer_op_id=operation.op_id,
+        output_index=2,
+        generation=7,
+        kind=ProductKind.LOGPROB,
+        storage_class=StorageClass.HOST_STAGING,
+        dtype=DType.U8,
+        shape_bound=ShapeBound((StaticDim(17),)),
+        point_range=PointRange(base_point=0, max_points=1),
+    )
+    invalid = replace(
+        operation,
+        outputs=(*operation.outputs, logprob),
+        bounds=replace(operation.bounds, max_completion_bytes=16),
+    )
+    invalid = replace(invalid, plan_digest=invalid.compute_plan_digest())
+
+    with pytest.raises(WorkerError, match="host-visible output"):
+        Operation.from_wire(invalid.to_wire())

@@ -22,7 +22,10 @@ pub use generation::{
     TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction, UndVisibility,
     VisibilityPolicyDescriptor, denoise_scratch_tokens, encoder_cache_key,
 };
-pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs};
+pub use sampling::{
+    SampleOutput, apply_sampling, score_token_logprobs, semantic_sampling_seed,
+    try_apply_sampling_counts,
+};
 
 /// A cloneable, thread-safe wake the command ingress fires after enqueuing a
 /// command, so a parked event-driven executor wakes immediately instead of

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import struct
 import time
 from collections import defaultdict
 from collections.abc import Generator, Iterable, Mapping, Sequence
@@ -20,6 +21,7 @@ from uniserve_worker.batch import (
     CompletionReport,
     DevicePoint,
     Domain,
+    DrawLayout,
     EncodeMode,
     FinishFlags,
     FixedPoint,
@@ -33,13 +35,18 @@ from uniserve_worker.batch import (
     RegistrationAck,
     Release,
     SamplingParams,
+    SamplingState,
     StorageClass,
     TimingCounters,
     TokenMode,
     TokenSpan,
     TransferMode,
     VersionRef,
+    decode_sampling_state_bytes,
     decode_token_product_bytes,
+)
+from uniserve_worker.batch import (
+    ErrorCode as ProtocolErrorCode,
 )
 from uniserve_worker.capabilities import work_operation_type
 from uniserve_worker.forward import (
@@ -149,6 +156,7 @@ from uniserve_worker.runtime.rng import (
     flow_noise_seed,
     normal_noise,
     sampling_draw_seed,
+    semantic_sampling_seed,
     uniform_samples,
 )
 from uniserve_worker.runtime.transfer import Locator, Transport, fetch_locator
@@ -231,6 +239,8 @@ class _SamplingRow:
     suppress: tuple[int, ...]
     draw_seed: int
     n_logprobs: int
+    finish_token_ids: tuple[int, ...] = ()
+    force_finish: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,24 +248,30 @@ class _SampleTask:
     operation: Operation
     logits: torch.Tensor
     rows: tuple[_SamplingRow, ...]
-    noise: torch.Tensor | None
+    draws: torch.Tensor | None
     penalty_token_ids: torch.Tensor | None
     penalty_counts: torch.Tensor | None
     parameter_values: torch.Tensor | None
-    defer_host_token: bool = False
     draft_token_ids: tuple[int, ...] = ()
     acceptance_uniforms: torch.Tensor | None = None
-    device_product: DeviceProductWrite | None = None
+    token_product: DeviceProductWrite | None = None
+    finish_product: DeviceProductWrite | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _SampleResult:
     token_id: int | _CompletionToken
     device_token: torch.Tensor | None
-    logprob: float | None
-    top_logprobs: tuple[tuple[int, float, int], ...] | None
-    num_accepted_tokens: int = 0
+    logprob: float | _CompletionLogprobValue | None
+    top_logprobs: tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs | None
+    num_accepted_tokens: int | _CompletionInteger = 0
+    prompt_logprobs: tuple[
+        tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
+        ...,
+    ] = ()
+    device_finish: torch.Tensor | None = None
     device_product_published: bool = False
+    finish_product_published: bool = False
 
 
 class _CompletionTokenSpan:
@@ -307,6 +323,324 @@ class _CompletionToken:
 
     def __hash__(self) -> int:
         return hash(self.finalize())
+
+
+class _InvalidSamplingDistribution(RuntimeError):
+    pass
+
+
+class _CompletionSampleSpan:
+    """Selected tokens, row validity, and accepted counts from one device wave."""
+
+    __slots__ = ("capture", "count", "_values")
+
+    def __init__(
+        self,
+        capture: CompletionCapture | None,
+        count: int,
+        values: tuple[int, ...] | None = None,
+    ) -> None:
+        self.capture = capture
+        self.count = int(count)
+        self._values = values
+
+    def ready(self) -> bool:
+        return self._values is not None or (
+            self.capture is not None and self.capture.ready()
+        )
+
+    def finalize(self) -> tuple[int, ...]:
+        if self._values is None:
+            if self.capture is None:
+                raise RuntimeError("sampling completion metadata has no capture")
+            values = self.capture.values()
+            if len(values) != self.count * 3:
+                raise RuntimeError("sampling completion metadata has an invalid extent")
+            self._values = values
+        return self._values
+
+    def token(self, index: int) -> int:
+        values = self.finalize()
+        if not bool(values[index]):
+            raise _InvalidSamplingDistribution(
+                "sampling policy produced an invalid distribution"
+            )
+        return values[self.count + index]
+
+    def accepted(self, index: int) -> int:
+        values = self.finalize()
+        if not bool(values[index]):
+            raise _InvalidSamplingDistribution(
+                "sampling policy produced an invalid distribution"
+            )
+        return values[self.count * 2 + index]
+
+
+class _CompletionSampleToken(_CompletionToken):
+    __slots__ = ("sample_span",)
+
+    def __init__(self, span: _CompletionSampleSpan, index: int) -> None:
+        self.sample_span = span
+        self.span = cast(_CompletionTokenSpan, span)
+        self.index = int(index)
+
+    def ready(self) -> bool:
+        return self.sample_span.ready()
+
+    def finalize(self) -> int:
+        return self.sample_span.token(self.index)
+
+
+class _CompletionInteger:
+    __slots__ = ("span", "index")
+
+    def __init__(self, span: _CompletionSampleSpan, index: int) -> None:
+        self.span = span
+        self.index = int(index)
+
+    def ready(self) -> bool:
+        return self.span.ready()
+
+    def finalize(self) -> int:
+        return self.span.accepted(self.index)
+
+    def __int__(self) -> int:
+        return self.finalize()
+
+    def __index__(self) -> int:
+        return self.finalize()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _CompletionInteger):
+            return self.finalize() == other.finalize()
+        if isinstance(other, int):
+            return self.finalize() == other
+        return NotImplemented
+
+
+class _CompletionLogprobBatch:
+    """Packed query-ready logprob tensors shared by a sampling group."""
+
+    __slots__ = (
+        "capture",
+        "rows",
+        "counts",
+        "requested_ids",
+        "max_count",
+        "max_requested",
+        "_details",
+    )
+
+    def __init__(
+        self,
+        capture: CompletionCapture | None,
+        rows: tuple[int, ...],
+        counts: tuple[int, ...],
+        requested_ids: tuple[tuple[int, ...], ...],
+        max_count: int,
+        max_requested: int,
+        values: tuple[int, ...] | None = None,
+    ) -> None:
+        self.capture = capture
+        self.rows = rows
+        self.counts = counts
+        self.requested_ids = requested_ids
+        self.max_count = int(max_count)
+        self.max_requested = int(max_requested)
+        self._details: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] | None = None
+        if values is not None:
+            self._details = self._decode(values)
+
+    def ready(self) -> bool:
+        return self._details is not None or (
+            self.capture is not None and self.capture.ready()
+        )
+
+    @staticmethod
+    def _float(value: int) -> float:
+        return struct.unpack("<f", struct.pack("<I", value & 0xFFFFFFFF))[0]
+
+    def finalize(self) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
+        if self._details is not None:
+            return self._details
+        if self.capture is None:
+            raise RuntimeError("logprob completion metadata has no capture")
+        self._details = self._decode(self.capture.values())
+        return self._details
+
+    def _decode(
+        self,
+        values: tuple[int, ...],
+    ) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
+        row_count = len(self.rows)
+        cursor = 0
+
+        def vector(width: int) -> tuple[tuple[int, ...], ...]:
+            nonlocal cursor
+            total = row_count * width
+            part = values[cursor : cursor + total]
+            if len(part) != total:
+                raise RuntimeError("logprob completion metadata is truncated")
+            cursor += total
+            return tuple(
+                tuple(part[row * width : (row + 1) * width])
+                for row in range(row_count)
+            )
+
+        selected_tokens = vector(1)
+        selected_values = vector(1)
+        selected_ranks = vector(1)
+        top_indexes = vector(self.max_count)
+        top_values = vector(self.max_count)
+        top_ranks = vector(self.max_count)
+        candidate_values = vector(self.max_requested)
+        candidate_ranks = vector(self.max_requested)
+        if cursor != len(values):
+            raise RuntimeError("logprob completion metadata has trailing values")
+        details: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] = {}
+        for local, result_index in enumerate(self.rows):
+            selected = selected_tokens[local][0]
+            selected_value = self._float(selected_values[local][0])
+            entries: list[tuple[int, float, int]] = [
+                (selected, selected_value, selected_ranks[local][0])
+            ]
+            seen = {selected}
+            for index in range(self.counts[local]):
+                candidate = top_indexes[local][index]
+                if candidate not in seen:
+                    entries.append(
+                        (
+                            candidate,
+                            self._float(top_values[local][index]),
+                            top_ranks[local][index],
+                        )
+                    )
+                    seen.add(candidate)
+            for index, candidate in enumerate(self.requested_ids[local]):
+                if candidate not in seen:
+                    entries.append(
+                        (
+                            candidate,
+                            self._float(candidate_values[local][index]),
+                            candidate_ranks[local][index],
+                        )
+                    )
+                    seen.add(candidate)
+            details[result_index] = (selected_value, tuple(entries))
+        return details
+
+
+class _CompletionLogprobValue:
+    __slots__ = ("batch", "index")
+
+    def __init__(self, batch: _CompletionLogprobBatch, index: int) -> None:
+        self.batch = batch
+        self.index = int(index)
+
+    def ready(self) -> bool:
+        return self.batch.ready()
+
+    def finalize(self) -> float:
+        return self.batch.finalize()[self.index][0]
+
+    def __float__(self) -> float:
+        return self.finalize()
+
+
+class _CompletionTopLogprobs:
+    __slots__ = ("batch", "index")
+
+    def __init__(self, batch: _CompletionLogprobBatch, index: int) -> None:
+        self.batch = batch
+        self.index = int(index)
+
+    def ready(self) -> bool:
+        return self.batch.ready()
+
+    def finalize(self) -> tuple[tuple[int, float, int], ...]:
+        return self.batch.finalize()[self.index][1]
+
+    def max_entries(self) -> int:
+        local = self.batch.rows.index(self.index)
+        return 1 + int(self.batch.counts[local]) + len(self.batch.requested_ids[local])
+
+
+class _CompletionLogprobPayload:
+    __slots__ = ("logprob", "top_logprobs", "prompt_logprobs", "_value")
+
+    def __init__(
+        self,
+        logprob: float | _CompletionLogprobValue | None,
+        top_logprobs: tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs | None,
+        prompt_logprobs: tuple[
+            tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
+            ...,
+        ] = (),
+    ) -> None:
+        self.logprob = logprob
+        self.top_logprobs = top_logprobs
+        self.prompt_logprobs = prompt_logprobs
+        self._value: bytes | None = None
+
+    def ready(self) -> bool:
+        if self._value is not None:
+            return True
+        return (
+            not isinstance(self.logprob, _CompletionLogprobValue) or self.logprob.ready()
+        ) and (
+            not isinstance(self.top_logprobs, _CompletionTopLogprobs)
+            or self.top_logprobs.ready()
+        ) and all(
+            not isinstance(position, _CompletionTopLogprobs) or position.ready()
+            for position in self.prompt_logprobs
+        )
+
+    def max_encoded_bytes(self) -> int:
+        def entry_bound(
+            entries: tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs | None,
+        ) -> int:
+            if isinstance(entries, _CompletionTopLogprobs):
+                return entries.max_entries()
+            return len(entries or ())
+
+        return (
+            (5 if self.logprob is not None else 1)
+            + 4
+            + 12 * entry_bound(self.top_logprobs)
+            + 4
+            + sum(4 + 12 * entry_bound(position) for position in self.prompt_logprobs)
+        )
+
+    def finalize(self) -> bytes:
+        if self._value is not None:
+            return self._value
+        if not self.ready():
+            raise RuntimeError("logprob payload was observed before query-ready")
+        logprob = None if self.logprob is None else float(self.logprob)
+        top = (
+            self.top_logprobs.finalize()
+            if isinstance(self.top_logprobs, _CompletionTopLogprobs)
+            else self.top_logprobs or ()
+        )
+        out = bytearray(b"\x00" if logprob is None else b"\x01" + struct.pack("<f", logprob))
+        out += struct.pack("<I", len(top))
+        for token_id, value, rank in top:
+            out += struct.pack("<IfI", int(token_id), float(value), int(rank))
+        out += struct.pack("<I", len(self.prompt_logprobs))
+        for position in self.prompt_logprobs:
+            entries = (
+                position.finalize()
+                if isinstance(position, _CompletionTopLogprobs)
+                else position
+            )
+            out += struct.pack("<I", len(entries))
+            for token_id, value, rank in entries:
+                out += struct.pack("<IfI", int(token_id), float(value), int(rank))
+        self._value = bytes(out)
+        return self._value
+
+    def __bytes__(self) -> bytes:
+        return self.finalize()
 
 
 _COMPLETION_FIELD_NAMES: tuple[str, ...] = tuple(
@@ -361,6 +695,7 @@ class _PendingDigest:
         "_completion_timing",
         "_value",
         "_observed",
+        "_invalid_sampling",
     )
 
     def __init__(
@@ -380,6 +715,7 @@ class _PendingDigest:
         self._completion_timing: tuple[int, int] | None = None
         self._value: str | None = None
         self._observed = False
+        self._invalid_sampling = False
 
     def ready(self) -> bool:
         if self._value is not None:
@@ -398,10 +734,17 @@ class _PendingDigest:
             # The digest packs each committed token via ``__index__``, which
             # finalizes a deferred token exactly as ``int(value)`` would, so
             # the record is hashed in place without a concrete-token copy.
-            self._value = self._record.compute_semantic_digest(
-                parent_semantic=cast(str, parent),
-                plan_digest=self._plan_digest,
-            )
+            try:
+                self._value = self._record.compute_semantic_digest(
+                    parent_semantic=cast(str, parent),
+                    plan_digest=self._plan_digest,
+                )
+            except _InvalidSamplingDistribution:
+                self._invalid_sampling = True
+                self._value = _invalid_sampling_record(self._record).compute_semantic_digest(
+                    parent_semantic=cast(str, parent),
+                    plan_digest=self._plan_digest,
+                )
             lease = self._lease
             if lease is None:
                 raise RuntimeError("completion digest lost its arena lease")
@@ -416,6 +759,11 @@ class _PendingDigest:
     def completion_timing(self) -> tuple[int, int]:
         self.resolve()
         return self._completion_timing or (0, 0)
+
+    @property
+    def invalid_sampling(self) -> bool:
+        self.resolve()
+        return self._invalid_sampling
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, _PendingDigest):
@@ -458,6 +806,12 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
         resolved = digest.resolve()
         copy_us, host_us = digest.completion_timing()
         timing = replace(record.timing_counters, copy_us=copy_us, host_us=host_us)
+        if digest.invalid_sampling:
+            return replace(
+                _invalid_sampling_record(record),
+                semantic_digest=resolved,
+                timing_counters=timing,
+            )
     else:
         resolved = digest
         timing = record.timing_counters
@@ -471,11 +825,27 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
     return _record_with_tokens(record, tokens, resolved, timing)
 
 
+def _invalid_sampling_record(record: CompletionRecord) -> CompletionRecord:
+    return replace(
+        record,
+        status=OpStatus.ERROR,
+        selected_point=max(0, int(record.selected_point) - 1),
+        token_span=replace(record.token_span, len=0),
+        committed_tokens=(),
+        product_generations=(),
+        error_code=ProtocolErrorCode.INVALID_OPERATION,
+    )
+
+
 def completion_report_ready(report: CompletionReport) -> bool:
     """True once every completion's deferred token/digest/artifact can be read
     without a stall."""
 
-    return all(_record_ready(record) for record in report.completions)
+    return all(_record_ready(record) for record in report.completions) and all(
+        not isinstance(product.payload, _CompletionLogprobPayload)
+        or product.payload.ready()
+        for product in report.products
+    )
 
 
 def finalize_completion_report(report: CompletionReport) -> CompletionReport:
@@ -491,9 +861,33 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
         _finalized_record(record) if _record_ready(record) else record
         for record in report.completions
     )
-    if all(new is old for new, old in zip(completions, report.completions, strict=True)):
+    products = tuple(
+        replace(product, payload=product.payload.finalize())
+        if isinstance(product.payload, _CompletionLogprobPayload) and product.payload.ready()
+        else product
+        for product in report.products
+    )
+    for product in products:
+        if isinstance(product.payload, bytes) and len(product.payload) > int(
+            product.product.max_bytes
+        ):
+            raise invalid_descriptor(
+                "completion product exceeds its registered product byte bound"
+            )
+    invalid_ops = {
+        int(record.op_id) for record in completions if record.status is OpStatus.ERROR
+    }
+    if invalid_ops:
+        products = tuple(
+            product
+            for product in products
+            if int(product.product.producer_op_id) not in invalid_ops
+        )
+    if all(
+        new is old for new, old in zip(completions, report.completions, strict=True)
+    ) and all(new is old for new, old in zip(products, report.products, strict=True)):
         return report
-    return replace(report, completions=completions)
+    return replace(report, completions=completions, products=products)
 
 
 _ExecutorTask: TypeAlias = _ForwardTask | _SampleTask
@@ -516,6 +910,9 @@ class _ExecutionScope:
     device_reads: list[DeviceProductRead] = field(default_factory=list)
     device_writes: list[DeviceProductWrite] = field(default_factory=list)
     operation_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
+    token_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
+    finish_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
+    sampling_states: dict[int, SamplingState] = field(default_factory=dict)
     next_row_id: int = 0
 
     def row_id(self) -> int:
@@ -551,6 +948,7 @@ class _StateOutcome:
 
     kv_tokens: int
     committed_tokens: tuple[int | _CompletionToken, ...] = ()
+    products: tuple[ProductPayload, ...] = ()
 
     @property
     def sampled_tokens(self) -> int:
@@ -582,6 +980,7 @@ class ModelExecutor:
         trace: ExecutionTrace,
         pipeline_depth: int = 1,
         defer_sampling: bool = False,
+        completion_payload_bytes: int,
     ) -> None:
         if not allowed_operation_types:
             raise ValueError("executor must accept at least one operation type")
@@ -635,6 +1034,11 @@ class ModelExecutor:
             else canonical_device(deployment.generation_device)
         )
         max_operations = 1024 if deployment is None else int(deployment.max_batch_operations)
+        if int(completion_payload_bytes) < 1:
+            raise ValueError("completion payload capacity must be positive")
+        completion_words = (
+            3 * max_operations + (int(completion_payload_bytes) + 3) // 4
+        )
         completion_devices: list[str] = []
         if deployment is not None:
             completion_devices.append(deployment.device)
@@ -642,7 +1046,7 @@ class ModelExecutor:
                 completion_devices.append(deployment.generation_device)
         self._completions = CompletionArena(
             depth=pipeline_depth,
-            token_capacity=max_operations,
+            token_capacity=completion_words,
             devices=tuple(completion_devices),
             event_pool=products.device_events,
         )
@@ -917,7 +1321,10 @@ class ModelExecutor:
         for write in writes:
             operation_id = int(write.reference.producer_op_id)
             if write.reference.kind is ProductKind.TOKEN:
-                scope.operation_writes[operation_id] = write
+                scope.token_writes[operation_id] = write
+                scope.operation_writes.setdefault(operation_id, write)
+            elif write.reference.kind is ProductKind.FINISH:
+                scope.finish_writes[operation_id] = write
             else:
                 scope.operation_writes.setdefault(operation_id, write)
 
@@ -936,9 +1343,19 @@ class ModelExecutor:
                 raise invalid_descriptor(
                     "completion carries a product not declared by its operation"
                 )
-            if reference.storage_class is StorageClass.COMPLETION_ARENA and len(
-                product.payload
-            ) > int(operation.bounds.max_completion_bytes):
+            payload_bound = (
+                product.payload.max_encoded_bytes()
+                if isinstance(product.payload, _CompletionLogprobPayload)
+                else len(product.payload)
+            )
+            if payload_bound > int(reference.max_bytes):
+                raise invalid_descriptor(
+                    "completion product exceeds its registered product byte bound"
+                )
+            if reference.storage_class in (
+                StorageClass.HOST_STAGING,
+                StorageClass.COMPLETION_ARENA,
+            ) and payload_bound > int(operation.bounds.max_completion_bytes):
                 raise invalid_descriptor(
                     "completion product exceeds its registered byte bound"
                 )
@@ -1032,6 +1449,11 @@ class ModelExecutor:
 
         for entry in batch.input_products:
             product = entry.product
+            if product.kind is ProductKind.SAMPLING_STATE:
+                scope.sampling_states[int(product.producer_op_id)] = (
+                    decode_sampling_state_bytes(entry.payload)
+                )
+                continue
             handle = self._input_product_handle(product)
             payload: LogitsProduct | EncodedImageProduct
             if product.kind is ProductKind.TOKEN:
@@ -1154,6 +1576,7 @@ class ModelExecutor:
                     base=start,
                     tokens=1,
                     committed_tokens=(sampled.token_id,),
+                    sample=sampled,
                 )
             )
         _record_component(scope, "text_finalize", finalize_started)
@@ -1704,11 +2127,15 @@ class ModelExecutor:
     ) -> _Driver:
         tokens = self._operation_token_ids(operation, scope)
         start = session.logical_position
+        sampling = _require_sampling(session)
+        scores_prompt = bool(
+            sampling.return_prompt_logprobs or int(sampling.n_prompt_logprobs) > 0
+        )
         task = self._token_task(
             operation,
             tokens,
             tuple(range(start, start + len(tokens))),
-            TokenSelection.LAST_LOGITS,
+            TokenSelection.ALL_LOGITS if scores_prompt else TokenSelection.LAST_LOGITS,
             scope,
         )
         outputs = yield (task,)
@@ -1722,6 +2149,17 @@ class ModelExecutor:
             positions=(start + len(tokens),),
         )
         sample = _sample_result((yield (sample_task,))[0])
+        if scores_prompt:
+            sample = replace(
+                sample,
+                prompt_logprobs=self._prompt_logprob_details(
+                    session,
+                    start,
+                    tokens,
+                    logits,
+                    scope,
+                ),
+            )
         self._publish_token_product(operation, sample, scope)
         session.rng_counter += 1
         session.logical_position = start + len(tokens)
@@ -1733,7 +2171,90 @@ class ModelExecutor:
             base=start,
             tokens=len(tokens),
             committed_tokens=(sample.token_id,),
+            sample=sample,
         )
+
+    def _prompt_logprob_details(
+        self,
+        session: RequestSession,
+        start: int,
+        tokens: tuple[int, ...],
+        logits: torch.Tensor,
+        scope: _ExecutionScope,
+    ) -> tuple[
+        tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
+        ...,
+    ]:
+        if logits.ndim != 2 or int(logits.shape[0]) != len(tokens):
+            raise invalid_descriptor("prompt scoring logits do not align with input tokens")
+        handle = _stable_handle(
+            session.request_key.session_id,
+            session.request_key.epoch,
+            0,
+            "prompt_logits",
+        )
+        if start == 0:
+            score_logits = logits[:-1]
+            targets = tokens[1:]
+        else:
+            record = scope.product_view.get(handle)
+            if record is None or not isinstance(record.payload, LogitsProduct):
+                raise invalid_descriptor("continued prompt scoring has no preceding logits")
+            previous = record.payload.logits.reshape(1, -1).to(
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            score_logits = torch.cat((previous, logits[:-1]), dim=0)
+            targets = tokens
+        scope.product_view.put(
+            ProductRecord(
+                handle=handle,
+                session_id=session.session_id,
+                payload=LogitsProduct(
+                    logits=logits[-1].detach(),
+                    source_mode=TokenMode.EXTEND,
+                ),
+            )
+        )
+        session.prompt_logits_handle = handle
+        session.product_handles.add(handle)
+        if not targets:
+            return ()
+        sampling = _require_sampling(session)
+        prompt_parameters = replace(
+            sampling,
+            return_logprobs=True,
+            n_logprobs=int(sampling.n_prompt_logprobs),
+        )
+        rows = tuple(
+            _SamplingRow(
+                parameters=prompt_parameters,
+                recent_counts=(),
+                allowed=None,
+                suppress=(),
+                draw_seed=0,
+                n_logprobs=int(sampling.n_prompt_logprobs),
+            )
+            for _ in targets
+        )
+        target_tensor = torch.tensor(
+            targets,
+            dtype=torch.long,
+            device=score_logits.device,
+        )
+        indexes = torch.arange(
+            len(targets),
+            dtype=torch.long,
+            device=score_logits.device,
+        )
+        details = _sample_logprob_details(
+            score_logits.float(),
+            indexes,
+            target_tensor,
+            rows,
+            scope.completion,
+        )
+        return tuple(details[index][1] for index in range(len(targets)))
 
     def _visual_extend(
         self,
@@ -1843,6 +2364,7 @@ class ModelExecutor:
             base=start,
             tokens=1,
             committed_tokens=(sampled.token_id,),
+            sample=sampled,
         )
 
     def _verify(
@@ -1904,6 +2426,7 @@ class ModelExecutor:
             base=start,
             tokens=committed,
             committed_tokens=committed_tokens,
+            sample=sampled,
         )
 
     def _token_outcome(
@@ -1913,6 +2436,7 @@ class ModelExecutor:
         base: int,
         tokens: int,
         committed_tokens: tuple[int | _CompletionToken, ...],
+        sample: _SampleResult | None = None,
     ) -> _Outcome:
         session = self.sessions.get(operation.request_key.session_id)
         return _Outcome(
@@ -1926,6 +2450,7 @@ class ModelExecutor:
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
             committed_tokens=committed_tokens,
+            products=_sample_product_payloads(operation, sample),
         )
 
     def _token_task(
@@ -2089,7 +2614,7 @@ class ModelExecutor:
     ) -> None:
         if sample.device_product_published:
             return
-        write = scope.operation_writes.get(int(operation.op_id))
+        write = scope.token_writes.get(int(operation.op_id))
         if write is None:
             return
         device_token = sample.device_token
@@ -2115,7 +2640,7 @@ class ModelExecutor:
         writes: list[DeviceProductWrite] = []
         device_tokens: list[torch.Tensor] = []
         for operation, sample in zip(operations, samples, strict=True):
-            write = scope.operation_writes.get(int(operation.op_id))
+            write = scope.token_writes.get(int(operation.op_id))
             if write is None or sample.device_token is None:
                 for candidate_operation, candidate_sample in zip(
                     operations,
@@ -2152,35 +2677,56 @@ class ModelExecutor:
         acceptance_uniforms: torch.Tensor | None = None,
     ) -> _SampleTask:
         sampling = _require_sampling(session)
+        state = scope.sampling_states.get(int(operation.op_id), SamplingState())
         rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
         if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
             raise invalid_descriptor("sampling task positions do not align with its logits")
-        allowed = sampling.allowed_token_ids
+        rng = operation.rng
+        if float(sampling.temperature) > 0.0:
+            if rng is None or rng.draw_layout is not DrawLayout.TARGET_SAMPLING:
+                raise invalid_descriptor(
+                    "stochastic sampling requires target-sampling RNG coordinates"
+                )
+            if int(rng.seed) != int(sampling.seed or 0):
+                raise invalid_descriptor("operation RNG seed disagrees with admitted sampling")
+            expected_positions = tuple(
+                range(int(rng.semantic_index_base), int(rng.semantic_index_base) + len(positions))
+            )
+            if positions != expected_positions:
+                raise invalid_descriptor(
+                    "sampling positions disagree with registered semantic RNG coordinates"
+                )
+        rng_seed = 0 if rng is None else int(rng.seed)
         descriptors = tuple(
             _SamplingRow(
                 parameters=sampling,
-                recent_counts=(),
-                allowed=None if allowed is None else tuple(int(value) for value in allowed),
-                suppress=(),
-                draw_seed=sampling_draw_seed(
-                    int(sampling.seed or 0),
-                    int(position),
+                recent_counts=state.recent_counts,
+                allowed=state.allowed_token_ids,
+                suppress=state.suppressed_token_ids,
+                finish_token_ids=state.finish_token_ids,
+                force_finish=state.force_finish,
+                draw_seed=(
+                    semantic_sampling_seed(
+                        operation.request_key,
+                        rng_seed,
+                        int(position),
+                    )
+                    if float(sampling.temperature) > 0.0
+                    else 0
                 ),
                 n_logprobs=int(sampling.n_logprobs),
             )
             for position in positions
         )
         plain_greedy = not draft_token_ids and all(_plain_greedy_row(row) for row in descriptors)
-        defer_host_token = plain_greedy
         if plain_greedy:
-            noise = None
+            draws = None
             penalty_token_ids = None
             penalty_counts = None
             parameter_values = None
         else:
-            noise = _semantic_sampling_noise(
+            draws = _semantic_sampling_draws(
                 descriptors,
-                vocab=int(rows.shape[1]),
                 device=rows.device,
             )
             penalty_token_ids, penalty_counts, parameter_values = _sampling_task_tensors(
@@ -2188,19 +2734,20 @@ class ModelExecutor:
                 vocab=int(rows.shape[1]),
                 device=rows.device,
             )
-        device_product = scope.operation_writes.get(int(operation.op_id))
+        token_product = scope.token_writes.get(int(operation.op_id))
+        finish_product = scope.finish_writes.get(int(operation.op_id))
         return _SampleTask(
             operation=operation,
             logits=rows,
             rows=descriptors,
-            noise=noise,
+            draws=draws,
             penalty_token_ids=penalty_token_ids,
             penalty_counts=penalty_counts,
             parameter_values=parameter_values,
-            defer_host_token=defer_host_token,
             draft_token_ids=tuple(int(value) for value in draft_token_ids),
             acceptance_uniforms=acceptance_uniforms,
-            device_product=device_product,
+            token_product=token_product,
+            finish_product=finish_product,
         )
 
     def _flow_driver(
@@ -2693,7 +3240,7 @@ class ModelExecutor:
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
             committed_tokens=outcome.committed_tokens,
-            products=products,
+            products=(*products, *outcome.products),
         )
 
     def _non_state_outcome(
@@ -3034,6 +3581,7 @@ class ModelExecutor:
     ) -> Generator[tuple[_ExecutorTask, ...], _TaskResult, _StateOutcome]:
         total = 0
         committed_tokens: tuple[int | _CompletionToken, ...] = ()
+        products: tuple[ProductPayload, ...] = ()
         for stage in self._state_stages(operation_type, retain_image=retain_image):
             if stage.row is RouteRowKind.ENCODE:
                 if image is None:
@@ -3094,6 +3642,7 @@ class ModelExecutor:
                     self._publish_token_product(operation, sampled, scope)
                     session.rng_counter += 1
                     committed_tokens = (sampled.token_id,)
+                    products = _sample_product_payloads(operation, sampled)
                 continue
             if stage.row is RouteRowKind.FLOW:
                 if latent is None:
@@ -3113,7 +3662,7 @@ class ModelExecutor:
                 total += task.query_tokens
                 continue
             raise invalid_descriptor("state publication cannot use a decode row")
-        return _StateOutcome(total, committed_tokens)
+        return _StateOutcome(total, committed_tokens, products)
 
     def _vision_state_task(
         self,
@@ -3568,6 +4117,40 @@ def _artifact_product_ref(operation: Operation) -> ProductRef:
     raise invalid_descriptor("materialize operation has no host-visible artifact output")
 
 
+def _logprob_product_ref(operation: Operation) -> ProductRef | None:
+    matches = tuple(
+        output for output in operation.outputs if output.kind is ProductKind.LOGPROB
+    )
+    if len(matches) > 1:
+        raise invalid_descriptor("operation declares multiple logprob products")
+    return matches[0] if matches else None
+
+
+def _sample_product_payloads(
+    operation: Operation,
+    sample: _SampleResult | None,
+) -> tuple[ProductPayload, ...]:
+    if sample is None or (
+        (sample.logprob is None or sample.top_logprobs is None)
+        and not sample.prompt_logprobs
+    ):
+        return ()
+    reference = _logprob_product_ref(operation)
+    if reference is None:
+        raise invalid_descriptor("sampler produced undeclared logprob output")
+    payload = _CompletionLogprobPayload(
+        sample.logprob,
+        sample.top_logprobs,
+        sample.prompt_logprobs,
+    )
+    return (
+        ProductPayload(
+            product=reference,
+            payload=cast(bytes, payload),
+        ),
+    )
+
+
 def _record_component(scope: _ExecutionScope, name: str, started_ns: int) -> None:
     elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
     scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
@@ -3729,7 +4312,7 @@ def _sample_task_batch(
                 any(
                     value is not None
                     for value in (
-                        task.noise,
+                        task.draws,
                         task.penalty_token_ids,
                         task.penalty_counts,
                         task.parameter_values,
@@ -3740,16 +4323,16 @@ def _sample_task_batch(
             ):
                 raise invalid_descriptor("greedy sampling task has shaped metadata")
         else:
-            noise = cast(torch.Tensor, task.noise)
+            draws = cast(torch.Tensor, task.draws)
             penalty_token_ids = cast(torch.Tensor, task.penalty_token_ids)
             penalty_counts = cast(torch.Tensor, task.penalty_counts)
             parameter_values = cast(torch.Tensor, task.parameter_values)
             if (
-                noise.device != task.logits.device
-                or tuple(noise.shape) != tuple(task.logits.shape)
-                or not noise.is_floating_point()
+                draws.device != task.logits.device
+                or tuple(draws.shape) != (len(task.rows),)
+                or not draws.is_floating_point()
             ):
-                raise invalid_descriptor("sampling task noise must align with its logits")
+                raise invalid_descriptor("sampling task draws must align with its rows")
             if (
                 penalty_token_ids.device != task.logits.device
                 or penalty_counts.device != task.logits.device
@@ -3794,9 +4377,20 @@ def _sample_task_batch(
                 device_reads=device_reads,
             )
         elif sampling_path > 0:
-            sampled_group = _sample_fused_top_k_group(tuple(group), sampling_path)
+            sampled_group = _sample_fused_top_k_group(
+                tuple(group),
+                sampling_path,
+                completion,
+                device_products=device_products,
+                device_reads=device_reads,
+            )
         else:
-            sampled_group = _sample_task_group(tuple(group))
+            sampled_group = _sample_task_group(
+                tuple(group),
+                completion,
+                device_products=device_products,
+                device_reads=device_reads,
+            )
         for index, sampled in zip(indexes, sampled_group, strict=True):
             result[index] = sampled
     return tuple(cast(_SampleResult, value) for value in result)
@@ -3814,7 +4408,7 @@ def _sample_plain_greedy_group(
         logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     else:
         logits = logits.reshape(len(tasks), -1)
-    products = tuple(task.device_product for task in tasks)
+    products = tuple(task.token_product for task in tasks)
     bound_products = device_products is not None and all(
         product is not None for product in products
     )
@@ -3842,34 +4436,34 @@ def _sample_plain_greedy_group(
                 product_batch,
                 after_reads=device_reads,
             )
-    defer = all(task.defer_host_token for task in tasks)
-    if defer:
-        owns_completion = completion is None
-        if completion is None:
-            arena = CompletionArena(
-                depth=1,
-                token_capacity=max(1, len(tasks)),
-                devices=((device_tokens.device,) if device_tokens.device.type == "cuda" else ()),
-            )
-            completion = arena.reserve(len(tasks))
-        span = _CompletionTokenSpan(completion.capture(device_tokens))
-        if owns_completion:
-            completion.seal()
-        host_tokens = None
-    else:
-        span = None
-        host_tokens = tuple(int(value) for value in device_tokens.to(device="cpu").tolist())
+    valid = (
+        ~torch.isnan(logits).any(dim=-1)
+        & ~torch.isposinf(logits).any(dim=-1)
+        & torch.isfinite(logits).any(dim=-1)
+    )
+    device_finish = _device_finish_values(tasks, device_tokens, valid)
+    finish_published = _publish_sampled_device_values(
+        tasks,
+        "finish_product",
+        device_finish,
+        device_products,
+        device_reads,
+    )
+    span = _capture_sample_span(
+        valid,
+        device_tokens,
+        torch.zeros_like(device_tokens),
+        completion,
+    )
     return tuple(
         _SampleResult(
-            token_id=(
-                _CompletionToken(cast(_CompletionTokenSpan, span), index)
-                if defer
-                else cast(tuple[int, ...], host_tokens)[index]
-            ),
+            token_id=_CompletionSampleToken(span, index),
             device_token=device_tokens[index : index + 1],
             logprob=None,
             top_logprobs=None,
+            device_finish=device_finish[index : index + 1],
             device_product_published=published,
+            finish_product_published=finish_published,
         )
         for index, task in enumerate(tasks)
     )
@@ -3902,10 +4496,14 @@ def _fused_top_k(task: _SampleTask, vocab: int) -> int:
 def _sample_fused_top_k_group(
     tasks: tuple[_SampleTask, ...],
     top_k: int,
+    completion: CompletionLease | None,
+    *,
+    device_products: DeviceProductTable | None,
+    device_reads: tuple[DeviceProductRead, ...],
 ) -> tuple[_SampleResult, ...]:
     rows = tuple(task.rows[0] for task in tasks)
     logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
-    noise = torch.cat(tuple(cast(torch.Tensor, task.noise) for task in tasks), dim=0)
+    draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
     penalty_token_ids = torch.cat(
         tuple(cast(torch.Tensor, task.penalty_token_ids) for task in tasks), dim=0
     )
@@ -3917,22 +4515,45 @@ def _sample_fused_top_k_group(
     )
     tokens, valid = _run_fused_top_k_sampling(
         logits,
-        noise,
+        draws,
         penalty_token_ids,
         penalty_counts,
         parameters,
         top_k,
     )
-    metadata = torch.cat((valid.to(torch.long), tokens)).cpu().tolist()
-    row_count = len(rows)
-    if not all(bool(value) for value in metadata[:row_count]):
-        raise invalid_descriptor("sampling policy masked every vocabulary entry")
-    return tuple(_SampleResult(int(token), None, None, None) for token in metadata[row_count:])
+    published = _publish_sampled_device_values(
+        tasks,
+        "token_product",
+        tokens,
+        device_products,
+        device_reads,
+    )
+    device_finish = _device_finish_values(tasks, tokens, valid)
+    finish_published = _publish_sampled_device_values(
+        tasks,
+        "finish_product",
+        device_finish,
+        device_products,
+        device_reads,
+    )
+    span = _capture_sample_span(valid, tokens, torch.zeros_like(tokens), completion)
+    return tuple(
+        _SampleResult(
+            _CompletionSampleToken(span, index),
+            tokens[index : index + 1],
+            None,
+            None,
+            device_finish=device_finish[index : index + 1],
+            device_product_published=published,
+            finish_product_published=finish_published,
+        )
+        for index in range(len(rows))
+    )
 
 
 def _run_fused_top_k_sampling(
     logits: torch.Tensor,
-    noise: torch.Tensor,
+    draws: torch.Tensor,
     penalty_token_ids: torch.Tensor,
     penalty_counts: torch.Tensor,
     parameters: torch.Tensor,
@@ -3943,7 +4564,7 @@ def _run_fused_top_k_sampling(
     provider = import_module("uniserve_kernel.sampling")
     result = provider.sample_top_k(
         logits,
-        noise,
+        draws,
         penalty_token_ids,
         penalty_counts,
         parameters,
@@ -3958,7 +4579,13 @@ def _run_fused_top_k_sampling(
     return result
 
 
-def _sample_task_group(tasks: tuple[_SampleTask, ...]) -> tuple[_SampleResult, ...]:
+def _sample_task_group(
+    tasks: tuple[_SampleTask, ...],
+    completion: CompletionLease | None,
+    *,
+    device_products: DeviceProductTable | None,
+    device_reads: tuple[DeviceProductRead, ...],
+) -> tuple[_SampleResult, ...]:
     device = tasks[0].logits.device
     vocab = int(tasks[0].logits.shape[1])
     offsets: list[int] = []
@@ -3968,7 +4595,7 @@ def _sample_task_group(tasks: tuple[_SampleTask, ...]) -> tuple[_SampleResult, .
         offset += len(task.rows)
     rows = tuple(row for task in tasks for row in task.rows)
     logits = torch.cat(tuple(task.logits.float() for task in tasks), dim=0)
-    noise = torch.cat(tuple(cast(torch.Tensor, task.noise) for task in tasks), dim=0)
+    draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
     work, valid = _shape_sampling_logits_batch(logits, rows)
 
     acceptance_rows: list[int] = []
@@ -4014,11 +4641,11 @@ def _sample_task_group(tasks: tuple[_SampleTask, ...]) -> tuple[_SampleResult, .
     accepted_counts: list[torch.Tensor] = []
     output_rows: list[torch.Tensor] = []
     for task_index, row_offset in enumerate(offsets):
-        span = acceptance_spans.get(task_index)
-        if span is None:
+        acceptance_span = acceptance_spans.get(task_index)
+        if acceptance_span is None:
             accepted = torch.zeros((), dtype=torch.long, device=device)
         else:
-            start, count = span
+            start, count = acceptance_span
             flags = cast(torch.Tensor, accepted_flags)[start : start + count]
             accepted = torch.cumprod(flags.to(torch.long), dim=0).sum()
         accepted_counts.append(accepted)
@@ -4048,56 +4675,196 @@ def _sample_task_group(tasks: tuple[_SampleTask, ...]) -> tuple[_SampleResult, .
         dtype=work.dtype,
         device=device,
     )
-    gumbel = -torch.log(-torch.log(noise))
-    semantic_noise = torch.where(
-        temperatures.unsqueeze(1) > 0.0,
-        gumbel,
-        torch.zeros((), dtype=work.dtype, device=device),
+    probabilities = torch.softmax(sample_work, dim=-1)
+    cumulative = probabilities.cumsum(dim=-1)
+    sampled_tokens = (
+        (cumulative < draws.to(dtype=cumulative.dtype).unsqueeze(1))
+        .sum(dim=-1)
+        .clamp_max(vocab - 1)
     )
-    row_tokens = torch.argmax(sample_work + semantic_noise, dim=-1)
+    row_tokens = torch.where(
+        temperatures > 0.0,
+        sampled_tokens,
+        torch.argmax(sample_work, dim=-1),
+    )
     output_indexes = torch.stack(output_rows)
     task_tokens = row_tokens.index_select(0, output_indexes)
     counts = torch.stack(accepted_counts)
 
-    metadata = torch.cat((valid.to(torch.long), task_tokens, counts)).cpu().tolist()
-    row_count = len(rows)
-    task_count = len(tasks)
-    if not all(bool(value) for value in metadata[:row_count]):
-        raise invalid_descriptor("sampling policy masked every vocabulary entry")
-    token_values = tuple(int(value) for value in metadata[row_count : row_count + task_count])
-    accepted_values = tuple(int(value) for value in metadata[row_count + task_count :])
+    task_valid = torch.stack(
+        tuple(
+            valid[offsets[index] : offsets[index] + len(task.rows)].all()
+            for index, task in enumerate(tasks)
+        )
+    )
+    published = _publish_sampled_device_values(
+        tasks,
+        "token_product",
+        task_tokens,
+        device_products,
+        device_reads,
+    )
+    device_finish = _device_finish_values(tasks, task_tokens, task_valid)
+    finish_published = _publish_sampled_device_values(
+        tasks,
+        "finish_product",
+        device_finish,
+        device_products,
+        device_reads,
+    )
+    span = _capture_sample_span(task_valid, task_tokens, counts, completion)
+    speculative_values: dict[int, tuple[int, int]] = {}
+    speculative_indexes = tuple(
+        index for index, task in enumerate(tasks) if task.draft_token_ids
+    )
+    if speculative_indexes and task_tokens.device.type == "cuda":
+        indexes = torch.tensor(
+            speculative_indexes,
+            dtype=torch.long,
+            device=task_tokens.device,
+        )
+        host = torch.cat(
+            (
+                task_valid.index_select(0, indexes).to(torch.long),
+                task_tokens.index_select(0, indexes),
+                counts.index_select(0, indexes),
+            )
+        ).to(device="cpu").tolist()
+        width = len(speculative_indexes)
+        if not all(bool(value) for value in host[:width]):
+            raise invalid_descriptor("sampling policy masked every vocabulary entry")
+        speculative_values = {
+            task_index: (
+                int(host[width + local]),
+                int(host[width * 2 + local]),
+            )
+            for local, task_index in enumerate(speculative_indexes)
+        }
     details = _sample_logprob_details(
         sample_work,
         output_indexes,
         task_tokens,
         tuple(task.rows[0] for task in tasks),
+        completion,
     )
     return tuple(
         _SampleResult(
-            token_id=token,
-            device_token=None,
+            token_id=(
+                speculative_values[index][0]
+                if index in speculative_values
+                else _CompletionSampleToken(span, index)
+            ),
+            device_token=task_tokens[index : index + 1],
             logprob=None if index not in details else details[index][0],
             top_logprobs=None if index not in details else details[index][1],
-            num_accepted_tokens=accepted,
+            num_accepted_tokens=(
+                speculative_values[index][1]
+                if index in speculative_values
+                else _CompletionInteger(span, index)
+            ),
+            device_finish=device_finish[index : index + 1],
+            device_product_published=published,
+            finish_product_published=finish_published,
         )
-        for index, (token, accepted) in enumerate(zip(token_values, accepted_values, strict=True))
+        for index in range(len(tasks))
     )
 
 
-def _semantic_sampling_noise(
+def _capture_sample_span(
+    valid: torch.Tensor,
+    tokens: torch.Tensor,
+    accepted: torch.Tensor,
+    completion: CompletionLease | None,
+) -> _CompletionSampleSpan:
+    count = int(tokens.numel())
+    if int(valid.numel()) != count or int(accepted.numel()) != count:
+        raise RuntimeError("sampling completion vectors do not align")
+    metadata = torch.cat(
+        (
+            valid.reshape(-1).to(dtype=torch.long),
+            tokens.reshape(-1).to(dtype=torch.long),
+            accepted.reshape(-1).to(dtype=torch.long),
+        )
+    )
+    owns_completion = completion is None
+    if metadata.device.type != "cuda":
+        values = tuple(int(value) for value in metadata.tolist())
+        if owns_completion and not all(bool(value) for value in values[:count]):
+            raise invalid_descriptor("sampling policy masked every vocabulary entry")
+        return _CompletionSampleSpan(None, count, values)
+    if completion is None:
+        arena = CompletionArena(
+            depth=1,
+            token_capacity=max(1, int(metadata.numel())),
+            devices=((metadata.device,) if metadata.device.type == "cuda" else ()),
+        )
+        completion = arena.reserve(max(1, count))
+    span = _CompletionSampleSpan(completion.capture(metadata), count)
+    if owns_completion:
+        completion.seal()
+        if span.ready():
+            for index in range(count):
+                span.token(index)
+    return span
+
+
+def _device_finish_values(
+    tasks: tuple[_SampleTask, ...],
+    device_tokens: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    values: list[torch.Tensor] = []
+    for index, task in enumerate(tasks):
+        row = task.rows[0]
+        selected = device_tokens[index]
+        if row.force_finish:
+            finish = torch.ones((), dtype=torch.bool, device=device_tokens.device)
+        elif row.finish_token_ids:
+            finish_ids = torch.tensor(
+                row.finish_token_ids,
+                dtype=device_tokens.dtype,
+                device=device_tokens.device,
+            )
+            finish = (finish_ids == selected).any()
+        else:
+            finish = torch.zeros((), dtype=torch.bool, device=device_tokens.device)
+        values.append(finish & valid[index])
+    return torch.stack(values)
+
+
+def _publish_sampled_device_values(
+    tasks: tuple[_SampleTask, ...],
+    product_field: str,
+    device_tokens: torch.Tensor,
+    device_products: DeviceProductTable | None,
+    device_reads: tuple[DeviceProductRead, ...],
+) -> bool:
+    products = tuple(getattr(task, product_field) for task in tasks)
+    if device_products is None or not all(product is not None for product in products):
+        return False
+    writes = tuple(cast(DeviceProductWrite, product) for product in products)
+    product_batch = device_products.producer_scalar_batch(writes)
+    if product_batch is not None and int(product_batch.tensor.numel()) == len(tasks):
+        product_batch.tensor.reshape(-1).copy_(device_tokens.reshape(-1))
+        device_products.publish_scalar_batch(product_batch, after_reads=device_reads)
+    else:
+        device_products.publish_writes(writes, device_tokens.reshape(-1))
+    return True
+
+
+def _semantic_sampling_draws(
     rows: Sequence[_SamplingRow],
     *,
-    vocab: int,
     device: torch.device,
 ) -> torch.Tensor:
     stochastic = tuple(
         index for index, row in enumerate(rows) if float(row.parameters.temperature) > 0.0
     )
     if len(stochastic) == len(rows):
-        return torch.stack(
+        return torch.cat(
             tuple(
                 uniform_samples(
-                    (vocab,),
+                    (1,),
                     seed=row.draw_seed,
                     device=device,
                 )
@@ -4105,13 +4872,13 @@ def _semantic_sampling_noise(
             ),
             dim=0,
         )
-    noise = torch.zeros((len(rows), vocab), dtype=torch.float32, device=device)
+    draws = torch.zeros((len(rows),), dtype=torch.float32, device=device)
     if stochastic:
         indexes = torch.tensor(stochastic, dtype=torch.long, device=device)
-        draws = torch.stack(
+        stochastic_draws = torch.cat(
             tuple(
                 uniform_samples(
-                    (vocab,),
+                    (1,),
                     seed=rows[index].draw_seed,
                     device=device,
                 )
@@ -4119,8 +4886,8 @@ def _semantic_sampling_noise(
             ),
             dim=0,
         )
-        noise.index_copy_(0, indexes, draws)
-    return noise
+        draws.index_copy_(0, indexes, stochastic_draws)
+    return draws
 
 
 def _shape_sampling_logits_batch(
@@ -4142,8 +4909,6 @@ def _shape_sampling_logits_batch(
         allowed = tuple(
             dict.fromkeys(int(value) for value in row.allowed if 0 <= int(value) < vocab)
         )
-        if not allowed:
-            raise invalid_descriptor("sampling allowed-token set has no vocabulary entries")
         allowed_rows.append(row_index)
         allowed_flat.extend(row_index * vocab + value for value in allowed)
     if allowed_rows:
@@ -4326,7 +5091,11 @@ def _shape_sampling_logits_batch(
         truncated.scatter_(1, token_indexes, ordered)
         work.index_copy_(0, indexes, truncated)
 
-    valid = ~torch.isnan(work).any(dim=-1) & torch.isfinite(work).any(dim=-1)
+    valid = (
+        ~torch.isnan(work).any(dim=-1)
+        & ~torch.isposinf(work).any(dim=-1)
+        & torch.isfinite(work).any(dim=-1)
+    )
     return work, valid
 
 
@@ -4335,7 +5104,14 @@ def _sample_logprob_details(
     output_rows: torch.Tensor,
     output_tokens: torch.Tensor,
     rows: Sequence[_SamplingRow],
-) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
+    completion: CompletionLease | None,
+) -> Mapping[
+    int,
+    tuple[
+        float | _CompletionLogprobValue,
+        tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
+    ],
+]:
     vocab = int(work.shape[1])
     requested_rows = tuple(
         index
@@ -4436,51 +5212,60 @@ def _sample_logprob_details(
             device=work.device,
         )
 
-    selected_value_list = selected_values.cpu().tolist()
-    selected_rank_list = selected_ranks.cpu().tolist()
-    selected_token_list = selected_tokens.cpu().tolist()
-    top_value_list = top_values.cpu().tolist()
-    top_index_list = top_indexes.cpu().tolist()
-    top_rank_list = top_ranks.cpu().tolist()
-    candidate_value_list = candidate_values.cpu().tolist()
-    candidate_rank_list = candidate_ranks.cpu().tolist()
-    result: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] = {}
-    for local_index, result_index in enumerate(requested_rows):
-        selected = int(selected_token_list[local_index])
-        selected_value = float(selected_value_list[local_index])
-        entries: list[tuple[int, float, int]] = [
-            (
-                selected,
-                selected_value,
-                int(selected_rank_list[local_index]),
-            )
-        ]
-        seen = {selected}
-        for top_index in range(counts[local_index]):
-            candidate = int(top_index_list[local_index][top_index])
-            if candidate in seen:
-                continue
-            entries.append(
-                (
-                    candidate,
-                    float(top_value_list[local_index][top_index]),
-                    int(top_rank_list[local_index][top_index]),
-                )
-            )
-            seen.add(candidate)
-        for requested_index, candidate in enumerate(requested_ids[local_index]):
-            if candidate in seen:
-                continue
-            entries.append(
-                (
-                    candidate,
-                    float(candidate_value_list[local_index][requested_index]),
-                    int(candidate_rank_list[local_index][requested_index]),
-                )
-            )
-            seen.add(candidate)
-        result[result_index] = (selected_value, tuple(entries))
-    return result
+    def float_bits(values: torch.Tensor) -> torch.Tensor:
+        return values.to(dtype=torch.float32).contiguous().view(torch.int32).to(torch.long)
+
+    packed = torch.cat(
+        (
+            selected_tokens.reshape(-1).to(torch.long),
+            float_bits(selected_values.reshape(-1)),
+            selected_ranks.reshape(-1).to(torch.long),
+            top_indexes.reshape(-1).to(torch.long),
+            float_bits(top_values.reshape(-1)),
+            top_ranks.reshape(-1).to(torch.long),
+            float_bits(candidate_values.reshape(-1)),
+            candidate_ranks.reshape(-1).to(torch.long),
+        )
+    )
+    owns_completion = completion is None
+    if completion is None:
+        arena = CompletionArena(
+            depth=1,
+            token_capacity=max(1, int(packed.numel())),
+            devices=((packed.device,) if packed.device.type == "cuda" else ()),
+        )
+        completion = arena.reserve(max(1, len(requested_rows)))
+    if packed.device.type != "cuda":
+        values = tuple(int(value) for value in packed.tolist())
+        batch = _CompletionLogprobBatch(
+            None,
+            requested_rows,
+            counts,
+            requested_ids,
+            max_count,
+            max_requested,
+            values,
+        )
+    else:
+        batch = _CompletionLogprobBatch(
+            completion.capture(packed),
+            requested_rows,
+            counts,
+            requested_ids,
+            max_count,
+            max_requested,
+        )
+    if owns_completion:
+        completion.seal()
+    if packed.device.type != "cuda":
+        return batch.finalize()
+    return {
+        result_index: (
+            _CompletionLogprobValue(batch, result_index),
+            _CompletionTopLogprobs(batch, result_index),
+        )
+        for result_index in requested_rows
+    }
 
 
 def _bound_device_write(

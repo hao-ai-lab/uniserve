@@ -78,6 +78,8 @@ class ProductKind(StrEnum):
     LATENT = "latent"
     ARTIFACT = "artifact"
     COMPLETION = "completion"
+    SAMPLING_STATE = "sampling_state"
+    FINISH = "finish"
 
 
 class StorageClass(StrEnum):
@@ -1088,11 +1090,12 @@ class Operation:
                     "a latent-arena output exceeds the operation latent-byte bound"
                 )
             if (
-                product.storage_class is StorageClass.COMPLETION_ARENA
+                product.storage_class
+                in (StorageClass.HOST_STAGING, StorageClass.COMPLETION_ARENA)
                 and product.max_bytes > self.bounds.max_completion_bytes
             ):
                 raise invalid_descriptor(
-                    "a completion-arena output exceeds the operation completion-byte bound"
+                    "a host-visible output exceeds the operation completion-byte bound"
                 )
             if product.output_index in output_indices:
                 raise invalid_descriptor("operation repeats an output index")
@@ -1884,6 +1887,94 @@ def decode_token_product_bytes(data: bytes) -> tuple[int, ...]:
             f"token product byte length {len(data)} does not match declared count {count}"
         )
     return tuple(struct.unpack_from("<I", data, 4 + index * 4)[0] for index in range(count))
+
+
+@dataclass(frozen=True, slots=True)
+class SamplingState:
+    """Canonical branch-local token processor inputs for one operation."""
+
+    recent_counts: tuple[tuple[int, int], ...] = ()
+    allowed_token_ids: tuple[int, ...] | None = None
+    suppressed_token_ids: tuple[int, ...] = ()
+    finish_token_ids: tuple[int, ...] = ()
+    force_finish: bool = False
+
+
+def encode_sampling_state_bytes(state: SamplingState) -> bytes:
+    counts: dict[int, int] = {}
+    for token, count in state.recent_counts:
+        if count > 0:
+            counts[int(token)] = min((1 << 32) - 1, counts.get(int(token), 0) + int(count))
+    recent = tuple(sorted(counts.items()))
+    allowed = (
+        None
+        if state.allowed_token_ids is None
+        else tuple(sorted(set(int(token) for token in state.allowed_token_ids)))
+    )
+    suppressed = tuple(sorted(set(int(token) for token in state.suppressed_token_ids)))
+    finish = tuple(sorted(set(int(token) for token in state.finish_token_ids)))
+    out = bytearray(struct.pack("<I", len(recent)))
+    for token, count in recent:
+        out += struct.pack("<II", token, count)
+    if allowed is None:
+        out += b"\x00"
+    else:
+        out += b"\x01" + struct.pack("<I", len(allowed))
+        for token in allowed:
+            out += struct.pack("<I", token)
+    out += struct.pack("<I", len(suppressed))
+    for token in suppressed:
+        out += struct.pack("<I", token)
+    out += struct.pack("<I", len(finish))
+    for token in finish:
+        out += struct.pack("<I", token)
+    out += bytes((int(state.force_finish),))
+    return bytes(out)
+
+
+def decode_sampling_state_bytes(data: bytes) -> SamplingState:
+    offset = 0
+
+    def take_u32() -> int:
+        nonlocal offset
+        if offset + 4 > len(data):
+            raise invalid_descriptor("sampling-state bytes are truncated")
+        value = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        return value
+
+    def take_ids(count: int) -> tuple[int, ...]:
+        values = tuple(take_u32() for _ in range(count))
+        if any(left >= right for left, right in zip(values, values[1:], strict=False)):
+            raise invalid_descriptor("sampling-state token ids are not canonical")
+        return values
+
+    recent = tuple((take_u32(), take_u32()) for _ in range(take_u32()))
+    if any(count == 0 for _token, count in recent):
+        raise invalid_descriptor("sampling-state recent count must be positive")
+    if any(left[0] >= right[0] for left, right in zip(recent, recent[1:], strict=False)):
+        raise invalid_descriptor("sampling-state recent token ids are not canonical")
+    if offset >= len(data):
+        raise invalid_descriptor("sampling-state bytes omit allowed presence")
+    presence = data[offset]
+    offset += 1
+    if presence == 0:
+        allowed = None
+    elif presence == 1:
+        allowed = take_ids(take_u32())
+    else:
+        raise invalid_descriptor(f"sampling-state allowed presence {presence} is invalid")
+    suppressed = take_ids(take_u32())
+    finish = take_ids(take_u32())
+    if offset >= len(data):
+        raise invalid_descriptor("sampling-state bytes omit force-finish")
+    force_finish = data[offset]
+    offset += 1
+    if force_finish not in (0, 1):
+        raise invalid_descriptor(f"sampling-state force-finish {force_finish} is invalid")
+    if offset != len(data):
+        raise invalid_descriptor("sampling-state bytes contain trailing data")
+    return SamplingState(recent, allowed, suppressed, finish, bool(force_finish))
 
 
 @dataclass(frozen=True, slots=True)

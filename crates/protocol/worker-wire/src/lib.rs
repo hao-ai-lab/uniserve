@@ -241,6 +241,8 @@ pub enum ProductKind {
     Latent = 6,
     Artifact = 7,
     Completion = 8,
+    SamplingState = 9,
+    Finish = 10,
 }
 
 /// The worker store family that backs a product.
@@ -602,9 +604,9 @@ impl Operation {
                     output.max_bytes() <= self.bounds.max_latent_bytes,
                     "a latent-arena output exceeds the operation latent-byte bound"
                 ),
-                StorageClass::CompletionArena => anyhow::ensure!(
+                StorageClass::HostStaging | StorageClass::CompletionArena => anyhow::ensure!(
                     output.max_bytes() <= self.bounds.max_completion_bytes,
-                    "a completion-arena output exceeds the operation completion-byte bound"
+                    "a host-visible output exceeds the operation completion-byte bound"
                 ),
                 _ => {}
             }
@@ -1222,11 +1224,8 @@ pub struct RegistrationAck {
 /// bytes are the value. A product payload is never a lineage identity and enters
 /// no digest.
 ///
-/// The protocol layer treats `bytes` as opaque; the codec agreement is enforced
-/// by consumers. The one convention this crate fixes and shares with the Python
-/// worker is the `ProductKind::Token` layout, produced and parsed by
-/// [`encode_token_product_bytes`] and [`decode_token_product_bytes`]: a
-/// little-endian `u32` count `N`, then `N` little-endian `u32` token ids.
+/// The protocol layer treats other product bytes as opaque. This crate fixes
+/// the cross-language layouts for token inputs and branch-local sampling state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductPayload {
     pub product: ProductRef,
@@ -1244,18 +1243,35 @@ impl ProductPayload {
     }
 
     fn validate_input_value(&self) -> anyhow::Result<()> {
-        if self.product.kind == ProductKind::Token {
-            let tokens = decode_token_product_bytes(&self.bytes)?;
-            anyhow::ensure!(
-                tokens.len() as u64 <= self.product.shape_bound.max_elements(),
-                "token input product exceeds its registered element bound"
-            );
-        } else {
-            anyhow::ensure!(
+        match self.product.kind {
+            ProductKind::Token => {
+                let tokens = decode_token_product_bytes(&self.bytes)?;
+                anyhow::ensure!(
+                    tokens.len() as u64 <= self.product.shape_bound.max_elements(),
+                    "token input product exceeds its registered element bound"
+                );
+            }
+            ProductKind::SamplingState => {
+                decode_sampling_state_bytes(&self.bytes)?;
+                anyhow::ensure!(
+                    self.bytes.len() as u64 <= self.product.max_bytes(),
+                    "sampling-state input exceeds its registered byte bound"
+                );
+            }
+            _ => anyhow::ensure!(
                 self.bytes.len() as u64 <= self.product.max_bytes(),
                 "input product payload exceeds its registered byte bound"
-            );
+            ),
         }
+        Ok(())
+    }
+
+    fn validate_output_value(&self) -> anyhow::Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            self.bytes.len() as u64 <= self.product.max_bytes(),
+            "output product payload exceeds its registered byte bound"
+        );
         Ok(())
     }
 }
@@ -1291,6 +1307,164 @@ pub fn decode_token_product_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u32>> {
         .collect())
 }
 
+/// Branch-local token processor inputs for one sampling operation.
+///
+/// Token ids in every field are strictly increasing. `allowed_token_ids`
+/// distinguishes no whitelist (`None`) from a present empty whitelist, which
+/// deterministically represents an invalid all-masked distribution.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SamplingState {
+    pub recent_counts: Vec<(u32, u32)>,
+    pub allowed_token_ids: Option<Vec<u32>>,
+    pub suppressed_token_ids: Vec<u32>,
+    pub finish_token_ids: Vec<u32>,
+    pub force_finish: bool,
+}
+
+impl SamplingState {
+    pub fn canonicalize(&mut self) {
+        self.recent_counts.retain(|(_, count)| *count > 0);
+        self.recent_counts.sort_unstable_by_key(|(token, _)| *token);
+        self.recent_counts.dedup_by(|next, prior| {
+            if next.0 == prior.0 {
+                prior.1 = prior.1.saturating_add(next.1);
+                true
+            } else {
+                false
+            }
+        });
+        if let Some(allowed) = &mut self.allowed_token_ids {
+            allowed.sort_unstable();
+            allowed.dedup();
+        }
+        self.suppressed_token_ids.sort_unstable();
+        self.suppressed_token_ids.dedup();
+        self.finish_token_ids.sort_unstable();
+        self.finish_token_ids.dedup();
+    }
+}
+
+/// Encode canonical branch-local sampling state.
+///
+/// Layout: recent count and `(token, count)` pairs; one allowed-presence byte;
+/// an allowed count and ids when present; then a suppressed count and ids.
+pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
+    let mut canonical = state.clone();
+    canonical.canonicalize();
+    let allowed_len = canonical.allowed_token_ids.as_ref().map_or(0, Vec::len);
+    let mut bytes = Vec::with_capacity(
+        9 + canonical.recent_counts.len() * 8
+            + allowed_len * 4
+            + canonical.suppressed_token_ids.len() * 4
+            + canonical.finish_token_ids.len() * 4
+            + 1,
+    );
+    bytes.extend_from_slice(&(canonical.recent_counts.len() as u32).to_le_bytes());
+    for (token, count) in canonical.recent_counts {
+        bytes.extend_from_slice(&token.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    match canonical.allowed_token_ids {
+        Some(allowed) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&(allowed.len() as u32).to_le_bytes());
+            for token in allowed {
+                bytes.extend_from_slice(&token.to_le_bytes());
+            }
+        }
+        None => bytes.push(0),
+    }
+    bytes.extend_from_slice(&(canonical.suppressed_token_ids.len() as u32).to_le_bytes());
+    for token in canonical.suppressed_token_ids {
+        bytes.extend_from_slice(&token.to_le_bytes());
+    }
+    bytes.extend_from_slice(&(canonical.finish_token_ids.len() as u32).to_le_bytes());
+    for token in canonical.finish_token_ids {
+        bytes.extend_from_slice(&token.to_le_bytes());
+    }
+    bytes.push(u8::from(canonical.force_finish));
+    bytes
+}
+
+/// Decode and validate canonical branch-local sampling state.
+pub fn decode_sampling_state_bytes(bytes: &[u8]) -> anyhow::Result<SamplingState> {
+    fn take_u32(bytes: &[u8], offset: &mut usize) -> anyhow::Result<u32> {
+        let end = offset
+            .checked_add(4)
+            .ok_or_else(|| anyhow::anyhow!("sampling-state offset overflow"))?;
+        anyhow::ensure!(end <= bytes.len(), "sampling-state bytes are truncated");
+        let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+        *offset = end;
+        Ok(value)
+    }
+    fn take_ids(bytes: &[u8], offset: &mut usize, count: u32) -> anyhow::Result<Vec<u32>> {
+        let mut values = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            values.push(take_u32(bytes, offset)?);
+        }
+        anyhow::ensure!(
+            values.windows(2).all(|pair| pair[0] < pair[1]),
+            "sampling-state token ids are not canonical"
+        );
+        Ok(values)
+    }
+
+    let mut offset = 0;
+    let recent_len = take_u32(bytes, &mut offset)?;
+    let mut recent_counts = Vec::with_capacity(recent_len as usize);
+    for _ in 0..recent_len {
+        let token = take_u32(bytes, &mut offset)?;
+        let count = take_u32(bytes, &mut offset)?;
+        anyhow::ensure!(count > 0, "sampling-state recent count must be positive");
+        recent_counts.push((token, count));
+    }
+    anyhow::ensure!(
+        recent_counts.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "sampling-state recent token ids are not canonical"
+    );
+    anyhow::ensure!(
+        offset < bytes.len(),
+        "sampling-state bytes omit allowed presence"
+    );
+    let allowed_token_ids = match bytes[offset] {
+        0 => {
+            offset += 1;
+            None
+        }
+        1 => {
+            offset += 1;
+            let count = take_u32(bytes, &mut offset)?;
+            Some(take_ids(bytes, &mut offset, count)?)
+        }
+        other => anyhow::bail!("sampling-state allowed presence {other} is invalid"),
+    };
+    let suppressed_len = take_u32(bytes, &mut offset)?;
+    let suppressed_token_ids = take_ids(bytes, &mut offset, suppressed_len)?;
+    let finish_len = take_u32(bytes, &mut offset)?;
+    let finish_token_ids = take_ids(bytes, &mut offset, finish_len)?;
+    anyhow::ensure!(
+        offset < bytes.len(),
+        "sampling-state bytes omit force-finish"
+    );
+    let force_finish = match bytes[offset] {
+        0 => false,
+        1 => true,
+        other => anyhow::bail!("sampling-state force-finish {other} is invalid"),
+    };
+    offset += 1;
+    anyhow::ensure!(
+        offset == bytes.len(),
+        "sampling-state bytes contain trailing data"
+    );
+    Ok(SamplingState {
+        recent_counts,
+        allowed_token_ids,
+        suppressed_token_ids,
+        finish_token_ids,
+        force_finish,
+    })
+}
+
 /// A worker response frame: one completion per submitted operation, the resolved
 /// output-product values for host consumption, and the registration
 /// acknowledgement.
@@ -1310,7 +1484,7 @@ impl CompletionReport {
             completion.validate()?;
         }
         for payload in &self.products {
-            payload.validate()?;
+            payload.validate_output_value()?;
         }
         Ok(())
     }

@@ -29,7 +29,9 @@ enum ProductKind : ubyte {
   Kv,
   Latent,
   Artifact,
-  Completion
+  Completion,
+  SamplingState,
+  Finish
 }
 
 enum StorageClass : ubyte {

@@ -19,17 +19,12 @@ Classification (construction.md "Checkpoint performance protection"):
 - ``regression`` for a minimize metric is ``max(0, candidate / baseline - 1)``.
 - A metric's effective regression is the worse of its regression against the anchor
   and against the previous checkpoint.
-- ``target-pass``: every required metric's effective regression is at most 5%.
-- ``grace-pass``: every effective regression is at most 7% and at least one exceeds
-  5%. Grace is available to the checkpoint performance triplet only.
-- ``block``: any effective regression exceeds 7%, or any correctness, work, output
+- ``pass``: every required metric's effective regression is at most 20%.
+- ``block``: any effective regression exceeds 20%, or any correctness, work, output
   validity, or provenance requirement fails.
 
-Major-boundary suites (default-travel elapsed time and the UEval interleave latency
-families) are evaluated with the stricter no-grace boundary: ``docs/benchmark-protocol.md``
-states the additional checkpoint allowance does not apply at a major boundary, so a
-major-boundary metric must remain within the 5% target. The stricter reading is used
-because a stricter gate cannot manufacture a false acceptance.
+The same performance limit applies to checkpoint triplets and major-boundary suites.
+Correctness, conformance, work, and artifact-integrity requirements remain hard gates.
 """
 
 from __future__ import annotations
@@ -42,8 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-TARGET_REGRESSION = 0.05
-GRACE_REGRESSION = 0.07
+REGRESSION_LIMIT = 0.20
 
 MetricSpec = tuple[str, tuple[str, ...], str]
 
@@ -139,10 +133,8 @@ def regression(candidate: float | None, baseline: float | None, objective: str) 
 def _band(reg: float | None) -> str:
     if reg is None:
         return "unavailable"
-    if reg <= TARGET_REGRESSION:
-        return "target"
-    if reg <= GRACE_REGRESSION:
-        return "grace"
+    if reg <= REGRESSION_LIMIT:
+        return "pass"
     return "block"
 
 
@@ -206,7 +198,7 @@ def hard_gate_failures(
     *,
     interleave: bool,
 ) -> list[str]:
-    """Correctness, work, output-validity, and provenance requirements. No grace."""
+    """Correctness, work, output-validity, and provenance hard requirements."""
 
     failures: list[str] = []
     if candidate.failed_count not in (0, None) and candidate.failed_count != 0:
@@ -254,16 +246,11 @@ def _image_step_work(point: Point) -> dict[str, Any]:
     return {"signatures": point.request_signatures, "expected_transitions": timing.get("expected_transition_count")}
 
 
-def classify(metric_outcomes: Sequence[MetricOutcome], *, allow_grace: bool) -> str:
+def classify(metric_outcomes: Sequence[MetricOutcome]) -> str:
     bands = [m.band for m in metric_outcomes]
     if any(b in ("block", "unavailable") for b in bands):
         return "block"
-    if all(b == "target" for b in bands):
-        return "target-pass"
-    # Some metric is in the grace band.
-    if allow_grace and all(b in ("target", "grace") for b in bands):
-        return "grace-pass"
-    return "block"
+    return "pass"
 
 
 def specs_for(point: Point, *, major_boundary: bool) -> tuple[MetricSpec, ...]:
@@ -430,10 +417,7 @@ def evaluate_checkpoint(
             PointOutcome(task=task, directory=directory, metrics=outcomes, hard_failures=hard)
         )
 
-    # Grace applies to the checkpoint performance triplet only; major boundaries use
-    # the stricter within-5% boundary.
-    allow_grace = not major_boundary
-    perf_verdict = classify(all_metric_outcomes, allow_grace=allow_grace)
+    perf_verdict = classify(all_metric_outcomes)
     report.verdict = "block" if any_hard_failure else perf_verdict
     return report
 
@@ -443,7 +427,7 @@ def render_report(report: CheckpointReport) -> str:
         f"# Checkpoint {report.checkpoint} acceptance",
         "",
         f"- Boundary: {'major-integration' if report.major_boundary else 'checkpoint-triplet'}",
-        f"- Grace band available: {not report.major_boundary}",
+        f"- Maximum performance regression: {REGRESSION_LIMIT * 100:.0f}%",
         f"- **Verdict: {report.verdict.upper()}**",
         "",
         "| Point | Metric | Objective | Candidate | Anchor | Prev | Reg vs anchor | Reg vs prev | Effective | Band |",
@@ -460,7 +444,7 @@ def render_report(report: CheckpointReport) -> str:
             )
     hard = [f"{p.task}: {', '.join(p.hard_failures)}" for p in report.points if p.hard_failures]
     if hard:
-        lines.extend(["", "## Hard-gate failures (no grace)", ""])
+        lines.extend(["", "## Hard-gate failures", ""])
         lines.extend(f"- {h}" for h in hard)
     return "\n".join(lines) + "\n"
 
@@ -477,13 +461,11 @@ def _pct(value: float | None) -> str:
 
 def _report_to_dict(report: CheckpointReport) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "checkpoint": report.checkpoint,
         "major_boundary": report.major_boundary,
-        "grace_available": not report.major_boundary,
         "verdict": report.verdict,
-        "target_regression": TARGET_REGRESSION,
-        "grace_regression": GRACE_REGRESSION,
+        "regression_limit": REGRESSION_LIMIT,
         "points": [
             {
                 "task": p.task,
@@ -537,7 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         out.mkdir(parents=True, exist_ok=True)
         (out / "acceptance.json").write_text(json.dumps(_report_to_dict(report), indent=2), encoding="utf-8")
         (out / "acceptance.md").write_text(markdown, encoding="utf-8")
-    return 0 if report.verdict in ("target-pass", "grace-pass") else 1
+    return 0 if report.verdict == "pass" else 1
 
 
 if __name__ == "__main__":

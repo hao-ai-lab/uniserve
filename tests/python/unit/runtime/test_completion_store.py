@@ -72,6 +72,16 @@ def test_execution_tensor_retires_before_host_completion_observation() -> None:
     lease.observe(0, lease.generation)
 
 
+def test_completion_capture_cannot_exceed_the_preallocated_slab() -> None:
+    arena = CompletionArena(depth=1, token_capacity=2)
+    lease = arena.reserve(1)
+
+    with pytest.raises(ResourceError):
+        lease.capture(torch.tensor([1, 2, 3], dtype=torch.long))
+
+    lease.abandon()
+
+
 def test_abandoned_query_ready_completion_returns_capacity() -> None:
     arena = CompletionArena(depth=1, token_capacity=1)
     lease = arena.reserve(1)

@@ -3,12 +3,13 @@ use std::collections::HashSet;
 use uniserve_core::product_blob::LogprobBlob;
 use uniserve_core::{
     BlockId, CfgParams, ContextSegment, GenerationRequest, ImageIngestRecipe, ImageIngestStep,
-    ImageKvEffect, RequestId, SegmentPlacement, UndTokenAction,
+    ImageKvEffect, RequestId, SamplingParams, SegmentPlacement, UndTokenAction,
 };
 use uniserve_worker_wire::{
-    Bounds, CompletionRecord, DType, DimBound, Domain, EncodeMode, GenMode, OpId, Operation, Point,
-    PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, Rng, RouteId,
-    ShapeBound, StorageClass, TokenMode, VersionRef, Work, WorkVariant, encode_token_product_bytes,
+    Bounds, CompletionRecord, DType, DimBound, Domain, DrawLayout, EncodeMode, GenMode, OpId,
+    OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
+    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode, VersionRef,
+    Work, WorkVariant, encode_sampling_state_bytes, encode_token_product_bytes,
 };
 
 use crate::image_artifact::png_artifact_dims_b64;
@@ -105,6 +106,7 @@ fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
 fn host_input_product(
     request_key: RequestKey,
     op_id: OpId,
+    output_index: u16,
     kind: ProductKind,
     dtype: DType,
     elements: usize,
@@ -119,7 +121,7 @@ fn host_input_product(
     Ok(ProductRef {
         request_key,
         producer_op_id: op_id,
-        output_index: HOST_INPUT_OUTPUT_INDEX,
+        output_index,
         generation: 0,
         kind,
         storage_class: StorageClass::HostStaging,
@@ -131,39 +133,106 @@ fn host_input_product(
     })
 }
 
+const RANKED_LOGPROB_BYTES: u64 = 12;
+
+fn logprob_blob_bound(
+    sampling: &SamplingParams,
+    prompt_positions: u32,
+) -> Result<Option<u64>, PlanningError> {
+    let generated = sampling.generated_logprobs_requested();
+    let prompt = sampling.prompt_logprobs_requested();
+    if !generated && !prompt {
+        return Ok(None);
+    }
+    let requested_ids = sampling
+        .logprob_token_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .len() as u64;
+    let generated_entries = generated.then_some(
+        1_u64
+            .checked_add(u64::from(sampling.n_logprobs))
+            .and_then(|value| value.checked_add(requested_ids))
+            .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?,
+    );
+    let prompt_entries = prompt.then_some(
+        1_u64
+            .checked_add(u64::from(sampling.n_prompt_logprobs))
+            .and_then(|value| value.checked_add(requested_ids))
+            .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?,
+    );
+    let generated_bytes = generated_entries
+        .unwrap_or(0)
+        .checked_mul(RANKED_LOGPROB_BYTES)
+        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+    let per_prompt_bytes = 4_u64
+        .checked_add(
+            prompt_entries
+                .unwrap_or(0)
+                .checked_mul(RANKED_LOGPROB_BYTES)
+                .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?,
+        )
+        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+    let prompt_bytes = u64::from(prompt_positions)
+        .checked_mul(per_prompt_bytes)
+        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+    let bytes = 1_u64
+        .checked_add(if generated { 4 } else { 0 })
+        .and_then(|value| value.checked_add(4))
+        .and_then(|value| value.checked_add(generated_bytes))
+        .and_then(|value| value.checked_add(4))
+        .and_then(|value| value.checked_add(prompt_bytes))
+        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+    Ok(Some(bytes))
+}
+
 /// The declared outputs of a token operation: a committed-token product, an
-/// optional logprob product when logprobs were requested, and an optional KV
-/// product when the operation publishes generation conditioning.
-fn token_outputs(logprobs: bool, publishes_conditioning: bool) -> Vec<ProductRef> {
+/// optional bounded logprob product, and an optional KV product when the
+/// operation publishes generation conditioning.
+fn token_outputs(
+    logprob_bound: Option<u64>,
+    publishes_conditioning: bool,
+) -> Result<Vec<ProductRef>, PlanningError> {
     let mut outputs = vec![output_product(
         0,
         ProductKind::Token,
         StorageClass::DeviceTensor,
         DType::U32,
     )];
-    if logprobs {
-        outputs.push(output_product(
-            1,
+    outputs.push(output_product(
+        1,
+        ProductKind::Finish,
+        StorageClass::DeviceTensor,
+        DType::U8,
+    ));
+    if let Some(bytes) = logprob_bound {
+        outputs.push(bounded_product(
+            2,
             ProductKind::Logprob,
             StorageClass::HostStaging,
             DType::U8,
+            dynamic_element_bound(bytes, DType::U8)?,
         ));
     }
     if publishes_conditioning {
         outputs.push(output_product(
-            2,
+            3,
             ProductKind::Kv,
             StorageClass::PagedKv,
             DType::BF16,
         ));
     }
-    outputs
+    Ok(outputs)
 }
 
 /// Products emitted by the state-advancing feedback extend. The completion
 /// predicate identifies the final feedback state transition independently of
 /// whether the dialect also requests a sampled continuation token.
-fn feedback_state_outputs(logprobs: bool, sample_continuation: bool) -> Vec<ProductRef> {
+fn feedback_state_outputs(
+    logprob_bound: Option<u64>,
+    sample_continuation: bool,
+) -> Result<Vec<ProductRef>, PlanningError> {
     let mut outputs = vec![output_product(
         0,
         ProductKind::Completion,
@@ -177,16 +246,23 @@ fn feedback_state_outputs(logprobs: bool, sample_continuation: bool) -> Vec<Prod
             StorageClass::DeviceTensor,
             DType::U32,
         ));
-        if logprobs {
-            outputs.push(output_product(
-                2,
+        outputs.push(output_product(
+            2,
+            ProductKind::Finish,
+            StorageClass::DeviceTensor,
+            DType::U8,
+        ));
+        if let Some(bytes) = logprob_bound {
+            outputs.push(bounded_product(
+                3,
                 ProductKind::Logprob,
                 StorageClass::HostStaging,
                 DType::U8,
+                dynamic_element_bound(bytes, DType::U8)?,
             ));
         }
     }
-    outputs
+    Ok(outputs)
 }
 
 /// Scheduler-private flattened context derived once at admission from ordered
@@ -730,7 +806,7 @@ pub(crate) enum TransitionIntent {
         prompt_start: u32,
         token_ids: Vec<u32>,
         new_blocks: Vec<BlockId>,
-        allowed_tokens: Option<Vec<u32>>,
+        sampling_state: SamplingState,
     },
     EncodeImage {
         segment_index: usize,
@@ -754,7 +830,7 @@ pub(crate) enum TransitionIntent {
         position: u32,
         new_blocks: Vec<BlockId>,
         spec_token_ids: Option<Vec<u32>>,
-        allowed_tokens: Option<Vec<u32>>,
+        sampling_state: SamplingState,
         /// The previously committed token this decode continues from — the host
         /// input the worker's forward consumes. Ignored when `relay_input` is
         /// set, in which case no host token product is attached.
@@ -793,7 +869,7 @@ pub(crate) enum TransitionIntent {
         feature: ProductRef,
         sample_continuation: bool,
         new_blocks: Vec<BlockId>,
-        allowed_tokens: Option<Vec<u32>>,
+        sampling_state: SamplingState,
     },
 }
 
@@ -818,17 +894,13 @@ struct Wire {
     input_tokens: Vec<u32>,
     /// Host-supplied input image bytes an encode operation's forward consumes.
     input_image_bytes: Option<Vec<u8>>,
+    sampling_state: Option<SamplingState>,
 }
 
 /// The reserved output index of a host-supplied input product, kept clear of an
 /// operation's declared output indices so the worker keys it distinctly.
 const HOST_INPUT_OUTPUT_INDEX: u16 = u16::MAX;
-
-/// The allowed-token mask a token operation validates its committed tokens
-/// against, dropped when empty.
-fn filter_allowed(allowed_tokens: Option<Vec<u32>>) -> Option<Vec<u32>> {
-    allowed_tokens.filter(|tokens| !tokens.is_empty())
-}
+const SAMPLING_INPUT_OUTPUT_INDEX: u16 = u16::MAX - 1;
 
 /// The immutable auxiliary feature product an encode operation produces.
 fn encode_outputs(
@@ -887,7 +959,7 @@ impl GenerationPlanner {
                 prompt_start,
                 token_ids,
                 new_blocks,
-                allowed_tokens,
+                sampling_state,
             } => {
                 if prompt_start != cursor.prompt_cursor {
                     return Err(PlanningError::PromptCursorMismatch {
@@ -913,17 +985,23 @@ impl GenerationPlanner {
                         domain: Domain::Und,
                         inputs: Vec::new(),
                         outputs: token_outputs(
-                            scores_prompt || request.sampling.generated_logprobs_requested(),
+                            logprob_blob_bound(
+                                &request.sampling,
+                                expected_prompt_token_ids
+                                    .as_ref()
+                                    .map_or(0, |tokens| tokens.len().min(u32::MAX as usize) as u32),
+                            )?,
                             request.behavior.gen_output,
-                        ),
+                        )?,
                         new_blocks,
                         draft_token_ids: Vec::new(),
                         token_cost: token_count as usize,
                         cfg_branches: 1,
-                        allowed_text_tokens: filter_allowed(allowed_tokens),
+                        allowed_text_tokens: sampling_state.allowed_token_ids.clone(),
                         expected_prompt_token_ids,
                         input_tokens: token_ids,
                         input_image_bytes: None,
+                        sampling_state: Some(sampling_state),
                     },
                     TransitionDelta::IngestText {
                         segment_index,
@@ -969,6 +1047,7 @@ impl GenerationPlanner {
                         input_tokens: Vec::new(),
                         input_image_bytes: (!has_source_product && !image_b64.is_empty())
                             .then(|| image_b64.clone().into_bytes()),
+                        sampling_state: None,
                     },
                     TransitionDelta::EncodeImageStep {
                         segment_index,
@@ -1011,6 +1090,7 @@ impl GenerationPlanner {
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
                         input_image_bytes: None,
+                        sampling_state: None,
                     },
                     TransitionDelta::IngestImageState {
                         segment_index,
@@ -1031,7 +1111,7 @@ impl GenerationPlanner {
                 position,
                 new_blocks,
                 spec_token_ids,
-                allowed_tokens,
+                sampling_state,
                 input_token,
                 relay_input,
             } => {
@@ -1066,17 +1146,18 @@ impl GenerationPlanner {
                         domain: Domain::Und,
                         inputs: Vec::new(),
                         outputs: token_outputs(
-                            request.sampling.generated_logprobs_requested(),
+                            logprob_blob_bound(&request.sampling, 0)?,
                             publishes_conditioning,
-                        ),
+                        )?,
                         new_blocks,
                         draft_token_ids,
                         token_cost,
                         cfg_branches: 1,
-                        allowed_text_tokens: filter_allowed(allowed_tokens),
+                        allowed_text_tokens: sampling_state.allowed_token_ids.clone(),
                         expected_prompt_token_ids: None,
                         input_tokens,
                         input_image_bytes: None,
+                        sampling_state: Some(sampling_state),
                     },
                     TransitionDelta::DecodeUnd {
                         logical_position: position,
@@ -1115,6 +1196,7 @@ impl GenerationPlanner {
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
                         input_image_bytes: None,
+                        sampling_state: None,
                     },
                     TransitionDelta::DenoiseGen {
                         image_id,
@@ -1150,6 +1232,7 @@ impl GenerationPlanner {
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
                         input_image_bytes: None,
+                        sampling_state: None,
                     },
                     TransitionDelta::CommitGen { image_id },
                     Vec::new(),
@@ -1187,6 +1270,7 @@ impl GenerationPlanner {
                         input_tokens: Vec::new(),
                         input_image_bytes: (source.is_none() && !image_b64.is_empty())
                             .then(|| image_b64.clone().into_bytes()),
+                        sampling_state: None,
                     },
                     TransitionDelta::EncodeFeedbackStep {
                         image_id,
@@ -1208,7 +1292,7 @@ impl GenerationPlanner {
                 feature,
                 sample_continuation,
                 new_blocks,
-                allowed_tokens,
+                sampling_state,
             } => {
                 if request.policy.feedback.is_none() {
                     return Err(PlanningError::FeedbackDisabled);
@@ -1220,9 +1304,12 @@ impl GenerationPlanner {
                     });
                 }
                 let outputs = feedback_state_outputs(
-                    request.sampling.generated_logprobs_requested(),
+                    sample_continuation
+                        .then(|| logprob_blob_bound(&request.sampling, 0))
+                        .transpose()?
+                        .flatten(),
                     sample_continuation,
-                );
+                )?;
                 (
                     Wire {
                         work: Work::Token(TokenMode::Extend),
@@ -1234,11 +1321,12 @@ impl GenerationPlanner {
                         token_cost: 1,
                         cfg_branches: 1,
                         allowed_text_tokens: sample_continuation
-                            .then(|| filter_allowed(allowed_tokens))
+                            .then(|| sampling_state.allowed_token_ids.clone())
                             .flatten(),
                         expected_prompt_token_ids: None,
                         input_tokens: Vec::new(),
                         input_image_bytes: None,
+                        sampling_state: sample_continuation.then_some(sampling_state),
                     },
                     TransitionDelta::FeedbackState {
                         image_id,
@@ -1283,10 +1371,14 @@ impl GenerationPlanner {
         let max_completion_bytes = wire
             .outputs
             .iter()
-            .filter(|output| output.storage_class == StorageClass::CompletionArena)
+            .filter(|output| {
+                matches!(
+                    output.storage_class,
+                    StorageClass::CompletionArena | StorageClass::HostStaging
+                )
+            })
             .map(product_bound_bytes)
-            .max()
-            .unwrap_or(0);
+            .fold(0_u64, u64::saturating_add);
         let resources = TransitionResources {
             new_blocks: new_blocks_len,
             kv_target_tokens,
@@ -1362,6 +1454,15 @@ impl GenerationPlanner {
             max_completion_bytes,
             max_transfer_bytes: 0,
         };
+        let rng = produces_token
+            .then(|| {
+                transition_sampling_index(&delta).map(|semantic_index_base| Rng {
+                    seed: request.sampling.seed.unwrap_or(0),
+                    semantic_index_base,
+                    draw_layout: DrawLayout::TargetSampling,
+                })
+            })
+            .flatten();
         Ok(PlannedTransition {
             work: wire.work,
             route: ROUTE,
@@ -1370,7 +1471,7 @@ impl GenerationPlanner {
             inputs: wire.inputs,
             outputs: wire.outputs,
             predicate: None,
-            rng: None,
+            rng,
             control_seq: 0,
             operation: None,
             operation_variant,
@@ -1380,7 +1481,9 @@ impl GenerationPlanner {
             token_cost: wire.token_cost,
             input_tokens: wire.input_tokens,
             input_image_bytes: wire.input_image_bytes,
+            sampling_state: wire.sampling_state,
             host_input: None,
+            sampling_input: None,
             device_parent_point: None,
             delta,
             resources,
@@ -1509,6 +1612,23 @@ fn bounded_worker_kv(
     }
 }
 
+fn transition_sampling_index(delta: &TransitionDelta) -> Option<u64> {
+    match delta {
+        TransitionDelta::IngestText { end, .. } => Some(u64::from(*end)),
+        TransitionDelta::DecodeUnd {
+            logical_position, ..
+        } => Some(u64::from(logical_position.saturating_add(1))),
+        TransitionDelta::FeedbackState {
+            position,
+            logical_positions,
+            ..
+        } => Some(u64::from(
+            position.saturating_add((*logical_positions).max(1)),
+        )),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlanningError {
     PromptCursorMismatch { expected: u32, actual: u32 },
@@ -1549,10 +1669,14 @@ pub(crate) struct PlannedTransition {
     pub(crate) input_tokens: Vec<u32>,
     /// Host-supplied input image bytes an encode operation's forward consumes.
     pub(crate) input_image_bytes: Option<Vec<u8>>,
+    /// Branch-local processor state consumed by this operation's sampler.
+    pub(crate) sampling_state: Option<SamplingState>,
     /// The reference of the host-supplied input product, stamped with the
     /// operation identity at [`PlannedTransition::assign_operation`]. Its value
     /// is transported in the batch's `input_products` under the same identity.
     pub(crate) host_input: Option<ProductRef>,
+    /// The host-staging product that carries `sampling_state`.
+    pub(crate) sampling_input: Option<ProductRef>,
     /// For a `Point::Device`-rooted successor, the scheduler-owned point index
     /// selected by its parent. `None` for a fixed-parent op, whose parent point
     /// is carried directly on the parent `Point::Fixed`. Used by
@@ -1579,7 +1703,8 @@ impl PlannedTransition {
             .iter()
             .filter(|product| product.generation == 0)
             .count()
-            + usize::from(!self.input_tokens.is_empty() || self.input_image_bytes.is_some());
+            + usize::from(!self.input_tokens.is_empty() || self.input_image_bytes.is_some())
+            + usize::from(self.sampling_state.is_some());
         let first_generation = (*next_product_generation).max(1);
         if required_generations > 0 {
             let last_generation = first_generation
@@ -1593,6 +1718,7 @@ impl PlannedTransition {
             Some(host_input_product(
                 request_key,
                 op_id,
+                HOST_INPUT_OUTPUT_INDEX,
                 ProductKind::Token,
                 DType::U32,
                 self.input_tokens.len(),
@@ -1601,6 +1727,7 @@ impl PlannedTransition {
             Some(host_input_product(
                 request_key,
                 op_id,
+                HOST_INPUT_OUTPUT_INDEX,
                 ProductKind::Artifact,
                 DType::U8,
                 self.input_image_bytes.as_ref().map_or(0, Vec::len),
@@ -1608,6 +1735,23 @@ impl PlannedTransition {
         } else {
             None
         };
+        let sampling_bytes = self
+            .sampling_state
+            .as_ref()
+            .map(encode_sampling_state_bytes);
+        let sampling_input = sampling_bytes
+            .as_ref()
+            .map(|bytes| {
+                host_input_product(
+                    request_key,
+                    op_id,
+                    SAMPLING_INPUT_OUTPUT_INDEX,
+                    ProductKind::SamplingState,
+                    DType::U8,
+                    bytes.len(),
+                )
+            })
+            .transpose()?;
         let mut acquire_generation = || {
             let generation =
                 u32::try_from((*next_product_generation).max(1)).expect("generation preflight");
@@ -1636,6 +1780,11 @@ impl PlannedTransition {
             self.host_input = Some(product.clone());
             inputs.push(product);
         }
+        if let Some(mut product) = sampling_input {
+            product.generation = acquire_generation();
+            self.sampling_input = Some(product.clone());
+            inputs.push(product);
+        }
         self.operation = Some(Operation::registered(
             request_key,
             op_id,
@@ -1656,17 +1805,27 @@ impl PlannedTransition {
         Ok(())
     }
 
-    /// The host-supplied input product value for this operation's forward, keyed
-    /// by the input reference stamped in [`Self::assign_operation`]. `None` when
-    /// the operation consumes no host-supplied input.
-    pub(crate) fn input_product(&self) -> Option<ProductPayload> {
-        let product = self.host_input.clone()?;
-        let bytes = if !self.input_tokens.is_empty() {
-            encode_token_product_bytes(&self.input_tokens)
-        } else {
-            self.input_image_bytes.clone().unwrap_or_default()
-        };
-        Some(ProductPayload { product, bytes })
+    /// Host-supplied values keyed by the exact input references stamped at
+    /// registration.
+    pub(crate) fn input_products(&self) -> Vec<ProductPayload> {
+        let mut values = Vec::with_capacity(2);
+        if let Some(product) = self.host_input.clone() {
+            let bytes = if !self.input_tokens.is_empty() {
+                encode_token_product_bytes(&self.input_tokens)
+            } else {
+                self.input_image_bytes.clone().unwrap_or_default()
+            };
+            values.push(ProductPayload { product, bytes });
+        }
+        if let (Some(product), Some(state)) =
+            (self.sampling_input.clone(), self.sampling_state.as_ref())
+        {
+            values.push(ProductPayload {
+                product,
+                bytes: encode_sampling_state_bytes(state),
+            });
+        }
+        values
     }
 
     pub(crate) fn validate_result(
@@ -1853,6 +2012,9 @@ impl TransitionValidation {
         record: &CompletionRecord,
         products: &[ProductPayload],
     ) -> Result<(), TransitionValidationError> {
+        if record.status != OpStatus::Ok {
+            return Err(TransitionValidationError::OperationFailed);
+        }
         if let Some(expected_step) = self.expected_denoise_step {
             let steps_done = record.logical_lengths.latent_len.min(u32::from(u16::MAX)) as u16;
             if steps_done != expected_step {
@@ -1967,6 +2129,13 @@ impl TransitionValidation {
                 });
             }
         }
+        if let Some(allowed) = self.allowed_text_tokens.as_deref()
+            && let Some(&token_id) = sampled_tokens
+                .iter()
+                .find(|token_id| !allowed.contains(token_id))
+        {
+            return Err(TransitionValidationError::SampledTokenOutsideAllowedSet { token_id });
+        }
         let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
             .and_then(|payload| LogprobBlob::decode(&payload.bytes).ok())
             .unwrap_or_default();
@@ -2054,6 +2223,7 @@ impl TransitionValidation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransitionValidationError {
+    OperationFailed,
     SessionMismatch {
         expected: u64,
         actual: u64,
@@ -2102,6 +2272,9 @@ pub(crate) enum TransitionValidationError {
         min: u32,
         max: u32,
         actual: u32,
+    },
+    SampledTokenOutsideAllowedSet {
+        token_id: u32,
     },
     UnexpectedPromptLogprobs {
         operation_variant: WorkVariant,
@@ -2189,7 +2362,7 @@ mod tests {
                     prompt_start: 0,
                     token_ids: vec![11, 12],
                     new_blocks: Vec::new(),
-                    allowed_tokens: None,
+                    sampling_state: SamplingState::default(),
                 },
             )
             .expect("plan sequence extension")
@@ -2231,6 +2404,142 @@ mod tests {
         };
         assert_eq!((start, end), (0, 2));
         assert_eq!(transition.token_cost, 2);
+        assert!(
+            transition
+                .outputs
+                .iter()
+                .any(|output| output.kind == ProductKind::Finish)
+        );
+        assert_eq!(
+            transition.rng,
+            Some(Rng {
+                seed: 0,
+                semantic_index_base: 2,
+                draw_layout: DrawLayout::TargetSampling,
+            })
+        );
+    }
+
+    #[test]
+    fn planner_registers_the_exact_logprob_blob_bound() {
+        let mut request = request(14, vec![11, 12, 13]);
+        request.sampling.return_logprobs = true;
+        request.sampling.n_logprobs = 3;
+        request.sampling.return_prompt_logprobs = true;
+        request.sampling.n_prompt_logprobs = 4;
+        request.sampling.logprob_token_ids = vec![17, 19, 17];
+        let mut transition = GenerationPlanner::new()
+            .plan(
+                &request,
+                CursorProjection {
+                    phase: GenerationPhase::Prefill,
+                    prompt_cursor: 0,
+                    logical_pos: 0,
+                    physical_kv_len: 0,
+                    replayability: Replayability::Replayable,
+                },
+                TransitionIntent::IngestText {
+                    segment_index: 0,
+                    prompt_start: 0,
+                    token_ids: vec![11, 12, 13],
+                    new_blocks: Vec::new(),
+                    sampling_state: SamplingState::default(),
+                },
+            )
+            .expect("plan scored prefill");
+        let logprob = transition
+            .outputs
+            .iter()
+            .find(|output| output.kind == ProductKind::Logprob)
+            .expect("bounded logprob output");
+        // One sampled value, six generated candidates, and two prompt positions
+        // with seven candidates each in the canonical LogprobBlob layout.
+        assert_eq!(product_bound_bytes(logprob), 261);
+        assert_eq!(transition.bounds.max_completion_bytes, 261);
+
+        let request_key = RequestKey::new(1, RequestId(14), 3);
+        let parent = VersionRef {
+            request_key,
+            producer_op_id: OpId(1),
+            point: Point::Fixed {
+                point_index: 0,
+                semantic_digest: digest(),
+            },
+        };
+        let mut next_generation = 1;
+        transition
+            .assign_operation(request_key, OpId(21), parent, &mut next_generation)
+            .expect("assign scored prefill");
+        transition
+            .operation
+            .as_ref()
+            .expect("registered operation")
+            .validate()
+            .expect("bounded operation");
+    }
+
+    #[test]
+    fn transition_validates_the_token_selected_under_its_branch_state() {
+        let mut transition = GenerationPlanner::new()
+            .plan(
+                &request(13, vec![11, 12]),
+                CursorProjection {
+                    phase: GenerationPhase::Prefill,
+                    prompt_cursor: 0,
+                    logical_pos: 0,
+                    physical_kv_len: 0,
+                    replayability: Replayability::Replayable,
+                },
+                TransitionIntent::IngestText {
+                    segment_index: 0,
+                    prompt_start: 0,
+                    token_ids: vec![11, 12],
+                    new_blocks: Vec::new(),
+                    sampling_state: SamplingState {
+                        allowed_token_ids: Some(vec![7]),
+                        ..SamplingState::default()
+                    },
+                },
+            )
+            .expect("plan constrained extension");
+        let request_key = RequestKey::new(1, RequestId(13), 3);
+        let parent = VersionRef {
+            request_key,
+            producer_op_id: OpId(1),
+            point: Point::Fixed {
+                point_index: 0,
+                semantic_digest: digest(),
+            },
+        };
+        let mut next_generation = 1;
+        transition
+            .assign_operation(request_key, OpId(19), parent, &mut next_generation)
+            .expect("assign constrained operation");
+        let sampling_payload = transition
+            .input_products()
+            .into_iter()
+            .find(|payload| payload.product.kind == ProductKind::SamplingState)
+            .expect("branch-local sampling input");
+        assert_eq!(
+            uniserve_worker_wire::decode_sampling_state_bytes(&sampling_payload.bytes)
+                .expect("decode sampling input")
+                .allowed_token_ids,
+            Some(vec![7])
+        );
+        assert!(
+            transition
+                .operation
+                .as_ref()
+                .expect("registered operation")
+                .inputs
+                .contains(&sampling_payload.product)
+        );
+        let record = completion(request_key, 19, 1);
+
+        assert!(matches!(
+            transition.validate_result(&record, &[]),
+            Err(TransitionValidationError::SampledTokenOutsideAllowedSet { token_id: 13 })
+        ));
     }
 
     #[test]
@@ -2263,7 +2572,7 @@ mod tests {
                         position: 2,
                         new_blocks: Vec::new(),
                         spec_token_ids: None,
-                        allowed_tokens: None,
+                        sampling_state: SamplingState::default(),
                         input_token: 7,
                         relay_input: false,
                     },
@@ -2377,6 +2686,7 @@ mod tests {
         let mut transition = prefill_transition();
         transition.outputs.truncate(1);
         transition.input_tokens.clear();
+        transition.sampling_state = None;
         let request_key = RequestKey::new(1, RequestId(9), 3);
         let parent = VersionRef {
             request_key,
@@ -2408,6 +2718,7 @@ mod tests {
         let mut exhausted = prefill_transition();
         exhausted.outputs.truncate(1);
         exhausted.input_tokens.clear();
+        exhausted.sampling_state = None;
         assert_eq!(
             exhausted
                 .assign_operation(request_key, OpId(18), parent, &mut next_product_generation,),

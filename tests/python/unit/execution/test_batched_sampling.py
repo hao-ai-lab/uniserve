@@ -10,6 +10,7 @@ import torch
 
 from uniserve_worker.batch import Operation, SamplingParams
 from uniserve_worker.execution.executor import (
+    _plain_greedy_row,
     _sample_task_batch,
     _SampleTask,
     _sampling_task_tensors,
@@ -31,6 +32,8 @@ def _row(
     recent: tuple[int, ...] = (),
     allowed: tuple[int, ...] | None = None,
     suppress: tuple[int, ...] = (),
+    finish: tuple[int, ...] = (),
+    force_finish: bool = False,
 ) -> _SamplingRow:
     counts: dict[int, int] = {}
     for token_id in recent:
@@ -42,19 +45,23 @@ def _row(
         suppress=suppress,
         draw_seed=sampling_draw_seed(session_seed, position),
         n_logprobs=parameters.n_logprobs,
+        finish_token_ids=finish,
+        force_finish=force_finish,
     )
 
 
 def _task(logits: torch.Tensor, row: _SamplingRow) -> _SampleTask:
     values = logits.reshape(1, -1)
-    noise = (
+    if _plain_greedy_row(row):
+        return _SampleTask(_ENVELOPE, values, (row,), None, None, None, None)
+    draws = (
         uniform_samples(
-            (values.shape[1],),
+            (1,),
             seed=row.draw_seed,
             device=values.device,
-        ).reshape_as(values)
+        )
         if row.parameters.temperature > 0
-        else torch.zeros_like(values, dtype=torch.float32)
+        else torch.zeros((1,), dtype=torch.float32, device=values.device)
     )
     penalty_token_ids, penalty_counts, parameter_values = _sampling_task_tensors(
         (row,),
@@ -65,7 +72,7 @@ def _task(logits: torch.Tensor, row: _SamplingRow) -> _SampleTask:
         _ENVELOPE,
         values,
         (row,),
-        noise,
+        draws,
         penalty_token_ids,
         penalty_counts,
         parameter_values,
@@ -122,15 +129,15 @@ def _reference_workspace(logits: torch.Tensor, row: _SamplingRow) -> torch.Tenso
 def _reference_token(logits: torch.Tensor, row: _SamplingRow) -> tuple[int, torch.Tensor]:
     work = _reference_workspace(logits, row)
     if row.parameters.temperature > 0:
-        uniform = uniform_samples(
-            (work.numel(),),
+        draw = uniform_samples(
+            (1,),
             seed=row.draw_seed,
             device=work.device,
-        )
-        work_for_draw = work - torch.log(-torch.log(uniform))
+        )[0]
+        token = int((torch.softmax(work, dim=-1).cumsum(dim=-1) < draw).sum())
     else:
-        work_for_draw = work
-    return int(torch.argmax(work_for_draw)), work
+        token = int(torch.argmax(work))
+    return min(token, int(work.numel()) - 1), work
 
 
 def _reference_logprobs(
@@ -158,7 +165,7 @@ def _reference_logprobs(
     return selected, tuple(entries)
 
 
-def test_heterogeneous_rows_match_shaped_logits_plus_semantic_gumbel_noise() -> None:
+def test_heterogeneous_rows_match_shaped_logits_plus_semantic_inverse_cdf_draws() -> None:
     logits = (
         torch.tensor([0.2, 1.6, -0.4, 2.1, 0.7, 1.3]),
         torch.tensor([1.7, -0.2, 0.4, 0.8, 2.2, 1.1]),
@@ -301,10 +308,10 @@ def test_verify_uses_prefix_acceptance_and_the_residual_position_draw() -> None:
         _ENVELOPE,
         logits,
         rows,
-        torch.stack(
+        torch.cat(
             tuple(
                 uniform_samples(
-                    (logits.shape[1],),
+                    (1,),
                     seed=row.draw_seed,
                     device=logits.device,
                 )
@@ -323,11 +330,14 @@ def test_verify_uses_prefix_acceptance_and_the_residual_position_draw() -> None:
     actual = _sample_task_batch((task,))[0]
     residual = _reference_workspace(logits[1], rows[1])
     residual[draft[1]] = float("-inf")
-    uniform = uniform_samples((residual.numel(),), seed=rows[1].draw_seed, device=residual.device)
-    expected = int(torch.argmax(residual - torch.log(-torch.log(uniform))))
+    draw = uniform_samples((1,), seed=rows[1].draw_seed, device=residual.device)[0]
+    expected = min(
+        int((torch.softmax(residual, dim=-1).cumsum(dim=-1) < draw).sum()),
+        int(residual.numel()) - 1,
+    )
 
     assert actual.num_accepted_tokens == 1
-    assert actual.token_id == expected
+    assert int(actual.token_id) == expected
 
 
 def test_a_policy_must_leave_a_finite_vocabulary_entry() -> None:
@@ -336,3 +346,28 @@ def test_a_policy_must_leave_a_finite_vocabulary_entry() -> None:
 
     with pytest.raises(WorkerError, match="masked every vocabulary entry"):
         _sample_task_batch((_task(torch.tensor([0.2, 0.8, 0.1]), row),))
+
+
+def test_finish_candidate_is_selected_on_device_from_token_and_length_state() -> None:
+    parameters = SamplingParams()
+    by_token = _sample_task_batch(
+        (
+            _task(
+                torch.tensor([0.2, 1.8, 0.1]),
+                _row(parameters, session_seed=3, position=1, finish=(1,)),
+            ),
+        )
+    )[0]
+    by_length = _sample_task_batch(
+        (
+            _task(
+                torch.tensor([2.2, 0.8, 0.1]),
+                _row(parameters, session_seed=3, position=2, force_finish=True),
+            ),
+        )
+    )[0]
+
+    assert by_token.device_finish is not None
+    assert by_length.device_finish is not None
+    assert bool(by_token.device_finish)
+    assert bool(by_length.device_finish)

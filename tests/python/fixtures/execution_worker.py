@@ -40,6 +40,7 @@ def execution_worker(
         mooncake_device="",
         mooncake_protocol="rdma",
         pipeline_depth=pipeline_depth,
+        completion_payload_bytes=1 << 16,
     )
 
 
