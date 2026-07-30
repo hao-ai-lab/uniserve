@@ -34,6 +34,43 @@ pytestmark = [
 ]
 
 
+def test_token_and_finish_outputs_share_the_sampling_submission_fence() -> None:
+    worker = execution_worker(device="cuda:0", pipeline_depth=2)
+    admission = und_admission(29, block_ids=(0,))
+    operation, token_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+
+    worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(operation,),
+            input_products=(token_input,),
+        )
+    )
+    token = next(output for output in operation.outputs if output.kind is ProductKind.TOKEN)
+    finish = next(output for output in operation.outputs if output.kind is ProductKind.FINISH)
+    token_read, finish_read = worker.products.device_products.consume_batch(
+        (
+            (token, 2, operation.plan_digest, "cuda:0"),
+            (finish, 2, operation.plan_digest, "cuda:0"),
+        ),
+        device="cuda:0",
+    )
+
+    assert token_read._write.producer_event is not None
+    assert token_read._write.producer_event is finish_read._write.producer_event
+    worker.products.device_products.record_readers(
+        (token_read, finish_read),
+        device="cuda:0",
+    )
+
+
 def test_same_request_continues_from_device_products_before_parent_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
