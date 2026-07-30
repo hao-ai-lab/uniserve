@@ -82,7 +82,16 @@ class ReplayStore:
         if len(completions) != len(operations):
             raise invalid_descriptor("terminal report does not align with its operations")
         with self._lock:
-            next_records = OrderedDict(self._records)
+            # Validation-only pass: no mutation of ``self._records``. ``pending``
+            # mirrors the digest a key would carry after earlier operations in the
+            # same batch, so an intra-batch digest conflict is detected exactly as
+            # the previous copy-then-mutate loop did (which read from the growing
+            # working copy). ``overwrites_existing`` records whether any key is
+            # already committed -- an overwrite+move of a pre-existing entry, whose
+            # exact position restoration on the error path is the one case the
+            # cheap delta cannot reverse in place.
+            pending: dict[tuple[int, int, int], str] = {}
+            overwrites_existing = False
             for operation, completion in zip(operations, completions, strict=True):
                 if (
                     completion.request_key != operation.request_key
@@ -90,32 +99,92 @@ class ReplayStore:
                 ):
                     raise invalid_descriptor("terminal completion identity does not match operation")
                 key = self._key(operation)
-                existing = next_records.get(key)
-                if existing is not None and existing[0] != operation.plan_digest:
+                if key in pending:
+                    prior_digest: str | None = pending[key]
+                elif key in self._records:
+                    prior_digest = self._records[key][0]
+                    overwrites_existing = True
+                else:
+                    prior_digest = None
+                if prior_digest is not None and prior_digest != operation.plan_digest:
                     raise invalid_descriptor(
                         f"operation {operation.op_id} conflicts with its committed digest"
                     )
-                next_records[key] = (
-                    operation.plan_digest,
-                    result.step_id,
-                    completion,
-                )
-                next_records.move_to_end(key)
-            while len(next_records) > self.capacity:
-                next_records.popitem(last=False)
-            previous = self._records
+                pending[key] = operation.plan_digest
+
+            if overwrites_existing:
+                # Rare fallback (never reached on the decode/commit hot path, where
+                # ``lookup`` has already deduplicated any committed operation): a
+                # pre-existing key would be overwritten and moved to the end, and
+                # restoring its exact prior position is intricate. Snapshot the
+                # whole dict for this call only; correctness over micro-cost here.
+                next_records = OrderedDict(self._records)
+                for operation, completion in zip(operations, completions, strict=True):
+                    key = self._key(operation)
+                    next_records[key] = (operation.plan_digest, result.step_id, completion)
+                    next_records.move_to_end(key)
+                while len(next_records) > self.capacity:
+                    next_records.popitem(last=False)
+                previous = self._records
+                published = False
+
+                def publish_snapshot() -> None:
+                    nonlocal published
+                    published = True
+                    self._records = next_records
+
+                try:
+                    commit_state(publish_snapshot)
+                except BaseException:
+                    if published:
+                        self._records = previous
+                    raise
+                return
+
+            # Hot path: every key is new. Apply additions and LRU evictions in
+            # place inside ``publish`` -- no full copy -- recording only the delta
+            # needed to undo them if a later commit step raises after publishing.
+            added_keys: list[tuple[int, int, int]] = []
+            evicted: list[tuple[tuple[int, int, int], tuple[str, int, CompletionRecord]]] = []
             published = False
 
             def publish() -> None:
                 nonlocal published
                 published = True
-                self._records = next_records
+                records = self._records
+                for operation, completion in zip(operations, completions, strict=True):
+                    key = self._key(operation)
+                    value = (operation.plan_digest, result.step_id, completion)
+                    if key in records:
+                        # A key repeated within this batch: it was appended by an
+                        # earlier operation above, so it is a self-add. Update the
+                        # value and re-append; the undo removes it regardless.
+                        records[key] = value
+                        records.move_to_end(key)
+                    else:
+                        records[key] = value
+                        added_keys.append(key)
+                while len(records) > self.capacity:
+                    evicted.append(records.popitem(last=False))
 
             try:
                 commit_state(publish)
             except BaseException:
                 if published:
-                    self._records = previous
+                    # Undo exactly: drop every newly-added key (some may already
+                    # have been evicted -- pop tolerates that), then re-insert the
+                    # evicted entries at the FRONT in reverse-eviction order so the
+                    # original front ordering is reproduced. Evicted entries that
+                    # were themselves self-adds must not reappear.
+                    added_set = set(added_keys)
+                    records = self._records
+                    for key in added_keys:
+                        records.pop(key, None)
+                    for key, value in reversed(evicted):
+                        if key in added_set:
+                            continue
+                        records[key] = value
+                        records.move_to_end(key, last=False)
                 raise
 
     def drop_session(self, session_id: int) -> None:
