@@ -9,12 +9,14 @@ oracle the stub model defines through its deterministic next-token map.
 from __future__ import annotations
 
 import struct
+from dataclasses import replace
 
 import pytest
 
 from tests.python.fixtures.depth_one import root_parent, token_operation, und_admission
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
+    Admission,
     Batch,
     DrawLayout,
     DType,
@@ -215,6 +217,91 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
     expected = _next_token(_next_token(4))
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
+
+
+def test_admission_finish_policy_drives_the_device_finish_product() -> None:
+    worker = execution_worker()
+    base = und_admission(23, block_ids=(2,))
+    expected = _next_token(4)
+    assert base.und is not None
+    admission = Admission.create(
+        base.request_key,
+        und=replace(base.und, finish_token_ids=(expected,)),
+    )
+    operation, token_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+
+    worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(operation,),
+            input_products=(token_input,),
+        )
+    )
+
+    finish = next(
+        output for output in operation.outputs if output.kind is ProductKind.FINISH
+    )
+    read = worker.products.device_products.consume(
+        finish,
+        consumer_op_id=2,
+        device="cpu",
+    )
+    assert read.tensor.tolist() == [1]
+
+
+def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:
+    worker = execution_worker()
+    first = und_admission(24, block_ids=(3,))
+    second_base = und_admission(25, block_ids=(4,))
+    expected = _next_token(4)
+    assert second_base.und is not None
+    second = Admission.create(
+        second_base.request_key,
+        und=replace(second_base.und, finish_token_ids=(expected,)),
+    )
+    first_op, first_input = token_operation(
+        first.request_key,
+        op_id=1,
+        parent=root_parent(first),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        produces_finish_candidate=False,
+    )
+    second_op, second_input = token_operation(
+        second.request_key,
+        op_id=2,
+        parent=root_parent(second),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+
+    result = worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(first, second),
+            operations=(first_op, second_op),
+            input_products=(first_input, second_input),
+        )
+    )
+
+    assert result.completions[0].committed_tokens == (expected,)
+    assert result.completions[1].committed_tokens == (expected,)
+    finish = next(
+        output for output in second_op.outputs if output.kind is ProductKind.FINISH
+    )
+    read = worker.products.device_products.consume(
+        finish,
+        consumer_op_id=3,
+        device="cpu",
+    )
+    assert read.tensor.tolist() == [1]
 
 
 def test_verify_submits_its_position_rows_as_one_sampling_task(

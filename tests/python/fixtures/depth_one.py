@@ -100,6 +100,7 @@ def token_operation(
     new_kv_blocks: Sequence[int] = (),
     predicate: ProductRef | None = None,
     publishes_predicate: bool = False,
+    produces_finish_candidate: bool = True,
     logprobs: bool = False,
     rng: Rng | None = None,
 ) -> tuple[Operation, ProductPayload]:
@@ -133,7 +134,9 @@ def token_operation(
         shape_bound=ShapeBound(),
         point_range=PointRange(),
     )
-    outputs = [token_output, finish_output]
+    outputs = [token_output]
+    if produces_finish_candidate:
+        outputs.append(finish_output)
     if publishes_predicate:
         outputs.append(
             ProductRef(

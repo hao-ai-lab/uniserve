@@ -940,11 +940,13 @@ pub struct KvAllocation {
     pub group_id: u32,
 }
 
-/// Understanding-branch admission: sampling parameters, negative tokens, and KV.
+/// Understanding-branch admission: invariant sampling policy, negative tokens,
+/// terminal token ids, and KV allocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UndAdmission {
     pub sampling: SamplingParams,
     pub negative_token_ids: Vec<u32>,
+    pub finish_token_ids: Vec<u32>,
     pub kv: KvAllocation,
 }
 
@@ -993,6 +995,7 @@ impl Admission {
         digest.option(self.und.as_ref(), |digest, und| {
             digest.sampling(&und.sampling);
             digest.u32s(und.negative_token_ids.iter().copied());
+            digest.u32s(und.finish_token_ids.iter().copied());
             digest.u32s(und.kv.block_ids.iter().map(|block| block.0));
             digest.u32(und.kv.prefix_len);
             digest.u32(und.kv.group_id);
@@ -1019,6 +1022,12 @@ impl Admission {
         );
         if let Some(und) = &self.und {
             und.sampling.validate()?;
+            anyhow::ensure!(
+                und.finish_token_ids
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+                "und admission finish token ids are not canonical"
+            );
             anyhow::ensure!(
                 und.kv.prefix_len == 0 || !und.kv.block_ids.is_empty(),
                 "a non-empty KV prefix requires allocated blocks"

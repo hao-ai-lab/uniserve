@@ -414,6 +414,7 @@ fn und_admission_to_fb(admission: &UndAdmission) -> anyhow::Result<fbs::UndAdmis
     Ok(fbs::UndAdmissionT {
         sampling: Some(Box::new(sampling_to_fb(&admission.sampling)?)),
         negative_token_ids: Some(admission.negative_token_ids.clone()),
+        finish_token_ids: Some(admission.finish_token_ids.clone()),
         kv: Some(Box::new(kv_allocation_to_fb(&admission.kv))),
     })
 }
@@ -426,6 +427,7 @@ fn und_admission_from_fb(admission: fbs::UndAdmissionT) -> anyhow::Result<UndAdm
                 .context("und admission has no sampling spec")?,
         )?,
         negative_token_ids: admission.negative_token_ids.unwrap_or_default(),
+        finish_token_ids: admission.finish_token_ids.unwrap_or_default(),
         kv: kv_allocation_from_fb(*admission.kv.context("und admission has no KV allocation")?),
     })
 }

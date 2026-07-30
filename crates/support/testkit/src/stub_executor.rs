@@ -219,6 +219,7 @@ mod tests {
             Some(UndAdmission {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
+                finish_token_ids: Vec::new(),
                 kv: Default::default(),
             }),
             None,
