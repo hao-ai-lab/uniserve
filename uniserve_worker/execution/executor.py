@@ -4809,22 +4809,45 @@ def _device_finish_values(
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
+    count = len(tasks)
+    tokens = device_tokens.reshape(-1)
+    validity = valid.reshape(-1)
+    if int(tokens.numel()) != count or int(validity.numel()) != count:
+        raise RuntimeError("sampling finish vectors do not align")
+    if count == 0:
+        return validity.to(dtype=torch.bool)
+
+    rows = tuple(task.rows[0] for task in tasks)
+    first = rows[0]
+    if all(
+        row.force_finish == first.force_finish
+        and row.finish_token_ids == first.finish_token_ids
+        for row in rows[1:]
+    ):
+        if first.force_finish:
+            return validity.to(dtype=torch.bool)
+        if not first.finish_token_ids:
+            return torch.zeros_like(validity, dtype=torch.bool)
+        matched = tokens == first.finish_token_ids[0]
+        for token_id in first.finish_token_ids[1:]:
+            matched |= tokens == token_id
+        return matched & validity
+
     values: list[torch.Tensor] = []
-    for index, task in enumerate(tasks):
-        row = task.rows[0]
-        selected = device_tokens[index]
+    for index, row in enumerate(rows):
+        selected = tokens[index]
         if row.force_finish:
-            finish = torch.ones((), dtype=torch.bool, device=device_tokens.device)
+            finish = torch.ones((), dtype=torch.bool, device=tokens.device)
         elif row.finish_token_ids:
             finish_ids = torch.tensor(
                 row.finish_token_ids,
-                dtype=device_tokens.dtype,
-                device=device_tokens.device,
+                dtype=tokens.dtype,
+                device=tokens.device,
             )
             finish = (finish_ids == selected).any()
         else:
-            finish = torch.zeros((), dtype=torch.bool, device=device_tokens.device)
-        values.append(finish & valid[index])
+            finish = torch.zeros((), dtype=torch.bool, device=tokens.device)
+        values.append(finish & validity[index])
     return torch.stack(values)
 
 
