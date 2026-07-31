@@ -23,8 +23,10 @@ Classification (construction.md "Checkpoint performance protection"):
 - ``block``: any effective regression exceeds 20%, or any correctness, work, output
   validity, or provenance requirement fails.
 
-The same performance limit applies to checkpoint triplets and major-boundary suites.
-Correctness, conformance, work, and artifact-integrity requirements remain hard gates.
+The same performance limit applies to checkpoint triplets and UEval
+major-boundary suites. Default travel is a correctness and provenance gate whose
+elapsed time is retained for longitudinal diagnosis. Correctness, conformance,
+work, and artifact-integrity requirements remain hard gates.
 """
 
 from __future__ import annotations
@@ -73,8 +75,8 @@ UEVAL_DIRECTIONAL_SPECS: tuple[tuple[MetricSpec, tuple[str, ...]], ...] = (
     ),
 )
 
-# Default-travel gate: elapsed wall time (minimize). Step conformance is a hard gate.
-DEFAULT_TRAVEL_SPECS: tuple[MetricSpec, ...] = (("elapsed_s", ("__elapsed_s__",), "minimize"),)
+MAJOR_INTERLEAVE_CHECKPOINTS = frozenset({"cp5", "cp7", "cp8"})
+MAJOR_INTERLEAVE_PREVIOUS_REQUIRED = frozenset({"cp7", "cp8"})
 
 
 @dataclass
@@ -219,7 +221,7 @@ def hard_gate_failures(
     for key in ("source_revision", "model", "dataset_revision"):
         if not candidate.provenance.get(key):
             failures.append(f"provenance_missing:{key}")
-    if candidate.provenance.get("source_dirty") is True:
+    if candidate.provenance.get("source_dirty") is not False:
         failures.append("source_tree_dirty")
 
     if interleave:
@@ -369,8 +371,68 @@ def discover_points(root: str | Path) -> dict[str, Point]:
 class CheckpointReport:
     checkpoint: str
     major_boundary: bool
+    source_revision: str | None = None
     points: list[PointOutcome] = field(default_factory=list)
     verdict: str = "block"
+
+
+def load_default_travel(directory: str | Path) -> tuple[float | None, dict[str, Any], dict[str, Any]]:
+    """Load the fixed default-travel verification artifact.
+
+    This point is emitted by ``uniserve-eval verify`` rather than the serving
+    benchmark harness, so its schema is intentionally handled at this boundary.
+    """
+
+    summary = json.loads((Path(directory) / "summary.json").read_text(encoding="utf-8"))
+    artifact = summary.get("artifact") if isinstance(summary.get("artifact"), dict) else {}
+    provenance = (
+        artifact.get("provenance") if isinstance(artifact.get("provenance"), dict) else {}
+    )
+    source_state = (
+        provenance.get("source_state")
+        if isinstance(provenance.get("source_state"), dict)
+        else {}
+    )
+    return _finite(summary.get("elapsed_s")), artifact, source_state
+
+
+def default_travel_failures(
+    directory: str | Path,
+    *,
+    expected_source_revision: str | None,
+) -> tuple[float | None, list[str]]:
+    failures: list[str] = []
+    try:
+        elapsed_s, artifact, source_state = load_default_travel(directory)
+    except (OSError, json.JSONDecodeError):
+        return None, ["point_missing"]
+    if artifact.get("valid") is not True or artifact.get("valid_marker") != "verify-valid-v1":
+        failures.append("artifact_invalid")
+    checks = artifact.get("checks") if isinstance(artifact.get("checks"), dict) else {}
+    if not checks:
+        failures.append("checks_missing")
+    else:
+        failures.extend(f"check:{name}" for name, value in checks.items() if value is not True)
+    provenance = (
+        artifact.get("provenance") if isinstance(artifact.get("provenance"), dict) else {}
+    )
+    profile = (
+        provenance.get("profile_contract")
+        if isinstance(provenance.get("profile_contract"), dict)
+        else {}
+    )
+    if profile.get("workload") != "gate/sensenova/default-travel":
+        failures.append("profile_mismatch")
+    source_revision = source_state.get("head")
+    if not source_revision:
+        failures.append("provenance_missing:source_revision")
+    if source_state.get("dirty") is not False:
+        failures.append("source_tree_dirty")
+    if expected_source_revision is not None and source_revision != expected_source_revision:
+        failures.append("source_revision_mismatch")
+    if elapsed_s is None or elapsed_s <= 0.0:
+        failures.append("elapsed_s_invalid")
+    return elapsed_s, failures
 
 
 def evaluate_checkpoint(
@@ -380,13 +442,17 @@ def evaluate_checkpoint(
     *,
     checkpoint: str,
     major_boundary: bool,
+    default_travel_dir: str | Path | None = None,
+    previous_major_root: str | Path | None = None,
 ) -> CheckpointReport:
     candidate_points = discover_points(candidate_root)
     anchor_points = discover_points(anchor_root)
     previous_points = discover_points(previous_root) if previous_root else {}
+    previous_major_points = discover_points(previous_major_root) if previous_major_root else {}
 
     report = CheckpointReport(checkpoint=checkpoint, major_boundary=major_boundary)
-    required_tasks = ["text", "t2i", "i2t"] + (["interleave"] if major_boundary else [])
+    require_interleave = major_boundary and checkpoint in MAJOR_INTERLEAVE_CHECKPOINTS
+    required_tasks = ["text", "t2i", "i2t"] + (["interleave"] if require_interleave else [])
 
     all_metric_outcomes: list[MetricOutcome] = []
     any_hard_failure = False
@@ -401,7 +467,7 @@ def evaluate_checkpoint(
             )
             any_hard_failure = True
             continue
-        prev = previous_points.get(task)
+        prev = previous_major_points.get(task) if task == "interleave" else previous_points.get(task)
         specs = specs_for(cand, major_boundary=major_boundary)
         outcomes = [evaluate_metric(spec, cand, anc, prev) for spec in specs]
         if task == "interleave":
@@ -410,11 +476,58 @@ def evaluate_checkpoint(
                 if baseline_count and baseline_count > 0:
                     outcomes.append(evaluate_metric(spec, cand, anc, prev))
         hard = hard_gate_failures(cand, anc, interleave=(task == "interleave"))
+        if task == "interleave" and checkpoint in MAJOR_INTERLEAVE_PREVIOUS_REQUIRED and prev is None:
+            hard.append("previous_major_point_missing")
         if hard:
             any_hard_failure = True
         all_metric_outcomes.extend(outcomes)
         report.points.append(
             PointOutcome(task=task, directory=directory, metrics=outcomes, hard_failures=hard)
+        )
+
+    candidate_revisions = {
+        point.provenance.get("source_revision")
+        for task, point in candidate_points.items()
+        if task in required_tasks and point.provenance.get("source_revision")
+    }
+    if len(candidate_revisions) == 1:
+        report.source_revision = next(iter(candidate_revisions))
+    else:
+        any_hard_failure = True
+        for point in report.points:
+            point.hard_failures.append("candidate_source_revision_mismatch")
+
+    if major_boundary:
+        if default_travel_dir is None:
+            elapsed_s, hard = None, ["point_missing"]
+            directory = "<missing>"
+        else:
+            directory = str(default_travel_dir)
+            elapsed_s, hard = default_travel_failures(
+                default_travel_dir,
+                expected_source_revision=report.source_revision,
+            )
+        if hard:
+            any_hard_failure = True
+        report.points.append(
+            PointOutcome(
+                task="default_travel",
+                directory=directory,
+                metrics=[
+                    MetricOutcome(
+                        name="elapsed_s",
+                        objective="record",
+                        candidate=elapsed_s,
+                        anchor=None,
+                        previous=None,
+                        regression_anchor=None,
+                        regression_previous=None,
+                        effective_regression=0.0 if elapsed_s is not None else None,
+                        band="pass" if elapsed_s is not None and not hard else "unavailable",
+                    )
+                ],
+                hard_failures=hard,
+            )
         )
 
     perf_verdict = classify(all_metric_outcomes)
@@ -461,9 +574,10 @@ def _pct(value: float | None) -> str:
 
 def _report_to_dict(report: CheckpointReport) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "checkpoint": report.checkpoint,
         "major_boundary": report.major_boundary,
+        "source_revision": report.source_revision,
         "verdict": report.verdict,
         "regression_limit": REGRESSION_LIMIT,
         "points": [
@@ -498,9 +612,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--anchor-root", required=True)
     parser.add_argument("--previous-root", default=None)
     parser.add_argument(
+        "--previous-major-root",
+        default=None,
+        help="previous accepted major-boundary artifact root for UEval comparison",
+    )
+    parser.add_argument(
         "--major-boundary",
         action="store_true",
-        help="also require the UEval interleave latency families (checkpoints 3, 5, 7, 8)",
+        help="require default travel and the checkpoint's declared integration-boundary points",
+    )
+    parser.add_argument(
+        "--default-travel-dir",
+        default=None,
+        help="default-travel verification artifact required at a major boundary",
     )
     parser.add_argument("--out", default=None, help="directory to write acceptance.json/acceptance.md")
     args = parser.parse_args(argv)
@@ -511,6 +635,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.previous_root,
         checkpoint=args.checkpoint,
         major_boundary=args.major_boundary,
+        default_travel_dir=args.default_travel_dir,
+        previous_major_root=args.previous_major_root,
     )
     markdown = render_report(report)
     print(markdown)
