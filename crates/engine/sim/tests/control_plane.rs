@@ -653,11 +653,12 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
 #[test]
 fn flow_phase_plans_exactly_image_steps_then_commits() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
+    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, WorkVariant};
 
     struct Recording {
         inner: SimExecutor,
         ops: Arc<Mutex<Vec<WorkVariant>>>,
+        public_event_limits: Arc<Mutex<Vec<u64>>>,
     }
     impl Executor for Recording {
         fn caps(&self) -> EngineCaps {
@@ -674,6 +675,15 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
                 .lock()
                 .unwrap()
                 .extend(batch.operations.iter().map(|op| op.work.variant()));
+            self.public_event_limits
+                .lock()
+                .unwrap()
+                .extend(batch.controls.iter().filter_map(|control| match control {
+                    Control::Commit {
+                        public_event_limit, ..
+                    } => Some(*public_event_limit),
+                    _ => None,
+                }));
             self.inner.submit(batch)
         }
         fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
@@ -699,9 +709,11 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
 
     const STEPS: u16 = 3;
     let ops = Arc::new(Mutex::new(Vec::new()));
+    let public_event_limits = Arc::new(Mutex::new(Vec::new()));
     let exec = Recording {
         inner: SimExecutor::new(Box::new(SimEngine::new())),
         ops: ops.clone(),
+        public_event_limits: public_event_limits.clone(),
     };
     let sched = Scheduler::new(Box::new(exec), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -759,6 +771,14 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
     assert!(
         last_flow < commit,
         "the commit must follow the final flow quantum, got {ops:?}"
+    );
+    let public_event_limits = public_event_limits.lock().unwrap();
+    assert!(public_event_limits.len() > usize::from(STEPS));
+    assert!(
+        public_event_limits
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1]),
+        "semantic commits must carry a monotonic public-event bound: {public_event_limits:?}"
     );
 }
 

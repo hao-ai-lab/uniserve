@@ -377,6 +377,8 @@ pub struct ReqState {
     pub(crate) control_seq: u64,
     /// Number of public events accepted by the request's output journal.
     pub(crate) public_event_seq: u64,
+    /// Monotonic public-event bound carried by the latest semantic commit.
+    pub(crate) public_event_limit: u64,
     pub(crate) public_token_seq: usize,
     /// Latest frontend-decoder token prefix accepted for semantic commit.
     pub(crate) semantic_token_seq: usize,
@@ -1710,6 +1712,7 @@ impl Scheduler {
             committed_producer_op_id: 0,
             control_seq: 0,
             public_event_seq: 0,
+            public_event_limit: 0,
             public_token_seq: 0,
             semantic_token_seq: 0,
             output_journal: VecDeque::new(),
@@ -2161,11 +2164,13 @@ impl Scheduler {
     }
 
     fn public_limit_for(&self, id: RequestId, transition: &PlannedTransition) -> u64 {
-        let current = self
-            .running
-            .get(&id)
-            .map_or(0, |state| state.public_event_seq);
-        current.saturating_add(transition_output_bound(transition) as u64)
+        self.running.get(&id).map_or(0, |state| {
+            state.public_event_limit.max(
+                state
+                    .public_event_seq
+                    .saturating_add(transition_output_bound(transition) as u64),
+            )
+        })
     }
 
     fn queue_commit(
@@ -2190,6 +2195,7 @@ impl Scheduler {
             Point::Device { .. } => state.committed_semantic.clone(),
         };
         state.committed_producer_op_id = selected.producer_op_id.0;
+        state.public_event_limit = public_event_limit;
         self.pending_controls.push_back(Control::Commit {
             request_key: selected.request_key,
             control_seq: state.control_seq,
@@ -3888,6 +3894,7 @@ impl Scheduler {
         st.committed_semantic = String::new();
         st.committed_producer_op_id = 0;
         st.control_seq = 0;
+        st.public_event_limit = 0;
         st.token_cutoffs.clear();
         st.semantic_commit = None;
         st.cancel_cutoff = None;
