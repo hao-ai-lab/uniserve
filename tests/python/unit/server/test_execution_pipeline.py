@@ -86,7 +86,7 @@ def test_pipeline_launches_to_depth_before_finalizing_the_oldest_response() -> N
     ]
 
 
-def test_pipeline_dispatches_a_later_query_ready_response(
+def test_pipeline_dispatches_ready_responses_in_lineage_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actions: list[str] = []
@@ -94,8 +94,33 @@ def test_pipeline_dispatches_a_later_query_ready_response(
     loop = WorkerServeLoop(server, _Endpoint(()))  # type: ignore[arg-type]
     loop.inflight.extend(
         (
-            ({"call_id": 1}, {"call_id": 1, "ready": False}),
-            ({"call_id": 2}, {"call_id": 2, "ready": True}),
+            (
+                {
+                    "call_id": 1,
+                    "batch": {
+                        "operations": [{"request_key": {"session_id": 7}}],
+                    },
+                },
+                {"call_id": 1, "ready": False},
+            ),
+            (
+                {
+                    "call_id": 2,
+                    "batch": {
+                        "operations": [{"request_key": {"session_id": 7}}],
+                    },
+                },
+                {"call_id": 2, "ready": True},
+            ),
+            (
+                {
+                    "call_id": 3,
+                    "batch": {
+                        "operations": [{"request_key": {"session_id": 9}}],
+                    },
+                },
+                {"call_id": 3, "ready": True},
+            ),
         )
     )
     monkeypatch.setattr(
@@ -104,5 +129,7 @@ def test_pipeline_dispatches_a_later_query_ready_response(
     )
 
     assert loop._respond_ready()
-    assert actions == ["respond:2"]
-    assert [int(response["call_id"]) for _request, response in loop.inflight] == [1]
+    loop.inflight[0][1]["ready"] = True
+    assert loop._respond_ready()
+    assert loop._respond_ready()
+    assert actions == ["respond:3", "respond:1", "respond:2"]

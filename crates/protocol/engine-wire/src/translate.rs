@@ -12,10 +12,9 @@ use crate::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
     EngineCoreRequest, EngineCoreSamplingParams, StopReason,
 };
-use tokio::sync::mpsc;
 use uniserve_core::{GenerationRequest, RequestId, SamplingParams as USampling};
 use uniserve_engine_api::{
-    FinishReason, GenEvent, PositionLogprobs as SemanticPositionLogprobs,
+    EventRx, FinishReason, GenEvent, PositionLogprobs as SemanticPositionLogprobs,
     TokenLogprob as SemanticTokenLogprob,
 };
 
@@ -202,7 +201,7 @@ pub struct AdapterParams {
 /// Returns when the stream reaches a terminal event or the consumer drops.
 pub async fn run_event_adapter<Emit, EmitFuture>(
     params: AdapterParams,
-    mut events: mpsc::UnboundedReceiver<GenEvent>,
+    mut events: EventRx,
     mut emit: Emit,
 ) where
     Emit: FnMut(EngineCoreOutput) -> EmitFuture,
@@ -676,7 +675,7 @@ mod tests {
     /// GenEvents adapted onto the wire and back arrive intact.
     #[tokio::test]
     async fn generation_event_wire_roundtrip() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = uniserve_engine_api::event_channel();
         let events = vec![
             GenEvent::TextToken {
                 id: 11,

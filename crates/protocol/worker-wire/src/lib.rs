@@ -775,6 +775,18 @@ impl CompletionRecord {
                 "a non-error completion must not carry an error code"
             ),
         }
+        if self.status == OpStatus::Predicated {
+            anyhow::ensure!(
+                self.token_span.len == 0
+                    && self.committed_tokens.is_empty()
+                    && self.product_generations.is_empty(),
+                "a predicated completion must select its parent without semantic output"
+            );
+            anyhow::ensure!(
+                !self.finish_flags.eos && !self.finish_flags.length && !self.finish_flags.stop,
+                "a predicated completion must not select a terminal outcome"
+            );
+        }
         Ok(())
     }
 }

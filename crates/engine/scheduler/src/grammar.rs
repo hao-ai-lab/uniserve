@@ -16,6 +16,8 @@ use xgrammar::{
     GrammarMatcher as XGrammarMatcher, TokenizerInfo, allocate_token_bitmask, get_bitmask_shape,
 };
 
+const GRAMMAR_SESSION_CAPACITY: usize = 262_144;
+
 #[derive(Debug)]
 pub enum CompiledGrammar {
     Choice {
@@ -138,6 +140,7 @@ pub(crate) fn grammar_allowed_tokens(
 #[derive(Clone)]
 struct GrammarRuntime {
     tx: crossbeam_channel::Sender<XGrammarCommand>,
+    drop_tx: crossbeam_channel::Sender<u64>,
     next_session_id: Arc<AtomicU64>,
 }
 
@@ -207,7 +210,12 @@ impl XGrammarSession {
 
 impl Drop for XGrammarSession {
     fn drop(&mut self) {
-        let _ = self.runtime.tx.send(XGrammarCommand::Drop { id: self.id });
+        if self.runtime.drop_tx.try_send(self.id).is_err() {
+            tracing::error!(
+                grammar_session_id = self.id,
+                "grammar session reclamation capacity invariant failed"
+            );
+        }
     }
 }
 
@@ -228,9 +236,6 @@ enum XGrammarCommand {
         token: u32,
         response: crossbeam_channel::Sender<Result<(), String>>,
     },
-    Drop {
-        id: u64,
-    },
 }
 
 struct XGrammarState {
@@ -240,9 +245,31 @@ struct XGrammarState {
     cached_allowed: Option<Vec<u32>>,
 }
 
-fn run_grammar_runtime(rx: crossbeam_channel::Receiver<XGrammarCommand>) {
+fn run_grammar_runtime(
+    rx: crossbeam_channel::Receiver<XGrammarCommand>,
+    drop_rx: crossbeam_channel::Receiver<u64>,
+) {
     let mut sessions = HashMap::<u64, XGrammarState>::new();
-    while let Ok(command) = rx.recv() {
+    loop {
+        while let Ok(id) = drop_rx.try_recv() {
+            sessions.remove(&id);
+        }
+        let command = crossbeam_channel::select! {
+            recv(drop_rx) -> dropped => {
+                match dropped {
+                    Ok(id) => {
+                        sessions.remove(&id);
+                        continue;
+                    }
+                    Err(_) if rx.is_empty() => break,
+                    Err(_) => continue,
+                }
+            }
+            recv(rx) -> command => match command {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         match command {
             XGrammarCommand::Create {
                 id,
@@ -251,12 +278,15 @@ fn run_grammar_runtime(rx: crossbeam_channel::Receiver<XGrammarCommand>) {
                 stop_token_ids,
                 response,
             } => {
-                let result =
+                let result = if sessions.len() >= GRAMMAR_SESSION_CAPACITY {
+                    Err("grammar session capacity is exhausted".to_string())
+                } else {
                     create_xgrammar_state(token_bytes, compiled_grammar_json, stop_token_ids).map(
                         |state| {
                             sessions.insert(id, state);
                         },
-                    );
+                    )
+                };
                 let _ = response.send(result);
             }
             XGrammarCommand::NextMask { id, response } => {
@@ -298,9 +328,6 @@ fn run_grammar_runtime(rx: crossbeam_channel::Receiver<XGrammarCommand>) {
                         Ok(())
                     });
                 let _ = response.send(result);
-            }
-            XGrammarCommand::Drop { id } => {
-                sessions.remove(&id);
             }
         }
     }
@@ -412,7 +439,7 @@ fn xgrammar_allowed_tokens(matcher: &mut XGrammarMatcher, vocab_size: usize) -> 
 
 pub struct GrammarCompiler {
     tx: crossbeam_channel::Sender<(RequestId, GrammarSpec)>,
-    rx: crossbeam_channel::Receiver<(RequestId, Result<CompiledGrammar, String>)>,
+    rx: crossbeam_channel::Receiver<(RequestId, Result<GrammarMatcher, String>)>,
     runtime: GrammarRuntime,
     _thread: std::thread::JoinHandle<()>,
     _runtime_thread: std::thread::JoinHandle<()>,
@@ -420,30 +447,42 @@ pub struct GrammarCompiler {
 
 impl GrammarCompiler {
     pub fn new() -> Self {
-        let (tx, job_rx) = crossbeam_channel::unbounded::<(RequestId, GrammarSpec)>();
-        let (done_tx, rx) = crossbeam_channel::unbounded();
+        Self::with_waker(uniserve_core::CommandWaker::noop())
+    }
+
+    pub fn with_waker(waker: uniserve_core::CommandWaker) -> Self {
+        const TASK_CAPACITY: usize = 256;
+        let (runtime_tx, runtime_rx) = crossbeam_channel::bounded(TASK_CAPACITY);
+        let (drop_tx, drop_rx) = crossbeam_channel::bounded(GRAMMAR_SESSION_CAPACITY);
+        let runtime = GrammarRuntime {
+            tx: runtime_tx,
+            drop_tx,
+            next_session_id: Arc::new(AtomicU64::new(1)),
+        };
+        let runtime_thread = std::thread::Builder::new()
+            .name("grammar-runtime".into())
+            .spawn(move || run_grammar_runtime(runtime_rx, drop_rx))
+            .unwrap_or_else(|error| panic!("failed to spawn grammar runtime: {error}"));
+        let (tx, job_rx) = crossbeam_channel::bounded::<(RequestId, GrammarSpec)>(TASK_CAPACITY);
+        let (done_tx, rx) = crossbeam_channel::bounded(TASK_CAPACITY);
+        let compiler_runtime = runtime.clone();
         let thread = std::thread::Builder::new()
             .name("grammar-compiler".into())
             .spawn(move || {
                 while let Ok((id, spec)) = job_rx.recv() {
-                    if done_tx.send((id, CompiledGrammar::compile(spec))).is_err() {
+                    let result = CompiledGrammar::compile(spec)
+                        .and_then(|grammar| GrammarMatcher::new(grammar, &compiler_runtime));
+                    if done_tx.send((id, result)).is_err() {
                         break;
                     }
+                    waker.wake();
                 }
             })
             .unwrap_or_else(|error| panic!("failed to spawn grammar compiler: {error}"));
-        let (runtime_tx, runtime_rx) = crossbeam_channel::unbounded();
-        let runtime_thread = std::thread::Builder::new()
-            .name("grammar-runtime".into())
-            .spawn(move || run_grammar_runtime(runtime_rx))
-            .unwrap_or_else(|error| panic!("failed to spawn grammar runtime: {error}"));
         Self {
             tx,
             rx,
-            runtime: GrammarRuntime {
-                tx: runtime_tx,
-                next_session_id: Arc::new(AtomicU64::new(1)),
-            },
+            runtime,
             _thread: thread,
             _runtime_thread: runtime_thread,
         }
@@ -453,16 +492,17 @@ impl GrammarCompiler {
         GrammarMatcher::new(grammar, &self.runtime)
     }
 
-    pub fn submit(&self, id: RequestId, spec: GrammarSpec) {
-        if self.tx.send((id, spec)).is_err() {
-            tracing::error!(
-                ?id,
-                "grammar compiler thread is gone; request will never be admitted from the structured-output gate"
-            );
-        }
+    pub fn submit(&self, id: RequestId, spec: GrammarSpec) -> Result<(), String> {
+        self.tx.try_send((id, spec)).map_err(|error| {
+            if error.is_full() {
+                "structured-output CPU task capacity is exhausted".to_string()
+            } else {
+                "grammar compiler thread is unavailable".to_string()
+            }
+        })
     }
 
-    pub fn drain_ready(&self) -> Vec<(RequestId, Result<CompiledGrammar, String>)> {
+    pub fn drain_ready(&self) -> Vec<(RequestId, Result<GrammarMatcher, String>)> {
         let mut out = Vec::new();
         while let Ok(item) = self.rx.try_recv() {
             out.push(item);
@@ -518,12 +558,14 @@ mod tests {
     #[test]
     fn compiler_gate_roundtrip() {
         let compiler = GrammarCompiler::new();
-        compiler.submit(
-            RequestId(7),
-            GrammarSpec::Choice {
-                token_sequences: vec![vec![1, 2]],
-            },
-        );
+        compiler
+            .submit(
+                RequestId(7),
+                GrammarSpec::Choice {
+                    token_sequences: vec![vec![1, 2]],
+                },
+            )
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let ready = compiler.drain_ready();

@@ -76,6 +76,9 @@ pub enum EngineCoreRequestType {
     StartDpWave = 2,
     Utility = 3,
     Cancel = 4,
+    CancelAt = 5,
+    AcknowledgeAt = 6,
+    StopAt = 7,
 }
 
 impl EngineCoreRequestType {
@@ -99,6 +102,9 @@ impl EngineCoreRequestType {
             Self::StartDpWave,
             Self::Utility,
             Self::Cancel,
+            Self::CancelAt,
+            Self::AcknowledgeAt,
+            Self::StopAt,
         ]
         .into_iter()
         .find(|variant| variant.as_byte() == *value)
@@ -129,6 +135,13 @@ pub enum EngineCoreControlRequest {
     Abort(Vec<String>),
     /// Cancel the listed request IDs because their owner no longer needs them.
     Cancel(Vec<String>),
+    /// Cancel each request at the exact public text-token prefix consumed by
+    /// its frontend output journal.
+    CancelAt(Vec<EngineCoreCancelAt>),
+    /// Accept each exact frontend-decoded token prefix for semantic commit.
+    AcknowledgeAt(Vec<EngineCoreAcknowledgeAt>),
+    /// Complete each request at the exact frontend-matched stop prefix.
+    StopAt(Vec<EngineCoreStopAt>),
     /// Invoke an engine utility method; payload is the
     /// [`EngineCoreUtilityRequest`](crate::utility::EngineCoreUtilityRequest)
     /// tuple.
@@ -144,6 +157,9 @@ impl EngineCoreControlRequest {
             Self::Add(_) => EngineCoreRequestType::Add,
             Self::Abort(_) => EngineCoreRequestType::Abort,
             Self::Cancel(_) => EngineCoreRequestType::Cancel,
+            Self::CancelAt(_) => EngineCoreRequestType::CancelAt,
+            Self::AcknowledgeAt(_) => EngineCoreRequestType::AcknowledgeAt,
+            Self::StopAt(_) => EngineCoreRequestType::StopAt,
             Self::Utility(_) => EngineCoreRequestType::Utility,
             Self::StartDpWave => EngineCoreRequestType::StartDpWave,
         }
@@ -157,6 +173,9 @@ impl EngineCoreControlRequest {
             Self::Add(request) => encode_msgpack(request.as_ref())?,
             Self::Abort(request_ids) => encode_msgpack(request_ids)?,
             Self::Cancel(request_ids) => encode_msgpack(request_ids)?,
+            Self::CancelAt(requests) => encode_msgpack(requests)?,
+            Self::AcknowledgeAt(requests) => encode_msgpack(requests)?,
+            Self::StopAt(requests) => encode_msgpack(requests)?,
             Self::Utility(request) => encode_msgpack(request.as_ref())?,
             Self::StartDpWave => Vec::new(),
         };
@@ -176,6 +195,15 @@ impl EngineCoreControlRequest {
             EngineCoreRequestType::Cancel => {
                 decode_msgpack::<Vec<String>>(payload).map(Self::Cancel)
             }
+            EngineCoreRequestType::CancelAt => {
+                decode_msgpack::<Vec<EngineCoreCancelAt>>(payload).map(Self::CancelAt)
+            }
+            EngineCoreRequestType::AcknowledgeAt => {
+                decode_msgpack::<Vec<EngineCoreAcknowledgeAt>>(payload).map(Self::AcknowledgeAt)
+            }
+            EngineCoreRequestType::StopAt => {
+                decode_msgpack::<Vec<EngineCoreStopAt>>(payload).map(Self::StopAt)
+            }
             EngineCoreRequestType::Utility => {
                 decode_msgpack::<crate::utility::EngineCoreUtilityRequest>(payload)
                     .map(|r| Self::Utility(Box::new(r)))
@@ -183,6 +211,24 @@ impl EngineCoreControlRequest {
             EngineCoreRequestType::StartDpWave => Ok(Self::StartDpWave),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct EngineCoreCancelAt {
+    pub request_id: String,
+    pub output_token_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct EngineCoreAcknowledgeAt {
+    pub request_id: String,
+    pub output_token_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct EngineCoreStopAt {
+    pub request_id: String,
+    pub output_token_count: u64,
 }
 
 /// Reason a request finished: stop, length, abort, error, or repetition.
@@ -671,6 +717,12 @@ mod tests {
         );
         assert_eq!(EngineCoreRequestType::Utility.to_frame().as_ref(), b"\x03");
         assert_eq!(EngineCoreRequestType::Cancel.to_frame().as_ref(), b"\x04");
+        assert_eq!(EngineCoreRequestType::CancelAt.to_frame().as_ref(), b"\x05");
+        assert_eq!(
+            EngineCoreRequestType::AcknowledgeAt.to_frame().as_ref(),
+            b"\x06"
+        );
+        assert_eq!(EngineCoreRequestType::StopAt.to_frame().as_ref(), b"\x07");
 
         assert_eq!(
             EngineCoreRequestType::from_frame(b"\x00"),
@@ -691,6 +743,18 @@ mod tests {
         assert_eq!(
             EngineCoreRequestType::from_frame(b"\x04"),
             Some(EngineCoreRequestType::Cancel)
+        );
+        assert_eq!(
+            EngineCoreRequestType::from_frame(b"\x05"),
+            Some(EngineCoreRequestType::CancelAt)
+        );
+        assert_eq!(
+            EngineCoreRequestType::from_frame(b"\x06"),
+            Some(EngineCoreRequestType::AcknowledgeAt)
+        );
+        assert_eq!(
+            EngineCoreRequestType::from_frame(b"\x07"),
+            Some(EngineCoreRequestType::StopAt)
         );
         assert_eq!(EngineCoreRequestType::from_frame(b"\x00\x00"), None);
     }
@@ -753,6 +817,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoded, EngineCoreControlRequest::Cancel(request_ids));
+    }
+
+    #[test]
+    fn control_request_cancel_at_round_trips_exact_token_prefixes() {
+        let requests = vec![
+            EngineCoreCancelAt {
+                request_id: "a".to_string(),
+                output_token_count: 3,
+            },
+            EngineCoreCancelAt {
+                request_id: "b".to_string(),
+                output_token_count: 11,
+            },
+        ];
+        let control = EngineCoreControlRequest::CancelAt(requests.clone());
+        let (type_frame, payload) = control.encode_frames().unwrap();
+        assert_eq!(type_frame, EngineCoreRequestType::CancelAt.to_frame());
+        assert_eq!(payload, encode_msgpack(&requests).unwrap());
+        let decoded = EngineCoreControlRequest::decode_frames(&type_frame, &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, EngineCoreControlRequest::CancelAt(requests));
+    }
+
+    #[test]
+    fn control_request_acknowledge_at_round_trips_exact_token_prefixes() {
+        let requests = vec![
+            EngineCoreAcknowledgeAt {
+                request_id: "a".to_string(),
+                output_token_count: 3,
+            },
+            EngineCoreAcknowledgeAt {
+                request_id: "b".to_string(),
+                output_token_count: 11,
+            },
+        ];
+        let control = EngineCoreControlRequest::AcknowledgeAt(requests.clone());
+        let (type_frame, payload) = control.encode_frames().unwrap();
+        assert_eq!(type_frame, EngineCoreRequestType::AcknowledgeAt.to_frame());
+        assert_eq!(payload, encode_msgpack(&requests).unwrap());
+        let decoded = EngineCoreControlRequest::decode_frames(&type_frame, &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, EngineCoreControlRequest::AcknowledgeAt(requests));
+    }
+
+    #[test]
+    fn control_request_stop_at_round_trips_exact_token_prefixes() {
+        let requests = vec![EngineCoreStopAt {
+            request_id: "a".to_string(),
+            output_token_count: 3,
+        }];
+        let control = EngineCoreControlRequest::StopAt(requests.clone());
+        let (type_frame, payload) = control.encode_frames().unwrap();
+        assert_eq!(type_frame, EngineCoreRequestType::StopAt.to_frame());
+        assert_eq!(payload, encode_msgpack(&requests).unwrap());
+        let decoded = EngineCoreControlRequest::decode_frames(&type_frame, &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, EngineCoreControlRequest::StopAt(requests));
     }
 
     /// `Utility` frames are byte-identical to `(type_frame, msgpack(EngineCoreUtilityRequest))`.

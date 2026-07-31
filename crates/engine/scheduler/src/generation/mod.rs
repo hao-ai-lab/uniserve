@@ -187,10 +187,10 @@ fn logprob_blob_bound(
     Ok(Some(bytes))
 }
 
-/// The declared outputs of a token operation: a committed-token product, a
-/// finish predicate when this operation can terminate its lineage, an optional
-/// bounded logprob product, and an optional KV product when the operation
-/// publishes generation conditioning.
+/// The declared outputs of a token operation: a selected-token product, a
+/// finish predicate when this operation can terminate its lineage, optional
+/// bounded logprobs and KV conditioning, and a continuation predicate for a
+/// registered device descendant.
 fn token_outputs(
     logprob_bound: Option<u64>,
     publishes_conditioning: bool,
@@ -227,6 +227,12 @@ fn token_outputs(
             DType::BF16,
         ));
     }
+    outputs.push(output_product(
+        4,
+        ProductKind::Completion,
+        StorageClass::DeviceTensor,
+        DType::U8,
+    ));
     Ok(outputs)
 }
 
@@ -402,7 +408,7 @@ pub enum GenerationPhase {
 /// Scheduler-owned cursor for one running request. Each mutable concern has a
 /// single typed owner; transition application is the only operation that
 /// commits worker-derived lifecycle progress.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerationCursor {
     pub(crate) lifecycle: LifecycleCursor,
     pub(crate) ingest: ContextCursor,
@@ -491,6 +497,9 @@ impl GenerationCursor {
         }
         if !self.applied_op_ids.insert(op_id) {
             return Err(CursorApplyError::DuplicateOperation { op_id });
+        }
+        if record.status == OpStatus::Predicated {
+            return Ok(());
         }
         match transition.delta {
             TransitionDelta::IngestText {
@@ -1870,6 +1879,7 @@ impl PlannedTransition {
         &self,
         record: &CompletionRecord,
         products: &[ProductPayload],
+        predicated_parent_point: Option<u32>,
     ) -> Result<(), TransitionValidationError> {
         let Some(operation) = self.operation.as_ref() else {
             return Err(TransitionValidationError::OpIdMismatch {
@@ -1889,7 +1899,7 @@ impl PlannedTransition {
                 actual: record.op_id.0,
             });
         }
-        let parent_point = match operation.parent.point {
+        let declared_parent_point = match operation.parent.point {
             Point::Fixed {
                 point_index: parent_point,
                 ..
@@ -1907,11 +1917,27 @@ impl PlannedTransition {
                 device_parent_point
             }
         };
-        let expected_point = parent_point.saturating_add(u32::from(operation.advances_state));
+        if record.status == OpStatus::Predicated {
+            let expected_point = predicated_parent_point.unwrap_or(declared_parent_point);
+            if operation.predicate.is_none()
+                || record.selected_point != expected_point
+                || record.token_span.len != 0
+                || !record.committed_tokens.is_empty()
+                || !record.product_generations.is_empty()
+                || products
+                    .iter()
+                    .any(|product| product.product.producer_op_id == operation.op_id)
+            {
+                return Err(TransitionValidationError::OperationFailed);
+            }
+            return Ok(());
+        }
+        let expected_point =
+            declared_parent_point.saturating_add(u32::from(operation.advances_state));
         if record.selected_point != expected_point {
             return Err(TransitionValidationError::VersionMismatch {
-                expected_base: u64::from(parent_point),
-                actual_base: u64::from(parent_point),
+                expected_base: u64::from(declared_parent_point),
+                actual_base: u64::from(declared_parent_point),
                 actual_result: u64::from(record.selected_point),
             });
         }
@@ -2603,9 +2629,57 @@ mod tests {
         let record = completion(request_key, 19, 1);
 
         assert!(matches!(
-            transition.validate_result(&record, &[]),
+            transition.validate_result(&record, &[], None),
             Err(TransitionValidationError::SampledTokenOutsideAllowedSet { token_id: 13 })
         ));
+    }
+
+    #[test]
+    fn predicated_completion_selects_its_actual_parent_and_preserves_cursor_state() {
+        let mut transition = prefill_transition();
+        let request_key = RequestKey::new(1, RequestId(15), 3);
+        let parent = VersionRef {
+            request_key,
+            producer_op_id: OpId(1),
+            point: Point::Fixed {
+                point_index: 0,
+                semantic_digest: digest(),
+            },
+        };
+        let mut next_generation = 1;
+        transition
+            .assign_operation(request_key, OpId(20), parent, &mut next_generation)
+            .expect("assign predicated operation");
+        let mut predicate = transition
+            .operation
+            .as_ref()
+            .expect("registered operation")
+            .outputs
+            .iter()
+            .find(|output| output.kind == ProductKind::Completion)
+            .expect("token operation completion predicate")
+            .clone();
+        predicate.producer_op_id = OpId(19);
+        transition
+            .operation
+            .as_mut()
+            .expect("registered operation")
+            .predicate = Some(predicate);
+        let mut record = completion(request_key, 20, 0);
+        record.status = OpStatus::Predicated;
+        record.token_span.len = 0;
+        record.committed_tokens.clear();
+        record.product_generations.clear();
+        record.finish_flags = FinishFlags::default();
+
+        assert_eq!(transition.validate_result(&record, &[], Some(0)), Ok(()));
+        let mut cursor = GenerationCursor::new(GenerationPhase::Prefill, 8, false);
+        let mut expected = cursor.clone();
+        expected.applied_op_ids.insert(20);
+        cursor
+            .apply_transition(&transition, &record, &[])
+            .expect("apply predicated completion");
+        assert_eq!(cursor, expected);
     }
 
     #[test]
@@ -2738,11 +2812,11 @@ mod tests {
         assert_eq!(generations.len(), generation_count);
 
         let record = completion(request_key, 17, 6);
-        assert_eq!(transition.validate_result(&record, &[]), Ok(()));
+        assert_eq!(transition.validate_result(&record, &[], None), Ok(()));
 
         let stale = completion(request_key, 17, 7);
         assert!(matches!(
-            transition.validate_result(&stale, &[]),
+            transition.validate_result(&stale, &[], None),
             Err(TransitionValidationError::VersionMismatch { .. })
         ));
     }

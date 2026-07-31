@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.depth_one import (
+    commit_resolved,
     root_parent,
     token_operation,
     und_admission,
@@ -102,7 +103,6 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         parent=root_parent(admission),
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
-        publishes_predicate=True,
     )
 
     observe = {"enabled": False}
@@ -181,7 +181,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
         rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
-        publishes_predicate=True,
     )
     observe = {"enabled": False}
     ready = CompletionLease.ready
@@ -249,19 +248,22 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
     torch.cuda.synchronize()
     serial_parent_report = finalize_completion_report(serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
+    commit = commit_resolved(serial_worker.sessions.get(41))
     serial_successor, serial_successor_input = token_operation(
         serial.request_key,
         op_id=12,
-        parent=serial_worker.sessions.get(41).committed_version(),
+        parent=commit.selected,
         mode=TokenMode.DECODE,
         tokens=(serial_first,),
         rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
+        control_seq=commit.control_seq,
     )
     serial_successor_report = serial_worker.execute(
         Batch(
             step_id=12,
             admissions=(),
             operations=(serial_successor,),
+            controls=(commit,),
             input_products=(serial_successor_input,),
         )
     )

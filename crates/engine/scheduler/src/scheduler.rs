@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::cpu_continuation::{CpuContinuationPool, CpuMasks, CpuTask, CpuTaskKey};
 use crate::generation::{
     CursorApplyError, CursorProjection, EncoderCachePin, GenerationCursor,
     GenerationPhase as Phase, GenerationPlanner, PlannedTransition, SchedulerContext,
@@ -48,6 +49,8 @@ pub const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
 /// Default admission backpressure bound: maximum waiting requests buffered
 /// before new submits are rejected at enqueue.
 pub const DEFAULT_MAX_NUM_WAITING: usize = 4096;
+pub const MAX_NUM_WAITING: usize = 65_536;
+pub const MAX_NUM_SEQS: usize = 65_536;
 
 /// General loop counters that do not belong to a more specific group.
 #[derive(Default)]
@@ -180,12 +183,13 @@ use uniserve_core::{HashAlgo, RequestId};
 use uniserve_engine_api::{Command, EventTx, FinishReason, GenEvent, GenerationSubmission};
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
-    Admission, Batch, CompletionRecord, CompletionReport, Control, EngineCaps, GenAdmission,
-    KvAllocation, OpId, Point, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass,
-    SamplingState, UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
+    Admission, Batch, CloseReason, CompletionRecord, CompletionReport, Control, Disposition,
+    EngineCaps, GenAdmission, KvAllocation, OpId, OpStatus, Point, ProductKind, ProductPayload,
+    ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
+    WorkerForwardStats,
 };
 
-use crate::grammar::{GrammarCompiler, GrammarMatcher, grammar_allowed_tokens};
+use crate::grammar::{GrammarCompiler, GrammarMatcher};
 use crate::image_artifact::validate_png_artifact;
 use crate::queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 use serde_json::json;
@@ -333,8 +337,8 @@ pub struct SchedulerConfig {
     /// disables it (the budget binds).
     pub long_prefill_threshold: usize,
     /// Admission backpressure — maximum waiting requests (pending +
-    /// grammar-gated) buffered before new submits are rejected at enqueue.
-    /// `usize::MAX` disables the cap (unbounded).
+    /// grammar-gated + terminal-output-retained) buffered before new submits
+    /// are rejected at enqueue.
     pub max_num_waiting: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as a mixed extend+decode forward. `0` keeps prefill and decode in
@@ -358,15 +362,31 @@ impl Default for SchedulerConfig {
 
 pub struct ReqState {
     pub req: GenerationRequest,
-    /// Scheduler-owned lifecycle generation and committed worker-session version.
+    /// Scheduler-owned lifecycle generation and latest host-resolved worker version.
     pub(crate) epoch: u64,
     pub(crate) version: u64,
     pub(crate) admission_digest: Option<String>,
-    /// Committed lineage for building an operation's parent version: the semantic
-    /// digest of the last committed point and the operation id that produced it
-    /// (the reserved admission-root id until the first state-advancing op).
+    /// Latest host-resolved lineage used to build the next exact fixed parent.
+    pub(crate) resolved_semantic: String,
+    pub(crate) resolved_producer_op_id: u64,
+    /// Latest semantically committed lineage.
+    pub(crate) committed_version: u64,
     pub(crate) committed_semantic: String,
     pub(crate) committed_producer_op_id: u64,
+    /// Last ordered semantic control emitted for this request.
+    pub(crate) control_seq: u64,
+    /// Number of public events accepted by the request's output journal.
+    pub(crate) public_event_seq: u64,
+    pub(crate) public_token_seq: usize,
+    /// Latest frontend-decoder token prefix accepted for semantic commit.
+    pub(crate) semantic_token_seq: usize,
+    /// Ordered public events waiting for immediate-consumer channel capacity.
+    pub(crate) output_journal: VecDeque<GenEvent>,
+    /// Fixed semantic cutoffs indexed by public text-token count.
+    pub(crate) token_cutoffs: BTreeMap<usize, VersionRef>,
+    /// State advance waiting for the frontend decoder's exact-prefix decision.
+    pub(crate) semantic_commit: Option<PendingSemanticCommit>,
+    pub(crate) cancel_cutoff: Option<VersionRef>,
     /// Exact worker-local selected-point product for the latest resolved state,
     /// together with the work variant that owns its physical pool. The scheduler
     /// retains this logical ownership until it submits a reachable consumer.
@@ -378,10 +398,25 @@ pub struct ReqState {
     pub(crate) cancelled: bool,
     /// The cancel was a server-side abort, not a client cancel.
     pub(crate) aborted: bool,
+    /// The frontend decoder selected an exact terminal stop prefix.
+    pub(crate) stop_matched: bool,
     /// Structured-output matcher (compiled grammar and progress).
     pub(crate) grammar: Option<GrammarMatcher>,
+    /// At most one CPU mask task may own this lineage's matcher state.
+    pub(crate) cpu_pending: Option<CpuTaskKey>,
+    pub(crate) cpu_masks: Option<CpuMasks>,
+    pub(crate) cpu_tokens_to_advance: Vec<u32>,
+    pub(crate) cpu_generation: u64,
     /// This request's lifecycle trace.
     pub(crate) trace: crate::trace::RequestTrace,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingSemanticCommit {
+    token_count: Option<usize>,
+    expected_parent: VersionRef,
+    selected: VersionRef,
+    public_event_limit: u64,
 }
 
 #[derive(Clone)]
@@ -461,12 +496,16 @@ pub struct Scheduler {
     /// preempt request state and invalidate cache ownership atomically.
     pending_prefix_reset: Option<PendingPrefixCacheReset>,
     /// Pluggable host-side logits-processor pipeline.
-    logits_pipeline: Vec<Box<dyn crate::logits::LogitsProcessor>>,
+    logits_pipeline: Vec<Arc<dyn crate::logits::LogitsProcessor>>,
+    custom_logits_processors: usize,
     /// Encoder-output cache (hashed, LRU, budgeted).
     enc_cache: EncoderCacheManager,
     /// Encoder-cache entries reserved by admitted image requests.
     reserved_encoder_entries: usize,
     running: HashMap<RequestId, ReqState>,
+    /// Terminal requests retain only their bounded public journal; execution,
+    /// KV, product, and scheduler-sequence ownership has already been released.
+    completed_outputs: HashMap<RequestId, RetiredOutput>,
     order: Vec<RequestId>, // stable iteration order
     pending: Box<dyn RequestQueue>,
     /// The structured-output gate: requests whose grammar is still compiling
@@ -474,6 +513,7 @@ pub struct Scheduler {
     /// only then queues these.
     skipped_waiting: HashMap<RequestId, ReqState>,
     grammar_compiler: GrammarCompiler,
+    cpu_continuations: CpuContinuationPool,
     reserved_blocks: usize,
     step_id: u64,
     /// Ordered submitted-but-unresolved operations for each request. The front
@@ -508,6 +548,10 @@ pub struct Scheduler {
     planner: GenerationPlanner,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
+    /// Ordered semantic controls waiting to cross the worker boundary.
+    pending_controls: VecDeque<Control>,
+    /// Controls attached to an in-flight batch, retained until its ack report.
+    control_batches: HashMap<u64, Vec<Control>>,
     /// The scheduler-authority identity stamped into every request key.
     authority_id: u64,
     /// Monotonic op ids and archived lifecycle traces.
@@ -583,6 +627,14 @@ fn finish_reason_str(r: &FinishReason) -> &'static str {
         FinishReason::Aborted => "aborted",
         FinishReason::Repetition => "repetition",
         FinishReason::Error => "error",
+    }
+}
+
+fn close_reason(reason: &FinishReason) -> CloseReason {
+    match reason {
+        FinishReason::Cancelled | FinishReason::Aborted => CloseReason::Cancelled,
+        FinishReason::Error => CloseReason::Error,
+        _ => CloseReason::Completed,
     }
 }
 
@@ -721,12 +773,22 @@ struct InflightOp {
     spec_tokens: Vec<u32>,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
+    /// Worst-case public events reserved before this operation was registered.
+    output_credit_bound: usize,
 }
 
 struct PendingFinish {
     reason: FinishReason,
     stop_reason: Option<String>,
 }
+
+struct RetiredOutput {
+    event_tx: EventTx,
+    journal: VecDeque<GenEvent>,
+}
+
+const OUTPUT_JOURNAL_CAPACITY: usize = uniserve_engine_api::EVENT_BUFFER_CAPACITY;
+const OUTPUT_TERMINAL_RESERVE: usize = 2;
 
 impl Scheduler {
     pub fn new(executor: Box<dyn Executor>, ctrl: ControlTokens, max_batch: usize) -> Self {
@@ -763,7 +825,10 @@ impl Scheduler {
         mut config: SchedulerConfig,
     ) -> Self {
         let caps = executor.caps();
+        let cpu_waker = executor.command_waker();
         let max_batch_ops = caps.execution_constraints.max_batch_operations as usize;
+        config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
+        config.max_num_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
@@ -845,12 +910,15 @@ impl Scheduler {
             sleeping: false,
             pending_prefix_reset: None,
             logits_pipeline: crate::logits::default_pipeline(),
+            custom_logits_processors: 0,
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
             running: HashMap::new(),
+            completed_outputs: HashMap::new(),
             order: Vec::new(),
             skipped_waiting: HashMap::new(),
-            grammar_compiler: GrammarCompiler::new(),
+            grammar_compiler: GrammarCompiler::with_waker(cpu_waker.clone()),
+            cpu_continuations: CpuContinuationPool::new(cpu_waker),
             reserved_blocks: 0,
             step_id: 0,
             inflight_ops: HashMap::new(),
@@ -865,6 +933,8 @@ impl Scheduler {
             latency: crate::policy::LatencyHistory::new(),
             planner: GenerationPlanner::new(),
             batch_started: HashMap::new(),
+            pending_controls: VecDeque::new(),
+            control_batches: HashMap::new(),
             authority_id: 1,
             next_op_id: 1,
             next_product_generation: 1,
@@ -890,7 +960,17 @@ impl Scheduler {
     }
     /// Register an extra logits processor — no other scheduler code changes.
     pub fn with_logits_processor(mut self, p: Box<dyn crate::logits::LogitsProcessor>) -> Self {
-        self.logits_pipeline.push(p);
+        let declaration = p.declaration();
+        assert!(
+            declaration.snapshotable
+                && declaration.deterministic
+                && declaration.max_output_tokens > 0
+                && declaration.max_output_tokens < usize::MAX
+                && declaration.max_outstanding_tasks == 1,
+            "custom logits processors must declare deterministic snapshot state, bounded output, and one outstanding task per request"
+        );
+        self.logits_pipeline.push(Arc::from(p));
+        self.custom_logits_processors = self.custom_logits_processors.saturating_add(1);
         self
     }
     /// Configure the per-step token budget.
@@ -901,12 +981,11 @@ impl Scheduler {
         self.config.long_prefill_threshold = n.max(1);
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
-        self.config.max_num_seqs = n.max(1);
+        self.config.max_num_seqs = n.clamp(1, MAX_NUM_SEQS);
     }
-    /// Cap the waiting-queue depth (pending + grammar-gated) for admission
-    /// backpressure. `usize::MAX` disables the cap.
+    /// Cap waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
-        self.config.max_num_waiting = n.max(1);
+        self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
     }
     pub fn caps(&self) -> &EngineCaps {
         &self.caps
@@ -1012,13 +1091,9 @@ impl Scheduler {
     /// spin the schedule-ahead loop. Returns `true` if the engine died
     /// (executor/worker failure) rather than shutting down gracefully.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
-        // Event-driven executors (the iceoryx2 worker) park on a single wait
-        // over {result, command, worker-death} instead of the fixed-interval
-        // poll; the command ingress fires the executor's command waker, so a
-        // freshly enqueued command interrupts the park (no missed-command
-        // window). Polling executors (sim/local, which wake natively on their
-        // result channel) keep the crossbeam select below
-        // Event-driven executors park on {result, command, death}.
+        // Event-driven executors park on {result, command, worker-death}; the
+        // command ingress wakes that wait. Polling executors use the crossbeam
+        // selection path below.
         let event_driven = self.executor.event_driven();
         loop {
             // drain pending commands (non-blocking)
@@ -1093,7 +1168,7 @@ impl Scheduler {
                 // liveness probe so a worker that dies with nothing in flight
                 // is detected promptly. When gated on grammar compilation we use
                 // the shorter slice so the compiler is polled responsively.
-                let wait = if self.skipped_waiting.is_empty() {
+                let wait = if self.skipped_waiting.is_empty() && !self.cpu_tasks_pending() {
                     IDLE_LIVENESS_POLL
                 } else {
                     std::time::Duration::from_millis(1)
@@ -1130,17 +1205,11 @@ impl Scheduler {
         false
     }
 
-    /// Event-driven park: block on the
-    /// executor's single wait over {result, command, worker-death} until any
-    /// source fires or a state-dependent safety-net timeout elapses, then probe
-    /// liveness so an idle worker death is caught even when no result surfaces
-    /// it. No fixed-interval poll: the timeout is purely a backstop for a missed
-    /// notification (which would only cost that much latency, never correctness)
-    /// and, while grammar compilation is pending, a short slice so the compiler
-    /// is drained promptly (that completion is not an event source).
+    /// Event-driven park over result, command, worker-death, CPU-continuation,
+    /// grammar, and output-capacity wakes. The timeout is a liveness backstop.
     fn park_event_driven(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        let timeout = if !self.skipped_waiting.is_empty() {
+        let timeout = if !self.skipped_waiting.is_empty() || self.cpu_tasks_pending() {
             Duration::from_millis(1)
         } else if self.executor.in_flight() > 0 {
             SCHEDULER_WAIT_SLICE
@@ -1233,8 +1302,19 @@ impl Scheduler {
     fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Submit(submission) => self.enqueue(*submission),
-            Command::Cancel(id) => self.mark_cancelled(id, false),
-            Command::Abort(id) => self.mark_cancelled(id, true),
+            Command::Cancel {
+                request_id,
+                output_token_count,
+            } => self.mark_cancelled(request_id, false, output_token_count),
+            Command::Acknowledge {
+                request_id,
+                output_token_count,
+            } => self.acknowledge_semantic(request_id, output_token_count),
+            Command::StopAt {
+                request_id,
+                output_token_count,
+            } => self.mark_stopped(request_id, output_token_count),
+            Command::Abort(id) => self.mark_cancelled(id, true, None),
             Command::ResetPrefixCache {
                 reset_running_requests,
                 reply,
@@ -1266,10 +1346,18 @@ impl Scheduler {
         event_rx
     }
 
-    fn mark_cancelled(&mut self, id: RequestId, abort: bool) {
+    fn mark_cancelled(&mut self, id: RequestId, abort: bool, output_token_count: Option<usize>) {
         if let Some(st) = self.running.get_mut(&id) {
+            if let Some(output_token_count) = output_token_count {
+                let Some(cutoff) = st.token_cutoffs.get(&output_token_count).cloned() else {
+                    self.finish_after_inflight(id, FinishReason::Error, None);
+                    return;
+                };
+                st.cancel_cutoff = Some(cutoff);
+            }
             st.cancelled = true;
             st.aborted = abort;
+            st.stop_matched = false;
         }
         // a request still gated on grammar compilation can be cancelled too
         if let Some(st) = self.skipped_waiting.remove(&id) {
@@ -1322,6 +1410,72 @@ impl Scheduler {
                 kv_transfer_params: None,
             });
         }
+    }
+
+    fn acknowledge_semantic(&mut self, id: RequestId, output_token_count: usize) {
+        let Some(current) = self.running.get(&id).map(|state| state.semantic_token_seq) else {
+            return;
+        };
+        if current == output_token_count {
+            return;
+        }
+        if output_token_count < current {
+            self.finish_after_inflight(id, FinishReason::Error, None);
+            return;
+        }
+
+        let pending = self.running.get_mut(&id).and_then(|state| {
+            if state
+                .semantic_commit
+                .as_ref()
+                .is_some_and(|pending| pending.token_count == Some(output_token_count))
+            {
+                state.semantic_commit.take()
+            } else {
+                None
+            }
+        });
+        let requires_decoder_commit = self.running.get(&id).is_some_and(|state| {
+            !state.req.stop_strings.is_empty() && state.semantic_commit.is_some()
+        });
+        if requires_decoder_commit {
+            self.finish_after_inflight(id, FinishReason::Error, None);
+            return;
+        }
+
+        if let Some(state) = self.running.get_mut(&id) {
+            state.semantic_token_seq = output_token_count;
+            if let Some((&acknowledged_cutoff, _)) =
+                state.token_cutoffs.range(..=output_token_count).next_back()
+            {
+                state
+                    .token_cutoffs
+                    .retain(|token_count, _| *token_count >= acknowledged_cutoff);
+            }
+        }
+        if let Some(pending) = pending {
+            self.queue_commit(
+                id,
+                pending.expected_parent,
+                pending.selected,
+                pending.public_event_limit,
+            );
+            self.finish_pending_if_idle(id);
+        }
+    }
+
+    fn mark_stopped(&mut self, id: RequestId, output_token_count: usize) {
+        let Some(state) = self.running.get_mut(&id) else {
+            return;
+        };
+        let Some(cutoff) = state.token_cutoffs.get(&output_token_count).cloned() else {
+            self.finish_after_inflight(id, FinishReason::Error, None);
+            return;
+        };
+        state.cancel_cutoff = Some(cutoff);
+        state.cancelled = true;
+        state.aborted = false;
+        state.stop_matched = true;
     }
 
     /// Accept only controls declared in the worker capability handshake.
@@ -1499,7 +1653,8 @@ impl Scheduler {
         // queues (pending + grammar-gated) grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
         // in-flight request. Reject the new submit with a typed event.
-        let waiting = self.pending.len() + self.skipped_waiting.len();
+        let waiting =
+            self.pending.len() + self.skipped_waiting.len() + self.completed_outputs.len();
         if waiting >= self.config.max_num_waiting {
             self.record_decision(
                 req.request_id,
@@ -1548,8 +1703,19 @@ impl Scheduler {
             epoch: self.next_epoch,
             version: 0,
             admission_digest: None,
+            resolved_semantic: String::new(),
+            resolved_producer_op_id: 0,
+            committed_version: 0,
             committed_semantic: String::new(),
             committed_producer_op_id: 0,
+            control_seq: 0,
+            public_event_seq: 0,
+            public_token_seq: 0,
+            semantic_token_seq: 0,
+            output_journal: VecDeque::new(),
+            token_cutoffs: BTreeMap::new(),
+            semantic_commit: None,
+            cancel_cutoff: None,
             latest_device_version: None,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
             context,
@@ -1557,7 +1723,12 @@ impl Scheduler {
             queued_at: now(),
             cancelled: false,
             aborted: false,
+            stop_matched: false,
             grammar: None,
+            cpu_pending: None,
+            cpu_masks: None,
+            cpu_tokens_to_advance: Vec::new(),
+            cpu_generation: 0,
             trace,
             req,
         };
@@ -1567,9 +1738,15 @@ impl Scheduler {
         // collects ready grammars each pass.
         if let Some(spec) = st.req.grammar.clone() {
             let id = st.req.request_id;
-            self.grammar_compiler.submit(id, spec);
-            self.trace_request_queued(&st, "skipped_waiting");
-            self.skipped_waiting.insert(id, st);
+            match self.grammar_compiler.submit(id, spec) {
+                Ok(()) => {
+                    self.trace_request_queued(&st, "skipped_waiting");
+                    self.skipped_waiting.insert(id, st);
+                }
+                Err(message) => {
+                    let _ = st.event_tx.send(GenEvent::Rejected { message });
+                }
+            }
             return;
         }
         self.trace_request_queued(&st, "pending");
@@ -1761,6 +1938,12 @@ impl Scheduler {
         pos.saturating_add(1).saturating_add(spec_len)
     }
 
+    fn cpu_tasks_pending(&self) -> bool {
+        self.running
+            .values()
+            .any(|state| state.cpu_pending.is_some())
+    }
+
     /// One loop iteration of the schedule-ahead loop. Returns true if any work
     /// was submitted or any result resolved.
     pub fn step(&mut self) -> bool {
@@ -1790,12 +1973,14 @@ impl Scheduler {
     /// slots, but leaves any blocking result wait to `run`.
     fn step_nonblocking(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.step").entered();
+        let mut progressed = self.flush_output_journals();
+        progressed |= self.drain_cpu_continuations();
         // 1. Resolve one completed batch. Refilling immediately after one
         // completion preserves an occupied execution slot when multiple
         // responses become ready together at pipeline depth greater than one.
         // The owner loop returns here without parking while progress is being
         // made, so subsequent ready completions are handled on successive turns.
-        let mut progressed = self.poll_one_result();
+        progressed |= self.poll_one_result();
 
         // 2. reap cancellations before assembling.
         self.reap_cancellations();
@@ -1812,15 +1997,23 @@ impl Scheduler {
         // the complete resident cohort instead of admitting only when a slot
         // happens to open.
         self.admit();
+        progressed |= self.start_cpu_continuations();
 
         // 4. submit as many batches as pipeline capacity allows.
         while self.executor.can_submit() {
             self.admit();
+            progressed |= self.start_cpu_continuations();
             let (new_reqs, ops) = self.assemble();
             if ops.is_empty() {
                 break;
             }
-            self.submit_batch(new_reqs, ops);
+            let controls = self.pending_controls.drain(..).collect();
+            self.submit_batch(new_reqs, ops, controls);
+            progressed = true;
+        }
+        while self.executor.can_submit() && !self.pending_controls.is_empty() {
+            let controls = self.pending_controls.drain(..).collect();
+            self.submit_batch(Vec::new(), Vec::new(), controls);
             progressed = true;
         }
 
@@ -1954,6 +2147,69 @@ impl Scheduler {
         Some(state.version.saturating_add(self.inflight_len(id) as u64))
     }
 
+    fn fixed_version(&self, id: RequestId) -> Option<VersionRef> {
+        let state = self.running.get(&id)?;
+        state.admission_digest.as_ref()?;
+        Some(VersionRef {
+            request_key: RequestKey::new(self.authority_id, id, state.epoch),
+            producer_op_id: OpId(state.resolved_producer_op_id),
+            point: Point::Fixed {
+                point_index: state.version as u32,
+                semantic_digest: state.resolved_semantic.clone(),
+            },
+        })
+    }
+
+    fn public_limit_for(&self, id: RequestId, transition: &PlannedTransition) -> u64 {
+        let current = self
+            .running
+            .get(&id)
+            .map_or(0, |state| state.public_event_seq);
+        current.saturating_add(transition_output_bound(transition) as u64)
+    }
+
+    fn queue_commit(
+        &mut self,
+        id: RequestId,
+        expected_parent: VersionRef,
+        selected: VersionRef,
+        public_event_limit: u64,
+    ) {
+        let Some(state) = self.running.get_mut(&id) else {
+            return;
+        };
+        state.control_seq = state.control_seq.saturating_add(1);
+        state.committed_version = match &selected.point {
+            Point::Fixed { point_index, .. } => u64::from(*point_index),
+            Point::Device { .. } => state.committed_version,
+        };
+        state.committed_semantic = match &selected.point {
+            Point::Fixed {
+                semantic_digest, ..
+            } => semantic_digest.clone(),
+            Point::Device { .. } => state.committed_semantic.clone(),
+        };
+        state.committed_producer_op_id = selected.producer_op_id.0;
+        self.pending_controls.push_back(Control::Commit {
+            request_key: selected.request_key,
+            control_seq: state.control_seq,
+            expected_parent,
+            selected,
+            public_event_limit,
+            disposition: Disposition::Publish,
+        });
+    }
+
+    fn acknowledge_controls(&mut self, controls: &[Control]) {
+        for control in controls {
+            if let Control::Close { request_key, .. } = control {
+                let _ = self
+                    .executor
+                    .control(ControlOp::DropSession(request_key.session_id));
+            }
+        }
+    }
+
     /// Whether a request may keep an additional operation in flight rooted on a
     /// predecessor's not-yet-observed selected point.
     ///
@@ -1974,6 +2230,7 @@ impl Scheduler {
         if queue.len() >= self.executor.pipeline_depth().max(1)
             || state.cancelled
             || self.pending_finishes.contains_key(&id)
+            || self.custom_logits_processors > 0
             || !state.is_replayable_text()
             || !Self::device_token_relay_eligible(state)
         {
@@ -2036,6 +2293,7 @@ impl Scheduler {
     fn can_reuse_resolved_token_product(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|state| {
             state.resources.worker_registered
+                && self.custom_logits_processors == 0
                 && state.und.tokens_emitted > 0
                 && state
                     .latest_device_version
@@ -2054,7 +2312,166 @@ impl Scheduler {
 
     fn can_schedule_next(&self, id: RequestId) -> bool {
         !self.pending_finishes.contains_key(&id)
+            && self.output_credit_ready(id)
+            && self.cpu_continuation_ready(id)
+            && self
+                .running
+                .get(&id)
+                .is_some_and(|state| state.semantic_commit.is_none())
             && (!self.has_inflight(id) || self.can_queue_decode_successor(id))
+    }
+
+    fn cpu_continuation_required(&self, state: &ReqState) -> bool {
+        state.req.grammar.is_some()
+            || self.custom_logits_processors > 0
+            || state.req.sampling.min_tokens > 0
+            || !state.req.sampling.bad_words_ids.is_empty()
+            || state.req.sampling.allowed_token_ids.is_some()
+    }
+
+    fn cpu_continuation_ready(&self, id: RequestId) -> bool {
+        self.running.get(&id).is_some_and(|state| {
+            !self.cpu_continuation_required(state)
+                || (state.cpu_pending.is_none()
+                    && state.cpu_masks.is_some()
+                    && state.cpu_tokens_to_advance.is_empty())
+        })
+    }
+
+    fn start_cpu_continuations(&mut self) -> bool {
+        let ids = self.order.clone();
+        let mut progressed = false;
+        for id in ids {
+            let required = self
+                .running
+                .get(&id)
+                .is_some_and(|state| self.cpu_continuation_required(state));
+            if !required {
+                continue;
+            }
+            let pipeline = self.logits_pipeline.clone();
+            let eos = self.ctrl.eos.clone();
+            let Some(state) = self.running.get_mut(&id) else {
+                continue;
+            };
+            if state.cancelled
+                || state.cpu_pending.is_some()
+                || state.cpu_masks.is_some()
+                || self.pending_finishes.contains_key(&id)
+            {
+                continue;
+            }
+            state.cpu_generation = state.cpu_generation.saturating_add(1);
+            let key = CpuTaskKey {
+                request_id: id,
+                epoch: state.epoch,
+                point: state.version,
+                generation: state.cpu_generation,
+            };
+            let mut grammar_stops = eos.clone();
+            grammar_stops.extend(state.req.stop_token_ids.iter().copied());
+            grammar_stops.sort_unstable();
+            grammar_stops.dedup();
+            let task = CpuTask {
+                key,
+                matcher: state.grammar.take(),
+                tokens_to_advance: std::mem::take(&mut state.cpu_tokens_to_advance),
+                n_generated: state.und.tokens_emitted,
+                eos,
+                generated: state.replay.generated_ids.clone(),
+                sampling: state.req.sampling.clone(),
+                grammar_stops,
+                pipeline,
+            };
+            match self.cpu_continuations.try_submit(task) {
+                Ok(()) => {
+                    state.cpu_pending = Some(key);
+                    progressed = true;
+                }
+                Err(task) => {
+                    let task = *task;
+                    state.grammar = task.matcher;
+                    state.cpu_tokens_to_advance = task.tokens_to_advance;
+                    break;
+                }
+            }
+        }
+        progressed
+    }
+
+    fn drain_cpu_continuations(&mut self) -> bool {
+        let ready = self.cpu_continuations.drain_ready();
+        if ready.is_empty() {
+            return false;
+        }
+        let mut failed = Vec::new();
+        for result in ready {
+            let Some(state) = self.running.get_mut(&result.key.request_id) else {
+                continue;
+            };
+            if state.cpu_pending != Some(result.key)
+                || state.epoch != result.key.epoch
+                || state.version != result.key.point
+            {
+                continue;
+            }
+            state.cpu_pending = None;
+            state.grammar = result.matcher;
+            match result.outcome {
+                Ok(masks) => state.cpu_masks = Some(masks),
+                Err(error) => {
+                    tracing::error!(
+                        request_id = result.key.request_id.0,
+                        %error,
+                        "CPU semantic continuation failed"
+                    );
+                    failed.push(result.key.request_id);
+                }
+            }
+        }
+        for id in failed {
+            self.finish_after_inflight(id, FinishReason::Error, None);
+        }
+        true
+    }
+
+    fn output_credit_ready(&self, id: RequestId) -> bool {
+        let Some(state) = self.running.get(&id) else {
+            return false;
+        };
+        if state.event_tx.is_closed() {
+            return false;
+        }
+        let available = state
+            .event_tx
+            .capacity()
+            .saturating_add(OUTPUT_JOURNAL_CAPACITY.saturating_sub(state.output_journal.len()));
+        let reserved = self
+            .inflight_ops
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .map(|operation| operation.output_credit_bound)
+            .sum::<usize>();
+        available
+            .saturating_sub(reserved)
+            .saturating_sub(OUTPUT_TERMINAL_RESERVE)
+            >= self.next_output_bound(id)
+    }
+
+    fn next_output_bound(&self, id: RequestId) -> usize {
+        match self.peek_next_operation_variant(id) {
+            Some(WorkVariant::TokenVerify) => self
+                .spec_decode
+                .max_ngram_tokens()
+                .saturating_add(1)
+                .saturating_mul(2)
+                .saturating_add(2),
+            Some(WorkVariant::TokenExtend | WorkVariant::TokenDecode) => 4,
+            Some(WorkVariant::GenFlow) => usize::from(self.denoise_step_burst).saturating_add(2),
+            Some(WorkVariant::Materialize) => 3,
+            Some(_) | None => 2,
+        }
     }
 
     fn register_inflight(&mut self, transition: PlannedTransition, started: Instant) {
@@ -2064,6 +2481,7 @@ impl Scheduler {
             .as_ref()
             .map_or(0, |operation| operation.op_id.0);
         let spec_tokens = transition.draft_token_ids.clone();
+        let output_credit_bound = transition_output_bound(&transition);
         self.inflight_ops
             .entry(request_id)
             .or_default()
@@ -2072,6 +2490,7 @@ impl Scheduler {
                 op_id,
                 spec_tokens,
                 started,
+                output_credit_bound,
             });
     }
 
@@ -2161,6 +2580,9 @@ impl Scheduler {
             forward_stats,
             ..
         } = report;
+        if let Some(controls) = self.control_batches.remove(&result_step_id) {
+            self.acknowledge_controls(&controls);
+        }
         let batch_roundtrip_us = self
             .batch_started
             .remove(&result_step_id)
@@ -2199,8 +2621,9 @@ impl Scheduler {
         for (operation_index, record) in completions.into_iter().enumerate() {
             let id = record.request_key.session_id;
             let op_id = record.op_id.0;
-            // op_id-correlated completion: resolve the exact op the
-            // worker echoed, not merely the FIFO-oldest one.
+            // Worker response publication is globally readiness-ordered while
+            // preserving lineage order, so the echoed op id must name this
+            // request's oldest unresolved operation.
             let (transition, draft_token_ids, started) = self.pop_inflight(id, op_id);
             let Some(transition) = transition else {
                 self.trace_record(json!({
@@ -2275,7 +2698,14 @@ impl Scheduler {
                 ev.completion_ready_to_observed_us = record.timing_counters.host_us;
                 st.trace.push(ev);
             }
-            if let Err(error) = transition.validate_result(&record, &products) {
+            let predicated_parent_point = (record.status == OpStatus::Predicated).then(|| {
+                self.running
+                    .get(&id)
+                    .map_or(0, |state| state.version.min(u64::from(u32::MAX)) as u32)
+            });
+            if let Err(error) =
+                transition.validate_result(&record, &products, predicated_parent_point)
+            {
                 self.trace_record(json!({
                     "event": "transition_validation_failed",
                     "at_s": now(),
@@ -2289,6 +2719,14 @@ impl Scheduler {
                 }
                 continue;
             }
+            let semantic_blocked = self.running.get(&id).is_some_and(|state| state.cancelled)
+                || self.pending_finishes.contains_key(&id);
+            if semantic_blocked {
+                self.release_transition_resources(id, &transition);
+                self.finish_pending_if_idle(id);
+                continue;
+            }
+            let expected_parent = self.fixed_version(id);
             let cursor_result = self.running.get_mut(&id).map(|state| {
                 state
                     .cursor
@@ -2308,23 +2746,23 @@ impl Scheduler {
                 }
                 continue;
             }
-            // A state-advancing op commits a new authoritative point; its selected
-            // point becomes the request version and its semantic digest and op id
-            // become the committed lineage. Non-advancing ops leave lineage intact.
-            let advanced = transition.operation.as_ref().is_some_and(|operation| {
-                match operation.parent.point {
-                    // A fixed-parent op advanced when its selected point moved
-                    // past the host-observed parent point.
-                    Point::Fixed { point_index, .. } => record.selected_point > point_index,
-                    // A device-parent op names no host-known parent point; the
-                    // validator already checked its selected point against the
-                    // projected parent, so its own advance flag is authoritative.
-                    // It must commit its own semantic digest and op id, otherwise
-                    // the committed lineage goes stale once the pipeline drains and
-                    // the next fixed-parent op roots on the wrong digest.
-                    Point::Device { .. } => operation.advances_state,
-                }
-            });
+            // A state-advancing completion resolves a new point. Ordered commit
+            // control emission below decides when that point becomes semantic.
+            let advanced = record.status == OpStatus::Ok
+                && transition.operation.as_ref().is_some_and(|operation| {
+                    match operation.parent.point {
+                        // A fixed-parent op advanced when its selected point moved
+                        // past the host-observed parent point.
+                        Point::Fixed { point_index, .. } => record.selected_point > point_index,
+                        // A device-parent op names no host-known parent point; the
+                        // validator already checked its selected point against the
+                        // projected parent, so its own advance flag is authoritative.
+                        // It must commit its own semantic digest and op id, otherwise
+                        // the committed lineage goes stale once the pipeline drains and
+                        // the next fixed-parent op roots on the wrong digest.
+                        Point::Device { .. } => operation.advances_state,
+                    }
+                });
             let latest_device_version = if advanced {
                 transition.operation.as_ref().and_then(|operation| {
                     operation
@@ -2353,15 +2791,47 @@ impl Scheduler {
             };
             let retain_device_version = !self.has_inflight(id);
             if let Some(state) = self.running.get_mut(&id) {
-                state.version = u64::from(record.selected_point);
+                if record.status != OpStatus::Predicated {
+                    state.version = u64::from(record.selected_point);
+                }
                 if advanced {
-                    state.committed_semantic = record.semantic_digest.clone();
-                    state.committed_producer_op_id = record.op_id.0;
+                    state.resolved_semantic = record.semantic_digest.clone();
+                    state.resolved_producer_op_id = record.op_id.0;
                     state.latest_device_version = if retain_device_version {
                         latest_device_version
                     } else {
                         None
                     };
+                }
+            }
+            let selected_fixed = self.fixed_version(id);
+            if advanced
+                && let (Some(expected_parent), Some(selected)) =
+                    (expected_parent, selected_fixed.clone())
+            {
+                let public_event_limit = self.public_limit_for(id, &transition);
+                let decoder_decision_required = matches!(
+                    operation_variant,
+                    WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
+                ) && self
+                    .running
+                    .get(&id)
+                    .is_some_and(|state| !state.req.stop_strings.is_empty());
+                if decoder_decision_required {
+                    let pending = PendingSemanticCommit {
+                        token_count: None,
+                        expected_parent,
+                        selected,
+                        public_event_limit,
+                    };
+                    if let Some(state) = self.running.get_mut(&id)
+                        && state.semantic_commit.replace(pending).is_some()
+                    {
+                        self.finish_after_inflight(id, FinishReason::Error, None);
+                        continue;
+                    }
+                } else {
+                    self.queue_commit(id, expected_parent, selected, public_event_limit);
                 }
             }
             self.release_transition_resources(id, &transition);
@@ -2371,19 +2841,68 @@ impl Scheduler {
                 | WorkVariant::TransferKvInstall => 0,
                 _ => 1,
             };
-            to_resolve.push((
-                priority,
-                operation_index,
-                id,
-                transition,
-                view,
-                draft_token_ids,
-            ));
+            let public_tokens_before = self
+                .running
+                .get(&id)
+                .map_or(0, |state| state.public_token_seq);
+            if record.status == OpStatus::Predicated {
+                self.finish_pending_if_idle(id);
+            } else {
+                to_resolve.push((
+                    priority,
+                    operation_index,
+                    id,
+                    transition,
+                    view,
+                    draft_token_ids,
+                    selected_fixed,
+                    public_tokens_before,
+                ));
+            }
         }
         to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
-        for (_priority, _seq_index, id, transition, view, draft_token_ids) in to_resolve {
+        for (
+            _priority,
+            _seq_index,
+            id,
+            transition,
+            view,
+            draft_token_ids,
+            selected_fixed,
+            public_tokens_before,
+        ) in to_resolve
+        {
+            let token_operation = matches!(
+                transition.operation_variant,
+                WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
+            );
             if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
                 self.resolve(id, transition, view, draft_token_ids);
+            }
+            if token_operation {
+                let mut commit_without_decoder_event = None;
+                if let Some(state) = self.running.get_mut(&id) {
+                    if state.public_token_seq > public_tokens_before {
+                        if let Some(selected) = selected_fixed {
+                            state.token_cutoffs.insert(state.public_token_seq, selected);
+                        }
+                        if !state.req.stop_strings.is_empty()
+                            && let Some(pending) = state.semantic_commit.as_mut()
+                        {
+                            pending.token_count = Some(state.public_token_seq);
+                        }
+                    } else if !state.req.stop_strings.is_empty() {
+                        commit_without_decoder_event = state.semantic_commit.take();
+                    }
+                }
+                if let Some(pending) = commit_without_decoder_event {
+                    self.queue_commit(
+                        id,
+                        pending.expected_parent,
+                        pending.selected,
+                        pending.public_event_limit,
+                    );
+                }
             }
             self.finish_pending_if_idle(id);
             if let (Some(st), Some(progress_ops)) = (self.running.get(&id), progress_ops.as_mut()) {
@@ -2587,14 +3106,16 @@ impl Scheduler {
         // request's KV cache on a pipelined worker. Defer to a later step: once
         // the op resolves, `inflight_kinds` drains and the next reap finishes it.
         // This mirrors the `!has_inflight` guard preemption already uses.
-        let cancelled: Vec<(RequestId, bool)> = self
+        let cancelled: Vec<(RequestId, bool, bool)> = self
             .running
             .iter()
             .filter(|(id, s)| s.cancelled && !self.has_inflight(**id))
-            .map(|(k, s)| (*k, s.aborted))
+            .map(|(k, s)| (*k, s.aborted, s.stop_matched))
             .collect();
-        for (id, aborted) in cancelled {
-            let reason = if aborted {
+        for (id, aborted, stop_matched) in cancelled {
+            let reason = if stop_matched {
+                FinishReason::Stop
+            } else if aborted {
                 FinishReason::Aborted
             } else {
                 FinishReason::Cancelled
@@ -2616,7 +3137,7 @@ impl Scheduler {
             let Some(mut st) = self.skipped_waiting.remove(&id) else {
                 continue;
             };
-            match compiled.and_then(|grammar| self.grammar_compiler.create_matcher(grammar)) {
+            match compiled {
                 Ok(matcher) => {
                     st.grammar = Some(matcher);
                     self.pending.add_request(st);
@@ -3037,10 +3558,24 @@ impl Scheduler {
                             // admission, identified by operation-id 0 — the sentinel the
                             // worker seeds as its initial committed version — so the first
                             // operation's fixed parent matches the worker's committed state.
+                            st.resolved_semantic = admission.digest.clone();
+                            st.resolved_producer_op_id = 0;
                             st.committed_semantic = admission.digest.clone();
                             st.committed_producer_op_id = 0;
                             st.latest_device_version = None;
                             st.admission_digest = Some(admission.digest.clone());
+                            st.token_cutoffs.clear();
+                            st.token_cutoffs.insert(
+                                st.public_token_seq,
+                                VersionRef {
+                                    request_key,
+                                    producer_op_id: OpId(0),
+                                    point: Point::Fixed {
+                                        point_index: 0,
+                                        semantic_digest: admission.digest.clone(),
+                                    },
+                                },
+                            );
                             admissions.push(admission);
                         }
                         if !self.reserve_transition_resources(&op) {
@@ -3214,7 +3749,11 @@ impl Scheduler {
 
     fn preemptible(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|st| {
-            if st.resources.reserve_worstcase || !st.is_replayable_text() {
+            if st.resources.reserve_worstcase
+                || !st.is_replayable_text()
+                || st.semantic_commit.is_some()
+                || st.cpu_pending.is_some()
+            {
                 return false;
             }
             // generated branch replay is too expensive under high concurrency: even
@@ -3343,9 +3882,21 @@ impl Scheduler {
         st.epoch = self.next_epoch;
         st.version = 0;
         st.admission_digest = None;
+        st.resolved_semantic = String::new();
+        st.resolved_producer_op_id = 0;
+        st.committed_version = 0;
         st.committed_semantic = String::new();
         st.committed_producer_op_id = 0;
+        st.control_seq = 0;
+        st.token_cutoffs.clear();
+        st.semantic_commit = None;
+        st.cancel_cutoff = None;
+        st.cpu_masks = None;
+        st.cpu_tokens_to_advance.clear();
+        st.cpu_generation = 0;
         st.latest_device_version = None;
+        self.pending_controls
+            .retain(|control| control.request_key().session_id != victim);
         self.next_epoch = self.next_epoch.saturating_add(1);
         st.replay.generated_ids = generated_ids;
         st.replay.recompute_ids = Some(recompute);
@@ -3379,6 +3930,7 @@ impl Scheduler {
         &mut self,
         admissions: Vec<Admission>,
         mut transitions: Vec<PlannedTransition>,
+        mut controls: Vec<Control>,
     ) {
         let _span =
             tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
@@ -3391,13 +3943,13 @@ impl Scheduler {
             let oid = self.next_op_id;
             self.next_op_id += 1;
             let request_id = transition.request_id;
-            let Some((epoch, committed_semantic, committed_producer_op_id, latest_device_version)) =
+            let Some((epoch, resolved_semantic, resolved_producer_op_id, latest_device_version)) =
                 self.running.get(&request_id).and_then(|state| {
                     state.admission_digest.as_ref().map(|_| {
                         (
                             state.epoch,
-                            state.committed_semantic.clone(),
-                            state.committed_producer_op_id,
+                            state.resolved_semantic.clone(),
+                            state.resolved_producer_op_id,
                             state.latest_device_version.clone(),
                         )
                     })
@@ -3472,10 +4024,10 @@ impl Scheduler {
                 (
                     VersionRef {
                         request_key,
-                        producer_op_id: OpId(committed_producer_op_id),
+                        producer_op_id: OpId(resolved_producer_op_id),
                         point: Point::Fixed {
                             point_index: version as u32,
-                            semantic_digest: committed_semantic,
+                            semantic_digest: resolved_semantic,
                         },
                     },
                     None,
@@ -3487,6 +4039,10 @@ impl Scheduler {
             let device_parent = matches!(parent.point, Point::Device { .. });
             transition.device_parent_point = device_parent.then_some(version as u32);
             transition.predicate = predicate;
+            transition.control_seq = self
+                .running
+                .get(&request_id)
+                .map_or(0, |state| state.control_seq);
             if let Err(error) = transition.assign_operation(
                 request_key,
                 OpId(oid),
@@ -3648,9 +4204,10 @@ impl Scheduler {
                 request_key: operation.request_key,
                 op_id: operation.parent.producer_op_id,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        controls.extend(releases);
         let batch = Batch::new(self.step_id, admissions, wire_ops)
-            .with_controls(releases)
+            .with_controls(controls.clone())
             .with_input_products(input_products);
         if let Err(e) = self.executor.submit(batch) {
             self.batch_started.remove(&step);
@@ -3664,6 +4221,9 @@ impl Scheduler {
             self.fatal = true;
             self.fail_all_inflight(&format!("{e}"));
         } else {
+            if !controls.is_empty() {
+                self.control_batches.insert(step, controls);
+            }
             for count in spec_draft_counts {
                 self.stats
                     .spec_decode
@@ -4189,13 +4749,20 @@ impl Scheduler {
             Some(s) => s,
             None => return (None, None),
         };
+        if self.cpu_continuation_required(st) {
+            return st
+                .cpu_masks
+                .as_ref()
+                .map(|masks| (masks.allowed.clone(), masks.suppress.clone()))
+                .unwrap_or((Some(Vec::new()), None));
+        }
         let ctx = crate::logits::ProcCtx {
             n_generated: st.und.tokens_emitted,
             eos: &self.ctrl.eos,
             generated: &st.replay.generated_ids,
             sampling: &st.req.sampling,
         };
-        let (mut allowed, mut suppress) = crate::logits::run_pipeline(&self.logits_pipeline, &ctx);
+        let (allowed, mut suppress) = crate::logits::run_pipeline(&self.logits_pipeline, &ctx);
         // Image-budget enforcement: once a request has produced max_images, a
         // direct branch-opening token is
         // suppressed, so an eager or positively-biased model must return to
@@ -4207,38 +4774,6 @@ impl Scheduler {
             && let Some(trigger) = st.req.policy.trigger.direct_token()
         {
             suppress.get_or_insert_with(Vec::new).push(trigger);
-        }
-        // If the model's text turn is naturally complete while image budget
-        // remains, resolve treats EOS as a clean image boundary instead of
-        // making the model invent filler text.
-        // Structured outputs: the grammar's per-step mask intersects whatever
-        // the pipeline allows. At a terminal trie node both termination and
-        // continuations into longer alternatives remain valid.
-        let grammar_stops = {
-            let mut stops = self.ctrl.eos.clone();
-            stops.extend(st.req.stop_token_ids.iter().copied());
-            stops.sort_unstable();
-            stops.dedup();
-            stops
-        };
-        let grammar_mask = self
-            .running
-            .get_mut(&id)
-            .and_then(|state| state.grammar.as_mut())
-            .map(|matcher| matcher.next_mask());
-        if let Some(mask) = grammar_mask {
-            let (complete, g_allowed) = match mask {
-                Ok(mask) => mask,
-                Err(error) => {
-                    tracing::error!(request_id = id.0, %error, "grammar mask computation failed");
-                    return (Some(Vec::new()), suppress);
-                }
-            };
-            let g_allowed = grammar_allowed_tokens(complete, g_allowed, &grammar_stops);
-            allowed = Some(match allowed {
-                Some(a) => a.into_iter().filter(|t| g_allowed.contains(t)).collect(),
-                None => g_allowed,
-            });
         }
         (allowed, suppress)
     }
@@ -4277,15 +4812,13 @@ impl Scheduler {
     }
 
     fn advance_grammar(&mut self, id: RequestId, token_id: u32) -> bool {
-        let error = self
+        let required = self
             .running
-            .get_mut(&id)
-            .and_then(|state| state.grammar.as_mut())
-            .and_then(|matcher| matcher.advance(token_id).err());
-        if let Some(error) = error {
-            tracing::error!(request_id = id.0, token_id, %error, "grammar state rejected a committed token");
-            self.finish(id, FinishReason::Error);
-            return false;
+            .get(&id)
+            .is_some_and(|state| self.cpu_continuation_required(state));
+        if required && let Some(state) = self.running.get_mut(&id) {
+            state.cpu_masks = None;
+            state.cpu_tokens_to_advance.push(token_id);
         }
         true
     }
@@ -4963,11 +5496,35 @@ impl Scheduler {
         self.promote_gen_branch_reservation(id);
     }
 
+    fn flush_output_journals(&mut self) -> bool {
+        let mut progressed = false;
+        for state in self.running.values_mut() {
+            if state.event_tx.is_closed() {
+                state.cancelled = true;
+                continue;
+            }
+            let before = state.output_journal.len();
+            if flush_public_journal(&state.event_tx, &mut state.output_journal) {
+                state.cancelled = true;
+            }
+            progressed |= state.output_journal.len() != before;
+        }
+        self.completed_outputs.retain(|_, output| {
+            let before = output.journal.len();
+            let closed = flush_public_journal(&output.event_tx, &mut output.journal);
+            progressed |= output.journal.len() != before;
+            !closed && !output.event_tx.is_closed() && !output.journal.is_empty()
+        });
+        progressed
+    }
+
     fn emit(&mut self, id: RequestId, ev: GenEvent) {
-        if let Some(st) = self.running.get_mut(&id)
-            && st.event_tx.send(ev).is_err()
-        {
-            st.cancelled = true; // receiver dropped == cancel
+        if let Some(st) = self.running.get_mut(&id) {
+            if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
+                st.cancelled = true;
+            } else {
+                st.public_event_seq = st.public_event_seq.saturating_add(1);
+            }
         }
     }
     /// Emit a text token and record it for preemption-recompute.
@@ -4981,7 +5538,16 @@ impl Scheduler {
         };
         match action {
             uniserve_core::UndTokenAction::Emit => {
+                let before = self
+                    .running
+                    .get(&id)
+                    .map_or(0, |state| state.public_event_seq);
                 self.emit(id, GenEvent::TextToken { id: tok, logprob });
+                if let Some(state) = self.running.get_mut(&id)
+                    && state.public_event_seq > before
+                {
+                    state.public_token_seq = state.public_token_seq.saturating_add(1);
+                }
                 true
             }
             uniserve_core::UndTokenAction::KeepInternal => false,
@@ -5085,8 +5651,10 @@ impl Scheduler {
     }
 
     fn emit_st(&self, st: &mut ReqState, ev: GenEvent) {
-        if st.event_tx.send(ev).is_err() {
+        if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
             st.cancelled = true;
+        } else {
+            st.public_event_seq = st.public_event_seq.saturating_add(1);
         }
     }
 
@@ -5100,7 +5668,12 @@ impl Scheduler {
         reason: FinishReason,
         stop_reason: Option<String>,
     ) {
-        if !self.has_inflight(id) {
+        let semantic_pending = !matches!(reason, FinishReason::Error)
+            && self
+                .running
+                .get(&id)
+                .is_some_and(|state| state.semantic_commit.is_some());
+        if !self.has_inflight(id) && !semantic_pending {
             self.finish_with(id, reason, stop_reason);
             return;
         }
@@ -5116,7 +5689,12 @@ impl Scheduler {
     }
 
     fn finish_pending_if_idle(&mut self, id: RequestId) {
-        if self.has_inflight(id) {
+        if self.has_inflight(id)
+            || self
+                .running
+                .get(&id)
+                .is_some_and(|state| state.semantic_commit.is_some())
+        {
             return;
         }
         if let Some(pending) = self.pending_finishes.remove(&id) {
@@ -5142,6 +5720,24 @@ impl Scheduler {
             );
         }
         if let Some(mut st) = self.running.remove(&id) {
+            if st.admission_digest.is_some() {
+                let request_key = RequestKey::new(self.authority_id, id, st.epoch);
+                let cutoff = st.cancel_cutoff.clone().unwrap_or_else(|| VersionRef {
+                    request_key,
+                    producer_op_id: OpId(st.committed_producer_op_id),
+                    point: Point::Fixed {
+                        point_index: st.committed_version as u32,
+                        semantic_digest: st.committed_semantic.clone(),
+                    },
+                });
+                st.control_seq = st.control_seq.saturating_add(1);
+                self.pending_controls.push_back(Control::Close {
+                    request_key,
+                    control_seq: st.control_seq,
+                    cutoff,
+                    reason: close_reason(&reason),
+                });
+            }
             self.order.retain(|x| *x != id);
             self.reserved_encoder_entries = self
                 .reserved_encoder_entries
@@ -5177,20 +5773,32 @@ impl Scheduler {
                 st.image_gen.images_done,
                 "running",
             );
-            let _ = st.event_tx.send(GenEvent::Finished {
+            let terminal = GenEvent::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens: st.context.prompt_ids.len(),
                 completion_tokens: st.und.tokens_emitted,
                 images: st.image_gen.images_done,
                 kv_transfer_params: None,
-            });
+            };
+            let closed = enqueue_public_event(&st.event_tx, &mut st.output_journal, terminal);
+            if !closed {
+                st.public_event_seq = st.public_event_seq.saturating_add(1);
+                if !st.output_journal.is_empty() {
+                    self.completed_outputs.insert(
+                        id,
+                        RetiredOutput {
+                            event_tx: st.event_tx,
+                            journal: st.output_journal,
+                        },
+                    );
+                }
+            }
         }
         self.bm.release(id);
         // release every lease this request held and assert it leaked none.
         self.ledger.release_request(id);
         self.ledger.assert_released(id);
-        let _ = self.executor.control(ControlOp::DropSession(id));
     }
 
     /// Clear the encoder cache (`/reset_encoder_cache` / `/reset_mm_cache`)
@@ -5281,6 +5889,71 @@ fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
     latent_tokens
         .saturating_mul(cfg_branches)
         .saturating_mul(timesteps)
+}
+
+fn transition_output_bound(transition: &PlannedTransition) -> usize {
+    match transition.operation_variant {
+        WorkVariant::TokenVerify => transition
+            .validation
+            .expected_text_tokens
+            .map_or(4, |range| {
+                usize::try_from(range.max)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(2)
+                    .saturating_add(2)
+            }),
+        WorkVariant::TokenExtend | WorkVariant::TokenDecode => 4,
+        WorkVariant::GenFlow => transition.token_cost.saturating_add(2),
+        WorkVariant::Materialize => 3,
+        _ => 2,
+    }
+}
+
+/// Flush as many ordered journal entries as the immediate consumer can accept.
+/// Returns true when the consumer has closed.
+fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenEvent>) -> bool {
+    while let Some(event) = journal.pop_front() {
+        match event_tx.send(event) {
+            Ok(()) => {}
+            Err(uniserve_engine_api::EventSendError::Full(event)) => {
+                journal.push_front(*event);
+                return false;
+            }
+            Err(uniserve_engine_api::EventSendError::Closed(_)) => {
+                journal.clear();
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Append one event to the bounded public journal without changing its order.
+/// Returns true when the consumer has closed.
+fn enqueue_public_event(
+    event_tx: &EventTx,
+    journal: &mut VecDeque<GenEvent>,
+    event: GenEvent,
+) -> bool {
+    if flush_public_journal(event_tx, journal) {
+        return true;
+    }
+    if journal.is_empty() {
+        match event_tx.send(event) {
+            Ok(()) => return false,
+            Err(uniserve_engine_api::EventSendError::Closed(_)) => return true,
+            Err(uniserve_engine_api::EventSendError::Full(event)) => {
+                journal.push_back(*event);
+            }
+        }
+    } else {
+        journal.push_back(event);
+    }
+    assert!(
+        journal.len() <= OUTPUT_JOURNAL_CAPACITY,
+        "scheduler output-credit invariant exceeded the bounded public journal"
+    );
+    false
 }
 
 fn operation_trace(transition: &PlannedTransition) -> serde_json::Value {

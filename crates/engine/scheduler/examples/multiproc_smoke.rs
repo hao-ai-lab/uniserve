@@ -45,8 +45,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut sched = Scheduler::new(Box::new(executor), ControlTokens::default(), 32);
 
-    let mut rxs: HashMap<RequestId, tokio::sync::mpsc::UnboundedReceiver<GenEvent>> =
-        HashMap::new();
+    let mut rxs: HashMap<RequestId, uniserve_engine_api::EventRx> = HashMap::new();
     for id in 1..=3u64 {
         let constraint = if id == 3 {
             GenerationConstraint::GenOnly

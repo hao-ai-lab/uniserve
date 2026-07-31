@@ -168,8 +168,7 @@ fn run_requests(
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let mut rxs: HashMap<RequestId, tokio::sync::mpsc::UnboundedReceiver<GenEvent>> =
-        HashMap::new();
+    let mut rxs: HashMap<RequestId, uniserve_engine_api::EventRx> = HashMap::new();
     let mut id = 1u64;
     for (constraint, n) in specs {
         for _ in 0..*n {
@@ -1174,6 +1173,275 @@ fn abort_and_cancel_are_distinct() {
     assert_eq!(run_until_control(true), FinishReason::Aborted);
 }
 
+#[test]
+fn exact_prefix_controls_close_the_selected_semantic_versions() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, Point, VersionRef};
+
+    struct Recording {
+        inner: SimExecutor,
+        controls: Arc<Mutex<Vec<Control>>>,
+    }
+
+    impl Executor for Recording {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+        fn can_submit(&self) -> bool {
+            self.inner.can_submit()
+        }
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            self.controls
+                .lock()
+                .unwrap()
+                .extend(batch.controls.iter().cloned());
+            self.inner.submit(batch)
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            self.inner.poll()
+        }
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.inner.next_result()
+        }
+        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(op)
+        }
+        fn control_wait(
+            &mut self,
+            op: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(op, targets)
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    sim.set_pipeline_depth(4);
+    let controls = Arc::new(Mutex::new(Vec::new()));
+    let executor = Recording {
+        inner: SimExecutor::new(Box::new(sim)),
+        controls: Arc::clone(&controls),
+    };
+    let scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    let request = generation_request(
+        RequestId(1),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        1_000_000,
+    );
+    let mut events = handle.submit(request).unwrap();
+    let mut consumed_tokens = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while consumed_tokens < 2 && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::TextToken { .. }) => {
+                consumed_tokens += 1;
+            }
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(consumed_tokens, 2);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let committed = controls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|control| matches!(control, Control::Commit { .. }))
+            .count();
+        if committed > consumed_tokens {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.cancel_at(RequestId(1), consumed_tokens);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let close_cutoff = loop {
+        let cutoff = controls.lock().unwrap().iter().find_map(|control| {
+            if let Control::Close { cutoff, .. } = control {
+                Some(cutoff.clone())
+            } else {
+                None
+            }
+        });
+        if cutoff.is_some() || Instant::now() >= deadline {
+            break cutoff;
+        }
+        thread::sleep(Duration::from_millis(1));
+    };
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+
+    let committed: Vec<(u64, VersionRef)> = controls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|control| {
+            if let Control::Commit {
+                control_seq,
+                selected,
+                ..
+            } = control
+            {
+                Some((*control_seq, selected.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(committed.len() > consumed_tokens);
+    let close_cutoff = close_cutoff.expect("cancelled lineage must close");
+    assert_eq!(close_cutoff, committed[consumed_tokens - 1].1);
+    let close_seq = controls
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|control| {
+            if let Control::Close { control_seq, .. } = control {
+                Some(*control_seq)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(close_seq, committed.last().unwrap().0 + 1);
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    sim.set_pipeline_depth(4);
+    let stop_controls = Arc::new(Mutex::new(Vec::new()));
+    let executor = Recording {
+        inner: SimExecutor::new(Box::new(sim)),
+        controls: Arc::clone(&stop_controls),
+    };
+    let scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+    let mut request = generation_request(
+        RequestId(2),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        1_000_000,
+    );
+    request.stop_strings = vec!["boundary".to_string()];
+    let mut events = handle.submit(request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut consumed_tokens = 0;
+    while consumed_tokens < 2 && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::TextToken { .. }) => {
+                consumed_tokens += 1;
+                if consumed_tokens == 1 {
+                    handle.acknowledge_at(RequestId(2), consumed_tokens);
+                    handle.acknowledge_at(RequestId(2), consumed_tokens);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(consumed_tokens, 2);
+    handle.stop_at(RequestId(2), consumed_tokens);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut finish_reason = None;
+    while Instant::now() < deadline {
+        while let Ok(event) = events.try_recv() {
+            if let GenEvent::Finished { reason, .. } = event {
+                finish_reason = Some(reason);
+            }
+        }
+        let closed = stop_controls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|control| matches!(control, Control::Close { .. }));
+        if closed && finish_reason.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+    assert_eq!(finish_reason, Some(FinishReason::Stop));
+
+    let stop_controls = stop_controls.lock().unwrap();
+    let committed: Vec<(u64, VersionRef)> = stop_controls
+        .iter()
+        .filter_map(|control| {
+            if let Control::Commit {
+                control_seq,
+                selected,
+                ..
+            } = control
+            {
+                Some((*control_seq, selected.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(committed.len(), consumed_tokens - 1);
+    let (close_seq, close_cutoff, close_reason) = stop_controls
+        .iter()
+        .find_map(|control| {
+            if let Control::Close {
+                control_seq,
+                cutoff,
+                reason,
+                ..
+            } = control
+            {
+                Some((*control_seq, cutoff, *reason))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(close_reason, uniserve_worker_wire::CloseReason::Completed);
+    assert_eq!(close_seq, committed[0].0 + 1);
+    assert_eq!(
+        close_cutoff.producer_op_id.0,
+        committed[0].1.producer_op_id.0 + 1
+    );
+    let (
+        Point::Fixed {
+            point_index: committed_point,
+            ..
+        },
+        Point::Fixed {
+            point_index: close_point,
+            ..
+        },
+    ) = (&committed[0].1.point, &close_cutoff.point)
+    else {
+        panic!("semantic controls must use fixed versions");
+    };
+    assert_eq!(*close_point, committed_point + 1);
+}
+
 /// the EngineCaps hybrid-group handshake builds a multi-group block
 /// manager and the scheduler still drives requests to completion.
 #[test]
@@ -1411,7 +1679,7 @@ fn chunked_prefill_progresses_with_decode() {
         ))
         .unwrap();
 
-    let collect = |erx: &mut tokio::sync::mpsc::UnboundedReceiver<GenEvent>| -> (usize, bool) {
+    let collect = |erx: &mut uniserve_engine_api::EventRx| -> (usize, bool) {
         let mut text = 0;
         let mut done = false;
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -1456,10 +1724,21 @@ fn priority_preemption_and_recompute() {
     a.priority = 10;
     let mut arx = sched.submit_for_test(a);
 
-    // step until A is running and decoding (holds the only block).
-    for _ in 0..4 {
+    // Resolve at least one semantic token before preemption so replay crosses
+    // a nonzero control sequence.
+    let mut a_text_before_preemption = 0;
+    for _ in 0..64 {
         sched.step();
+        while let Ok(event) = arx.try_recv() {
+            if matches!(event, GenEvent::TextToken { .. }) {
+                a_text_before_preemption += 1;
+            }
+        }
+        if a_text_before_preemption > 0 {
+            break;
+        }
     }
+    assert!(a_text_before_preemption > 0);
 
     let mut b = generation_request(
         RequestId(2),
@@ -1485,7 +1764,7 @@ fn priority_preemption_and_recompute() {
         "expected at least one preemption"
     );
 
-    let drain = |erx: &mut tokio::sync::mpsc::UnboundedReceiver<GenEvent>| -> (usize, bool) {
+    let drain = |erx: &mut uniserve_engine_api::EventRx| -> (usize, bool) {
         let mut text = 0;
         let mut done = false;
         while let Ok(ev) = erx.try_recv() {
@@ -1497,7 +1776,8 @@ fn priority_preemption_and_recompute() {
         }
         (text, done)
     };
-    let (ta, da) = drain(&mut arx);
+    let (ta_after_preemption, da) = drain(&mut arx);
+    let ta = a_text_before_preemption + ta_after_preemption;
     let (tb, db) = drain(&mut brx);
     assert!(db, "high-priority B must finish (text={tb})");
     assert!(da, "preempted A must resume and finish (text={ta})");
@@ -3174,4 +3454,155 @@ fn lifecycle_trace_and_health_snapshot() {
             .all(|e| e.op_id.is_some() && e.op_kind.is_some()),
         "every submitted op carries an op_id + kind for correlation"
     );
+}
+
+#[test]
+fn slow_cpu_continuation_suspends_only_its_request_lineage() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use uniserve_scheduler::{LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration};
+
+    struct ControlledProcessor {
+        release: Arc<AtomicBool>,
+    }
+
+    impl LogitsProcessor for ControlledProcessor {
+        fn name(&self) -> &'static str {
+            "controlled"
+        }
+
+        fn declaration(&self) -> ProcessorDeclaration {
+            ProcessorDeclaration {
+                snapshotable: true,
+                deterministic: true,
+                max_output_tokens: 1,
+                max_outstanding_tasks: 1,
+            }
+        }
+
+        fn is_argmax_invariant(&self) -> bool {
+            true
+        }
+
+        fn contribute(&self, context: &ProcCtx<'_>) -> MaskContribution {
+            if context.sampling.seed == Some(1)
+                && context.n_generated == 0
+                && !self.release.load(Ordering::Acquire)
+            {
+                while !self.release.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            MaskContribution::default()
+        }
+    }
+
+    let release = Arc::new(AtomicBool::new(false));
+    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
+    let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs)
+        .with_logits_processor(Box::new(ControlledProcessor {
+            release: Arc::clone(&release),
+        }));
+    let mut slow_request = generation_request(
+        RequestId(1),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    slow_request.sampling.seed = Some(1);
+    let mut fast_request = generation_request(
+        RequestId(2),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    fast_request.sampling.seed = Some(2);
+    let mut slow_events = scheduler.submit_for_test(slow_request);
+    let mut fast_events = scheduler.submit_for_test(fast_request);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut fast_finished = false;
+    while Instant::now() < deadline && !fast_finished {
+        scheduler.step();
+        while let Ok(event) = fast_events.try_recv() {
+            fast_finished |= matches!(event, GenEvent::Finished { .. });
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        fast_finished,
+        "an unrelated request must complete while one CPU continuation is suspended"
+    );
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut slow_finished = false;
+    while Instant::now() < deadline && !slow_finished {
+        scheduler.step();
+        while let Ok(event) = slow_events.try_recv() {
+            slow_finished |= matches!(event, GenEvent::Finished { .. });
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(slow_finished);
+}
+
+#[test]
+fn slow_client_releases_execution_credits_before_output_capacity_returns() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
+    let slow_events = scheduler.submit_for_test(generation_request(
+        RequestId(1),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        256,
+    ));
+    let mut fast_events = scheduler.submit_for_test(generation_request(
+        RequestId(2),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        8,
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut fast_finished = false;
+    while Instant::now() < deadline && !fast_finished {
+        scheduler.step();
+        while let Ok(event) = fast_events.try_recv() {
+            fast_finished |= matches!(event, GenEvent::Finished { .. });
+        }
+    }
+    assert!(
+        fast_finished,
+        "the consuming client must complete independently"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && scheduler.step() {}
+    let health = scheduler.health_snapshot();
+    assert_eq!(
+        health.in_flight, 0,
+        "an output-credit-stalled request cannot retain an execution slot"
+    );
+    assert_eq!(health.running, 1);
+
+    drop(slow_events);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && scheduler.health_snapshot().running > 0 {
+        scheduler.step();
+    }
+    let health = scheduler.health_snapshot();
+    assert_eq!(health.running, 0);
+    assert_eq!(health.active_leases, 0);
 }

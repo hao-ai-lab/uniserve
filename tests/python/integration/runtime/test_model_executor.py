@@ -13,6 +13,7 @@ from PIL import Image
 from torch import nn
 
 from tests.python.fixtures.depth_one import (
+    commit_resolved,
     encode_operation,
     flow_operation,
     gen_admission,
@@ -149,15 +150,23 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     assert worker.sessions.get(1).logical_position == 2
 
     first_token = extended.completions[0].committed_tokens[0]
+    commit = commit_resolved(worker.sessions.get(1))
     decode, decode_input = token_operation(
         admission.request_key,
         op_id=2,
-        parent=worker.sessions.get(1).committed_version(),
+        parent=commit.selected,
         mode=TokenMode.DECODE,
         tokens=(first_token,),
+        control_seq=commit.control_seq,
     )
     decoded = worker.execute(
-        Batch(step_id=2, admissions=(), operations=(decode,), input_products=(decode_input,))
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(decode,),
+            controls=(commit,),
+            input_products=(decode_input,),
+        )
     )
 
     assert decoded.completions[0].committed_tokens == (_next_token(first_token),)
@@ -258,19 +267,29 @@ def test_token_decode_uses_the_homogeneous_paged_plan():
 
     decode_ops = []
     decode_inputs = []
+    commits = []
     for index, admission in enumerate(admissions):
         session_id = admission.request_key.session_id
+        commit = commit_resolved(worker.sessions.get(session_id))
         operation, payload = token_operation(
             admission.request_key,
             op_id=60 + index,
-            parent=worker.sessions.get(session_id).committed_version(),
+            parent=commit.selected,
             mode=TokenMode.DECODE,
             tokens=(_next_token(4),),
+            control_seq=commit.control_seq,
         )
         decode_ops.append(operation)
         decode_inputs.append(payload)
+        commits.append(commit)
     decoded = worker.execute(
-        Batch(step_id=2, admissions=(), operations=tuple(decode_ops), input_products=tuple(decode_inputs))
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=tuple(decode_ops),
+            controls=tuple(commits),
+            input_products=tuple(decode_inputs),
+        )
     )
 
     plan = model.attention_plans[-1]
@@ -304,16 +323,24 @@ def test_image_capable_pure_token_decode_uses_paged_attention():
             input_products=(prefill_input,),
         )
     )
+    commit = commit_resolved(worker.sessions.get(43))
     decode, decode_input = token_operation(
         admission.request_key,
         op_id=71,
-        parent=worker.sessions.get(43).committed_version(),
+        parent=commit.selected,
         mode=TokenMode.DECODE,
         tokens=(extended.completions[0].committed_tokens[0],),
+        control_seq=commit.control_seq,
     )
 
     worker.execute(
-        Batch(step_id=2, admissions=(), operations=(decode,), input_products=(decode_input,))
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(decode,),
+            controls=(commit,),
+            input_products=(decode_input,),
+        )
     )
 
     plan = model.attention_plans[-1]
@@ -321,7 +348,7 @@ def test_image_capable_pure_token_decode_uses_paged_attention():
     assert plan.query_lens_cpu == (1,)
 
 
-def test_replay_is_idempotent_and_conflicts_or_stale_work_do_not_mutate_state():
+def test_replay_identity_is_idempotent_and_conflicts_are_atomic():
     model = _ObservedModel()
     worker = execution_worker(model)
     admission = und_admission(3, block_ids=(3,))
@@ -356,18 +383,6 @@ def test_replay_is_idempotent_and_conflicts_or_stale_work_do_not_mutate_state():
             Batch(step_id=8, admissions=(), operations=(conflicting,), input_products=(conflicting_input,))
         )
 
-    stale, stale_input = token_operation(
-        admission.request_key,
-        op_id=22,
-        parent=root_parent(admission),
-        mode=TokenMode.DECODE,
-        tokens=(0,),
-    )
-    with pytest.raises(Exception, match="parent"):
-        worker.execute(
-            Batch(step_id=9, admissions=(), operations=(stale,), input_products=(stale_input,))
-        )
-
     assert worker.sessions.get(3) == committed
     assert len(model.calls) == 1
 
@@ -386,17 +401,22 @@ def test_output_validation_failure_rolls_back_every_authority():
     worker.execute(
         Batch(step_id=11, admissions=(admission,), operations=(initial,), input_products=(initial_input,))
     )
+    commit = commit_resolved(worker.sessions.get(4))
+    worker.execute(
+        Batch(step_id=12, admissions=(), operations=(), controls=(commit,))
+    )
     committed = deepcopy(worker.sessions.get(4))
     committed_length = worker.kv.get(4).length
 
     retry, retry_input = token_operation(
         admission.request_key,
         op_id=32,
-        parent=worker.sessions.get(4).committed_version(),
+        parent=commit.selected,
         mode=TokenMode.DECODE,
         tokens=(_next_token(13),),
+        control_seq=commit.control_seq,
     )
-    retry_batch = Batch(step_id=12, admissions=(), operations=(retry,), input_products=(retry_input,))
+    retry_batch = Batch(step_id=13, admissions=(), operations=(retry,), input_products=(retry_input,))
     model.fault = "misaligned"
     with pytest.raises(Exception):
         worker.execute(retry_batch)
@@ -464,16 +484,24 @@ def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
             new_kv_blocks = (next_block,)
             next_block += 1
             crossed = True
+        commit = commit_resolved(worker.sessions.get(1))
         decode, decode_input = token_operation(
             admission.request_key,
             op_id=2 + step,
-            parent=worker.sessions.get(1).committed_version(),
+            parent=commit.selected,
             mode=TokenMode.DECODE,
             tokens=(committed[-1],),
             new_kv_blocks=new_kv_blocks,
+            control_seq=commit.control_seq,
         )
         report = worker.execute(
-            Batch(step_id=2 + step, admissions=(), operations=(decode,), input_products=(decode_input,))
+            Batch(
+                step_id=2 + step,
+                admissions=(),
+                operations=(decode,),
+                controls=(commit,),
+                input_products=(decode_input,),
+            )
         )
         if new_kv_blocks:
             assert tuple(worker.kv.get(1).block_ids) == blocks + new_kv_blocks
@@ -501,11 +529,22 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
     first_report = worker.execute(
         Batch(step_id=1, admissions=(admission,), operations=(first,), input_products=())
     )
+    commit = commit_resolved(worker.sessions.get(2))
     second = flow_operation(
-        admission.request_key, op_id=2, parent=worker.sessions.get(2).committed_version(), steps=1
+        admission.request_key,
+        op_id=2,
+        parent=commit.selected,
+        steps=1,
+        control_seq=commit.control_seq,
     )
     second_report = worker.execute(
-        Batch(step_id=2, admissions=(), operations=(second,), input_products=())
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(second,),
+            controls=(commit,),
+            input_products=(),
+        )
     )
 
     assert first_report.completions[0].logical_lengths.latent_len == 1
@@ -532,15 +571,23 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
     Image.new("RGB", (16, 16), (128, 128, 128)).save(buffer, format="PNG")
     image_base64 = base64.b64encode(buffer.getvalue()).decode()
     handle = 0xABCDEF
+    commit = commit_resolved(worker.sessions.get(3))
     encode, encode_input = encode_operation(
         admission.request_key,
         op_id=2,
-        parent=worker.sessions.get(3).committed_version(),
+        parent=commit.selected,
         image_base64=image_base64,
         encoder_handle=handle,
+        control_seq=commit.control_seq,
     )
     report = worker.execute(
-        Batch(step_id=2, admissions=(), operations=(encode,), input_products=(encode_input,))
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(encode,),
+            controls=(commit,),
+            input_products=(encode_input,),
+        )
     )
     completion = report.completions[0]
     assert completion.logical_lengths.kv_visible_len == 0
@@ -566,14 +613,22 @@ def test_generated_feedback_advances_state_only_in_visual_token_extend():
     worker.execute(Batch(step_id=1, admissions=(admission,), operations=(flow,), input_products=()))
     assert worker.sessions.get(6).version == 1
 
+    commit = commit_resolved(worker.sessions.get(6))
     materialize = materialize_operation(
         admission.request_key,
         op_id=2,
-        parent=worker.sessions.get(6).committed_version(),
+        parent=commit.selected,
         feedback_source=True,
+        control_seq=commit.control_seq,
     )
     materialize_report = worker.execute(
-        Batch(step_id=2, admissions=(), operations=(materialize,), input_products=())
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(materialize,),
+            controls=(commit,),
+            input_products=(),
+        )
     )
     assert materialize_report.completions[0].logical_lengths.kv_visible_len == 0
     assert materialize_report.completions[0].selected_point == 1
@@ -583,10 +638,11 @@ def test_generated_feedback_advances_state_only_in_visual_token_extend():
     encode, _ = encode_operation(
         admission.request_key,
         op_id=3,
-        parent=worker.sessions.get(6).committed_version(),
+        parent=commit.selected,
         image_base64=None,
         encoder_handle=10,
         source_product=materialize.outputs[1],
+        control_seq=commit.control_seq,
     )
     encode_report = worker.execute(
         Batch(step_id=3, admissions=(), operations=(encode,), input_products=())
@@ -599,9 +655,10 @@ def test_generated_feedback_advances_state_only_in_visual_token_extend():
     state = visual_state_operation(
         admission.request_key,
         op_id=4,
-        parent=worker.sessions.get(6).committed_version(),
+        parent=commit.selected,
         feature=encode.outputs[0],
         sample_continuation=True,
+        control_seq=commit.control_seq,
     )
     report = worker.execute(Batch(step_id=4, admissions=(), operations=(state,), input_products=()))
 

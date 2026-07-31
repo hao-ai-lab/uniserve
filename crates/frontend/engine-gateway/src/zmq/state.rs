@@ -170,6 +170,12 @@ impl RequestRegistry {
         by_engine
     }
 
+    pub(crate) fn engine_for_request(&self, request_id: &str) -> Option<EngineId> {
+        self.requests
+            .get(request_id)
+            .map(|tracked| tracked.engine_id.clone())
+    }
+
     /// Obtain the stream sender for one output. If it indicates the request is
     /// finished, it will be removed from the registry.
     pub(crate) fn sender_for_output(&mut self, output: &EngineCoreOutput) -> Option<OutputSender> {

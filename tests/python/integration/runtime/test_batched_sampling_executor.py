@@ -13,7 +13,12 @@ from dataclasses import replace
 
 import pytest
 
-from tests.python.fixtures.depth_one import root_parent, token_operation, und_admission
+from tests.python.fixtures.depth_one import (
+    commit_resolved,
+    root_parent,
+    token_operation,
+    und_admission,
+)
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
@@ -191,17 +196,21 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
 
     decode_ops = []
     decode_inputs = []
+    commits = []
     for index, admission in enumerate(admissions):
         session_id = admission.request_key.session_id
+        commit = commit_resolved(worker.sessions.get(session_id))
         operation, payload = token_operation(
             admission.request_key,
             op_id=3 + index,
-            parent=worker.sessions.get(session_id).committed_version(),
+            parent=commit.selected,
             mode=TokenMode.DECODE,
             tokens=(_next_token(4),),
+            control_seq=commit.control_seq,
         )
         decode_ops.append(operation)
         decode_inputs.append(payload)
+        commits.append(commit)
     observed = _observe_sample_batches(monkeypatch)
 
     result = worker.execute(
@@ -209,6 +218,7 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
             step_id=9,
             admissions=(),
             operations=tuple(decode_ops),
+            controls=tuple(commits),
             input_products=tuple(decode_inputs),
         )
     )
@@ -325,18 +335,26 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
             step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
         )
     )
+    commit = commit_resolved(worker.sessions.get(4))
     verify, verify_input = token_operation(
         admission.request_key,
         op_id=2,
-        parent=worker.sessions.get(4).committed_version(),
+        parent=commit.selected,
         mode=TokenMode.VERIFY,
         tokens=(1000, 1001, STUB_IMG_START_TOKEN_ID),
         logprobs=True,
+        control_seq=commit.control_seq,
     )
     observed = _observe_sample_batches(monkeypatch)
 
     result = worker.execute(
-        Batch(step_id=2, admissions=(), operations=(verify,), input_products=(verify_input,))
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(verify,),
+            controls=(commit,),
+            input_products=(verify_input,),
+        )
     )
     committed = result.completions[0].committed_tokens
 
@@ -367,19 +385,22 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
             input_products=(first_input,),
         )
     )
+    commit = commit_resolved(worker.sessions.get(31))
     second, second_input = token_operation(
         admission.request_key,
         op_id=2,
-        parent=worker.sessions.get(31).committed_version(),
+        parent=commit.selected,
         mode=TokenMode.EXTEND,
         tokens=(5, 6),
         logprobs=True,
+        control_seq=commit.control_seq,
     )
     second_result = worker.execute(
         Batch(
             step_id=2,
             admissions=(),
             operations=(second,),
+            controls=(commit,),
             input_products=(second_input,),
         )
     )

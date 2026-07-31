@@ -23,8 +23,7 @@ fn main() {
     let handle = EngineHandle::new(cmd_tx);
     let jh = thread::spawn(move || sched.run(cmd_rx));
 
-    let mut rxs: HashMap<RequestId, (String, tokio::sync::mpsc::UnboundedReceiver<GenEvent>)> =
-        HashMap::new();
+    let mut rxs: HashMap<RequestId, (String, uniserve_engine_api::EventRx)> = HashMap::new();
     let mut next_id = 1u64;
     let mut mk = |constraint: GenerationConstraint| {
         let id = RequestId(next_id);

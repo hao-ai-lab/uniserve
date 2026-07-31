@@ -22,7 +22,7 @@ use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
 use uniserve_worker_ipc::{UniprocExecutor, WorkerLaunchConfig};
 
-type Rxs = HashMap<RequestId, tokio::sync::mpsc::UnboundedReceiver<GenEvent>>;
+type Rxs = HashMap<RequestId, uniserve_engine_api::EventRx>;
 
 fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<()> {
     let constraint = GenerationConstraint::UndOnly;

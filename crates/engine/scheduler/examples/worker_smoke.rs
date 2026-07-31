@@ -40,8 +40,7 @@ fn main() -> anyhow::Result<()> {
     };
     let mut sched = Scheduler::new(Box::new(engine), ctrl, 32);
 
-    let mut rxs: HashMap<RequestId, (&str, tokio::sync::mpsc::UnboundedReceiver<GenEvent>)> =
-        HashMap::new();
+    let mut rxs: HashMap<RequestId, (&str, uniserve_engine_api::EventRx)> = HashMap::new();
     // we drive step directly here instead of the run thread
     let mut reqs = Vec::new();
     let mk = |id: u64, constraint: GenerationConstraint| generation_request(id, constraint);

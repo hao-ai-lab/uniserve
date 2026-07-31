@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..capabilities import RequestKind
@@ -12,6 +13,47 @@ if TYPE_CHECKING:
     from .app import WorkerServer
 
 __all__ = ["WorkerIpcTransport", "WorkerServeLoop"]
+
+
+def _request_session_ids(request: Mapping[str, Any]) -> frozenset[int]:
+    sessions: set[int] = set()
+    direct_session = request.get("session_id")
+    if isinstance(direct_session, int) and not isinstance(direct_session, bool):
+        sessions.add(direct_session)
+    batch = request.get("batch")
+    groups: tuple[object, ...]
+    if isinstance(batch, Mapping):
+        groups = (
+            batch.get("admissions", ()),
+            batch.get("operations", ()),
+            batch.get("controls", ()),
+        )
+    elif batch is not None:
+        groups = (
+            getattr(batch, "admissions", ()),
+            getattr(batch, "operations", ()),
+            getattr(batch, "controls", ()),
+        )
+    else:
+        groups = ()
+    for group in groups:
+        if not isinstance(group, Sequence):
+            continue
+        for item in group:
+            value = item.get("value", item) if isinstance(item, Mapping) else item
+            request_key = (
+                value.get("request_key")
+                if isinstance(value, Mapping)
+                else getattr(value, "request_key", None)
+            )
+            session_id = (
+                request_key.get("session_id")
+                if isinstance(request_key, Mapping)
+                else getattr(request_key, "session_id", None)
+            )
+            if isinstance(session_id, int) and not isinstance(session_id, bool):
+                sessions.add(session_id)
+    return frozenset(sessions)
 
 
 class WorkerIpcTransport(Protocol):
@@ -76,11 +118,15 @@ class WorkerServeLoop:
     def _respond_ready(self) -> bool:
         from .app import _response_ready
 
-        for index, (_request, response) in enumerate(self.inflight):
-            if _response_ready(response):
+        earlier_sessions: set[int] = set()
+        for index, (request, response) in enumerate(self.inflight):
+            request_sessions = _request_session_ids(request)
+            lineage_ready = earlier_sessions.isdisjoint(request_sessions)
+            if lineage_ready and _response_ready(response):
                 del self.inflight[index]
                 self.worker_server.respond(response)
                 return True
+            earlier_sessions.update(request_sessions)
         return False
 
     def _receive(self) -> dict[str, Any]:

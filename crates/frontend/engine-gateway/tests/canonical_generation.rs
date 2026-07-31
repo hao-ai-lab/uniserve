@@ -13,7 +13,7 @@ use uniserve_engine_gateway::protocol::{
 };
 use uniserve_engine_gateway::{
     EngineCoreClient, EngineGateway, GenEvent, GenerationFinishReason, GenerationSubmission,
-    MockClientMessage,
+    MockClientMessage, StreamCancelCause,
 };
 
 fn text_request() -> GenerationRequest {
@@ -131,5 +131,53 @@ async fn cancellation_and_abort_use_distinct_controls() {
         Some(MockClientMessage::Abort(ids)) if ids == ["aborted-request"]
     ));
 
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn decoder_prefix_decisions_preserve_exact_stream_controls() {
+    let (client, mut engine) = EngineCoreClient::connect_mock("test-model");
+    let gateway = EngineGateway::new(client);
+    let mut request = text_request();
+    request.stop_strings = vec!["boundary".to_string()];
+    let mut events = gateway
+        .submit_generation(GenerationSubmission::new("stop-request", request))
+        .await
+        .unwrap();
+    let request = engine.recv_request().await;
+
+    for token_id in [31, 32] {
+        engine.send_outputs(EngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: request.request_id.clone(),
+                new_token_ids: vec![token_id],
+                ..EngineCoreOutput::default()
+            }],
+            ..EngineCoreOutputs::default()
+        });
+        assert!(matches!(
+            events.next().await,
+            Some(GenEvent::TextToken { id, .. }) if id == token_id
+        ));
+        if token_id == 31 {
+            events.acknowledge_text_prefix();
+            assert!(matches!(
+                engine.recv().await,
+                Some(MockClientMessage::Acknowledge {
+                    request_id,
+                    output_token_count: 1,
+                }) if request_id == "stop-request"
+            ));
+        }
+    }
+
+    events.cancel_at_consumed_prefix(StreamCancelCause::StopStringMatched);
+    assert!(matches!(
+        engine.recv().await,
+        Some(MockClientMessage::StopAt {
+            request_id,
+            output_token_count: 2,
+        }) if request_id == "stop-request"
+    ));
     gateway.shutdown().await.unwrap();
 }

@@ -9,7 +9,12 @@
 //! masking code never changes. This also leaves the clean insertion point for
 //! guided decoding (out of scope) without committing to it.
 
+use std::sync::Arc;
 use uniserve_core::SamplingParams;
+
+const TOKEN_ID_OUTPUT_BOUND: usize = u32::MAX as usize;
+pub type TokenMask = Option<Vec<u32>>;
+pub type ProcessorMasks = (TokenMask, TokenMask);
 
 /// Per-request, per-step context a processor inspects.
 pub struct ProcCtx<'a> {
@@ -28,8 +33,17 @@ pub struct MaskContribution {
     pub suppress: Vec<u32>,
 }
 
-pub trait LogitsProcessor: Send {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessorDeclaration {
+    pub snapshotable: bool,
+    pub deterministic: bool,
+    pub max_output_tokens: usize,
+    pub max_outstanding_tasks: usize,
+}
+
+pub trait LogitsProcessor: Send + Sync {
     fn name(&self) -> &'static str;
+    fn declaration(&self) -> ProcessorDeclaration;
     /// the reference `is_argmax_invariant`: whether the processor can change the argmax.
     fn is_argmax_invariant(&self) -> bool;
     fn contribute(&self, ctx: &ProcCtx) -> MaskContribution;
@@ -41,6 +55,14 @@ pub struct MinTokensProcessor;
 impl LogitsProcessor for MinTokensProcessor {
     fn name(&self) -> &'static str {
         "min_tokens"
+    }
+    fn declaration(&self) -> ProcessorDeclaration {
+        ProcessorDeclaration {
+            snapshotable: true,
+            deterministic: true,
+            max_output_tokens: TOKEN_ID_OUTPUT_BOUND,
+            max_outstanding_tasks: 1,
+        }
     }
     fn is_argmax_invariant(&self) -> bool {
         false
@@ -59,6 +81,14 @@ pub struct BadWordsProcessor;
 impl LogitsProcessor for BadWordsProcessor {
     fn name(&self) -> &'static str {
         "bad_words"
+    }
+    fn declaration(&self) -> ProcessorDeclaration {
+        ProcessorDeclaration {
+            snapshotable: true,
+            deterministic: true,
+            max_output_tokens: TOKEN_ID_OUTPUT_BOUND,
+            max_outstanding_tasks: 1,
+        }
     }
     fn is_argmax_invariant(&self) -> bool {
         false
@@ -84,6 +114,14 @@ impl LogitsProcessor for AllowedTokensProcessor {
     fn name(&self) -> &'static str {
         "allowed_tokens"
     }
+    fn declaration(&self) -> ProcessorDeclaration {
+        ProcessorDeclaration {
+            snapshotable: true,
+            deterministic: true,
+            max_output_tokens: TOKEN_ID_OUTPUT_BOUND,
+            max_outstanding_tasks: 1,
+        }
+    }
     fn is_argmax_invariant(&self) -> bool {
         false
     }
@@ -96,19 +134,16 @@ impl LogitsProcessor for AllowedTokensProcessor {
 }
 
 /// The default control-flow pipeline (order matches the reference non-argmax-invariant set).
-pub fn default_pipeline() -> Vec<Box<dyn LogitsProcessor>> {
+pub fn default_pipeline() -> Vec<Arc<dyn LogitsProcessor>> {
     vec![
-        Box::new(MinTokensProcessor),
-        Box::new(BadWordsProcessor),
-        Box::new(AllowedTokensProcessor),
+        Arc::new(MinTokensProcessor),
+        Arc::new(BadWordsProcessor),
+        Arc::new(AllowedTokensProcessor),
     ]
 }
 
 /// Merge all processors' contributions into a single `(allowed, suppress)` pair.
-pub fn run_pipeline(
-    pipeline: &[Box<dyn LogitsProcessor>],
-    ctx: &ProcCtx,
-) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
+pub fn run_pipeline(pipeline: &[Arc<dyn LogitsProcessor>], ctx: &ProcCtx) -> ProcessorMasks {
     let mut allowed: Option<Vec<u32>> = None;
     let mut suppress: Vec<u32> = Vec::new();
     for p in pipeline {
@@ -129,6 +164,49 @@ pub fn run_pipeline(
         Some(suppress)
     };
     (allowed, suppress)
+}
+
+pub(crate) fn run_pipeline_checked(
+    pipeline: &[Arc<dyn LogitsProcessor>],
+    ctx: &ProcCtx,
+) -> Result<ProcessorMasks, String> {
+    let mut allowed: Option<Vec<u32>> = None;
+    let mut suppress = Vec::new();
+    for processor in pipeline {
+        let contribution = processor.contribute(ctx);
+        let declaration = processor.declaration();
+        let output_tokens = contribution
+            .allowed
+            .as_ref()
+            .map_or(0, Vec::len)
+            .saturating_add(contribution.suppress.len());
+        if output_tokens > declaration.max_output_tokens {
+            return Err(format!(
+                "logits processor `{}` exceeded its declared output bound",
+                processor.name()
+            ));
+        }
+        if let Some(tokens) = contribution.allowed {
+            allowed = Some(match allowed {
+                None => tokens,
+                Some(previous) => previous
+                    .into_iter()
+                    .filter(|token| tokens.contains(token))
+                    .collect(),
+            });
+        }
+        suppress.extend(contribution.suppress);
+    }
+    suppress.sort_unstable();
+    suppress.dedup();
+    Ok((
+        allowed,
+        if suppress.is_empty() {
+            None
+        } else {
+            Some(suppress)
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -197,6 +275,14 @@ mod tests {
             fn name(&self) -> &'static str {
                 "ban_zero"
             }
+            fn declaration(&self) -> ProcessorDeclaration {
+                ProcessorDeclaration {
+                    snapshotable: true,
+                    deterministic: true,
+                    max_output_tokens: 1,
+                    max_outstanding_tasks: 1,
+                }
+            }
             fn is_argmax_invariant(&self) -> bool {
                 false
             }
@@ -208,7 +294,7 @@ mod tests {
             }
         }
         let mut pipe = default_pipeline();
-        pipe.push(Box::new(BanZero));
+        pipe.push(Arc::new(BanZero));
         let sp = SamplingParams {
             min_tokens: 3,
             ..Default::default()

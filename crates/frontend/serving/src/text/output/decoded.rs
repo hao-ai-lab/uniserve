@@ -188,6 +188,9 @@ pub async fn decoded_text_event_stream(
                 }
             }
             if let Some((stop_string, offset)) = decoded.stop {
+                raw_stream.cancel_at_consumed_prefix(
+                    uniserve_engine_gateway::transport::StreamCancelCause::StopStringMatched,
+                );
                 let truncate_to = Some(if decode_options.include_stop_str_in_output {
                     offset + stop_string.len()
                 } else {
@@ -218,6 +221,7 @@ pub async fn decoded_text_event_stream(
                 .await;
                 return Ok(());
             }
+            raw_stream.acknowledge_text_prefix();
             if intermediate {
                 y.yield_ok(DecodedTextEvent::TextDelta {
                     delta: decoded.delta,

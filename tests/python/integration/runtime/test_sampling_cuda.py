@@ -8,6 +8,7 @@ import torch
 
 from uniserve_worker.batch import Operation, SamplingParams
 from uniserve_worker.execution.executor import (
+    SAMPLING_COMPLETION_FIELDS,
     _sample_task_batch,
     _SampleTask,
     _sampling_task_tensors,
@@ -82,7 +83,11 @@ def test_supported_device_sampling_returns_before_any_host_scalar_observation(
             13,
         ),
     )
-    warm_arena = CompletionArena(depth=1, token_capacity=3, devices=(device,))
+    warm_arena = CompletionArena(
+        depth=1,
+        token_capacity=SAMPLING_COMPLETION_FIELDS,
+        devices=(device,),
+    )
     warm_lease = warm_arena.reserve(1, devices=(device,))
     warm_sample = _sample_task_batch((tasks[3],), warm_lease)[0]
     warm_lease.seal()

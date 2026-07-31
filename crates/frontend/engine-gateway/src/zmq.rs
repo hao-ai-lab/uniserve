@@ -15,7 +15,7 @@ use tracing::{debug, info, trace};
 use uniserve_core::GenerationRuntimeCapabilities;
 use uniserve_engine_wire::generation::GenerationControlTokens;
 
-use crate::client::{EngineCoreOutputStream, StreamCancelRequest};
+use crate::client::{EngineCoreOutputStream, StreamControlRequest};
 use crate::error::{Error, Result};
 use crate::generation::{
     GenerationEventStream, generation_event_stream_from_wire, generation_request_to_wire,
@@ -24,7 +24,7 @@ use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
 use crate::protocol::utility::EngineCoreUtilityRequest;
 use crate::protocol::{EngineCoreControlRequest, EngineCoreRequest, ModelDtype};
-use crate::zmq::imp::{ClientInner, run_output_dispatcher_loop, run_stream_cancel_loop};
+use crate::zmq::imp::{ClientInner, run_output_dispatcher_loop, run_stream_control_loop};
 
 pub(crate) mod imp;
 pub(crate) mod state;
@@ -124,12 +124,12 @@ pub struct ZmqEngineCoreClient {
     output_address: String,
     engines: Vec<ConnectedEngine>,
     inner: Arc<ClientInner>,
-    cancel_tx: mpsc::UnboundedSender<StreamCancelRequest>,
+    control_tx: mpsc::UnboundedSender<StreamControlRequest>,
 
     // Background tasks
     output_task: AbortOnDropHandle<()>,
     dispatcher_task: AbortOnDropHandle<()>,
-    cancel_task: AbortOnDropHandle<()>,
+    control_task: AbortOnDropHandle<()>,
 }
 
 impl ZmqEngineCoreClient {
@@ -177,7 +177,7 @@ impl ZmqEngineCoreClient {
         };
 
         let (output_tx, output_rx) = mpsc::channel(64);
-        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
         let engines = connected.engines;
         let inner = Arc::new(ClientInner::new(
             connected.input_send,
@@ -192,9 +192,9 @@ impl ZmqEngineCoreClient {
             Arc::clone(&inner),
             output_rx,
         )));
-        let cancel_task = AbortOnDropHandle::new(tokio::spawn(run_stream_cancel_loop(
+        let control_task = AbortOnDropHandle::new(tokio::spawn(run_stream_control_loop(
             Arc::clone(&inner),
-            cancel_rx,
+            control_rx,
         )));
 
         Ok(Self {
@@ -203,10 +203,10 @@ impl ZmqEngineCoreClient {
             output_address: connected.output_address,
             engines,
             inner,
-            cancel_tx,
+            control_tx,
             output_task,
             dispatcher_task,
-            cancel_task,
+            control_task,
         })
     }
 
@@ -346,6 +346,7 @@ impl ZmqEngineCoreClient {
     pub async fn call(&self, mut req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
         req.client_index = self.config.client_index;
         req.validate()?;
+        let acknowledge_on_receive = req.generation.stop_strings.is_empty();
         trace!(
             request_id = %req.request_id,
             client_index = req.client_index,
@@ -376,8 +377,9 @@ impl ZmqEngineCoreClient {
 
         Ok(EngineCoreOutputStream::new(
             request_id,
-            self.cancel_tx.clone(),
+            self.control_tx.clone(),
             rx,
+            acknowledge_on_receive,
         ))
     }
 
@@ -387,9 +389,13 @@ impl ZmqEngineCoreClient {
         &self,
         submission: crate::generation::GenerationSubmission,
     ) -> Result<GenerationEventStream> {
+        let decoder_ack_required = !submission.request.stop_strings.is_empty();
         let wire = generation_request_to_wire(submission);
         let stream = self.call(wire).await?;
-        Ok(generation_event_stream_from_wire(stream))
+        Ok(generation_event_stream_from_wire(
+            stream,
+            decoder_ack_required,
+        ))
     }
 
     /// Abort currently in-flight requests by request ID.
@@ -615,19 +621,19 @@ impl ZmqEngineCoreClient {
     pub async fn shutdown(self) -> Result<()> {
         let Self {
             inner,
-            cancel_tx,
+            control_tx,
             output_task,
             dispatcher_task,
-            cancel_task,
+            control_task,
             ..
         } = self;
 
         info!("shutting down engine client");
         inner.shutdown();
-        drop(cancel_tx);
+        drop(control_tx);
 
         // Abort all client tasks first, then await them, in dependency order.
-        let tasks = vec![cancel_task, dispatcher_task, output_task];
+        let tasks = vec![control_task, dispatcher_task, output_task];
         tasks.iter().for_each(|t| t.abort());
         join_all(tasks).await;
 

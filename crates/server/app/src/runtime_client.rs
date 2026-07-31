@@ -10,7 +10,8 @@ use uniserve_engine_gateway::transport::protocol::EngineCoreRequest;
 use uniserve_engine_gateway::transport::protocol::lora::LoraRequest;
 use uniserve_engine_gateway::transport::{
     EngineCoreOutputStream, EngineCoreStreamOutput, Error, GenerationEventStream,
-    GenerationSubmission, InProcessEngineClient, Result, StreamCancelRequest,
+    GenerationSubmission, InProcessEngineClient, Result, StreamCancelCause, StreamControl,
+    StreamControlRequest,
 };
 use uniserve_engine_runtime::EngineCore;
 use uniserve_engine_wire::translate::{AdapterParams, run_event_adapter, to_generation_request};
@@ -29,7 +30,7 @@ fn now_secs() -> f64 {
 pub(crate) struct RuntimeEngineClient {
     core: Arc<EngineCore>,
     active: SharedActiveRequests,
-    cancel_tx: mpsc::UnboundedSender<StreamCancelRequest>,
+    control_tx: mpsc::UnboundedSender<StreamControlRequest>,
     _stats_guard: Arc<()>,
 }
 
@@ -69,17 +70,34 @@ impl RuntimeEngineClient {
         let core = Arc::new(core);
 
         let active: SharedActiveRequests = Arc::new(Mutex::new(HashMap::new()));
-        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<StreamCancelRequest>();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<StreamControlRequest>();
 
         {
             let handle = core.handle();
             let active = Arc::clone(&active);
             tokio::spawn(async move {
-                while let Some(req) = cancel_rx.recv().await {
+                while let Some(req) = control_rx.recv().await {
                     let rid = lock_active(&active).get(&req.request_id).copied();
                     if let Some(rid) = rid {
-                        debug!(request_id = req.request_id, ?req.cause, "cancelling request");
-                        handle.cancel(rid);
+                        match req.control {
+                            StreamControl::Cancel {
+                                cause,
+                                output_token_count,
+                            } => {
+                                debug!(request_id = req.request_id, ?cause, "cancelling request");
+                                match cause {
+                                    StreamCancelCause::StopStringMatched => {
+                                        handle.stop_at(rid, output_token_count);
+                                    }
+                                    StreamCancelCause::DroppedStream => {
+                                        handle.cancel_at(rid, output_token_count);
+                                    }
+                                }
+                            }
+                            StreamControl::Acknowledge { output_token_count } => {
+                                handle.acknowledge_at(rid, output_token_count);
+                            }
+                        }
                     }
                 }
             });
@@ -114,7 +132,7 @@ impl RuntimeEngineClient {
         Ok(Self {
             core,
             active,
-            cancel_tx,
+            control_tx,
             _stats_guard: stats_guard,
         })
     }
@@ -159,6 +177,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
 
     fn call(&self, req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
         let request_id = req.request_id.clone();
+        let acknowledge_on_receive = req.generation.stop_strings.is_empty();
         let rid = self.core.next_request_id();
         lock_active(&self.active).insert(request_id.clone(), rid);
 
@@ -173,12 +192,13 @@ impl InProcessEngineClient for RuntimeEngineClient {
                 message: error.to_string(),
             }
         })?;
-        let event_rx = self.core.submit(generate).map_err(|e| {
+        let mut event_rx = self.core.submit(generate).map_err(|e| {
             lock_active(&self.active).remove(&request_id);
             Error::ClientClosed {
                 message: e.to_string(),
             }
         })?;
+        event_rx.delegate_cancellation();
 
         let (out_tx, out_rx) = mpsc::channel::<Result<EngineCoreStreamOutput>>(
             EngineCoreOutputStream::BUFFER_CAPACITY,
@@ -205,8 +225,9 @@ impl InProcessEngineClient for RuntimeEngineClient {
 
         Ok(EngineCoreOutputStream::new(
             request_id,
-            self.cancel_tx.clone(),
+            self.control_tx.clone(),
             out_rx,
+            acknowledge_on_receive,
         ))
     }
 
@@ -217,6 +238,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
             ..
         } = submission;
         let rid = self.core.next_request_id();
+        let decoder_ack_required = !request.stop_strings.is_empty();
         request.request_id = rid;
         lock_active(&self.active).insert(external_request_id.clone(), rid);
         let mut scheduler_rx = self.core.submit(request).map_err(|e| {
@@ -225,6 +247,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
                 message: e.to_string(),
             }
         })?;
+        scheduler_rx.delegate_cancellation();
         let (event_tx, event_rx) = mpsc::channel::<GenEvent>(
             uniserve_engine_gateway::generation::GENERATION_EVENT_BUFFER_CAPACITY,
         );
@@ -245,10 +268,25 @@ impl InProcessEngineClient for RuntimeEngineClient {
         let handle = self.handle();
         let active = Arc::clone(&self.active);
         let active_id = external_request_id;
-        Ok(GenerationEventStream::with_cancel(event_rx, move || {
-            handle.cancel(rid);
-            lock_active(&active).remove(&active_id);
-        }))
+        let acknowledge_handle = handle.clone();
+        Ok(GenerationEventStream::with_control_policy(
+            event_rx,
+            move |cause, output_token_count| {
+                match cause {
+                    StreamCancelCause::StopStringMatched => {
+                        handle.stop_at(rid, output_token_count);
+                    }
+                    StreamCancelCause::DroppedStream => {
+                        handle.cancel_at(rid, output_token_count);
+                    }
+                }
+                lock_active(&active).remove(&active_id);
+            },
+            move |output_token_count| {
+                acknowledge_handle.acknowledge_at(rid, output_token_count);
+            },
+            !decoder_ack_required,
+        ))
     }
 
     fn abort(&self, ids: &[String]) -> Result<()> {

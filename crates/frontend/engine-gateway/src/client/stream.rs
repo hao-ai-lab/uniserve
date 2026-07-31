@@ -8,7 +8,7 @@ use thiserror_ext::AsReport as _;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-use crate::client::StreamCancelRequest;
+use crate::client::{StreamControl, StreamControlRequest};
 use crate::protocol::{EngineCoreFinishReason, EngineCoreOutput};
 use crate::{Error, Result, StreamCancelCause};
 
@@ -44,7 +44,9 @@ impl Deref for EngineCoreStreamOutput {
 /// `finish_reason` is non-`None`.
 pub struct EngineCoreOutputStream {
     request_id: String,
-    cancel_tx: mpsc::UnboundedSender<StreamCancelRequest>,
+    control_tx: mpsc::UnboundedSender<StreamControlRequest>,
+    output_token_count: usize,
+    acknowledge_on_receive: bool,
     state: State,
     rx: mpsc::Receiver<Result<EngineCoreStreamOutput>>,
 }
@@ -54,12 +56,15 @@ impl EngineCoreOutputStream {
 
     pub fn new(
         request_id: String,
-        cancel_tx: mpsc::UnboundedSender<StreamCancelRequest>,
+        control_tx: mpsc::UnboundedSender<StreamControlRequest>,
         rx: mpsc::Receiver<Result<EngineCoreStreamOutput>>,
+        acknowledge_on_receive: bool,
     ) -> Self {
         Self {
             request_id,
-            cancel_tx,
+            control_tx,
+            output_token_count: 0,
+            acknowledge_on_receive,
             state: State::Running,
             rx,
         }
@@ -68,6 +73,44 @@ impl EngineCoreOutputStream {
     /// Return the engine-wire `request_id` bound to this stream.
     pub fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    pub(crate) fn cancel_at(&mut self, cause: StreamCancelCause, output_token_count: usize) {
+        if self.is_terminated() {
+            return;
+        }
+        let control_request = StreamControlRequest {
+            request_id: self.request_id.clone(),
+            control: StreamControl::Cancel {
+                cause,
+                output_token_count,
+            },
+        };
+        if self.control_tx.send(control_request).is_err() {
+            warn!(
+                request_id = self.request_id,
+                "stream-cancellation worker already shut down; skip cancellation"
+            );
+        }
+        self.state = State::Finished;
+    }
+
+    pub(crate) fn acknowledge_at(&self, output_token_count: usize) {
+        let control_request = StreamControlRequest {
+            request_id: self.request_id.clone(),
+            control: StreamControl::Acknowledge { output_token_count },
+        };
+        if self.control_tx.send(control_request).is_err() {
+            warn!(
+                request_id = self.request_id,
+                "stream-control worker already shut down; skip semantic acknowledgement"
+            );
+        }
+    }
+
+    /// Transfer prefix acknowledgement to a downstream canonical decoder.
+    pub(crate) fn delegate_acknowledgement(&mut self) {
+        self.acknowledge_on_receive = false;
     }
 }
 
@@ -84,6 +127,12 @@ impl Stream for EngineCoreOutputStream {
             Poll::Ready(Some(item)) => {
                 match &item {
                     Ok(output) => {
+                        self.output_token_count = self
+                            .output_token_count
+                            .saturating_add(output.output.new_token_ids.len());
+                        if self.acknowledge_on_receive && !output.output.new_token_ids.is_empty() {
+                            self.acknowledge_at(self.output_token_count);
+                        }
                         // If the output indicates the request is finished, mark the stream as
                         // terminated with cleanly-finished state and expect no more outputs to
                         // come.
@@ -139,16 +188,6 @@ impl Drop for EngineCoreOutputStream {
             return;
         }
 
-        let cancel_request = StreamCancelRequest {
-            request_id: self.request_id.clone(),
-            cause: StreamCancelCause::current(),
-        };
-
-        if self.cancel_tx.send(cancel_request).is_err() {
-            warn!(
-                request_id = self.request_id,
-                "stream-cancellation worker already shut down; skip cancellation"
-            );
-        }
+        self.cancel_at(StreamCancelCause::current(), self.output_token_count);
     }
 }

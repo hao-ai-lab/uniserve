@@ -1390,6 +1390,17 @@ class CompletionRecord:
                 raise invalid_descriptor("an error completion must carry an error code")
         elif self.error_code is not None:
             raise invalid_descriptor("a non-error completion must not carry an error code")
+        if self.status is OpStatus.PREDICATED and (
+            self.token_span.len != 0
+            or self.committed_tokens
+            or self.product_generations
+            or self.finish_flags.eos
+            or self.finish_flags.length
+            or self.finish_flags.stop
+        ):
+            raise invalid_descriptor(
+                "a predicated completion must select its parent without semantic output"
+            )
 
     @classmethod
     def from_wire(cls, value: object, where: str = "completion") -> CompletionRecord:
