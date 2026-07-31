@@ -4,20 +4,23 @@
 # Runs the fixed triplet (Qwen3 ShareGPT r16, SenseNova T2I c32, SenseNova I2T c32) on the
 # frozen candidate tree and classifies every required metric against the immutable anchor
 # (and, when provided, the previous accepted checkpoint) via scripts/checkpoint_controller.py.
-# With --major-boundary it additionally requires the SenseNova UEval interleave c4 point.
+# With --major-boundary it additionally requires SenseNova default travel and, at the
+# CP5, CP7, and CP8 boundaries, the SenseNova UEval interleave c4 point.
 #
-# Usage: checkpoint_gate.sh <checkpoint-id> [--previous <dir>] [--major-boundary]
+# Usage: checkpoint_gate.sh <checkpoint-id> [--previous <dir>] [--major-boundary] [--previous-major <dir>]
 # Example: checkpoint_gate.sh cp1
 set -euo pipefail
 cd /home/hal-ysun/uniserve-dev
 
 CP="${1:?checkpoint id, e.g. cp1}"; shift || true
 PREVIOUS=""
-MAJOR=""
+PREVIOUS_MAJOR=""
+MAJOR=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --previous) PREVIOUS="$2"; shift 2;;
-    --major-boundary) MAJOR="--major-boundary"; shift;;
+    --previous-major) PREVIOUS_MAJOR="$2"; shift 2;;
+    --major-boundary) MAJOR=1; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
@@ -51,13 +54,26 @@ BENCHES="qwen-uniserve-sharegpt-r16,sensenova-uniserve-t2i-c32,sensenova-uniserv
 # NB: not GROUPS -- that is a read-only bash special array (the caller's unix groups);
 # assigning to it is silently ignored and "$GROUPS" expands to the primary gid.
 SERVER_GROUPS="qwen-uniserve,sensenova-uniserve"
-if [ -n "$MAJOR" ]; then BENCHES="${BENCHES},sensenova-uniserve-interleave-c4"; fi
+if [ "$MAJOR" -eq 1 ] && [[ "$CP" =~ ^cp(5|7|8)$ ]]; then
+  BENCHES="${BENCHES},sensenova-uniserve-interleave-c4"
+fi
 
 rm -rf "$ROOT"
 .venv/bin/python scripts/run_benchmarks.py --benchmark main --output-root "$ROOT" \
   --only "$SERVER_GROUPS" --only-bench "$BENCHES" --require-clean-gpu
 
-ARGS=(--checkpoint "$CP" --candidate-root "$ROOT" --anchor-root "$ANCHOR" --out "$ACCEPT" $MAJOR)
+ARGS=(--checkpoint "$CP" --candidate-root "$ROOT" --anchor-root "$ANCHOR" --out "$ACCEPT")
+if [ "$MAJOR" -eq 1 ]; then
+  DEFAULT_TRAVEL="${ROOT}/default_travel"
+  .venv/bin/uniserve-eval clean gate/server/sensenova
+  trap '.venv/bin/uniserve-eval clean gate/server/sensenova' EXIT
+  .venv/bin/uniserve-eval launch gate/server/sensenova --timeout-s 1800
+  .venv/bin/uniserve-eval verify gate/sensenova/default-travel --output-dir "$DEFAULT_TRAVEL"
+  .venv/bin/uniserve-eval clean gate/server/sensenova
+  trap - EXIT
+  ARGS+=(--major-boundary --default-travel-dir "$DEFAULT_TRAVEL")
+fi
 if [ -n "$PREVIOUS" ]; then ARGS+=(--previous-root "$PREVIOUS"); fi
+if [ -n "$PREVIOUS_MAJOR" ]; then ARGS+=(--previous-major-root "$PREVIOUS_MAJOR"); fi
 .venv/bin/python scripts/checkpoint_controller.py "${ARGS[@]}"
 echo "acceptance artifact: $ACCEPT/acceptance.md"

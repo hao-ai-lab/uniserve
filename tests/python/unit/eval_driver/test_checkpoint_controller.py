@@ -59,7 +59,7 @@ def _write_point(
     generation_valid: bool = True,
     interleave_valid: bool | None = None,
     head: str = "0" * 40,
-    dirty: bool = False,
+    dirty: bool | None = False,
     dataset_revision: str = "d" * 40,
     load_case: str = "c32",
 ) -> Path:
@@ -188,6 +188,35 @@ def _triplet(
     )
 
 
+def _write_default_travel(
+    directory: Path,
+    *,
+    head: str,
+    elapsed_s: float = 42.0,
+    dirty: bool = False,
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "elapsed_s": elapsed_s,
+        "artifact": {
+            "valid": True,
+            "valid_marker": "verify-valid-v1",
+            "checks": {
+                "error_free": True,
+                "image_steps_per_image": True,
+                "finish_reason": True,
+                "image_dimensions": True,
+            },
+            "provenance": {
+                "source_state": {"head": head, "dirty": dirty},
+                "profile_contract": {"workload": "gate/sensenova/default-travel"},
+            },
+        },
+    }
+    (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return directory
+
+
 @pytest.mark.parametrize(
     ("candidate", "baseline", "objective", "expected"),
     [
@@ -302,6 +331,7 @@ def test_hard_gate_accepts_complete_valid_point(tmp_path: Path) -> None:
         ({"valid": False}, "artifact_invalid"),
         ({"generation_valid": False}, "generation_conformance_invalid"),
         ({"dirty": True}, "source_tree_dirty"),
+        ({"dirty": None}, "source_tree_dirty"),
     ],
 )
 def test_hard_gate_rejects_invalid_candidate_evidence(
@@ -510,13 +540,18 @@ def test_major_boundary_uses_the_same_performance_limit(tmp_path: Path) -> None:
         head="b" * 40,
         load_case="c4",
     )
+    default_travel = _write_default_travel(
+        tmp_path / "candidate_default_travel",
+        head="b" * 40,
+    )
 
     report = cc.evaluate_checkpoint(
         tmp_path / "candidate",
         tmp_path / "anchor",
         None,
-        checkpoint="cp3",
+        checkpoint="cp5",
         major_boundary=True,
+        default_travel_dir=default_travel,
     )
 
     assert report.verdict == "pass"
@@ -534,6 +569,175 @@ def test_major_boundary_uses_the_same_performance_limit(tmp_path: Path) -> None:
         "text_to_image_transition_mean_ms",
         "image_to_text_transition_mean_ms",
     }
+
+
+def test_later_ueval_boundary_compares_the_previous_major_point(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="b" * 40,
+    )
+    metrics = _interleave_metrics(
+        ttft=100.0,
+        tpot=10.0,
+        image_latency=1000.0,
+        transition=2000.0,
+        text_to_image=3000.0,
+        image_to_text=5.0,
+    )
+    _write_point(
+        tmp_path / "anchor" / "sensenova_ueval_interleave" / "uniserve_c4",
+        task="interleave",
+        metrics=metrics,
+        interleave_valid=True,
+        head="a" * 40,
+        load_case="c4",
+    )
+    _write_point(
+        tmp_path / "candidate" / "sensenova_ueval_interleave" / "uniserve_c4",
+        task="interleave",
+        metrics=_interleave_metrics(
+            ttft=120.0,
+            tpot=12.0,
+            image_latency=1200.0,
+            transition=2400.0,
+            text_to_image=3600.0,
+            image_to_text=6.0,
+        ),
+        interleave_valid=True,
+        head="b" * 40,
+        load_case="c4",
+    )
+    _write_point(
+        tmp_path / "previous_major" / "sensenova_ueval_interleave" / "uniserve_c4",
+        task="interleave",
+        metrics=_interleave_metrics(
+            ttft=90.0,
+            tpot=9.0,
+            image_latency=900.0,
+            transition=1800.0,
+            text_to_image=2700.0,
+            image_to_text=4.5,
+        ),
+        interleave_valid=True,
+        head="c" * 40,
+        load_case="c4",
+    )
+    default_travel = _write_default_travel(
+        tmp_path / "candidate_default_travel",
+        head="b" * 40,
+    )
+
+    report = cc.evaluate_checkpoint(
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        None,
+        checkpoint="cp7",
+        major_boundary=True,
+        default_travel_dir=default_travel,
+        previous_major_root=tmp_path / "previous_major",
+    )
+
+    assert report.verdict == "block"
+    point = next(point for point in report.points if point.task == "interleave")
+    assert point.hard_failures == []
+    assert {metric.previous for metric in point.metrics} == {
+        90.0,
+        9.0,
+        900.0,
+        1800.0,
+        2700.0,
+        4.5,
+    }
+    assert {metric.band for metric in point.metrics} == {"block"}
+
+
+def test_cp3_major_boundary_accepts_triplet_and_default_travel(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=90.0,
+        ttft=110.0,
+        tpot=22.0,
+        images_per_s=0.9,
+        head="b" * 40,
+    )
+    default_travel = _write_default_travel(
+        tmp_path / "candidate_default_travel",
+        head="b" * 40,
+    )
+
+    report = cc.evaluate_checkpoint(
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        None,
+        checkpoint="cp3",
+        major_boundary=True,
+        default_travel_dir=default_travel,
+    )
+
+    assert report.verdict == "pass"
+    assert report.source_revision == "b" * 40
+    assert {point.task for point in report.points} == {
+        "text",
+        "t2i",
+        "i2t",
+        "default_travel",
+    }
+
+
+def test_default_travel_is_bound_to_the_candidate_source_revision(tmp_path: Path) -> None:
+    _triplet(
+        tmp_path / "anchor",
+        throughput=100.0,
+        ttft=100.0,
+        tpot=20.0,
+        images_per_s=1.0,
+        head="a" * 40,
+    )
+    _triplet(
+        tmp_path / "candidate",
+        throughput=90.0,
+        ttft=110.0,
+        tpot=22.0,
+        images_per_s=0.9,
+        head="b" * 40,
+    )
+    default_travel = _write_default_travel(
+        tmp_path / "candidate_default_travel",
+        head="c" * 40,
+    )
+
+    report = cc.evaluate_checkpoint(
+        tmp_path / "candidate",
+        tmp_path / "anchor",
+        None,
+        checkpoint="cp3",
+        major_boundary=True,
+        default_travel_dir=default_travel,
+    )
+
+    assert report.verdict == "block"
+    point = next(point for point in report.points if point.task == "default_travel")
+    assert point.hard_failures == ["source_revision_mismatch"]
 
 
 def test_acceptance_artifact_declares_the_fixed_limit(tmp_path: Path) -> None:
@@ -563,6 +767,7 @@ def test_acceptance_artifact_declares_the_fixed_limit(tmp_path: Path) -> None:
 
     artifact = cc._report_to_dict(report)
 
-    assert artifact["schema_version"] == 2
+    assert artifact["schema_version"] == 3
+    assert artifact["source_revision"] == "b" * 40
     assert artifact["regression_limit"] == pytest.approx(0.20)
     assert artifact["verdict"] == "pass"
