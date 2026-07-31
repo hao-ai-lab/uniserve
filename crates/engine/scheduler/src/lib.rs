@@ -2,6 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub(crate) mod bench_trace;
+pub(crate) mod cpu_continuation;
 pub mod generation;
 pub mod grammar;
 pub(crate) mod image_artifact;
@@ -16,7 +17,7 @@ pub mod stats_report;
 pub mod trace;
 
 pub use grammar::{CompiledGrammar, GrammarCompiler, GrammarMatcher};
-pub use logits::{LogitsProcessor, MaskContribution, ProcCtx};
+pub use logits::{LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration};
 pub use policy::{DecisionLog, LatencyHistory, PolicyDecision, PolicyReason, PolicySnapshot};
 pub use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 pub use resources::{LedgerStats, ResourceLedger};

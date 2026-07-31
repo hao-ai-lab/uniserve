@@ -97,6 +97,7 @@ impl SpecDecodeAccounting {
         st.is_replayable_text()
             && !st.req.behavior.gen_output
             && st.grammar.is_none()
+            && st.req.stop_strings.is_empty()
             && st.und.tokens_emitted >= sp.min_tokens
             && !sp.generated_logprobs_requested()
             && sp.bad_words_ids.is_empty()

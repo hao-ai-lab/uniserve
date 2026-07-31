@@ -11,12 +11,16 @@ from typing import Protocol, TypeAlias, cast
 from ..batch import (
     Admission,
     Batch,
+    Close,
+    Commit,
+    Control,
     FixedPoint,
     ImageParams,
     Operation,
     RequestKey,
     SamplingParams,
     VersionRef,
+    control_content_digest,
 )
 from ..foundation.errors import invalid_descriptor
 
@@ -42,19 +46,26 @@ class ScratchStore(Protocol):
 
 
 TransactionalStore: TypeAlias = SnapshotStore | ScratchStore
+MAX_SESSION_HISTORY_POINTS = 262_144
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedRuntimeState:
+    logical_position: int
+    rng_counter: int
+    kv_length: int
 
 
 @dataclass(slots=True)
 class RequestSession:
     """All worker-owned scalar state and logical handles for one request.
 
-    Committed request state is a fixed :class:`VersionRef`. ``version`` is the
-    accounting point index of that committed version, ``committed_op_id`` its
-    producer operation, and ``committed_digest`` its semantic digest; together
-    they reconstruct the committed :class:`VersionRef` a successor's ``parent``
-    must name exactly. ``logical_position`` is independent model accounting: it
-    is the absolute semantic position consumed by token and multimodal RoPE and
-    is never used as lineage identity.
+    ``version``, ``resolved_op_id``, and ``resolved_digest`` name the latest
+    device-resolved point. ``committed_point``, ``committed_op_id``, and
+    ``committed_digest`` name the latest scheduler-selected semantic point.
+    ``logical_position`` is independent model accounting: it is the absolute
+    semantic position consumed by token and multimodal RoPE and is never used as
+    lineage identity.
     """
 
     request_key: RequestKey
@@ -65,8 +76,17 @@ class RequestSession:
     finish_token_ids: tuple[int, ...]
     adapter_id: int | None
     version: int = 0
+    resolved_op_id: int = 0
+    resolved_digest: str = ""
+    committed_point: int = 0
     committed_op_id: int = 0
     committed_digest: str = ""
+    public_event_limit: int = 0
+    applied_control_seq: int = 0
+    control_digests: dict[tuple[int, str], str] = field(default_factory=dict)
+    resolved_versions: dict[int, VersionRef] = field(default_factory=dict)
+    resolved_runtime: dict[int, ResolvedRuntimeState] = field(default_factory=dict)
+    terminal_cutoff: VersionRef | None = None
     latent_handle: int | None = None
     product_handles: set[int] = field(default_factory=set)
     prompt_logits_handle: int | None = None
@@ -94,13 +114,28 @@ class RequestSession:
         return VersionRef(
             request_key=self.request_key,
             producer_op_id=self.committed_op_id,
-            point=FixedPoint(self.version, str(self.committed_digest)),
+            point=FixedPoint(self.committed_point, str(self.committed_digest)),
+        )
+
+    def resolved_version(self) -> VersionRef:
+        """The latest worker-resolved point, including uncommitted descendants."""
+
+        return VersionRef(
+            request_key=self.request_key,
+            producer_op_id=self.resolved_op_id,
+            point=FixedPoint(self.version, str(self.resolved_digest)),
         )
 
     def rollback_snapshot(self) -> RequestSession:
         """Copy mutable session-owned state while sharing immutable declarations."""
 
-        return replace(self, product_handles=set(self.product_handles))
+        return replace(
+            self,
+            product_handles=set(self.product_handles),
+            control_digests=dict(self.control_digests),
+            resolved_versions=dict(self.resolved_versions),
+            resolved_runtime=dict(self.resolved_runtime),
+        )
 
 
 class SessionStore:
@@ -168,6 +203,15 @@ class SessionStore:
                     f"operation {operation.op_id} has stale epoch {operation.request_key.epoch}; "
                     f"session epoch is {session.epoch}"
                 )
+            if session.terminal_cutoff is not None:
+                raise invalid_descriptor(
+                    f"operation {operation.op_id} targets a closed request lineage"
+                )
+            if operation.control_seq != session.applied_control_seq:
+                raise invalid_descriptor(
+                    f"operation {operation.op_id} requires control sequence "
+                    f"{operation.control_seq}; worker applied {session.applied_control_seq}"
+                )
             parent = operation.parent
             if parent.is_fixed():
                 expected = session.committed_version()
@@ -177,16 +221,14 @@ class SessionStore:
                         f"its declared parent does not match committed state"
                     )
             else:
-                # A device-relay successor roots on its predecessor's
-                # not-yet-observed selected point. By the time the worker
-                # registers it, the predecessor has committed and advanced this
-                # session, so the device reference must name the session's
-                # current committed producer.
-                if parent.producer_op_id != session.committed_op_id:
+                # A device-relay successor roots on the latest worker-resolved
+                # product or on a predicated alias that selected the same fixed
+                # ancestor without advancing semantic state.
+                if parent.producer_op_id not in session.resolved_versions:
                     raise invalid_descriptor(
                         f"operation {operation.op_id} names a device parent whose "
-                        f"producer {parent.producer_op_id} does not match the "
-                        f"session's committed op {session.committed_op_id}"
+                        f"producer {parent.producer_op_id} is not in the "
+                        "session's resolved execution window"
                     )
 
     def admit(self, admission: Admission) -> RequestSession:
@@ -203,17 +245,163 @@ class SessionStore:
             admission_digest=admission.digest,
             sampling=None if admission.und is None else admission.und.sampling,
             image=None if admission.gen_admission is None else admission.gen_admission.image,
-            negative_token_ids=(
-                () if admission.und is None else admission.und.negative_token_ids
-            ),
-            finish_token_ids=(
-                () if admission.und is None else admission.und.finish_token_ids
-            ),
+            negative_token_ids=(() if admission.und is None else admission.und.negative_token_ids),
+            finish_token_ids=(() if admission.und is None else admission.und.finish_token_ids),
             adapter_id=admission.adapter_id,
+            resolved_digest=admission.digest,
             committed_digest=admission.digest,
+        )
+        root = session.committed_version()
+        session.resolved_versions[0] = root
+        session.resolved_runtime[0] = ResolvedRuntimeState(
+            logical_position=session.logical_position,
+            rng_counter=session.rng_counter,
+            kv_length=(0 if admission.und is None else int(admission.und.kv.prefix_len)),
         )
         self._sessions[session_id] = session
         return session
+
+    def apply_controls(self, controls: Sequence[Control]) -> tuple[tuple[int, int], ...]:
+        """Apply ordered semantic controls before registering new operations."""
+
+        rewinds: list[tuple[int, int]] = []
+        for control in controls:
+            if isinstance(control, Commit):
+                self._apply_commit(control)
+            elif isinstance(control, Close):
+                rewind = self._apply_close(control)
+                if rewind is not None:
+                    rewinds.append(rewind)
+        return tuple(rewinds)
+
+    def finalize_predicated(
+        self,
+        session_id: int,
+        op_id: int,
+        parent: VersionRef,
+    ) -> tuple[VersionRef, ResolvedRuntimeState, bool]:
+        """Resolve a device-predicated no-op to its predecessor's selected point."""
+
+        session = self.get(session_id)
+        with self._lock(session_id):
+            selected: VersionRef | None = (
+                parent
+                if parent.is_fixed()
+                else session.resolved_versions.get(parent.producer_op_id)
+            )
+            runtime = session.resolved_runtime.get(parent.producer_op_id)
+            if selected is None or runtime is None:
+                raise invalid_descriptor(
+                    f"predicated operation {op_id} lost its resolved parent runtime state"
+                )
+            point = selected.point
+            if not isinstance(point, FixedPoint):
+                raise invalid_descriptor(
+                    f"predicated operation {op_id} resolved to a non-fixed parent"
+                )
+            selected = VersionRef(
+                request_key=selected.request_key,
+                producer_op_id=selected.producer_op_id,
+                point=FixedPoint(point.point_index, str(point.semantic_digest)),
+            )
+            session.resolved_versions[int(op_id)] = selected
+            session.resolved_runtime[int(op_id)] = runtime
+            latest = session.resolved_op_id == int(op_id)
+            if latest:
+                session.version = int(point.point_index)
+                session.resolved_op_id = int(selected.producer_op_id)
+                session.resolved_digest = point.semantic_digest
+                session.logical_position = runtime.logical_position
+                session.rng_counter = runtime.rng_counter
+            return selected, runtime, latest
+
+    def _validate_control_identity(
+        self,
+        session: RequestSession,
+        control: Commit | Close,
+    ) -> tuple[bool, tuple[int, str], str]:
+        kind = "commit" if isinstance(control, Commit) else "close"
+        identity = (int(control.control_seq), kind)
+        digest = control_content_digest(control)
+        existing = session.control_digests.get(identity)
+        if existing is not None:
+            if existing != digest:
+                raise invalid_descriptor(
+                    f"control identity {identity} conflicts with its committed content"
+                )
+            return True, identity, digest
+        if int(control.control_seq) != session.applied_control_seq + 1:
+            raise invalid_descriptor(
+                f"control sequence {control.control_seq} does not follow "
+                f"{session.applied_control_seq}"
+            )
+        return False, identity, digest
+
+    def _apply_commit(self, control: Commit) -> None:
+        session = self.get(control.request_key.session_id)
+        if control.request_key != session.request_key:
+            raise invalid_descriptor("commit control has a stale request key")
+        duplicate, identity, digest = self._validate_control_identity(session, control)
+        if duplicate:
+            return
+        if session.terminal_cutoff is not None:
+            raise invalid_descriptor("commit control targets a closed request lineage")
+        if control.expected_parent != session.committed_version():
+            raise invalid_descriptor("commit control expected parent is not current")
+        selected = control.selected
+        if not selected.is_fixed():
+            raise invalid_descriptor("commit control selected point is not fixed")
+        resolved = session.resolved_versions.get(selected.producer_op_id)
+        if resolved != selected:
+            raise invalid_descriptor("commit control selected point was not resolved")
+        point = selected.point
+        assert isinstance(point, FixedPoint)
+        if int(control.public_event_limit) < session.public_event_limit:
+            raise invalid_descriptor("commit control regresses the public event limit")
+        session.committed_point = int(point.point_index)
+        session.committed_op_id = int(selected.producer_op_id)
+        session.committed_digest = point.semantic_digest
+        session.public_event_limit = int(control.public_event_limit)
+        session.applied_control_seq = int(control.control_seq)
+        session.control_digests[identity] = digest
+
+    def _apply_close(self, control: Close) -> tuple[int, int] | None:
+        session = self.get(control.request_key.session_id)
+        if control.request_key != session.request_key:
+            raise invalid_descriptor("close control has a stale request key")
+        duplicate, identity, digest = self._validate_control_identity(session, control)
+        if duplicate:
+            return None
+        cutoff = control.cutoff
+        if not cutoff.is_fixed():
+            raise invalid_descriptor("close control cutoff is not fixed")
+        point = cutoff.point
+        assert isinstance(point, FixedPoint)
+        reachable = (
+            cutoff == session.committed_version()
+            or session.resolved_versions.get(cutoff.producer_op_id) == cutoff
+        )
+        if not reachable:
+            raise invalid_descriptor("close control cutoff is not on the resolved lineage")
+        if int(point.point_index) > session.version:
+            raise invalid_descriptor("close control cutoff is beyond the resolved lineage")
+        runtime = session.resolved_runtime.get(cutoff.producer_op_id)
+        if runtime is None:
+            raise invalid_descriptor("close control cutoff lost its runtime state")
+        session.committed_point = int(point.point_index)
+        session.committed_op_id = int(cutoff.producer_op_id)
+        session.committed_digest = point.semantic_digest
+        session.version = int(point.point_index)
+        session.resolved_op_id = int(cutoff.producer_op_id)
+        session.resolved_digest = point.semantic_digest
+        session.logical_position = runtime.logical_position
+        session.rng_counter = runtime.rng_counter
+        session.terminal_cutoff = cutoff
+        session.applied_control_seq = int(control.control_seq)
+        session.control_digests[identity] = digest
+        session.resolved_versions = {int(cutoff.producer_op_id): cutoff}
+        session.resolved_runtime = {int(cutoff.producer_op_id): runtime}
+        return session.session_id, runtime.kv_length
 
     def begin_step(
         self,
@@ -240,12 +428,41 @@ class SessionStore:
         for lock in locks:
             lock.acquire()
         try:
+            snapshots: list[RequestSession] = []
+            for session_id in requested:
+                snapshot = copy.deepcopy(self.get(session_id))
+                snapshot.version = snapshot.committed_point
+                snapshot.resolved_op_id = snapshot.committed_op_id
+                snapshot.resolved_digest = str(snapshot.committed_digest)
+                snapshot.resolved_versions = {
+                    snapshot.committed_op_id: snapshot.committed_version()
+                }
+                runtime = snapshot.resolved_runtime.get(snapshot.committed_op_id)
+                if runtime is None:
+                    raise invalid_descriptor("committed session runtime state is missing")
+                snapshot.logical_position = runtime.logical_position
+                snapshot.rng_counter = runtime.rng_counter
+                snapshot.resolved_runtime = {snapshot.committed_op_id: runtime}
+                snapshots.append(snapshot)
+            return tuple(snapshots)
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+    def snapshot_live(self, session_ids: set[int]) -> tuple[RequestSession, ...]:
+        """Capture exact live session state for an atomic administrative rollback."""
+
+        requested = sorted(int(value) for value in session_ids)
+        locks = [self._lock(session_id) for session_id in requested]
+        for lock in locks:
+            lock.acquire()
+        try:
             return tuple(copy.deepcopy(self.get(session_id)) for session_id in requested)
         finally:
             for lock in reversed(locks):
                 lock.release()
 
-    def restore_committed(
+    def restore_sessions(
         self,
         sessions: Sequence[RequestSession],
         session_ids: set[int] | None = None,
@@ -264,10 +481,19 @@ class SessionStore:
             for session_id in requested - set(staged):
                 self._sessions.pop(session_id, None)
             for session_id, session in staged.items():
-                if session.epoch < 0 or session.version < 0:
+                if session.epoch < 0 or session.version < 0 or session.committed_point < 0:
                     raise invalid_descriptor("session snapshot version is invalid")
                 if not session.admission_digest:
                     raise invalid_descriptor("session snapshot admission identity is missing")
+                if (
+                    session.resolved_versions.get(session.resolved_op_id)
+                    != session.resolved_version()
+                    or session.resolved_runtime.get(session.resolved_op_id) is None
+                    or session.resolved_versions.get(session.committed_op_id)
+                    != session.committed_version()
+                    or session.resolved_runtime.get(session.committed_op_id) is None
+                ):
+                    raise invalid_descriptor("session snapshot lineage state is incomplete")
                 self._sessions[session_id] = session
         finally:
             for lock in reversed(locks):
@@ -305,11 +531,11 @@ class StepTxn:
     """Atomic register-before-submit scope across every touched authority.
 
     Registration binds and validates before the operation is runnable: the
-    operations' declared parents are checked against committed state and every
-    touched store opens its transaction. Only after device work resolves does
-    :meth:`commit` advance each request to its selected fixed version. A
-    rejection at any point leaves no registered product, storage entry, or
-    committed version.
+    operations' declared parents are checked against the applicable committed
+    or device-resolved state and every touched store opens its transaction. Only
+    after device work resolves does :meth:`commit` advance each request's
+    resolved point. A rejection at any point leaves no registered product,
+    storage entry, or resolved version.
     """
 
     def __init__(
@@ -352,26 +578,38 @@ class StepTxn:
     def commit(
         self,
         committed: Mapping[int, VersionRef],
+        resolved_runtime: Mapping[int, ResolvedRuntimeState],
         publish: Callable[[], None] | None = None,
     ) -> None:
-        """Advance each request to its selected fixed version and publish stores.
+        """Advance each request to its selected resolved version and publish stores.
 
-        ``committed`` maps each session id to the fixed :class:`VersionRef`
+        ``committed`` maps each session id to the resolved fixed :class:`VersionRef`
         selected for its operation. A non-state-advancing operation names its
-        own committed parent, so the version does not move.
+        own parent, so the version does not move.
         """
 
         self._require_open()
+        for session_id in self.request_ids:
+            session = self.sessions.get(session_id)
+            additions = sum(
+                1
+                for operation in self.operations
+                if operation.request_key.session_id == session_id
+                and operation.advances_state
+                and operation.op_id not in session.resolved_versions
+            )
+            if len(session.resolved_versions) + additions > MAX_SESSION_HISTORY_POINTS:
+                raise invalid_descriptor("request session history capacity is exhausted")
         for operation in self.operations:
             session = self.sessions.get(operation.request_key.session_id)
             parent = operation.parent
-            # A fixed parent must equal the session's committed version. A device
-            # parent names the predecessor that already committed and advanced
-            # this session, so it is checked against that committed producer.
+            # A fixed parent must equal the semantic commit cursor. A device
+            # parent names the latest worker-resolved predecessor, which may be
+            # ahead of host observation.
             parent_matches = (
                 session.committed_version() == parent
                 if parent.is_fixed()
-                else parent.producer_op_id == session.committed_op_id
+                else parent.producer_op_id in session.resolved_versions
             )
             if session.request_key != operation.request_key or not parent_matches:
                 raise RuntimeError(
@@ -387,8 +625,17 @@ class StepTxn:
                 if not isinstance(point, FixedPoint):
                     raise RuntimeError("committed version must be fixed")
                 session.version = point.point_index
-                session.committed_op_id = selected.producer_op_id
-                session.committed_digest = point.semantic_digest
+                session.resolved_op_id = selected.producer_op_id
+                session.resolved_digest = point.semantic_digest
+                session.resolved_versions[selected.producer_op_id] = selected
+                runtime = (
+                    resolved_runtime.get(operation.request_key.session_id)
+                    if operation.advances_state
+                    else session.resolved_runtime.get(selected.producer_op_id)
+                )
+                if runtime is None:
+                    raise RuntimeError("resolved operation runtime state is missing")
+                session.resolved_runtime[selected.producer_op_id] = runtime
                 session.last_op_id = operation.op_id
                 session.last_step_id = self.step_id
             for _store, transaction in self._store_transactions:
@@ -442,7 +689,9 @@ def cast_snapshot_store(value: object) -> SnapshotStore:
 
 
 __all__ = [
+    "MAX_SESSION_HISTORY_POINTS",
     "RequestSession",
+    "ResolvedRuntimeState",
     "SessionStore",
     "StepTxn",
     "TransactionalStore",

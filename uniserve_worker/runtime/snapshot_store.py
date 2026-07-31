@@ -18,10 +18,12 @@ from safetensors.torch import load_file, save_file
 from ..batch import (
     CompletionRecord,
     CompletionReport,
+    FixedPoint,
     ImageParams,
     RequestKey,
     SamplingParams,
     TokenMode,
+    VersionRef,
 )
 from ..foundation.errors import invalid_descriptor
 from .adapter_store import AdapterSnapshot, AdapterStore
@@ -40,10 +42,10 @@ from .product_store import (
     VisionFeatureProduct,
 )
 from .replay import ReplayRecord, ReplayStore
-from .request_session import RequestSession, SessionStore
+from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
 from .transfer import Locator, Transport, fetch_locator
 
-SNAPSHOT_FORMAT_VERSION = 2
+SNAPSHOT_FORMAT_VERSION = 3
 _ASSET_PREFIX = "asset:"
 
 
@@ -156,9 +158,13 @@ class SnapshotProvider:
             sessions = self.sessions.snapshot_committed(requested)
             if {value.session_id for value in sessions} != requested:
                 raise invalid_descriptor("snapshot operation contains an unknown session")
+            committed_kv_lengths = {
+                session.session_id: session.resolved_runtime[session.resolved_op_id].kv_length
+                for session in sessions
+            }
             manifest, tensors, locator_assets = self._encode(
                 sessions=sessions,
-                kv=self.kv.snapshot_committed(requested),
+                kv=self.kv.snapshot_committed(requested, committed_kv_lengths),
                 latents=self.latents.snapshot_records(requested),
                 products=self.products.snapshot_records(requested),
                 replay=self.replay.snapshot_records(requested),
@@ -183,8 +189,7 @@ class SnapshotProvider:
             catalog["adapter"] = self._adapter_catalog_entry(digest, manifest.get("adapter"))
             self._write_catalog(catalog)
             replacements = {
-                raw: self._durable_locator(raw, digest, key)
-                for raw, key in locator_assets.items()
+                raw: self._durable_locator(raw, digest, key) for raw, key in locator_assets.items()
             }
             self.products.rewrite_locators(requested, replacements)
             return refs, replacements
@@ -402,9 +407,7 @@ class SnapshotProvider:
             )
             in selected
         )
-        required_assets = {
-            key for value in raw_products for key in _asset_references(value)
-        }
+        required_assets = {key for value in raw_products for key in _asset_references(value)}
         assets, published_assets = self._restore_assets(manifest, tensors, required_assets)
         try:
             products = tuple(
@@ -435,7 +438,7 @@ class SnapshotProvider:
             self._release_assets(decoded.published_assets)
             raise
         existing_ids = {value for value in session_ids if self.sessions.peek(value) is not None}
-        prior_sessions = self.sessions.snapshot_committed(existing_ids)
+        prior_sessions = self.sessions.snapshot_live(existing_ids)
         prior_kv = self.kv.snapshot_committed(existing_ids)
         prior_latents = self.latents.snapshot_records(session_ids)
         prior_products = self.products.snapshot_records(session_ids)
@@ -451,7 +454,7 @@ class SnapshotProvider:
             self.kv.restore_committed(decoded.kv, session_ids)
             self.latents.restore_records(session_ids, decoded.latents)
             self.products.restore_records(session_ids, decoded.products)
-            self.sessions.restore_committed(decoded.sessions, session_ids)
+            self.sessions.restore_sessions(decoded.sessions, session_ids)
             self.replay.restore_records(session_ids, decoded.replay)
             if self.adapters is not None:
                 if decoded.adapter is None:
@@ -463,7 +466,7 @@ class SnapshotProvider:
             self.kv.restore_committed(prior_kv, session_ids)
             self.latents.restore_records(session_ids, prior_latents)
             self.products.restore_records(session_ids, prior_products)
-            self.sessions.restore_committed(prior_sessions, session_ids)
+            self.sessions.restore_sessions(prior_sessions, session_ids)
             self.replay.restore_records(session_ids, prior_replay)
             if self.adapters is not None and prior_adapter is not None:
                 self.adapters.restore(prior_adapter)
@@ -477,6 +480,7 @@ class SnapshotProvider:
     ) -> None:
         if {state.session_id for state in decoded.kv} != selected:
             raise invalid_descriptor("snapshot KV state does not align with sessions")
+        kv_by_session = {state.session_id: state for state in decoded.kv}
         latent_by_handle = {record.handle: record for record in decoded.latents}
         product_by_handle = {record.handle: record for record in decoded.products}
         if len(latent_by_handle) != len(decoded.latents):
@@ -485,6 +489,11 @@ class SnapshotProvider:
             raise invalid_descriptor("snapshot repeats a product handle")
         adapter_id = None if decoded.adapter is None else decoded.adapter.adapter_id
         for session in decoded.sessions:
+            runtime = session.resolved_runtime.get(session.resolved_op_id)
+            if runtime is None or runtime.kv_length != kv_by_session[session.session_id].length:
+                raise invalid_descriptor(
+                    f"session {session.session_id} runtime state does not align with KV"
+                )
             if session.adapter_id != adapter_id:
                 raise invalid_descriptor(
                     f"session {session.session_id} adapter identity is not restorable"
@@ -640,11 +649,22 @@ class SnapshotProvider:
 
     @staticmethod
     def _session_to_json(session: RequestSession) -> dict[str, object]:
+        runtime = session.resolved_runtime.get(session.resolved_op_id)
+        if runtime is None:
+            raise invalid_descriptor("snapshot session resolved runtime state is missing")
         return {
             "authority_id": session.request_key.authority_id,
             "session_id": session.session_id,
             "epoch": session.epoch,
             "version": session.version,
+            "resolved_op_id": session.resolved_op_id,
+            "resolved_digest": str(session.resolved_digest),
+            "resolved_runtime": {
+                "logical_position": runtime.logical_position,
+                "rng_counter": runtime.rng_counter,
+                "kv_length": runtime.kv_length,
+            },
+            "committed_point": session.committed_point,
             "admission_digest": session.admission_digest,
             "sampling": None if session.sampling is None else session.sampling.to_wire(),
             "image": None if session.image is None else session.image.to_wire(),
@@ -655,6 +675,27 @@ class SnapshotProvider:
             # ``str`` finalizes a digest still deferred behind an in-flight decode
             # response; snapshotting is a control op off the decode critical path.
             "committed_digest": str(session.committed_digest),
+            "public_event_limit": session.public_event_limit,
+            "applied_control_seq": session.applied_control_seq,
+            "control_digests": [
+                {
+                    "control_seq": control_seq,
+                    "kind": kind,
+                    "digest": digest,
+                }
+                for (control_seq, kind), digest in sorted(session.control_digests.items())
+            ],
+            "terminal_cutoff": (
+                None
+                if session.terminal_cutoff is None
+                else {
+                    "producer_op_id": session.terminal_cutoff.producer_op_id,
+                    "point_index": cast(FixedPoint, session.terminal_cutoff.point).point_index,
+                    "semantic_digest": cast(
+                        FixedPoint, session.terminal_cutoff.point
+                    ).semantic_digest,
+                }
+            ),
             "latent_handle": session.latent_handle,
             "product_handles": sorted(session.product_handles),
             "prompt_logits_handle": session.prompt_logits_handle,
@@ -668,12 +709,72 @@ class SnapshotProvider:
     @staticmethod
     def _session_from_json(value: object) -> RequestSession:
         data = _mapping(value, "snapshot session")
-        return RequestSession(
-            request_key=RequestKey(
-                authority_id=_uint(data.get("authority_id"), "snapshot session.authority_id"),
-                session_id=_uint(data.get("session_id"), "snapshot session.session_id"),
-                epoch=_uint(data.get("epoch"), "snapshot session.epoch"),
+        request_key = RequestKey(
+            authority_id=_uint(data.get("authority_id"), "snapshot session.authority_id"),
+            session_id=_uint(data.get("session_id"), "snapshot session.session_id"),
+            epoch=_uint(data.get("epoch"), "snapshot session.epoch"),
+        )
+        control_digests: dict[tuple[int, str], str] = {}
+        for index, value in enumerate(
+            _sequence(data.get("control_digests"), "snapshot session.control_digests")
+        ):
+            control = _mapping(value, f"snapshot session.control_digests[{index}]")
+            identity = (
+                _uint(
+                    control.get("control_seq"),
+                    f"snapshot session.control_digests[{index}].control_seq",
+                ),
+                _string(
+                    control.get("kind"),
+                    f"snapshot session.control_digests[{index}].kind",
+                ),
+            )
+            if identity[1] not in {"commit", "close"}:
+                raise invalid_descriptor("snapshot session control kind is invalid")
+            if identity in control_digests:
+                raise invalid_descriptor("snapshot session repeats a control identity")
+            control_digests[identity] = _digest(
+                control.get("digest"),
+                f"snapshot session.control_digests[{index}].digest",
+            )
+        terminal = data.get("terminal_cutoff")
+        terminal_cutoff = None
+        if terminal is not None:
+            cutoff = _mapping(terminal, "snapshot session.terminal_cutoff")
+            terminal_cutoff = VersionRef(
+                request_key=request_key,
+                producer_op_id=_uint(
+                    cutoff.get("producer_op_id"),
+                    "snapshot session.terminal_cutoff.producer_op_id",
+                ),
+                point=FixedPoint(
+                    point_index=_uint(
+                        cutoff.get("point_index"),
+                        "snapshot session.terminal_cutoff.point_index",
+                    ),
+                    semantic_digest=_digest(
+                        cutoff.get("semantic_digest"),
+                        "snapshot session.terminal_cutoff.semantic_digest",
+                    ),
+                ),
+            )
+        runtime_data = _mapping(data.get("resolved_runtime"), "snapshot session.resolved_runtime")
+        runtime = ResolvedRuntimeState(
+            logical_position=_uint(
+                runtime_data.get("logical_position"),
+                "snapshot session.resolved_runtime.logical_position",
             ),
+            rng_counter=_uint(
+                runtime_data.get("rng_counter"),
+                "snapshot session.resolved_runtime.rng_counter",
+            ),
+            kv_length=_uint(
+                runtime_data.get("kv_length"),
+                "snapshot session.resolved_runtime.kv_length",
+            ),
+        )
+        session = RequestSession(
+            request_key=request_key,
             admission_digest=_digest(
                 data.get("admission_digest"), "snapshot session.admission_digest"
             ),
@@ -695,10 +796,23 @@ class SnapshotProvider:
             ),
             adapter_id=_optional_uint(data.get("adapter_id"), "snapshot session.adapter_id"),
             version=_uint(data.get("version"), "snapshot session.version"),
+            resolved_op_id=_uint(data.get("resolved_op_id"), "snapshot session.resolved_op_id"),
+            resolved_digest=_digest(
+                data.get("resolved_digest"), "snapshot session.resolved_digest"
+            ),
+            committed_point=_uint(data.get("committed_point"), "snapshot session.committed_point"),
             committed_op_id=_uint(data.get("committed_op_id"), "snapshot session.committed_op_id"),
             committed_digest=_digest(
                 data.get("committed_digest"), "snapshot session.committed_digest"
             ),
+            public_event_limit=_uint(
+                data.get("public_event_limit"), "snapshot session.public_event_limit"
+            ),
+            applied_control_seq=_uint(
+                data.get("applied_control_seq"), "snapshot session.applied_control_seq"
+            ),
+            control_digests=control_digests,
+            terminal_cutoff=terminal_cutoff,
             latent_handle=_optional_uint(
                 data.get("latent_handle"), "snapshot session.latent_handle"
             ),
@@ -717,6 +831,18 @@ class SnapshotProvider:
             last_op_id=_optional_uint(data.get("last_op_id"), "snapshot session.last_op_id"),
             last_step_id=_optional_uint(data.get("last_step_id"), "snapshot session.last_step_id"),
         )
+        if (
+            session.committed_op_id != session.resolved_op_id
+            or session.committed_point != session.version
+            or session.committed_digest != session.resolved_digest
+        ):
+            raise invalid_descriptor("snapshot session is not normalized to its committed point")
+        control_sequences = sorted(control_seq for control_seq, _kind in control_digests)
+        if control_sequences != list(range(1, session.applied_control_seq + 1)):
+            raise invalid_descriptor("snapshot session control ledger is not contiguous")
+        session.resolved_versions[session.resolved_op_id] = session.resolved_version()
+        session.resolved_runtime[session.resolved_op_id] = runtime
+        return session
 
     @staticmethod
     def _kv_to_json(
@@ -1279,7 +1405,7 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _snapshot_digest(manifest: bytes, tensor_path: Path) -> str:
-    digest = hashlib.sha256(b"uniserve-worker-snapshot-v2\0")
+    digest = hashlib.sha256(b"uniserve-worker-snapshot-v3\0")
     digest.update(len(manifest).to_bytes(8, "little"))
     digest.update(manifest)
     with tensor_path.open("rb") as source:

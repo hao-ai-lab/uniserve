@@ -2,6 +2,7 @@
 //! of [`GenEvent`]s over a per-request channel. Supports text and image events.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+use tokio::sync::mpsc;
 use uniserve_core::RequestId;
 
 pub use uniserve_core::{
@@ -100,12 +101,133 @@ pub enum GenEvent {
     },
 }
 
-/// Engine-to-caller channel; dropping the receiver cancels the request.
-pub type EventTx = tokio::sync::mpsc::UnboundedSender<GenEvent>;
-pub type EventRx = tokio::sync::mpsc::UnboundedReceiver<GenEvent>;
+/// Maximum number of canonical generation events buffered between one
+/// scheduler request and its immediate consumer.
+pub const EVENT_BUFFER_CAPACITY: usize = 64;
+
+#[derive(Debug)]
+pub enum EventSendError {
+    Full(Box<GenEvent>),
+    Closed(Box<GenEvent>),
+}
+
+/// Bounded engine-to-caller event sender.
+#[derive(Clone)]
+pub struct EventTx {
+    inner: mpsc::Sender<GenEvent>,
+}
+
+impl EventTx {
+    pub fn send(&self, event: GenEvent) -> Result<(), EventSendError> {
+        self.inner.try_send(event).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(event) => EventSendError::Full(Box::new(event)),
+            mpsc::error::TrySendError::Closed(event) => EventSendError::Closed(Box::new(event)),
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+/// Bounded engine-to-caller event receiver. Releasing one channel slot wakes
+/// the scheduler so an output-credit-stalled lineage becomes runnable without
+/// polling.
+pub struct EventRx {
+    inner: mpsc::Receiver<GenEvent>,
+    waker: uniserve_core::CommandWaker,
+    cancellation: Option<EventCancellation>,
+    text_tokens_received: usize,
+}
+
+struct EventCancellation {
+    tx: crossbeam_channel::Sender<Command>,
+    request_id: RequestId,
+    acknowledge_on_receive: bool,
+}
+
+impl EventRx {
+    /// Transfer cancellation ownership to a downstream adapter that emits its
+    /// own prefix-aware stream controls.
+    pub fn delegate_cancellation(&mut self) {
+        self.cancellation = None;
+    }
+
+    pub async fn recv(&mut self) -> Option<GenEvent> {
+        let event = self.inner.recv().await;
+        if let Some(event) = event.as_ref() {
+            self.observe(event);
+            self.waker.wake();
+        }
+        event
+    }
+
+    pub fn try_recv(&mut self) -> Result<GenEvent, mpsc::error::TryRecvError> {
+        let event = self.inner.try_recv();
+        if let Ok(event) = event.as_ref() {
+            self.observe(event);
+            self.waker.wake();
+        }
+        event
+    }
+
+    fn observe(&mut self, event: &GenEvent) {
+        match event {
+            GenEvent::TextToken { .. } => {
+                self.text_tokens_received = self.text_tokens_received.saturating_add(1);
+                if let Some(cancellation) = self
+                    .cancellation
+                    .as_ref()
+                    .filter(|cancellation| cancellation.acknowledge_on_receive)
+                {
+                    let _ = cancellation.tx.send(Command::Acknowledge {
+                        request_id: cancellation.request_id,
+                        output_token_count: self.text_tokens_received,
+                    });
+                }
+            }
+            GenEvent::Finished { .. } | GenEvent::Rejected { .. } | GenEvent::Error { .. } => {
+                self.cancellation = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for EventRx {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            let _ = cancellation.tx.send(Command::Cancel {
+                request_id: cancellation.request_id,
+                output_token_count: Some(self.text_tokens_received),
+            });
+        }
+        self.waker.wake();
+    }
+}
 
 pub fn event_channel() -> (EventTx, EventRx) {
-    tokio::sync::mpsc::unbounded_channel()
+    event_channel_with_waker(uniserve_core::CommandWaker::noop(), None)
+}
+
+fn event_channel_with_waker(
+    waker: uniserve_core::CommandWaker,
+    cancellation: Option<EventCancellation>,
+) -> (EventTx, EventRx) {
+    let (tx, rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
+    (
+        EventTx { inner: tx },
+        EventRx {
+            inner: rx,
+            waker,
+            cancellation,
+            text_tokens_received: 0,
+        },
+    )
 }
 
 /// Submission plumbing kept separate from the pure generation request value.
@@ -131,7 +253,20 @@ pub type PrefixCacheResetReply = std::sync::mpsc::Sender<Result<bool, String>>;
 pub enum Command {
     Submit(Box<GenerationSubmission>),
     /// Client-side cancel → `FinishReason::Cancelled`.
-    Cancel(RequestId),
+    Cancel {
+        request_id: RequestId,
+        output_token_count: Option<usize>,
+    },
+    /// Frontend decoder matched a stop string at this exact token prefix.
+    StopAt {
+        request_id: RequestId,
+        output_token_count: usize,
+    },
+    /// Frontend decoder accepted this exact public token prefix.
+    Acknowledge {
+        request_id: RequestId,
+        output_token_count: usize,
+    },
     /// Server-side abort → `FinishReason::Aborted`.
     Abort(RequestId),
     /// Clear the prefix cache after applying the requested running-request policy.
@@ -203,7 +338,16 @@ impl EngineHandle {
     }
 
     pub fn submit(&self, request: GenerationRequest) -> Result<EventRx, String> {
-        let (event_tx, event_rx) = event_channel();
+        let request_id = request.request_id;
+        let acknowledge_on_receive = request.stop_strings.is_empty();
+        let (event_tx, event_rx) = event_channel_with_waker(
+            self.waker.clone(),
+            Some(EventCancellation {
+                tx: self.tx.clone(),
+                request_id,
+                acknowledge_on_receive,
+            }),
+        );
         self.send(Command::Submit(Box::new(GenerationSubmission::new(
             request, event_tx,
         ))))
@@ -211,7 +355,28 @@ impl EngineHandle {
         Ok(event_rx)
     }
     pub fn cancel(&self, id: RequestId) {
-        let _ = self.send(Command::Cancel(id));
+        let _ = self.send(Command::Cancel {
+            request_id: id,
+            output_token_count: None,
+        });
+    }
+    pub fn cancel_at(&self, id: RequestId, output_token_count: usize) {
+        let _ = self.send(Command::Cancel {
+            request_id: id,
+            output_token_count: Some(output_token_count),
+        });
+    }
+    pub fn stop_at(&self, id: RequestId, output_token_count: usize) {
+        let _ = self.send(Command::StopAt {
+            request_id: id,
+            output_token_count,
+        });
+    }
+    pub fn acknowledge_at(&self, id: RequestId, output_token_count: usize) {
+        let _ = self.send(Command::Acknowledge {
+            request_id: id,
+            output_token_count,
+        });
     }
     /// Server-side abort, distinct from a client cancel.
     pub fn abort(&self, id: RequestId) {
@@ -344,19 +509,110 @@ mod tests {
         }
     }
 
-    /// `cancel` and `abort` send distinct commands (client cancel vs server
-    /// abort) carrying the target request id.
     #[test]
-    fn cancel_and_abort_send_distinct_commands() {
+    fn dropping_event_receiver_cancels_at_the_consumed_text_prefix() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        let mut events = handle.submit(test_request(12)).unwrap();
+        let submission = match rx.recv().unwrap() {
+            Command::Submit(submission) => submission,
+            _ => panic!("expected Submit command"),
+        };
+        submission
+            .event_tx
+            .send(GenEvent::TextToken {
+                id: 7,
+                logprob: None,
+            })
+            .unwrap();
+        submission
+            .event_tx
+            .send(GenEvent::TextToken {
+                id: 8,
+                logprob: None,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(GenEvent::TextToken { id: 7, .. })
+        ));
+        drop(events);
+
+        match rx.recv().unwrap() {
+            Command::Acknowledge {
+                request_id,
+                output_token_count,
+            } => {
+                assert_eq!(request_id, RequestId(12));
+                assert_eq!(output_token_count, 1);
+            }
+            _ => panic!("expected consumed-prefix Acknowledge command"),
+        }
+        match rx.recv().unwrap() {
+            Command::Cancel {
+                request_id,
+                output_token_count,
+            } => {
+                assert_eq!(request_id, RequestId(12));
+                assert_eq!(output_token_count, Some(1));
+            }
+            _ => panic!("expected exact-prefix Cancel command"),
+        }
+    }
+
+    /// Cancellation, exact-prefix cancellation, semantic acknowledgement, and
+    /// server abort preserve their distinct command payloads.
+    #[test]
+    fn request_control_commands_preserve_their_semantics() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
 
         handle.cancel(RequestId(1));
+        handle.cancel_at(RequestId(2), 7);
+        handle.stop_at(RequestId(4), 8);
+        handle.acknowledge_at(RequestId(3), 9);
         handle.abort(RequestId(2));
 
         match rx.recv().unwrap() {
-            Command::Cancel(id) => assert_eq!(id, RequestId(1)),
+            Command::Cancel {
+                request_id,
+                output_token_count,
+            } => {
+                assert_eq!(request_id, RequestId(1));
+                assert_eq!(output_token_count, None);
+            }
             _ => panic!("expected Cancel command"),
+        }
+        match rx.recv().unwrap() {
+            Command::Cancel {
+                request_id,
+                output_token_count,
+            } => {
+                assert_eq!(request_id, RequestId(2));
+                assert_eq!(output_token_count, Some(7));
+            }
+            _ => panic!("expected exact-prefix Cancel command"),
+        }
+        match rx.recv().unwrap() {
+            Command::StopAt {
+                request_id,
+                output_token_count,
+            } => {
+                assert_eq!(request_id, RequestId(4));
+                assert_eq!(output_token_count, 8);
+            }
+            _ => panic!("expected exact-prefix Stop command"),
+        }
+        match rx.recv().unwrap() {
+            Command::Acknowledge {
+                request_id,
+                output_token_count,
+            } => {
+                assert_eq!(request_id, RequestId(3));
+                assert_eq!(output_token_count, 9);
+            }
+            _ => panic!("expected Acknowledge command"),
         }
         match rx.recv().unwrap() {
             Command::Abort(id) => assert_eq!(id, RequestId(2)),

@@ -961,12 +961,10 @@ fn full_completion_report() -> CompletionReport {
     predicated_record.request_key = session_key(101);
     predicated_record.op_id = OpId(12);
     predicated_record.status = OpStatus::Predicated;
+    predicated_record.token_span.len = 0;
     predicated_record.committed_tokens = Vec::new();
-    predicated_record.finish_flags = FinishFlags {
-        eos: false,
-        length: true,
-        stop: false,
-    };
+    predicated_record.finish_flags = FinishFlags::default();
+    predicated_record.product_generations = Vec::new();
     let mut error_record = ok_record.clone();
     error_record.request_key = session_key(102);
     error_record.op_id = OpId(13);

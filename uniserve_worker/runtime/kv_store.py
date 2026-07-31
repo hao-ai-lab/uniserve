@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from threading import RLock
 
@@ -634,6 +634,16 @@ class KvStore:
             self.validate_write(session_id, entry.length, end)
             entry.length = end
 
+    def rewind(self, session_id: int, length: int) -> None:
+        """Select an already initialized prefix as the lineage's visible KV extent."""
+
+        with self._lock:
+            entry = self.get(session_id)
+            selected = int(length)
+            if selected < entry.prefix_len or selected > entry.length:
+                raise invalid_descriptor("KV rewind selects an uninitialized prefix")
+            entry.length = selected
+
     def append_kv_blocks(self, session_id: int, new_blocks: Sequence[int]) -> None:
         """Grow a session's block lease by the blocks an operation appends this step.
 
@@ -925,7 +935,11 @@ class KvStore:
             for key in keys:
                 self._release_scratch(self._branches.pop(key).block_ids)
 
-    def snapshot_committed(self, request_ids: set[int]) -> tuple[KvCommittedState, ...]:
+    def snapshot_committed(
+        self,
+        request_ids: set[int],
+        committed_lengths: Mapping[int, int] | None = None,
+    ) -> tuple[KvCommittedState, ...]:
         requested = sorted(int(value) for value in request_ids)
         with self._lock:
             states: list[KvCommittedState] = []
@@ -933,6 +947,13 @@ class KvStore:
                 entry = self._entries.get(session_id)
                 if entry is None:
                     raise invalid_descriptor(f"session {session_id} has no KV state")
+                length = (
+                    entry.length
+                    if committed_lengths is None
+                    else int(committed_lengths[session_id])
+                )
+                if length < entry.prefix_len or length > entry.length:
+                    raise invalid_descriptor("committed KV snapshot extent is invalid")
                 pages = self._snapshot_pages(self.pool, entry.block_ids)
                 branches = tuple(
                     KvBranchState(
@@ -953,7 +974,7 @@ class KvStore:
                         session_id=session_id,
                         block_ids=tuple(entry.block_ids),
                         prefix_len=entry.prefix_len,
-                        length=entry.length,
+                        length=length,
                         group_id=entry.group_id,
                         pages=pages,
                         branches=branches,

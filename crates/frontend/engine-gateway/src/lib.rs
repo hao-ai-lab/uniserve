@@ -17,7 +17,7 @@ pub use uniserve_engine_wire as protocol;
 
 pub use client::{
     EngineAppControl, EngineCoreClient, EngineCoreOutputStream, EngineCoreStreamOutput,
-    InProcessEngineClient, StreamCancelCause, StreamCancelRequest,
+    InProcessEngineClient, StreamCancelCause, StreamControl, StreamControlRequest,
 };
 pub use error::{Error, Result};
 pub use generation::{
@@ -108,7 +108,7 @@ pub mod transport {
         EngineId, EngineSamplingParams, Error, GenEvent, GenerationConstraint,
         GenerationEventStream, GenerationFinishReason, GenerationSubmission, ImageParams,
         InProcessEngineClient, MockClientMessage, MockEngine, Result, StreamCancelCause,
-        StreamCancelRequest, TransportMode, ZmqClientConfig, ZmqEngineCoreClient,
+        StreamControl, StreamControlRequest, TransportMode, ZmqClientConfig, ZmqEngineCoreClient,
     };
     pub use super::{generation, metrics, zmq};
 }

@@ -108,6 +108,8 @@ enum OutMsg {
     Dead,
 }
 
+const OUTPUT_BUFFER_CAPACITY: usize = 256;
+
 type ActiveRequests = HashMap<String, RequestId>;
 type SharedActiveRequests = Arc<Mutex<ActiveRequests>>;
 
@@ -255,7 +257,7 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
     info!(engine_index = cfg.engine_index, "engine ready");
 
     // ---- 6. Serve. ----
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<OutMsg>();
+    let (out_tx, out_rx) = mpsc::channel::<OutMsg>(OUTPUT_BUFFER_CAPACITY);
     let output_task = tokio::spawn(run_output_loop(
         cfg.engine_index,
         output,
@@ -276,7 +278,7 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
             loop {
                 if core.is_dead() {
                     warn!("engine core died; emitting ENGINE_CORE_DEAD");
-                    let _ = out_tx.send(OutMsg::Dead);
+                    let _ = out_tx.send(OutMsg::Dead).await;
                     // Give the output loop a beat to flush the sentinel.
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     return;
@@ -315,7 +317,7 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
 async fn run_input_loop(
     core: &Arc<EngineCore>,
     active: &SharedActiveRequests,
-    out_tx: &mpsc::UnboundedSender<OutMsg>,
+    out_tx: &mpsc::Sender<OutMsg>,
     input: &mut DealerSocket,
     shutdown: &CancellationToken,
 ) -> Result<()> {
@@ -347,7 +349,7 @@ async fn run_input_loop(
             };
 
         match request {
-            EngineCoreControlRequest::Add(req) => handle_add(core, active, out_tx, *req),
+            EngineCoreControlRequest::Add(req) => handle_add(core, active, out_tx, *req).await,
             EngineCoreControlRequest::Abort(ids) => {
                 let handle = core.handle();
                 let active = lock_active(active);
@@ -366,9 +368,42 @@ async fn run_input_loop(
                     }
                 }
             }
+            EngineCoreControlRequest::CancelAt(requests) => {
+                let handle = core.handle();
+                let active = lock_active(active);
+                for request in requests {
+                    if let Some(rid) = active.get(&request.request_id)
+                        && let Ok(output_token_count) = usize::try_from(request.output_token_count)
+                    {
+                        handle.cancel_at(*rid, output_token_count);
+                    }
+                }
+            }
+            EngineCoreControlRequest::AcknowledgeAt(requests) => {
+                let handle = core.handle();
+                let active = lock_active(active);
+                for request in requests {
+                    if let Some(rid) = active.get(&request.request_id)
+                        && let Ok(output_token_count) = usize::try_from(request.output_token_count)
+                    {
+                        handle.acknowledge_at(*rid, output_token_count);
+                    }
+                }
+            }
+            EngineCoreControlRequest::StopAt(requests) => {
+                let handle = core.handle();
+                let active = lock_active(active);
+                for request in requests {
+                    if let Some(rid) = active.get(&request.request_id)
+                        && let Ok(output_token_count) = usize::try_from(request.output_token_count)
+                    {
+                        handle.stop_at(*rid, output_token_count);
+                    }
+                }
+            }
             EngineCoreControlRequest::Utility(req) => {
                 let output = execute_utility(core, *req);
-                let _ = out_tx.send(OutMsg::Utility(output));
+                let _ = out_tx.send(OutMsg::Utility(output)).await;
             }
             EngineCoreControlRequest::StartDpWave => {
                 // Reserved: wave coordination for engines sharing collective forward passes.
@@ -379,10 +414,10 @@ async fn run_input_loop(
 }
 
 /// Register, translate, and submit one add-request; spawn its event adapter.
-fn handle_add(
+async fn handle_add(
     core: &Arc<EngineCore>,
     active: &SharedActiveRequests,
-    out_tx: &mpsc::UnboundedSender<OutMsg>,
+    out_tx: &mpsc::Sender<OutMsg>,
     req: EngineCoreRequest,
 ) {
     let request_id = req.request_id.clone();
@@ -398,33 +433,39 @@ fn handle_add(
         Err(error) => {
             warn!(request_id, %error, "canonical generation request rejected");
             lock_active(active).remove(&request_id);
-            let _ = out_tx.send(OutMsg::Output(Box::new(EngineCoreOutput {
-                request_id,
-                finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
-                ..Default::default()
-            })));
+            let _ = out_tx
+                .send(OutMsg::Output(Box::new(EngineCoreOutput {
+                    request_id,
+                    finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
+                    ..Default::default()
+                })))
+                .await;
             return;
         }
     };
-    let event_rx = match core.submit(generate) {
+    let mut event_rx = match core.submit(generate) {
         Ok(event_rx) => event_rx,
         Err(e) => {
             warn!(request_id, error = %e, "submit failed");
             lock_active(active).remove(&request_id);
-            let _ = out_tx.send(OutMsg::Output(Box::new(EngineCoreOutput {
-                request_id,
-                finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
-                ..Default::default()
-            })));
+            let _ = out_tx
+                .send(OutMsg::Output(Box::new(EngineCoreOutput {
+                    request_id,
+                    finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
+                    ..Default::default()
+                })))
+                .await;
             return;
         }
     };
+    event_rx.delegate_cancellation();
 
     let out_tx = out_tx.clone();
     let active = Arc::clone(active);
     tokio::spawn(async move {
         run_event_adapter(params, event_rx, |o| {
-            std::future::ready(out_tx.send(OutMsg::Output(Box::new(o))).is_ok())
+            let out_tx = out_tx.clone();
+            async move { out_tx.send(OutMsg::Output(Box::new(o))).await.is_ok() }
         })
         .await;
         lock_active(&active).remove(&request_id);
@@ -514,7 +555,7 @@ fn execute_utility(core: &Arc<EngineCore>, req: EngineCoreUtilityRequest) -> Uti
 async fn run_output_loop(
     engine_index: u32,
     mut socket: PushSocket,
-    mut rx: mpsc::UnboundedReceiver<OutMsg>,
+    mut rx: mpsc::Receiver<OutMsg>,
     stats: std::sync::Arc<uniserve_scheduler::SchedStats>,
     block_size: u32,
 ) {

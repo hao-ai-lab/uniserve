@@ -15,12 +15,13 @@ use zeromq::RouterSendHalf;
 
 use crate::client::state::{OutputReceiver, UtilityReceiver};
 use crate::client::stream::EngineCoreStreamOutput;
-use crate::client::{StreamCancelCause, StreamCancelRequest};
+use crate::client::{StreamCancelCause, StreamControl, StreamControlRequest};
 use crate::error::{client_closed, dispatcher_closed, unexpected_dispatcher_output};
 use crate::protocol::stats::SchedulerStats;
 use crate::protocol::utility::UtilityOutput;
 use crate::protocol::{
-    ClassifiedEngineCoreOutputs, EngineCoreControlRequest, EngineCoreOutput, EngineCoreOutputs,
+    ClassifiedEngineCoreOutputs, EngineCoreAcknowledgeAt, EngineCoreCancelAt,
+    EngineCoreControlRequest, EngineCoreOutput, EngineCoreOutputs, EngineCoreStopAt,
 };
 use crate::zmq::state::{RequestRegistry, UtilityRegistry};
 use crate::zmq::transport::{self, ConnectedEngine, EngineId};
@@ -219,6 +220,42 @@ impl ClientInner {
         .await
     }
 
+    pub(crate) async fn do_cancel_at_requests(
+        &self,
+        engine_id: &EngineId,
+        requests: &[EngineCoreCancelAt],
+    ) -> Result<()> {
+        self.send_to_engine(
+            engine_id,
+            EngineCoreControlRequest::CancelAt(requests.to_vec()),
+        )
+        .await
+    }
+
+    pub(crate) async fn do_acknowledge_at_requests(
+        &self,
+        engine_id: &EngineId,
+        requests: &[EngineCoreAcknowledgeAt],
+    ) -> Result<()> {
+        self.send_to_engine(
+            engine_id,
+            EngineCoreControlRequest::AcknowledgeAt(requests.to_vec()),
+        )
+        .await
+    }
+
+    pub(crate) async fn do_stop_at_requests(
+        &self,
+        engine_id: &EngineId,
+        requests: &[EngineCoreStopAt],
+    ) -> Result<()> {
+        self.send_to_engine(
+            engine_id,
+            EngineCoreControlRequest::StopAt(requests.to_vec()),
+        )
+        .await
+    }
+
     /// Shut down by closing all active request streams and utility calls with a
     /// sticky client closed error.
     pub(crate) fn shutdown(&self) {
@@ -235,6 +272,14 @@ impl ClientInner {
             return None;
         }
         Some(engine_id)
+    }
+
+    pub(crate) fn stream_control_target(&self, request_id: &str) -> Option<EngineId> {
+        let registry = self.request_reg.lock();
+        if registry.is_closed() {
+            return None;
+        }
+        registry.engine_for_request(request_id)
     }
 
     /// Publish the first persistent health error and return the sticky error
@@ -264,45 +309,108 @@ impl ClientInner {
 }
 
 /// Background loop that cancels requests whose output streams stop being consumed.
-pub(crate) async fn run_stream_cancel_loop(
+pub(crate) async fn run_stream_control_loop(
     inner: Arc<ClientInner>,
-    mut cancel_rx: mpsc::UnboundedReceiver<StreamCancelRequest>,
+    mut control_rx: mpsc::UnboundedReceiver<StreamControlRequest>,
 ) {
-    // Coalesce bursts of dropped-stream cancellations per engine.
+    // Coalesce bursts of stream controls per engine.
     const MAX_DRAIN: usize = 1024;
-    let mut batch: Vec<StreamCancelRequest> = Vec::new();
+    let mut batch: Vec<StreamControlRequest> = Vec::new();
 
-    while cancel_rx.recv_many(&mut batch, MAX_DRAIN).await > 0 {
-        let mut by_engine: BTreeMap<EngineId, Vec<String>> = BTreeMap::new();
+    while control_rx.recv_many(&mut batch, MAX_DRAIN).await > 0 {
+        let mut cutoffs_by_engine: BTreeMap<EngineId, Vec<EngineCoreCancelAt>> = BTreeMap::new();
+        let mut stops_by_engine: BTreeMap<EngineId, Vec<EngineCoreStopAt>> = BTreeMap::new();
+        let mut acknowledgements_by_engine: BTreeMap<EngineId, Vec<EngineCoreAcknowledgeAt>> =
+            BTreeMap::new();
 
-        for StreamCancelRequest { request_id, cause } in batch.drain(..) {
-            let Some(engine_id) = inner.take_stream_cancel_target(&request_id) else {
-                debug!(request_id, "skip stream cancellation for inactive request");
-                continue;
-            };
-
-            match cause {
-                StreamCancelCause::DroppedStream => {
-                    info!(request_id, "cancelling request due to dropped stream")
+        for StreamControlRequest {
+            request_id,
+            control,
+        } in batch.drain(..)
+        {
+            match control {
+                StreamControl::Cancel {
+                    cause,
+                    output_token_count,
+                } => {
+                    let Some(engine_id) = inner.take_stream_cancel_target(&request_id) else {
+                        debug!(request_id, "skip stream cancellation for inactive request");
+                        continue;
+                    };
+                    match cause {
+                        StreamCancelCause::DroppedStream => {
+                            info!(request_id, "cancelling request due to dropped stream");
+                            cutoffs_by_engine.entry(engine_id).or_default().push(
+                                EngineCoreCancelAt {
+                                    request_id,
+                                    output_token_count: output_token_count as u64,
+                                },
+                            );
+                        }
+                        StreamCancelCause::StopStringMatched => {
+                            debug!(
+                                request_id,
+                                "cancelling request after frontend stop-string match"
+                            );
+                            stops_by_engine
+                                .entry(engine_id)
+                                .or_default()
+                                .push(EngineCoreStopAt {
+                                    request_id,
+                                    output_token_count: output_token_count as u64,
+                                });
+                        }
+                    }
                 }
-                StreamCancelCause::StopStringMatched => {
-                    debug!(
-                        request_id,
-                        "cancelling request after frontend stop-string match"
-                    )
+                StreamControl::Acknowledge { output_token_count } => {
+                    let Some(engine_id) = inner.stream_control_target(&request_id) else {
+                        debug!(
+                            request_id,
+                            "skip semantic acknowledgement for inactive request"
+                        );
+                        continue;
+                    };
+                    acknowledgements_by_engine
+                        .entry(engine_id)
+                        .or_default()
+                        .push(EngineCoreAcknowledgeAt {
+                            request_id,
+                            output_token_count: output_token_count as u64,
+                        });
                 }
             }
-
-            by_engine.entry(engine_id).or_default().push(request_id);
         }
 
-        for (engine_id, request_ids) in by_engine {
-            if let Err(error) = inner.do_cancel_requests(&engine_id, &request_ids).await {
+        for (engine_id, requests) in cutoffs_by_engine {
+            if let Err(error) = inner.do_cancel_at_requests(&engine_id, &requests).await {
                 warn!(
                     ?engine_id,
-                    ?request_ids,
+                    ?requests,
                     error = %error.as_report(),
-                    "failed to cancel unconsumed request streams"
+                    "failed to cancel requests at their consumed output prefix"
+                );
+            }
+        }
+        for (engine_id, requests) in stops_by_engine {
+            if let Err(error) = inner.do_stop_at_requests(&engine_id, &requests).await {
+                warn!(
+                    ?engine_id,
+                    ?requests,
+                    error = %error.as_report(),
+                    "failed to complete requests at matched stop prefixes"
+                );
+            }
+        }
+        for (engine_id, requests) in acknowledgements_by_engine {
+            if let Err(error) = inner
+                .do_acknowledge_at_requests(&engine_id, &requests)
+                .await
+            {
+                warn!(
+                    ?engine_id,
+                    ?requests,
+                    error = %error.as_report(),
+                    "failed to acknowledge decoded token prefixes"
                 );
             }
         }

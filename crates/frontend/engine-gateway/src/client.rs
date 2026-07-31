@@ -42,11 +42,23 @@ impl StreamCancelCause {
     }
 }
 
-/// Cancellation work item sent from stream `Drop` handlers to the active backend.
+/// Request-scoped semantic control emitted by a frontend output stream.
 #[derive(Debug, Clone)]
-pub struct StreamCancelRequest {
+pub enum StreamControl {
+    Cancel {
+        cause: StreamCancelCause,
+        output_token_count: usize,
+    },
+    Acknowledge {
+        output_token_count: usize,
+    },
+}
+
+/// Stream control work item sent to the active backend.
+#[derive(Debug, Clone)]
+pub struct StreamControlRequest {
     pub request_id: String,
-    pub cause: StreamCancelCause,
+    pub control: StreamControl,
 }
 
 /// Backend contract for a runtime hosted in the same process as the server.
@@ -235,9 +247,13 @@ impl EngineCoreClient {
             Self::InProcess(c) => c.submit_generation(submission),
             Self::Zmq(c) => c.submit_generation(submission).await,
             Self::Mock(c) => {
+                let decoder_ack_required = !submission.request.stop_strings.is_empty();
                 let wire = crate::generation::generation_request_to_wire(submission);
                 let stream = c.call(wire)?;
-                Ok(crate::generation::generation_event_stream_from_wire(stream))
+                Ok(crate::generation::generation_event_stream_from_wire(
+                    stream,
+                    decoder_ack_required,
+                ))
             }
         }
     }

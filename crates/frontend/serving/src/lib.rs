@@ -4134,6 +4134,13 @@ async fn dialect_event_stream(
                     finish_reason: FinishReason::Stop(Some(StopReason::Text(stop_string.clone()))),
                     kv_transfer_params: None,
                 });
+            if stop_string.is_none() {
+                stream.acknowledge_text_prefix();
+            } else {
+                stream.cancel_at_consumed_prefix(
+                    uniserve_engine_gateway::transport::StreamCancelCause::StopStringMatched,
+                );
+            }
             let done = emit_dialect_text_update(
                 &request_id,
                 &mut processor,
@@ -4165,8 +4172,6 @@ async fn dialect_event_stream(
                     &mut y,
                 )
                 .await;
-                uniserve_engine_gateway::transport::StreamCancelCause::StopStringMatched
-                    .drop_as(stream);
                 return Ok(());
             }
         }};
