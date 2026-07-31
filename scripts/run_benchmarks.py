@@ -959,14 +959,69 @@ def benchmark_execution_policy_contract(
     return {**payload, "fingerprint": canonical_digest(payload)}
 
 
+def worker_extension_paths(config: dict[str, Any]) -> tuple[Path, Path, Path]:
+    python = repo_path(expand_profile_value(config.get("python", ".venv/bin/python")))
+    process = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')",
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    extension_suffix = process.stdout.strip()
+    if process.returncode != 0 or not extension_suffix.startswith("."):
+        raise RuntimeError(
+            f"cannot resolve extension suffix from {python}: {process.stdout.strip()}"
+        )
+    built = ROOT / "target" / "release" / "lib_uniserve_ipc.so"
+    installed = ROOT / "uniserve_worker" / f"_uniserve_ipc{extension_suffix}"
+    return python, built, installed
+
+
+def build_uniserve_runtime(config: dict[str, Any], build_log: Path) -> None:
+    python, built_extension, installed_extension = worker_extension_paths(config)
+    environment = effective_environment()
+    environment["PYO3_PYTHON"] = str(python)
+    run_command(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--package",
+            "uniserve-cli",
+            "--package",
+            "uniserve-ipc-py",
+        ],
+        log_path=build_log,
+        env=environment,
+    )
+    if not built_extension.is_file():
+        raise RuntimeError(f"release worker extension was not built: {built_extension}")
+    installed_extension.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(built_extension, installed_extension)
+
+
 def build_manifest_contract(
     config: dict[str, Any],
     build_log: Path,
 ) -> dict[str, Any]:
     binary = repo_path(expand_profile_value(config.get("server_bin", "target/release/uniserve")))
+    python, built_extension, installed_extension = worker_extension_paths(config)
     cargo_lock = ROOT / "Cargo.lock"
-    if not binary.is_file() or not cargo_lock.is_file() or not build_log.is_file():
+    if not all(
+        path.is_file()
+        for path in (binary, cargo_lock, build_log, python, built_extension, installed_extension)
+    ):
         raise RuntimeError("formal build did not produce its required files")
+    built_extension_contract = _file_content_contract(built_extension)
+    installed_extension_contract = _file_content_contract(installed_extension)
+    if installed_extension_contract != built_extension_contract:
+        raise RuntimeError("installed worker extension does not match the release build")
 
     def version(command: list[str]) -> str:
         process = subprocess.run(
@@ -982,13 +1037,23 @@ def build_manifest_contract(
         return process.stdout.strip()
 
     payload = {
-        "schema_version": 2,
-        "command": ["cargo", "build", "--release", "--bin", "uniserve"],
+        "schema_version": 3,
+        "command": [
+            "cargo",
+            "build",
+            "--release",
+            "--package",
+            "uniserve-cli",
+            "--package",
+            "uniserve-ipc-py",
+        ],
         "cargo_version": version(["cargo", "--version"]),
         "rustc_version": version(["rustc", "--version", "--verbose"]),
         "source_state": repository_state(ROOT),
         "cargo_lock": _file_content_contract(cargo_lock),
         "binary": _file_content_contract(binary),
+        "worker_python": _file_content_contract(python),
+        "worker_extension": installed_extension_contract,
         "build_log_present": True,
     }
     return {**payload, "fingerprint": canonical_digest(payload)}
@@ -1831,10 +1896,7 @@ def _run_once(args: argparse.Namespace) -> int:
     if active != "(none)":
         raise SystemExit(f"refusing to start with active benchmark/server processes:\n{active}")
     if not args.no_build and not args.dry_run:
-        run_command(
-            ["cargo", "build", "--release", "--bin", "uniserve"],
-            log_path=output_root / "build.log",
-        )
+        build_uniserve_runtime(config, output_root / "build.log")
     build_manifest = (
         build_manifest_contract(config, output_root / "build.log")
         if (output_root / "build.log").is_file()

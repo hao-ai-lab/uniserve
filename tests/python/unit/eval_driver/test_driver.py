@@ -977,11 +977,24 @@ def test_skipped_benchmarks_remain_in_the_aggregate_selection(tmp_path: Path) ->
     assert [item.name for item in report] == ["first", "second"]
 
 
-def test_build_manifest_identity_ignores_timestamped_log_content(tmp_path: Path) -> None:
+def test_build_manifest_identity_covers_runtime_binaries(tmp_path: Path, monkeypatch) -> None:
     run_benchmarks = _load_run_benchmarks()
     build_log = tmp_path / "build.log"
+    binary = tmp_path / "uniserve"
+    python = tmp_path / "python"
+    built_extension = tmp_path / "lib_uniserve_ipc.so"
+    installed_extension = tmp_path / "_uniserve_ipc.so"
+    binary.write_bytes(b"host")
+    python.write_bytes(b"python")
+    built_extension.write_bytes(b"worker")
+    installed_extension.write_bytes(b"worker")
     build_log.write_text("started at 2026-01-01T00:00:00Z\n", encoding="utf-8")
-    config = {"server_bin": str(run_benchmarks.ROOT / "target/release/uniserve")}
+    config = {"server_bin": str(binary)}
+    monkeypatch.setattr(
+        run_benchmarks,
+        "worker_extension_paths",
+        lambda _config: (python, built_extension, installed_extension),
+    )
 
     first = run_benchmarks.build_manifest_contract(config, build_log)
     build_log.write_text("started at 2027-01-01T00:00:00Z\n", encoding="utf-8")
@@ -989,6 +1002,47 @@ def test_build_manifest_identity_ignores_timestamped_log_content(tmp_path: Path)
 
     assert first == second
     assert first["build_log_present"] is True
+    assert first["binary"] == run_benchmarks._file_content_contract(binary)
+    assert first["worker_python"] == run_benchmarks._file_content_contract(python)
+    assert first["worker_extension"] == run_benchmarks._file_content_contract(installed_extension)
+
+
+def test_runtime_build_installs_release_worker_extension(tmp_path: Path, monkeypatch) -> None:
+    run_benchmarks = _load_run_benchmarks()
+    python = tmp_path / "python"
+    built_extension = tmp_path / "lib_uniserve_ipc.so"
+    installed_extension = tmp_path / "_uniserve_ipc.so"
+    build_log = tmp_path / "build.log"
+    python.write_bytes(b"python")
+    observed: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        run_benchmarks,
+        "worker_extension_paths",
+        lambda _config: (python, built_extension, installed_extension),
+    )
+
+    def build(command, *, log_path, env, check=True):
+        observed.update(command=command, log_path=log_path, env=env, check=check)
+        built_extension.write_bytes(b"release-worker")
+        return 0
+
+    monkeypatch.setattr(run_benchmarks, "run_command", build)
+
+    run_benchmarks.build_uniserve_runtime({}, build_log)
+
+    assert observed["command"] == [
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "uniserve-cli",
+        "--package",
+        "uniserve-ipc-py",
+    ]
+    assert observed["log_path"] == build_log
+    assert observed["env"]["PYO3_PYTHON"] == str(python)
+    assert installed_extension.read_bytes() == b"release-worker"
 
 
 def test_clean_gpu_check_queries_only_the_selected_physical_gpu(monkeypatch) -> None:
