@@ -4,7 +4,7 @@
 //! real `Scheduler` over a `LocalExecutor`+`SimEngine` and assert the lifecycle/event
 //! contract. This is the regression harness every workstream relies on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -3354,6 +3354,134 @@ fn resource_leases_drain_to_zero_after_completion() {
     );
 }
 
+/// Host KV pages remain bound to their worker session until the exact close
+/// acknowledgement orders worker retirement ahead of cross-request reuse.
+#[test]
+fn kv_page_ownership_turns_over_after_close_acknowledgement() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps};
+
+    struct OwnershipChecking {
+        inner: SimExecutor,
+        owners: Arc<Mutex<HashMap<u32, RequestId>>>,
+    }
+
+    impl Executor for OwnershipChecking {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+
+        fn can_submit(&self) -> bool {
+            self.inner.can_submit()
+        }
+
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            {
+                let mut owners = self.owners.lock().unwrap();
+                for operation in &batch.operations {
+                    let session_id = operation.request_key.session_id;
+                    for block in &operation.new_kv_blocks {
+                        if let Some(owner) = owners.get(&block.0) {
+                            anyhow::ensure!(
+                                *owner == session_id,
+                                "KV page {} remains owned by session {}",
+                                block.0,
+                                owner.0
+                            );
+                        }
+                        owners.insert(block.0, session_id);
+                    }
+                }
+            }
+            self.inner.submit(batch)
+        }
+
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            self.inner.poll()
+        }
+
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.inner.next_result()
+        }
+
+        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
+            if let ControlOp::DropSession(id) = &operation {
+                self.owners.lock().unwrap().retain(|_, owner| owner != id);
+            }
+            self.inner.control(operation)
+        }
+
+        fn control_wait(
+            &mut self,
+            operation: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            if let ControlOp::DropSession(id) = &operation {
+                self.owners.lock().unwrap().retain(|_, owner| owner != id);
+            }
+            self.inner.control_wait(operation, targets)
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let mut sim = SimEngine::new();
+    sim.set_num_blocks(2);
+    sim.set_pipeline_depth(2);
+    sim.set_text_len(1);
+    let owners = Arc::new(Mutex::new(HashMap::new()));
+    let executor = OwnershipChecking {
+        inner: SimExecutor::new(Box::new(sim)),
+        owners: Arc::clone(&owners),
+    };
+    let mut scheduler =
+        Scheduler::with_policy(Box::new(executor), ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut receivers = (1..=2)
+        .map(|request_id| {
+            scheduler.submit_for_test(generation_request(
+                RequestId(request_id),
+                text_context(vec![1]),
+                SamplingParams::default(),
+                ImageParams::default(),
+                GenerationConstraint::UndOnly,
+                1,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut finished = HashSet::new();
+    for _ in 0..256 {
+        scheduler.step();
+        for (index, receiver) in receivers.iter_mut().enumerate() {
+            while let Ok(event) = receiver.try_recv() {
+                if matches!(event, GenEvent::Finished { .. }) {
+                    finished.insert(index);
+                }
+            }
+        }
+        if finished.len() == receivers.len()
+            && scheduler.health_snapshot().in_flight == 0
+            && scheduler.health_snapshot().active_leases == 0
+        {
+            break;
+        }
+    }
+
+    assert_eq!(finished.len(), receivers.len());
+    assert_eq!(scheduler.health_snapshot().active_leases, 0);
+    assert_eq!(scheduler.health_snapshot().free_blocks, 1);
+    assert!(owners.lock().unwrap().is_empty());
+}
+
 /// The scheduler exposes structured facts, explainable decisions, and latency history.
 #[test]
 fn policy_facts_and_decisions_are_recorded() {
@@ -3619,7 +3747,10 @@ fn slow_client_releases_execution_credits_before_output_capacity_returns() {
 
     drop(slow_events);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && scheduler.health_snapshot().running > 0 {
+    while Instant::now() < deadline
+        && (scheduler.health_snapshot().running > 0
+            || scheduler.health_snapshot().active_leases > 0)
+    {
         scheduler.step();
     }
     let health = scheduler.health_snapshot();

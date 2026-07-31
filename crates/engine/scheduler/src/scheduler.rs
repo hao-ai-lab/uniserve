@@ -505,9 +505,13 @@ pub struct Scheduler {
     /// Encoder-cache entries reserved by admitted image requests.
     reserved_encoder_entries: usize,
     running: HashMap<RequestId, ReqState>,
-    /// Terminal requests retain only their bounded public journal; execution,
-    /// KV, product, and scheduler-sequence ownership has already been released.
+    /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
+    /// Worker-visible sessions whose close transaction has been submitted but
+    /// not yet acknowledged. Their host KV pages and logical leases remain
+    /// owned until the close report establishes the worker-side retirement
+    /// ordering point.
+    retiring_sessions: HashMap<RequestId, RequestKey>,
     order: Vec<RequestId>, // stable iteration order
     pending: Box<dyn RequestQueue>,
     /// The structured-output gate: requests whose grammar is still compiling
@@ -917,6 +921,7 @@ impl Scheduler {
             reserved_encoder_entries: 0,
             running: HashMap::new(),
             completed_outputs: HashMap::new(),
+            retiring_sessions: HashMap::new(),
             order: Vec::new(),
             skipped_waiting: HashMap::new(),
             grammar_compiler: GrammarCompiler::with_waker(cpu_waker.clone()),
@@ -2209,9 +2214,32 @@ impl Scheduler {
     fn acknowledge_controls(&mut self, controls: &[Control]) {
         for control in controls {
             if let Control::Close { request_key, .. } = control {
-                let _ = self
-                    .executor
-                    .control(ControlOp::DropSession(request_key.session_id));
+                let id = request_key.session_id;
+                if self.retiring_sessions.get(&id) != Some(request_key) {
+                    tracing::error!(
+                        request_id = id.0,
+                        epoch = request_key.epoch,
+                        "close acknowledgement does not match a retiring session"
+                    );
+                    self.fatal = true;
+                    continue;
+                }
+                match self.executor.control(ControlOp::DropSession(id)) {
+                    Ok(_) => {
+                        self.retiring_sessions.remove(&id);
+                        self.bm.release(id);
+                        self.ledger.release_request(id);
+                        self.ledger.assert_released(id);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            request_id = id.0,
+                            %error,
+                            "failed to enqueue worker session retirement"
+                        );
+                        self.fatal = true;
+                    }
+                }
             }
         }
     }
@@ -3104,14 +3132,9 @@ impl Scheduler {
     }
 
     fn reap_cancellations(&mut self) {
-        // never release a cancelled request's KV while one of its ops is
-        // still executing on the worker. `finish` frees the physical blocks
-        // immediately (and DropRequest is fire-and-forget), so reaping an
-        // in-flight request would let the blocks be re-allocated to another
-        // request before the cancelled forward completes — corrupting that
-        // request's KV cache on a pipelined worker. Defer to a later step: once
-        // the op resolves, `inflight_kinds` drains and the next reap finishes it.
-        // This mirrors the `!has_inflight` guard preemption already uses.
+        // A cancelled request closes only after every submitted descendant has
+        // resolved. Host KV ownership then remains pinned through the close
+        // acknowledgement and ordered worker session retirement.
         let cancelled: Vec<(RequestId, bool, bool)> = self
             .running
             .iter()
@@ -5726,6 +5749,7 @@ impl Scheduler {
                 "scheduler request terminated with an internal error"
             );
         }
+        let mut awaits_close = false;
         if let Some(mut st) = self.running.remove(&id) {
             if st.admission_digest.is_some() {
                 let request_key = RequestKey::new(self.authority_id, id, st.epoch);
@@ -5744,6 +5768,8 @@ impl Scheduler {
                     cutoff,
                     reason: close_reason(&reason),
                 });
+                self.retiring_sessions.insert(id, request_key);
+                awaits_close = true;
             }
             self.order.retain(|x| *x != id);
             self.reserved_encoder_entries = self
@@ -5802,10 +5828,11 @@ impl Scheduler {
                 }
             }
         }
-        self.bm.release(id);
-        // release every lease this request held and assert it leaked none.
-        self.ledger.release_request(id);
-        self.ledger.assert_released(id);
+        if !awaits_close {
+            self.bm.release(id);
+            self.ledger.release_request(id);
+            self.ledger.assert_released(id);
+        }
     }
 
     /// Clear the encoder cache (`/reset_encoder_cache` / `/reset_mm_cache`)
