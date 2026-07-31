@@ -44,9 +44,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
             input_products=(parent_input,),
         )
     )
-    continuation = next(
-        output for output in parent.outputs if output.kind is ProductKind.COMPLETION
-    )
+    continuation = next(output for output in parent.outputs if output.kind is ProductKind.TOKEN)
     successor, successor_input = token_operation(
         admission.request_key,
         op_id=2,
@@ -68,7 +66,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         )
     )
     successor_continuation = next(
-        output for output in successor.outputs if output.kind is ProductKind.COMPLETION
+        output for output in successor.outputs if output.kind is ProductKind.TOKEN
     )
     descendant, descendant_input = token_operation(
         admission.request_key,

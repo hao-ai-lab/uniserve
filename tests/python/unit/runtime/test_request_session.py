@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests.python.fixtures.depth_one import root_parent, token_operation, und_admission
 from uniserve_worker.batch import (
     Admission,
     Close,
@@ -10,6 +11,7 @@ from uniserve_worker.batch import (
     Disposition,
     FixedPoint,
     RequestKey,
+    TokenMode,
     UndAdmission,
     VersionRef,
 )
@@ -18,21 +20,35 @@ from uniserve_worker.runtime.request_session import ResolvedRuntimeState, Sessio
 from uniserve_worker.runtime.snapshot_store import SnapshotProvider
 
 
-def test_rollback_snapshot_shares_declarations_and_copies_mutable_state() -> None:
+def test_step_rollback_restores_scalar_and_lineage_state() -> None:
     sessions = SessionStore()
-    admission = Admission.create(RequestKey(0, 7, 3), und=UndAdmission())
+    admission = und_admission(7, block_ids=(0,))
     session = sessions.admit(admission)
     session.product_handles.update({11, 13})
-    session.control_digests[(1, "commit")] = "a" * 64
+    operation, _token_input = token_operation(
+        admission.request_key,
+        op_id=11,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    selected = VersionRef(admission.request_key, 11, FixedPoint(1, "a" * 64))
+    transaction = sessions.begin_step(1, (operation,), ())
 
-    snapshot = session.rollback_snapshot()
+    def fail_publish() -> None:
+        raise RuntimeError("publication failed")
 
-    assert snapshot.sampling is session.sampling
-    assert snapshot.negative_token_ids is session.negative_token_ids
-    assert snapshot.product_handles == session.product_handles
-    assert snapshot.product_handles is not session.product_handles
-    assert snapshot.control_digests == session.control_digests
-    assert snapshot.control_digests is not session.control_digests
+    with pytest.raises(RuntimeError, match="publication failed"):
+        transaction.commit(
+            {7: selected},
+            {7: ResolvedRuntimeState(logical_position=1, rng_counter=1, kv_length=1)},
+            fail_publish,
+        )
+
+    restored = sessions.get(7)
+    assert restored.resolved_version() == root_parent(admission)
+    assert restored.product_handles == {11, 13}
+    assert tuple(restored.resolved_versions) == (0,)
 
 
 def _resolved_version(

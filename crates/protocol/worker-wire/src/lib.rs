@@ -620,11 +620,14 @@ impl Operation {
         }
         if let Some(predicate) = &self.predicate {
             predicate.validate()?;
+            let continuation_token = predicate.kind == ProductKind::Token
+                && predicate.dtype == DType::U32
+                && predicate.shape_bound.max_elements() == 1;
             anyhow::ensure!(
                 predicate.generation > 0
                     && predicate.storage_class == StorageClass::DeviceTensor
-                    && predicate.kind == ProductKind::Completion,
-                "operation predicate is not a generation-tagged device completion product"
+                    && (predicate.kind == ProductKind::Completion || continuation_token),
+                "operation predicate is not a generation-tagged device decision product"
             );
         }
         anyhow::ensure!(

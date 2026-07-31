@@ -199,6 +199,8 @@ from ._inputs import PreparedImage, prepare_image, prepare_tensor_image
 from .model_runner import ModelRunner, RunObservation
 
 SAMPLING_COMPLETION_FIELDS = 4
+TOKEN_CONTINUATION_BIT = 1 << 31
+TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
 
 @dataclass(slots=True)
@@ -265,6 +267,7 @@ class _SampleTask:
     finish_product: DeviceProductWrite | None = None
     continuation_product: DeviceProductWrite | None = None
     predicate: torch.Tensor | None = None
+    tagged_predicate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +282,7 @@ class _SampleResult:
         ...,
     ] = ()
     device_finish: torch.Tensor | None = None
+    device_continuation: torch.Tensor | None = None
     device_product_published: bool = False
 
 
@@ -980,6 +984,7 @@ class _ExecutionScope:
     finish_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
     continuation_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
     predicate_reads: dict[int, DeviceProductRead] = field(default_factory=dict)
+    predicate_values: dict[int, tuple[torch.Tensor, bool]] = field(default_factory=dict)
     sampling_states: dict[int, SamplingState] = field(default_factory=dict)
     device_continuation: DeviceProductContinuationBatch | None = None
     next_row_id: int = 0
@@ -1504,6 +1509,14 @@ class ModelExecutor:
         )
         scope.device_continuation = continuation
         scope.device_writes.extend(continuation.writes)
+        for operation, parent_value in zip(operations, continuation.inputs, strict=True):
+            parent_point = operation.parent.point
+            if (
+                isinstance(parent_point, DevicePoint)
+                and operation.predicate == parent_point.selected_point
+                and operation.predicate is not None
+            ):
+                scope.predicate_values[int(operation.op_id)] = (parent_value, True)
         return True
 
     def _operation_device(self, operation: Operation) -> torch.device:
@@ -1545,6 +1558,8 @@ class ModelExecutor:
             predicate = operation.predicate
             if predicate is None:
                 continue
+            if int(operation.op_id) in scope.predicate_values:
+                continue
             read = self.products.device_products.consume(
                 predicate,
                 consumer_op_id=operation.op_id,
@@ -1552,6 +1567,8 @@ class ModelExecutor:
             )
             scope.device_reads.append(read)
             scope.predicate_reads[int(operation.op_id)] = read
+            tagged = predicate.kind is ProductKind.TOKEN and predicate.dtype is DType.U32
+            scope.predicate_values[int(operation.op_id)] = (read.tensor, tagged)
 
     def _publish_predicates(
         self,
@@ -2760,7 +2777,7 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> tuple[int | torch.Tensor, ...]:
         if scope.device_continuation is not None:
-            return scope.device_continuation.inputs
+            return _decode_tagged_token_views(scope.device_continuation.inputs)
         resolved: list[int | torch.Tensor | None] = [None] * len(operations)
         device_indexes: list[int] = []
         requests: list[tuple[ProductRef, int, str | None, torch.device | str | None]] = []
@@ -2789,8 +2806,9 @@ class ModelExecutor:
             device=self._operation_device(operations[0]),
         )
         scope.device_reads.extend(reads)
-        for index, read in zip(device_indexes, reads, strict=True):
-            resolved[index] = read.tensor
+        decoded = _decode_tagged_token_views(tuple(read.tensor for read in reads))
+        for index, token in zip(device_indexes, decoded, strict=True):
+            resolved[index] = token
         if any(value is None for value in resolved):
             raise RuntimeError("decode token resolution left an operation without input")
         return tuple(cast(int | torch.Tensor, value) for value in resolved)
@@ -2813,9 +2831,12 @@ class ModelExecutor:
                 dtype=torch.long,
                 device=self._operation_device(operation),
             )
+        continuation = sample.device_continuation
+        if continuation is None:
+            continuation = torch.ones_like(device_token, dtype=torch.bool)
         self.products.device_products.publish_write(
             write,
-            device_token,
+            _tagged_token_values(device_token, continuation),
         )
 
     def _publish_token_products(
@@ -2833,14 +2854,22 @@ class ModelExecutor:
             continuation_tokens = tuple(
                 sample.device_token for sample in samples if sample.device_token is not None
             )
-            if len(continuation_tokens) != len(samples):
+            continuation_flags = tuple(
+                sample.device_continuation
+                for sample in samples
+                if sample.device_continuation is not None
+            )
+            if len(continuation_tokens) != len(samples) or len(continuation_flags) != len(samples):
                 raise RuntimeError("device continuation sampling lost a device token")
             packed = packed_tensor_views(continuation_tokens)
             if packed is None:
                 packed = torch.cat(continuation_tokens, dim=0)
+            packed_flags = packed_tensor_views(continuation_flags)
+            if packed_flags is None:
+                packed_flags = torch.cat(continuation_flags, dim=0)
             self.products.device_products.publish_continuation(
                 continuation,
-                packed,
+                _tagged_token_values(packed, packed_flags),
                 after_reads=tuple(scope.device_reads),
             )
             return
@@ -2867,9 +2896,19 @@ class ModelExecutor:
             for operation, sample in zip(operations, samples, strict=True):
                 self._publish_token_product(operation, sample, scope)
             return
+        continuation_flags = tuple(
+            sample.device_continuation
+            for sample in samples
+            if sample.device_continuation is not None
+        )
+        if len(continuation_flags) != len(samples):
+            raise RuntimeError("sampled token publication lost its continuation state")
+        packed_flags = packed_tensor_views(continuation_flags)
+        if packed_flags is None:
+            packed_flags = torch.cat(continuation_flags, dim=0)
         self.products.device_products.publish_writes(
             tuple(writes),
-            packed,
+            _tagged_token_values(packed, packed_flags),
         )
 
     def _sample_task(
@@ -2962,7 +3001,7 @@ class ModelExecutor:
         token_product = scope.token_writes.get(int(operation.op_id))
         finish_product = scope.finish_writes.get(int(operation.op_id))
         continuation_product = scope.continuation_writes.get(int(operation.op_id))
-        predicate_read = scope.predicate_reads.get(int(operation.op_id))
+        predicate_value = scope.predicate_values.get(int(operation.op_id))
         return _SampleTask(
             operation=operation,
             logits=rows,
@@ -2976,7 +3015,8 @@ class ModelExecutor:
             token_product=token_product,
             finish_product=finish_product,
             continuation_product=continuation_product,
-            predicate=None if predicate_read is None else predicate_read.tensor,
+            predicate=None if predicate_value is None else predicate_value[0],
+            tagged_predicate=False if predicate_value is None else predicate_value[1],
         )
 
     def _flow_driver(
@@ -4582,6 +4622,8 @@ def _sample_task_batch(
         elif task.acceptance_uniforms is not None or len(task.rows) != 1:
             raise invalid_descriptor("ordinary sampling tasks must contain exactly one row")
         vocab = int(task.logits.shape[1])
+        if vocab > TOKEN_VALUE_MASK:
+            raise capability_mismatch("vocabulary exceeds the device token decision range")
         if any(value < 0 or value >= vocab for value in task.draft_token_ids):
             raise invalid_descriptor("speculative draft token is outside the model vocabulary")
         sampling_path = -1 if plain_greedy else _fused_top_k(task, vocab)
@@ -4671,7 +4713,7 @@ def _sample_plain_greedy_group(
         & torch.isfinite(logits).any(dim=-1)
     )
     active = _sample_predicates(tasks, device_tokens.device)
-    device_finish, producer_event = _resolve_sampled_finish_values(
+    device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
         tasks,
         device_tokens,
         valid,
@@ -4679,27 +4721,6 @@ def _sample_plain_greedy_group(
         device_products,
         device_reads,
     )
-    published = product_table is not None
-    if product_table is not None:
-        if device_continuation is not None:
-            product_table.publish_continuation(
-                device_continuation,
-                None if product_batch is not None else device_tokens,
-                after_reads=device_reads,
-                producer_event=producer_event,
-            )
-        elif product_batch is None:
-            product_table.publish_writes(
-                product_writes,
-                device_tokens,
-                producer_event=producer_event,
-            )
-        else:
-            product_table.publish_scalar_batch(
-                product_batch,
-                after_reads=device_reads,
-                producer_event=producer_event,
-            )
     span = _capture_sample_span(
         valid,
         active,
@@ -4707,6 +4728,29 @@ def _sample_plain_greedy_group(
         torch.zeros_like(device_tokens),
         completion,
     )
+    tagged_tokens = _tagged_token_values(
+        device_tokens,
+        continuation_values,
+        in_place=packed_output is not None and int(packed_output.numel()) == len(tasks),
+    )
+    published = product_table is not None
+    if product_table is not None:
+        if device_continuation is not None:
+            product_table.publish_continuation(
+                device_continuation,
+                None if product_batch is not None else tagged_tokens,
+                after_reads=device_reads,
+            )
+        elif product_batch is None:
+            product_table.publish_writes(
+                product_writes,
+                tagged_tokens,
+            )
+        else:
+            product_table.publish_scalar_batch(
+                product_batch,
+                after_reads=device_reads,
+            )
     return tuple(
         _SampleResult(
             token_id=_CompletionSampleToken(span, index),
@@ -4714,6 +4758,7 @@ def _sample_plain_greedy_group(
             logprob=None,
             top_logprobs=None,
             device_finish=(None if device_finish is None else device_finish[index : index + 1]),
+            device_continuation=continuation_values[index : index + 1],
             device_product_published=published,
         )
         for index, task in enumerate(tasks)
@@ -4773,7 +4818,7 @@ def _sample_fused_top_k_group(
         top_k,
     )
     active = _sample_predicates(tasks, tokens.device)
-    device_finish, producer_event = _resolve_sampled_finish_values(
+    device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
         tasks,
         tokens,
         valid,
@@ -4784,10 +4829,9 @@ def _sample_fused_top_k_group(
     published = _publish_sampled_device_values(
         tasks,
         "token_product",
-        tokens,
+        _tagged_token_values(tokens, continuation_values),
         device_products,
         device_reads,
-        producer_event=producer_event,
     )
     span = _capture_sample_span(valid, active, tokens, torch.zeros_like(tokens), completion)
     return tuple(
@@ -4797,6 +4841,7 @@ def _sample_fused_top_k_group(
             None,
             None,
             device_finish=(None if device_finish is None else device_finish[index : index + 1]),
+            device_continuation=continuation_values[index : index + 1],
             device_product_published=published,
         )
         for index in range(len(rows))
@@ -4950,7 +4995,7 @@ def _sample_task_group(
         )
     )
     active = _sample_predicates(tasks, task_tokens.device)
-    device_finish, producer_event = _resolve_sampled_finish_values(
+    device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
         tasks,
         task_tokens,
         task_valid,
@@ -4961,10 +5006,9 @@ def _sample_task_group(
     published = _publish_sampled_device_values(
         tasks,
         "token_product",
-        task_tokens,
+        _tagged_token_values(task_tokens, continuation_values),
         device_products,
         device_reads,
-        producer_event=producer_event,
     )
     span = _capture_sample_span(task_valid, active, task_tokens, counts, completion)
     speculative_values: dict[int, tuple[int, int]] = {}
@@ -5019,6 +5063,7 @@ def _sample_task_group(
                 else _CompletionInteger(span, index)
             ),
             device_finish=(None if device_finish is None else device_finish[index : index + 1]),
+            device_continuation=continuation_values[index : index + 1],
             device_product_published=published,
         )
         for index in range(len(tasks))
@@ -5119,19 +5164,53 @@ def _device_finish_values(
     return torch.stack(values)
 
 
+def _decode_tagged_token_views(values: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    if not values:
+        return ()
+    packed = packed_tensor_views(values)
+    if packed is None:
+        packed = torch.cat(tuple(value.reshape(-1)[:1] for value in values), dim=0)
+    decoded = packed.reshape(-1).bitwise_and(TOKEN_VALUE_MASK)
+    return tuple(decoded[index : index + 1] for index in range(len(values)))
+
+
 def _sample_predicates(
     tasks: tuple[_SampleTask, ...],
     device: torch.device,
 ) -> torch.Tensor:
+    if tasks and all(task.predicate is not None and task.tagged_predicate for task in tasks):
+        predicates = tuple(cast(torch.Tensor, task.predicate).reshape(-1)[:1] for task in tasks)
+        packed = packed_tensor_views(predicates)
+        if packed is None:
+            packed = torch.cat(predicates, dim=0)
+        return packed.reshape(-1).bitwise_and(TOKEN_CONTINUATION_BIT).ne(0)
     values = tuple(
         (
             torch.ones((1,), dtype=torch.bool, device=device)
             if task.predicate is None
-            else task.predicate.reshape(-1)[:1].to(device=device, dtype=torch.bool)
+            else (
+                task.predicate.reshape(-1)[:1].bitwise_and(TOKEN_CONTINUATION_BIT).ne(0)
+                if task.tagged_predicate
+                else task.predicate.reshape(-1)[:1].to(device=device, dtype=torch.bool)
+            )
         )
         for task in tasks
     )
     return torch.cat(values, dim=0)
+
+
+def _tagged_token_values(
+    tokens: torch.Tensor,
+    continuation: torch.Tensor,
+    *,
+    in_place: bool = False,
+) -> torch.Tensor:
+    if int(tokens.numel()) != int(continuation.numel()):
+        raise RuntimeError("token continuation vector does not align with selected tokens")
+    tags = torch.where(continuation.reshape(-1), TOKEN_CONTINUATION_BIT, 0)
+    target = tokens.reshape(-1) if in_place else tokens.reshape(-1).clone()
+    target.bitwise_or_(tags)
+    return target
 
 
 def _publish_sampled_device_values(
@@ -5164,7 +5243,7 @@ def _resolve_sampled_finish_values(
     active: torch.Tensor,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
-) -> tuple[torch.Tensor | None, torch.cuda.Event | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.cuda.Event | None]:
     finish_values = _device_finish_values(tasks, device_tokens, valid & active)
     continuation_values = active & valid & ~finish_values
     _publish_sampled_device_values(
@@ -5175,14 +5254,14 @@ def _resolve_sampled_finish_values(
         device_reads,
     )
     if device_products is None:
-        return finish_values, None
+        return finish_values, continuation_values, None
     selected = tuple(
         (index, task, task.finish_product)
         for index, task in enumerate(tasks)
         if task.finish_product is not None
     )
     if not selected:
-        return None, None
+        return None, continuation_values, None
     indexes = tuple(index for index, _task, _write in selected)
     finish_tasks = tuple(task for _index, task, _write in selected)
     writes = tuple(write for _index, _task, write in selected)
@@ -5203,7 +5282,7 @@ def _resolve_sampled_finish_values(
         device_products,
         device_reads,
     )
-    return None, producer_event
+    return None, continuation_values, producer_event
 
 
 def _select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torch.Tensor:

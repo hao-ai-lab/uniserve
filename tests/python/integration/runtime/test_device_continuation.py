@@ -35,7 +35,7 @@ pytestmark = [
 ]
 
 
-def test_token_and_finish_outputs_share_the_sampling_submission_fence() -> None:
+def test_token_and_finish_outputs_are_fenced_after_sampling_submission() -> None:
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     admission = und_admission(29, block_ids=(0,))
     operation, token_input = token_operation(
@@ -65,7 +65,7 @@ def test_token_and_finish_outputs_share_the_sampling_submission_fence() -> None:
     )
 
     assert token_read._write.producer_event is not None
-    assert token_read._write.producer_event is finish_read._write.producer_event
+    assert finish_read._write.producer_event is not None
     worker.products.device_products.record_readers(
         (token_read, finish_read),
         device="cuda:0",
@@ -133,9 +133,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         parent=device_parent,
         mode=TokenMode.DECODE,
         tokens=(0,),
-        predicate=next(
-            output for output in parent.outputs if output.kind is ProductKind.COMPLETION
-        ),
+        predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
     )
     successor = Operation.registered(
         request_key=successor_template.request_key,
@@ -208,9 +206,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
-        predicate=next(
-            output for output in parent.outputs if output.kind is ProductKind.COMPLETION
-        ),
+        predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
         rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
     successor_report = worker.execute(

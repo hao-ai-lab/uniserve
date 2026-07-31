@@ -127,14 +127,16 @@ class RequestSession:
         )
 
     def rollback_snapshot(self) -> RequestSession:
-        """Copy mutable session-owned state while sharing immutable declarations."""
+        """Capture scalar transaction state without copying the lineage ledger.
+
+        A step appends at most its own selected versions. ``StepTxn`` journals
+        those exact dictionary writes, so the historical cutoff ledger remains
+        shared and rollback cost is independent of generated sequence length.
+        """
 
         return replace(
             self,
             product_handles=set(self.product_handles),
-            control_digests=dict(self.control_digests),
-            resolved_versions=dict(self.resolved_versions),
-            resolved_runtime=dict(self.resolved_runtime),
         )
 
 
@@ -558,6 +560,9 @@ class StepTxn:
         }
         self._store_snapshots: list[tuple[SnapshotStore, object]] = []
         self._store_transactions: list[tuple[ScratchStore, StoreTxn]] = []
+        self._history_undo: dict[
+            tuple[int, str, int], tuple[dict[int, object], int, bool, object | None]
+        ] = {}
         for store in stores:
             begin = getattr(store, "begin_step", None)
             if callable(begin):
@@ -627,6 +632,12 @@ class StepTxn:
                 session.version = point.point_index
                 session.resolved_op_id = selected.producer_op_id
                 session.resolved_digest = point.semantic_digest
+                self._record_history_write(
+                    operation.request_key.session_id,
+                    "version",
+                    cast(dict[int, object], session.resolved_versions),
+                    int(selected.producer_op_id),
+                )
                 session.resolved_versions[selected.producer_op_id] = selected
                 runtime = (
                     resolved_runtime.get(operation.request_key.session_id)
@@ -635,6 +646,12 @@ class StepTxn:
                 )
                 if runtime is None:
                     raise RuntimeError("resolved operation runtime state is missing")
+                self._record_history_write(
+                    operation.request_key.session_id,
+                    "runtime",
+                    cast(dict[int, object], session.resolved_runtime),
+                    int(selected.producer_op_id),
+                )
                 session.resolved_runtime[selected.producer_op_id] = runtime
                 session.last_op_id = operation.op_id
                 session.last_step_id = self.step_id
@@ -655,6 +672,11 @@ class StepTxn:
         try:
             for _store, transaction in reversed(self._store_transactions):
                 transaction.rollback()
+            for mapping, key, existed, value in reversed(tuple(self._history_undo.values())):
+                if existed:
+                    mapping[key] = value
+                else:
+                    mapping.pop(key, None)
             for session_id, session_snapshot in self._snapshots.items():
                 if not session_snapshot.existed:
                     self.sessions._sessions.pop(session_id, None)
@@ -671,6 +693,18 @@ class StepTxn:
             existed=session is not None,
             value=None if session is None else session.rollback_snapshot(),
         )
+
+    def _record_history_write(
+        self,
+        session_id: int,
+        ledger: str,
+        mapping: dict[int, object],
+        key: int,
+    ) -> None:
+        identity = (int(session_id), ledger, int(key))
+        if identity in self._history_undo:
+            return
+        self._history_undo[identity] = (mapping, key, key in mapping, mapping.get(key))
 
     def _close(self) -> None:
         if self._closed:

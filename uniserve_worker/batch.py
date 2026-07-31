@@ -669,10 +669,7 @@ class ShapeBound:
         device_dims = sum(1 for dim in self.dims if isinstance(dim, DeviceDim))
         if device_dims > 1:
             raise invalid_descriptor("a shape bound carries more than one device-actual dimension")
-        if any(
-            (dim.extent if isinstance(dim, StaticDim) else dim.bound) < 1
-            for dim in self.dims
-        ):
+        if any((dim.extent if isinstance(dim, StaticDim) else dim.bound) < 1 for dim in self.dims):
             raise invalid_descriptor("a shape bound contains a zero extent")
 
     @property
@@ -1090,8 +1087,7 @@ class Operation:
                     "a latent-arena output exceeds the operation latent-byte bound"
                 )
             if (
-                product.storage_class
-                in (StorageClass.HOST_STAGING, StorageClass.COMPLETION_ARENA)
+                product.storage_class in (StorageClass.HOST_STAGING, StorageClass.COMPLETION_ARENA)
                 and product.max_bytes > self.bounds.max_completion_bytes
             ):
                 raise invalid_descriptor(
@@ -1111,14 +1107,20 @@ class Operation:
                 )
             if selected.generation < 1:
                 raise invalid_descriptor("device version selected point has no logical generation")
-        if self.predicate is not None and (
-            self.predicate.generation < 1
-            or self.predicate.storage_class is not StorageClass.DEVICE_TENSOR
-            or self.predicate.kind is not ProductKind.COMPLETION
-        ):
-            raise invalid_descriptor(
-                "operation predicate is not a generation-tagged device completion product"
+        if self.predicate is not None:
+            continuation_token = (
+                self.predicate.kind is ProductKind.TOKEN
+                and self.predicate.dtype is DType.U32
+                and self.predicate.shape_bound.max_elements == 1
             )
+            if (
+                self.predicate.generation < 1
+                or self.predicate.storage_class is not StorageClass.DEVICE_TENSOR
+                or not (self.predicate.kind is ProductKind.COMPLETION or continuation_token)
+            ):
+                raise invalid_descriptor(
+                    "operation predicate is not a generation-tagged device decision product"
+                )
         if not _is_digest(self.plan_digest):
             raise invalid_descriptor("operation plan digest is not a lowercase SHA-256 digest")
         if self.plan_digest != self.compute_plan_digest():
@@ -1620,9 +1622,7 @@ class UndAdmission:
             negative_token_ids=_uints(
                 data.get("negative_token_ids", ()), f"{where}.negative_token_ids"
             ),
-            finish_token_ids=_uints(
-                data.get("finish_token_ids", ()), f"{where}.finish_token_ids"
-            ),
+            finish_token_ids=_uints(data.get("finish_token_ids", ()), f"{where}.finish_token_ids"),
             kv=KvAllocation.from_wire(data.get("kv", {}), f"{where}.kv"),
         )
 
@@ -1759,17 +1759,12 @@ class Batch:
                     "a submission batch reuses a control identity with different content"
                 )
             identities[identity] = control
-        declared_inputs = {
-            product for operation in self.operations for product in operation.inputs
-        }
+        declared_inputs = {product for operation in self.operations for product in operation.inputs}
         for operation in self.operations:
             for product in operation.inputs:
-                if (
-                    product.storage_class is StorageClass.HOST_STAGING
-                    and (
-                        product.request_key != operation.request_key
-                        or product.producer_op_id != operation.op_id
-                    )
+                if product.storage_class is StorageClass.HOST_STAGING and (
+                    product.request_key != operation.request_key
+                    or product.producer_op_id != operation.op_id
                 ):
                     raise invalid_descriptor(
                         "a host-staging input is not owned by its consuming operation"
@@ -1786,27 +1781,24 @@ class Batch:
                     "an input product payload does not name host-staging storage"
                 )
             if product in supplied_inputs:
-                raise invalid_descriptor(
-                    "a submission batch repeats an input product payload"
-                )
+                raise invalid_descriptor("a submission batch repeats an input product payload")
             supplied_inputs.add(product)
             if product.kind is ProductKind.TOKEN:
-                if len(decode_token_product_bytes(payload.payload)) > product.shape_bound.max_elements:
+                if (
+                    len(decode_token_product_bytes(payload.payload))
+                    > product.shape_bound.max_elements
+                ):
                     raise invalid_descriptor(
                         "token input product exceeds its registered element bound"
                     )
             elif len(payload.payload) > product.max_bytes:
-                raise invalid_descriptor(
-                    "input product payload exceeds its registered byte bound"
-                )
+                raise invalid_descriptor("input product payload exceeds its registered byte bound")
         for product in declared_inputs:
             if (
                 product.storage_class is StorageClass.HOST_STAGING
                 and product not in supplied_inputs
             ):
-                raise invalid_descriptor(
-                    "a host-staging operation input has no product payload"
-                )
+                raise invalid_descriptor("a host-staging operation input has no product payload")
 
     @classmethod
     def from_wire(cls, value: object) -> Batch:
@@ -1832,9 +1824,7 @@ class Batch:
         controls = tuple(
             _fast_release_control(item)
             or control_from_wire(item, f"execute batch.controls[{index}]")
-            for index, item in enumerate(
-                _seq(data.get("controls", ()), "execute batch.controls")
-            )
+            for index, item in enumerate(_seq(data.get("controls", ()), "execute batch.controls"))
         )
         input_products = tuple(
             ProductPayload.from_wire(item, f"execute batch.input_products[{index}]")
