@@ -4045,7 +4045,7 @@ impl Scheduler {
                     predecessor
                         .outputs
                         .iter()
-                        .find(|output| output.kind == ProductKind::Completion)
+                        .find(|output| output.kind == ProductKind::Token)
                         .cloned(),
                 )
             } else if let Some(parent) = reusable_device_version {

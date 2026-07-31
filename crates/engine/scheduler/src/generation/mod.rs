@@ -187,10 +187,9 @@ fn logprob_blob_bound(
     Ok(Some(bytes))
 }
 
-/// The declared outputs of a token operation: a selected-token product, a
-/// finish predicate when this operation can terminate its lineage, optional
-/// bounded logprobs and KV conditioning, and a continuation predicate for a
-/// registered device descendant.
+/// The declared outputs of a token operation. The selected-token product also
+/// carries the device continuation bit consumed by a registered descendant;
+/// the worker masks that bit before the token reaches model input.
 fn token_outputs(
     logprob_bound: Option<u64>,
     publishes_conditioning: bool,
@@ -227,12 +226,6 @@ fn token_outputs(
             DType::BF16,
         ));
     }
-    outputs.push(output_product(
-        4,
-        ProductKind::Completion,
-        StorageClass::DeviceTensor,
-        DType::U8,
-    ));
     Ok(outputs)
 }
 
@@ -2656,8 +2649,8 @@ mod tests {
             .expect("registered operation")
             .outputs
             .iter()
-            .find(|output| output.kind == ProductKind::Completion)
-            .expect("token operation completion predicate")
+            .find(|output| output.kind == ProductKind::Token)
+            .expect("token operation decision predicate")
             .clone();
         predicate.producer_op_id = OpId(19);
         transition

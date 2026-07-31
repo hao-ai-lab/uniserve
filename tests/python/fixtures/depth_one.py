@@ -166,19 +166,6 @@ def token_operation(
                 point_range=PointRange(),
             )
         )
-    outputs.append(
-        ProductRef(
-            request_key=rk,
-            producer_op_id=op_id,
-            output_index=4,
-            generation=op_id * 4 + 3,
-            kind=ProductKind.COMPLETION,
-            storage_class=StorageClass.DEVICE_TENSOR,
-            dtype=DType.U8,
-            shape_bound=ShapeBound(),
-            point_range=PointRange(),
-        )
-    )
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -262,9 +249,7 @@ def encode_operation(
         control_seq=control_seq,
     )
     payload = (
-        None
-        if image_base64 is None
-        else ProductPayload(product=image_ref, payload=image_bytes)
+        None if image_base64 is None else ProductPayload(product=image_ref, payload=image_bytes)
     )
     return operation, payload
 
