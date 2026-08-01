@@ -558,11 +558,13 @@ class ModelWorker:
             Batch,
             Bounds,
             Domain,
+            DrawLayout,
             FixedPoint,
             GenAdmission,
             ImageParams,
             Operation,
             RequestKey,
+            Rng,
             VersionRef,
             Work,
         )
@@ -593,6 +595,11 @@ class ModelWorker:
                 route=0,
                 domain=Domain.GEN,
                 bounds=Bounds(max_points=1),
+                rng=Rng(
+                    seed=0,
+                    semantic_index_base=1,
+                    draw_layout=DrawLayout.FLOW_NOISE,
+                ),
             )
             self._execute_warmup(
                 Batch(step_id=3, admissions=(admission,), operations=(flow,), input_products=())
