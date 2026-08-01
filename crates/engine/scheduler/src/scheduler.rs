@@ -5042,12 +5042,18 @@ impl Scheduler {
                         if !is_final_step {
                             return;
                         }
-                        self.release_transient_products(id);
                         let sample_continuation = self
                             .running
                             .get(&id)
                             .and_then(|st| st.req.policy.feedback.as_ref())
                             .is_some_and(|feedback| feedback.sample_continuation);
+                        if sample_continuation && !self.publish_feedback_image(id) {
+                            return self.finish(id, FinishReason::Error);
+                        }
+                        if !sample_continuation && let Some(st) = self.running.get_mut(&id) {
+                            st.feedback.image_b64 = None;
+                        }
+                        self.release_transient_products(id);
                         if let Some(st) = self.running.get_mut(&id) {
                             st.image_gen.images_done += 1;
                             st.und.text_since_image = 0;
@@ -5258,16 +5264,9 @@ impl Scheduler {
             }
             WorkVariant::Materialize => {
                 let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
-                self.emit(id, GenEvent::ImageCommit { image_id });
                 let image = view.image_png.clone();
-                if let Some(image_b64) = image.clone() {
-                    let Some(event) = image_done_event(image_id, image_b64) else {
-                        return self.finish(id, FinishReason::Error);
-                    };
-                    self.emit(id, event);
-                }
                 self.bm.activate(id);
-                let (continues_after_gen_commit, feedback_source) = {
+                let (continues_after_gen_commit, feedback_source, sample_continuation) = {
                     let st = self.running.get(&id).unwrap();
                     (
                         st.continues_after_gen_commit(),
@@ -5276,8 +5275,22 @@ impl Scheduler {
                             .feedback
                             .as_ref()
                             .map(|feedback| feedback.source.clone()),
+                        st.req
+                            .policy
+                            .feedback
+                            .as_ref()
+                            .is_some_and(|feedback| feedback.sample_continuation),
                     )
                 };
+                if !continues_after_gen_commit || !sample_continuation {
+                    self.emit(id, GenEvent::ImageCommit { image_id });
+                    if let Some(image_b64) = image.clone() {
+                        let Some(event) = image_done_event(image_id, image_b64) else {
+                            return self.finish(id, FinishReason::Error);
+                        };
+                        self.emit(id, event);
+                    }
+                }
                 if continues_after_gen_commit {
                     let Some(feedback_source) = feedback_source else {
                         return self.finish(id, FinishReason::Error);
@@ -5556,6 +5569,28 @@ impl Scheduler {
                 st.public_event_seq = st.public_event_seq.saturating_add(1);
             }
         }
+    }
+
+    /// Publish a generated artifact at the semantic boundary that also makes
+    /// its sampled Und continuation visible. This preserves one ordered public
+    /// commit for a feedback round while materialization, visual encoding, and
+    /// state extension remain independently scheduled operations.
+    fn publish_feedback_image(&mut self, id: RequestId) -> bool {
+        let Some((image_id, image_b64)) = self.running.get_mut(&id).and_then(|state| {
+            state
+                .feedback
+                .image_b64
+                .take()
+                .map(|image| (state.image_gen.image_id, image))
+        }) else {
+            return false;
+        };
+        let Some(event) = image_done_event(image_id, image_b64) else {
+            return false;
+        };
+        self.emit(id, GenEvent::ImageCommit { image_id });
+        self.emit(id, event);
+        true
     }
     /// Emit a text token and record it for preemption-recompute.
     fn emit_text(&mut self, id: RequestId, tok: u32, logprob: Option<f32>) -> bool {

@@ -2181,6 +2181,130 @@ fn gen_branch_round_trip_text_image_text_image() {
 }
 
 #[test]
+fn sampled_feedback_publishes_the_image_with_its_continuation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use uniserve_executor::ModelEngine;
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, ProductKind, WorkVariant};
+
+    struct FeedbackGateEngine {
+        inner: SimEngine,
+        submitted: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl ModelEngine for FeedbackGateEngine {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+
+        fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport> {
+            let feedback_state = batch.operations.iter().any(|operation| {
+                operation.work.variant() == WorkVariant::TokenExtend
+                    && operation.inputs.iter().any(|input| {
+                        matches!(
+                            input.kind,
+                            ProductKind::VisionFeature | ProductKind::LatentFeature
+                        )
+                    })
+                    && operation
+                        .outputs
+                        .iter()
+                        .any(|output| output.kind == ProductKind::Token)
+            });
+            if feedback_state {
+                self.submitted.store(true, Ordering::Release);
+                while !self.release.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            self.inner.execute(batch)
+        }
+
+        fn drop_session(&mut self, id: RequestId) -> anyhow::Result<()> {
+            self.inner.drop_session(id)
+        }
+    }
+
+    let submitted = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let mut sim = SimEngine::new();
+    sim.set_pipeline_depth(1);
+    sim.set_text_len(1_000_000);
+    let engine = FeedbackGateEngine {
+        inner: sim,
+        submitted: Arc::clone(&submitted),
+        release: Arc::clone(&release),
+    };
+    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(engine))), ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let request = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams {
+                logit_bias: vec![(2222, 1000.0)],
+                ..Default::default()
+            },
+            ImageParams {
+                steps: 2,
+                max_images: 1,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            8,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
+    );
+    let mut events = handle.submit(request).expect("submit request");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !submitted.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        submitted.load(Ordering::Acquire),
+        "feedback state was not submitted"
+    );
+    let visible_before_feedback = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| {
+            matches!(
+                event,
+                GenEvent::TextToken { .. } | GenEvent::ImageDone { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        visible_before_feedback.is_empty(),
+        "the feedback round became public before its continuation was semantic"
+    );
+
+    release.store(true, Ordering::Release);
+    let mut sequence = Vec::new();
+    let mut finished = false;
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::ImageDone { .. }) => sequence.push('I'),
+            Ok(GenEvent::TextToken { .. }) => sequence.push('T'),
+            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+
+    assert!(finished, "feedback request did not finish: {sequence:?}");
+    assert!(
+        sequence.starts_with(&['I', 'T']),
+        "the image and sampled continuation did not share one public boundary: {sequence:?}"
+    );
+}
+
+#[test]
 fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
