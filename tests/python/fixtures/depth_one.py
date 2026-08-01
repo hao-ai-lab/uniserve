@@ -52,6 +52,7 @@ def und_admission(
     session_id: int,
     *,
     block_ids: Sequence[int] = (),
+    prefix_len: int = 0,
     epoch: int = 1,
     sampling: SamplingParams | None = None,
 ) -> Admission:
@@ -63,7 +64,10 @@ def und_admission(
                 if sampling is not None
                 else SamplingParams(temperature=0.0, ignore_eos=True)
             ),
-            kv=KvAllocation(block_ids=tuple(int(value) for value in block_ids)),
+            kv=KvAllocation(
+                block_ids=tuple(int(value) for value in block_ids),
+                prefix_len=int(prefix_len),
+            ),
         ),
     )
 

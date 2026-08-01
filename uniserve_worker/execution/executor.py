@@ -2039,7 +2039,11 @@ class ModelExecutor:
         pure_token_decode = all(
             isinstance(task.row, TokenRow) and task.query_tokens == 1 for task in tasks
         )
-        if RouteRowKind.FLOW in route.row_kinds and not pure_token_decode:
+        image_capable = any(
+            self.sessions.get(task.operation.request_key.session_id).image is not None
+            for task in tasks
+        )
+        if RouteRowKind.FLOW in route.row_kinds and (not pure_token_decode or image_capable):
             return self._packed_attention_plan(tasks, scope, device, staging_slot)
         sessions = tuple(task.operation.request_key.session_id for task in tasks)
         query_lens = tuple(task.query_tokens for task in tasks)
