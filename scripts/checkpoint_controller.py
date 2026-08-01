@@ -20,24 +20,25 @@ Classification (construction.md "Checkpoint performance protection"):
 - A metric's effective regression is the worse of its regression against the anchor
   and against the previous checkpoint.
 - ``pass``: every required metric's effective regression is at most 20%.
-- ``block``: any effective regression exceeds 20%, or any correctness, work, output
-  validity, or provenance requirement fails.
+- ``block``: any effective regression exceeds 20%, or any correctness, requested
+  workload, output-validity, or provenance requirement fails.
 
 The same performance limit applies to checkpoint triplets and UEval
 major-boundary suites. Default travel is a correctness and provenance gate whose
 elapsed time is retained for longitudinal diagnosis. Correctness, conformance,
-work, and artifact-integrity requirements remain hard gates.
+requested-workload identity, and artifact-integrity requirements remain hard gates.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 REGRESSION_LIMIT = 0.20
 
@@ -66,11 +67,19 @@ UEVAL_SPECS: tuple[MetricSpec, ...] = (
 )
 UEVAL_DIRECTIONAL_SPECS: tuple[tuple[MetricSpec, tuple[str, ...]], ...] = (
     (
-        ("text_to_image_transition_mean_ms", (*_TRANSITION, "text_to_image_transition_latency_ms", "mean"), "minimize"),
+        (
+            "text_to_image_transition_mean_ms",
+            (*_TRANSITION, "text_to_image_transition_latency_ms", "mean"),
+            "minimize",
+        ),
         (*_TRANSITION, "text_to_image_transition_latency_ms", "count"),
     ),
     (
-        ("image_to_text_transition_mean_ms", (*_TRANSITION, "image_to_text_transition_latency_ms", "mean"), "minimize"),
+        (
+            "image_to_text_transition_mean_ms",
+            (*_TRANSITION, "image_to_text_transition_latency_ms", "mean"),
+            "minimize",
+        ),
         (*_TRANSITION, "image_to_text_transition_latency_ms", "count"),
     ),
 )
@@ -95,7 +104,7 @@ class Point:
     checks: dict[str, Any]
     generation_conformance_valid: bool
     interleave_latency: dict[str, Any] | None
-    request_signatures: dict[str, Any]
+    workload_contract: dict[str, Any]
     provenance: dict[str, Any]
 
     def metric(self, path: tuple[str, ...]) -> float | None:
@@ -114,6 +123,12 @@ def _finite(value: Any) -> float | None:
         return None
     numeric = float(value)
     return numeric if math.isfinite(numeric) else None
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    """Narrow an untyped JSON value to the object shape used by this controller."""
+
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
 
 
 def regression(candidate: float | None, baseline: float | None, objective: str) -> float | None:
@@ -197,10 +212,11 @@ class PointOutcome:
 def hard_gate_failures(
     candidate: Point,
     anchor: Point | None,
+    previous: Point | None = None,
     *,
     interleave: bool,
 ) -> list[str]:
-    """Correctness, work, output-validity, and provenance hard requirements."""
+    """Correctness, requested-workload, output-validity, and provenance gates."""
 
     failures: list[str] = []
     if candidate.failed_count not in (0, None) and candidate.failed_count != 0:
@@ -224,7 +240,19 @@ def hard_gate_failures(
     if candidate.provenance.get("source_dirty") is not False:
         failures.append("source_tree_dirty")
 
+    if not candidate.workload_contract:
+        failures.append("workload_contract_missing")
+    for label, baseline in (("anchor", anchor), ("previous", previous)):
+        if baseline is None:
+            continue
+        if not baseline.workload_contract:
+            failures.append(f"{label}_workload_contract_missing")
+        elif candidate.workload_contract != baseline.workload_contract:
+            failures.append(f"workload_contract_mismatch:{label}")
+
     if interleave:
+        if candidate.request_count != 32 or candidate.ok_count != 32:
+            failures.append(f"interleave_success={candidate.ok_count}/{candidate.request_count}")
         il = candidate.interleave_latency or {}
         if il.get("valid") is not True:
             failures.append("interleave_latency_invalid")
@@ -232,20 +260,41 @@ def hard_gate_failures(
         if timing.get("timestamp_coverage") != 1.0:
             failures.append(f"timestamp_coverage={timing.get('timestamp_coverage')}")
         if timing.get("transition_sample_coverage") != 1.0:
-            failures.append(f"transition_sample_coverage={timing.get('transition_sample_coverage')}")
-        if anchor is not None:
-            if candidate.request_signatures != anchor.request_signatures:
-                failures.append("modality_signature_mismatch")
-            if _image_step_work(candidate) != _image_step_work(anchor):
-                failures.append("work_signature_mismatch")
+            failures.append(
+                f"transition_sample_coverage={timing.get('transition_sample_coverage')}"
+            )
     return failures
 
 
-def _image_step_work(point: Point) -> dict[str, Any]:
-    """Per-request decoded-image and image-step work, used for major-boundary equality."""
+def _workload_contract(artifact: dict[str, Any]) -> dict[str, Any]:
+    """Requested inputs and quality/load controls that make two points comparable."""
 
-    timing = (point.metrics.get("modality_interleave") or {}).get("transition_timing") or {}
-    return {"signatures": point.request_signatures, "expected_transitions": timing.get("expected_transition_count")}
+    contract = _mapping(artifact.get("contract"))
+    request_spec = _mapping(contract.get("spec"))
+    selected_rows = _mapping(contract.get("selected_rows"))
+    matrix = _mapping(artifact.get("matrix_contract"))
+    definition = _mapping(matrix.get("benchmark_definition"))
+    if not request_spec:
+        return {}
+    normalized_spec = dict(request_spec)
+    # The selected-row digest and dataset revision bind dataset content. The local
+    # extraction directory is execution-environment provenance, not request work.
+    normalized_spec.pop("dataset_path", None)
+    values = {
+        "request_spec_sha256": hashlib.sha256(
+            json.dumps(
+                normalized_spec,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "selected_row_count": selected_rows.get("count"),
+        "selected_rows_sha256": selected_rows.get("sha256"),
+        "benchmark_definition_fingerprint": definition.get("fingerprint"),
+        "load_case_id": definition.get("load_case_id"),
+    }
+    return values if all(value is not None and value != "" for value in values.values()) else {}
 
 
 def classify(metric_outcomes: Sequence[MetricOutcome]) -> str:
@@ -266,22 +315,21 @@ def specs_for(point: Point, *, major_boundary: bool) -> tuple[MetricSpec, ...]:
 
 def load_point(directory: str | Path) -> Point:
     directory = Path(directory)
-    summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
-    run = {}
+    summary = _mapping(json.loads((directory / "summary.json").read_text(encoding="utf-8")))
+    run: dict[str, Any] = {}
     run_path = directory / "run.json"
     if run_path.is_file():
         try:
-            run = json.loads(run_path.read_text(encoding="utf-8"))
+            run = _mapping(json.loads(run_path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             run = {}
-    artifact = summary.get("artifact") if isinstance(summary.get("artifact"), dict) else {}
-    checks = artifact.get("checks") if isinstance(artifact.get("checks"), dict) else {}
-    gen = artifact.get("generation_conformance")
-    il = artifact.get("interleave_latency_conformance")
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
-    timing = (metrics.get("modality_interleave") or {}).get("transition_timing") or {}
-    matrix = artifact.get("matrix_contract") if isinstance(artifact.get("matrix_contract"), dict) else {}
-    bench_def = matrix.get("benchmark_definition") if isinstance(matrix.get("benchmark_definition"), dict) else {}
+    artifact = _mapping(summary.get("artifact"))
+    checks = _mapping(artifact.get("checks"))
+    gen = _mapping(artifact.get("generation_conformance"))
+    il = _mapping(artifact.get("interleave_latency_conformance"))
+    metrics = _mapping(summary.get("metrics"))
+    matrix = _mapping(artifact.get("matrix_contract"))
+    bench_def = _mapping(matrix.get("benchmark_definition"))
     return Point(
         directory=directory,
         task=summary.get("task"),
@@ -295,9 +343,9 @@ def load_point(directory: str | Path) -> Point:
             artifact.get("valid") is True and artifact.get("valid_marker") == "canonical-valid-v2"
         ),
         checks=checks,
-        generation_conformance_valid=bool(isinstance(gen, dict) and gen.get("valid") is True),
-        interleave_latency=il if isinstance(il, dict) else None,
-        request_signatures=timing.get("request_signatures") if isinstance(timing.get("request_signatures"), dict) else {},
+        generation_conformance_valid=bool(gen.get("valid") is True),
+        interleave_latency=il or None,
+        workload_contract=_workload_contract(artifact),
         provenance=_provenance(summary, run, artifact),
     )
 
@@ -306,10 +354,11 @@ def _source_state(matrix: dict[str, Any]) -> dict[str, Any]:
     """Workspace source-tree state, present as a formal build manifest or, for a
     non-formal run, as the workspace entry of an execution's source-revision list."""
 
-    execution_policy = matrix.get("execution_policy") if isinstance(matrix.get("execution_policy"), dict) else {}
-    build_manifest = execution_policy.get("build_manifest") if isinstance(execution_policy.get("build_manifest"), dict) else {}
-    if isinstance(build_manifest.get("source_state"), dict):
-        return build_manifest["source_state"]
+    execution_policy = _mapping(matrix.get("execution_policy"))
+    build_manifest = _mapping(execution_policy.get("build_manifest"))
+    source_state = _mapping(build_manifest.get("source_state"))
+    if source_state:
+        return source_state
     for execution_key in ("harness_execution", "server_execution"):
         execution = matrix.get(execution_key)
         revisions = execution.get("source_revisions") if isinstance(execution, dict) else None
@@ -318,23 +367,27 @@ def _source_state(matrix: dict[str, Any]) -> dict[str, Any]:
         for revision in revisions:
             if not isinstance(revision, dict):
                 continue
-            state = revision.get("state")
-            if isinstance(state, dict) and "workspace" in (revision.get("roles") or []):
+            state = _mapping(revision.get("state"))
+            if state and "workspace" in (revision.get("roles") or []):
                 return state
         for revision in revisions:
-            if isinstance(revision, dict) and isinstance(revision.get("state"), dict):
-                return revision["state"]
+            if isinstance(revision, dict):
+                state = _mapping(revision.get("state"))
+                if state:
+                    return state
     return {}
 
 
-def _provenance(summary: dict[str, Any], run: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:
-    matrix = artifact.get("matrix_contract") if isinstance(artifact.get("matrix_contract"), dict) else {}
+def _provenance(
+    summary: dict[str, Any], run: dict[str, Any], artifact: dict[str, Any]
+) -> dict[str, Any]:
+    matrix = _mapping(artifact.get("matrix_contract"))
     source_state = _source_state(matrix)
-    model_contract = matrix.get("model_revision_contract") if isinstance(matrix.get("model_revision_contract"), dict) else {}
-    contract_spec = (artifact.get("contract") or {}).get("spec") if isinstance(artifact.get("contract"), dict) else {}
+    model_contract = _mapping(matrix.get("model_revision_contract"))
+    contract_spec = _mapping(_mapping(artifact.get("contract")).get("spec"))
     dataset_revision = (
         run.get("dataset_revision")
-        or (contract_spec.get("dataset_revision") if isinstance(contract_spec, dict) else None)
+        or contract_spec.get("dataset_revision")
         or run.get("t2i_dataset_revision")
         or run.get("i2t_dataset_revision")
     )
@@ -376,23 +429,19 @@ class CheckpointReport:
     verdict: str = "block"
 
 
-def load_default_travel(directory: str | Path) -> tuple[float | None, dict[str, Any], dict[str, Any]]:
+def load_default_travel(
+    directory: str | Path,
+) -> tuple[float | None, dict[str, Any], dict[str, Any]]:
     """Load the fixed default-travel verification artifact.
 
     This point is emitted by ``uniserve-eval verify`` rather than the serving
     benchmark harness, so its schema is intentionally handled at this boundary.
     """
 
-    summary = json.loads((Path(directory) / "summary.json").read_text(encoding="utf-8"))
-    artifact = summary.get("artifact") if isinstance(summary.get("artifact"), dict) else {}
-    provenance = (
-        artifact.get("provenance") if isinstance(artifact.get("provenance"), dict) else {}
-    )
-    source_state = (
-        provenance.get("source_state")
-        if isinstance(provenance.get("source_state"), dict)
-        else {}
-    )
+    summary = _mapping(json.loads((Path(directory) / "summary.json").read_text(encoding="utf-8")))
+    artifact = _mapping(summary.get("artifact"))
+    provenance = _mapping(artifact.get("provenance"))
+    source_state = _mapping(provenance.get("source_state"))
     return _finite(summary.get("elapsed_s")), artifact, source_state
 
 
@@ -408,19 +457,13 @@ def default_travel_failures(
         return None, ["point_missing"]
     if artifact.get("valid") is not True or artifact.get("valid_marker") != "verify-valid-v1":
         failures.append("artifact_invalid")
-    checks = artifact.get("checks") if isinstance(artifact.get("checks"), dict) else {}
+    checks = _mapping(artifact.get("checks"))
     if not checks:
         failures.append("checks_missing")
     else:
         failures.extend(f"check:{name}" for name, value in checks.items() if value is not True)
-    provenance = (
-        artifact.get("provenance") if isinstance(artifact.get("provenance"), dict) else {}
-    )
-    profile = (
-        provenance.get("profile_contract")
-        if isinstance(provenance.get("profile_contract"), dict)
-        else {}
-    )
+    provenance = _mapping(artifact.get("provenance"))
+    profile = _mapping(provenance.get("profile_contract"))
     if profile.get("workload") != "gate/sensenova/default-travel":
         failures.append("profile_mismatch")
     source_revision = source_state.get("head")
@@ -443,10 +486,18 @@ def evaluate_checkpoint(
     checkpoint: str,
     major_boundary: bool,
     default_travel_dir: str | Path | None = None,
+    candidate_major_root: str | Path | None = None,
+    anchor_major_root: str | Path | None = None,
     previous_major_root: str | Path | None = None,
 ) -> CheckpointReport:
     candidate_points = discover_points(candidate_root)
+    candidate_major_points = discover_points(candidate_major_root) if candidate_major_root else {}
+    if "interleave" in candidate_major_points:
+        candidate_points["interleave"] = candidate_major_points["interleave"]
     anchor_points = discover_points(anchor_root)
+    anchor_major_points = discover_points(anchor_major_root) if anchor_major_root else {}
+    if "interleave" in anchor_major_points:
+        anchor_points["interleave"] = anchor_major_points["interleave"]
     previous_points = discover_points(previous_root) if previous_root else {}
     previous_major_points = discover_points(previous_major_root) if previous_major_root else {}
 
@@ -463,11 +514,15 @@ def evaluate_checkpoint(
         directory = str(cand.directory) if cand else "<missing>"
         if cand is None or anc is None:
             report.points.append(
-                PointOutcome(task=task, directory=directory, metrics=[], hard_failures=["point_missing"])
+                PointOutcome(
+                    task=task, directory=directory, metrics=[], hard_failures=["point_missing"]
+                )
             )
             any_hard_failure = True
             continue
-        prev = previous_major_points.get(task) if task == "interleave" else previous_points.get(task)
+        prev = (
+            previous_major_points.get(task) if task == "interleave" else previous_points.get(task)
+        )
         specs = specs_for(cand, major_boundary=major_boundary)
         outcomes = [evaluate_metric(spec, cand, anc, prev) for spec in specs]
         if task == "interleave":
@@ -475,8 +530,12 @@ def evaluate_checkpoint(
                 baseline_count = anc.metric(count_path)
                 if baseline_count and baseline_count > 0:
                     outcomes.append(evaluate_metric(spec, cand, anc, prev))
-        hard = hard_gate_failures(cand, anc, interleave=(task == "interleave"))
-        if task == "interleave" and checkpoint in MAJOR_INTERLEAVE_PREVIOUS_REQUIRED and prev is None:
+        hard = hard_gate_failures(cand, anc, prev, interleave=(task == "interleave"))
+        if (
+            task == "interleave"
+            and checkpoint in MAJOR_INTERLEAVE_PREVIOUS_REQUIRED
+            and prev is None
+        ):
             hard.append("previous_major_point_missing")
         if hard:
             any_hard_failure = True
@@ -548,7 +607,9 @@ def render_report(report: CheckpointReport) -> str:
     ]
     for point in report.points:
         if not point.metrics:
-            lines.append(f"| {point.task} | — | — | — | — | — | — | — | — | {'; '.join(point.hard_failures) or '—'} |")
+            lines.append(
+                f"| {point.task} | — | — | — | — | — | — | — | — | {'; '.join(point.hard_failures) or '—'} |"
+            )
         for m in point.metrics:
             lines.append(
                 f"| {point.task} | {m.name} | {m.objective} | {_n(m.candidate)} | {_n(m.anchor)} | "
@@ -574,7 +635,7 @@ def _pct(value: float | None) -> str:
 
 def _report_to_dict(report: CheckpointReport) -> dict[str, Any]:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "checkpoint": report.checkpoint,
         "major_boundary": report.major_boundary,
         "source_revision": report.source_revision,
@@ -612,6 +673,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--anchor-root", required=True)
     parser.add_argument("--previous-root", default=None)
     parser.add_argument(
+        "--candidate-major-root",
+        default=None,
+        help="candidate major-boundary artifact root when it is separate from the triplet root",
+    )
+    parser.add_argument(
+        "--anchor-major-root",
+        default=None,
+        help="immutable major-boundary anchor root when it is separate from the triplet anchor",
+    )
+    parser.add_argument(
         "--previous-major-root",
         default=None,
         help="previous accepted major-boundary artifact root for UEval comparison",
@@ -626,7 +697,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="default-travel verification artifact required at a major boundary",
     )
-    parser.add_argument("--out", default=None, help="directory to write acceptance.json/acceptance.md")
+    parser.add_argument(
+        "--out", default=None, help="directory to write acceptance.json/acceptance.md"
+    )
     args = parser.parse_args(argv)
 
     report = evaluate_checkpoint(
@@ -636,6 +709,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint=args.checkpoint,
         major_boundary=args.major_boundary,
         default_travel_dir=args.default_travel_dir,
+        candidate_major_root=args.candidate_major_root,
+        anchor_major_root=args.anchor_major_root,
         previous_major_root=args.previous_major_root,
     )
     markdown = render_report(report)
@@ -643,7 +718,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.out:
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
-        (out / "acceptance.json").write_text(json.dumps(_report_to_dict(report), indent=2), encoding="utf-8")
+        (out / "acceptance.json").write_text(
+            json.dumps(_report_to_dict(report), indent=2), encoding="utf-8"
+        )
         (out / "acceptance.md").write_text(markdown, encoding="utf-8")
     return 0 if report.verdict == "pass" else 1
 

@@ -76,13 +76,15 @@ This RFC does not define Green Context sizing or SM placement; the SM-budget mea
 
 The construction checkpoint sequence, staged cutover, validation economy, correctness qualification, and performance-protection gates for this runtime are defined in [`decode-runtime-construction.md`](decode-runtime-construction.md).
 
+The Rust host engine ingress value, generate gateway surface, and `WorkerTopology` deployment language are defined in [`engine-surface.md`](engine-surface.md). The HTTP and model-tokenize funnel that produces the submit unit are defined in [`serving-surface.md`](serving-surface.md).
+
 ## Required outcomes
 
 - No blocking host/device observation in the steady-state path for greedy sampling, stochastic sampling, logprobs, speculative decoding, grammar, stop strings, KV publication, Gen, feedback, or interleave.
-- Exact semantic equivalence to a serial depth-one oracle under the same model, precision, sampling parameters, processor order, seed, cache state, and image-quality controls.
+- Exact protocol, state-transition, constraint, RNG-coordinate, cache-effect, cancellation, tensor-shape, and output-ordering equivalence to a serial depth-one oracle under the same model, precision, sampling parameters, processor order, seed, cache state, and image-quality controls; generated payloads satisfy the applicable numerical and quality contracts.
 - Continuous same-request device submission whenever successor inputs and allocation bounds are device-representable.
 - Bounded memory and work under speculation, cancellation, slow clients, slow CPU processors, transfer backpressure, and mixed workloads.
-- Deterministic committed output independent of batching, completion order, execution-window depth, and interleave timing.
+- Deterministic commit identity, ordering, lineage, and constraint enforcement independent of batching, completion order, execution-window depth, and interleave timing; legal free-running token and image payloads are not required to be bit-identical across execution geometries.
 - Independent Und and Gen completion, accounting, backpressure, and publication even when both domains are admitted in one scheduler batch.
 - UEval exposes comparable latency distributions for first text, token progress, decoded images, and every visible text/image boundary.
 - End-to-end decode performance in the reference-parity band while preserving correctness and workload semantics.
@@ -627,7 +629,7 @@ A route may declare tensorized mixed submission when a conformance proof establi
 - Und attention masks, sequence lengths, position IDs, KV mappings, graph keys, collective order, and sampler rows are identical to domain-homogeneous execution.
 - Gen rows cannot change an Und row's shape, padding, kernel choice, graph capture, RNG coordinate, KV visibility, or completion event.
 - Every domain has independent output slices, product events, completion records, failures, and work counters.
-- Batch permutation tests reproduce the serial oracle across all supported mixtures and shapes.
+- Batch permutation tests reproduce the serial oracle's protocol, state, shape, constraint, RNG-coordinate, and numerical-conformance properties across all supported mixtures and shapes.
 - Interference measurements meet the declared service envelope.
 
 SenseNova production interleave requires the tensorized mixed capability because its parity target includes shared-batch execution. A failed tensorized-mixed qualification requires an explicit resource-partitioning architecture decision; it cannot be resolved by silently substituting domain-homogeneous calls in a passing candidate. Routes that do not declare tensorized mixed submission use domain-homogeneous physical calls while preserving joint admission, fairness, and accounting. The capability is route-static and does not introduce a per-request compatibility path.
