@@ -583,6 +583,7 @@ impl GenerationCursor {
                         .und
                         .logical_pos
                         .max(position.saturating_add(logical_positions));
+                    self.feedback.image_b64 = None;
                     self.feedback.ingest_step = 0;
                     self.feedback.source_product = None;
                     self.feedback.encoded_product = None;
