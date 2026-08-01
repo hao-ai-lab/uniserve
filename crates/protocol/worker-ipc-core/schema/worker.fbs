@@ -31,7 +31,10 @@ enum ProductKind : ubyte {
   Artifact,
   Completion,
   SamplingState,
-  Finish
+  Finish,
+  SelectedPoint,
+  AcceptedSpan,
+  Continuation
 }
 
 enum StorageClass : ubyte {
@@ -152,7 +155,13 @@ table RankInfo {
   dp_size:uint = 1;
 }
 
-table ExecutionConstraints { max_batch_operations:uint; }
+table ExecutionConstraints {
+  max_batch_operations:uint;
+  max_speculative_points:uint;
+  device_sequence_lengths:bool;
+  device_append_offsets:bool;
+  incremental_kv_publication:bool;
+}
 
 table ResourcePressure {
   class:ResourceClass;
@@ -286,6 +295,10 @@ table LogicalLengths {
   token_len:uint;
   kv_visible_len:uint;
   latent_len:uint;
+  kv_reserved_len:uint;
+  kv_initialized_len:uint;
+  kv_committed_len:uint;
+  kv_published_len:uint;
 }
 
 table TokenSpan {

@@ -3,32 +3,76 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.batch import Admission, KvAllocation, RequestKey, UndAdmission
+from uniserve_worker.batch import (
+    Admission,
+    DeviceDim,
+    DType,
+    FixedPoint,
+    KvAllocation,
+    PointRange,
+    ProductKind,
+    ProductRef,
+    RequestKey,
+    ShapeBound,
+    StorageClass,
+    UndAdmission,
+    VersionRef,
+)
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.kv_pool import PagedKVPool
-from uniserve_worker.runtime.kv_store import KvStore
-from uniserve_worker.runtime.transfer import LocalTransport
+from uniserve_worker.runtime.kv_store import KvExtents, KvSnapshot, KvStore
+from uniserve_worker.runtime.transfer import LocalTransport, Locator
 
 
-def _admit(store: KvStore, session_id: int, *, block_ids: tuple[int, ...], prefix_len: int) -> None:
-    store.admit(
-        Admission.create(
-            RequestKey(0, session_id, 1),
-            und=UndAdmission(kv=KvAllocation(block_ids=block_ids, prefix_len=prefix_len)),
-        )
-    )
-
-
-def test_bounded_kv_view_stages_rows_and_writes_ragged_tokens() -> None:
-    pool = PagedKVPool(
-        num_layers=1,
-        num_blocks=4,
+def _pool(*, layers: int = 2) -> PagedKVPool:
+    return PagedKVPool(
+        num_layers=layers,
+        num_blocks=8,
         block_size=2,
         num_kv_heads=1,
         head_dim=1,
         device="cpu",
         dtype=torch.float32,
     )
+
+
+def _admit(
+    store: KvStore,
+    session_id: int,
+    *,
+    block_ids: tuple[int, ...],
+    prefix_len: int,
+) -> RequestKey:
+    request_key = RequestKey(0, session_id, 1)
+    store.admit(
+        Admission.create(
+            request_key,
+            und=UndAdmission(kv=KvAllocation(block_ids=block_ids, prefix_len=prefix_len)),
+        )
+    )
+    return request_key
+
+
+def _version(request_key: RequestKey, op_id: int, point: int, byte: str) -> VersionRef:
+    return VersionRef(request_key, op_id, FixedPoint(point, byte * 64))
+
+
+def _publication_product(request_key: RequestKey, op_id: int) -> ProductRef:
+    return ProductRef(
+        request_key=request_key,
+        producer_op_id=op_id,
+        output_index=0,
+        generation=op_id,
+        kind=ProductKind.KV,
+        storage_class=StorageClass.PAGED_KV,
+        dtype=DType.U8,
+        shape_bound=ShapeBound((DeviceDim(1 << 20),)),
+        point_range=PointRange(),
+    )
+
+
+def test_kv_view_uses_visible_extents_and_device_append_offsets() -> None:
+    pool = _pool(layers=1)
     store = KvStore(pool)
     _admit(store, 1, block_ids=(0, 1), prefix_len=1)
     _admit(store, 2, block_ids=(2, 3), prefix_len=2)
@@ -36,7 +80,6 @@ def test_bounded_kv_view_stages_rows_and_writes_ragged_tokens() -> None:
 
     block_table = view.block_table(torch.device("cpu"))
     cache_seqlens = view.cache_seqlens(torch.device("cpu"))
-    query_offsets = torch.tensor((0, 1, 3), dtype=torch.int32)
     values = torch.tensor((10.0, 20.0, 30.0)).reshape(3, 1, 1)
     view.append_varlen(
         0,
@@ -45,11 +88,10 @@ def test_bounded_kv_view_stages_rows_and_writes_ragged_tokens() -> None:
         (1, 2),
         block_table=block_table,
         cache_seqlens=cache_seqlens,
-        query_offsets=query_offsets,
+        query_offsets=torch.tensor((0, 1, 3), dtype=torch.int32),
     )
 
     assert view.base_lens == (1, 2)
-    assert view.supports_paged_attention_storage is True
     torch.testing.assert_close(block_table, torch.tensor(((0, 1), (2, 3)), dtype=torch.int32))
     torch.testing.assert_close(cache_seqlens, torch.tensor((1, 2), dtype=torch.int32))
     first_key, first_value = pool.read(0, [0, 1], start=1, length=1)
@@ -62,90 +104,170 @@ def test_bounded_kv_view_stages_rows_and_writes_ragged_tokens() -> None:
     torch.testing.assert_close(second_value, -values[1:])
 
 
-def test_snapshot_import_accepts_the_sessions_own_partial_page() -> None:
-    pool = PagedKVPool(
-        num_layers=1,
-        num_blocks=4,
-        block_size=2,
-        num_kv_heads=1,
-        head_dim=1,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    store = KvStore(pool)
-    _admit(store, 1, block_ids=(0, 1), prefix_len=0)
-    store.advance(1, 3)
-    transport = LocalTransport()
-    snapshot = store.publish(
-        1,
-        source_version=1,
-        position=3,
-        transport=transport,
-    )
+def test_five_extents_select_and_commit_one_initialized_prefix() -> None:
+    store = KvStore(_pool(layers=1))
+    _admit(store, 1, block_ids=(0, 1, 2), prefix_len=2)
 
-    store.import_snapshot(1, snapshot, transport)
+    initialized = store.initialize(1, 3)
+    assert initialized == 5
+    assert store.get(1).extents() == KvExtents(6, 5, 2, 2, 0)
 
-    entry = store.get(1)
-    assert entry.block_ids == [0, 1]
-    assert entry.length == 3
+    store.select(1, 4)
+    assert store.get(1).extents() == KvExtents(6, 5, 4, 2, 0)
+    store.commit(1, 4)
+    assert store.get(1).extents() == KvExtents(6, 5, 4, 4, 0)
 
 
-def test_snapshot_import_rejects_another_sessions_partial_page() -> None:
-    pool = PagedKVPool(
-        num_layers=1,
-        num_blocks=4,
-        block_size=2,
-        num_kv_heads=1,
-        head_dim=1,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    store = KvStore(pool)
-    _admit(store, 1, block_ids=(0, 1), prefix_len=0)
-    _admit(store, 2, block_ids=(2, 3), prefix_len=0)
-    store.advance(1, 3)
-    transport = LocalTransport()
-    snapshot = store.publish(
-        1,
-        source_version=1,
-        position=3,
-        transport=transport,
-    )
-
-    with pytest.raises(WorkerError, match="writable KV block 1 held by another session"):
-        store.import_snapshot(2, snapshot, transport)
-
-
-def _published_store() -> tuple[KvStore, LocalTransport]:
-    pool = PagedKVPool(
-        num_layers=2,
-        num_blocks=4,
-        block_size=2,
-        num_kv_heads=1,
-        head_dim=1,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    store = KvStore(pool)
+def test_step_rollback_restores_every_extent_and_mapping() -> None:
+    store = KvStore(_pool(layers=1))
     _admit(store, 1, block_ids=(0, 1), prefix_len=2)
-    return store, LocalTransport()
+    baseline = store.get(1).extents()
+    transaction = store.begin_step({1})
+
+    transaction.initialize(1, 2)
+    transaction.select(1, 3)
+    transaction.rollback()
+
+    assert store.get(1).extents() == baseline
+    assert store.get(1).block_ids == [0, 1]
 
 
-def test_a_new_publication_returns_the_copies_the_previous_one_holds() -> None:
-    store, transport = _published_store()
+def test_publication_is_incremental_immutable_and_exact_base_bound() -> None:
+    pool = _pool()
+    store = KvStore(pool)
+    request_key = _admit(store, 1, block_ids=(0, 1, 2), prefix_len=2)
+    transport = LocalTransport()
+    for layer in range(pool.num_layers):
+        prefix = torch.tensor((1.0, 2.0)).reshape(2, 1, 1) + layer * 10
+        pool.write(layer, [0, 1, 2], start=0, k=prefix, v=-prefix)
 
-    first = store.publish(1, source_version=1, position=2, transport=transport)
-    second = store.publish(1, source_version=2, position=2, transport=transport)
+    first_version = _version(request_key, 10, 1, "a")
+    first_product = _publication_product(request_key, 20)
+    first = store.publish(
+        1,
+        source_version=first_version,
+        source_digest="a" * 64,
+        destination="gen",
+        expected_base=None,
+        product=first_product,
+        transport=transport,
+    )
+    first_values = tuple(
+        transport.fetch(Locator.from_wire_json(value)).clone() for value in first.locators
+    )
 
-    assert first.locators and second.locators
-    assert len(transport._table) == len(second.locators)
+    for layer in range(pool.num_layers):
+        suffix = torch.tensor((3.0,)).reshape(1, 1, 1) + layer * 10
+        pool.write(layer, [0, 1, 2], start=2, k=suffix, v=-suffix)
+    store.advance(1, 1)
+    store.commit(1, 3)
+    second_version = _version(request_key, 11, 1, "b")
+    second_product = _publication_product(request_key, 21)
+    second = store.publish(
+        1,
+        source_version=second_version,
+        source_digest="b" * 64,
+        destination="gen",
+        expected_base=first_version,
+        product=second_product,
+        transport=transport,
+    )
+
+    assert (first.base_extent, first.published_extent) == (0, 2)
+    assert (second.base_extent, second.published_extent) == (2, 3)
+    assert second.base_version == first_version
+    assert all(Locator.from_wire_json(value).shape[0] == 1 for value in second.locators)
+    for encoded, expected in zip(first.locators, first_values, strict=True):
+        torch.testing.assert_close(transport.fetch(Locator.from_wire_json(encoded)), expected)
+    assert store.destination_base(1, "gen") == second_version
+    assert store.validate_conditioning(1, second_product) == second
+    assert store.get(1).extents() == KvExtents(6, 3, 3, 3, 3)
+
+    with pytest.raises(WorkerError, match="expected base does not match destination"):
+        store.publish(
+            1,
+            source_version=_version(request_key, 12, 1, "c"),
+            source_digest="c" * 64,
+            destination="gen",
+            expected_base=first_version,
+            product=_publication_product(request_key, 22),
+            transport=transport,
+        )
 
 
-def test_dropping_a_session_returns_the_copies_its_publication_holds() -> None:
-    store, transport = _published_store()
-    store.publish(1, source_version=1, position=2, transport=transport)
-    assert transport._table
+def test_publication_preserves_the_committed_watermark_for_a_provisional_suffix() -> None:
+    store = KvStore(_pool(layers=1))
+    request_key = _admit(store, 1, block_ids=(0, 1), prefix_len=2)
+    transport = LocalTransport()
+    committed_version = _version(request_key, 9, 1, "9")
+    store.publish(
+        1,
+        source_version=committed_version,
+        source_digest="9" * 64,
+        destination="gen",
+        expected_base=None,
+        product=_publication_product(request_key, 19),
+        transport=transport,
+    )
+    store.initialize(1, 2)
+    store.select(1, 3)
+
+    with pytest.raises(WorkerError, match="not the committed visible version"):
+        store.publish(
+            1,
+            source_version=_version(request_key, 10, 1, "a"),
+            source_digest="a" * 64,
+            destination="gen",
+            expected_base=committed_version,
+            product=_publication_product(request_key, 20),
+            transport=transport,
+        )
+
+    assert store.get(1).extents() == KvExtents(4, 4, 3, 2, 2)
+    assert store.destination_base(1, "gen") == committed_version
+
+
+def test_publication_descriptor_requires_an_exact_fixed_digest() -> None:
+    request_key = RequestKey(0, 1, 1)
+    with pytest.raises(WorkerError, match="source digest is not exact"):
+        KvSnapshot(
+            locators=(),
+            source_version=_version(request_key, 10, 1, "a"),
+            source_digest="b" * 64,
+            destination="gen",
+            base_version=None,
+            base_extent=0,
+            published_extent=0,
+            block_ids=(0,),
+            group_id=0,
+            mapping_generation=1,
+            scale_identity="float32",
+        )
+
+
+def test_drop_releases_every_immutable_transport_entry() -> None:
+    class RecordingTransport(LocalTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.released: list[Locator] = []
+
+        def release(self, locator: Locator) -> None:
+            self.released.append(locator)
+            super().release(locator)
+
+    store = KvStore(_pool(layers=1))
+    request_key = _admit(store, 1, block_ids=(0,), prefix_len=1)
+    transport = RecordingTransport()
+    snapshot = store.publish(
+        1,
+        source_version=_version(request_key, 10, 1, "a"),
+        source_digest="a" * 64,
+        destination="gen",
+        expected_base=None,
+        product=_publication_product(request_key, 20),
+        transport=transport,
+    )
 
     store.drop(1)
 
-    assert not transport._table
+    assert tuple(locator.to_wire_json() for locator in transport.released) == snapshot.locators

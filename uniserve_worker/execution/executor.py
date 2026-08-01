@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import struct
 import time
@@ -12,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from functools import partial
 from importlib import import_module
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias, cast, overload
 
 import torch
 
@@ -36,6 +37,7 @@ from uniserve_worker.batch import (
     ProductRef,
     RegistrationAck,
     Release,
+    RequestKey,
     SamplingParams,
     SamplingState,
     ShapeBound,
@@ -160,7 +162,6 @@ from uniserve_worker.runtime.request_session import (
 from uniserve_worker.runtime.rng import (
     flow_noise_seed,
     normal_noise,
-    sampling_draw_seed,
     semantic_sampling_seed,
     uniform_samples,
 )
@@ -262,7 +263,7 @@ class _SampleTask:
     penalty_counts: torch.Tensor | None
     parameter_values: torch.Tensor | None
     draft_token_ids: tuple[int, ...] = ()
-    acceptance_uniforms: torch.Tensor | None = None
+    terminal_draft_prefix: int | None = None
     token_product: DeviceProductWrite | None = None
     finish_product: DeviceProductWrite | None = None
     continuation_product: DeviceProductWrite | None = None
@@ -277,6 +278,8 @@ class _SampleResult:
     logprob: float | _CompletionLogprobValue | None
     top_logprobs: tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs | None
     num_accepted_tokens: int | _CompletionInteger = 0
+    device_accepted_tokens: torch.Tensor | None = None
+    device_selected_point: torch.Tensor | None = None
     prompt_logprobs: tuple[
         tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
         ...,
@@ -430,6 +433,95 @@ class _CompletionInteger:
         if isinstance(other, int):
             return self.finalize() == other
         return NotImplemented
+
+
+class _CompletionDerivedInteger:
+    __slots__ = ("source", "offset")
+
+    def __init__(self, source: _CompletionInteger, offset: int) -> None:
+        self.source = source
+        self.offset = int(offset)
+
+    def ready(self) -> bool:
+        return self.source.ready()
+
+    def finalize(self) -> int:
+        return int(self.source) + self.offset
+
+    def __int__(self) -> int:
+        return self.finalize()
+
+    def __index__(self) -> int:
+        return self.finalize()
+
+
+class _CompletionSpeculativePoint:
+    __slots__ = ("accepted", "terminal_prefix")
+
+    def __init__(self, accepted: _CompletionInteger, terminal_prefix: int | None) -> None:
+        self.accepted = accepted
+        self.terminal_prefix = terminal_prefix
+
+    def ready(self) -> bool:
+        return self.accepted.ready()
+
+    def finalize(self) -> int:
+        accepted = int(self.accepted)
+        if self.terminal_prefix is not None and accepted >= self.terminal_prefix:
+            return accepted
+        return accepted + 1
+
+    def __int__(self) -> int:
+        return self.finalize()
+
+    def __index__(self) -> int:
+        return self.finalize()
+
+
+class _CompletionSpeculativeTokens(Sequence[int]):
+    __slots__ = ("draft", "accepted", "continuation", "terminal_prefix", "_value")
+
+    def __init__(
+        self,
+        draft: tuple[int, ...],
+        accepted: _CompletionInteger,
+        continuation: int | _CompletionToken,
+        terminal_prefix: int | None,
+    ) -> None:
+        self.draft = tuple(int(value) for value in draft)
+        self.accepted = accepted
+        self.continuation = continuation
+        self.terminal_prefix = terminal_prefix
+        self._value: tuple[int, ...] | None = None
+
+    def ready(self) -> bool:
+        continuation = self.continuation
+        return self.accepted.ready() and (
+            not isinstance(continuation, _CompletionToken) or continuation.ready()
+        )
+
+    def finalize(self) -> tuple[int, ...]:
+        if self._value is None:
+            accepted = int(self.accepted)
+            if accepted < 0 or accepted > len(self.draft):
+                raise RuntimeError("speculative acceptance count is outside the draft span")
+            if self.terminal_prefix is not None and accepted >= self.terminal_prefix:
+                self._value = self.draft[:accepted]
+            else:
+                self._value = (*self.draft[:accepted], int(self.continuation))
+        return self._value
+
+    def __len__(self) -> int:
+        return len(self.finalize())
+
+    @overload
+    def __getitem__(self, index: int) -> int: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[int, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> int | tuple[int, ...]:
+        return self.finalize()[index]
 
 
 class _CompletionLogprobBatch:
@@ -709,6 +801,7 @@ class _PendingDigest:
         "_predicated_parent",
         "_selected_point",
         "_selected_runtime",
+        "_resolved_callback",
     )
 
     def __init__(
@@ -719,6 +812,7 @@ class _PendingDigest:
         lease: CompletionLease,
         row: int,
         predicated_parent: Callable[[], tuple[VersionRef, ResolvedRuntimeState]],
+        resolved_callback: Callable[[CompletionRecord, str, str], None] | None = None,
     ) -> None:
         self._record = record
         self._parent = parent
@@ -732,8 +826,9 @@ class _PendingDigest:
         self._invalid_sampling = False
         self._predicated = False
         self._predicated_parent = predicated_parent
-        self._selected_point = int(record.selected_point)
+        self._selected_point = record.selected_point
         self._selected_runtime: ResolvedRuntimeState | None = None
+        self._resolved_callback = resolved_callback
 
     def ready(self) -> bool:
         if self._value is not None:
@@ -753,10 +848,13 @@ class _PendingDigest:
             # finalizes a deferred token exactly as ``int(value)`` would, so
             # the record is hashed in place without a concrete-token copy.
             try:
-                self._value = self._record.compute_semantic_digest(
+                value = self._record.compute_semantic_digest(
                     parent_semantic=cast(str, parent),
                     plan_digest=self._plan_digest,
                 )
+                if self._resolved_callback is not None:
+                    self._resolved_callback(self._record, value, cast(str, parent))
+                self._value = value
             except _PredicatedOperation:
                 self._predicated = True
                 self._value = cast(str, parent)
@@ -800,7 +898,7 @@ class _PendingDigest:
     @property
     def selected_point(self) -> int:
         self.resolve()
-        return self._selected_point
+        return int(self._selected_point)
 
     @property
     def selected_runtime(self) -> ResolvedRuntimeState:
@@ -866,13 +964,25 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
         resolved = digest
         timing = record.timing_counters
     tokens = tuple(int(value) for value in record.committed_tokens)
-    if (
-        resolved is record.semantic_digest
-        and tokens == tuple(record.committed_tokens)
-        and timing is record.timing_counters
-    ):
-        return record
-    return _record_with_tokens(record, tokens, resolved, timing)
+    lengths = record.logical_lengths
+    span = record.token_span
+    return replace(
+        record,
+        selected_point=int(record.selected_point),
+        logical_lengths=LogicalLengths(
+            token_len=int(lengths.token_len),
+            kv_visible_len=int(lengths.kv_visible_len),
+            latent_len=int(lengths.latent_len),
+            kv_reserved_len=int(lengths.kv_reserved_len),
+            kv_initialized_len=int(lengths.kv_initialized_len),
+            kv_committed_len=int(lengths.kv_committed_len),
+            kv_published_len=int(lengths.kv_published_len),
+        ),
+        token_span=TokenSpan(base=int(span.base), len=int(span.len)),
+        committed_tokens=tokens,
+        semantic_digest=resolved,
+        timing_counters=timing,
+    )
 
 
 def _invalid_sampling_record(record: CompletionRecord) -> CompletionRecord:
@@ -899,8 +1009,12 @@ def _predicated_record(
         selected_point=int(selected_point),
         logical_lengths=LogicalLengths(
             token_len=runtime.logical_position,
-            kv_visible_len=runtime.kv_length,
+            kv_visible_len=runtime.kv_visible_len,
             latent_len=0,
+            kv_reserved_len=runtime.kv_reserved_len,
+            kv_initialized_len=runtime.kv_initialized_len,
+            kv_committed_len=runtime.kv_committed_len,
+            kv_published_len=runtime.kv_published_len,
         ),
         token_span=replace(record.token_span, len=0),
         committed_tokens=(),
@@ -963,6 +1077,15 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
 _ExecutorTask: TypeAlias = _ForwardTask | _SampleTask
 _TaskResult: TypeAlias = tuple[Any, ...]
 _Driver: TypeAlias = Generator[tuple[_ExecutorTask, ...], _TaskResult, "_Outcome"]
+_OperationIdentity: TypeAlias = tuple[RequestKey, int]
+
+
+def _operation_identity(operation: Operation) -> _OperationIdentity:
+    return operation.request_key, int(operation.op_id)
+
+
+def _reference_operation_identity(reference: ProductRef) -> _OperationIdentity:
+    return reference.request_key, int(reference.producer_op_id)
 
 
 @dataclass(slots=True)
@@ -979,13 +1102,23 @@ class _ExecutionScope:
     component_us: dict[str, int] = field(default_factory=dict)
     device_reads: list[DeviceProductRead] = field(default_factory=list)
     device_writes: list[DeviceProductWrite] = field(default_factory=list)
-    operation_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
-    token_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
-    finish_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
-    continuation_writes: dict[int, DeviceProductWrite] = field(default_factory=dict)
-    predicate_reads: dict[int, DeviceProductRead] = field(default_factory=dict)
-    predicate_values: dict[int, tuple[torch.Tensor, bool]] = field(default_factory=dict)
-    sampling_states: dict[int, SamplingState] = field(default_factory=dict)
+    operation_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
+    token_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
+    selected_point_writes: dict[_OperationIdentity, DeviceProductWrite] = field(
+        default_factory=dict
+    )
+    accepted_span_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
+    state_continuation_writes: dict[_OperationIdentity, DeviceProductWrite] = field(
+        default_factory=dict
+    )
+    finish_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
+    continuation_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
+    predicate_reads: dict[_OperationIdentity, DeviceProductRead] = field(default_factory=dict)
+    selected_point_reads: dict[_OperationIdentity, DeviceProductRead] = field(default_factory=dict)
+    predicate_values: dict[_OperationIdentity, tuple[torch.Tensor, bool]] = field(
+        default_factory=dict
+    )
+    sampling_states: dict[_OperationIdentity, SamplingState] = field(default_factory=dict)
     device_continuation: DeviceProductContinuationBatch | None = None
     next_row_id: int = 0
 
@@ -993,6 +1126,18 @@ class _ExecutionScope:
         value = self.next_row_id
         self.next_row_id += 1
         return value
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeculativeSelection:
+    accepted: _CompletionInteger
+    selected_point: _CompletionSpeculativePoint
+    draft_tokens: tuple[int, ...]
+    terminal_prefix: int | None
+    base_logical_position: int
+    base_rng_counter: int
+    base_kv_visible: int
+    initialized_kv: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1007,20 +1152,20 @@ class _Outcome:
     """
 
     status: OpStatus
-    selected_point: int
+    selected_point: int | _CompletionSpeculativePoint
     logical_lengths: LogicalLengths
     token_span: TokenSpan
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
     committed_tokens: tuple[int | _CompletionToken, ...] = ()
     products: tuple[ProductPayload, ...] = ()
+    selection: _SpeculativeSelection | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _StateOutcome:
-    """KV growth and semantic tokens committed while publishing image state."""
+    """Semantic tokens and products committed while publishing image state."""
 
-    kv_tokens: int
     committed_tokens: tuple[int | _CompletionToken, ...] = ()
     products: tuple[ProductPayload, ...] = ()
 
@@ -1163,8 +1308,10 @@ class ModelExecutor:
             operations,
             duration_us=(time.perf_counter_ns() - validation_started) // 1000,
         )
-        for session_id, kv_length in self.sessions.apply_controls(batch.controls):
-            self.kv.rewind(session_id, kv_length)
+        for update in self.sessions.apply_controls(batch.controls):
+            if update.rewind:
+                self.kv.rewind(update.session_id, update.visible_len)
+            self.kv.commit(update.session_id, update.committed_len)
         if not batch.operations:
             self._apply_release_controls(batch)
             return CompletionReport(
@@ -1274,14 +1421,13 @@ class ModelExecutor:
                 # The base point and parent semantic come from the fixed parent
                 # directly, or from the session's tracked committed point for a
                 # device-relay successor whose parent carries no host point index.
-                base_point = _parent_base_point(operation, session)
                 parent_semantic = _parent_semantic(operation, session)
                 placeholder = CompletionRecord(
                     request_key=operation.request_key,
                     op_id=operation.op_id,
                     completion_slot_generation=completion.generation,
                     status=outcome.status,
-                    selected_point=base_point + (1 if operation.advances_state else 0),
+                    selected_point=cast(int, outcome.selected_point),
                     logical_lengths=outcome.logical_lengths,
                     token_span=outcome.token_span,
                     committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
@@ -1302,6 +1448,15 @@ class ModelExecutor:
                     completion,
                     row,
                     partial(self._finalize_predicated_runtime, operation),
+                    (
+                        partial(
+                            self._finalize_speculative_runtime,
+                            operation,
+                            outcome.selection,
+                        )
+                        if outcome.selection is not None
+                        else None
+                    ),
                 )
                 record = replace(placeholder, semantic_digest=cast(str, pending))
                 records.append(record)
@@ -1309,13 +1464,18 @@ class ModelExecutor:
                     committed[operation.request_key.session_id] = VersionRef(
                         request_key=operation.request_key,
                         producer_op_id=operation.op_id,
-                        point=FixedPoint(base_point + 1, cast(str, pending)),
+                        point=FixedPoint(cast(int, outcome.selected_point), cast(str, pending)),
                     )
                     pending_by_session[operation.request_key.session_id] = pending
+                    extents = self.kv.get(operation.request_key.session_id).extents()
                     resolved_runtime[operation.request_key.session_id] = ResolvedRuntimeState(
                         logical_position=session.logical_position,
                         rng_counter=session.rng_counter,
-                        kv_length=self.kv.get(operation.request_key.session_id).length,
+                        kv_reserved_len=extents.reserved,
+                        kv_initialized_len=extents.initialized,
+                        kv_visible_len=outcome.logical_lengths.kv_visible_len,
+                        kv_committed_len=extents.committed,
+                        kv_published_len=extents.published,
                     )
                 else:
                     committed[operation.request_key.session_id] = operation.parent
@@ -1329,7 +1489,11 @@ class ModelExecutor:
             self.replay.commit_atomic(
                 batch.operations,
                 report,
-                lambda publish: transaction.commit(committed, resolved_runtime, publish),
+                lambda publish: transaction.commit(
+                    committed,
+                    resolved_runtime,
+                    publish=publish,
+                ),
             )
             self._apply_release_controls(batch)
             # Finalize every row already detected ready. Other rows remain owned
@@ -1369,8 +1533,78 @@ class ModelExecutor:
             operation.parent,
         )
         if latest:
-            self.kv.rewind(operation.request_key.session_id, runtime.kv_length)
+            self.kv.select(operation.request_key.session_id, runtime.kv_visible_len)
         return selected, runtime
+
+    def _finalize_speculative_runtime(
+        self,
+        operation: Operation,
+        selection: _SpeculativeSelection,
+        record: CompletionRecord,
+        selected_digest: str,
+        parent_semantic: str,
+    ) -> None:
+        tokens = tuple(int(value) for value in record.committed_tokens)
+        selected_point = len(tokens)
+        accepted = int(selection.accepted)
+        expected_point = int(selection.selected_point)
+        if (
+            selected_point != expected_point
+            or accepted > len(selection.draft_tokens)
+            or int(record.selected_point) != expected_point
+        ):
+            raise RuntimeError("speculative completion selection is inconsistent")
+        entry = self.kv.get(operation.request_key.session_id)
+        extents = entry.extents()
+        selected_kv = selection.base_kv_visible + selected_point
+        if extents.initialized != selection.initialized_kv or selected_kv > extents.initialized:
+            raise RuntimeError("speculative KV selection is outside initialized state")
+        prefixes: list[tuple[VersionRef, ResolvedRuntimeState]] = []
+        for point_index in range(1, selected_point + 1):
+            prefix_record = replace(
+                record,
+                selected_point=point_index,
+                logical_lengths=replace(
+                    record.logical_lengths,
+                    token_len=selection.base_logical_position + point_index,
+                    kv_visible_len=selection.base_kv_visible + point_index,
+                ),
+                token_span=replace(record.token_span, len=point_index),
+                committed_tokens=tokens[:point_index],
+            )
+            digest = prefix_record.compute_semantic_digest(
+                parent_semantic=parent_semantic,
+                plan_digest=operation.plan_digest,
+            )
+            runtime = ResolvedRuntimeState(
+                logical_position=selection.base_logical_position + point_index,
+                rng_counter=selection.base_rng_counter + point_index,
+                kv_reserved_len=extents.reserved,
+                kv_initialized_len=extents.initialized,
+                kv_visible_len=selection.base_kv_visible + point_index,
+                kv_committed_len=extents.committed,
+                kv_published_len=extents.published,
+            )
+            prefixes.append(
+                (
+                    VersionRef(
+                        request_key=operation.request_key,
+                        producer_op_id=operation.op_id,
+                        point=FixedPoint(point_index, digest),
+                    ),
+                    runtime,
+                )
+            )
+        selected, _runtime = prefixes[-1]
+        point = cast(FixedPoint, selected.point)
+        if point.semantic_digest != selected_digest:
+            raise RuntimeError("selected speculative prefix digest is inconsistent")
+        self.kv.select(operation.request_key.session_id, selected_kv)
+        self.sessions.finalize_prefixes(
+            operation.request_key.session_id,
+            operation.op_id,
+            prefixes,
+        )
 
     def _validate_batch_identity(self, batch: Batch) -> None:
         if (
@@ -1437,21 +1671,29 @@ class ModelExecutor:
             groups = (*groups, tuple(general_bindings))
         bound_groups = self.products.device_products.bind_output_groups(groups)
         scope.device_writes.extend(write for binding in bound_groups for write in binding.writes)
+        operation_identities = {_operation_identity(operation) for operation in operations}
         for write in scope.device_writes:
-            operation_id = int(write.reference.producer_op_id)
-            operation = next(value for value in operations if int(value.op_id) == operation_id)
+            operation_identity = _reference_operation_identity(write.reference)
+            if operation_identity not in operation_identities:
+                raise RuntimeError("device output binding has no operation in the execution batch")
             if write.reference.kind is ProductKind.TOKEN:
-                scope.token_writes[operation_id] = write
-                scope.operation_writes.setdefault(operation_id, write)
+                scope.token_writes[operation_identity] = write
+                scope.operation_writes.setdefault(operation_identity, write)
+            elif write.reference.kind is ProductKind.SELECTED_POINT:
+                scope.selected_point_writes[operation_identity] = write
+            elif write.reference.kind is ProductKind.ACCEPTED_SPAN:
+                scope.accepted_span_writes[operation_identity] = write
+            elif write.reference.kind is ProductKind.CONTINUATION:
+                scope.state_continuation_writes[operation_identity] = write
             elif write.reference.kind is ProductKind.FINISH:
-                scope.finish_writes[operation_id] = write
+                scope.finish_writes[operation_identity] = write
             elif (
                 write.reference.kind is ProductKind.COMPLETION
                 and int(write.reference.output_index) == 4
             ):
-                scope.continuation_writes[operation_id] = write
+                scope.continuation_writes[operation_identity] = write
             else:
-                scope.operation_writes.setdefault(operation_id, write)
+                scope.operation_writes.setdefault(operation_identity, write)
 
     def _reserve_device_continuation(
         self,
@@ -1487,9 +1729,10 @@ class ModelExecutor:
             ):
                 return False
             point = operation.parent.point
-            parent = point.selected_point
+            parent = operation.predicate
             if (
-                parent.kind is not ProductKind.TOKEN
+                parent is None
+                or parent.kind is not ProductKind.TOKEN
                 or parent.storage_class is not StorageClass.DEVICE_TENSOR
                 or parent.shape_bound.max_elements != 1
             ):
@@ -1510,13 +1753,8 @@ class ModelExecutor:
         scope.device_continuation = continuation
         scope.device_writes.extend(continuation.writes)
         for operation, parent_value in zip(operations, continuation.inputs, strict=True):
-            parent_point = operation.parent.point
-            if (
-                isinstance(parent_point, DevicePoint)
-                and operation.predicate == parent_point.selected_point
-                and operation.predicate is not None
-            ):
-                scope.predicate_values[int(operation.op_id)] = (parent_value, True)
+            if isinstance(operation.parent.point, DevicePoint) and operation.predicate is not None:
+                scope.predicate_values[_operation_identity(operation)] = (parent_value, True)
         return True
 
     def _operation_device(self, operation: Operation) -> torch.device:
@@ -1555,10 +1793,24 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> None:
         for operation in operations:
+            operation_identity = _operation_identity(operation)
+            point = operation.parent.point
+            if isinstance(point, DevicePoint):
+                selected = point.selected_point
+                if selected.kind is not ProductKind.SELECTED_POINT:
+                    raise invalid_descriptor("device parent does not name a selected-point product")
+                selected_read = self.products.device_products.consume(
+                    selected,
+                    consumer_op_id=operation.op_id,
+                    producer_plan_digest=point.producer_plan_digest,
+                    device=self._operation_device(operation),
+                )
+                scope.device_reads.append(selected_read)
+                scope.selected_point_reads[operation_identity] = selected_read
             predicate = operation.predicate
             if predicate is None:
                 continue
-            if int(operation.op_id) in scope.predicate_values:
+            if operation_identity in scope.predicate_values:
                 continue
             read = self.products.device_products.consume(
                 predicate,
@@ -1566,9 +1818,9 @@ class ModelExecutor:
                 device=self._operation_device(operation),
             )
             scope.device_reads.append(read)
-            scope.predicate_reads[int(operation.op_id)] = read
+            scope.predicate_reads[operation_identity] = read
             tagged = predicate.kind is ProductKind.TOKEN and predicate.dtype is DType.U32
-            scope.predicate_values[int(operation.op_id)] = (read.tensor, tagged)
+            scope.predicate_values[operation_identity] = (read.tensor, tagged)
 
     def _publish_predicates(
         self,
@@ -1578,7 +1830,7 @@ class ModelExecutor:
             write
             for write in scope.device_writes
             if write.reference.kind is ProductKind.COMPLETION
-            and int(write.reference.producer_op_id) not in scope.continuation_writes
+            and _reference_operation_identity(write.reference) not in scope.continuation_writes
         )
         if not writes:
             return
@@ -1612,7 +1864,9 @@ class ModelExecutor:
             return
         after_writes: list[DeviceProductWrite] = []
         for read in reads:
-            write = scope.operation_writes.get(read.consumer_op_id)
+            write = scope.operation_writes.get(
+                (read.reference.request_key, int(read.consumer_op_id))
+            )
             if write is None:
                 after_writes.clear()
                 break
@@ -1663,8 +1917,8 @@ class ModelExecutor:
         for entry in batch.input_products:
             product = entry.product
             if product.kind is ProductKind.SAMPLING_STATE:
-                scope.sampling_states[int(product.producer_op_id)] = decode_sampling_state_bytes(
-                    entry.payload
+                scope.sampling_states[_reference_operation_identity(product)] = (
+                    decode_sampling_state_bytes(entry.payload)
                 )
                 continue
             handle = self._input_product_handle(product)
@@ -1775,6 +2029,11 @@ class ModelExecutor:
         _record_component(scope, "text_sample", sample_started)
         finalize_started = time.perf_counter_ns()
         self._publish_token_products(operations, samples, scope)
+        self._publish_decode_selection_products(
+            operations,
+            samples,
+            scope,
+        )
         outcomes: list[_Outcome] = []
         for operation, start, sampled in zip(operations, starts, samples, strict=True):
             session = self.sessions.get(operation.request_key.session_id)
@@ -1787,10 +2046,12 @@ class ModelExecutor:
             outcomes.append(
                 self._token_outcome(
                     operation,
+                    scope,
                     base=start,
                     tokens=1,
                     committed_tokens=(sampled.token_id,),
                     sample=sampled,
+                    selection_products_published=True,
                 )
             )
         _record_component(scope, "text_finalize", finalize_started)
@@ -2353,6 +2614,14 @@ class ModelExecutor:
         outputs = yield (task,)
         logits = _token_logits(outputs[0])
         self._commit_task_kv(task, len(tokens), scope)
+        if not any(output.kind is ProductKind.TOKEN for output in operation.outputs):
+            return self._token_outcome(
+                operation,
+                scope,
+                base=start,
+                tokens=0,
+                committed_tokens=(),
+            )
         sample_task = self._sample_task(
             operation,
             logits[-1],
@@ -2380,6 +2649,7 @@ class ModelExecutor:
         # would reintroduce the per-step host stall.
         return self._token_outcome(
             operation,
+            scope,
             base=start,
             tokens=len(tokens),
             committed_tokens=(sample.token_id,),
@@ -2569,6 +2839,7 @@ class ModelExecutor:
         # response is serialized, off the decode critical path.
         return self._token_outcome(
             operation,
+            scope,
             base=start,
             tokens=1,
             committed_tokens=(sampled.token_id,),
@@ -2603,13 +2874,6 @@ class ModelExecutor:
         )
         outputs = yield (task,)
         logits = _token_logits(outputs[0])
-        sampling = _require_sampling(session)
-        seed = int(sampling.seed or 0)
-        coins = uniform_samples(
-            (len(draft),),
-            seed=sampling_draw_seed(seed, start),
-            device=logits.device,
-        )
         sample_task = self._sample_task(
             operation,
             logits,
@@ -2617,48 +2881,96 @@ class ModelExecutor:
             scope,
             positions=tuple(range(start + 1, start + len(draft) + 2)),
             draft_token_ids=draft,
-            acceptance_uniforms=coins,
         )
         sampled = _sample_result((yield (sample_task,))[0])
-        accepted = int(sampled.num_accepted_tokens)
-        committed = 1 + accepted
-        self._commit_task_kv(task, committed, scope)
+        initialized = scope.kv.initialize(operation.request_key.session_id, task.query_tokens)
         self._publish_token_product(operation, sampled, scope)
-        session.rng_counter += len(draft) + 1
-        session.logical_position = start + committed
-        committed_tokens = tuple(int(value) for value in draft[:accepted]) + (
-            int(sampled.token_id),
+        accepted = cast(_CompletionInteger, sampled.num_accepted_tokens)
+        selected_point = _CompletionSpeculativePoint(
+            accepted,
+            sample_task.terminal_draft_prefix,
+        )
+        committed_tokens = _CompletionSpeculativeTokens(
+            draft,
+            accepted,
+            sampled.token_id,
+            sample_task.terminal_draft_prefix,
         )
         return self._token_outcome(
             operation,
+            scope,
             base=start,
-            tokens=committed,
-            committed_tokens=committed_tokens,
+            tokens=selected_point,
+            committed_tokens=cast(tuple[int | _CompletionToken, ...], committed_tokens),
             sample=sampled,
+            selection=_SpeculativeSelection(
+                accepted=accepted,
+                selected_point=selected_point,
+                draft_tokens=draft,
+                terminal_prefix=sample_task.terminal_draft_prefix,
+                base_logical_position=start,
+                base_rng_counter=session.rng_counter,
+                base_kv_visible=initialized - task.query_tokens,
+                initialized_kv=initialized,
+            ),
         )
 
     def _token_outcome(
         self,
         operation: Operation,
+        scope: _ExecutionScope,
         *,
         base: int,
-        tokens: int,
+        tokens: int | _CompletionDerivedInteger | _CompletionSpeculativePoint,
         committed_tokens: tuple[int | _CompletionToken, ...],
         sample: _SampleResult | None = None,
+        selection: _SpeculativeSelection | None = None,
+        selection_products_published: bool = False,
     ) -> _Outcome:
         session = self.sessions.get(operation.request_key.session_id)
+        extents = self.kv.get(operation.request_key.session_id).extents()
+        visible = (
+            extents.visible
+            if selection is None
+            else _CompletionDerivedInteger(
+                cast(_CompletionInteger, selection.selected_point),
+                selection.base_kv_visible,
+            )
+        )
+        token_len = (
+            session.logical_position
+            if selection is None
+            else _CompletionDerivedInteger(
+                cast(_CompletionInteger, selection.selected_point),
+                selection.base_logical_position,
+            )
+        )
+        if sample is not None and not selection_products_published:
+            self._publish_selection_products(
+                operation,
+                sample,
+                scope,
+                logical_position=session.logical_position,
+                kv_visible=extents.visible,
+                selection=selection,
+            )
         return _Outcome(
             status=OpStatus.OK,
-            selected_point=1,
+            selected_point=(1 if selection is None else selection.selected_point),
             logical_lengths=LogicalLengths(
-                token_len=session.logical_position,
-                kv_visible_len=self.kv.get(operation.request_key.session_id).length,
+                token_len=cast(int, token_len),
+                kv_visible_len=cast(int, visible),
+                kv_reserved_len=extents.reserved,
+                kv_initialized_len=extents.initialized,
+                kv_committed_len=extents.committed,
+                kv_published_len=extents.published,
             ),
-            token_span=TokenSpan(base=base, len=int(tokens)),
+            token_span=TokenSpan(base=base, len=cast(int, tokens)),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
             committed_tokens=committed_tokens,
             products=_sample_product_payloads(operation, sample),
+            selection=selection,
         )
 
     def _token_task(
@@ -2759,17 +3071,10 @@ class ModelExecutor:
     ) -> int | torch.Tensor:
         point = operation.parent.point
         if isinstance(point, DevicePoint):
-            reference = point.selected_point
-            if reference.kind is not ProductKind.TOKEN:
-                raise invalid_descriptor("device parent selected point is not a token product")
-            read = self.products.device_products.consume(
-                reference,
-                consumer_op_id=operation.op_id,
-                producer_plan_digest=point.producer_plan_digest,
-                device=self._operation_device(operation),
-            )
-            scope.device_reads.append(read)
-            return read.tensor
+            predicate = scope.predicate_values.get(_operation_identity(operation))
+            if predicate is None or not predicate[1]:
+                raise invalid_descriptor("device token continuation is not registered")
+            return _decode_tagged_token_views((predicate[0],))[0]
         tokens = self._operation_token_ids(operation, scope)
         if not tokens:
             raise invalid_descriptor("last-sampled token source has no committed token")
@@ -2783,36 +3088,18 @@ class ModelExecutor:
         if scope.device_continuation is not None:
             return _decode_tagged_token_views(scope.device_continuation.inputs)
         resolved: list[int | torch.Tensor | None] = [None] * len(operations)
-        device_indexes: list[int] = []
-        requests: list[tuple[ProductRef, int, str | None, torch.device | str | None]] = []
         for index, operation in enumerate(operations):
             point = operation.parent.point
             if isinstance(point, DevicePoint):
-                reference = point.selected_point
-                if reference.kind is not ProductKind.TOKEN:
-                    raise invalid_descriptor("device parent selected point is not a token product")
-                device_indexes.append(index)
-                requests.append(
-                    (
-                        reference,
-                        operation.op_id,
-                        point.producer_plan_digest,
-                        None,
-                    )
-                )
+                predicate = scope.predicate_values.get(_operation_identity(operation))
+                if predicate is None or not predicate[1]:
+                    raise invalid_descriptor("device token continuation is not registered")
+                resolved[index] = _decode_tagged_token_views((predicate[0],))[0]
                 continue
             tokens = self._operation_token_ids(operation, scope)
             if not tokens:
                 raise invalid_descriptor("last-sampled token source has no committed token")
             resolved[index] = int(tokens[0])
-        reads = self.products.device_products.consume_batch(
-            tuple(requests),
-            device=self._operation_device(operations[0]),
-        )
-        scope.device_reads.extend(reads)
-        decoded = _decode_tagged_token_views(tuple(read.tensor for read in reads))
-        for index, token in zip(device_indexes, decoded, strict=True):
-            resolved[index] = token
         if any(value is None for value in resolved):
             raise RuntimeError("decode token resolution left an operation without input")
         return tuple(cast(int | torch.Tensor, value) for value in resolved)
@@ -2825,7 +3112,7 @@ class ModelExecutor:
     ) -> None:
         if sample.device_product_published:
             return
-        write = scope.token_writes.get(int(operation.op_id))
+        write = scope.token_writes.get(_operation_identity(operation))
         if write is None:
             return
         device_token = sample.device_token
@@ -2880,7 +3167,7 @@ class ModelExecutor:
         writes: list[DeviceProductWrite] = []
         device_tokens: list[torch.Tensor] = []
         for operation, sample in zip(operations, samples, strict=True):
-            write = scope.token_writes.get(int(operation.op_id))
+            write = scope.token_writes.get(_operation_identity(operation))
             if write is None or sample.device_token is None:
                 for candidate_operation, candidate_sample in zip(
                     operations,
@@ -2915,6 +3202,126 @@ class ModelExecutor:
             _tagged_token_values(packed, packed_flags),
         )
 
+    def _publish_decode_selection_products(
+        self,
+        operations: tuple[Operation, ...],
+        samples: tuple[_SampleResult, ...],
+        scope: _ExecutionScope,
+    ) -> None:
+        if len(operations) != len(samples):
+            raise RuntimeError("decode selection publication rows do not align")
+        selected_writes: list[DeviceProductWrite] = []
+        device_tokens: list[torch.Tensor] = []
+        for operation, sample in zip(operations, samples, strict=True):
+            if int(operation.bounds.max_points) != 1:
+                raise RuntimeError("decode selection publication requires one selected point")
+            if sample.device_token is None:
+                raise RuntimeError("device selection products require a device token")
+            operation_identity = _operation_identity(operation)
+            selected_write = scope.selected_point_writes.get(operation_identity)
+            if selected_write is None:
+                raise invalid_descriptor("token operation is missing its selected-point product")
+            selected_writes.append(selected_write)
+            device_tokens.append(sample.device_token)
+
+        device_names = {str(device_token.device) for device_token in device_tokens}
+        if len(device_names) > 1:
+            for device_name in sorted(device_names):
+                indexes = tuple(
+                    index
+                    for index, device_token in enumerate(device_tokens)
+                    if str(device_token.device) == device_name
+                )
+                self._publish_decode_selection_products(
+                    tuple(operations[index] for index in indexes),
+                    tuple(samples[index] for index in indexes),
+                    scope,
+                )
+            return
+
+        selected_points = torch.ones(
+            len(device_tokens),
+            dtype=torch.long,
+            device=device_tokens[0].device,
+        )
+        self.products.device_products.publish_writes(
+            tuple(selected_writes),
+            selected_points,
+        )
+
+    def _publish_selection_products(
+        self,
+        operation: Operation,
+        sample: _SampleResult,
+        scope: _ExecutionScope,
+        *,
+        logical_position: int,
+        kv_visible: int,
+        selection: _SpeculativeSelection | None,
+    ) -> None:
+        device_token = sample.device_token
+        if device_token is None:
+            raise RuntimeError("device selection products require a device token")
+        accepted = sample.device_accepted_tokens
+        if accepted is None:
+            accepted = torch.zeros_like(device_token, dtype=torch.long)
+        selected_point = sample.device_selected_point
+        if selected_point is None:
+            selected_point = accepted.to(dtype=torch.long) + 1
+        semantic_token = device_token.reshape(-1).to(dtype=torch.long).bitwise_and(TOKEN_VALUE_MASK)
+        operation_identity = _operation_identity(operation)
+        selected_write = scope.selected_point_writes.get(operation_identity)
+        span_write = scope.accepted_span_writes.get(operation_identity)
+        continuation_write = scope.state_continuation_writes.get(operation_identity)
+        if selected_write is None:
+            raise invalid_descriptor("token operation is missing its selected-point product")
+        self.products.device_products.publish_write(selected_write, selected_point)
+        if (
+            span_write is None
+            and continuation_write is None
+            and int(operation.bounds.max_points) == 1
+        ):
+            return
+        if span_write is None or continuation_write is None:
+            raise invalid_descriptor("multi-point token operation is missing its branch products")
+        if selection is None:
+            candidates = semantic_token
+            logical = torch.full_like(selected_point, int(logical_position))
+            visible = torch.full_like(selected_point, int(kv_visible))
+        else:
+            draft = torch.tensor(
+                selection.draft_tokens,
+                dtype=torch.long,
+                device=device_token.device,
+            )
+            candidates = torch.cat((draft, semantic_token))
+            logical = selected_point + int(selection.base_logical_position)
+            visible = selected_point + int(selection.base_kv_visible)
+        max_points = int(operation.bounds.max_points)
+        if int(candidates.numel()) != max_points:
+            raise RuntimeError("selection candidates do not match the operation point bound")
+        indexes = torch.arange(max_points, dtype=torch.long, device=device_token.device)
+        visible_tokens = torch.where(
+            indexes < selected_point.reshape(()),
+            candidates,
+            torch.zeros_like(candidates),
+        )
+        self.products.device_products.publish_write(
+            span_write,
+            torch.cat((selected_point.reshape(-1), visible_tokens)),
+        )
+        self.products.device_products.publish_write(
+            continuation_write,
+            torch.stack(
+                (
+                    semantic_token[0],
+                    selected_point.reshape(-1)[0],
+                    visible.reshape(-1)[0],
+                    logical.reshape(-1)[0],
+                )
+            ),
+        )
+
     def _sample_task(
         self,
         operation: Operation,
@@ -2924,10 +3331,10 @@ class ModelExecutor:
         *,
         positions: tuple[int, ...],
         draft_token_ids: tuple[int, ...] = (),
-        acceptance_uniforms: torch.Tensor | None = None,
     ) -> _SampleTask:
         sampling = _require_sampling(session)
-        state = scope.sampling_states.get(int(operation.op_id), SamplingState())
+        operation_identity = _operation_identity(operation)
+        state = scope.sampling_states.get(operation_identity, SamplingState())
         allowed_token_ids = (
             state.allowed_token_ids
             if state.allowed_token_ids is not None
@@ -2965,28 +3372,36 @@ class ModelExecutor:
                     "sampling positions disagree with registered semantic RNG coordinates"
                 )
         rng_seed = 0 if rng is None else int(rng.seed)
-        descriptors = tuple(
-            _SamplingRow(
-                parameters=sampling,
-                recent_counts=state.recent_counts,
-                allowed=allowed_token_ids,
-                suppress=state.suppressed_token_ids,
-                finish_token_ids=finish_token_ids,
-                force_finish=state.force_finish,
-                draw_seed=(
-                    semantic_sampling_seed(
-                        operation.request_key,
-                        rng_seed,
-                        int(position),
-                    )
-                    if float(sampling.temperature) > 0.0
-                    else 0
-                ),
-                n_logprobs=int(sampling.n_logprobs),
+        base_counts = dict(state.recent_counts)
+        descriptors: list[_SamplingRow] = []
+        for index, position in enumerate(positions):
+            prefix_counts = dict(base_counts)
+            for token_id in draft_token_ids[:index]:
+                prefix_counts[int(token_id)] = prefix_counts.get(int(token_id), 0) + 1
+            descriptors.append(
+                _SamplingRow(
+                    parameters=sampling,
+                    recent_counts=tuple(sorted(prefix_counts.items())),
+                    allowed=allowed_token_ids,
+                    suppress=state.suppressed_token_ids,
+                    finish_token_ids=finish_token_ids,
+                    force_finish=state.force_finish,
+                    draw_seed=(
+                        semantic_sampling_seed(
+                            operation.request_key,
+                            rng_seed,
+                            int(position),
+                        )
+                        if float(sampling.temperature) > 0.0
+                        else 0
+                    ),
+                    n_logprobs=int(sampling.n_logprobs),
+                )
             )
-            for position in positions
+        descriptor_rows = tuple(descriptors)
+        plain_greedy = not draft_token_ids and all(
+            _plain_greedy_row(row) for row in descriptor_rows
         )
-        plain_greedy = not draft_token_ids and all(_plain_greedy_row(row) for row in descriptors)
         if plain_greedy:
             draws = None
             penalty_token_ids = None
@@ -2994,28 +3409,33 @@ class ModelExecutor:
             parameter_values = None
         else:
             draws = _semantic_sampling_draws(
-                descriptors,
+                descriptor_rows,
                 device=rows.device,
             )
             penalty_token_ids, penalty_counts, parameter_values = _sampling_task_tensors(
-                descriptors,
+                descriptor_rows,
                 vocab=int(rows.shape[1]),
                 device=rows.device,
             )
-        token_product = scope.token_writes.get(int(operation.op_id))
-        finish_product = scope.finish_writes.get(int(operation.op_id))
-        continuation_product = scope.continuation_writes.get(int(operation.op_id))
-        predicate_value = scope.predicate_values.get(int(operation.op_id))
+        token_product = scope.token_writes.get(operation_identity)
+        finish_product = scope.finish_writes.get(operation_identity)
+        continuation_product = scope.continuation_writes.get(operation_identity)
+        predicate_value = scope.predicate_values.get(operation_identity)
+        finish_set = set(finish_token_ids)
+        terminal_draft_prefix = next(
+            (index + 1 for index, token_id in enumerate(draft_token_ids) if token_id in finish_set),
+            None,
+        )
         return _SampleTask(
             operation=operation,
             logits=rows,
-            rows=descriptors,
+            rows=descriptor_rows,
             draws=draws,
             penalty_token_ids=penalty_token_ids,
             penalty_counts=penalty_counts,
             parameter_values=parameter_values,
             draft_token_ids=tuple(int(value) for value in draft_token_ids),
-            acceptance_uniforms=acceptance_uniforms,
+            terminal_draft_prefix=terminal_draft_prefix,
             token_product=token_product,
             finish_product=finish_product,
             continuation_product=continuation_product,
@@ -3033,6 +3453,12 @@ class ModelExecutor:
         if flow is None:
             raise invalid_descriptor("flow operation requires a declared FlowSpec")
         session_id = operation.request_key.session_id
+        conditioning = tuple(
+            reference for reference in operation.inputs if reference.kind is ProductKind.KV
+        )
+        if len(conditioning) != 1:
+            raise invalid_descriptor("flow operation requires one exact KV publication")
+        self.kv.validate_conditioning(session_id, conditioning[0])
         session = self.sessions.get(session_id)
         image = session.image
         if image is None:
@@ -3174,6 +3600,7 @@ class ModelExecutor:
             scope.latents.write(record)
             session.flow_step = step + 1
         length = self.kv.get(session_id).length
+        extents = self.kv.get(session_id).extents()
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1,
@@ -3184,6 +3611,10 @@ class ModelExecutor:
                 # the quantum (start_step + step_count), which the ordered-commit
                 # validator matches against the request's expected denoise step.
                 latent_len=record.step,
+                kv_reserved_len=extents.reserved,
+                kv_initialized_len=extents.initialized,
+                kv_committed_len=extents.committed,
+                kv_published_len=extents.published,
             ),
             token_span=TokenSpan(base=session.logical_position, len=0),
             finish_flags=FinishFlags(),
@@ -3507,16 +3938,18 @@ class ModelExecutor:
         products: tuple[ProductPayload, ...] = (),
     ) -> _Outcome:
         session = self.sessions.get(operation.request_key.session_id)
+        extents = self.kv.get(operation.request_key.session_id).extents()
         span_base = session.logical_position if base is None else int(base)
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1 if operation.advances_state else 0,
-            # The image KV tokens this encode/ingest/feedback operation actually
-            # wrote (its state-driver forward query span), which the validator
-            # matches against the request's expected image KV extent.
             logical_lengths=LogicalLengths(
                 token_len=session.logical_position,
-                kv_visible_len=outcome.kv_tokens,
+                kv_visible_len=extents.visible,
+                kv_reserved_len=extents.reserved,
+                kv_initialized_len=extents.initialized,
+                kv_committed_len=extents.committed,
+                kv_published_len=extents.published,
             ),
             token_span=TokenSpan(base=span_base, len=outcome.sampled_tokens),
             finish_flags=FinishFlags(),
@@ -3529,17 +3962,21 @@ class ModelExecutor:
         self,
         operation: Operation,
         *,
-        kv_len: int,
         products: tuple[ProductPayload, ...] = (),
     ) -> _Outcome:
         session = self.sessions.get(operation.request_key.session_id)
+        extents = self.kv.get(operation.request_key.session_id).extents()
         base = session.logical_position
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1 if operation.advances_state else 0,
             logical_lengths=LogicalLengths(
                 token_len=session.logical_position,
-                kv_visible_len=kv_len,
+                kv_visible_len=extents.visible,
+                kv_reserved_len=extents.reserved,
+                kv_initialized_len=extents.initialized,
+                kv_committed_len=extents.committed,
+                kv_published_len=extents.published,
             ),
             token_span=TokenSpan(base=base, len=0),
             finish_flags=FinishFlags(),
@@ -3621,7 +4058,7 @@ class ModelExecutor:
             write,
             value,
         )
-        scope.operation_writes.setdefault(int(operation.op_id), write)
+        scope.operation_writes.setdefault(_operation_identity(operation), write)
         payload = (
             replace(payload, features=resident)
             if isinstance(payload, VisionFeatureProduct)
@@ -3636,7 +4073,7 @@ class ModelExecutor:
         )
         session = self.sessions.get(session_id)
         session.product_handles.add(handle)
-        return self._non_state_outcome(operation, kv_len=0)
+        return self._non_state_outcome(operation)
 
     def _materialize_driver(
         self,
@@ -3721,7 +4158,7 @@ class ModelExecutor:
                 write,
                 image_tensor,
             )
-            scope.operation_writes.setdefault(int(operation.op_id), write)
+            scope.operation_writes.setdefault(_operation_identity(operation), write)
             scope.product_view.put(
                 ProductRecord(
                     handle=image_handle,
@@ -3751,7 +4188,6 @@ class ModelExecutor:
         )
         return self._non_state_outcome(
             operation,
-            kv_len=0,
             products=products,
         )
 
@@ -3769,20 +4205,51 @@ class ModelExecutor:
         session_id = operation.request_key.session_id
         mode = operation.work.mode
         if mode == TransferMode.KV_PUBLISH.value:
-            parent_index = _fixed_parent(operation).point_index
+            point = _fixed_parent(operation)
+            outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
+            if len(outputs) != 1:
+                raise invalid_descriptor("KV publication requires one KV output product")
+            if any(reference.kind is ProductKind.KV for reference in operation.inputs):
+                raise invalid_descriptor("KV publication is rooted only by its fixed parent")
+            expected_base = self.kv.destination_base(session_id, "gen")
             snapshot = self.kv.publish(
                 session_id,
-                source_version=parent_index,
-                position=parent_index,
+                source_version=operation.parent,
+                source_digest=point.semantic_digest,
+                destination="gen",
+                expected_base=expected_base,
+                product=outputs[0],
                 transport=self.transport,
             )
             for encoded in snapshot.locators:
                 scope.published.append(Locator.from_wire_json(encoded))
-            return self._non_state_outcome(operation, kv_len=snapshot.kv_tokens)
+            payload = json.dumps(
+                snapshot.to_wire(),
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            return self._non_state_outcome(
+                operation,
+                products=(ProductPayload(product=outputs[0], payload=payload),),
+            )
         if mode == TransferMode.KV_INSTALL.value:
-            # Installing transferred conditioning rides the transport-backed KV
-            # store, which is out of depth-one scope; no local state changes here.
-            return self._non_state_outcome(operation, kv_len=self.kv.get(session_id).length)
+            inputs = tuple(
+                reference for reference in operation.inputs if reference.kind is ProductKind.KV
+            )
+            outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
+            if len(inputs) != 1 or len(outputs) != 1:
+                raise invalid_descriptor("KV installation requires one input and one output")
+            snapshot = self.kv.install_publication(
+                session_id,
+                inputs[0],
+                outputs[0],
+                self.transport,
+            )
+            return self._non_state_outcome(
+                operation,
+                products=(ProductPayload(product=outputs[0], payload=b""),),
+            )
         value, metadata = self._fetch_product_tensor(operation, scope)
         self._publish_tensor(
             value,
@@ -3792,7 +4259,7 @@ class ModelExecutor:
             width=_metadata_uint(metadata, "width", 0),
             value_range=_metadata_string(metadata, "value_range", ""),
         )
-        return self._non_state_outcome(operation, kv_len=self.kv.get(session_id).length)
+        return self._non_state_outcome(operation)
 
     def _encode_source(
         self,
@@ -3859,9 +4326,9 @@ class ModelExecutor:
         close_image: bool = False,
         retain_image: bool,
     ) -> Generator[tuple[_ExecutorTask, ...], _TaskResult, _StateOutcome]:
-        total = 0
         committed_tokens: tuple[int | _CompletionToken, ...] = ()
         products: tuple[ProductPayload, ...] = ()
+        state_query_tokens = 0
         for stage in self._state_stages(operation_type, retain_image=retain_image):
             if stage.row is RouteRowKind.ENCODE:
                 if image is None:
@@ -3894,10 +4361,14 @@ class ModelExecutor:
                     close_image=close_image,
                     logits=sample_token,
                 )
+                state_query_tokens += task.query_tokens
+                if state_query_tokens > int(operation.bounds.max_tokens):
+                    raise invalid_descriptor(
+                        "image state query span exceeds the operation token bound"
+                    )
                 outputs = yield (task,)
                 value = _token_logits_or_hidden(outputs[0])
                 self._commit_task_kv(task, task.query_tokens, scope)
-                total += task.query_tokens
                 if sample_token:
                     if not isinstance(outputs[0], TokenOutput) or not isinstance(
                         outputs[0].value, TokenLogits
@@ -3936,13 +4407,17 @@ class ModelExecutor:
                     conditioning_position,
                     scope,
                 )
+                state_query_tokens += task.query_tokens
+                if state_query_tokens > int(operation.bounds.max_tokens):
+                    raise invalid_descriptor(
+                        "image state query span exceeds the operation token bound"
+                    )
                 outputs = yield (task,)
                 _flow_prediction(outputs[0])
                 self._commit_task_kv(task, task.query_tokens, scope)
-                total += task.query_tokens
                 continue
             raise invalid_descriptor("state publication cannot use a decode row")
-        return _StateOutcome(total, committed_tokens, products)
+        return _StateOutcome(committed_tokens, products)
 
     def _vision_state_task(
         self,
@@ -4138,7 +4613,7 @@ class ModelExecutor:
         frames = scope.product_view.require(frame_handle).payload
         if not isinstance(frames, FrameCollectionProduct):
             raise RuntimeError("frame collection publication produced the wrong product variant")
-        return self._non_state_outcome(operation, kv_len=self.kv.get(session_id).length)
+        return self._non_state_outcome(operation)
 
     def _append_frame(
         self,
@@ -4626,13 +5101,7 @@ def _sample_task_batch(
         if task.draft_token_ids:
             if len(task.rows) != len(task.draft_token_ids) + 1:
                 raise invalid_descriptor("speculative sampling rows do not cover the draft chain")
-            if task.acceptance_uniforms is None or tuple(task.acceptance_uniforms.shape) != (
-                len(task.draft_token_ids),
-            ):
-                raise invalid_descriptor(
-                    "speculative acceptance RNG shape does not match the draft"
-                )
-        elif task.acceptance_uniforms is not None or len(task.rows) != 1:
+        elif len(task.rows) != 1:
             raise invalid_descriptor("ordinary sampling tasks must contain exactly one row")
         vocab = int(task.logits.shape[1])
         if vocab > TOKEN_VALUE_MASK:
@@ -4731,6 +5200,7 @@ def _sample_plain_greedy_group(
         device_tokens,
         valid,
         active,
+        torch.zeros_like(active, dtype=torch.bool),
         device_products,
         device_reads,
     )
@@ -4836,6 +5306,7 @@ def _sample_fused_top_k_group(
         tokens,
         valid,
         active,
+        torch.zeros_like(active, dtype=torch.bool),
         device_products,
         device_reads,
     )
@@ -4908,84 +5379,12 @@ def _sample_task_group(
     draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
     work, valid = _shape_sampling_logits_batch(logits, rows)
 
-    acceptance_rows: list[int] = []
-    acceptance_tokens: list[int] = []
-    acceptance_parts: list[torch.Tensor] = []
-    acceptance_spans: dict[int, tuple[int, int]] = {}
-    acceptance_offset = 0
-    for task_index, (task, row_offset) in enumerate(zip(tasks, offsets, strict=True)):
-        count = len(task.draft_token_ids)
-        if not count:
-            continue
-        acceptance_rows.extend(range(row_offset, row_offset + count))
-        acceptance_tokens.extend(task.draft_token_ids)
-        acceptance_parts.append(cast(torch.Tensor, task.acceptance_uniforms))
-        acceptance_spans[task_index] = (acceptance_offset, count)
-        acceptance_offset += count
-
-    accepted_flags: torch.Tensor | None = None
-    if acceptance_rows:
-        acceptance_indexes = torch.tensor(
-            acceptance_rows,
-            dtype=torch.long,
-            device=device,
-        )
-        target_indexes = torch.tensor(
-            acceptance_tokens,
-            dtype=torch.long,
-            device=device,
-        )
-        target_probabilities = torch.softmax(
-            work.index_select(0, acceptance_indexes),
-            dim=-1,
-        ).gather(1, target_indexes.unsqueeze(1))[:, 0]
-        coins = torch.cat(
-            tuple(
-                value.to(device=device, dtype=target_probabilities.dtype)
-                for value in acceptance_parts
-            ),
-            dim=0,
-        )
-        accepted_flags = (coins <= target_probabilities) | (target_probabilities >= 1.0)
-
-    accepted_counts: list[torch.Tensor] = []
-    output_rows: list[torch.Tensor] = []
-    for task_index, row_offset in enumerate(offsets):
-        acceptance_span = acceptance_spans.get(task_index)
-        if acceptance_span is None:
-            accepted = torch.zeros((), dtype=torch.long, device=device)
-        else:
-            start, count = acceptance_span
-            flags = cast(torch.Tensor, accepted_flags)[start : start + count]
-            accepted = torch.cumprod(flags.to(torch.long), dim=0).sum()
-        accepted_counts.append(accepted)
-        output_rows.append(accepted + row_offset)
-
-    sample_work = work
-    if acceptance_rows:
-        sample_work = work.clone()
-        flat_exclusions = torch.tensor(
-            [
-                row * vocab + token
-                for row, token in zip(
-                    acceptance_rows,
-                    acceptance_tokens,
-                    strict=True,
-                )
-            ],
-            dtype=torch.long,
-            device=device,
-        )
-        sample_work.reshape(-1).index_fill_(0, flat_exclusions, float("-inf"))
-        has_residual = torch.isfinite(sample_work).any(dim=-1)
-        sample_work = torch.where(has_residual.unsqueeze(1), sample_work, work)
-
     temperatures = torch.tensor(
         [float(row.parameters.temperature) for row in rows],
         dtype=work.dtype,
         device=device,
     )
-    probabilities = torch.softmax(sample_work, dim=-1)
+    probabilities = torch.softmax(work, dim=-1)
     cumulative = probabilities.cumsum(dim=-1)
     sampled_tokens = (
         (cumulative < draws.to(dtype=cumulative.dtype).unsqueeze(1))
@@ -4995,15 +5394,47 @@ def _sample_task_group(
     row_tokens = torch.where(
         temperatures > 0.0,
         sampled_tokens,
-        torch.argmax(sample_work, dim=-1),
+        torch.argmax(work, dim=-1),
     )
+    accepted_counts: list[torch.Tensor] = []
+    selected_points: list[torch.Tensor] = []
+    terminal_finishes: list[torch.Tensor] = []
+    output_rows: list[torch.Tensor] = []
+    terminal_tokens: list[torch.Tensor] = []
+    for task, row_offset in zip(tasks, offsets, strict=True):
+        if task.draft_token_ids:
+            draft = torch.tensor(task.draft_token_ids, dtype=row_tokens.dtype, device=device)
+            matches = row_tokens[row_offset : row_offset + len(task.draft_token_ids)] == draft
+            raw_accepted = torch.cumprod(matches.to(torch.long), dim=0).sum()
+        else:
+            draft = torch.empty((0,), dtype=row_tokens.dtype, device=device)
+            raw_accepted = torch.zeros((), dtype=torch.long, device=device)
+        if task.terminal_draft_prefix is None:
+            accepted = raw_accepted
+            terminal = torch.zeros((), dtype=torch.bool, device=device)
+            terminal_token = torch.zeros((), dtype=row_tokens.dtype, device=device)
+        else:
+            terminal_prefix = int(task.terminal_draft_prefix)
+            accepted = raw_accepted.clamp_max(terminal_prefix)
+            terminal = raw_accepted >= terminal_prefix
+            terminal_token = draft[terminal_prefix - 1]
+        accepted_counts.append(accepted)
+        selected_points.append(accepted + (~terminal).to(dtype=torch.long))
+        terminal_finishes.append(terminal)
+        output_rows.append(accepted + row_offset)
+        terminal_tokens.append(terminal_token)
     output_indexes = torch.stack(output_rows)
     task_tokens = row_tokens.index_select(0, output_indexes)
     counts = torch.stack(accepted_counts)
+    points = torch.stack(selected_points)
+    terminal_finish = torch.stack(terminal_finishes)
+    task_tokens = torch.where(terminal_finish, torch.stack(terminal_tokens), task_tokens)
 
     task_valid = torch.stack(
         tuple(
-            valid[offsets[index] : offsets[index] + len(task.rows)].all()
+            valid[offsets[index] : offsets[index] + len(task.rows)][
+                torch.arange(len(task.rows), device=device) < points[index]
+            ].all()
             for index, task in enumerate(tasks)
         )
     )
@@ -5013,6 +5444,7 @@ def _sample_task_group(
         task_tokens,
         task_valid,
         active,
+        terminal_finish,
         device_products,
         device_reads,
     )
@@ -5024,57 +5456,22 @@ def _sample_task_group(
         device_reads,
     )
     span = _capture_sample_span(task_valid, active, task_tokens, counts, completion)
-    speculative_values: dict[int, tuple[int, int]] = {}
-    speculative_indexes = tuple(index for index, task in enumerate(tasks) if task.draft_token_ids)
-    if speculative_indexes and task_tokens.device.type == "cuda":
-        indexes = torch.tensor(
-            speculative_indexes,
-            dtype=torch.long,
-            device=task_tokens.device,
-        )
-        host = (
-            torch.cat(
-                (
-                    task_valid.index_select(0, indexes).to(torch.long),
-                    task_tokens.index_select(0, indexes),
-                    counts.index_select(0, indexes),
-                )
-            )
-            .to(device="cpu")
-            .tolist()
-        )
-        width = len(speculative_indexes)
-        if not all(bool(value) for value in host[:width]):
-            raise invalid_descriptor("sampling policy masked every vocabulary entry")
-        speculative_values = {
-            task_index: (
-                int(host[width + local]),
-                int(host[width * 2 + local]),
-            )
-            for local, task_index in enumerate(speculative_indexes)
-        }
     details = _sample_logprob_details(
-        sample_work,
-        output_indexes,
+        work,
+        output_indexes - terminal_finish.to(dtype=torch.long),
         task_tokens,
         tuple(task.rows[0] for task in tasks),
         completion,
     )
     return tuple(
         _SampleResult(
-            token_id=(
-                speculative_values[index][0]
-                if index in speculative_values
-                else _CompletionSampleToken(span, index)
-            ),
+            token_id=(_CompletionSampleToken(span, index)),
             device_token=task_tokens[index : index + 1],
             logprob=None if index not in details else details[index][0],
             top_logprobs=None if index not in details else details[index][1],
-            num_accepted_tokens=(
-                speculative_values[index][1]
-                if index in speculative_values
-                else _CompletionInteger(span, index)
-            ),
+            num_accepted_tokens=(_CompletionInteger(span, index)),
+            device_accepted_tokens=counts[index : index + 1],
+            device_selected_point=points[index : index + 1],
             device_finish=(None if device_finish is None else device_finish[index : index + 1]),
             device_continuation=continuation_values[index : index + 1],
             device_product_published=published,
@@ -5254,10 +5651,13 @@ def _resolve_sampled_finish_values(
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
     active: torch.Tensor,
+    terminal_finish: torch.Tensor,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.cuda.Event | None]:
-    finish_values = _device_finish_values(tasks, device_tokens, valid & active)
+    finish_values = _device_finish_values(tasks, device_tokens, valid & active) | (
+        terminal_finish.reshape(-1).to(dtype=torch.bool) & valid & active
+    )
     continuation_values = active & valid & ~finish_values
     _publish_sampled_device_values(
         tasks,
@@ -5276,19 +5676,8 @@ def _resolve_sampled_finish_values(
     if not selected:
         return None, continuation_values, None
     indexes = tuple(index for index, _task, _write in selected)
-    finish_tasks = tuple(task for _index, task, _write in selected)
     writes = tuple(write for _index, _task, write in selected)
-    finish_valid = _select_device_values(valid & active, indexes)
-    rows = tuple(task.rows[0] for task in finish_tasks)
-    if all(row.force_finish for row in rows):
-        selected_finish_values = finish_valid.to(dtype=torch.bool)
-    else:
-        finish_tokens = _select_device_values(device_tokens, indexes)
-        selected_finish_values = _device_finish_values(
-            finish_tasks,
-            finish_tokens,
-            finish_valid,
-        )
+    selected_finish_values = _select_device_values(finish_values, indexes)
     producer_event = _publish_device_writes(
         writes,
         selected_finish_values,

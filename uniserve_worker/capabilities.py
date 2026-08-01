@@ -226,10 +226,16 @@ class RankInfo:
 @dataclass(frozen=True, slots=True)
 class ExecutionConstraints:
     max_batch_operations: int
+    max_speculative_points: int
+    device_sequence_lengths: bool
+    device_append_offsets: bool
+    incremental_kv_publication: bool
 
     def __post_init__(self) -> None:
         if self.max_batch_operations < 1:
             raise invalid_descriptor("max_batch_operations must be positive")
+        if self.max_speculative_points < 1:
+            raise invalid_descriptor("max_speculative_points must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +342,10 @@ class EngineCaps:
                 self.max_vision_feature_bytes,
                 _WireAdapterMode(self.adapter_mode.value),
                 self.execution_constraints.max_batch_operations,
+                self.execution_constraints.max_speculative_points,
+                self.execution_constraints.device_sequence_lengths,
+                self.execution_constraints.device_append_offsets,
+                self.execution_constraints.incremental_kv_publication,
                 self.kv_dtype,
                 self.model_dtype,
                 self.attention_backend,
@@ -359,9 +369,7 @@ class EngineCaps:
                 )
             ),
             max_latent_size=_uint(data.get("max_latent_size"), f"{where}.max_latent_size"),
-            latent_downsample=_uint(
-                data.get("latent_downsample"), f"{where}.latent_downsample"
-            ),
+            latent_downsample=_uint(data.get("latent_downsample"), f"{where}.latent_downsample"),
             max_vae_grid_tokens=_uint(
                 data.get("max_vae_grid_tokens"), f"{where}.max_vae_grid_tokens"
             ),
@@ -377,12 +385,8 @@ class EngineCaps:
             commit_marker_tokens=_uint(
                 data.get("commit_marker_tokens"), f"{where}.commit_marker_tokens"
             ),
-            gen_rope_advance=_uint(
-                data.get("gen_rope_advance"), f"{where}.gen_rope_advance"
-            ),
-            max_cfg_branches=_uint(
-                data.get("max_cfg_branches"), f"{where}.max_cfg_branches"
-            ),
+            gen_rope_advance=_uint(data.get("gen_rope_advance"), f"{where}.gen_rope_advance"),
+            max_cfg_branches=_uint(data.get("max_cfg_branches"), f"{where}.max_cfg_branches"),
             bytes_per_token=_uint(data.get("bytes_per_token"), f"{where}.bytes_per_token"),
             groups=tuple(
                 KvGroupSpec.from_wire(item, f"{where}.groups[{index}]")
@@ -390,9 +394,7 @@ class EngineCaps:
             ),
             kv_dtype=_str(data.get("kv_dtype"), f"{where}.kv_dtype"),
             model_dtype=_str(data.get("model_dtype"), f"{where}.model_dtype"),
-            attention_backend=_str(
-                data.get("attention_backend"), f"{where}.attention_backend"
-            ),
+            attention_backend=_str(data.get("attention_backend"), f"{where}.attention_backend"),
             quantization=(
                 None
                 if data.get("quantization") is None
@@ -411,12 +413,36 @@ class EngineCaps:
             ),
             adapter_mode=_enum(AdapterMode, data.get("adapter_mode"), f"{where}.adapter_mode"),
             execution_constraints=ExecutionConstraints(
-                _uint(
-                    _map(
-                        data.get("execution_constraints"), f"{where}.execution_constraints"
-                    ).get("max_batch_operations"),
+                max_batch_operations=_uint(
+                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
+                        "max_batch_operations"
+                    ),
                     f"{where}.execution_constraints.max_batch_operations",
-                )
+                ),
+                max_speculative_points=_uint(
+                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
+                        "max_speculative_points"
+                    ),
+                    f"{where}.execution_constraints.max_speculative_points",
+                ),
+                device_sequence_lengths=_bool(
+                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
+                        "device_sequence_lengths"
+                    ),
+                    f"{where}.execution_constraints.device_sequence_lengths",
+                ),
+                device_append_offsets=_bool(
+                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
+                        "device_append_offsets"
+                    ),
+                    f"{where}.execution_constraints.device_append_offsets",
+                ),
+                incremental_kv_publication=_bool(
+                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
+                        "incremental_kv_publication"
+                    ),
+                    f"{where}.execution_constraints.incremental_kv_publication",
+                ),
             ),
             resource_classes=tuple(
                 _enum(ResourceClass, item, f"{where}.resource_classes[{index}]")
@@ -424,9 +450,7 @@ class EngineCaps:
                     _seq(data.get("resource_classes", ()), f"{where}.resource_classes")
                 )
             ),
-            model_spec_digest=_str(
-                data.get("model_spec_digest", ""), f"{where}.model_spec_digest"
-            ),
+            model_spec_digest=_str(data.get("model_spec_digest", ""), f"{where}.model_spec_digest"),
             weight_digest=_str(data.get("weight_digest", ""), f"{where}.weight_digest"),
             restored_sessions=tuple(
                 _uint(item, f"{where}.restored_sessions[{index}]")
@@ -464,7 +488,11 @@ class EngineCaps:
             "supported_controls": [value.value for value in self.supported_controls],
             "adapter_mode": self.adapter_mode.value,
             "execution_constraints": {
-                "max_batch_operations": self.execution_constraints.max_batch_operations
+                "max_batch_operations": self.execution_constraints.max_batch_operations,
+                "max_speculative_points": self.execution_constraints.max_speculative_points,
+                "device_sequence_lengths": self.execution_constraints.device_sequence_lengths,
+                "device_append_offsets": self.execution_constraints.device_append_offsets,
+                "incremental_kv_publication": self.execution_constraints.incremental_kv_publication,
             },
             "resource_classes": [value.value for value in self.resource_classes],
             "model_spec_digest": self.model_spec_digest,
@@ -502,6 +530,12 @@ def _seq(value: object, where: str) -> Sequence[Any]:
 def _uint(value: object, where: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(f"{where} must be a non-negative integer")
+    return value
+
+
+def _bool(value: object, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise invalid_descriptor(f"{where} must be a boolean")
     return value
 
 

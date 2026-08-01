@@ -296,7 +296,7 @@ fn scheduler_submits_mixed_op_kind_batches() {
     }
 
     let mut sim = SimEngine::new();
-    sim.set_text_len(8);
+    sim.set_text_len(32);
     sim.set_pipeline_depth(2);
     let batches = Arc::new(Mutex::new(Vec::new()));
     let exec = Recording {
@@ -431,6 +431,7 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
         sim.set_text_len(64);
         sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
             max_batch_operations: 1024,
+            ..ExecutionConstraints::default()
         };
         let batches = Arc::new(Mutex::new(Vec::new()));
         let exec = Recording {
@@ -587,6 +588,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     sim.mut_caps_for_test().latent_downsample = 16;
     sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
         max_batch_operations: 1024,
+        ..ExecutionConstraints::default()
     };
     let batches = Arc::new(Mutex::new(Vec::new()));
     let exec = Recording {
@@ -789,6 +791,7 @@ fn scheduler_clamps_max_batch_to_worker_caps() {
     let mut sim = SimEngine::new();
     sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
         max_batch_operations: 3,
+        ..ExecutionConstraints::default()
     };
     let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
 
@@ -821,12 +824,11 @@ fn pipeline_depth_is_token_identical() {
 #[test]
 fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, Point, WorkVariant};
+    use uniserve_worker_wire::{
+        Batch, CompletionReport, Control, EngineCaps, OpId, Point, WorkVariant,
+    };
 
-    // Per submitted operation: its work variant, its parent point (`Some(index)`
-    // for a host-observed fixed point, `None` for a device-rooted successor), and
-    // the executor's in-flight depth at submit time.
-    type OperationLog = Arc<Mutex<Vec<(WorkVariant, Option<u64>, usize, bool)>>>;
+    type OperationLog = Arc<Mutex<Vec<(OpId, WorkVariant, Option<(OpId, u64)>, usize, bool)>>>;
 
     struct Recording {
         inner: SimExecutor,
@@ -849,8 +851,10 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
         fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
             let in_flight = self.inner.in_flight();
             for envelope in &batch.operations {
-                let parent_point = match &envelope.parent.point {
-                    Point::Fixed { point_index, .. } => Some(u64::from(*point_index)),
+                let parent = match &envelope.parent.point {
+                    Point::Fixed { point_index, .. } => {
+                        Some((envelope.parent.producer_op_id, u64::from(*point_index)))
+                    }
                     Point::Device { .. } => None,
                 };
                 let releases_parent = envelope.parent.producer_op_id.0 == 0
@@ -865,8 +869,9 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
                         )
                     });
                 self.operations.lock().unwrap().push((
+                    envelope.op_id,
                     envelope.work.variant(),
-                    parent_point,
+                    parent,
                     in_flight,
                     releases_parent,
                 ));
@@ -954,29 +959,40 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
         assert!(
             operations
                 .iter()
-                .all(|(_, _, _, releases_parent)| *releases_parent),
+                .all(|(_, _, _, _, releases_parent)| *releases_parent),
             "every successor retires its parent after submission"
         );
-        // Host-observed fixed roots form a continuous lineage. Device roots
-        // advance the point between two fixed points, so only adjacent fixed
-        // operations can be compared directly.
-        for pair in operations.windows(2) {
-            if let (Some(previous), Some(next)) = (pair[0].1, pair[1].1) {
-                assert_eq!(next, previous + u64::from(pair[0].0.advances_state()));
+        // A fixed producer exports operation-local point one when it advances
+        // state and point zero when it preserves state.
+        for (_, _, parent, _, _) in operations {
+            if let Some((producer_op_id, point)) = parent {
+                let expected = if producer_op_id.0 == 0 {
+                    0
+                } else {
+                    u64::from(
+                        operations
+                            .iter()
+                            .find(|(op_id, _, _, _, _)| op_id == producer_op_id)
+                            .expect("fixed parent producer must precede its consumer")
+                            .1
+                            .advances_state(),
+                    )
+                };
+                assert_eq!(*point, expected);
             }
         }
     }
 
     let serial = &runs[0].3;
     assert!(
-        serial.iter().any(|(kind, parent, in_flight, _)| {
+        serial.iter().any(|(_, kind, parent, in_flight, _)| {
             *kind == WorkVariant::TokenDecode && parent.is_none() && *in_flight == 0
         }),
         "a resolved selected-point product remains the next decode parent"
     );
     let pipelined = &runs[1].3;
     assert!(
-        pipelined.iter().any(|(kind, parent, in_flight, _)| {
+        pipelined.iter().any(|(_, kind, parent, in_flight, _)| {
             *kind == WorkVariant::TokenDecode && parent.is_none() && *in_flight > 0
         }),
         "an in-flight selected-point product feeds the next decode"
@@ -1459,7 +1475,8 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
     else {
         panic!("semantic controls must use fixed versions");
     };
-    assert_eq!(*close_point, committed_point + 1);
+    assert_eq!(*committed_point, 1);
+    assert_eq!(*close_point, 1);
 }
 
 /// the EngineCaps hybrid-group handshake builds a multi-group block
@@ -2084,7 +2101,7 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
 
     let request = generation_request(
         RequestId(81),
-        context_with_image(vec![1, 2], vec![3, 4], 0x81, 4, 1),
+        context_with_image(vec![1, 2], vec![3, 4], 0x81, 4, 17),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,

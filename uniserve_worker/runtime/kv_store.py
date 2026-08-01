@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from threading import RLock
+from typing import cast
 
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
-from ..batch import Admission
+from ..batch import Admission, FixedPoint, ProductKind, ProductRef, VersionRef
 from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import bucketed_page_count, ceil_div
 from .host_staging import (
@@ -25,19 +26,97 @@ from .transfer import Locator, Transport
 
 @dataclass(frozen=True, slots=True)
 class KvSnapshot:
-    """A committed local KV view published for Gen conditioning or a replica.
-
-    Transport locators, page identities, and extents stay worker-local: the
-    wire protocol names a published KV product by :class:`ProductRef` identity
-    and the worker binds that identity to these physical addresses here.
-    """
+    """One immutable incremental publication of an exact committed KV view."""
 
     locators: tuple[str, ...]
-    source_version: int
-    kv_tokens: int
+    source_version: VersionRef
+    source_digest: str
+    destination: str
+    base_version: VersionRef | None
+    base_extent: int
+    published_extent: int
     block_ids: tuple[int, ...]
     group_id: int
-    position: int
+    mapping_generation: int
+    scale_identity: str
+
+    def __post_init__(self) -> None:
+        point = self.source_version.point
+        if (
+            not isinstance(point, FixedPoint)
+            or point.semantic_digest != self.source_digest
+            or len(self.source_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.source_digest)
+        ):
+            raise invalid_descriptor("KV publication source digest is not exact")
+        if not self.destination:
+            raise invalid_descriptor("KV publication destination is empty")
+        if self.base_extent < 0 or self.published_extent < self.base_extent:
+            raise invalid_descriptor("KV publication extents are not contiguous")
+        if self.base_version is None and self.base_extent != 0:
+            raise invalid_descriptor("KV publication base identity does not match its extent")
+        if self.base_version is not None:
+            base_point = self.base_version.point
+            if self.base_version.request_key != self.source_version.request_key or not isinstance(
+                base_point, FixedPoint
+            ):
+                raise invalid_descriptor("KV publication base version is not exact")
+        if any(block_id < 0 for block_id in self.block_ids) or len(set(self.block_ids)) != len(
+            self.block_ids
+        ):
+            raise invalid_descriptor("KV publication block mapping is invalid")
+        if self.group_id < 0 or self.mapping_generation < 1 or not self.scale_identity:
+            raise invalid_descriptor("KV publication mapping metadata is invalid")
+        if self.published_extent == self.base_extent and self.locators:
+            raise invalid_descriptor("empty KV publication suffix carries transfer locators")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "locators": list(self.locators),
+            "source_version": self.source_version.to_wire(),
+            "source_digest": self.source_digest,
+            "destination": self.destination,
+            "base_version": None if self.base_version is None else self.base_version.to_wire(),
+            "base_extent": self.base_extent,
+            "published_extent": self.published_extent,
+            "block_ids": list(self.block_ids),
+            "group_id": self.group_id,
+            "mapping_generation": self.mapping_generation,
+            "scale_identity": self.scale_identity,
+        }
+
+    @classmethod
+    def from_wire(cls, value: object) -> KvSnapshot:
+        if not isinstance(value, Mapping):
+            raise invalid_descriptor("KV publication descriptor is not a mapping")
+        base = value.get("base_version")
+        raw_block_ids = value.get("block_ids", ())
+        if not isinstance(raw_block_ids, Sequence) or isinstance(
+            raw_block_ids, (str, bytes, bytearray)
+        ):
+            raise invalid_descriptor("KV publication block mapping is not a sequence")
+        block_ids: list[int] = []
+        for item in raw_block_ids:
+            if not isinstance(item, int) or isinstance(item, bool):
+                raise invalid_descriptor("KV publication block mapping contains a non-integer")
+            block_ids.append(item)
+        return cls(
+            locators=tuple(str(item) for item in cast(Sequence[object], value.get("locators", ()))),
+            source_version=VersionRef.from_wire(
+                value.get("source_version"), "KV publication.source_version"
+            ),
+            source_digest=str(value.get("source_digest", "")),
+            destination=str(value.get("destination", "")),
+            base_version=None
+            if base is None
+            else VersionRef.from_wire(base, "KV publication.base_version"),
+            base_extent=int(value.get("base_extent", 0)),
+            published_extent=int(value.get("published_extent", 0)),
+            block_ids=tuple(block_ids),
+            group_id=int(value.get("group_id", 0)),
+            mapping_generation=int(value.get("mapping_generation", 0)),
+            scale_identity=str(value.get("scale_identity", "")),
+        )
 
     def for_tensor_rank(self, rank: int, size: int) -> KvSnapshot:
         """Select this rank's contiguous locator group from a TP publication."""
@@ -61,8 +140,59 @@ class KvSnapshot:
 class KvEntry:
     block_ids: list[int] = field(default_factory=list)
     prefix_len: int = 0
-    length: int = 0
     group_id: int = 0
+    reserved_len: int = 0
+    initialized_len: int = 0
+    visible_len: int = 0
+    committed_len: int = 0
+    published_by_destination: dict[str, int] = field(default_factory=dict)
+    mapping_generation: int = 1
+    scale_identity: str = "none"
+
+    @property
+    def length(self) -> int:
+        """Attention-visible extent retained for existing runner ownership."""
+
+        return self.visible_len
+
+    @length.setter
+    def length(self, value: int) -> None:
+        self.visible_len = int(value)
+
+    @property
+    def published_len(self) -> int:
+        return max(self.published_by_destination.values(), default=0)
+
+    def extents(self) -> KvExtents:
+        value = KvExtents(
+            reserved=self.reserved_len,
+            initialized=self.initialized_len,
+            visible=self.visible_len,
+            committed=self.committed_len,
+            published=self.published_len,
+        )
+        value.validate()
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class KvExtents:
+    reserved: int = 0
+    initialized: int = 0
+    visible: int = 0
+    committed: int = 0
+    published: int = 0
+
+    def validate(self) -> None:
+        if (
+            not 0
+            <= self.published
+            <= self.committed
+            <= self.visible
+            <= self.initialized
+            <= self.reserved
+        ):
+            raise invalid_descriptor("KV extents are not monotonically contained")
 
 
 @dataclass(slots=True)
@@ -77,8 +207,27 @@ class _RetainedPage:
 
 @dataclass(frozen=True, slots=True)
 class _KvSnapshot:
-    entries: dict[int, tuple[bool, tuple[int, ...], int, int, int]]
+    entries: dict[
+        int,
+        tuple[
+            bool,
+            tuple[int, ...],
+            int,
+            int,
+            int,
+            int,
+            int,
+            int,
+            dict[str, int],
+            int,
+            str,
+        ],
+    ]
     branches: dict[tuple[int, int, str], tuple[tuple[int, ...], int]]
+    publications: dict[ProductRef, KvSnapshot]
+    destination_bases: dict[tuple[int, str], tuple[VersionRef, int, tuple[int, ...], int, str]]
+    installed_bases: dict[tuple[int, str], tuple[VersionRef, int]]
+    retained_counts: dict[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +256,12 @@ class KvCommittedState:
     prefix_len: int
     length: int
     group_id: int
+    reserved_len: int
+    initialized_len: int
+    committed_len: int
+    published_by_destination: tuple[tuple[str, int], ...]
+    mapping_generation: int
+    scale_identity: str
     pages: KvPageState | None
     branches: tuple[KvBranchState, ...]
 
@@ -380,14 +535,14 @@ class KvBatchView:
         if len(self._block_ids) == 1:
             positions = cache_seqlens[0].to(dtype=torch.int64) + token_offsets
             block_slots = torch.div(positions, self._pool.block_size, rounding_mode="floor")
-            page_ids = block_table[0].to(dtype=torch.int64).index_select(0, block_slots).contiguous()
+            page_ids = (
+                block_table[0].to(dtype=torch.int64).index_select(0, block_slots).contiguous()
+            )
         else:
             offsets = query_offsets.to(dtype=torch.int64)
             row_ids = torch.bucketize(token_offsets, offsets[1:].contiguous(), right=True)
             positions = (
-                cache_seqlens.to(dtype=torch.int64)[row_ids]
-                + token_offsets
-                - offsets[row_ids]
+                cache_seqlens.to(dtype=torch.int64)[row_ids] + token_offsets - offsets[row_ids]
             )
             block_slots = torch.div(positions, self._pool.block_size, rounding_mode="floor")
             page_ids = block_table.to(dtype=torch.int64)[row_ids, block_slots].contiguous()
@@ -564,7 +719,12 @@ class KvStore:
         self._entries: dict[int, KvEntry] = {}
         self._branches: dict[tuple[int, int, str], KvEntry] = {}
         self._holders: dict[int, set[int]] = {}
-        self._published: dict[int, tuple[tuple[str, ...], object]] = {}
+        self._published: dict[int, list[tuple[tuple[str, ...], object]]] = {}
+        self._destination_bases: dict[
+            tuple[int, str], tuple[VersionRef, int, tuple[int, ...], int, str]
+        ] = {}
+        self._installed_bases: dict[tuple[int, str], tuple[VersionRef, int]] = {}
+        self._publication_products: dict[ProductRef, KvSnapshot] = {}
         self._lock = RLock()
 
     def bind_pool(self, pool: PagedKVPool) -> None:
@@ -602,8 +762,16 @@ class KvStore:
             entry = KvEntry(
                 block_ids=list(allocation.block_ids),
                 prefix_len=allocation.prefix_len,
-                length=allocation.prefix_len,
                 group_id=allocation.group_id,
+                reserved_len=(
+                    len(allocation.block_ids) * self.pool.block_size
+                    if self.pool is not None
+                    else allocation.prefix_len
+                ),
+                initialized_len=allocation.prefix_len,
+                visible_len=allocation.prefix_len,
+                committed_len=allocation.prefix_len,
+                scale_identity=self._scale_identity(),
             )
             self._validate_blocks(session_id, entry.block_ids, entry.prefix_len)
             self._entries[session_id] = entry
@@ -630,9 +798,41 @@ class KvStore:
     def advance(self, session_id: int, tokens: int) -> None:
         with self._lock:
             entry = self.get(session_id)
-            end = entry.length + int(tokens)
-            self.validate_write(session_id, entry.length, end)
-            entry.length = end
+            begin = entry.visible_len
+            end = begin + int(tokens)
+            self.validate_write(session_id, begin, end)
+            entry.initialized_len = max(entry.initialized_len, end)
+            entry.visible_len = end
+
+    def initialize(self, session_id: int, tokens: int) -> int:
+        """Record an enqueued append without making its suffix attention-visible."""
+
+        with self._lock:
+            entry = self.get(session_id)
+            end = entry.visible_len + int(tokens)
+            self.validate_write(session_id, entry.visible_len, end)
+            entry.initialized_len = max(entry.initialized_len, end)
+            return end
+
+    def select(self, session_id: int, length: int) -> None:
+        """Select one initialized prefix as the device-visible extent."""
+
+        with self._lock:
+            entry = self.get(session_id)
+            selected = int(length)
+            if selected < entry.committed_len or selected > entry.initialized_len:
+                raise invalid_descriptor("KV selection is outside initialized branch state")
+            entry.visible_len = selected
+
+    def commit(self, session_id: int, length: int) -> None:
+        """Advance the semantic extent to an exact already visible prefix."""
+
+        with self._lock:
+            entry = self.get(session_id)
+            selected = int(length)
+            if selected < entry.committed_len or selected > entry.visible_len:
+                raise invalid_descriptor("KV commit is outside the visible extent")
+            entry.committed_len = selected
 
     def rewind(self, session_id: int, length: int) -> None:
         """Select an already initialized prefix as the lineage's visible KV extent."""
@@ -640,9 +840,10 @@ class KvStore:
         with self._lock:
             entry = self.get(session_id)
             selected = int(length)
-            if selected < entry.prefix_len or selected > entry.length:
+            if selected < entry.prefix_len or selected > entry.initialized_len:
                 raise invalid_descriptor("KV rewind selects an uninitialized prefix")
-            entry.length = selected
+            entry.visible_len = selected
+            entry.committed_len = min(entry.committed_len, selected)
 
     def append_kv_blocks(self, session_id: int, new_blocks: Sequence[int]) -> None:
         """Grow a session's block lease by the blocks an operation appends this step.
@@ -668,6 +869,9 @@ class KvStore:
             self._validate_blocks(session_id, new, entry.length)
             entry.block_ids.extend(new)
             self._register(session_id, new)
+            if self.pool is not None:
+                entry.reserved_len = len(entry.block_ids) * self.pool.block_size
+            entry.mapping_generation += 1
 
     def view(
         self,
@@ -711,8 +915,13 @@ class KvStore:
                 self._ensure_scratch_capacity(existing, capacity_tokens)
                 return existing, False
             source = self.get(session_id)
-            prefix = source.length if copy_conditioning else 0
-            entry = KvEntry(length=prefix)
+            prefix = source.visible_len if copy_conditioning else 0
+            entry = KvEntry(
+                initialized_len=prefix,
+                visible_len=prefix,
+                committed_len=prefix,
+                scale_identity=self._scale_identity(),
+            )
             try:
                 self._ensure_scratch_capacity(entry, max(prefix, int(capacity_tokens)))
                 if copy_conditioning and prefix:
@@ -731,7 +940,9 @@ class KvStore:
         end = entry.length + int(tokens)
         if end > len(entry.block_ids) * pool.block_size:
             raise invalid_descriptor("KV advance exceeds its block capacity")
-        entry.length = end
+        entry.initialized_len = max(entry.initialized_len, end)
+        entry.visible_len = end
+        entry.committed_len = end
 
     def release_generation(self, session_id: int, generation: int) -> None:
         with self._lock:
@@ -747,39 +958,187 @@ class KvStore:
         self,
         session_id: int,
         *,
-        source_version: int,
-        position: int,
+        source_version: VersionRef,
+        source_digest: str,
+        destination: str,
+        expected_base: VersionRef | None,
+        product: ProductRef,
         transport: object | None = None,
     ) -> KvSnapshot:
+        """Publish only the missing suffix of one exact committed version.
+
+        Destination state is immutable: every successful call appends a new
+        snapshot and advances its exact installed base. A caller cannot skip,
+        approximate, or overwrite that base by scalar length.
+        """
+
+        if int(source_version.request_key.session_id) != int(session_id):
+            raise invalid_descriptor("KV publication source belongs to another session")
+        if (
+            product.request_key != source_version.request_key
+            or product.kind is not ProductKind.KV
+            or product.producer_op_id == source_version.producer_op_id
+        ):
+            raise invalid_descriptor("KV publication product has an invalid identity")
+        point = source_version.point
+        if not isinstance(point, FixedPoint) or point.semantic_digest != source_digest:
+            raise invalid_descriptor("KV publication requires an exact fixed source digest")
+        destination = str(destination)
+        if not destination:
+            raise invalid_descriptor("KV publication destination is empty")
         entry = self.get(session_id)
+        extents = entry.extents()
+        if extents.committed != extents.visible:
+            raise invalid_descriptor("KV publication source is not the committed visible version")
+        installed = self._destination_bases.get((int(session_id), destination))
+        if installed is None:
+            if expected_base is not None:
+                raise invalid_descriptor("KV publication expected base is not installed")
+            base_extent = 0
+        else:
+            installed_version, base_extent, base_blocks, group_id, scale_identity = installed
+            if expected_base != installed_version:
+                raise invalid_descriptor("KV publication expected base does not match destination")
+            base_pages = ceil_div(base_extent, self.pool.block_size) if self.pool is not None else 0
+            if (
+                tuple(entry.block_ids[:base_pages]) != base_blocks[:base_pages]
+                or group_id != entry.group_id
+                or scale_identity != entry.scale_identity
+            ):
+                raise invalid_descriptor("KV publication base has incompatible mapping metadata")
+        if base_extent > entry.committed_len:
+            raise invalid_descriptor("KV publication destination is ahead of its source")
         locators: list[str] = []
-        if transport is not None:
+        suffix = entry.committed_len - base_extent
+        if transport is not None and suffix:
             if self.pool is None:
                 raise RuntimeError("KV publication requires a physical pool")
-            publish = getattr(transport, "publish")
+            if not bool(getattr(transport, "supports_async_publication", False)):
+                raise invalid_descriptor("KV publication transport is not asynchronous")
+            publish = getattr(transport, "publish_async")
             for layer in range(self.pool.num_layers):
                 key, value = self.pool.read(
                     layer,
                     entry.block_ids,
-                    start=0,
-                    length=entry.length,
+                    start=base_extent,
+                    length=suffix,
                 )
                 if key is None or value is None:
                     raise RuntimeError("published KV span is incomplete")
                 locators.append(publish(key.contiguous()).to_wire_json())
                 locators.append(publish(value.contiguous()).to_wire_json())
-            # A session's newest publication is the one its consumers resolve,
-            # so the copies the previous publication handed the transport are
-            # unreachable and their device memory returns here.
             self._retain_published(session_id, tuple(locators), transport)
-        return KvSnapshot(
+        snapshot = KvSnapshot(
             locators=tuple(locators),
-            source_version=int(source_version),
-            kv_tokens=entry.length,
+            source_version=source_version,
+            source_digest=source_digest,
+            destination=destination,
+            base_version=expected_base,
+            base_extent=base_extent,
+            published_extent=entry.committed_len,
             block_ids=tuple(entry.block_ids),
             group_id=entry.group_id,
-            position=int(position),
+            mapping_generation=entry.mapping_generation,
+            scale_identity=entry.scale_identity,
         )
+        self._destination_bases[(int(session_id), destination)] = (
+            source_version,
+            entry.committed_len,
+            tuple(entry.block_ids),
+            entry.group_id,
+            entry.scale_identity,
+        )
+        entry.published_by_destination[destination] = entry.committed_len
+        self._publication_products[product] = snapshot
+        entry.extents().validate()
+        return snapshot
+
+    def publication(self, product: ProductRef) -> KvSnapshot:
+        with self._lock:
+            try:
+                return self._publication_products[product]
+            except KeyError:
+                raise invalid_descriptor("KV publication product is not resident") from None
+
+    def destination_base(self, session_id: int, destination: str) -> VersionRef | None:
+        """Return the exact immutable base currently installed for a destination."""
+
+        with self._lock:
+            base = self._destination_bases.get((int(session_id), str(destination)))
+            return None if base is None else base[0]
+
+    def validate_conditioning(self, session_id: int, product: ProductRef) -> KvSnapshot:
+        """Validate a local published prefix without waiting for its remote copy."""
+
+        with self._lock:
+            try:
+                snapshot = self._publication_products[product]
+            except KeyError:
+                raise invalid_descriptor("KV conditioning product is not resident") from None
+            if int(product.request_key.session_id) != int(session_id):
+                raise invalid_descriptor("KV conditioning product belongs to another session")
+            point = snapshot.source_version.point
+            if not isinstance(point, FixedPoint) or point.semantic_digest != snapshot.source_digest:
+                raise invalid_descriptor("KV conditioning product has no exact source digest")
+            entry = self.get(session_id)
+            if (
+                entry.initialized_len < snapshot.published_extent
+                or entry.visible_len < snapshot.published_extent
+                or entry.committed_len < snapshot.published_extent
+            ):
+                raise invalid_descriptor("KV conditioning prefix is not locally committed")
+            if self.pool is None:
+                raise RuntimeError("KV conditioning validation requires a physical pool")
+            pages = ceil_div(snapshot.published_extent, self.pool.block_size)
+            if (
+                tuple(entry.block_ids[:pages]) != snapshot.block_ids[:pages]
+                or entry.group_id != snapshot.group_id
+                or entry.scale_identity != snapshot.scale_identity
+            ):
+                raise invalid_descriptor("KV conditioning mapping does not match its publication")
+            return snapshot
+
+    def install_publication(
+        self,
+        session_id: int,
+        source: ProductRef,
+        installed_product: ProductRef,
+        transport: Transport,
+    ) -> KvSnapshot:
+        """Install or validate one immutable publication and bind its installed product."""
+
+        snapshot = self.publication(source)
+        if (
+            installed_product.request_key != source.request_key
+            or installed_product.kind is not ProductKind.KV
+            or installed_product.producer_op_id == source.producer_op_id
+        ):
+            raise invalid_descriptor("installed KV product has an invalid identity")
+        entry = self.get(session_id)
+        local_exact = (
+            entry.visible_len == snapshot.published_extent
+            and entry.committed_len == snapshot.published_extent
+            and tuple(entry.block_ids) == snapshot.block_ids
+            and entry.mapping_generation == snapshot.mapping_generation
+            and entry.scale_identity == snapshot.scale_identity
+        )
+        if local_exact:
+            self._installed_bases[(int(session_id), snapshot.destination)] = (
+                snapshot.source_version,
+                snapshot.published_extent,
+            )
+        else:
+            self.import_snapshot(session_id, snapshot, transport)
+        with self._lock:
+            self._publication_products[installed_product] = snapshot
+        return snapshot
+
+    def validate_installed(self, session_id: int, product: ProductRef) -> KvSnapshot:
+        snapshot = self.publication(product)
+        installed = self._installed_bases.get((int(session_id), snapshot.destination))
+        if installed != (snapshot.source_version, snapshot.published_extent):
+            raise invalid_descriptor("KV input is not the exact installed publication")
+        return snapshot
 
     def _retain_published(
         self,
@@ -787,24 +1146,33 @@ class KvStore:
         locators: tuple[str, ...],
         transport: object,
     ) -> None:
-        self.release_published(session_id)
         if locators:
             with self._lock:
-                self._published[int(session_id)] = (locators, transport)
+                self._published.setdefault(int(session_id), []).append((locators, transport))
 
     def release_published(self, session_id: int) -> None:
         """Return the device copies one session handed the transport."""
 
         with self._lock:
-            retained = self._published.pop(int(session_id), None)
-        if retained is None:
+            retained = self._published.pop(int(session_id), ())
+            for key in [key for key in self._destination_bases if key[0] == int(session_id)]:
+                del self._destination_bases[key]
+            for key in [key for key in self._installed_bases if key[0] == int(session_id)]:
+                del self._installed_bases[key]
+            for product in [
+                product
+                for product in self._publication_products
+                if product.request_key.session_id == int(session_id)
+            ]:
+                del self._publication_products[product]
+        if not retained:
             return
-        locators, transport = retained
-        release = getattr(transport, "release", None)
-        if not callable(release):
-            return
-        for encoded in locators:
-            release(Locator.from_wire_json(encoded))
+        for locators, transport in retained:
+            release = getattr(transport, "release", None)
+            if not callable(release):
+                continue
+            for encoded in locators:
+                release(Locator.from_wire_json(encoded))
 
     def import_snapshot(self, session_id: int, snapshot: KvSnapshot, transport: Transport) -> None:
         """Install a complete transferred snapshot without exposing partial state.
@@ -838,7 +1206,9 @@ class KvStore:
     ) -> None:
         if self.pool is None:
             raise RuntimeError("KV snapshot import requires a physical pool")
-        if len(snapshot.locators) != 2 * self.pool.num_layers:
+        suffix = snapshot.published_extent - snapshot.base_extent
+        expected_locators = 2 * self.pool.num_layers if suffix else 0
+        if len(snapshot.locators) != expected_locators:
             raise invalid_descriptor("published KV locator count does not match cache layers")
         from .transfer import Locator, fetch_locator
 
@@ -846,18 +1216,21 @@ class KvStore:
             resident = self.get(session_id)
             if resident.group_id != snapshot.group_id:
                 raise invalid_descriptor("published KV group does not match the local session")
-            if (
-                resident.length == snapshot.kv_tokens
-                and tuple(resident.block_ids) == tuple(snapshot.block_ids)
-            ):
-                # Flow conditioning is re-published on every denoise step, but it
-                # is fixed across an image's steps. Once the session entry already
-                # holds exactly these blocks and tokens, re-fetching over the
-                # transport and re-copying the KV block-by-block is pure waste
-                # (it dominated the travel workload). The entry is unchanged, so
-                # there is nothing to write and nothing to roll back -- skip the
-                # fetch, the copy, and the per-block rollback snapshot entirely.
-                return
+            installed = self._installed_bases.get((int(session_id), snapshot.destination))
+            if snapshot.base_version is None:
+                if installed is not None or snapshot.base_extent != 0:
+                    raise invalid_descriptor("KV installation base does not match destination")
+            elif installed != (snapshot.base_version, snapshot.base_extent):
+                raise invalid_descriptor("KV installation base does not match destination")
+            if resident.visible_len != snapshot.base_extent:
+                raise invalid_descriptor("KV installation resident extent does not match base")
+            if resident.group_id != snapshot.group_id:
+                raise invalid_descriptor("published KV group does not match the local session")
+            base_pages = ceil_div(snapshot.base_extent, self.pool.block_size)
+            if tuple(resident.block_ids[:base_pages]) != snapshot.block_ids[:base_pages]:
+                raise invalid_descriptor("KV installation block mapping does not match base")
+            if resident.scale_identity != snapshot.scale_identity:
+                raise invalid_descriptor("KV installation scale identity does not match base")
 
         tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in range(self.pool.num_layers):
@@ -865,7 +1238,7 @@ class KvStore:
             value = fetch_locator(
                 transport, Locator.from_wire_json(snapshot.locators[2 * layer + 1])
             )
-            expected = (snapshot.kv_tokens, self.pool.n_kv, self.pool.head_dim)
+            expected = (suffix, self.pool.n_kv, self.pool.head_dim)
             if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
                 raise invalid_descriptor("published KV transport returned a non-tensor value")
             if tuple(key.shape) != expected or tuple(value.shape) != expected:
@@ -881,30 +1254,32 @@ class KvStore:
             if entry.group_id != snapshot.group_id:
                 raise invalid_descriptor("published KV group does not match the local session")
             blocks = list(snapshot.block_ids)
-            self._validate_blocks(session_id, blocks, snapshot.kv_tokens)
-            shared_blocks = 0
-            for block in blocks:
-                if self._holders.get(block, set()) - {int(session_id)}:
-                    shared_blocks += 1
-                else:
-                    break
-            write_start = min(snapshot.kv_tokens, shared_blocks * self.pool.block_size)
-            transaction._retain_pages(blocks[shared_blocks:])
+            self._validate_blocks(session_id, blocks, snapshot.published_extent)
+            write_page = snapshot.base_extent // self.pool.block_size
+            transaction._retain_pages(blocks[write_page:])
             for layer, (key, value) in enumerate(tensors):
-                if write_start >= snapshot.kv_tokens:
-                    continue
                 self.pool.write(
                     layer,
                     blocks,
-                    start=write_start,
-                    k=key[write_start:].to(self.pool.k.device),
-                    v=value[write_start:].to(self.pool.v.device),
+                    start=snapshot.base_extent,
+                    k=key.to(self.pool.k.device),
+                    v=value.to(self.pool.v.device),
                 )
             self._unregister(session_id, entry.block_ids)
             entry.block_ids = blocks
-            entry.length = snapshot.kv_tokens
-            entry.prefix_len = min(entry.prefix_len, entry.length)
+            entry.reserved_len = len(blocks) * self.pool.block_size
+            entry.initialized_len = snapshot.published_extent
+            entry.visible_len = snapshot.published_extent
+            entry.committed_len = snapshot.published_extent
+            entry.published_by_destination[snapshot.destination] = snapshot.published_extent
+            entry.mapping_generation = snapshot.mapping_generation
+            entry.scale_identity = snapshot.scale_identity
+            entry.prefix_len = min(entry.prefix_len, entry.visible_len)
             self._register(session_id, blocks)
+            self._installed_bases[(int(session_id), snapshot.destination)] = (
+                snapshot.source_version,
+                snapshot.published_extent,
+            )
 
     def copy(self, copies: Sequence[tuple[int, int]]) -> None:
         if self.pool is None:
@@ -976,6 +1351,14 @@ class KvStore:
                         prefix_len=entry.prefix_len,
                         length=length,
                         group_id=entry.group_id,
+                        reserved_len=entry.reserved_len,
+                        initialized_len=entry.initialized_len,
+                        committed_len=min(entry.committed_len, length),
+                        published_by_destination=tuple(
+                            sorted(entry.published_by_destination.items())
+                        ),
+                        mapping_generation=entry.mapping_generation,
+                        scale_identity=entry.scale_identity,
                         pages=pages,
                         branches=branches,
                     )
@@ -1006,16 +1389,47 @@ class KvStore:
     def _validate_committed_states(self, states: Sequence[KvCommittedState]) -> None:
         main_pages: dict[int, tuple[KvPageState, int]] = {}
         for state in states:
-            if min(state.prefix_len, state.length, state.group_id) < 0:
+            if (
+                min(
+                    state.prefix_len,
+                    state.length,
+                    state.group_id,
+                    state.reserved_len,
+                    state.initialized_len,
+                    state.committed_len,
+                    state.mapping_generation,
+                )
+                < 0
+            ):
                 raise invalid_descriptor("KV snapshot metadata must be non-negative")
-            if state.prefix_len > state.length:
+            published_extent = max(
+                (extent for _destination, extent in state.published_by_destination), default=0
+            )
+            if (
+                not published_extent
+                <= state.committed_len
+                <= state.length
+                <= state.initialized_len
+                <= state.reserved_len
+            ):
+                raise invalid_descriptor("KV snapshot extents are not monotonically contained")
+            if state.prefix_len > state.committed_len:
                 raise invalid_descriptor("KV snapshot prefix exceeds its committed length")
+            if not state.scale_identity or state.mapping_generation < 1:
+                raise invalid_descriptor("KV snapshot mapping metadata is invalid")
+            destinations = [destination for destination, _extent in state.published_by_destination]
+            if any(not destination for destination in destinations) or len(
+                set(destinations)
+            ) != len(destinations):
+                raise invalid_descriptor("KV snapshot publication destinations are invalid")
             if self.pool is None:
-                if state.block_ids or state.length or state.pages is not None:
+                if state.block_ids or state.reserved_len or state.pages is not None:
                     raise invalid_descriptor("KV snapshot requires an absent physical pool")
             else:
-                if state.length > len(state.block_ids) * self.pool.block_size:
-                    raise invalid_descriptor("KV snapshot length exceeds its block capacity")
+                if state.reserved_len != len(state.block_ids) * self.pool.block_size:
+                    raise invalid_descriptor(
+                        "KV snapshot reservation does not match block capacity"
+                    )
                 self.pool.validate_block_ids(state.block_ids)
                 if any(value >= self.pool.leasable_num_blocks for value in state.block_ids):
                     raise invalid_descriptor("KV snapshot uses a block outside the leased range")
@@ -1065,8 +1479,14 @@ class KvStore:
             entry = KvEntry(
                 block_ids=list(state.block_ids),
                 prefix_len=state.prefix_len,
-                length=state.length,
                 group_id=state.group_id,
+                reserved_len=state.reserved_len,
+                initialized_len=state.initialized_len,
+                visible_len=state.length,
+                committed_len=state.committed_len,
+                published_by_destination=dict(state.published_by_destination),
+                mapping_generation=state.mapping_generation,
+                scale_identity=state.scale_identity,
             )
             block_size = 0 if self.pool is None else self.pool.block_size
             shared_boundary = entry.prefix_len // block_size if block_size else 0
@@ -1104,7 +1524,11 @@ class KvStore:
                     raise
                 self._branches[(state.session_id, branch.generation, branch.branch)] = KvEntry(
                     block_ids=list(block_ids),
-                    length=branch.length,
+                    reserved_len=len(block_ids) * pool.block_size,
+                    initialized_len=branch.length,
+                    visible_len=branch.length,
+                    committed_len=branch.length,
+                    scale_identity=self._scale_identity(),
                 )
 
     @staticmethod
@@ -1204,25 +1628,69 @@ class KvStore:
 
     def snapshot_requests(self, request_ids: set[int]) -> _KvSnapshot:
         with self._lock:
-            result: dict[int, tuple[bool, tuple[int, ...], int, int, int]] = {}
+            result: dict[
+                int,
+                tuple[
+                    bool,
+                    tuple[int, ...],
+                    int,
+                    int,
+                    int,
+                    int,
+                    int,
+                    int,
+                    dict[str, int],
+                    int,
+                    str,
+                ],
+            ] = {}
             for session_id in request_ids:
                 entry = self._entries.get(session_id)
                 if entry is None:
-                    result[session_id] = (False, (), 0, 0, 0)
+                    result[session_id] = (False, (), 0, 0, 0, 0, 0, 0, {}, 0, "none")
                 else:
                     result[session_id] = (
                         True,
                         tuple(entry.block_ids),
                         entry.prefix_len,
-                        entry.length,
                         entry.group_id,
+                        entry.reserved_len,
+                        entry.initialized_len,
+                        entry.visible_len,
+                        entry.committed_len,
+                        dict(entry.published_by_destination),
+                        entry.mapping_generation,
+                        entry.scale_identity,
                     )
             branches = {
                 key: (tuple(entry.block_ids), entry.length)
                 for key, entry in self._branches.items()
                 if key[0] in request_ids
             }
-            return _KvSnapshot(entries=result, branches=branches)
+            publications = {
+                product: publication
+                for product, publication in self._publication_products.items()
+                if product.request_key.session_id in request_ids
+            }
+            return _KvSnapshot(
+                entries=result,
+                branches=branches,
+                publications=publications,
+                destination_bases={
+                    key: value
+                    for key, value in self._destination_bases.items()
+                    if key[0] in request_ids
+                },
+                installed_bases={
+                    key: value
+                    for key, value in self._installed_bases.items()
+                    if key[0] in request_ids
+                },
+                retained_counts={
+                    session_id: len(self._published.get(session_id, ()))
+                    for session_id in request_ids
+                },
+            )
 
     def restore_requests(
         self,
@@ -1236,11 +1704,35 @@ class KvStore:
                 current = self._entries.pop(session_id, None)
                 if current is not None:
                     self._unregister(session_id, current.block_ids)
-                existed, blocks, prefix_len, length, group_id = snapshot.entries.get(
-                    session_id, (False, (), 0, 0, 0)
+                (
+                    existed,
+                    blocks,
+                    prefix_len,
+                    group_id,
+                    reserved_len,
+                    initialized_len,
+                    visible_len,
+                    committed_len,
+                    published,
+                    mapping_generation,
+                    scale_identity,
+                ) = snapshot.entries.get(
+                    session_id,
+                    (False, (), 0, 0, 0, 0, 0, 0, {}, 0, "none"),
                 )
                 if existed:
-                    entry = KvEntry(list(blocks), prefix_len, length, group_id)
+                    entry = KvEntry(
+                        block_ids=list(blocks),
+                        prefix_len=prefix_len,
+                        group_id=group_id,
+                        reserved_len=reserved_len,
+                        initialized_len=initialized_len,
+                        visible_len=visible_len,
+                        committed_len=committed_len,
+                        published_by_destination=dict(published),
+                        mapping_generation=mapping_generation,
+                        scale_identity=scale_identity,
+                    )
                     self._entries[session_id] = entry
                     self._register(session_id, entry.block_ids)
             current_keys = [key for key in self._branches if key[0] in request_ids]
@@ -1252,7 +1744,36 @@ class KvStore:
                 )
             for key, (blocks, length) in snapshot.branches.items():
                 if key[0] in request_ids:
-                    self._branches[key] = KvEntry(list(blocks), length=length)
+                    self._branches[key] = KvEntry(
+                        block_ids=list(blocks),
+                        reserved_len=len(blocks)
+                        * (0 if self.pool is None else self.pool.block_size),
+                        initialized_len=length,
+                        visible_len=length,
+                        committed_len=length,
+                        scale_identity=self._scale_identity(),
+                    )
+            for product in [
+                product
+                for product in self._publication_products
+                if product.request_key.session_id in request_ids
+            ]:
+                del self._publication_products[product]
+            self._publication_products.update(snapshot.publications)
+            for destination_key in [
+                key for key in self._destination_bases if key[0] in request_ids
+            ]:
+                del self._destination_bases[destination_key]
+            self._destination_bases.update(snapshot.destination_bases)
+            for installed_key in [key for key in self._installed_bases if key[0] in request_ids]:
+                del self._installed_bases[installed_key]
+            self._installed_bases.update(snapshot.installed_bases)
+            for session_id in request_ids:
+                retained = self._published.get(session_id)
+                if retained is not None:
+                    del retained[snapshot.retained_counts.get(session_id, 0) :]
+                    if not retained:
+                        self._published.pop(session_id, None)
 
     def _ensure_scratch_capacity(self, entry: KvEntry, tokens: int) -> None:
         pool = self.pool
@@ -1267,6 +1788,23 @@ class KvStore:
                     pool.release_branch_blocks(allocated)
                 raise RuntimeError("branch KV allocator returned an incomplete lease")
             entry.block_ids.extend(int(value) for value in allocated)
+            entry.reserved_len = len(entry.block_ids) * pool.block_size
+            entry.mapping_generation += 1
+
+    def _scale_identity(self) -> str:
+        pool = self.pool
+        if pool is None:
+            return "none"
+        return ":".join(
+            (
+                str(pool.store_dtype),
+                str(pool.dtype),
+                str(pool.block_size),
+                str(pool.n_kv),
+                str(pool.head_dim),
+                "quantized" if pool.is_quantized else "direct",
+            )
+        )
 
     def _release_scratch(self, blocks: Sequence[int]) -> None:
         if blocks and self.pool is not None:
@@ -1357,6 +1895,30 @@ class KvTxn:
         if int(session_id) not in self._session_ids:
             raise RuntimeError("KV advance targets a session outside this step")
         self._store.advance(int(session_id), int(tokens))
+
+    def initialize(self, session_id: int, tokens: int) -> int:
+        self._require_open()
+        if int(session_id) not in self._session_ids:
+            raise RuntimeError("KV initialization targets a session outside this step")
+        return self._store.initialize(int(session_id), int(tokens))
+
+    def select(self, session_id: int, length: int) -> None:
+        self._require_open()
+        if int(session_id) not in self._session_ids:
+            raise RuntimeError("KV selection targets a session outside this step")
+        self._store.select(int(session_id), int(length))
+
+    def commit(self, session_id: int, length: int) -> None:
+        self._require_open()
+        if int(session_id) not in self._session_ids:
+            raise RuntimeError("KV commit targets a session outside this step")
+        self._store.commit(int(session_id), int(length))
+
+    def extents(self, session_id: int) -> KvExtents:
+        self._require_open()
+        if int(session_id) not in self._session_ids:
+            raise RuntimeError("KV extent query targets a session outside this step")
+        return self._store.get(int(session_id)).extents()
 
     def append_kv_blocks(self, session_id: int, new_blocks: Sequence[int]) -> None:
         self._require_open()

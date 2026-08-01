@@ -1,13 +1,4 @@
-"""The worker capability wire reports the exact agreement digests.
-
-Admission requires that a worker's protocol-layout and route-capability digests
-match the canonical ones and that every party agrees. A missing or empty digest
-field yields a malformed capability record at the Rust boundary (a flatbuffer
-string with no terminator), so this test pins both digests, their canonical
-values, and the ``supported_work`` shape the capability handshake serializes.
-The live cross-language handshake is the GPU backstop; this guards the Python
-wire the bridge consumes so a blank digest can never regress silently.
-"""
+"""Exact worker capability agreement across the Python wire boundary."""
 
 from __future__ import annotations
 
@@ -41,6 +32,10 @@ def _recompute_route_digest(wire: dict) -> str:
         wire["max_vision_feature_bytes"],
         AdapterMode(wire["adapter_mode"]),
         wire["execution_constraints"]["max_batch_operations"],
+        wire["execution_constraints"]["max_speculative_points"],
+        wire["execution_constraints"]["device_sequence_lengths"],
+        wire["execution_constraints"]["device_append_offsets"],
+        wire["execution_constraints"]["incremental_kv_publication"],
         wire["kv_dtype"],
         wire["model_dtype"],
         wire["attention_backend"],
@@ -51,7 +46,6 @@ def test_capability_wire_carries_the_agreement_digests_and_work_shape():
     worker = execution_worker()
     wire = dispatch(worker, {"kind": "get_capabilities"})["capabilities"]
 
-    assert "supported_operation_types" not in wire
     assert wire["supported_work"]
     known = {variant.value for variant in WorkVariant}
     assert all(value in known for value in wire["supported_work"])

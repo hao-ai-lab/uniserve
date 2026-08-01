@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from torch import nn
 
-from ..batch import Batch, CompletionReport
+from ..batch import Batch, CompletionReport, ProductRef, RequestKey, StorageClass
 from ..capabilities import RequestKind
 from ..execution import ModelExecutor, ModelRunner
 from ..execution.executor import completion_report_ready, finalize_completion_report
@@ -34,6 +34,42 @@ from ..spec import DeploymentOverlay, ModelSpec, OperationType, RouteRowKind, re
 from .protocol import WorkerContract
 
 logger = logging.getLogger(__name__)
+
+_TOKEN_DEVICE_PRODUCT_COUNT = 5
+
+
+def _warmup_token_outputs(
+    request_key: RequestKey,
+    op_id: int,
+    first_generation: int,
+) -> tuple[ProductRef, ...]:
+    from ..batch import (
+        DType,
+        PointRange,
+        ProductKind,
+        ShapeBound,
+        StorageClass,
+    )
+
+    definitions = (
+        (0, ProductKind.TOKEN, DType.U32, ShapeBound()),
+        (1, ProductKind.SELECTED_POINT, DType.U32, ShapeBound()),
+        (4, ProductKind.FINISH, DType.U8, ShapeBound()),
+    )
+    return tuple(
+        ProductRef(
+            request_key=request_key,
+            producer_op_id=op_id,
+            output_index=output_index,
+            generation=first_generation + output_index,
+            kind=kind,
+            storage_class=StorageClass.DEVICE_TENSOR,
+            dtype=dtype,
+            shape_bound=shape,
+            point_range=PointRange(base_point=0, max_points=1),
+        )
+        for output_index, kind, dtype, shape in definitions
+    )
 
 
 class ModelWorker:
@@ -117,8 +153,10 @@ class ModelWorker:
         self.products = ProductStore(
             encoder_cache_budget=model_spec.inputs.encoder_cache_budget,
             device_product_capacity=max(
-                2,
-                2 * int(pipeline_depth) * int(deployment.max_batch_operations),
+                _TOKEN_DEVICE_PRODUCT_COUNT,
+                _TOKEN_DEVICE_PRODUCT_COUNT
+                * int(pipeline_depth)
+                * int(deployment.max_batch_operations),
             ),
         )
         self.replay = ReplayStore()
@@ -232,7 +270,15 @@ class ModelWorker:
         report = self.executor.execute(batch)
         while not completion_report_ready(report):
             time.sleep(0.00005)
-        return finalize_completion_report(report)
+        finalized = finalize_completion_report(report)
+        device_generations = tuple(
+            int(output.generation)
+            for operation in batch.operations
+            for output in operation.outputs
+            if output.storage_class is StorageClass.DEVICE_TENSOR
+        )
+        self.products.release(device_generations)
+        return finalized
 
     def warmup(self) -> None:
         """Pay first-use kernel JIT before the worker is reachable.
@@ -351,6 +397,9 @@ class ModelWorker:
             )
             for block_id, sid in enumerate(session_ids)
         }
+
+        next_product_generation = 1
+
         def token_op(
             sid: int,
             op_id: int,
@@ -358,6 +407,7 @@ class ModelWorker:
             mode: TokenMode,
             tokens: tuple[int, ...],
         ) -> tuple[Operation, ProductPayload]:
+            nonlocal next_product_generation
             token_ref = ProductRef(
                 request_key=keys[sid],
                 producer_op_id=op_id,
@@ -369,6 +419,8 @@ class ModelWorker:
                 shape_bound=ShapeBound((StaticDim(max(1, len(tokens))),)),
                 point_range=PointRange(),
             )
+            outputs = _warmup_token_outputs(keys[sid], op_id, next_product_generation)
+            next_product_generation += len(outputs)
             operation = Operation.registered(
                 request_key=keys[sid],
                 op_id=op_id,
@@ -378,6 +430,7 @@ class ModelWorker:
                 domain=Domain.UND,
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
                 inputs=(token_ref,),
+                outputs=outputs,
             )
             return operation, ProductPayload(
                 product=token_ref, payload=encode_token_product_bytes(tokens)
@@ -531,6 +584,7 @@ class ModelWorker:
                     domain=Domain.UND,
                     bounds=Bounds(max_points=1, max_tokens=token_count),
                     inputs=(token_ref,),
+                    outputs=_warmup_token_outputs(rk, 1, 2),
                 )
                 try:
                     self._execute_warmup(
@@ -557,14 +611,22 @@ class ModelWorker:
             Admission,
             Batch,
             Bounds,
+            DeviceDim,
             Domain,
             DrawLayout,
+            DType,
             FixedPoint,
             GenAdmission,
             ImageParams,
             Operation,
+            PointRange,
+            ProductKind,
+            ProductRef,
             RequestKey,
             Rng,
+            ShapeBound,
+            StorageClass,
+            TransferMode,
             VersionRef,
             Work,
         )
@@ -587,14 +649,39 @@ class ModelWorker:
         )
         try:
             root = VersionRef(rk, 0, FixedPoint(0, admission.digest))
-            flow = Operation.registered(
+            conditioning = ProductRef(
+                request_key=rk,
+                producer_op_id=1,
+                output_index=0,
+                generation=4,
+                kind=ProductKind.KV,
+                storage_class=StorageClass.PAGED_KV,
+                dtype=DType.U8,
+                shape_bound=ShapeBound((DeviceDim(1 << 20),)),
+                point_range=PointRange(),
+            )
+            publication = Operation.registered(
                 request_key=rk,
                 op_id=1,
+                parent=root,
+                work=Work("transfer", TransferMode.KV_PUBLISH.value),
+                route=0,
+                domain=Domain.UND,
+                bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
+                outputs=(conditioning,),
+            )
+            self._execute_warmup(
+                Batch(step_id=3, admissions=(admission,), operations=(publication,))
+            )
+            flow = Operation.registered(
+                request_key=rk,
+                op_id=2,
                 parent=root,
                 work=Work("gen", "flow"),
                 route=0,
                 domain=Domain.GEN,
                 bounds=Bounds(max_points=1),
+                inputs=(conditioning,),
                 rng=Rng(
                     seed=0,
                     semantic_index_base=1,
@@ -602,7 +689,7 @@ class ModelWorker:
                 ),
             )
             self._execute_warmup(
-                Batch(step_id=3, admissions=(admission,), operations=(flow,), input_products=())
+                Batch(step_id=4, admissions=(), operations=(flow,), input_products=())
             )
         finally:
             if self.sessions.peek(session_id) is not None:

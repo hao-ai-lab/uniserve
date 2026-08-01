@@ -146,9 +146,10 @@ def test_semantic_digest_matches_rust() -> None:
     # Token values are lineage identity: a different committed token at the same
     # span changes the semantic digest.
     shifted = replace(completion, committed_tokens=(completion.committed_tokens[0] + 1,))
-    assert shifted.compute_semantic_digest(
-        fixture["parent_semantic_digest"], fixture["plan_digest"]
-    ) != fixture["semantic_digest"]
+    assert (
+        shifted.compute_semantic_digest(fixture["parent_semantic_digest"], fixture["plan_digest"])
+        != fixture["semantic_digest"]
+    )
 
 
 def test_protocol_layout_digest_matches_rust() -> None:
@@ -159,20 +160,27 @@ def test_protocol_layout_digest_matches_rust() -> None:
 def test_route_capability_digest_matches_rust() -> None:
     fixture = _fixture()
     sample = fixture["route_capability_sample"]
-    assert route_capability_digest(
-        [WorkVariant(name) for name in sample["supported_work"]],
-        sample["max_cfg_branches"],
-        sample["max_latent_size"],
-        sample["max_vae_grid_tokens"],
-        sample["max_vit_grid_tokens"],
-        sample["max_latent_feature_bytes"],
-        sample["max_vision_feature_bytes"],
-        AdapterMode(sample["adapter_mode"]),
-        sample["max_batch_operations"],
-        sample["kv_dtype"],
-        sample["model_dtype"],
-        sample["attention_backend"],
-    ) == fixture["route_capability_digest"]
+    assert (
+        route_capability_digest(
+            [WorkVariant(name) for name in sample["supported_work"]],
+            sample["max_cfg_branches"],
+            sample["max_latent_size"],
+            sample["max_vae_grid_tokens"],
+            sample["max_vit_grid_tokens"],
+            sample["max_latent_feature_bytes"],
+            sample["max_vision_feature_bytes"],
+            AdapterMode(sample["adapter_mode"]),
+            sample["max_batch_operations"],
+            sample["max_speculative_points"],
+            sample["device_sequence_lengths"],
+            sample["device_append_offsets"],
+            sample["incremental_kv_publication"],
+            sample["kv_dtype"],
+            sample["model_dtype"],
+            sample["attention_backend"],
+        )
+        == fixture["route_capability_digest"]
+    )
 
 
 # --- Round-trip and validation ---------------------------------------------

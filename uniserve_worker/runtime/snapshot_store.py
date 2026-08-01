@@ -45,7 +45,7 @@ from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
 from .transfer import Locator, Transport, fetch_locator
 
-SNAPSHOT_FORMAT_VERSION = 3
+SNAPSHOT_FORMAT_VERSION = 4
 _ASSET_PREFIX = "asset:"
 
 
@@ -159,7 +159,10 @@ class SnapshotProvider:
             if {value.session_id for value in sessions} != requested:
                 raise invalid_descriptor("snapshot operation contains an unknown session")
             committed_kv_lengths = {
-                session.session_id: session.resolved_runtime[session.resolved_op_id].kv_length
+                session.session_id: cast(
+                    ResolvedRuntimeState,
+                    session.runtime_for(session.resolved_version()),
+                ).kv_visible_len
                 for session in sessions
             }
             manifest, tensors, locator_assets = self._encode(
@@ -489,7 +492,7 @@ class SnapshotProvider:
             raise invalid_descriptor("snapshot repeats a product handle")
         adapter_id = None if decoded.adapter is None else decoded.adapter.adapter_id
         for session in decoded.sessions:
-            runtime = session.resolved_runtime.get(session.resolved_op_id)
+            runtime = session.runtime_for(session.resolved_version())
             if runtime is None or runtime.kv_length != kv_by_session[session.session_id].length:
                 raise invalid_descriptor(
                     f"session {session.session_id} runtime state does not align with KV"
@@ -649,7 +652,7 @@ class SnapshotProvider:
 
     @staticmethod
     def _session_to_json(session: RequestSession) -> dict[str, object]:
-        runtime = session.resolved_runtime.get(session.resolved_op_id)
+        runtime = session.runtime_for(session.resolved_version())
         if runtime is None:
             raise invalid_descriptor("snapshot session resolved runtime state is missing")
         return {
@@ -662,7 +665,11 @@ class SnapshotProvider:
             "resolved_runtime": {
                 "logical_position": runtime.logical_position,
                 "rng_counter": runtime.rng_counter,
-                "kv_length": runtime.kv_length,
+                "kv_reserved_len": runtime.kv_reserved_len,
+                "kv_initialized_len": runtime.kv_initialized_len,
+                "kv_visible_len": runtime.kv_visible_len,
+                "kv_committed_len": runtime.kv_committed_len,
+                "kv_published_len": runtime.kv_published_len,
             },
             "committed_point": session.committed_point,
             "admission_digest": session.admission_digest,
@@ -768,9 +775,25 @@ class SnapshotProvider:
                 runtime_data.get("rng_counter"),
                 "snapshot session.resolved_runtime.rng_counter",
             ),
-            kv_length=_uint(
-                runtime_data.get("kv_length"),
-                "snapshot session.resolved_runtime.kv_length",
+            kv_reserved_len=_uint(
+                runtime_data.get("kv_reserved_len"),
+                "snapshot session.resolved_runtime.kv_reserved_len",
+            ),
+            kv_initialized_len=_uint(
+                runtime_data.get("kv_initialized_len"),
+                "snapshot session.resolved_runtime.kv_initialized_len",
+            ),
+            kv_visible_len=_uint(
+                runtime_data.get("kv_visible_len"),
+                "snapshot session.resolved_runtime.kv_visible_len",
+            ),
+            kv_committed_len=_uint(
+                runtime_data.get("kv_committed_len"),
+                "snapshot session.resolved_runtime.kv_committed_len",
+            ),
+            kv_published_len=_uint(
+                runtime_data.get("kv_published_len"),
+                "snapshot session.resolved_runtime.kv_published_len",
             ),
         )
         session = RequestSession(
@@ -840,8 +863,12 @@ class SnapshotProvider:
         control_sequences = sorted(control_seq for control_seq, _kind in control_digests)
         if control_sequences != list(range(1, session.applied_control_seq + 1)):
             raise invalid_descriptor("snapshot session control ledger is not contiguous")
-        session.resolved_versions[session.resolved_op_id] = session.resolved_version()
-        session.resolved_runtime[session.resolved_op_id] = runtime
+        resolved = session.resolved_version()
+        key = session.point_key(resolved)
+        session.resolved_versions[key] = resolved
+        session.resolved_runtime[key] = runtime
+        session.resolved_operations[session.resolved_op_id] = resolved
+        session.resolved_parents[session.resolved_op_id] = resolved
         return session
 
     @staticmethod
@@ -855,6 +882,15 @@ class SnapshotProvider:
             "prefix_len": state.prefix_len,
             "length": state.length,
             "group_id": state.group_id,
+            "reserved_len": state.reserved_len,
+            "initialized_len": state.initialized_len,
+            "committed_len": state.committed_len,
+            "published_by_destination": [
+                {"destination": destination, "extent": extent}
+                for destination, extent in state.published_by_destination
+            ],
+            "mapping_generation": state.mapping_generation,
+            "scale_identity": state.scale_identity,
             "pages": _pages_to_json(state.pages, f"kv.{state.session_id}.pages", tensor),
             "branches": [
                 {
@@ -894,12 +930,32 @@ class SnapshotProvider:
         )
         if any(branch.pages is None for branch in branches):
             raise invalid_descriptor("snapshot KV scratch branch is missing pages")
+        published = tuple(
+            (
+                _string(item.get("destination"), "snapshot KV publication.destination"),
+                _uint(item.get("extent"), "snapshot KV publication.extent"),
+            )
+            for raw in _sequence(
+                data.get("published_by_destination"),
+                "snapshot KV.published_by_destination",
+            )
+            for item in (_mapping(raw, "snapshot KV publication"),)
+        )
         return KvCommittedState(
             session_id=_uint(data.get("session_id"), "snapshot KV.session_id"),
             block_ids=_uint_tuple(data.get("block_ids"), "snapshot KV.block_ids"),
             prefix_len=_uint(data.get("prefix_len"), "snapshot KV.prefix_len"),
             length=_uint(data.get("length"), "snapshot KV.length"),
             group_id=_uint(data.get("group_id"), "snapshot KV.group_id"),
+            reserved_len=_uint(data.get("reserved_len"), "snapshot KV.reserved_len"),
+            initialized_len=_uint(data.get("initialized_len"), "snapshot KV.initialized_len"),
+            committed_len=_uint(data.get("committed_len"), "snapshot KV.committed_len"),
+            published_by_destination=published,
+            mapping_generation=_uint(
+                data.get("mapping_generation"),
+                "snapshot KV.mapping_generation",
+            ),
+            scale_identity=_string(data.get("scale_identity"), "snapshot KV.scale_identity"),
             pages=_pages_from_json(data.get("pages"), tensors, "snapshot KV.pages"),
             branches=branches,
         )

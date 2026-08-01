@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import replace
+from typing import cast
 
 import pytest
 
@@ -39,6 +40,7 @@ from uniserve_worker.batch import (
     StaticDim,
     StorageClass,
     TokenMode,
+    UndAdmission,
     encode_sampling_state_bytes,
 )
 from uniserve_worker.execution import executor as executor_module
@@ -227,6 +229,15 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
     expected = _next_token(_next_token(4))
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
+    for consumer_op_id, operation in enumerate(decode_ops, start=20):
+        selected = next(
+            output for output in operation.outputs if output.kind is ProductKind.SELECTED_POINT
+        )
+        assert worker.products.device_products.consume(
+            selected,
+            consumer_op_id=consumer_op_id,
+            device="cpu",
+        ).tensor.tolist() == [1]
 
 
 def test_admission_finish_policy_drives_the_device_finish_product() -> None:
@@ -255,9 +266,7 @@ def test_admission_finish_policy_drives_the_device_finish_product() -> None:
         )
     )
 
-    finish = next(
-        output for output in operation.outputs if output.kind is ProductKind.FINISH
-    )
+    finish = next(output for output in operation.outputs if output.kind is ProductKind.FINISH)
     read = worker.products.device_products.consume(
         finish,
         consumer_op_id=2,
@@ -303,9 +312,7 @@ def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:
 
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
-    finish = next(
-        output for output in second_op.outputs if output.kind is ProductKind.FINISH
-    )
+    finish = next(output for output in second_op.outputs if output.kind is ProductKind.FINISH)
     read = worker.products.device_products.consume(
         finish,
         consumer_op_id=3,
@@ -360,6 +367,141 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
 
     assert observed == [(1, 3)]
     assert committed == (1001, STUB_IMG_START_TOKEN_ID, 1002)
+    assert result.completions[0].selected_point == 3
+    assert result.completions[0].logical_lengths.kv_visible_len == 5
+    session = worker.sessions.get(4)
+    assert tuple(
+        point for producer, point in session.resolved_versions if producer == verify.op_id
+    ) == (1, 2, 3)
+    selected = next(
+        output for output in verify.outputs if output.kind is ProductKind.SELECTED_POINT
+    )
+    accepted_span = next(
+        output for output in verify.outputs if output.kind is ProductKind.ACCEPTED_SPAN
+    )
+    continuation = next(
+        output for output in verify.outputs if output.kind is ProductKind.CONTINUATION
+    )
+    assert worker.products.device_products.consume(
+        selected, consumer_op_id=31, device="cpu"
+    ).tensor.tolist() == [3]
+    assert worker.products.device_products.consume(
+        accepted_span, consumer_op_id=32, device="cpu"
+    ).tensor.tolist() == [3, 1001, STUB_IMG_START_TOKEN_ID, 1002]
+    assert worker.products.device_products.consume(
+        continuation, consumer_op_id=33, device="cpu"
+    ).tensor.tolist() == [1002, 3, 5, 5]
+
+
+def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -> None:
+    worker = execution_worker()
+    admission = und_admission(5, block_ids=(4,))
+    extend, extend_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    prime = worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(extend,),
+            input_products=(extend_input,),
+        )
+    )
+    commit = commit_resolved(worker.sessions.get(5))
+    verify, verify_input = token_operation(
+        admission.request_key,
+        op_id=2,
+        parent=commit.selected,
+        mode=TokenMode.VERIFY,
+        tokens=(prime.completions[0].committed_tokens[0], 900, 901),
+        control_seq=commit.control_seq,
+    )
+
+    result = worker.execute(
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(verify,),
+            controls=(commit,),
+            input_products=(verify_input,),
+        )
+    )
+
+    completion = result.completions[0]
+    assert completion.committed_tokens == (_next_token(prime.completions[0].committed_tokens[0]),)
+    assert completion.selected_point == 1
+    assert completion.logical_lengths.kv_initialized_len == 5
+    assert completion.logical_lengths.kv_visible_len == 3
+    assert completion.logical_lengths.kv_committed_len == 2
+    assert completion.logical_lengths.kv_published_len == 0
+    entry = worker.kv.get(5)
+    assert entry.initialized_len == 5
+    assert entry.visible_len == 3
+    assert entry.committed_len == 2
+    assert entry.published_len == 0
+    session = worker.sessions.get(5)
+    assert session.selected_for_operation(2) == session.resolved_versions[(2, 1)]
+
+
+def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> None:
+    worker = execution_worker()
+    base = und_admission(6, block_ids=(5,))
+    admission = Admission.create(
+        base.request_key,
+        und=replace(cast(UndAdmission, base.und), finish_token_ids=(1001,)),
+    )
+    extend, extend_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(extend,),
+            input_products=(extend_input,),
+        )
+    )
+    commit = commit_resolved(worker.sessions.get(6))
+    verify, verify_input = token_operation(
+        admission.request_key,
+        op_id=2,
+        parent=commit.selected,
+        mode=TokenMode.VERIFY,
+        tokens=(1000, 1001),
+        control_seq=commit.control_seq,
+    )
+
+    result = worker.execute(
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(verify,),
+            controls=(commit,),
+            input_products=(verify_input,),
+        )
+    )
+
+    completion = result.completions[0]
+    assert completion.committed_tokens == (1001,)
+    assert completion.selected_point == 1
+    selected = next(
+        output for output in verify.outputs if output.kind is ProductKind.SELECTED_POINT
+    )
+    finish = next(output for output in verify.outputs if output.kind is ProductKind.FINISH)
+    assert worker.products.device_products.consume(
+        selected, consumer_op_id=41, device="cpu"
+    ).tensor.tolist() == [1]
+    assert worker.products.device_products.consume(
+        finish, consumer_op_id=42, device="cpu"
+    ).tensor.tolist() == [1]
 
 
 def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:

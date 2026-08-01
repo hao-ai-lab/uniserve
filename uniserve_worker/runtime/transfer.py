@@ -25,8 +25,10 @@ import hashlib
 import json
 import os
 import pickle
+import queue
 import socket
 import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -182,9 +184,11 @@ def _load_durable_tensor(locator: Locator, descriptor: dict[str, Any]) -> "torch
     if _snapshot_digest(raw_manifest, tensor_path) != object_digest:
         raise invalid_descriptor("durable locator object failed content verification")
     assets = manifest.get("assets")
-    if not isinstance(assets, list) or sum(
-        isinstance(asset, dict) and asset.get("tensor") == tensor_key for asset in assets
-    ) != 1:
+    if (
+        not isinstance(assets, list)
+        or sum(isinstance(asset, dict) and asset.get("tensor") == tensor_key for asset in assets)
+        != 1
+    ):
         raise invalid_descriptor("durable locator asset is not declared exactly once")
     tensors = load_file(str(tensor_path), device="cpu")
     value = tensors.get(tensor_key)
@@ -242,6 +246,7 @@ class Transport(ABC):
     """Register-once one-sided transport. One instance per worker."""
 
     name: str = "transport"
+    supports_async_publication: bool = False
 
     def session(self) -> str:
         """This worker's transport session id (for the locator)."""
@@ -250,6 +255,15 @@ class Transport(ABC):
     @abstractmethod
     def publish(self, tensor: "torch.Tensor") -> Locator:
         """Register the tensor's buffer (once) and return a locator for it."""
+
+    def publish_async(self, tensor: "torch.Tensor") -> Locator:
+        """Enqueue publication without observing device completion on the caller."""
+
+        if not self.supports_async_publication:
+            raise capability_mismatch(
+                f"{self.name} transport does not support asynchronous publication"
+            )
+        return self.publish(tensor)
 
     @abstractmethod
     def fetch(self, locator: Locator) -> "torch.Tensor":
@@ -274,6 +288,7 @@ class LocalTransport(Transport):
     """Same process, zero copy. The locator is a counter into a local table."""
 
     name = "local"
+    supports_async_publication = True
 
     def __init__(self) -> None:
         self._table: dict[int, "torch.Tensor"] = {}
@@ -344,13 +359,70 @@ class ShmTransport(Transport):
     reclaims promptly."""
 
     name = "shm"
+    supports_async_publication = True
     _MAX_LIVE_SEGMENTS = 256
 
     def __init__(self) -> None:
         from collections import OrderedDict
 
         self._segments: "OrderedDict[str, Any]" = OrderedDict()  # name -> SharedMemory (LRU)
+        self._pending: dict[str, tuple[Any, Any]] = {}
+        self._release_pending: set[str] = set()
         self._lock = threading.Lock()
+        self._publication_queue: queue.Queue[tuple[str, Any, int, Any, Any] | None] = queue.Queue()
+        self._publication_worker = threading.Thread(
+            target=self._complete_publications,
+            name="uniserve-shm-publication",
+            daemon=True,
+        )
+        self._publication_worker.start()
+
+    def _complete_publications(self) -> None:
+        import torch
+
+        pending: list[tuple[str, Any, int, Any, Any]] = []
+        closing = False
+        while pending or not closing:
+            try:
+                item = self._publication_queue.get(timeout=0.001)
+                if item is None:
+                    closing = True
+                else:
+                    pending.append(item)
+            except queue.Empty:
+                pass
+            deferred: list[tuple[str, Any, int, Any, Any]] = []
+            for name, shm, nbytes, host, event in pending:
+                try:
+                    ready = bool(event.query())
+                except BaseException:
+                    ready = True
+                    succeeded = False
+                else:
+                    succeeded = True
+                if not ready:
+                    deferred.append((name, shm, nbytes, host, event))
+                    continue
+                try:
+                    if succeeded:
+                        raw = host.view(torch.uint8).reshape(-1)
+                        shm.buf[1 : nbytes + 1] = bytes(raw.numpy())
+                except BaseException:
+                    succeeded = False
+                shm.buf[0] = 1 if succeeded else 2
+                with self._lock:
+                    self._pending.pop(name, None)
+                    release = name in self._release_pending
+                    self._release_pending.discard(name)
+                    if release:
+                        self._segments.pop(name, None)
+                if release:
+                    shm.close()
+                    try:
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
+            pending = deferred
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
         from multiprocessing import shared_memory
@@ -389,6 +461,53 @@ class ShmTransport(Transport):
             handle=shm.name.encode(),
         )
 
+    def publish_async(self, tensor: "torch.Tensor") -> Locator:
+        if not tensor.is_cuda:
+            return self.publish(tensor)
+        from multiprocessing import shared_memory
+
+        import torch
+
+        source = tensor.detach().contiguous()
+        nbytes = _nbytes(source)
+        host = torch.empty(tuple(source.shape), dtype=source.dtype, device="cpu", pin_memory=True)
+        host.copy_(source, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(source.device))
+        shm = shared_memory.SharedMemory(create=True, size=max(1, nbytes + 1))
+        shm_buffer = shm.buf
+        if shm_buffer is None:
+            raise RuntimeError("shared-memory segment has no writable buffer")
+        shm_buffer[0] = 0
+
+        evicted: list[Any] = []
+        with self._lock:
+            self._segments[shm.name] = shm
+            self._pending[shm.name] = (host, event)
+            while len(self._segments) > self._MAX_LIVE_SEGMENTS:
+                name, old = self._segments.popitem(last=False)
+                if name in self._pending:
+                    self._segments[name] = old
+                    break
+                evicted.append(old)
+        self._publication_queue.put((shm.name, shm, nbytes, host, event))
+        for old in evicted:
+            old.close()
+            try:
+                old.unlink()
+            except FileNotFoundError:
+                pass
+        return Locator(
+            transport="shm",
+            session=self.name,
+            nbytes=nbytes,
+            dtype=_dtype_to_str(source.dtype),
+            shape=tuple(source.shape),
+            device=str(source.device),
+            handle=shm.name.encode(),
+            meta={"ready_header_bytes": 1},
+        )
+
     def fetch(self, locator: Locator) -> "torch.Tensor":
         from multiprocessing import shared_memory
 
@@ -399,8 +518,13 @@ class ShmTransport(Transport):
             shm_buffer = shm.buf
             if shm_buffer is None:
                 raise RuntimeError("shared-memory segment has no readable buffer")
+            header = int(locator.meta.get("ready_header_bytes", 0))
+            while header and shm_buffer[0] == 0:
+                time.sleep(0.0001)
+            if header and shm_buffer[0] != 1:
+                raise capability_mismatch("shared-memory publication did not complete")
             try:
-                buf = bytearray(memoryview(shm_buffer)[: locator.nbytes])
+                buf = bytearray(memoryview(shm_buffer)[header : header + locator.nbytes])
             finally:
                 shm_buffer.release()
         finally:
@@ -418,7 +542,12 @@ class ShmTransport(Transport):
     def release(self, locator: Locator) -> None:
         name = locator.handle.decode()
         with self._lock:
+            pending = name in self._pending
+            if pending:
+                self._release_pending.add(name)
             shm = self._segments.pop(name, None)
+        if pending:
+            return
         if shm is not None:
             shm.close()
             try:
@@ -427,6 +556,8 @@ class ShmTransport(Transport):
                 pass
 
     def close(self) -> None:
+        self._publication_queue.put(None)
+        self._publication_worker.join()
         with self._lock:
             segs = list(self._segments.values())
             self._segments.clear()
@@ -445,6 +576,7 @@ class CudaIpcTransport(Transport):
     handle into a view of the producer's VRAM and clones it out."""
 
     name = "cuda_ipc"
+    supports_async_publication = True
 
     def __init__(self) -> None:
         self._alive: dict[int, "torch.Tensor"] = {}  # data_ptr -> kept-alive tensor
@@ -499,6 +631,7 @@ class MooncakeTransport(Transport):
     """
 
     name = "mooncake"
+    supports_async_publication = True
 
     def __init__(
         self,

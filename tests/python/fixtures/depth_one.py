@@ -36,6 +36,7 @@ from uniserve_worker.batch import (
     StaticDim,
     StorageClass,
     TokenMode,
+    TransferMode,
     UndAdmission,
     VersionRef,
     Work,
@@ -141,20 +142,59 @@ def token_operation(
         storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.U32,
         shape_bound=ShapeBound(),
-        point_range=PointRange(),
+        point_range=PointRange(
+            base_point=0,
+            max_points=(len(tokens) if mode is TokenMode.VERIFY else 1),
+        ),
+    )
+    max_points = len(tokens) if mode is TokenMode.VERIFY else 1
+    selected_point_output = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=1,
+        generation=op_id * 6 + 2,
+        kind=ProductKind.SELECTED_POINT,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.U32,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(base_point=0, max_points=max_points),
+    )
+    accepted_span_output = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=2,
+        generation=op_id * 6 + 3,
+        kind=ProductKind.ACCEPTED_SPAN,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.U32,
+        shape_bound=ShapeBound((StaticDim(max_points + 1),)),
+        point_range=PointRange(base_point=0, max_points=max_points),
+    )
+    continuation_output = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=3,
+        generation=op_id * 6 + 4,
+        kind=ProductKind.CONTINUATION,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.I64,
+        shape_bound=ShapeBound((StaticDim(4),)),
+        point_range=PointRange(base_point=0, max_points=max_points),
     )
     finish_output = ProductRef(
         request_key=rk,
         producer_op_id=op_id,
-        output_index=1,
-        generation=op_id * 4 + 2,
+        output_index=4,
+        generation=op_id * 6 + 5,
         kind=ProductKind.FINISH,
         storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
         point_range=PointRange(),
     )
-    outputs = [token_output]
+    outputs = [token_output, selected_point_output]
+    if mode is TokenMode.VERIFY:
+        outputs.extend((accepted_span_output, continuation_output))
     if produces_finish_candidate:
         outputs.append(finish_output)
     if logprobs:
@@ -162,8 +202,8 @@ def token_operation(
             ProductRef(
                 request_key=rk,
                 producer_op_id=op_id,
-                output_index=2,
-                generation=op_id * 4 + 4,
+                output_index=5,
+                generation=op_id * 6 + 6,
                 kind=ProductKind.LOGPROB,
                 storage_class=StorageClass.HOST_STAGING,
                 dtype=DType.U8,
@@ -179,7 +219,7 @@ def token_operation(
         route=0,
         domain=Domain.UND,
         bounds=Bounds(
-            max_points=1,
+            max_points=max_points,
             max_tokens=max(1, len(tokens)),
             max_completion_bytes=((1 << 16) - 1 if logprobs else 0),
         ),
@@ -264,6 +304,7 @@ def flow_operation(
     *,
     op_id: int,
     parent: VersionRef,
+    conditioning: ProductRef,
     steps: int,
     seed: int = 29,
     image_index: int = 1,
@@ -277,6 +318,7 @@ def flow_operation(
         route=0,
         domain=Domain.GEN,
         bounds=Bounds(max_points=int(steps)),
+        inputs=(conditioning,),
         rng=Rng(
             seed=int(seed),
             semantic_index_base=int(image_index),
@@ -284,6 +326,38 @@ def flow_operation(
         ),
         control_seq=control_seq,
     )
+
+
+def kv_publication_operation(
+    rk: RequestKey,
+    *,
+    op_id: int,
+    parent: VersionRef,
+    control_seq: int = 0,
+) -> tuple[Operation, ProductRef]:
+    product = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=0,
+        generation=op_id * 3 + 1,
+        kind=ProductKind.KV,
+        storage_class=StorageClass.PAGED_KV,
+        dtype=DType.U8,
+        shape_bound=ShapeBound((DeviceDim(1 << 20),)),
+        point_range=PointRange(),
+    )
+    operation = Operation.registered(
+        request_key=rk,
+        op_id=op_id,
+        parent=parent,
+        work=Work("transfer", TransferMode.KV_PUBLISH.value),
+        route=0,
+        domain=Domain.UND,
+        bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
+        outputs=(product,),
+        control_seq=control_seq,
+    )
+    return operation, product
 
 
 def materialize_operation(
@@ -344,6 +418,7 @@ def visual_state_operation(
     parent: VersionRef,
     feature: ProductRef,
     sample_continuation: bool,
+    max_tokens: int,
     control_seq: int = 0,
 ) -> Operation:
     outputs = (
@@ -380,7 +455,7 @@ def visual_state_operation(
         work=Work.token(TokenMode.EXTEND),
         route=0,
         domain=Domain.UND,
-        bounds=Bounds(max_points=1, max_tokens=1),
+        bounds=Bounds(max_points=1, max_tokens=max_tokens),
         inputs=(feature,),
         outputs=outputs,
         control_seq=control_seq,
@@ -394,6 +469,7 @@ __all__ = [
     "flow_operation",
     "gen_admission",
     "materialize_operation",
+    "kv_publication_operation",
     "request_key",
     "root_parent",
     "token_operation",

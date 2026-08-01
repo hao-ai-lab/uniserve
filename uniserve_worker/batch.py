@@ -80,6 +80,9 @@ class ProductKind(StrEnum):
     COMPLETION = "completion"
     SAMPLING_STATE = "sampling_state"
     FINISH = "finish"
+    SELECTED_POINT = "selected_point"
+    ACCEPTED_SPAN = "accepted_span"
+    CONTINUATION = "continuation"
 
 
 class StorageClass(StrEnum):
@@ -272,6 +275,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "bounds",
         "inputs",
         "outputs",
+        "new_kv_blocks",
         "predicate",
         "rng",
         "control_seq",
@@ -318,12 +322,27 @@ def protocol_layout_digest() -> str:
     digest.u64(len(WorkVariant))
     for variant in WorkVariant:
         digest.string(variant.value)
+    digest.u64(len(ProductKind))
+    for kind in ProductKind:
+        digest.string(kind.value)
     for control in ("commit", "close", "release"):
         digest.string(control)
     for record in _LAYOUT_RECORDS:
         digest.u64(len(record))
         for name in record:
             digest.string(name)
+    logical_lengths = (
+        "token_len",
+        "kv_visible_len",
+        "latent_len",
+        "kv_reserved_len",
+        "kv_initialized_len",
+        "kv_committed_len",
+        "kv_published_len",
+    )
+    digest.u64(len(logical_lengths))
+    for name in logical_lengths:
+        digest.string(name)
     return digest.finish()
 
 
@@ -337,6 +356,10 @@ def route_capability_digest(
     max_vision_feature_bytes: int,
     adapter_mode: AdapterMode,
     max_batch_operations: int,
+    max_speculative_points: int,
+    device_sequence_lengths: bool,
+    device_append_offsets: bool,
+    incremental_kv_publication: bool,
     kv_dtype: str,
     model_dtype: str,
     attention_backend: str,
@@ -360,6 +383,10 @@ def route_capability_digest(
     digest.u64(max_vision_feature_bytes)
     digest.u8(_ADAPTER_MODE_INDEX[AdapterMode(adapter_mode)])
     digest.u32(max_batch_operations)
+    digest.u32(max_speculative_points)
+    digest.boolean(device_sequence_lengths)
+    digest.boolean(device_append_offsets)
+    digest.boolean(incremental_kv_publication)
     digest.string(kv_dtype)
     digest.string(model_dtype)
     digest.string(attention_backend)
@@ -1093,6 +1120,13 @@ class Operation:
                 raise invalid_descriptor(
                     "a host-visible output exceeds the operation completion-byte bound"
                 )
+            if (
+                product.storage_class is StorageClass.PAGED_KV
+                and product.max_bytes > self.bounds.max_transfer_bytes
+            ):
+                raise invalid_descriptor(
+                    "a paged-KV output exceeds the operation transfer-byte bound"
+                )
             if product.output_index in output_indices:
                 raise invalid_descriptor("operation repeats an output index")
             output_indices.add(product.output_index)
@@ -1107,6 +1141,15 @@ class Operation:
                 )
             if selected.generation < 1:
                 raise invalid_descriptor("device version selected point has no logical generation")
+            if (
+                selected.kind is not ProductKind.SELECTED_POINT
+                or selected.storage_class is not StorageClass.DEVICE_TENSOR
+                or selected.dtype is not DType.U32
+                or selected.shape_bound.max_elements != 1
+            ):
+                raise invalid_descriptor(
+                    "device version does not name a scalar selected-point product"
+                )
         if self.predicate is not None:
             continuation_token = (
                 self.predicate.kind is ProductKind.TOKEN
@@ -1263,6 +1306,10 @@ class LogicalLengths:
     token_len: int = 0
     kv_visible_len: int = 0
     latent_len: int = 0
+    kv_reserved_len: int = 0
+    kv_initialized_len: int = 0
+    kv_committed_len: int = 0
+    kv_published_len: int = 0
 
     @classmethod
     def from_wire(cls, value: object, where: str = "logical_lengths") -> LogicalLengths:
@@ -1271,6 +1318,12 @@ class LogicalLengths:
             token_len=_uint(data.get("token_len"), f"{where}.token_len"),
             kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),
             latent_len=_uint(data.get("latent_len"), f"{where}.latent_len"),
+            kv_reserved_len=_uint(data.get("kv_reserved_len", 0), f"{where}.kv_reserved_len"),
+            kv_initialized_len=_uint(
+                data.get("kv_initialized_len", 0), f"{where}.kv_initialized_len"
+            ),
+            kv_committed_len=_uint(data.get("kv_committed_len", 0), f"{where}.kv_committed_len"),
+            kv_published_len=_uint(data.get("kv_published_len", 0), f"{where}.kv_published_len"),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1278,6 +1331,10 @@ class LogicalLengths:
             "token_len": self.token_len,
             "kv_visible_len": self.kv_visible_len,
             "latent_len": self.latent_len,
+            "kv_reserved_len": self.kv_reserved_len,
+            "kv_initialized_len": self.kv_initialized_len,
+            "kv_committed_len": self.kv_committed_len,
+            "kv_published_len": self.kv_published_len,
         }
 
 
@@ -1458,6 +1515,10 @@ class CompletionRecord:
                 "token_len": lengths.token_len,
                 "kv_visible_len": lengths.kv_visible_len,
                 "latent_len": lengths.latent_len,
+                "kv_reserved_len": lengths.kv_reserved_len,
+                "kv_initialized_len": lengths.kv_initialized_len,
+                "kv_committed_len": lengths.kv_committed_len,
+                "kv_published_len": lengths.kv_published_len,
             },
             "token_span": {"base": span.base, "len": span.len},
             "committed_tokens": list(self.committed_tokens),

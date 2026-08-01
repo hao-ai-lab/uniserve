@@ -524,6 +524,10 @@ fn completion_record_from_table(
             token_len: logical_lengths.token_len(),
             kv_visible_len: logical_lengths.kv_visible_len(),
             latent_len: logical_lengths.latent_len(),
+            kv_reserved_len: logical_lengths.kv_reserved_len(),
+            kv_initialized_len: logical_lengths.kv_initialized_len(),
+            kv_committed_len: logical_lengths.kv_committed_len(),
+            kv_published_len: logical_lengths.kv_published_len(),
         },
         token_span: TokenSpan {
             base: token_span.base(),
@@ -650,6 +654,10 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
             .execution_constraints()
             .map(|constraints| ExecutionConstraints {
                 max_batch_operations: constraints.max_batch_operations(),
+                max_speculative_points: constraints.max_speculative_points(),
+                device_sequence_lengths: constraints.device_sequence_lengths(),
+                device_append_offsets: constraints.device_append_offsets(),
+                incremental_kv_publication: constraints.incremental_kv_publication(),
             })
             .context("capabilities have no execution constraints")?,
         resource_classes: caps
@@ -1750,6 +1758,10 @@ fn completion_record_to_fb(record: &CompletionRecord) -> fbs::CompletionRecordT 
             token_len: record.logical_lengths.token_len,
             kv_visible_len: record.logical_lengths.kv_visible_len,
             latent_len: record.logical_lengths.latent_len,
+            kv_reserved_len: record.logical_lengths.kv_reserved_len,
+            kv_initialized_len: record.logical_lengths.kv_initialized_len,
+            kv_committed_len: record.logical_lengths.kv_committed_len,
+            kv_published_len: record.logical_lengths.kv_published_len,
         })),
         token_span: Some(Box::new(fbs::TokenSpanT {
             base: record.token_span.base,
@@ -1797,6 +1809,10 @@ fn completion_record_from_fb(record: fbs::CompletionRecordT) -> anyhow::Result<C
             token_len: logical_lengths.token_len,
             kv_visible_len: logical_lengths.kv_visible_len,
             latent_len: logical_lengths.latent_len,
+            kv_reserved_len: logical_lengths.kv_reserved_len,
+            kv_initialized_len: logical_lengths.kv_initialized_len,
+            kv_committed_len: logical_lengths.kv_committed_len,
+            kv_published_len: logical_lengths.kv_published_len,
         },
         token_span: TokenSpan {
             base: token_span.base,
@@ -1906,6 +1922,10 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         adapter_mode: adapter_mode_to_fb(caps.adapter_mode),
         execution_constraints: Some(Box::new(fbs::ExecutionConstraintsT {
             max_batch_operations: caps.execution_constraints.max_batch_operations,
+            max_speculative_points: caps.execution_constraints.max_speculative_points,
+            device_sequence_lengths: caps.execution_constraints.device_sequence_lengths,
+            device_append_offsets: caps.execution_constraints.device_append_offsets,
+            incremental_kv_publication: caps.execution_constraints.incremental_kv_publication,
         })),
         resource_classes: Some(
             caps.resource_classes
@@ -1983,6 +2003,10 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
             .execution_constraints
             .map(|constraints| ExecutionConstraints {
                 max_batch_operations: constraints.max_batch_operations,
+                max_speculative_points: constraints.max_speculative_points,
+                device_sequence_lengths: constraints.device_sequence_lengths,
+                device_append_offsets: constraints.device_append_offsets,
+                incremental_kv_publication: constraints.incremental_kv_publication,
             })
             .context("capabilities have no execution constraints")?,
         resource_classes: caps
@@ -2495,6 +2519,9 @@ fn product_kind_to_fb(kind: ProductKind) -> fbs::ProductKind {
         ProductKind::Completion => fbs::ProductKind::Completion,
         ProductKind::SamplingState => fbs::ProductKind::SamplingState,
         ProductKind::Finish => fbs::ProductKind::Finish,
+        ProductKind::SelectedPoint => fbs::ProductKind::SelectedPoint,
+        ProductKind::AcceptedSpan => fbs::ProductKind::AcceptedSpan,
+        ProductKind::Continuation => fbs::ProductKind::Continuation,
     }
 }
 
@@ -2511,6 +2538,9 @@ fn product_kind_from_fb(kind: fbs::ProductKind) -> anyhow::Result<ProductKind> {
         fbs::ProductKind::Completion => ProductKind::Completion,
         fbs::ProductKind::SamplingState => ProductKind::SamplingState,
         fbs::ProductKind::Finish => ProductKind::Finish,
+        fbs::ProductKind::SelectedPoint => ProductKind::SelectedPoint,
+        fbs::ProductKind::AcceptedSpan => ProductKind::AcceptedSpan,
+        fbs::ProductKind::Continuation => ProductKind::Continuation,
         other => bail!("unknown product kind {}", other.0),
     })
 }

@@ -9,6 +9,8 @@ is caught without a GPU.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from torch import nn
 
@@ -34,8 +36,9 @@ class _Observed(nn.Module):
 
 def test_warmup_is_a_safe_noop_off_cuda() -> None:
     worker = execution_worker()
+    baseline = (worker.kv.resident_block_count(), worker.kv.scratch_token_count())
     worker.warmup()
-    assert worker.sessions.session_ids() == ()
+    assert (worker.kv.resident_block_count(), worker.kv.scratch_token_count()) == baseline
 
 
 def test_warmup_image_geometry_fits_the_declared_latent_capacity() -> None:
@@ -59,11 +62,20 @@ def test_warmup_sequence_drives_a_real_forward_and_cleans_up() -> None:
     if OperationType.SEQUENCE_EXTEND not in worker.contract.capabilities.operation_types:
         pytest.skip("stub does not support sequence extend")
 
+    worker._execution = replace(
+        worker._execution,
+        cuda_graph=True,
+        cuda_graph_warmup=True,
+        cuda_graph_warmup_batches=(4, 2),
+    )
+    worker.products.device_products.capacity = 20
+    baseline = (worker.kv.resident_block_count(), worker.kv.scratch_token_count())
     worker._warmup_sequence()
 
     assert model.calls
-    assert all(row_kinds == ("TokenRow",) for _route, row_kinds in model.calls)
-    assert worker.sessions.session_ids() == ()
+    assert all(row_kinds and set(row_kinds) == {"TokenRow"} for _route, row_kinds in model.calls)
+    assert {2, 4} <= {len(row_kinds) for _route, row_kinds in model.calls}
+    assert (worker.kv.resident_block_count(), worker.kv.scratch_token_count()) == baseline
 
 
 def test_warmup_flow_drives_a_real_forward_and_cleans_up() -> None:
@@ -72,7 +84,8 @@ def test_warmup_flow_drives_a_real_forward_and_cleans_up() -> None:
     if OperationType.FLOW not in worker.contract.capabilities.operation_types:
         pytest.skip("stub does not support flow")
 
+    baseline = (worker.kv.resident_block_count(), worker.kv.scratch_token_count())
     worker._warmup_flow()
 
     assert any("FlowRow" in row_kinds for _route, row_kinds in model.calls)
-    assert worker.sessions.session_ids() == ()
+    assert (worker.kv.resident_block_count(), worker.kv.scratch_token_count()) == baseline

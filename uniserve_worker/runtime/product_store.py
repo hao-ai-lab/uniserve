@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from itertools import chain
 from threading import RLock
 from typing import Final, cast
 
@@ -47,6 +47,7 @@ def _invariant(message: str) -> WorkerError:
 
 _ReferenceKey = tuple[int, int, int, int, int]
 _OperationKey = tuple[RequestKey, int]
+_SlotStorageKey = tuple[str, tuple[int, ...], torch.dtype]
 
 
 def _reference_key(reference: ProductRef) -> _ReferenceKey:
@@ -197,7 +198,9 @@ class DeviceProductTable:
         self.capacity = max(1, int(capacity))
         self._slots: dict[str, list[_DeviceSlot]] = {}
         self._occupied_slots: dict[str, int] = {}
-        self._allocation_cursor: dict[str, int] = {}
+        self._free_slots: dict[str, set[int]] = {}
+        self._free_slot_queues: dict[str, deque[int]] = {}
+        self._compatible_free_slots: dict[_SlotStorageKey, deque[int]] = {}
         self._scalar_arenas: dict[tuple[str, torch.dtype], torch.Tensor] = {}
         self.event_pool = DeviceEventPool() if event_pool is None else event_pool
         self._entries: dict[_ReferenceKey, DeviceProductWrite] = {}
@@ -283,34 +286,35 @@ class DeviceProductTable:
                 by_device.setdefault(str(device), []).append(
                     (index, reference, device, shape, dtype)
                 )
-            for device_name, group in by_device.items():
-                ordered = sorted(
-                    group,
-                    key=lambda item: (
-                        math.prod(item[3]) != 1,
-                        str(item[4]),
-                        item[3],
-                        item[0],
-                    ),
+            try:
+                for device_name, group in by_device.items():
+                    ordered = sorted(
+                        group,
+                        key=lambda item: (
+                            math.prod(item[3]) != 1,
+                            str(item[4]),
+                            item[3],
+                            item[0],
+                        ),
+                    )
+                    available, reclaimed = self._plan_compatible_slots_locked(
+                        device_name,
+                        ordered,
+                        reclaimed=reclaimed,
+                    )
+                    for (
+                        request_index,
+                        _reference,
+                        _device,
+                        _shape,
+                        _dtype,
+                    ), slot in zip(ordered, available, strict=True):
+                        planned_slots[request_index] = slot
+            except BaseException:
+                self._restore_planned_slots_locked(
+                    slot for slot in planned_slots if slot is not None
                 )
-                available, reclaimed = self._plan_slots_locked(
-                    device_name,
-                    len(ordered),
-                    reclaimed=reclaimed,
-                )
-                available = self._prefer_compatible_slots_locked(
-                    device_name,
-                    ordered,
-                    available,
-                )
-                for (
-                    request_index,
-                    _reference,
-                    _device,
-                    _shape,
-                    _dtype,
-                ), slot in zip(ordered, available, strict=True):
-                    planned_slots[request_index] = slot
+                raise
             registered: list[_ReferenceKey] = []
             writes: list[DeviceProductWrite] = []
             try:
@@ -361,6 +365,9 @@ class DeviceProductTable:
                     entry = self._entries.pop(key)
                     self._detach_write_locked(entry)
                     self._return_slot_locked(entry.slot)
+                self._restore_planned_slots_locked(
+                    slot for slot in planned_slots if slot is not None
+                )
                 raise
             return DeviceProductBindingBatch(tuple(writes))
 
@@ -381,47 +388,30 @@ class DeviceProductTable:
                         bindings.append(self.bind_output_batch(group))
             except BaseException:
                 self.abandon_writes(
-                    tuple(
-                        write
-                        for binding in bindings
-                        for write in binding.writes
-                    )
+                    tuple(write for binding in bindings for write in binding.writes)
                 )
                 raise
         return tuple(bindings)
 
-    def _prefer_compatible_slots_locked(
+    def _plan_compatible_slots_locked(
         self,
         device_name: str,
         requested: list[tuple[int, ProductRef, torch.device, tuple[int, ...], torch.dtype]],
-        planned: list[_DeviceSlot],
-    ) -> list[_DeviceSlot]:
-        slots = self._slots[device_name]
+        *,
+        reclaimed: bool,
+    ) -> tuple[list[_DeviceSlot], bool]:
+        reclaimed = self._ensure_free_slots_locked(
+            device_name,
+            len(requested),
+            reclaimed=reclaimed,
+        )
         selected: list[_DeviceSlot] = []
-        selected_ids: set[int] = set()
         for _index, _reference, _device, shape, dtype in requested:
-            compatible = next(
-                (
-                    slot
-                    for slot in slots
-                    if slot.owner is None
-                    and slot.index not in selected_ids
-                    and slot.shape == shape
-                    and slot.dtype == dtype
-                ),
-                None,
-            )
-            candidate = compatible or next(
-                (slot for slot in planned if slot.index not in selected_ids),
-                None,
-            )
+            candidate = self._take_compatible_slot_locked(device_name, shape, dtype)
             if candidate is None:
-                candidate = next(
-                    slot for slot in slots if slot.owner is None and slot.index not in selected_ids
-                )
+                candidate = self._take_free_slot_locked(device_name)
             selected.append(candidate)
-            selected_ids.add(candidate.index)
-        return selected
+        return selected, reclaimed
 
     def _bind_homogeneous_outputs(
         self,
@@ -457,7 +447,11 @@ class DeviceProductTable:
                 len(bindings),
                 reclaimed=False,
             )
-            self._prepare_homogeneous_slots_locked(device, shape, dtype, slots)
+            try:
+                self._prepare_homogeneous_slots_locked(device, shape, dtype, slots)
+            except BaseException:
+                self._restore_planned_slots_locked(slots)
+                raise
             registered: list[_ReferenceKey] = []
             writes: list[DeviceProductWrite] = []
             owned_slots: list[_DeviceSlot] = []
@@ -527,6 +521,7 @@ class DeviceProductTable:
                 for slot in owned_slots:
                     slot.owner = None
                 self._occupied_slots[device_name] = occupied_before
+                self._restore_planned_slots_locked(slots)
                 raise
 
     def bind_scalar_continuation(
@@ -806,6 +801,25 @@ class DeviceProductTable:
                 producer_event=producer_event,
             )
 
+    def publish_rows(
+        self,
+        writes: tuple[DeviceProductWrite, ...],
+        values: torch.Tensor,
+        *,
+        producer_event: torch.cuda.Event | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Publish equal-shaped tensor rows with one completion event."""
+
+        if not writes:
+            return ()
+        with self._lock:
+            entries = tuple(self._require_write_locked(write) for write in writes)
+            return self._publish_rows_locked(
+                entries,
+                values,
+                producer_event=producer_event,
+            )
+
     def publish_scalar_batch(
         self,
         batch: DeviceProductScalarBatch,
@@ -1029,6 +1043,59 @@ class DeviceProductTable:
         if linked is not None:
             linked._published = True
         return tensors
+
+    def _publish_rows_locked(
+        self,
+        entries: tuple[DeviceProductWrite, ...],
+        values: torch.Tensor,
+        *,
+        producer_event: torch.cuda.Event | None,
+    ) -> tuple[torch.Tensor, ...]:
+        rows = values.detach()
+        if rows.ndim < 2 or int(rows.shape[0]) != len(entries):
+            raise invalid_descriptor(
+                "row device-product publication requires one tensor row per output"
+            )
+        if any(entry.producer_recorded for entry in entries):
+            raise _invariant("device product was published more than once")
+        targets = tuple(entry.slot.tensor for entry in entries)
+        if any(target is None for target in targets):
+            raise _invariant("device product has no physical tensor")
+        tensors = tuple(target for target in targets if target is not None)
+        first = tensors[0]
+        if any(tensor.device != first.device or tensor.dtype != first.dtype for tensor in tensors):
+            raise invalid_descriptor("row device-product publication spans incompatible storage")
+        if rows.device != first.device:
+            raise invalid_descriptor("row device-product publication spans incompatible devices")
+
+        row_shape = tuple(int(size) for size in rows.shape[1:])
+        row_extent = math.prod(row_shape)
+        if any(int(tensor.numel()) < row_extent for tensor in tensors):
+            raise _invariant("device product exceeds its registered shape bound")
+        source = rows.to(dtype=first.dtype)
+        views = tuple(tensor.reshape(-1)[:row_extent].reshape(row_shape) for tensor in tensors)
+        torch._foreach_copy_(
+            views,
+            tuple(source.unbind(0)),
+            non_blocking=source.device.type == "cuda",
+        )
+
+        event: torch.cuda.Event | None = None
+        if first.device.type == "cuda":
+            event, stream_id = self._producer_event_locked(
+                first.device,
+                producer_event,
+            )
+            self._retain_event_locked(event, first.device, len(entries))
+        else:
+            stream_id = None
+        for entry in entries:
+            entry.producer_event = event
+            entry.producer_stream = stream_id
+            entry.actual_extent = row_extent
+            entry.actual_shape = row_shape
+            entry.producer_recorded = True
+        return views
 
     def publish_scalar(
         self,
@@ -1479,6 +1546,7 @@ class DeviceProductTable:
                 self._detach_write_locked(entry)
                 entry.logical_references = 0
                 entry.released = True
+            self._reclaim_ready_locked()
 
     def abandon_outputs(self, references: tuple[ProductRef, ...]) -> None:
         with self._lock:
@@ -1663,48 +1731,86 @@ class DeviceProductTable:
         *,
         reclaimed: bool,
     ) -> tuple[list[_DeviceSlot], bool]:
+        reclaimed = self._ensure_free_slots_locked(
+            device_name,
+            count,
+            reclaimed=reclaimed,
+        )
+        return [self._take_free_slot_locked(device_name) for _ in range(count)], reclaimed
+
+    def _ensure_free_slots_locked(
+        self,
+        device_name: str,
+        count: int,
+        *,
+        reclaimed: bool,
+    ) -> bool:
         slots = self._slots.get(device_name)
         if slots is None:
             slots = [
                 _DeviceSlot(index=index, device_name=device_name) for index in range(self.capacity)
             ]
             self._slots[device_name] = slots
-        occupied = self._occupied_slots.get(device_name, 0)
-        if self.capacity - occupied < count and not reclaimed:
+            self._free_slots[device_name] = set(range(self.capacity))
+            self._free_slot_queues[device_name] = deque(range(self.capacity))
+        free = self._free_slots[device_name]
+        if len(free) < count and not reclaimed:
             self._reclaim_ready_locked()
             reclaimed = True
-            occupied = self._occupied_slots.get(device_name, 0)
-        if self.capacity - occupied < count:
+        if len(free) < count:
             raise resource_error(
                 f"device-product arena for {device_name} has no query-ready free generation"
             )
+        return reclaimed
 
-        cursor = self._allocation_cursor.get(device_name, 0)
-        last_start = self.capacity - count
-        starts = (
-            chain(
-                range(cursor, last_start + 1),
-                range(0, min(cursor, last_start + 1)),
-            )
-            if cursor <= last_start
-            else range(0, last_start + 1)
-        )
-        run_start = next(
-            (
-                start
-                for start in starts
-                if all(slots[index].owner is None for index in range(start, start + count))
-            ),
-            None,
-        )
-        available = (
-            slots[run_start : run_start + count]
-            if run_start is not None
-            else [slot for slot in slots if slot.owner is None][:count]
-        )
-        if run_start is not None:
-            self._allocation_cursor[device_name] = (run_start + count) % self.capacity
-        return available, reclaimed
+    def _take_free_slot_locked(self, device_name: str) -> _DeviceSlot:
+        free = self._free_slots[device_name]
+        queue = self._free_slot_queues[device_name]
+        while queue:
+            index = queue.popleft()
+            if index in free:
+                free.remove(index)
+                return self._slots[device_name][index]
+        if not free:
+            raise _invariant("device-product free-slot index lost its capacity accounting")
+        queue.extend(sorted(free))
+        index = queue.popleft()
+        free.remove(index)
+        return self._slots[device_name][index]
+
+    def _take_compatible_slot_locked(
+        self,
+        device_name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> _DeviceSlot | None:
+        free = self._free_slots[device_name]
+        queue = self._compatible_free_slots.get((device_name, shape, dtype))
+        if queue is None:
+            return None
+        slots = self._slots[device_name]
+        while queue:
+            index = queue.popleft()
+            slot = slots[index]
+            if index in free and slot.shape == shape and slot.dtype == dtype:
+                free.remove(index)
+                return slot
+        return None
+
+    def _restore_planned_slots_locked(self, slots: Iterable[_DeviceSlot]) -> None:
+        for slot in slots:
+            if slot.owner is not None:
+                continue
+            free = self._free_slots[slot.device_name]
+            if slot.index in free:
+                continue
+            free.add(slot.index)
+            self._free_slot_queues[slot.device_name].append(slot.index)
+            if slot.shape is not None and slot.dtype is not None:
+                self._compatible_free_slots.setdefault(
+                    (slot.device_name, slot.shape, slot.dtype),
+                    deque(),
+                ).append(slot.index)
 
     def _acquire_slot_locked(
         self,
@@ -1778,6 +1884,7 @@ class DeviceProductTable:
                 raise _invariant("device-product occupancy underflow")
             self._occupied_slots[slot.device_name] = occupied - 1
         slot.owner = None
+        self._restore_planned_slots_locked((slot,))
 
     def _detach_write_locked(self, entry: DeviceProductWrite) -> None:
         if not entry._indexed:
