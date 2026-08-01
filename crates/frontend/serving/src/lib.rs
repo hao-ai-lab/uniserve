@@ -4022,6 +4022,7 @@ async fn dialect_event_stream(
     let mut accepted = false;
     let mut pending_scheduled = None;
     let mut pending_token = None;
+    let mut pending_image_events = Vec::new();
     let mut chat_bridge = chat_processor
         .map(ChatOutputBridge::new)
         .transpose()
@@ -4082,10 +4083,18 @@ async fn dialect_event_stream(
             }
         }};
     }
+    macro_rules! flush_pending_images {
+        () => {{
+            for event in pending_image_events.drain(..) {
+                y.yield_ok(event).await;
+            }
+        }};
+    }
     macro_rules! consume_token {
         ($id:expr, $logprobs:expr) => {{
             let id = $id;
             let logprobs: Option<DecodedLogprobs> = $logprobs;
+            flush_pending_images!();
             emitted_output_tokens = emitted_output_tokens.saturating_add(1);
             let new_bytes =
                 decoder
@@ -4342,12 +4351,11 @@ async fn dialect_event_stream(
             }
             GenEvent::ImageCommit { image_id } => {
                 ensure_output_ready!("image-commit event");
-                y.yield_ok(ServeEvent::ImageCommit {
+                pending_image_events.push(ServeEvent::ImageCommit {
                     candidate_id: CandidateId::PRIMARY,
                     image_id: image_id.to_string(),
                     elapsed_us: started.elapsed().as_micros() as u64,
-                })
-                .await;
+                });
             }
             GenEvent::ImageDone {
                 image_id,
@@ -4359,7 +4367,7 @@ async fn dialect_event_stream(
             } => {
                 ensure_output_ready!("image-done event");
                 image_count = image_count.saturating_add(1);
-                y.yield_ok(ServeEvent::ImageDone {
+                pending_image_events.push(ServeEvent::ImageDone {
                     candidate_id: CandidateId::PRIMARY,
                     image_id: image_id.to_string(),
                     width: Some(width),
@@ -4368,8 +4376,7 @@ async fn dialect_event_stream(
                     sha256: Some(sha256),
                     pixels_png_b64: Some(pixels_png_b64),
                     elapsed_us: started.elapsed().as_micros() as u64,
-                })
-                .await;
+                });
             }
             GenEvent::Finished {
                 reason,
@@ -4380,6 +4387,7 @@ async fn dialect_event_stream(
                 kv_transfer_params,
             } => {
                 ensure_output_ready!("terminal event");
+                flush_pending_images!();
                 let (last_chunk, _) =
                     decoder
                         .flush(None)
@@ -4430,6 +4438,7 @@ async fn dialect_event_stream(
                 return Ok(());
             }
             GenEvent::Rejected { message } => {
+                flush_pending_images!();
                 y.yield_ok(ServeEvent::Rejected {
                     request_id: request_id.clone(),
                     message,
@@ -4438,6 +4447,7 @@ async fn dialect_event_stream(
                 return Ok(());
             }
             GenEvent::Error { message } => {
+                flush_pending_images!();
                 y.yield_ok(ServeEvent::Failed {
                     request_id: request_id.clone(),
                     message,
@@ -4448,6 +4458,7 @@ async fn dialect_event_stream(
         }
     }
 
+    flush_pending_images!();
     Err(ServeError::OutputProcessing {
         request_id,
         message: "engine stream closed before a terminal event".to_string(),
@@ -4756,6 +4767,110 @@ mod tests {
             events.last(),
             Some(Ok(ServeEvent::Finished {
                 reason: FinishStatus::Length,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dialect_stream_publishes_an_image_with_its_next_text_token() {
+        let tokenizer: uniserve_model_profile::tokenizer::DynTokenizer = Arc::new(ByteTokenizer);
+        let processor = bagel_processor(Arc::clone(&tokenizer));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(GenEvent::Scheduled {
+            queued_at: 1.0,
+            scheduled_at: 2.0,
+        })
+        .unwrap();
+
+        let events = dialect_event_stream(
+            "feedback-output".into(),
+            dialect_event_context(),
+            vec![b'p' as u32],
+            tokenizer,
+            false,
+            false,
+            TextDecodeOptions::default(),
+            processor,
+            None,
+            GenerationEventStream::new(rx),
+        );
+        tokio::pin!(events);
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::Accepted { .. }))
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::Scheduled { .. }))
+        ));
+
+        tx.send(GenEvent::TextToken {
+            id: b'a' as u32,
+            logprob: None,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::TextDelta { text, .. })) if text == "a"
+        ));
+
+        tx.send(GenEvent::ImageCommit { image_id: 0 })
+            .await
+            .unwrap();
+        tx.send(GenEvent::ImageDone {
+            image_id: 0,
+            height: 1,
+            width: 1,
+            bytes: 3,
+            sha256: "image".to_string(),
+            pixels_png_b64: "cG5n".to_string(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), events.next())
+                .await
+                .is_err(),
+            "the image became public before a continuation token arrived"
+        );
+
+        tx.send(GenEvent::TextToken {
+            id: b'b' as u32,
+            logprob: None,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::ImageCommit { .. }))
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::ImageDone { .. }))
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::TextDelta { text, .. })) if text == "b"
+        ));
+
+        tx.send(GenEvent::Finished {
+            reason: GenerationFinishReason::Eos,
+            stop_reason: None,
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            images: 1,
+            kv_transfer_params: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let terminal = events.collect::<Vec<_>>().await;
+        assert!(matches!(
+            terminal.last(),
+            Some(Ok(ServeEvent::Finished {
+                reason: FinishStatus::Stop { .. },
                 ..
             }))
         ));
