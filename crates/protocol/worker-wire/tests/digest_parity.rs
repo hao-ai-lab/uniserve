@@ -50,7 +50,7 @@ fn canonical_operation() -> Operation {
         generation: 3,
         kind: ProductKind::Token,
         storage_class: StorageClass::DeviceTensor,
-        dtype: DType::I32,
+        dtype: DType::U32,
         shape_bound: ShapeBound {
             dims: vec![DimBound::Static(1)],
         },
@@ -59,16 +59,48 @@ fn canonical_operation() -> Operation {
             max_points: 1,
         },
     };
-    let kv_output = ProductRef {
+    let selected_point_output = ProductRef {
         request_key: request_key(),
         producer_op_id: OpId(11),
         output_index: 1,
-        generation: 5,
-        kind: ProductKind::Kv,
-        storage_class: StorageClass::PagedKv,
-        dtype: DType::BF16,
+        generation: 4,
+        kind: ProductKind::SelectedPoint,
+        storage_class: StorageClass::DeviceTensor,
+        dtype: DType::U32,
         shape_bound: ShapeBound {
-            dims: vec![DimBound::Device { max: 64 }],
+            dims: vec![DimBound::Static(1)],
+        },
+        point_range: PointRange {
+            base_point: 0,
+            max_points: 1,
+        },
+    };
+    let accepted_span_output = ProductRef {
+        request_key: request_key(),
+        producer_op_id: OpId(11),
+        output_index: 2,
+        generation: 5,
+        kind: ProductKind::AcceptedSpan,
+        storage_class: StorageClass::DeviceTensor,
+        dtype: DType::U32,
+        shape_bound: ShapeBound {
+            dims: vec![DimBound::Static(2)],
+        },
+        point_range: PointRange {
+            base_point: 0,
+            max_points: 1,
+        },
+    };
+    let continuation_output = ProductRef {
+        request_key: request_key(),
+        producer_op_id: OpId(11),
+        output_index: 3,
+        generation: 6,
+        kind: ProductKind::Continuation,
+        storage_class: StorageClass::DeviceTensor,
+        dtype: DType::I64,
+        shape_bound: ShapeBound {
+            dims: vec![DimBound::Static(4)],
         },
         point_range: PointRange {
             base_point: 0,
@@ -91,7 +123,12 @@ fn canonical_operation() -> Operation {
             max_transfer_bytes: 0,
         },
         vec![input],
-        vec![token_output, kv_output],
+        vec![
+            token_output,
+            selected_point_output,
+            accepted_span_output,
+            continuation_output,
+        ],
         vec![BlockId(64)],
         None,
         Some(Rng {
@@ -114,6 +151,10 @@ fn canonical_completion(semantic_digest: String) -> CompletionRecord {
             token_len: 41,
             kv_visible_len: 41,
             latent_len: 0,
+            kv_reserved_len: 64,
+            kv_initialized_len: 42,
+            kv_committed_len: 41,
+            kv_published_len: 40,
         },
         token_span: TokenSpan { base: 40, len: 1 },
         committed_tokens: vec![50256],
@@ -122,7 +163,7 @@ fn canonical_completion(semantic_digest: String) -> CompletionRecord {
             length: false,
             stop: true,
         },
-        product_generations: vec![3, 5],
+        product_generations: vec![3, 4, 5, 6],
         semantic_digest,
         error_code: None,
         timing_counters: TimingCounters::default(),
@@ -186,6 +227,7 @@ fn emit_digest_parity_fixture() {
         adapter_mode: AdapterMode::PerRequest,
         execution_constraints: ExecutionConstraints {
             max_batch_operations: 16,
+            ..ExecutionConstraints::default()
         },
         kv_dtype: "bfloat16".into(),
         model_dtype: "bfloat16".into(),
@@ -215,6 +257,10 @@ fn emit_digest_parity_fixture() {
             "max_vision_feature_bytes": caps.max_vision_feature_bytes,
             "adapter_mode": "per_request",
             "max_batch_operations": caps.execution_constraints.max_batch_operations,
+            "max_speculative_points": caps.execution_constraints.max_speculative_points,
+            "device_sequence_lengths": caps.execution_constraints.device_sequence_lengths,
+            "device_append_offsets": caps.execution_constraints.device_append_offsets,
+            "incremental_kv_publication": caps.execution_constraints.incremental_kv_publication,
             "kv_dtype": caps.kv_dtype,
             "model_dtype": caps.model_dtype,
             "attention_backend": caps.attention_backend,

@@ -243,6 +243,9 @@ pub enum ProductKind {
     Completion = 8,
     SamplingState = 9,
     Finish = 10,
+    SelectedPoint = 11,
+    AcceptedSpan = 12,
+    Continuation = 13,
 }
 
 /// The worker store family that backs a product.
@@ -437,6 +440,13 @@ impl VersionRef {
                     "device version selected point has no logical generation"
                 );
                 anyhow::ensure!(
+                    selected_point.kind == ProductKind::SelectedPoint
+                        && selected_point.storage_class == StorageClass::DeviceTensor
+                        && selected_point.dtype == DType::U32
+                        && selected_point.shape_bound.max_elements() == 1,
+                    "device version does not name a scalar selected-point product"
+                );
+                anyhow::ensure!(
                     is_digest(producer_plan_digest),
                     "device version reference has an invalid producer plan digest"
                 );
@@ -608,6 +618,10 @@ impl Operation {
                     output.max_bytes() <= self.bounds.max_completion_bytes,
                     "a host-visible output exceeds the operation completion-byte bound"
                 ),
+                StorageClass::PagedKv => anyhow::ensure!(
+                    output.max_bytes() <= self.bounds.max_transfer_bytes,
+                    "a paged-KV output exceeds the operation transfer-byte bound"
+                ),
                 _ => {}
             }
             anyhow::ensure!(
@@ -687,6 +701,10 @@ pub struct LogicalLengths {
     pub token_len: u32,
     pub kv_visible_len: u32,
     pub latent_len: u32,
+    pub kv_reserved_len: u32,
+    pub kv_initialized_len: u32,
+    pub kv_committed_len: u32,
+    pub kv_published_len: u32,
 }
 
 /// The span of tokens an operation contributed.
@@ -1528,9 +1546,25 @@ pub enum AdapterMode {
     MultiAdapter,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionConstraints {
     pub max_batch_operations: u32,
+    pub max_speculative_points: u32,
+    pub device_sequence_lengths: bool,
+    pub device_append_offsets: bool,
+    pub incremental_kv_publication: bool,
+}
+
+impl Default for ExecutionConstraints {
+    fn default() -> Self {
+        Self {
+            max_batch_operations: 1,
+            max_speculative_points: 17,
+            device_sequence_lengths: true,
+            device_append_offsets: true,
+            incremental_kv_publication: true,
+        }
+    }
 }
 
 /// A worker's advertised capabilities. Admission requires every rank, worker,
@@ -1602,6 +1636,10 @@ impl EngineCaps {
         digest.u64(self.max_vision_feature_bytes);
         digest.u8(self.adapter_mode as u8);
         digest.u32(self.execution_constraints.max_batch_operations);
+        digest.u32(self.execution_constraints.max_speculative_points);
+        digest.bool(self.execution_constraints.device_sequence_lengths);
+        digest.bool(self.execution_constraints.device_append_offsets);
+        digest.bool(self.execution_constraints.incremental_kv_publication);
         digest.string(&self.kv_dtype);
         digest.string(&self.model_dtype);
         digest.string(&self.attention_backend);
@@ -1618,6 +1656,11 @@ impl EngineCaps {
         anyhow::ensure!(
             !self.supported_work.is_empty(),
             "worker capabilities declare no work variants"
+        );
+        anyhow::ensure!(
+            self.execution_constraints.max_batch_operations > 0
+                && self.execution_constraints.max_speculative_points > 0,
+            "worker execution constraints declare a zero bound"
         );
         anyhow::ensure!(
             self.protocol_layout_digest == protocol_layout_digest(),
@@ -1685,6 +1728,26 @@ pub fn protocol_layout_digest() -> Digest {
     for variant in WorkVariant::ALL {
         digest.string(variant.as_wire_str());
     }
+    let product_kinds = [
+        "token",
+        "logprob",
+        "draft",
+        "vision_feature",
+        "latent_feature",
+        "kv",
+        "latent",
+        "artifact",
+        "completion",
+        "sampling_state",
+        "finish",
+        "selected_point",
+        "accepted_span",
+        "continuation",
+    ];
+    digest.u64(product_kinds.len() as u64);
+    for kind in product_kinds {
+        digest.string(kind);
+    }
     for control in ["commit", "close", "release"] {
         digest.string(control);
     }
@@ -1701,6 +1764,7 @@ pub fn protocol_layout_digest() -> Digest {
             "bounds",
             "inputs",
             "outputs",
+            "new_kv_blocks",
             "predicate",
             "rng",
             "control_seq",
@@ -1738,6 +1802,19 @@ pub fn protocol_layout_digest() -> Digest {
         for field in record {
             digest.string(field);
         }
+    }
+    let logical_lengths = [
+        "token_len",
+        "kv_visible_len",
+        "latent_len",
+        "kv_reserved_len",
+        "kv_initialized_len",
+        "kv_committed_len",
+        "kv_published_len",
+    ];
+    digest.u64(logical_lengths.len() as u64);
+    for field in logical_lengths {
+        digest.string(field);
     }
     digest.finish()
 }

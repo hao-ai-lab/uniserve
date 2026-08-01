@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from uniserve_worker.batch import (
+    DeviceDim,
     DType,
     PointRange,
     ProductKind,
@@ -20,7 +21,7 @@ pytestmark = [
 ]
 
 
-def _reference(op_id: int, generation: int) -> ProductRef:
+def _reference(op_id: int, generation: int, *, elements: int = 1) -> ProductRef:
     return ProductRef(
         request_key=RequestKey(1, 9, 2),
         producer_op_id=op_id,
@@ -29,7 +30,7 @@ def _reference(op_id: int, generation: int) -> ProductRef:
         kind=ProductKind.TOKEN,
         storage_class=StorageClass.DEVICE_TENSOR,
         dtype=DType.U32,
-        shape_bound=ShapeBound(),
+        shape_bound=(ShapeBound() if elements == 1 else ShapeBound((DeviceDim(elements),))),
         point_range=PointRange(),
     )
 
@@ -175,3 +176,33 @@ def test_batched_producer_writes_registered_scalar_storage_directly() -> None:
 
     torch.cuda.synchronize(device)
     assert tuple(int(read.tensor.item()) for read in recycled_reads) == (1, 3, 2, 0)
+
+
+def test_row_product_publication_uses_one_completion_event() -> None:
+    device = torch.device("cuda:0")
+    table = DeviceProductTable(capacity=3)
+    references = tuple(_reference(71 + index, 31 + index, elements=4) for index in range(3))
+    writes = table.bind_outputs(tuple((reference, "ab" * 32, device) for reference in references))
+    values = torch.tensor(
+        (
+            (1, 2, 3, 4),
+            (5, 6, 7, 8),
+            (9, 10, 11, 12),
+        ),
+        dtype=torch.long,
+        device=device,
+    )
+
+    table.publish_rows(writes, values)
+    event = writes[0].producer_event
+    assert event is not None
+    assert all(write.producer_event is event for write in writes)
+    reads = table.consume_batch(
+        tuple(
+            (reference, 81 + index, "ab" * 32, device) for index, reference in enumerate(references)
+        )
+    )
+    observed = torch.stack(tuple(read.tensor for read in reads))
+    table.record_readers(reads, device=device)
+
+    torch.testing.assert_close(observed, values)

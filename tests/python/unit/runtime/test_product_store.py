@@ -52,6 +52,7 @@ def _device_ref(
     dtype: DType = DType.U32,
     output_index: int = 0,
     kind: ProductKind = ProductKind.TOKEN,
+    elements: int = 1,
 ) -> ProductRef:
     return ProductRef(
         request_key=RequestKey(1, 7, 3),
@@ -61,7 +62,7 @@ def _device_ref(
         kind=kind,
         storage_class=StorageClass.DEVICE_TENSOR,
         dtype=dtype,
-        shape_bound=ShapeBound(),
+        shape_bound=(ShapeBound() if elements == 1 else ShapeBound((DeviceDim(elements),))),
         point_range=PointRange(),
     )
 
@@ -279,6 +280,91 @@ def test_scalar_output_groups_retain_independent_direct_producer_ranges() -> Non
         (3,),
         (3,),
     )
+
+
+def test_row_output_batch_publishes_each_registered_tensor_shape() -> None:
+    table = DeviceProductTable(capacity=3)
+    references = tuple(
+        _device_ref(op_id=91 + index, generation=60 + index, elements=3) for index in range(3)
+    )
+    writes = table.bind_outputs(tuple((reference, "ab" * 32, "cpu") for reference in references))
+
+    table.publish_rows(
+        writes,
+        torch.tensor(
+            (
+                (1, 2, 3),
+                (4, 5, 6),
+                (7, 8, 9),
+            ),
+            dtype=torch.long,
+        ),
+    )
+    reads = table.consume_batch(
+        tuple(
+            (reference, 101 + index, "ab" * 32, "cpu") for index, reference in enumerate(references)
+        )
+    )
+
+    assert tuple(read.tensor.tolist() for read in reads) == (
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+    )
+    assert tuple(write.actual_shape for write in writes) == ((3,), (3,), (3,))
+
+
+def test_mixed_shape_generations_reuse_compatible_resident_storage() -> None:
+    table = DeviceProductTable(capacity=4)
+    first = tuple(
+        _device_ref(
+            op_id=101 + index,
+            generation=70 + index,
+            output_index=index,
+            elements=elements,
+        )
+        for index, elements in enumerate((2, 4, 2, 4))
+    )
+    first_writes = table.bind_outputs(
+        tuple((reference, "ab" * 32, "cpu") for reference in first)
+    )
+    for write, elements in zip(first_writes, (2, 4, 2, 4), strict=True):
+        table.publish_write(write, torch.arange(elements, dtype=torch.long))
+    first_storage = {
+        elements: {
+            write.slot.tensor.untyped_storage().data_ptr()
+            for write in first_writes
+            if write.slot.tensor is not None and write.actual_extent == elements
+        }
+        for elements in (2, 4)
+    }
+    table.release_operations(
+        (reference.request_key, reference.producer_op_id) for reference in first
+    )
+    assert table.reclaim_ready() == 4
+
+    second = tuple(
+        _device_ref(
+            op_id=111 + index,
+            generation=80 + index,
+            output_index=index,
+            elements=elements,
+        )
+        for index, elements in enumerate((4, 2, 4, 2))
+    )
+    second_writes = table.bind_outputs(
+        tuple((reference, "cd" * 32, "cpu") for reference in second)
+    )
+    second_storage = {
+        elements: {
+            write.slot.tensor.untyped_storage().data_ptr()
+            for write in second_writes
+            if write.slot.tensor is not None and write.slot.tensor.numel() == elements
+        }
+        for elements in (2, 4)
+    }
+
+    assert second_storage == first_storage
 
 
 def test_operation_release_covers_continuation_and_regular_outputs() -> None:

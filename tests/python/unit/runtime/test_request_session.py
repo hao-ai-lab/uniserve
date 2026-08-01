@@ -2,37 +2,70 @@ from __future__ import annotations
 
 import pytest
 
-from tests.python.fixtures.depth_one import root_parent, token_operation, und_admission
 from uniserve_worker.batch import (
     Admission,
+    Bounds,
     Close,
     CloseReason,
     Commit,
     Disposition,
+    Domain,
     FixedPoint,
+    Operation,
     RequestKey,
     TokenMode,
     UndAdmission,
     VersionRef,
+    Work,
 )
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.request_session import ResolvedRuntimeState, SessionStore
 from uniserve_worker.runtime.snapshot_store import SnapshotProvider
 
 
-def test_step_rollback_restores_scalar_and_lineage_state() -> None:
-    sessions = SessionStore()
-    admission = und_admission(7, block_ids=(0,))
-    session = sessions.admit(admission)
-    session.product_handles.update({11, 13})
-    operation, _token_input = token_operation(
-        admission.request_key,
-        op_id=11,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
+def _admit(sessions: SessionStore, session_id: int = 7) -> tuple[Admission, object]:
+    admission = Admission.create(RequestKey(0, session_id, 3), und=UndAdmission())
+    return admission, sessions.admit(admission)
+
+
+def _runtime(point: int, *, initialized: int = 4, committed: int = 0) -> ResolvedRuntimeState:
+    return ResolvedRuntimeState(
+        logical_position=point,
+        rng_counter=point,
+        kv_reserved_len=4,
+        kv_initialized_len=initialized,
+        kv_visible_len=point,
+        kv_committed_len=committed,
+        kv_published_len=0,
     )
-    selected = VersionRef(admission.request_key, 11, FixedPoint(1, "a" * 64))
+
+
+def _version(request_key: RequestKey, op_id: int, point: int, byte: str) -> VersionRef:
+    return VersionRef(request_key, op_id, FixedPoint(point, byte * 64))
+
+
+def _verify_operation(request_key: RequestKey, parent: VersionRef, op_id: int = 11) -> Operation:
+    return Operation.registered(
+        request_key=request_key,
+        op_id=op_id,
+        parent=parent,
+        work=Work.token(TokenMode.VERIFY),
+        route=0,
+        domain=Domain.UND,
+        bounds=Bounds(max_points=4, max_tokens=4),
+    )
+
+
+def test_step_rollback_restores_scalar_and_prefix_ledgers() -> None:
+    sessions = SessionStore()
+    admission, session = _admit(sessions)
+    session.product_handles.update({11, 13})
+    operation = _verify_operation(admission.request_key, session.committed_version())
+    selected = _version(admission.request_key, 11, 2, "b")
+    prefixes = (
+        (_version(admission.request_key, 11, 1, "a"), _runtime(1)),
+        (selected, _runtime(2)),
+    )
     transaction = sessions.begin_step(1, (operation,), ())
 
     def fail_publish() -> None:
@@ -41,152 +74,138 @@ def test_step_rollback_restores_scalar_and_lineage_state() -> None:
     with pytest.raises(RuntimeError, match="publication failed"):
         transaction.commit(
             {7: selected},
-            {7: ResolvedRuntimeState(logical_position=1, rng_counter=1, kv_length=1)},
-            fail_publish,
+            {7: _runtime(2)},
+            resolved_prefixes={7: prefixes},
+            publish=fail_publish,
         )
 
     restored = sessions.get(7)
-    assert restored.resolved_version() == root_parent(admission)
+    assert restored.resolved_version() == session.committed_version()
     assert restored.product_handles == {11, 13}
-    assert tuple(restored.resolved_versions) == (0,)
+    assert tuple(restored.resolved_versions.values()) == (session.committed_version(),)
+    assert restored.resolved_parents == {0: session.committed_version()}
 
 
-def _resolved_version(
-    sessions: SessionStore,
-    session_id: int,
-    *,
-    op_id: int,
-    point: int,
-    digest: str,
-) -> VersionRef:
-    session = sessions.get(session_id)
-    selected = VersionRef(session.request_key, op_id, FixedPoint(point, digest))
-    session.version = point
-    session.resolved_op_id = op_id
-    session.resolved_digest = digest
-    session.resolved_versions[op_id] = selected
-    session.logical_position = point
-    session.rng_counter = point
-    session.resolved_runtime[op_id] = ResolvedRuntimeState(
-        logical_position=point,
-        rng_counter=point,
-        kv_length=point,
-    )
-    return selected
-
-
-def test_commit_advances_only_the_ordered_semantic_cursor() -> None:
+def test_commit_selects_any_contiguous_prefix_with_its_exact_kv_extent() -> None:
     sessions = SessionStore()
-    session = sessions.admit(Admission.create(RequestKey(0, 7, 3), und=UndAdmission()))
+    admission, session = _admit(sessions)
     root = session.committed_version()
-    selected = _resolved_version(sessions, 7, op_id=11, point=1, digest="a" * 64)
-
-    control = Commit(
-        request_key=session.request_key,
-        control_seq=1,
-        expected_parent=root,
-        selected=selected,
-        public_event_limit=4,
-        disposition=Disposition.PUBLISH,
+    operation = _verify_operation(admission.request_key, root)
+    prefixes = tuple(
+        (_version(admission.request_key, 11, point, byte), _runtime(point))
+        for point, byte in ((1, "a"), (2, "b"), (3, "c"))
     )
-    sessions.apply_controls((control,))
-    sessions.apply_controls((control,))
+    selected = prefixes[-1][0]
+    transaction = sessions.begin_step(1, (operation,), ())
+    transaction.commit(
+        {7: selected},
+        {7: prefixes[-1][1]},
+        resolved_prefixes={7: prefixes},
+    )
 
-    assert session.committed_version() == selected
-    assert session.resolved_version() == selected
-    assert session.applied_control_seq == 1
-    assert session.public_event_limit == 4
-
-
-def test_close_rewinds_resolved_descendants_to_the_exact_cutoff() -> None:
-    sessions = SessionStore()
-    session = sessions.admit(Admission.create(RequestKey(0, 7, 3), und=UndAdmission()))
-    root = session.committed_version()
-    cutoff = _resolved_version(sessions, 7, op_id=11, point=1, digest="a" * 64)
-    sessions.apply_controls(
+    cutoff = prefixes[1][0]
+    updates = sessions.apply_controls(
         (
             Commit(
-                request_key=session.request_key,
+                request_key=admission.request_key,
                 control_seq=1,
                 expected_parent=root,
                 selected=cutoff,
-                public_event_limit=4,
+                public_event_limit=2,
                 disposition=Disposition.PUBLISH,
             ),
         )
     )
-    committed = _resolved_version(sessions, 7, op_id=12, point=2, digest="b" * 64)
-    sessions.apply_controls(
-        (
-            Commit(
-                request_key=session.request_key,
-                control_seq=2,
-                expected_parent=cutoff,
-                selected=committed,
-                public_event_limit=8,
-                disposition=Disposition.PUBLISH,
-            ),
-        )
-    )
-    _resolved_version(sessions, 7, op_id=13, point=3, digest="c" * 64)
-    assert session.resolved_runtime[committed.producer_op_id].kv_length == 2
-    live = sessions.snapshot_live({7})[0]
-    assert live.committed_version() == committed
-    assert live.resolved_version().point == FixedPoint(3, "c" * 64)
 
+    assert session.committed_version() == cutoff
+    assert session.resolved_version() == selected
+    assert session.runtime_for(cutoff) == _runtime(2)
+    assert updates[0].visible_len == 2
+    assert updates[0].committed_len == 2
+
+
+def test_close_retracts_to_one_exact_resolved_prefix() -> None:
+    sessions = SessionStore()
+    admission, session = _admit(sessions)
+    root = session.committed_version()
+    operation = _verify_operation(admission.request_key, root)
+    prefixes = tuple(
+        (_version(admission.request_key, 11, point, byte), _runtime(point))
+        for point, byte in ((1, "a"), (2, "b"), (3, "c"))
+    )
+    transaction = sessions.begin_step(1, (operation,), ())
+    transaction.commit(
+        {7: prefixes[-1][0]},
+        {7: prefixes[-1][1]},
+        resolved_prefixes={7: prefixes},
+    )
     sessions.apply_controls(
         (
             Close(
-                request_key=session.request_key,
-                control_seq=3,
-                cutoff=cutoff,
+                request_key=admission.request_key,
+                control_seq=1,
+                cutoff=prefixes[0][0],
                 reason=CloseReason.CANCELLED,
             ),
         )
     )
 
+    cutoff = prefixes[0][0]
     assert session.terminal_cutoff == cutoff
     assert session.committed_version() == cutoff
     assert session.resolved_version() == cutoff
     assert session.logical_position == 1
     assert session.rng_counter == 1
-    assert session.resolved_runtime[cutoff.producer_op_id].kv_length == 1
-    assert session.applied_control_seq == 3
     assert tuple(session.resolved_versions.values()) == (cutoff,)
+    assert tuple(session.resolved_runtime.values()) == (_runtime(1),)
 
     restored = SnapshotProvider._session_from_json(SnapshotProvider._session_to_json(session))
     assert restored.committed_version() == cutoff
     assert restored.resolved_version() == cutoff
     assert restored.terminal_cutoff == cutoff
-    assert restored.control_digests == session.control_digests
+    assert restored.runtime_for(cutoff) == _runtime(1)
 
 
-def test_rejected_control_identity_does_not_consume_its_sequence() -> None:
+def test_commit_requires_the_selected_operation_to_name_the_current_parent() -> None:
     sessions = SessionStore()
-    session = sessions.admit(Admission.create(RequestKey(0, 7, 3), und=UndAdmission()))
+    admission, session = _admit(sessions)
     root = session.committed_version()
-    selected = _resolved_version(sessions, 7, op_id=11, point=1, digest="a" * 64)
-    invalid = Commit(
-        request_key=session.request_key,
-        control_seq=1,
-        expected_parent=selected,
-        selected=selected,
-        public_event_limit=4,
-        disposition=Disposition.PUBLISH,
+    operation = _verify_operation(admission.request_key, root)
+    selected = _version(admission.request_key, 11, 1, "a")
+    transaction = sessions.begin_step(1, (operation,), ())
+    transaction.commit(
+        {7: selected},
+        {7: _runtime(1)},
+        resolved_prefixes={7: ((selected, _runtime(1)),)},
     )
-    with pytest.raises(WorkerError):
-        sessions.apply_controls((invalid,))
+    different_parent = VersionRef(admission.request_key, 0, FixedPoint(0, "d" * 64))
 
-    sessions.apply_controls(
-        (
-            Commit(
-                request_key=session.request_key,
-                control_seq=1,
-                expected_parent=root,
-                selected=selected,
-                public_event_limit=4,
-                disposition=Disposition.PUBLISH,
-            ),
+    with pytest.raises(WorkerError, match="expected parent is not current"):
+        sessions.apply_controls(
+            (
+                Commit(
+                    request_key=admission.request_key,
+                    control_seq=1,
+                    expected_parent=different_parent,
+                    selected=selected,
+                    public_event_limit=1,
+                    disposition=Disposition.PUBLISH,
+                ),
+            )
         )
-    )
-    assert session.committed_version() == selected
+
+    assert session.committed_version() == root
+    assert session.applied_control_seq == 0
+
+
+def test_runtime_state_enforces_the_five_extent_order() -> None:
+    with pytest.raises(WorkerError, match="not monotonically contained"):
+        ResolvedRuntimeState(
+            logical_position=1,
+            rng_counter=1,
+            kv_reserved_len=4,
+            kv_initialized_len=2,
+            kv_visible_len=3,
+            kv_committed_len=1,
+            kv_published_len=0,
+        )

@@ -85,18 +85,13 @@ impl StubExecutor {
     /// operation commits the request's session id as its single token; every
     /// other work variant contributes no committed tokens.
     fn echo_record(operation: &Operation) -> CompletionRecord {
-        let (parent_index, parent_semantic) = match &operation.parent.point {
+        let parent_semantic = match &operation.parent.point {
             Point::Fixed {
-                point_index,
-                semantic_digest,
-            } => (*point_index, semantic_digest.clone()),
-            Point::Device { .. } => (0, "0".repeat(64)),
+                semantic_digest, ..
+            } => semantic_digest.clone(),
+            Point::Device { .. } => "0".repeat(64),
         };
-        let selected_point = if operation.advances_state {
-            parent_index.saturating_add(1)
-        } else {
-            parent_index
-        };
+        let selected_point = u32::from(operation.advances_state);
         let committed_tokens = if matches!(operation.work, Work::Token(_)) {
             vec![operation.request_key.session_id.0 as u32]
         } else {
@@ -112,6 +107,7 @@ impl StubExecutor {
                 token_len: committed_tokens.len() as u32,
                 kv_visible_len: 0,
                 latent_len: 0,
+                ..LogicalLengths::default()
             },
             token_span: TokenSpan {
                 base: 0,

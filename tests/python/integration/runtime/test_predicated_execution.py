@@ -51,7 +51,12 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         parent=VersionRef(
             admission.request_key,
             parent.op_id,
-            DevicePoint(parent.outputs[0], parent.plan_digest),
+            DevicePoint(
+                next(
+                    output for output in parent.outputs if output.kind is ProductKind.SELECTED_POINT
+                ),
+                parent.plan_digest,
+            ),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
@@ -74,7 +79,14 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         parent=VersionRef(
             admission.request_key,
             successor.op_id,
-            DevicePoint(successor.outputs[0], successor.plan_digest),
+            DevicePoint(
+                next(
+                    output
+                    for output in successor.outputs
+                    if output.kind is ProductKind.SELECTED_POINT
+                ),
+                successor.plan_digest,
+            ),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
@@ -107,14 +119,15 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         FixedPoint(parent_completion.selected_point, parent_completion.semantic_digest),
     )
     session = worker.sessions.get(51)
-    parent_runtime = session.resolved_runtime[parent.op_id]
+    parent_runtime = session.runtime_for(resolved_parent)
+    assert parent_runtime is not None
     assert session.resolved_version() == resolved_parent
     assert completion.logical_lengths.token_len == parent_runtime.logical_position
-    assert completion.logical_lengths.kv_visible_len == parent_runtime.kv_length
+    assert completion.logical_lengths.kv_visible_len == parent_runtime.kv_visible_len
     assert descendant_completion.logical_lengths == completion.logical_lengths
     assert session.logical_position == parent_runtime.logical_position
     assert session.rng_counter == parent_runtime.rng_counter
-    assert worker.kv.get(51).length == parent_runtime.kv_length
+    assert worker.kv.get(51).length == parent_runtime.kv_visible_len
 
     selected = VersionRef(
         admission.request_key,

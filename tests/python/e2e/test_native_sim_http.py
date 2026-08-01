@@ -204,7 +204,7 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
             json.dumps(
                 {
                     "id": "smoke-1",
-                    "task": "default",
+                    "task": "interleave",
                     "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
                 }
             )
@@ -220,6 +220,8 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
             num_prompts=1,
             warmup_requests=0,
             max_tokens=8,
+            max_images=1,
+            extra_request_body={"logit_bias": {"151670": 100.0}},
             runtime_profile_id="sensenova-u1",
             plan_evidence_policy="runtime_inspection",
         )
@@ -245,7 +247,7 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
             "cfg_interval": [0.0, 1.0],
             "timestep_shift": 3.0,
             "seed": 42,
-            "max_images": 4,
+            "max_images": 1,
             "image_prompt_count": 0,
             "retain_images": True,
         }

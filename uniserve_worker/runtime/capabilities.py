@@ -42,9 +42,7 @@ def resolve_capabilities(
         else 0
     )
     hidden_elements = int(spec.cache.num_attention_heads) * int(spec.cache.head_dim)
-    max_vision_feature_bytes = (
-        int(spec.inputs.max_vit_grid_tokens) * hidden_elements * 2
-    )
+    max_vision_feature_bytes = int(spec.inputs.max_vit_grid_tokens) * hidden_elements * 2
     max_latent_feature_bytes = (
         0
         if flow is None
@@ -94,7 +92,11 @@ def resolve_capabilities(
         supported_controls=tuple(controls),
         adapter_mode=AdapterMode(deployment.adapter_mode),
         execution_constraints=ExecutionConstraints(
-            max_batch_operations=int(deployment.max_batch_operations)
+            max_batch_operations=int(deployment.max_batch_operations),
+            max_speculative_points=17,
+            device_sequence_lengths=True,
+            device_append_offsets=True,
+            incremental_kv_publication=True,
         ),
         resource_classes=tuple(ResourceClass(value) for value in resources.classes()),
         attention_backend=deployment.attention_backend or "auto",
@@ -134,13 +136,7 @@ def _kv_bytes_per_token(spec: ModelSpec, deployment: DeploymentOverlay) -> int:
     if width is None:
         raise ValueError(f"unsupported KV dtype {_kv_dtype(spec, deployment)!r}")
     cache = spec.cache
-    return (
-        2
-        * int(width)
-        * int(cache.num_layers)
-        * int(cache.num_kv_heads)
-        * int(cache.head_dim)
-    )
+    return 2 * int(width) * int(cache.num_layers) * int(cache.num_kv_heads) * int(cache.head_dim)
 
 
 def _kv_residency_shape(

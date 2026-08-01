@@ -12,8 +12,11 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Batch,
+    Commit,
     DevicePoint,
+    Disposition,
     DrawLayout,
+    FixedPoint,
     Operation,
     ProductKind,
     Release,
@@ -35,7 +38,7 @@ pytestmark = [
 ]
 
 
-def test_token_and_finish_outputs_are_fenced_after_sampling_submission() -> None:
+def test_token_selected_point_and_finish_outputs_are_fenced_after_sampling_submission() -> None:
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     admission = und_admission(29, block_ids=(0,))
     operation, token_input = token_operation(
@@ -55,19 +58,27 @@ def test_token_and_finish_outputs_are_fenced_after_sampling_submission() -> None
         )
     )
     token = next(output for output in operation.outputs if output.kind is ProductKind.TOKEN)
+    selected = next(
+        output for output in operation.outputs if output.kind is ProductKind.SELECTED_POINT
+    )
     finish = next(output for output in operation.outputs if output.kind is ProductKind.FINISH)
-    token_read, finish_read = worker.products.device_products.consume_batch(
-        (
-            (token, 2, operation.plan_digest, "cuda:0"),
-            (finish, 2, operation.plan_digest, "cuda:0"),
-        ),
-        device="cuda:0",
+    token_read, selected_read, finish_read = (
+        worker.products.device_products.consume_batch(
+            (
+                (token, 2, operation.plan_digest, "cuda:0"),
+                (selected, 2, operation.plan_digest, "cuda:0"),
+                (finish, 2, operation.plan_digest, "cuda:0"),
+            ),
+            device="cuda:0",
+        )
     )
 
     assert token_read._write.producer_event is not None
+    assert selected_read._write.producer_event is not None
     assert finish_read._write.producer_event is not None
+    torch.testing.assert_close(selected_read.tensor, torch.tensor([1], device="cuda:0"))
     worker.products.device_products.record_readers(
-        (token_read, finish_read),
+        (token_read, selected_read, finish_read),
         device="cuda:0",
     )
 
@@ -125,7 +136,10 @@ def test_same_request_continues_from_device_products_before_parent_observation(
     device_parent = VersionRef(
         admission.request_key,
         parent.op_id,
-        DevicePoint(parent.outputs[0], parent.plan_digest),
+        DevicePoint(
+            next(output for output in parent.outputs if output.kind is ProductKind.SELECTED_POINT),
+            parent.plan_digest,
+        ),
     )
     successor_template, _ = token_operation(
         admission.request_key,
@@ -164,6 +178,32 @@ def test_same_request_continues_from_device_products_before_parent_observation(
     first = _next_token(4)
     assert parent_report.completions[0].committed_tokens == (first,)
     assert successor_report.completions[0].committed_tokens == (_next_token(first),)
+    parent_record = parent_report.completions[0]
+    parent_selected = VersionRef(
+        admission.request_key,
+        parent.op_id,
+        FixedPoint(parent_record.selected_point, parent_record.semantic_digest),
+    )
+    worker.execute(
+        Batch(
+            step_id=3,
+            admissions=(),
+            operations=(),
+            controls=(
+                Commit(
+                    request_key=admission.request_key,
+                    control_seq=1,
+                    expected_parent=root_parent(admission),
+                    selected=parent_selected,
+                    public_event_limit=1,
+                    disposition=Disposition.PUBLISH,
+                ),
+            ),
+        )
+    )
+    extents = worker.kv.get(admission.request_key.session_id).extents()
+    assert extents.visible == 3
+    assert extents.committed == 2
 
 
 def test_stochastic_device_continuation_matches_depth_one_serial_execution(
@@ -202,7 +242,12 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         parent=VersionRef(
             pipelined.request_key,
             parent.op_id,
-            DevicePoint(parent.outputs[0], parent.plan_digest),
+            DevicePoint(
+                next(
+                    output for output in parent.outputs if output.kind is ProductKind.SELECTED_POINT
+                ),
+                parent.plan_digest,
+            ),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),

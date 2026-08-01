@@ -18,6 +18,7 @@
 //! safe to enable by default and trivially reversible.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use iceoryx2::port::listener::Listener;
@@ -98,6 +99,7 @@ fn make_listener(factory: &EventFactory<IxService>) -> anyhow::Result<Listener<I
 pub struct WakeSender {
     notifier: Arc<Notifier<IxService>>,
     event_id: usize,
+    pending: Arc<AtomicBool>,
 }
 
 impl WakeSender {
@@ -106,6 +108,9 @@ impl WakeSender {
     /// correctness requirement, so a transient notify failure must not surface
     /// as a command/teardown error.
     pub fn wake(&self) {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let _ = self
             .notifier
             .notify_with_custom_event_id(EventId::new(self.event_id));
@@ -133,6 +138,8 @@ impl WakeEvents {
 pub(crate) struct ClientEvents {
     wake_listener: Listener<IxService>,
     wake_notifier: Arc<Notifier<IxService>>,
+    command_pending: Arc<AtomicBool>,
+    death_pending: Arc<AtomicBool>,
 }
 
 impl ClientEvents {
@@ -140,9 +147,13 @@ impl ClientEvents {
         let wake = open_event_service(node, &wake_event_name(service))?;
         let wake_notifier = Arc::new(make_notifier(&wake, EVT_COMMAND)?);
         let wake_listener = make_listener(&wake)?;
+        let command_pending = Arc::new(AtomicBool::new(false));
+        let death_pending = Arc::new(AtomicBool::new(false));
         Ok(Self {
             wake_listener,
             wake_notifier,
+            command_pending,
+            death_pending,
         })
     }
 
@@ -150,6 +161,8 @@ impl ClientEvents {
     /// event id so a backlog cannot cause an immediate re-wake spin.
     pub(crate) fn wait(&self, timeout: Duration) -> anyhow::Result<WakeEvents> {
         let mut ev = WakeEvents::default();
+        self.command_pending.store(false, Ordering::Release);
+        self.death_pending.store(false, Ordering::Release);
         self.wake_listener
             .timed_wait_all(
                 |id| match id.as_value() {
@@ -171,6 +184,7 @@ impl ClientEvents {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
             event_id: EVT_COMMAND,
+            pending: Arc::clone(&self.command_pending),
         }
     }
 
@@ -180,6 +194,7 @@ impl ClientEvents {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
             event_id: EVT_DEATH,
+            pending: Arc::clone(&self.death_pending),
         }
     }
 }
@@ -202,5 +217,51 @@ impl ServerEvents {
         let _ = self
             .wake_notifier
             .notify_with_custom_event_id(EventId::new(EVT_RESULT));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn wake_sources_deliver_across_busy_periods_and_listener_drains() {
+        let node = NodeBuilder::new()
+            .create::<IxService>()
+            .expect("create event test node");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let service = format!("uniserve/test/events/{}/{nonce}", std::process::id());
+        let events = ClientEvents::open(&node, &service).expect("open client events");
+        let command = events.command_wake();
+        let death = events.death_wake();
+
+        for _ in 0..10_000 {
+            command.wake();
+        }
+        assert!(
+            events
+                .wait(Duration::from_secs(1))
+                .expect("drain command wake")
+                .command
+        );
+
+        command.wake();
+        assert!(
+            events
+                .wait(Duration::from_secs(1))
+                .expect("receive next command wake")
+                .command
+        );
+        death.wake();
+        assert!(
+            events
+                .wait(Duration::from_secs(1))
+                .expect("receive death wake")
+                .death
+        );
     }
 }

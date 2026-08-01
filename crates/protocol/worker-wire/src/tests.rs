@@ -30,9 +30,9 @@ fn output_product(op: OpId) -> ProductRef {
         generation: 3,
         kind: ProductKind::Token,
         storage_class: StorageClass::DeviceTensor,
-        dtype: DType::I32,
+        dtype: DType::U32,
         shape_bound: ShapeBound {
-            dims: vec![DimBound::Static(1), DimBound::Device { max: 8 }],
+            dims: vec![DimBound::Static(1)],
         },
         point_range: PointRange {
             base_point: 0,
@@ -41,17 +41,55 @@ fn output_product(op: OpId) -> ProductRef {
     }
 }
 
-fn kv_output(op: OpId) -> ProductRef {
+fn selected_point_product(op: OpId) -> ProductRef {
     ProductRef {
         request_key: request_key(),
         producer_op_id: op,
         output_index: 1,
-        generation: 5,
-        kind: ProductKind::Kv,
-        storage_class: StorageClass::PagedKv,
-        dtype: DType::BF16,
+        generation: 4,
+        kind: ProductKind::SelectedPoint,
+        storage_class: StorageClass::DeviceTensor,
+        dtype: DType::U32,
         shape_bound: ShapeBound {
-            dims: vec![DimBound::Device { max: 64 }],
+            dims: vec![DimBound::Static(1)],
+        },
+        point_range: PointRange {
+            base_point: 0,
+            max_points: 1,
+        },
+    }
+}
+
+fn accepted_span_product(op: OpId) -> ProductRef {
+    ProductRef {
+        request_key: request_key(),
+        producer_op_id: op,
+        output_index: 2,
+        generation: 5,
+        kind: ProductKind::AcceptedSpan,
+        storage_class: StorageClass::DeviceTensor,
+        dtype: DType::U32,
+        shape_bound: ShapeBound {
+            dims: vec![DimBound::Static(2)],
+        },
+        point_range: PointRange {
+            base_point: 0,
+            max_points: 1,
+        },
+    }
+}
+
+fn continuation_product(op: OpId) -> ProductRef {
+    ProductRef {
+        request_key: request_key(),
+        producer_op_id: op,
+        output_index: 3,
+        generation: 6,
+        kind: ProductKind::Continuation,
+        storage_class: StorageClass::DeviceTensor,
+        dtype: DType::I64,
+        shape_bound: ShapeBound {
+            dims: vec![DimBound::Static(4)],
         },
         point_range: PointRange {
             base_point: 0,
@@ -75,7 +113,12 @@ fn token_decode_operation() -> Operation {
             ..Bounds::default()
         },
         Vec::new(),
-        vec![output_product(OpId(11)), kv_output(OpId(11))],
+        vec![
+            output_product(OpId(11)),
+            selected_point_product(OpId(11)),
+            accepted_span_product(OpId(11)),
+            continuation_product(OpId(11)),
+        ],
         vec![BlockId(7)],
         None,
         Some(Rng {
@@ -119,6 +162,7 @@ fn completion_record() -> CompletionRecord {
             token_len: 5,
             kv_visible_len: 5,
             latent_len: 0,
+            ..LogicalLengths::default()
         },
         token_span: TokenSpan { base: 4, len: 1 },
         committed_tokens: vec![271],
@@ -127,7 +171,7 @@ fn completion_record() -> CompletionRecord {
             length: false,
             stop: false,
         },
-        product_generations: vec![3, 5],
+        product_generations: vec![3, 4, 5, 6],
         semantic_digest: digest_string(0xbb),
         error_code: None,
         timing_counters: TimingCounters::default(),
@@ -190,7 +234,7 @@ fn version_ref_device_point_round_trips() {
         request_key: request_key(),
         producer_op_id: OpId(9),
         point: Point::Device {
-            selected_point: output_product(OpId(9)),
+            selected_point: selected_point_product(OpId(9)),
             producer_plan_digest: digest_string(0xcc),
         },
     };
@@ -536,7 +580,7 @@ fn commit_control_requires_a_fixed_selected_version() {
         request_key: request_key(),
         producer_op_id: OpId(9),
         point: Point::Device {
-            selected_point: output_product(OpId(9)),
+            selected_point: selected_point_product(OpId(9)),
             producer_plan_digest: digest_string(0xcc),
         },
     };
@@ -599,14 +643,24 @@ fn product_for(key: RequestKey, op: OpId, output_index: u16, kind: ProductKind) 
             _ => StorageClass::DeviceTensor,
         },
         dtype: match kind {
-            ProductKind::Token => DType::I32,
+            ProductKind::Token | ProductKind::SelectedPoint | ProductKind::AcceptedSpan => {
+                DType::U32
+            }
+            ProductKind::Continuation => DType::I64,
             ProductKind::Kv => DType::BF16,
             ProductKind::Logprob => DType::F32,
             ProductKind::Completion => DType::U8,
             _ => DType::F16,
         },
         shape_bound: ShapeBound {
-            dims: vec![DimBound::Static(2), DimBound::Device { max: 16 }],
+            dims: match kind {
+                ProductKind::Token | ProductKind::SelectedPoint | ProductKind::Finish => {
+                    vec![DimBound::Static(1)]
+                }
+                ProductKind::AcceptedSpan => vec![DimBound::Static(2)],
+                ProductKind::Continuation => vec![DimBound::Static(4)],
+                _ => vec![DimBound::Static(2), DimBound::Device { max: 16 }],
+            },
         },
         point_range: PointRange {
             base_point: 0,
@@ -686,7 +740,7 @@ fn comprehensive_batch() -> Batch {
                 request_key: key,
                 producer_op_id: OpId(9),
                 point: Point::Device {
-                    selected_point: product_for(key, OpId(9), 0, ProductKind::Token),
+                    selected_point: product_for(key, OpId(9), 0, ProductKind::SelectedPoint),
                     producer_plan_digest: digest_string(0xcc),
                 },
             }
@@ -876,6 +930,7 @@ fn full_caps() -> EngineCaps {
         adapter_mode: AdapterMode::PerRequest,
         execution_constraints: ExecutionConstraints {
             max_batch_operations: 64,
+            ..ExecutionConstraints::default()
         },
         resource_classes: vec![ResourceClass::KvBlock, ResourceClass::Adapter],
         model_spec_digest: digest_string(0x21),
@@ -939,6 +994,10 @@ fn full_completion_report() -> CompletionReport {
             token_len: 5,
             kv_visible_len: 6,
             latent_len: 7,
+            kv_reserved_len: 64,
+            kv_initialized_len: 8,
+            kv_committed_len: 6,
+            kv_published_len: 5,
         },
         token_span: TokenSpan { base: 4, len: 2 },
         committed_tokens: vec![271, 272],

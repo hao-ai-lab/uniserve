@@ -702,6 +702,9 @@ fn product_kind_py<'py>(py: Python<'py>, kind: ProductKind) -> &'py Bound<'py, P
         ProductKind::Completion => intern!(py, "completion"),
         ProductKind::SamplingState => intern!(py, "sampling_state"),
         ProductKind::Finish => intern!(py, "finish"),
+        ProductKind::SelectedPoint => intern!(py, "selected_point"),
+        ProductKind::AcceptedSpan => intern!(py, "accepted_span"),
+        ProductKind::Continuation => intern!(py, "continuation"),
     }
 }
 
@@ -857,6 +860,10 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionRecor
         token_len: u32_of(&get(lengths, intern!(py, "token_len"))?)?,
         kv_visible_len: u32_of(&get(lengths, intern!(py, "kv_visible_len"))?)?,
         latent_len: u32_of(&get(lengths, intern!(py, "latent_len"))?)?,
+        kv_reserved_len: u32_of(&get(lengths, intern!(py, "kv_reserved_len"))?)?,
+        kv_initialized_len: u32_of(&get(lengths, intern!(py, "kv_initialized_len"))?)?,
+        kv_committed_len: u32_of(&get(lengths, intern!(py, "kv_committed_len"))?)?,
+        kv_published_len: u32_of(&get(lengths, intern!(py, "kv_published_len"))?)?,
     };
     let span = get(dict, intern!(py, "token_span"))?;
     let span = span.cast::<PyDict>().ok()?;
@@ -923,6 +930,9 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
         "completion" => ProductKind::Completion,
         "sampling_state" => ProductKind::SamplingState,
         "finish" => ProductKind::Finish,
+        "selected_point" => ProductKind::SelectedPoint,
+        "accepted_span" => ProductKind::AcceptedSpan,
+        "continuation" => ProductKind::Continuation,
         _ => return None,
     };
     let storage_class = str_field(dict, intern!(py, "storage_class"))?;
@@ -1103,7 +1113,7 @@ mod tests {
 
     use super::*;
 
-    const PRODUCT_KINDS: [ProductKind; 11] = [
+    const PRODUCT_KINDS: [ProductKind; 14] = [
         ProductKind::Token,
         ProductKind::Logprob,
         ProductKind::Draft,
@@ -1115,6 +1125,9 @@ mod tests {
         ProductKind::Completion,
         ProductKind::SamplingState,
         ProductKind::Finish,
+        ProductKind::SelectedPoint,
+        ProductKind::AcceptedSpan,
+        ProductKind::Continuation,
     ];
     const STORAGE_CLASSES: [StorageClass; 5] = [
         StorageClass::DeviceTensor,
@@ -1525,6 +1538,10 @@ mod tests {
                 token_len: 100 + seed as u32,
                 kv_visible_len: 200 + seed as u32,
                 latent_len: seed as u32 % 2,
+                kv_reserved_len: 256 + seed as u32,
+                kv_initialized_len: 201 + seed as u32,
+                kv_committed_len: 200 + seed as u32,
+                kv_published_len: 199 + seed as u32,
             },
             token_span: TokenSpan {
                 base: 100 + seed as u32,

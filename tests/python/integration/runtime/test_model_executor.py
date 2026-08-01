@@ -17,6 +17,7 @@ from tests.python.fixtures.depth_one import (
     encode_operation,
     flow_operation,
     gen_admission,
+    kv_publication_operation,
     materialize_operation,
     root_parent,
     token_operation,
@@ -130,6 +131,16 @@ class _RetainedImageStateModel(_ObservedModel):
         self.spec = replace(self.spec, operations=operations, inputs=inputs)
 
 
+def _publish_conditioning(worker: object, admission: Admission, *, op_id: int, step_id: int):
+    publication, product = kv_publication_operation(
+        admission.request_key,
+        op_id=op_id,
+        parent=root_parent(admission),
+    )
+    worker.execute(Batch(step_id=step_id, admissions=(admission,), operations=(publication,)))
+    return product
+
+
 def test_extend_then_decode_commit_the_serial_oracle_tokens():
     model = _ObservedModel()
     worker = execution_worker(model)
@@ -142,7 +153,9 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         tokens=(3, 4),
     )
     extended = worker.execute(
-        Batch(step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,))
+        Batch(
+            step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+        )
     )
 
     assert extended.completions[0].committed_tokens == (_next_token(4),)
@@ -172,7 +185,7 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
 
     assert decoded.completions[0].committed_tokens == (_next_token(first_token),)
     assert worker.kv.get(1).length == 3
-    assert worker.sessions.get(1).version == 2
+    assert worker.sessions.get(1).version == 1
     assert worker.sessions.get(1).logical_position == 3
     assert model.token_positions == [(0, 1), (2,)]
 
@@ -201,7 +214,9 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
     session = worker.sessions.get(8)
     assert model.token_positions == [(2,)]
     assert session.logical_position == 3
-    assert session.resolved_runtime[0].logical_position == 2
+    root_runtime = session.runtime_for(root_parent(admission))
+    assert root_runtime is not None
+    assert root_runtime.logical_position == 2
 
 
 def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
@@ -216,12 +231,19 @@ def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    flow = flow_operation(flow_admission.request_key, op_id=12, parent=root_parent(flow_admission), steps=1)
+    mixed_conditioning = _publish_conditioning(mixed, flow_admission, op_id=10, step_id=1)
+    flow = flow_operation(
+        flow_admission.request_key,
+        op_id=12,
+        parent=root_parent(flow_admission),
+        conditioning=mixed_conditioning,
+        steps=1,
+    )
 
     mixed_result = mixed.execute(
         Batch(
-            step_id=1,
-            admissions=(sequence_admission, flow_admission),
+            step_id=2,
+            admissions=(sequence_admission,),
             operations=(sequence, flow),
             input_products=(sequence_input,),
         )
@@ -236,26 +258,34 @@ def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
+    split_conditioning = _publish_conditioning(split, flow_admission, op_id=10, step_id=1)
     split_flow = flow_operation(
-        flow_admission.request_key, op_id=12, parent=root_parent(flow_admission), steps=1
+        flow_admission.request_key,
+        op_id=12,
+        parent=root_parent(flow_admission),
+        conditioning=split_conditioning,
+        steps=1,
     )
     sequence_result = split.execute(
         Batch(
-            step_id=1,
+            step_id=2,
             admissions=(sequence_admission,),
             operations=(split_sequence,),
             input_products=(split_sequence_input,),
         )
     )
     flow_result = split.execute(
-        Batch(step_id=2, admissions=(flow_admission,), operations=(split_flow,), input_products=())
+        Batch(step_id=3, admissions=(), operations=(split_flow,), input_products=())
     )
 
     assert (
         mixed_result.completions[0].committed_tokens
         == sequence_result.completions[0].committed_tokens
     )
-    assert mixed_result.completions[0].semantic_digest == sequence_result.completions[0].semantic_digest
+    assert (
+        mixed_result.completions[0].semantic_digest
+        == sequence_result.completions[0].semantic_digest
+    )
     assert mixed_result.completions[1].semantic_digest == flow_result.completions[0].semantic_digest
     torch.testing.assert_close(
         mixed.latents.require(mixed.sessions.get(2).latent_handle).value,
@@ -268,22 +298,25 @@ def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
     assert len(split_model.calls) == 2
 
 
-def test_token_decode_uses_the_homogeneous_paged_plan():
+def test_request_scoped_operation_identity_preserves_homogeneous_decode():
     model = _ObservedModel()
     worker = execution_worker(model)
     admissions = (und_admission(41, block_ids=(0,)), und_admission(42, block_ids=(1,)))
     prefill_ops = []
     prefill_inputs = []
+    last_tokens = []
     for index, admission in enumerate(admissions):
+        tokens = (3 + 4 * index, 4 + 4 * index)
         operation, payload = token_operation(
             admission.request_key,
-            op_id=50 + index,
+            op_id=50,
             parent=root_parent(admission),
             mode=TokenMode.EXTEND,
-            tokens=(3, 4),
+            tokens=tokens,
         )
         prefill_ops.append(operation)
         prefill_inputs.append(payload)
+        last_tokens.append(tokens[-1])
     worker.execute(
         Batch(
             step_id=1,
@@ -301,10 +334,10 @@ def test_token_decode_uses_the_homogeneous_paged_plan():
         commit = commit_resolved(worker.sessions.get(session_id))
         operation, payload = token_operation(
             admission.request_key,
-            op_id=60 + index,
+            op_id=60,
             parent=commit.selected,
             mode=TokenMode.DECODE,
-            tokens=(_next_token(4),),
+            tokens=(_next_token(last_tokens[index]),),
             control_seq=commit.control_seq,
         )
         decode_ops.append(operation)
@@ -323,8 +356,9 @@ def test_token_decode_uses_the_homogeneous_paged_plan():
     plan = model.attention_plans[-1]
     assert isinstance(plan, PagedDecodePlan)
     assert tuple(plan.query_lens.tolist()) == (1, 1)
-    assert decoded.completions[0].committed_tokens == (_next_token(_next_token(4)),)
-    assert decoded.completions[1].committed_tokens == (_next_token(_next_token(4)),)
+    assert tuple(record.committed_tokens for record in decoded.completions) == tuple(
+        (_next_token(_next_token(token)),) for token in last_tokens
+    )
 
 
 def test_image_capable_token_decode_preserves_mixed_route_attention():
@@ -385,7 +419,9 @@ def test_replay_identity_is_idempotent_and_conflicts_are_atomic():
         mode=TokenMode.EXTEND,
         tokens=(8, 9),
     )
-    batch = Batch(step_id=7, admissions=(admission,), operations=(operation,), input_products=(payload,))
+    batch = Batch(
+        step_id=7, admissions=(admission,), operations=(operation,), input_products=(payload,)
+    )
 
     first = worker.execute(batch)
     replayed = worker.execute(batch)
@@ -406,7 +442,12 @@ def test_replay_identity_is_idempotent_and_conflicts_are_atomic():
     )
     with pytest.raises(Exception, match="conflicts with its committed digest"):
         worker.execute(
-            Batch(step_id=8, admissions=(), operations=(conflicting,), input_products=(conflicting_input,))
+            Batch(
+                step_id=8,
+                admissions=(),
+                operations=(conflicting,),
+                input_products=(conflicting_input,),
+            )
         )
 
     assert worker.sessions.get(3) == committed
@@ -425,12 +466,15 @@ def test_output_validation_failure_rolls_back_every_authority():
         tokens=(12, 13),
     )
     worker.execute(
-        Batch(step_id=11, admissions=(admission,), operations=(initial,), input_products=(initial_input,))
+        Batch(
+            step_id=11,
+            admissions=(admission,),
+            operations=(initial,),
+            input_products=(initial_input,),
+        )
     )
     commit = commit_resolved(worker.sessions.get(4))
-    worker.execute(
-        Batch(step_id=12, admissions=(), operations=(), controls=(commit,))
-    )
+    worker.execute(Batch(step_id=12, admissions=(), operations=(), controls=(commit,)))
     committed = deepcopy(worker.sessions.get(4))
     committed_length = worker.kv.get(4).length
 
@@ -442,7 +486,9 @@ def test_output_validation_failure_rolls_back_every_authority():
         tokens=(_next_token(13),),
         control_seq=commit.control_seq,
     )
-    retry_batch = Batch(step_id=13, admissions=(), operations=(retry,), input_products=(retry_input,))
+    retry_batch = Batch(
+        step_id=13, admissions=(), operations=(retry,), input_products=(retry_input,)
+    )
     model.fault = "misaligned"
     with pytest.raises(Exception):
         worker.execute(retry_batch)
@@ -453,7 +499,7 @@ def test_output_validation_failure_rolls_back_every_authority():
     model.fault = None
     result = worker.execute(retry_batch)
     assert result.completions[0].committed_tokens == (_next_token(_next_token(13)),)
-    assert worker.sessions.get(4).version == 2
+    assert worker.sessions.get(4).version == 1
     assert worker.kv.get(4).length == committed_length + 1
 
 
@@ -461,15 +507,25 @@ def test_failed_first_flow_attempt_reclaims_state_and_retries_deterministically(
     model = _ObservedModel()
     worker = execution_worker(model)
     admission = gen_admission(5, ImageParams(steps=2, height=16, width=16, seed=29))
-    flow = flow_operation(admission.request_key, op_id=41, parent=root_parent(admission), steps=2)
-    batch = Batch(step_id=13, admissions=(admission,), operations=(flow,), input_products=())
+    conditioning = _publish_conditioning(worker, admission, op_id=40, step_id=12)
+    flow = flow_operation(
+        admission.request_key,
+        op_id=41,
+        parent=root_parent(admission),
+        conditioning=conditioning,
+        steps=2,
+    )
+    batch = Batch(step_id=13, admissions=(), operations=(flow,), input_products=())
+    admitted = deepcopy(worker.sessions.get(5))
+    kv_extents = worker.kv.get(5).extents()
     model.fault = "raise"
 
     with pytest.raises(Exception, match="injected neural failure"):
         worker.execute(batch)
 
     first_input = model.flow_inputs[-1]
-    assert worker.sessions.peek(5) is None
+    assert worker.sessions.get(5) == admitted
+    assert worker.kv.get(5).extents() == kv_extents
 
     model.fault = None
     worker.execute(batch)
@@ -485,17 +541,17 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
     for op_id in (41, 109):
         model = _ObservedModel()
         worker = execution_worker(model)
+        conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
         flow = flow_operation(
             admission.request_key,
             op_id=op_id,
             parent=root_parent(admission),
+            conditioning=conditioning,
             steps=1,
             seed=29,
             image_index=3,
         )
-        worker.execute(
-            Batch(step_id=op_id, admissions=(admission,), operations=(flow,), input_products=())
-        )
+        worker.execute(Batch(step_id=op_id, admissions=(), operations=(flow,), input_products=()))
         observed.append(model.flow_inputs[0])
 
     torch.testing.assert_close(observed[1], observed[0], rtol=0, atol=0)
@@ -517,7 +573,9 @@ def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
         tokens=(3, 4),
     )
     extended = worker.execute(
-        Batch(step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,))
+        Batch(
+            step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+        )
     )
     committed = list(extended.completions[0].committed_tokens)
     assert worker.kv.get(1).block_ids == [0]
@@ -573,21 +631,29 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
     # single-step quanta must report 1 then 2.
     worker = execution_worker(_ObservedModel())
     admission = gen_admission(2, ImageParams(steps=2, height=16, width=16, seed=29))
-    first = flow_operation(admission.request_key, op_id=1, parent=root_parent(admission), steps=1)
+    conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
+    first = flow_operation(
+        admission.request_key,
+        op_id=2,
+        parent=root_parent(admission),
+        conditioning=conditioning,
+        steps=1,
+    )
     first_report = worker.execute(
-        Batch(step_id=1, admissions=(admission,), operations=(first,), input_products=())
+        Batch(step_id=2, admissions=(), operations=(first,), input_products=())
     )
     commit = commit_resolved(worker.sessions.get(2))
     second = flow_operation(
         admission.request_key,
-        op_id=2,
+        op_id=3,
         parent=commit.selected,
+        conditioning=conditioning,
         steps=1,
         control_seq=commit.control_seq,
     )
     second_report = worker.execute(
         Batch(
-            step_id=2,
+            step_id=3,
             admissions=(),
             operations=(second,),
             controls=(commit,),
@@ -610,7 +676,9 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
         tokens=(3, 4),
     )
     worker.execute(
-        Batch(step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,))
+        Batch(
+            step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+        )
     )
     session_kv_before = worker.kv.get(3).length
     assert session_kv_before == 2
@@ -638,16 +706,16 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
         )
     )
     completion = report.completions[0]
-    assert completion.logical_lengths.kv_visible_len == 0
+    assert completion.logical_lengths.kv_visible_len == session_kv_before
     assert worker.kv.get(3).length == session_kv_before
     assert worker.sessions.get(3).logical_position == 2
-    assert completion.selected_point == 1
+    assert completion.selected_point == 0
     assert completion.product_generations
     assert completion.product_generations[0] == handle
     assert completion.product_generations[0] != 0
 
 
-def test_generated_feedback_advances_state_only_in_visual_token_extend():
+def test_generated_feedback_commits_absolute_visual_token_state():
     worker = execution_worker(_RetainedImageStateModel())
     understanding = und_admission(6, block_ids=(0,))
     admission = Admission.create(
@@ -657,35 +725,72 @@ def test_generated_feedback_advances_state_only_in_visual_token_extend():
             ImageParams(steps=2, height=16, width=16, seed=29, retain_images=True)
         ),
     )
-    flow = flow_operation(admission.request_key, op_id=1, parent=root_parent(admission), steps=2)
-    worker.execute(Batch(step_id=1, admissions=(admission,), operations=(flow,), input_products=()))
+    extend, extend_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(extend,),
+            input_products=(extend_input,),
+        )
+    )
+    first_commit = commit_resolved(worker.sessions.get(6))
+    publication, conditioning = kv_publication_operation(
+        admission.request_key,
+        op_id=2,
+        parent=first_commit.selected,
+        control_seq=first_commit.control_seq,
+    )
+    worker.execute(
+        Batch(
+            step_id=2,
+            admissions=(),
+            operations=(publication,),
+            controls=(first_commit,),
+        )
+    )
+    flow = flow_operation(
+        admission.request_key,
+        op_id=3,
+        parent=first_commit.selected,
+        conditioning=conditioning,
+        steps=2,
+        control_seq=first_commit.control_seq,
+    )
+    worker.execute(Batch(step_id=3, admissions=(), operations=(flow,), input_products=()))
     assert worker.sessions.get(6).version == 1
 
     commit = commit_resolved(worker.sessions.get(6))
     materialize = materialize_operation(
         admission.request_key,
-        op_id=2,
+        op_id=4,
         parent=commit.selected,
         feedback_source=True,
         control_seq=commit.control_seq,
     )
     materialize_report = worker.execute(
         Batch(
-            step_id=2,
+            step_id=4,
             admissions=(),
             operations=(materialize,),
             controls=(commit,),
             input_products=(),
         )
     )
-    assert materialize_report.completions[0].logical_lengths.kv_visible_len == 0
-    assert materialize_report.completions[0].selected_point == 1
+    assert materialize_report.completions[0].logical_lengths.kv_visible_len == 2
+    assert materialize_report.completions[0].selected_point == 0
     assert worker.sessions.get(6).version == 1
-    assert worker.sessions.get(6).logical_position == 0
+    assert worker.sessions.get(6).logical_position == 2
 
     encode, _ = encode_operation(
         admission.request_key,
-        op_id=3,
+        op_id=5,
         parent=commit.selected,
         image_base64=None,
         encoder_handle=10,
@@ -693,35 +798,48 @@ def test_generated_feedback_advances_state_only_in_visual_token_extend():
         control_seq=commit.control_seq,
     )
     encode_report = worker.execute(
-        Batch(step_id=3, admissions=(), operations=(encode,), input_products=())
+        Batch(step_id=5, admissions=(), operations=(encode,), input_products=())
     )
-    assert encode_report.completions[0].logical_lengths.kv_visible_len == 0
-    assert encode_report.completions[0].selected_point == 1
+    assert encode_report.completions[0].logical_lengths.kv_visible_len == 2
+    assert encode_report.completions[0].selected_point == 0
     assert worker.sessions.get(6).version == 1
-    assert worker.sessions.get(6).logical_position == 0
+    assert worker.sessions.get(6).logical_position == 2
 
     state = visual_state_operation(
         admission.request_key,
-        op_id=4,
+        op_id=6,
         parent=commit.selected,
         feature=encode.outputs[0],
         sample_continuation=True,
+        max_tokens=2,
         control_seq=commit.control_seq,
     )
-    report = worker.execute(Batch(step_id=4, admissions=(), operations=(state,), input_products=()))
+    report = worker.execute(Batch(step_id=6, admissions=(), operations=(state,), input_products=()))
 
     completion = report.completions[0]
     assert completion.committed_tokens == (_next_token(1007),)
-    assert completion.token_span.base == 0
+    assert completion.token_span.base == 2
     assert completion.token_span.len == 1
-    assert completion.logical_lengths.token_len == 2
-    assert completion.selected_point == 2
-    assert worker.sessions.get(6).version == 2
-    assert worker.sessions.get(6).logical_position == 2
+    assert completion.logical_lengths.token_len == 4
+    extents = worker.kv.get(6).extents()
+    assert (
+        completion.logical_lengths.kv_reserved_len,
+        completion.logical_lengths.kv_initialized_len,
+        completion.logical_lengths.kv_visible_len,
+        completion.logical_lengths.kv_committed_len,
+        completion.logical_lengths.kv_published_len,
+    ) == (
+        extents.reserved,
+        extents.initialized,
+        extents.visible,
+        extents.committed,
+        extents.published,
+    )
+    assert completion.selected_point == 1
+    assert worker.sessions.get(6).version == 1
+    assert worker.sessions.get(6).logical_position == 4
 
-    artifacts = [
-        p for p in materialize_report.products if p.product.kind is ProductKind.ARTIFACT
-    ]
+    artifacts = [p for p in materialize_report.products if p.product.kind is ProductKind.ARTIFACT]
     assert len(artifacts) == 1
     # The Artifact product carries the base64 PNG string as bytes: the scheduler
     # recovers it with String::from_utf8 and hands it to validate_png_artifact,

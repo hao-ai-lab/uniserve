@@ -184,9 +184,9 @@ use uniserve_engine_api::{Command, EventTx, FinishReason, GenEvent, GenerationSu
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, Batch, CloseReason, CompletionRecord, CompletionReport, Control, Disposition,
-    EngineCaps, GenAdmission, KvAllocation, OpId, OpStatus, Point, ProductKind, ProductPayload,
-    ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
-    WorkerForwardStats,
+    EngineCaps, GenAdmission, KvAllocation, OpId, OpStatus, Operation, Point, ProductKind,
+    ProductPayload, ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef,
+    WorkVariant, WorkerForwardStats,
 };
 
 use crate::grammar::{GrammarCompiler, GrammarMatcher};
@@ -247,7 +247,6 @@ struct SequenceView {
     top_logprobs: Vec<RankedToken>,
     prompt_logprobs: Vec<Vec<RankedToken>>,
     accepted_draft_tokens: Option<u32>,
-    kv_product: Option<ProductRef>,
     image_png: Option<String>,
     encode_generation: Option<u32>,
     kv_visible_len: u32,
@@ -259,28 +258,30 @@ impl SequenceView {
         variant: WorkVariant,
         record: &CompletionRecord,
         products: &[ProductPayload],
+        draft_token_ids: &[u32],
     ) -> Self {
         let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
             .and_then(|payload| LogprobBlob::decode(&payload.bytes).ok())
             .unwrap_or_default();
         let accepted_draft_tokens = (variant == WorkVariant::TokenVerify).then(|| {
-            record
-                .committed_tokens
-                .len()
-                .saturating_sub(1)
-                .min(u32::MAX as usize) as u32
+            let count = record.committed_tokens.len();
+            let accepted = if count <= draft_token_ids.len()
+                && record.committed_tokens.as_slice() == &draft_token_ids[..count]
+            {
+                count
+            } else {
+                count.saturating_sub(1)
+            };
+            accepted.min(u32::MAX as usize) as u32
         });
         let image_png = find_product(products, record.op_id, ProductKind::Artifact)
             .and_then(|payload| String::from_utf8(payload.bytes.clone()).ok());
-        let kv_product = find_product(products, record.op_id, ProductKind::Kv)
-            .map(|payload| payload.product.clone());
         Self {
             committed_tokens: record.committed_tokens.clone(),
             sampled_logprob: logprobs.sampled_logprob,
             top_logprobs: logprobs.top_logprobs,
             prompt_logprobs: logprobs.prompt_logprobs,
             accepted_draft_tokens,
-            kv_product,
             image_png,
             encode_generation: record.product_generations.first().copied(),
             kv_visible_len: record.logical_lengths.kv_visible_len,
@@ -289,6 +290,57 @@ impl SequenceView {
                 || record.finish_flags.stop,
         }
     }
+}
+
+fn token_prefix_versions(
+    operation: Option<&Operation>,
+    record: &CompletionRecord,
+    parent: Option<&VersionRef>,
+) -> Vec<VersionRef> {
+    let Some(operation) = operation else {
+        return Vec::new();
+    };
+    let Some(Point::Fixed {
+        semantic_digest: parent_semantic,
+        ..
+    }) = parent.map(|version| &version.point)
+    else {
+        return Vec::new();
+    };
+    let count = record.committed_tokens.len();
+    if record.status != OpStatus::Ok || count == 0 || record.selected_point as usize != count {
+        return Vec::new();
+    }
+    (1..=count)
+        .map(|point_index| {
+            let digest = if point_index == count {
+                record.semantic_digest.clone()
+            } else {
+                let mut prefix = record.clone();
+                prefix.selected_point = point_index as u32;
+                prefix.logical_lengths.token_len = record
+                    .logical_lengths
+                    .token_len
+                    .saturating_sub((count - point_index) as u32);
+                prefix.logical_lengths.kv_visible_len = record
+                    .logical_lengths
+                    .kv_visible_len
+                    .saturating_sub((count - point_index) as u32);
+                prefix.token_span.len = point_index as u32;
+                prefix.committed_tokens.truncate(point_index);
+                prefix.finish_flags = Default::default();
+                prefix.compute_semantic_digest(parent_semantic, &operation.plan_digest)
+            };
+            VersionRef {
+                request_key: record.request_key,
+                producer_op_id: record.op_id,
+                point: Point::Fixed {
+                    point_index: point_index as u32,
+                    semantic_digest: digest,
+                },
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -424,6 +476,7 @@ pub(crate) struct PendingSemanticCommit {
 #[derive(Clone)]
 pub(crate) struct ResidentDeviceVersion {
     version: VersionRef,
+    token: ProductRef,
     producer: WorkVariant,
 }
 
@@ -675,7 +728,7 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
         TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
         TransitionValidationError::MissingImageArtifact => "missing_image_artifact",
         TransitionValidationError::InvalidImageArtifact => "invalid_image_artifact",
-        TransitionValidationError::MissingImageLocator => "missing_image_locator",
+        TransitionValidationError::MissingKvPublication => "missing_kv_publication",
         TransitionValidationError::MissingImageDimensions => "missing_image_dimensions",
         TransitionValidationError::ImageDimensionsMismatch { .. } => "image_dimensions_mismatch",
         TransitionValidationError::ImageKvMismatch { .. } => "image_kv_mismatch",
@@ -684,9 +737,7 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
         TransitionValidationError::AcceptedDraftCountExceeded { .. } => {
             "accepted_draft_count_exceeded"
         }
-        TransitionValidationError::TextTokenCountInconsistent { .. } => {
-            "text_token_count_inconsistent"
-        }
+        TransitionValidationError::VerifiedDraftPrefixMismatch => "verified_draft_prefix_mismatch",
         TransitionValidationError::TextTokenCountMismatch { .. } => "text_token_count_mismatch",
         TransitionValidationError::SampledTokenOutsideAllowedSet { .. } => {
             "sampled_token_outside_allowed_set"
@@ -730,6 +781,8 @@ fn phase_str(phase: Phase) -> &'static str {
         Phase::IngestState => "ingest_state",
         Phase::Prefill => "prefill",
         Phase::DecodeUnd => "decode_und",
+        Phase::CloseKv => "close_kv",
+        Phase::PublishKv => "publish_kv",
         Phase::DenoiseGen => "denoise_gen",
         Phase::CommitGen => "commit_gen",
         Phase::FeedbackEncode => "feedback_encode",
@@ -1797,7 +1850,9 @@ impl Scheduler {
             supports_vision_encode: supports(WorkVariant::EncodeVision),
             supports_latent_encode: supports(WorkVariant::EncodeLatent),
             supports_image_generation: supports(WorkVariant::GenFlow)
-                && supports(WorkVariant::Materialize),
+                && supports(WorkVariant::Materialize)
+                && supports(WorkVariant::TransferKvPublish)
+                && self.caps.execution_constraints.incremental_kv_publication,
             max_latent_units: u64::from(self.caps.max_latent_size),
             latent_downsample: self.caps.latent_downsample,
             max_vae_grid_tokens: self.cap_max_vae_grid_tokens() as u32,
@@ -2152,7 +2207,11 @@ impl Scheduler {
 
     fn projected_version(&self, id: RequestId) -> Option<u64> {
         let state = self.running.get(&id)?;
-        Some(state.version.saturating_add(self.inflight_len(id) as u64))
+        Some(if self.inflight_len(id) > 0 {
+            1
+        } else {
+            state.version
+        })
     }
 
     fn fixed_version(&self, id: RequestId) -> Option<VersionRef> {
@@ -2672,7 +2731,8 @@ impl Scheduler {
                 continue;
             };
             let operation_variant = transition.operation_variant;
-            let view = SequenceView::from_report(operation_variant, &record, &products);
+            let view =
+                SequenceView::from_report(operation_variant, &record, &products, &draft_token_ids);
             let draft_tokens = draft_token_ids.len();
             // fold this op's host-side round-trip latency into the history.
             let roundtrip_us = started
@@ -2761,6 +2821,11 @@ impl Scheduler {
                 continue;
             }
             let expected_parent = self.fixed_version(id);
+            let prefix_versions = token_prefix_versions(
+                transition.operation.as_ref(),
+                &record,
+                expected_parent.as_ref(),
+            );
             let cursor_result = self.running.get_mut(&id).map(|state| {
                 state
                     .cursor
@@ -2783,23 +2848,23 @@ impl Scheduler {
             // A state-advancing completion resolves a new point. Ordered commit
             // control emission below decides when that point becomes semantic.
             let advanced = record.status == OpStatus::Ok
-                && transition.operation.as_ref().is_some_and(|operation| {
-                    match operation.parent.point {
-                        // A fixed-parent op advanced when its selected point moved
-                        // past the host-observed parent point.
-                        Point::Fixed { point_index, .. } => record.selected_point > point_index,
-                        // A device-parent op names no host-known parent point; the
-                        // validator already checked its selected point against the
-                        // projected parent, so its own advance flag is authoritative.
-                        // It must commit its own semantic digest and op id, otherwise
-                        // the committed lineage goes stale once the pipeline drains and
-                        // the next fixed-parent op roots on the wrong digest.
-                        Point::Device { .. } => operation.advances_state,
-                    }
-                });
+                && record.selected_point > 0
+                && transition
+                    .operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.advances_state);
             let latest_device_version = if advanced {
                 transition.operation.as_ref().and_then(|operation| {
-                    operation
+                    let selected_point = operation
+                        .outputs
+                        .iter()
+                        .find(|output| {
+                            output.kind == ProductKind::SelectedPoint
+                                && output.storage_class
+                                    == uniserve_worker_wire::StorageClass::DeviceTensor
+                        })
+                        .cloned();
+                    let token = operation
                         .outputs
                         .iter()
                         .find(|output| {
@@ -2807,9 +2872,12 @@ impl Scheduler {
                                 && output.storage_class
                                     == uniserve_worker_wire::StorageClass::DeviceTensor
                         })
-                        .cloned()
-                        .map(|selected_point| ResidentDeviceVersion {
+                        .cloned();
+                    selected_point
+                        .zip(token)
+                        .map(|(selected_point, token)| ResidentDeviceVersion {
                             producer: operation.work.variant(),
+                            token,
                             version: VersionRef {
                                 request_key: operation.request_key,
                                 producer_op_id: operation.op_id,
@@ -2824,19 +2892,17 @@ impl Scheduler {
                 None
             };
             let retain_device_version = !self.has_inflight(id);
-            if let Some(state) = self.running.get_mut(&id) {
-                if record.status != OpStatus::Predicated {
-                    state.version = u64::from(record.selected_point);
-                }
-                if advanced {
-                    state.resolved_semantic = record.semantic_digest.clone();
-                    state.resolved_producer_op_id = record.op_id.0;
-                    state.latest_device_version = if retain_device_version {
-                        latest_device_version
-                    } else {
-                        None
-                    };
-                }
+            if let Some(state) = self.running.get_mut(&id)
+                && advanced
+            {
+                state.version = u64::from(record.selected_point);
+                state.resolved_semantic = record.semantic_digest.clone();
+                state.resolved_producer_op_id = record.op_id.0;
+                state.latest_device_version = if retain_device_version {
+                    latest_device_version
+                } else {
+                    None
+                };
             }
             let selected_fixed = self.fixed_version(id);
             if advanced
@@ -2891,6 +2957,7 @@ impl Scheduler {
                     draft_token_ids,
                     selected_fixed,
                     public_tokens_before,
+                    prefix_versions,
                 ));
             }
         }
@@ -2904,6 +2971,7 @@ impl Scheduler {
             draft_token_ids,
             selected_fixed,
             public_tokens_before,
+            prefix_versions,
         ) in to_resolve
         {
             let token_operation = matches!(
@@ -2917,7 +2985,18 @@ impl Scheduler {
                 let mut commit_without_decoder_event = None;
                 if let Some(state) = self.running.get_mut(&id) {
                     if state.public_token_seq > public_tokens_before {
-                        if let Some(selected) = selected_fixed {
+                        let emitted = state.public_token_seq - public_tokens_before;
+                        for (offset, selected) in
+                            prefix_versions.into_iter().take(emitted).enumerate()
+                        {
+                            state
+                                .token_cutoffs
+                                .insert(public_tokens_before + offset + 1, selected);
+                        }
+                        if emitted > 0
+                            && !state.token_cutoffs.contains_key(&state.public_token_seq)
+                            && let Some(selected) = selected_fixed
+                        {
                             state.token_cutoffs.insert(state.public_token_seq, selected);
                         }
                         if !state.req.stop_strings.is_empty()
@@ -3725,6 +3804,9 @@ impl Scheduler {
 
     fn supports_spec_decode(&self) -> bool {
         self.caps.supported_work.contains(&WorkVariant::TokenVerify)
+            && self.caps.execution_constraints.device_sequence_lengths
+            && self.caps.execution_constraints.device_append_offsets
+            && self.caps.execution_constraints.max_speculative_points > 1
     }
 
     fn peek_next_operation_variant(&self, id: RequestId) -> Option<WorkVariant> {
@@ -3763,6 +3845,8 @@ impl Scheduler {
             }
             Phase::Prefill => WorkVariant::TokenExtend,
             Phase::DecodeUnd => WorkVariant::TokenDecode,
+            Phase::CloseKv => WorkVariant::TokenExtend,
+            Phase::PublishKv => WorkVariant::TransferKvPublish,
             Phase::DenoiseGen => WorkVariant::GenFlow,
             Phase::CommitGen => WorkVariant::Materialize,
             Phase::FeedbackEncode => {
@@ -4012,7 +4096,7 @@ impl Scheduler {
             let projected_successor = self.has_inflight(request_id);
             let reusable_device_version =
                 if !projected_successor && self.can_reuse_resolved_token_product(request_id) {
-                    latest_device_version.map(|resident| resident.version)
+                    latest_device_version
                 } else {
                     None
                 };
@@ -4035,10 +4119,12 @@ impl Scheduler {
                         request_key,
                         producer_op_id: predecessor.op_id,
                         point: Point::Device {
-                            // The predecessor's declared Token output is its
-                            // selected-point product; the successor's device relay
-                            // reads the sampled token this reference resolves.
-                            selected_point: predecessor.outputs[0].clone(),
+                            selected_point: predecessor
+                                .outputs
+                                .iter()
+                                .find(|output| output.kind == ProductKind::SelectedPoint)
+                                .cloned()
+                                .expect("token predecessor has a selected-point product"),
                             producer_plan_digest: predecessor.plan_digest.clone(),
                         },
                     },
@@ -4049,7 +4135,7 @@ impl Scheduler {
                         .cloned(),
                 )
             } else if let Some(parent) = reusable_device_version {
-                (parent, None)
+                (parent.version, Some(parent.token))
             } else {
                 (
                     VersionRef {
@@ -4448,13 +4534,20 @@ impl Scheduler {
                 let spec_token_ids =
                     if !projected_successor && budget > 1 && self.supports_spec_decode() {
                         self.running.get(&id).and_then(|st| {
-                            self.spec_decode.draft_tokens(
+                            let mut draft = self.spec_decode.draft_tokens(
                                 st,
                                 tok,
                                 sampling_state.allowed_token_ids.as_deref(),
                                 Some(sampling_state.suppressed_token_ids.as_slice())
                                     .filter(|tokens| !tokens.is_empty()),
-                            )
+                            )?;
+                            draft.truncate(
+                                self.caps
+                                    .execution_constraints
+                                    .max_speculative_points
+                                    .saturating_sub(1) as usize,
+                            );
+                            (!draft.is_empty()).then_some(draft)
                         })
                     } else {
                         None
@@ -4475,6 +4568,40 @@ impl Scheduler {
                         sampling_state,
                         input_token,
                         relay_input,
+                    },
+                )
+            }
+            Phase::CloseKv => {
+                let st = self.running.get(&id)?;
+                let capacity_target =
+                    self.decode_capacity_target(st.und.physical_kv_len as usize, 0);
+                if !self.bm.ensure_capacity(id, capacity_target) {
+                    return None;
+                }
+                let image_id = st.image_gen.image_id;
+                let position = st.und.logical_pos;
+                let physical_position = st.und.physical_kv_len;
+                let token = st.und.next_token;
+                let new_blocks = self.take_new_blocks(id);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::CloseKv {
+                        image_id,
+                        position,
+                        physical_position,
+                        token,
+                        new_blocks,
+                    },
+                )
+            }
+            Phase::PublishKv => {
+                let st = self.running.get(&id)?;
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::PublishKv {
+                        image_id: st.image_gen.image_id,
                     },
                 )
             }
@@ -4993,16 +5120,6 @@ impl Scheduler {
         draft_token_ids: Vec<u32>,
     ) {
         let operation_variant = transition.operation_variant;
-        // A token operation that publishes a KV product supplies the conditioning
-        // a later denoise operation lists among its inputs.
-        if matches!(
-            operation_variant,
-            WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
-        ) && let Some(conditioning) = view.kv_product.clone()
-            && let Some(state) = self.running.get_mut(&id)
-        {
-            state.image_gen.conditioning = Some(conditioning);
-        }
         if !view.prompt_logprobs.is_empty() {
             let positions = std::mem::take(&mut view.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
@@ -5017,6 +5134,7 @@ impl Scheduler {
             WorkVariant::TokenExtend => {
                 self.bm.activate(id);
                 match &transition.delta {
+                    crate::generation::TransitionDelta::CloseKv { .. } => return,
                     crate::generation::TransitionDelta::IngestImageState {
                         is_final_step, ..
                     } => {
@@ -5520,7 +5638,7 @@ impl Scheduler {
             st.image_gen.steps_done = 0;
             st.image_gen.image_id += 1;
             st.und.text_since_image = 0;
-            st.lifecycle.phase = Phase::DenoiseGen;
+            st.lifecycle.phase = Phase::CloseKv;
             st.image_gen.branch_pending = true;
         }
         self.promote_gen_branch_reservation(id);

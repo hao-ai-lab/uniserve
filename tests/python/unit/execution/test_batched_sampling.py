@@ -293,8 +293,8 @@ def test_logprob_values_ranks_and_entry_sets_match_full_vocab_reference() -> Non
     )
 
 
-def test_verify_uses_prefix_acceptance_and_the_residual_position_draw() -> None:
-    parameters = SamplingParams(temperature=0.75, return_logprobs=True, n_logprobs=2)
+def test_verify_matches_serial_target_draws_until_the_first_draft_mismatch() -> None:
+    parameters = SamplingParams(temperature=0.0)
     rows = tuple(_row(parameters, session_seed=53, position=position) for position in (21, 22, 23))
     logits = torch.tensor(
         [
@@ -308,36 +308,42 @@ def test_verify_uses_prefix_acceptance_and_the_residual_position_draw() -> None:
         _ENVELOPE,
         logits,
         rows,
-        torch.cat(
-            tuple(
-                uniform_samples(
-                    (1,),
-                    seed=row.draw_seed,
-                    device=logits.device,
-                )
-                for row in rows
-            )
-        ),
+        torch.zeros((3,), dtype=torch.float32),
         *_sampling_task_tensors(
             rows,
             vocab=int(logits.shape[1]),
             device=logits.device,
         ),
         draft_token_ids=draft,
-        acceptance_uniforms=torch.tensor([0.0, 0.99]),
     )
 
     actual = _sample_task_batch((task,))[0]
-    residual = _reference_workspace(logits[1], rows[1])
-    residual[draft[1]] = float("-inf")
-    draw = uniform_samples((1,), seed=rows[1].draw_seed, device=residual.device)[0]
-    expected = min(
-        int((torch.softmax(residual, dim=-1).cumsum(dim=-1) < draw).sum()),
-        int(residual.numel()) - 1,
-    )
 
     assert actual.num_accepted_tokens == 1
-    assert int(actual.token_id) == expected
+    assert int(actual.token_id) == 0
+    assert int(cast(torch.Tensor, actual.device_selected_point).item()) == 2
+
+
+def test_verify_selects_the_accepted_terminal_draft_as_the_exact_point() -> None:
+    parameters = SamplingParams(temperature=0.0)
+    rows = tuple(_row(parameters, session_seed=67, position=position) for position in (31, 32))
+    logits = torch.tensor(((0.2, 2.4, 0.5), (1.7, 0.2, 1.1)))
+    task = _SampleTask(
+        _ENVELOPE,
+        logits,
+        rows,
+        torch.zeros((2,), dtype=torch.float32),
+        *_sampling_task_tensors(rows, vocab=3, device=logits.device),
+        draft_token_ids=(1,),
+        terminal_draft_prefix=1,
+    )
+
+    actual = _sample_task_batch((task,))[0]
+
+    assert actual.num_accepted_tokens == 1
+    assert int(actual.token_id) == 1
+    assert int(cast(torch.Tensor, actual.device_selected_point).item()) == 1
+    assert bool(cast(torch.Tensor, actual.device_finish).item()) is True
 
 
 def test_a_policy_must_leave_a_finite_vocabulary_entry() -> None:

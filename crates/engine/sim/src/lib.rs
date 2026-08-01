@@ -22,9 +22,10 @@ use uniserve_core::{
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
     Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, EngineCaps,
-    ErrorCode, FinishFlags, GenMode, LogicalLengths, OpStatus, Operation, Point, ProductKind,
-    ProductPayload, ProductRef, RegistrationAck, RequestKind, SamplingState, TimingCounters,
-    TokenMode, TokenSpan, TransferMode, Work, WorkVariant, decode_sampling_state_bytes,
+    ErrorCode, ExecutionConstraints, FinishFlags, GenMode, LogicalLengths, OpStatus, Operation,
+    Point, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, SamplingState,
+    TimingCounters, TokenMode, TokenSpan, TransferMode, Work, WorkVariant,
+    decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -229,6 +230,9 @@ struct SimSession {
     admission: Admission,
     point_index: u32,
     committed_semantic: Digest,
+    logical_position: u32,
+    kv_visible_len: u32,
+    kv_published_len: u32,
     emitted: usize,
     flow_step: u16,
     terminal: BTreeMap<u64, RecordedCompletion>,
@@ -237,10 +241,17 @@ struct SimSession {
 impl SimSession {
     fn new(admission: Admission) -> Self {
         let committed_semantic = admission.digest.clone();
+        let prefix_len = admission
+            .und
+            .as_ref()
+            .map_or(0, |branch| branch.kv.prefix_len);
         Self {
             admission,
             point_index: 0,
             committed_semantic,
+            logical_position: prefix_len,
+            kv_visible_len: prefix_len,
+            kv_published_len: 0,
             emitted: 0,
             flow_step: 0,
             terminal: BTreeMap::new(),
@@ -300,6 +311,10 @@ impl SimEngine {
                 RequestKind::UnloadAdapter,
                 RequestKind::ResetPrefixCache,
             ],
+            execution_constraints: ExecutionConstraints {
+                max_batch_operations: 1024,
+                ..ExecutionConstraints::default()
+            },
             model_spec_digest: "0".repeat(64),
             weight_digest: "1".repeat(64),
             ..EngineCaps::default()
@@ -412,11 +427,7 @@ impl SimEngine {
         input_products: &[ProductPayload],
     ) -> anyhow::Result<(CompletionRecord, Vec<ProductPayload>)> {
         let point_index = session.point_index;
-        let selected_point = if operation.advances_state {
-            point_index.saturating_add(1)
-        } else {
-            point_index
-        };
+        let selected_point = u32::from(operation.advances_state);
         let parent_semantic = session.committed_semantic.clone();
 
         let mut record = CompletionRecord {
@@ -434,6 +445,13 @@ impl SimEngine {
             error_code: None,
             timing_counters: TimingCounters::default(),
         };
+        record.logical_lengths.token_len = session.logical_position;
+        set_kv_lengths(
+            &mut record.logical_lengths,
+            session.kv_visible_len,
+            session.kv_visible_len,
+            session.kv_published_len,
+        );
         let mut products = Vec::new();
 
         match operation.work {
@@ -449,7 +467,15 @@ impl SimEngine {
                     .iter()
                     .any(|output| output.kind == ProductKind::Token);
                 if visual_state {
-                    record.logical_lengths.kv_visible_len = operation.bounds.max_tokens.max(1);
+                    session.kv_visible_len = session
+                        .kv_visible_len
+                        .saturating_add(operation.bounds.max_tokens);
+                    set_kv_lengths(
+                        &mut record.logical_lengths,
+                        session.kv_visible_len,
+                        session.kv_visible_len,
+                        session.kv_published_len,
+                    );
                     if operation
                         .outputs
                         .iter()
@@ -458,7 +484,18 @@ impl SimEngine {
                         session.emitted = 0;
                     }
                 }
-                if !visual_state || samples_token {
+                if !visual_state && !samples_token {
+                    session.kv_visible_len = session
+                        .kv_visible_len
+                        .saturating_add(operation.bounds.max_tokens);
+                    record.logical_lengths.token_len = session.logical_position;
+                    set_kv_lengths(
+                        &mut record.logical_lengths,
+                        session.kv_visible_len,
+                        session.kv_visible_len,
+                        session.kv_published_len,
+                    );
+                } else if samples_token {
                     let index = session.emitted;
                     let sampling_state = operation_sampling_state(operation, input_products)?;
                     let Some(output) =
@@ -485,7 +522,21 @@ impl SimEngine {
                     };
                     record.logical_lengths.token_len = 1;
                     if !visual_state {
-                        record.logical_lengths.kv_visible_len = operation.bounds.max_tokens;
+                        let query_tokens = match mode {
+                            TokenMode::Extend => operation.bounds.max_tokens,
+                            TokenMode::Decode | TokenMode::Verify => 1,
+                        };
+                        session.logical_position =
+                            session.logical_position.saturating_add(query_tokens);
+                        session.kv_visible_len =
+                            session.kv_visible_len.saturating_add(query_tokens);
+                        record.logical_lengths.token_len = session.logical_position;
+                        set_kv_lengths(
+                            &mut record.logical_lengths,
+                            session.kv_visible_len,
+                            session.kv_visible_len,
+                            session.kv_published_len,
+                        );
                     }
                     match mode {
                         TokenMode::Extend => session.emitted = session.emitted.max(1),
@@ -521,8 +572,15 @@ impl SimEngine {
             Work::Draft => {}
             Work::Encode(_) => {}
             Work::Transfer(mode) => {
-                record.logical_lengths.kv_visible_len =
-                    matches!(mode, TransferMode::KvPublish | TransferMode::KvInstall) as u32;
+                if mode == TransferMode::KvPublish {
+                    session.kv_published_len = session.kv_visible_len;
+                }
+                set_kv_lengths(
+                    &mut record.logical_lengths,
+                    session.kv_visible_len,
+                    session.kv_visible_len,
+                    session.kv_published_len,
+                );
             }
             Work::Gen(GenMode::Transition) => {}
             Work::Gen(GenMode::Flow) => {
@@ -640,6 +698,14 @@ fn operation_sampling_state(
     decode_sampling_state_bytes(&payload.bytes).map(Some)
 }
 
+fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, committed: u32, published: u32) {
+    lengths.kv_reserved_len = visible;
+    lengths.kv_initialized_len = visible;
+    lengths.kv_visible_len = visible;
+    lengths.kv_committed_len = committed;
+    lengths.kv_published_len = published;
+}
+
 /// The declared output-product reference for a value packed into a completion.
 fn output_ref(operation: &Operation, kind: ProductKind) -> anyhow::Result<ProductRef> {
     operation
@@ -741,13 +807,17 @@ impl ModelEngine for SimEngine {
                 } => {
                     anyhow::ensure!(
                         *point_index == session.point_index,
-                        "operation parent point {} does not match session point {}",
+                        "operation {} ({}) parent point {} does not match session point {}",
+                        operation.op_id.0,
+                        operation.work.variant().as_wire_str(),
                         point_index,
                         session.point_index
                     );
                     anyhow::ensure!(
                         *semantic_digest == session.committed_semantic,
-                        "operation parent semantic digest does not match the committed point"
+                        "operation {} ({}) parent semantic digest does not match the committed point",
+                        operation.op_id.0,
+                        operation.work.variant().as_wire_str()
                     );
                 }
                 Point::Device {
@@ -821,7 +891,8 @@ impl ModelEngine for SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_wire::{
-        Bounds, Domain, KvAllocation, OpId, RequestKey, RouteId, UndAdmission, VersionRef,
+        Bounds, DType, Domain, KvAllocation, OpId, PointRange, ProductRef, RequestKey, RouteId,
+        ShapeBound, StorageClass, UndAdmission, VersionRef,
     };
 
     fn request_key() -> RequestKey {
@@ -843,6 +914,30 @@ mod tests {
         .expect("admission")
     }
 
+    fn token_outputs(op_id: OpId) -> Vec<ProductRef> {
+        [
+            (ProductKind::Token, DType::U32, Vec::new()),
+            (ProductKind::SelectedPoint, DType::U32, Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, dtype, dims))| ProductRef {
+            request_key: request_key(),
+            producer_op_id: op_id,
+            output_index: index as u16,
+            generation: index as u32 + 1,
+            kind,
+            storage_class: StorageClass::DeviceTensor,
+            dtype,
+            shape_bound: ShapeBound { dims },
+            point_range: PointRange {
+                base_point: 0,
+                max_points: 1,
+            },
+        })
+        .collect()
+    }
+
     fn batch(step_id: u64, op_id: u64) -> Batch {
         let request_key = request_key();
         let admission = admission();
@@ -860,7 +955,7 @@ mod tests {
                 ..Bounds::default()
             },
             Vec::new(),
-            Vec::new(),
+            token_outputs(OpId(op_id)),
             Vec::new(),
             None,
             None,
