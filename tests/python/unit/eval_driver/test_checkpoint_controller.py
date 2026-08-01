@@ -2,8 +2,8 @@
 
 The protocol uses the worse regression against the immutable anchor and previous
 accepted checkpoint, admits every required performance metric through a single 20%
-limit, and retains correctness, work, artifact-validity, interleave-conformance,
-and provenance checks as hard gates.
+limit, and retains correctness, requested-workload identity, artifact-validity,
+interleave-conformance, and provenance checks as hard gates.
 """
 
 from __future__ import annotations
@@ -61,7 +61,10 @@ def _write_point(
     head: str = "0" * 40,
     dirty: bool | None = False,
     dataset_revision: str = "d" * 40,
+    dataset_path: str | None = None,
     load_case: str = "c32",
+    contract_fingerprint: str = "1" * 64,
+    temperature: float = 0.0,
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     ok_count = request_count if ok_count is None else ok_count
@@ -70,9 +73,20 @@ def _write_point(
         "valid_marker": "canonical-valid-v2" if valid else "invalid",
         "checks": _base_checks() if checks is None else checks,
         "generation_conformance": {"valid": generation_valid},
-        "contract": {"spec": {"dataset_revision": dataset_revision}},
+        "contract": {
+            "fingerprint": contract_fingerprint,
+            "selected_rows": {"count": request_count, "sha256": "2" * 64},
+            "spec": {
+                "dataset_revision": dataset_revision,
+                "dataset_path": dataset_path,
+                "temperature": temperature,
+            },
+        },
         "matrix_contract": {
-            "benchmark_definition": {"load_case_id": load_case},
+            "benchmark_definition": {
+                "fingerprint": "3" * 64,
+                "load_case_id": load_case,
+            },
             "execution_policy": {
                 "build_manifest": {
                     "source_state": {
@@ -395,6 +409,154 @@ def test_interleave_hard_gate_requires_complete_timestamped_conformance(
     assert "transition_sample_coverage=0.5" in failures
 
 
+def test_interleave_comparison_accepts_conforming_realized_trajectory_variation(
+    tmp_path: Path,
+) -> None:
+    anchor = cc.load_point(
+        _write_point(
+            tmp_path / "anchor",
+            task="interleave",
+            metrics=_interleave_metrics(
+                ttft=100.0,
+                tpot=10.0,
+                image_latency=1000.0,
+                transition=2000.0,
+                text_to_image=3000.0,
+                image_to_text=5.0,
+                signatures={"r0": "text->image->text"},
+            ),
+            interleave_valid=True,
+            load_case="c4",
+        )
+    )
+    candidate = cc.load_point(
+        _write_point(
+            tmp_path / "candidate",
+            task="interleave",
+            metrics=_interleave_metrics(
+                ttft=100.0,
+                tpot=10.0,
+                image_latency=1000.0,
+                transition=2000.0,
+                text_to_image=3000.0,
+                image_to_text=5.0,
+                signatures={"r0": "text->image->text->image->text"},
+            ),
+            interleave_valid=True,
+            load_case="c4",
+        )
+    )
+
+    assert cc.hard_gate_failures(candidate, anchor, interleave=True) == []
+
+
+def test_interleave_comparison_binds_the_requested_workload_contract(
+    tmp_path: Path,
+) -> None:
+    metrics = _interleave_metrics(
+        ttft=100.0,
+        tpot=10.0,
+        image_latency=1000.0,
+        transition=2000.0,
+        text_to_image=3000.0,
+        image_to_text=5.0,
+    )
+    anchor = cc.load_point(
+        _write_point(
+            tmp_path / "anchor",
+            task="interleave",
+            metrics=metrics,
+            interleave_valid=True,
+            load_case="c4",
+        )
+    )
+    candidate = cc.load_point(
+        _write_point(
+            tmp_path / "candidate",
+            task="interleave",
+            metrics=metrics,
+            interleave_valid=True,
+            load_case="c4",
+            temperature=0.7,
+        )
+    )
+
+    assert cc.hard_gate_failures(candidate, anchor, interleave=True) == [
+        "workload_contract_mismatch:anchor"
+    ]
+
+
+def test_comparison_contract_is_independent_of_local_dataset_location(
+    tmp_path: Path,
+) -> None:
+    metrics = {"output_throughput": 100.0}
+    anchor = cc.load_point(
+        _write_point(
+            tmp_path / "anchor",
+            task="i2t",
+            metrics=metrics,
+            dataset_path="/artifact/anchor/i2t_beans",
+            contract_fingerprint="1" * 64,
+        )
+    )
+    candidate = cc.load_point(
+        _write_point(
+            tmp_path / "candidate",
+            task="i2t",
+            metrics=metrics,
+            dataset_path="/artifact/candidate/i2t_beans",
+            contract_fingerprint="4" * 64,
+        )
+    )
+
+    assert candidate.workload_contract == anchor.workload_contract
+    assert cc.hard_gate_failures(candidate, anchor, interleave=False) == []
+
+
+def test_triplet_comparison_binds_requested_sampling_controls(tmp_path: Path) -> None:
+    metrics = {"output_throughput": 100.0}
+    anchor = cc.load_point(
+        _write_point(tmp_path / "anchor", task="text", metrics=metrics)
+    )
+    candidate = cc.load_point(
+        _write_point(
+            tmp_path / "candidate",
+            task="text",
+            metrics=metrics,
+            temperature=0.7,
+        )
+    )
+
+    assert cc.hard_gate_failures(candidate, anchor, interleave=False) == [
+        "workload_contract_mismatch:anchor"
+    ]
+
+
+def test_comparison_binds_the_previous_requested_workload_contract(tmp_path: Path) -> None:
+    metrics = {"output_throughput": 100.0}
+    anchor = cc.load_point(
+        _write_point(tmp_path / "anchor", task="text", metrics=metrics)
+    )
+    previous = cc.load_point(
+        _write_point(
+            tmp_path / "previous",
+            task="text",
+            metrics=metrics,
+            temperature=0.7,
+        )
+    )
+    candidate = cc.load_point(
+        _write_point(tmp_path / "candidate", task="text", metrics=metrics)
+    )
+
+    assert cc.hard_gate_failures(
+        candidate,
+        anchor,
+        previous,
+        interleave=False,
+    ) == ["workload_contract_mismatch:previous"]
+
+
 def test_checkpoint_passes_at_the_performance_limit(tmp_path: Path) -> None:
     _triplet(
         tmp_path / "anchor",
@@ -525,7 +687,7 @@ def test_major_boundary_uses_the_same_performance_limit(tmp_path: Path) -> None:
         image_to_text=6.0,
     )
     _write_point(
-        tmp_path / "anchor" / "sensenova_ueval_interleave" / "uniserve_c4",
+        tmp_path / "anchor_major" / "sensenova_ueval_interleave" / "uniserve_c4",
         task="interleave",
         metrics=anchor_interleave,
         interleave_valid=True,
@@ -533,7 +695,7 @@ def test_major_boundary_uses_the_same_performance_limit(tmp_path: Path) -> None:
         load_case="c4",
     )
     _write_point(
-        tmp_path / "candidate" / "sensenova_ueval_interleave" / "uniserve_c4",
+        tmp_path / "candidate_major" / "sensenova_ueval_interleave" / "uniserve_c4",
         task="interleave",
         metrics=candidate_interleave,
         interleave_valid=True,
@@ -552,6 +714,8 @@ def test_major_boundary_uses_the_same_performance_limit(tmp_path: Path) -> None:
         checkpoint="cp5",
         major_boundary=True,
         default_travel_dir=default_travel,
+        candidate_major_root=tmp_path / "candidate_major",
+        anchor_major_root=tmp_path / "anchor_major",
     )
 
     assert report.verdict == "pass"
@@ -767,7 +931,7 @@ def test_acceptance_artifact_declares_the_fixed_limit(tmp_path: Path) -> None:
 
     artifact = cc._report_to_dict(report)
 
-    assert artifact["schema_version"] == 3
+    assert artifact["schema_version"] == 4
     assert artifact["source_revision"] == "b" * 40
     assert artifact["regression_limit"] == pytest.approx(0.20)
     assert artifact["verdict"] == "pass"
