@@ -3037,6 +3037,13 @@ class ModelExecutor:
         image = session.image
         if image is None:
             raise invalid_descriptor("flow operation has no admitted image parameters")
+        rng = operation.rng
+        if rng is None or rng.draw_layout is not DrawLayout.FLOW_NOISE:
+            raise invalid_descriptor("flow operation requires semantic flow-noise RNG coordinates")
+        if int(rng.seed) != int(image.seed or 0):
+            raise invalid_descriptor("operation flow-noise seed disagrees with admitted image seed")
+        if int(rng.semantic_index_base) < 1:
+            raise invalid_descriptor("flow-noise semantic image index must be positive")
         latent_handle = _stable_handle(session_id, operation.request_key.epoch, 0, "latent")
         start_step = session.flow_step
         remaining = int(image.steps) - start_step
@@ -3195,7 +3202,9 @@ class ModelExecutor:
         route = self._route(self._primary_stage(OperationType.FLOW))
         device = torch.device(self._route_device(route))
         dtype = _torch_dtype(route.dtype)
-        seed = flow_noise_seed(int(_require_image(session).seed or 0), operation.op_id)
+        rng = operation.rng
+        assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
+        seed = flow_noise_seed(int(rng.seed), int(rng.semantic_index_base))
         scale = self._noise_scale(height, width)
         shape: tuple[int, ...]
         if flow.latent_layout is LatentLayout.PATCH_TOKENS:

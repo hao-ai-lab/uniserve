@@ -1494,15 +1494,21 @@ impl GenerationPlanner {
             max_completion_bytes,
             max_transfer_bytes: 0,
         };
-        let rng = produces_token
-            .then(|| {
+        let rng = match &delta {
+            TransitionDelta::DenoiseGen { image_id, .. } => Some(Rng {
+                seed: request.image.seed.unwrap_or(0),
+                semantic_index_base: u64::from(*image_id),
+                draw_layout: DrawLayout::FlowNoise,
+            }),
+            _ if produces_token => {
                 transition_sampling_index(&delta).map(|semantic_index_base| Rng {
                     seed: request.sampling.seed.unwrap_or(0),
                     semantic_index_base,
                     draw_layout: DrawLayout::TargetSampling,
                 })
-            })
-            .flatten();
+            }
+            _ => None,
+        };
         Ok(PlannedTransition {
             work: wire.work,
             route: ROUTE,
@@ -2467,6 +2473,54 @@ mod tests {
                 seed: 0,
                 semantic_index_base: 2,
                 draw_layout: DrawLayout::TargetSampling,
+            })
+        );
+    }
+
+    #[test]
+    fn planner_coordinates_flow_noise_by_semantic_image() {
+        let mut request = request(19, vec![11, 12]);
+        request.constraint = GenerationConstraint::Default;
+        request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 };
+        request.behavior =
+            GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+        request.image.seed = Some(29);
+
+        let transition = GenerationPlanner::new()
+            .plan(
+                &request,
+                CursorProjection {
+                    phase: GenerationPhase::DenoiseGen,
+                    prompt_cursor: 2,
+                    logical_pos: 2,
+                    physical_kv_len: 2,
+                    replayability: Replayability::NotReplayable,
+                },
+                TransitionIntent::DenoiseGen {
+                    image_id: 3,
+                    start_step: 0,
+                    step_count: 1,
+                    cfg: CfgParams {
+                        branch_count: 3,
+                        text_scale: 1.0,
+                        img_scale: 1.0,
+                        renorm_type: String::new(),
+                        renorm_min: 0.0,
+                        interval: (0.0, 1.0),
+                    },
+                    latent_units: 64,
+                    host_scratch_tokens: 64,
+                    conditioning: None,
+                },
+            )
+            .expect("plan flow denoise");
+
+        assert_eq!(
+            transition.rng,
+            Some(Rng {
+                seed: 29,
+                semantic_index_base: 3,
+                draw_layout: DrawLayout::FlowNoise,
             })
         );
     }
