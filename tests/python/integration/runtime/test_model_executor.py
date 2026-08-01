@@ -479,6 +479,28 @@ def test_failed_first_flow_attempt_reclaims_state_and_retries_deterministically(
     assert worker.latents.require(worker.sessions.get(5).latent_handle).step == 2
 
 
+def test_initial_flow_noise_is_stable_across_operation_schedules():
+    admission = gen_admission(5, ImageParams(steps=1, height=16, width=16, seed=29))
+    observed: list[torch.Tensor] = []
+    for op_id in (41, 109):
+        model = _ObservedModel()
+        worker = execution_worker(model)
+        flow = flow_operation(
+            admission.request_key,
+            op_id=op_id,
+            parent=root_parent(admission),
+            steps=1,
+            seed=29,
+            image_index=3,
+        )
+        worker.execute(
+            Batch(step_id=op_id, admissions=(admission,), operations=(flow,), input_products=())
+        )
+        observed.append(model.flow_inputs[0])
+
+    torch.testing.assert_close(observed[1], observed[0], rtol=0, atol=0)
+
+
 def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
     # A small page (4 tokens/block) forces the decode chain to cross a block
     # boundary. Each step's `new_kv_blocks` grows the session lease before the

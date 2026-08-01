@@ -41,10 +41,10 @@ def semantic_sampling_seed(
     return value
 
 
-def flow_noise_seed(session_seed: int, op_id: int) -> int:
-    """Return the retry-stable seed for one flow operation's initial noise."""
+def flow_noise_seed(session_seed: int, semantic_image_index: int) -> int:
+    """Return the schedule-stable seed for one semantic image's initial noise."""
 
-    return _splitmix_coordinate(session_seed, op_id)
+    return _splitmix_coordinate(session_seed, semantic_image_index)
 
 
 def uniform_samples(

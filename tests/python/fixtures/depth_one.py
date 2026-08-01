@@ -17,6 +17,7 @@ from uniserve_worker.batch import (
     DeviceDim,
     Disposition,
     Domain,
+    DrawLayout,
     DType,
     EncodeMode,
     FixedPoint,
@@ -264,6 +265,8 @@ def flow_operation(
     op_id: int,
     parent: VersionRef,
     steps: int,
+    seed: int = 29,
+    image_index: int = 1,
     control_seq: int = 0,
 ) -> Operation:
     return Operation.registered(
@@ -274,6 +277,11 @@ def flow_operation(
         route=0,
         domain=Domain.GEN,
         bounds=Bounds(max_points=int(steps)),
+        rng=Rng(
+            seed=int(seed),
+            semantic_index_base=int(image_index),
+            draw_layout=DrawLayout.FLOW_NOISE,
+        ),
         control_seq=control_seq,
     )
 
