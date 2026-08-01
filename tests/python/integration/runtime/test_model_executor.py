@@ -36,6 +36,7 @@ from uniserve_worker.forward import (
     FlowRow,
     ForwardBatch,
     ForwardOutput,
+    PackedAttentionPlan,
     PagedDecodePlan,
     TokenRow,
 )
@@ -176,6 +177,33 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     assert model.token_positions == [(0, 1), (2,)]
 
 
+def test_prefix_reuse_continues_from_the_admitted_logical_position():
+    model = _ObservedModel()
+    worker = execution_worker(model)
+    admission = und_admission(8, block_ids=(0,), prefix_len=2)
+    extend, extend_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(4,),
+    )
+
+    worker.execute(
+        Batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(extend,),
+            input_products=(extend_input,),
+        )
+    )
+
+    session = worker.sessions.get(8)
+    assert model.token_positions == [(2,)]
+    assert session.logical_position == 3
+    assert session.resolved_runtime[0].logical_position == 2
+
+
 def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
     mixed_model = _ObservedModel()
     mixed = execution_worker(mixed_model)
@@ -299,7 +327,7 @@ def test_token_decode_uses_the_homogeneous_paged_plan():
     assert decoded.completions[1].committed_tokens == (_next_token(_next_token(4)),)
 
 
-def test_image_capable_pure_token_decode_uses_paged_attention():
+def test_image_capable_token_decode_preserves_mixed_route_attention():
     model = _ObservedModel()
     worker = execution_worker(model)
     understanding = und_admission(43, block_ids=(0,))
@@ -343,9 +371,7 @@ def test_image_capable_pure_token_decode_uses_paged_attention():
         )
     )
 
-    plan = model.attention_plans[-1]
-    assert isinstance(plan, PagedDecodePlan)
-    assert plan.query_lens_cpu == (1,)
+    assert isinstance(model.attention_plans[-1], PackedAttentionPlan)
 
 
 def test_replay_identity_is_idempotent_and_conflicts_are_atomic():

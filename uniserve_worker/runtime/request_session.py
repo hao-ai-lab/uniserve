@@ -242,6 +242,7 @@ class SessionStore:
                     f"session {session_id} admission conflicts with committed state"
                 )
             return existing
+        prefix_len = 0 if admission.und is None else int(admission.und.kv.prefix_len)
         session = RequestSession(
             request_key=admission.request_key,
             admission_digest=admission.digest,
@@ -252,13 +253,14 @@ class SessionStore:
             adapter_id=admission.adapter_id,
             resolved_digest=admission.digest,
             committed_digest=admission.digest,
+            logical_position=prefix_len,
         )
         root = session.committed_version()
         session.resolved_versions[0] = root
         session.resolved_runtime[0] = ResolvedRuntimeState(
             logical_position=session.logical_position,
             rng_counter=session.rng_counter,
-            kv_length=(0 if admission.und is None else int(admission.und.kv.prefix_len)),
+            kv_length=prefix_len,
         )
         self._sessions[session_id] = session
         return session
