@@ -25,8 +25,7 @@ pub mod schema {
 }
 
 pub use resources::{
-    LeasePolicy, ResourceClass, ResourceEvent, ResourceEventKind, ResourceHandle, ResourceLease,
-    ResourcePressure,
+    CreditDimension, CreditVector, ResourceClass, ResourcePressure, RouteCreditLimits,
 };
 
 /// A lowercase 64-character SHA-256 digest string. Both protocol digests and
@@ -355,7 +354,7 @@ impl ProductRef {
         self.shape_bound.validate()
     }
 
-    fn max_bytes(&self) -> u64 {
+    pub fn max_bytes(&self) -> u64 {
         let element_bytes = match self.dtype {
             DType::U8 => 1,
             DType::U16 | DType::F16 | DType::BF16 => 2,
@@ -383,7 +382,10 @@ pub enum Point {
     },
     /// A device-selected point a successor may consume before host observation.
     Device {
-        selected_point: ProductRef,
+        /// The producer-local point when selection is statically determined.
+        point_index: u32,
+        /// The producer's dynamic selection product for multi-point work.
+        selected_point: Option<ProductRef>,
         producer_plan_digest: Digest,
     },
 }
@@ -426,26 +428,38 @@ impl VersionRef {
                 "fixed version reference has an invalid semantic digest"
             ),
             Point::Device {
+                point_index,
                 selected_point,
                 producer_plan_digest,
             } => {
-                selected_point.validate()?;
-                anyhow::ensure!(
-                    selected_point.request_key == self.request_key
-                        && selected_point.producer_op_id == self.producer_op_id,
-                    "device version selected point is not owned by its producer"
-                );
-                anyhow::ensure!(
-                    selected_point.generation > 0,
-                    "device version selected point has no logical generation"
-                );
-                anyhow::ensure!(
-                    selected_point.kind == ProductKind::SelectedPoint
-                        && selected_point.storage_class == StorageClass::DeviceTensor
-                        && selected_point.dtype == DType::U32
-                        && selected_point.shape_bound.max_elements() == 1,
-                    "device version does not name a scalar selected-point product"
-                );
+                if let Some(selected_point) = selected_point {
+                    anyhow::ensure!(
+                        *point_index == 0,
+                        "a dynamic device version also declares a fixed point"
+                    );
+                    selected_point.validate()?;
+                    anyhow::ensure!(
+                        selected_point.request_key == self.request_key
+                            && selected_point.producer_op_id == self.producer_op_id,
+                        "device version selected point is not owned by its producer"
+                    );
+                    anyhow::ensure!(
+                        selected_point.generation > 0,
+                        "device version selected point has no logical generation"
+                    );
+                    anyhow::ensure!(
+                        selected_point.kind == ProductKind::SelectedPoint
+                            && selected_point.storage_class == StorageClass::DeviceTensor
+                            && selected_point.dtype == DType::U32
+                            && selected_point.shape_bound.max_elements() == 1,
+                        "device version does not name a scalar selected-point product"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        *point_index > 0,
+                        "a static device version must name a positive producer point"
+                    );
+                }
                 anyhow::ensure!(
                     is_digest(producer_plan_digest),
                     "device version reference has an invalid producer plan digest"
@@ -467,6 +481,38 @@ impl VersionRef {
 pub enum Domain {
     Und = 0,
     Gen = 1,
+}
+
+/// The physical execution contract for one scheduler batch partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ExecutionCapability {
+    /// The physical submission contains one independently described domain.
+    DomainHomogeneous = 0,
+    /// Multiple independently described domain partitions share only the final
+    /// tensorized runner call under a route-static capability declaration.
+    TensorizedMixed = 1,
+}
+
+/// The attention structure one partition presents to the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum AttentionRegime {
+    None = 0,
+    Causal = 1,
+    Bidirectional = 2,
+    Hybrid = 3,
+}
+
+/// Tensor-parallel ownership of device token selection for one route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum SamplingOwnership {
+    DesignatedRank = 0,
+    DeterministicSharded = 1,
 }
 
 /// Hard resource maxima the scheduler reserves before an operation runs.
@@ -1081,13 +1127,57 @@ impl Admission {
 // Batch and response framing
 // ---------------------------------------------------------------------------
 
-/// A submission window: a topologically ordered set of operations plus any
-/// controls, and the admissions that establish their lineages.
+/// One independently owned scheduler batch partition. `submission_group`
+/// identifies the physical runner call: a domain-homogeneous group has exactly
+/// one partition, while a qualified tensorized-mixed group has one partition
+/// per participating domain. `collective_seq` is the exact TP collective order
+/// all ranks validate before enqueue.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchPartition {
+    pub partition_id: u32,
+    pub submission_group: u32,
+    pub collective_seq: u64,
+    pub domain: Domain,
+    pub route: RouteId,
+    pub execution: ExecutionCapability,
+    pub attention: AttentionRegime,
+    pub shape_class: u64,
+    pub operations: Vec<Operation>,
+}
+
+impl BatchPartition {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.partition_id > 0, "batch partition id must be positive");
+        anyhow::ensure!(
+            self.submission_group > 0,
+            "batch partition submission group must be positive"
+        );
+        anyhow::ensure!(
+            self.collective_seq > 0,
+            "batch partition collective sequence must be positive"
+        );
+        anyhow::ensure!(
+            !self.operations.is_empty(),
+            "batch partition must carry at least one operation"
+        );
+        for operation in &self.operations {
+            operation.validate()?;
+            anyhow::ensure!(
+                operation.domain == self.domain && operation.route == self.route,
+                "batch partition operation disagrees with its domain or route"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A submission window containing independently owned physical partitions plus
+/// controls and the admissions that establish their lineages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
     pub step_id: u64,
     pub admissions: Vec<Admission>,
-    pub operations: Vec<Operation>,
+    pub partitions: Vec<BatchPartition>,
     pub controls: Vec<Control>,
     /// Host-supplied input product values the operations reference through
     /// `Operation::inputs`, matched by `ProductRef` identity. These are
@@ -1097,14 +1187,27 @@ pub struct Batch {
 }
 
 impl Batch {
-    pub fn new(step_id: u64, admissions: Vec<Admission>, operations: Vec<Operation>) -> Self {
+    pub fn new(step_id: u64, admissions: Vec<Admission>, partitions: Vec<BatchPartition>) -> Self {
         Self {
             step_id,
             admissions,
-            operations,
+            partitions,
             controls: Vec::new(),
             input_products: Vec::new(),
         }
+    }
+
+    pub fn operations(&self) -> impl Iterator<Item = &Operation> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.operations.iter())
+    }
+
+    pub fn operation_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|partition| partition.operations.len())
+            .sum()
     }
 
     pub fn with_controls(mut self, controls: Vec<Control>) -> Self {
@@ -1119,13 +1222,68 @@ impl Batch {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.operations.is_empty() || !self.controls.is_empty(),
+            !self.partitions.is_empty() || !self.controls.is_empty(),
             "a submission batch must carry at least one operation or control"
         );
+        let mut partition_ids = HashSet::with_capacity(self.partitions.len());
+        let mut submission_groups: std::collections::HashMap<u32, Vec<&BatchPartition>> =
+            std::collections::HashMap::new();
+        for partition in &self.partitions {
+            partition.validate()?;
+            anyhow::ensure!(
+                partition_ids.insert(partition.partition_id),
+                "a submission batch repeats a partition id"
+            );
+            submission_groups
+                .entry(partition.submission_group)
+                .or_default()
+                .push(partition);
+        }
+        for partitions in submission_groups.values() {
+            let execution = partitions[0].execution;
+            let collective_seq = partitions[0].collective_seq;
+            let attention = partitions[0].attention;
+            let shape_class = partitions[0].shape_class;
+            anyhow::ensure!(
+                partitions.iter().all(|partition| {
+                    partition.execution == execution
+                        && partition.collective_seq == collective_seq
+                        && partition.attention == attention
+                        && partition.shape_class == shape_class
+                }),
+                "physical submission partitions disagree on execution, attention, shape, or collective order"
+            );
+            match execution {
+                ExecutionCapability::DomainHomogeneous => anyhow::ensure!(
+                    partitions.len() == 1,
+                    "a domain-homogeneous submission group must contain one partition"
+                ),
+                ExecutionCapability::TensorizedMixed => {
+                    anyhow::ensure!(
+                        partitions.len() >= 2,
+                        "a tensorized-mixed submission group must contain multiple partitions"
+                    );
+                    anyhow::ensure!(
+                        partitions
+                            .iter()
+                            .map(|partition| partition.domain)
+                            .collect::<HashSet<_>>()
+                            .len()
+                            == partitions.len(),
+                        "a tensorized-mixed submission group repeats a domain"
+                    );
+                    anyhow::ensure!(
+                        partitions
+                            .iter()
+                            .all(|partition| partition.route == partitions[0].route),
+                        "a tensorized-mixed submission group spans route capabilities"
+                    );
+                }
+            }
+        }
         // Depth one: at most one runnable operation per request per batch.
-        let mut request_keys = HashSet::with_capacity(self.operations.len());
-        for operation in &self.operations {
-            operation.validate()?;
+        let mut request_keys = HashSet::with_capacity(self.operation_count());
+        for operation in self.operations() {
             anyhow::ensure!(
                 request_keys.insert(operation.request_key),
                 "a submission batch carries multiple operations for one request"
@@ -1139,8 +1297,7 @@ impl Batch {
                 "a submission batch carries a duplicate admission"
             );
             anyhow::ensure!(
-                self.operations
-                    .iter()
+                self.operations()
                     .any(|operation| operation.request_key == admission.request_key),
                 "a submission batch admits a request without an operation"
             );
@@ -1171,11 +1328,10 @@ impl Batch {
             payload.validate()?;
         }
         let declared_inputs = self
-            .operations
-            .iter()
+            .operations()
             .flat_map(|operation| operation.inputs.iter())
             .collect::<HashSet<_>>();
-        for operation in &self.operations {
+        for operation in self.operations() {
             for input in operation
                 .inputs
                 .iter()
@@ -1194,10 +1350,18 @@ impl Batch {
                 declared_inputs.contains(&payload.product),
                 "an input product payload is not declared by any operation"
             );
-            anyhow::ensure!(
-                payload.product.storage_class == StorageClass::HostStaging,
-                "an input product payload does not name host-staging storage"
-            );
+            let transferred = is_transfer_descriptor(&payload.bytes);
+            if payload.product.storage_class == StorageClass::HostStaging {
+                anyhow::ensure!(
+                    !transferred,
+                    "host-staging input cannot carry a cross-stage transfer descriptor"
+                );
+            } else {
+                anyhow::ensure!(
+                    transferred && payload.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
+                    "cross-stage product input has an invalid transfer descriptor frame"
+                );
+            }
             anyhow::ensure!(
                 supplied_inputs.insert(&payload.product),
                 "a submission batch repeats an input product payload"
@@ -1285,6 +1449,14 @@ impl ProductPayload {
     }
 
     fn validate_input_value(&self) -> anyhow::Result<()> {
+        if is_transfer_descriptor(&self.bytes) {
+            anyhow::ensure!(
+                self.product.storage_class != StorageClass::HostStaging
+                    && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
+                "cross-stage product input has an invalid transfer descriptor frame"
+            );
+            return Ok(());
+        }
         match self.product.kind {
             ProductKind::Token => {
                 let tokens = decode_token_product_bytes(&self.bytes)?;
@@ -1310,12 +1482,28 @@ impl ProductPayload {
 
     fn validate_output_value(&self) -> anyhow::Result<()> {
         self.validate()?;
+        if is_transfer_descriptor(&self.bytes) {
+            anyhow::ensure!(
+                self.product.storage_class != StorageClass::HostStaging
+                    && self.product.storage_class != StorageClass::CompletionArena
+                    && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
+                "output transfer descriptor has an invalid storage class or byte bound"
+            );
+            return Ok(());
+        }
         anyhow::ensure!(
             self.bytes.len() as u64 <= self.product.max_bytes(),
             "output product payload exceeds its registered byte bound"
         );
         Ok(())
     }
+}
+
+pub const TRANSFER_DESCRIPTOR_PREFIX: &[u8] = b"uniserve-transfer\0";
+pub const MAX_TRANSFER_DESCRIPTOR_BYTES: usize = 64 * 1024;
+
+pub fn is_transfer_descriptor(bytes: &[u8]) -> bool {
+    bytes.starts_with(TRANSFER_DESCRIPTOR_PREFIX)
 }
 
 /// Encode a `ProductKind::Token` product value: a little-endian `u32` count
@@ -1507,12 +1695,10 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> anyhow::Result<SamplingState
     })
 }
 
-/// A worker response frame: one completion per submitted operation, the resolved
-/// output-product values for host consumption, and the registration
-/// acknowledgement.
+/// One independently completed partition in a worker response frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CompletionReport {
-    pub step_id: u64,
+pub struct PartitionCompletion {
+    pub partition_id: u32,
     pub completions: Vec<CompletionRecord>,
     pub products: Vec<ProductPayload>,
     pub registration: RegistrationAck,
@@ -1520,13 +1706,52 @@ pub struct CompletionReport {
     pub forward_stats: Option<WorkerForwardStats>,
 }
 
-impl CompletionReport {
+impl PartitionCompletion {
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.partition_id > 0,
+            "partition completion id must be positive"
+        );
         for completion in &self.completions {
             completion.validate()?;
         }
         for payload in &self.products {
             payload.validate_output_value()?;
+        }
+        Ok(())
+    }
+}
+
+/// A worker response frame containing independently completed scheduler
+/// partitions. Partition order is framing only; operation identity restores
+/// scheduler order without imposing a cross-partition readiness dependency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletionReport {
+    pub step_id: u64,
+    pub partitions: Vec<PartitionCompletion>,
+}
+
+impl CompletionReport {
+    pub fn completions(&self) -> impl Iterator<Item = &CompletionRecord> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.completions.iter())
+    }
+
+    pub fn products(&self) -> impl Iterator<Item = &ProductPayload> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.products.iter())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut partition_ids = HashSet::with_capacity(self.partitions.len());
+        for partition in &self.partitions {
+            partition.validate()?;
+            anyhow::ensure!(
+                partition_ids.insert(partition.partition_id),
+                "completion report repeats a partition id"
+            );
         }
         Ok(())
     }
@@ -1547,12 +1772,23 @@ pub enum AdapterMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteExecutionCapability {
+    pub route: RouteId,
+    pub supported_work: Vec<WorkVariant>,
+    pub tensorized_mixed: bool,
+    pub sampling_ownership: SamplingOwnership,
+    pub preemptible: bool,
+    pub credits: RouteCreditLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionConstraints {
     pub max_batch_operations: u32,
     pub max_speculative_points: u32,
     pub device_sequence_lengths: bool,
     pub device_append_offsets: bool,
     pub incremental_kv_publication: bool,
+    pub route_capabilities: Vec<RouteExecutionCapability>,
 }
 
 impl Default for ExecutionConstraints {
@@ -1563,6 +1799,27 @@ impl Default for ExecutionConstraints {
             device_sequence_lengths: true,
             device_append_offsets: true,
             incremental_kv_publication: true,
+            route_capabilities: vec![RouteExecutionCapability {
+                route: RouteId(0),
+                supported_work: vec![WorkVariant::TokenExtend, WorkVariant::TokenDecode],
+                tensorized_mixed: false,
+                sampling_ownership: SamplingOwnership::DesignatedRank,
+                preemptible: false,
+                credits: RouteCreditLimits {
+                    per_request: CreditVector {
+                        registered_operations: 1,
+                        execution_slots: 1,
+                        completion_slots: 1,
+                        ..CreditVector::ZERO
+                    },
+                    worker: CreditVector {
+                        registered_operations: 1,
+                        execution_slots: 1,
+                        completion_slots: 1,
+                        ..CreditVector::ZERO
+                    },
+                },
+            }],
         }
     }
 }
@@ -1603,7 +1860,7 @@ pub struct EngineCaps {
     pub weight_digest: Digest,
     pub protocol_layout_digest: Digest,
     pub route_capability_digest: Digest,
-    pub restored_sessions: Vec<RequestId>,
+    pub restored_snapshots: Vec<SnapshotRef>,
 }
 
 impl EngineCaps {
@@ -1640,6 +1897,28 @@ impl EngineCaps {
         digest.bool(self.execution_constraints.device_sequence_lengths);
         digest.bool(self.execution_constraints.device_append_offsets);
         digest.bool(self.execution_constraints.incremental_kv_publication);
+        let mut route_capabilities = self.execution_constraints.route_capabilities.to_vec();
+        route_capabilities.sort_unstable_by_key(|capability| capability.route.0);
+        digest.u64(route_capabilities.len() as u64);
+        for capability in route_capabilities {
+            digest.u32(capability.route.0);
+            let mut supported_work = capability
+                .supported_work
+                .iter()
+                .map(|variant| *variant as u8)
+                .collect::<Vec<_>>();
+            supported_work.sort_unstable();
+            supported_work.dedup();
+            digest.u64(supported_work.len() as u64);
+            for variant in supported_work {
+                digest.u8(variant);
+            }
+            digest.bool(capability.tensorized_mixed);
+            digest.u8(capability.sampling_ownership as u8);
+            digest.bool(capability.preemptible);
+            digest.credit_vector(capability.credits.per_request);
+            digest.credit_vector(capability.credits.worker);
+        }
         digest.string(&self.kv_dtype);
         digest.string(&self.model_dtype);
         digest.string(&self.attention_backend);
@@ -1663,6 +1942,59 @@ impl EngineCaps {
             "worker execution constraints declare a zero bound"
         );
         anyhow::ensure!(
+            !self.execution_constraints.route_capabilities.is_empty()
+                && self
+                    .execution_constraints
+                    .route_capabilities
+                    .iter()
+                    .map(|capability| capability.route)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == self.execution_constraints.route_capabilities.len(),
+            "worker execution constraints declare missing or repeated route capabilities"
+        );
+        let declared_work = self.supported_work.iter().copied().collect::<HashSet<_>>();
+        let routed_work = self
+            .execution_constraints
+            .route_capabilities
+            .iter()
+            .flat_map(|capability| capability.supported_work.iter().copied())
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            self.execution_constraints
+                .route_capabilities
+                .iter()
+                .all(|capability| {
+                    !capability.supported_work.is_empty()
+                        && capability
+                            .supported_work
+                            .iter()
+                            .all(|variant| declared_work.contains(variant))
+                        && capability
+                            .supported_work
+                            .iter()
+                            .collect::<HashSet<_>>()
+                            .len()
+                            == capability.supported_work.len()
+                        && capability.credits.validate().is_ok()
+                        && capability.credits.per_request.registered_operations > 0
+                        && capability.credits.per_request.execution_slots > 0
+                        && capability.credits.per_request.completion_slots > 0
+                })
+                && routed_work == declared_work,
+            "worker route capabilities do not partition the declared work"
+        );
+        let shared_worker_credits = self.execution_constraints.route_capabilities[0]
+            .credits
+            .worker;
+        anyhow::ensure!(
+            self.execution_constraints
+                .route_capabilities
+                .iter()
+                .all(|capability| capability.credits.worker == shared_worker_credits),
+            "worker routes disagree on the shared worker-wide credit vector"
+        );
+        anyhow::ensure!(
             self.protocol_layout_digest == protocol_layout_digest(),
             "worker capabilities carry a disagreeing protocol-layout digest"
         );
@@ -1674,6 +2006,20 @@ impl EngineCaps {
             (self.model_spec_digest.is_empty() && self.weight_digest.is_empty())
                 || (is_digest(&self.model_spec_digest) && is_digest(&self.weight_digest)),
             "worker capability model and weight identities are incomplete"
+        );
+        let restored_session_ids = self
+            .restored_snapshots
+            .iter()
+            .map(|snapshot| snapshot.version.request_key.session_id)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            self.restored_snapshots
+                .iter()
+                .all(|snapshot| snapshot.validate().is_ok())
+                && restored_session_ids
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+            "worker restored snapshot identities are invalid or non-canonical"
         );
         Ok(())
     }
@@ -1713,7 +2059,7 @@ impl Default for EngineCaps {
             weight_digest: String::new(),
             protocol_layout_digest: protocol_layout_digest(),
             route_capability_digest: String::new(),
-            restored_sessions: Vec::new(),
+            restored_snapshots: Vec::new(),
         };
         caps.route_capability_digest = caps.compute_route_capability_digest();
         caps
@@ -1752,7 +2098,7 @@ pub fn protocol_layout_digest() -> Digest {
         digest.string(control);
     }
     // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 4] = [
+    let record_layouts: [&[&str]; 5] = [
         &[
             "request_key",
             "op_id",
@@ -1796,6 +2142,7 @@ pub fn protocol_layout_digest() -> Digest {
             "error_code",
             "timing_counters",
         ],
+        &["version", "digest", "locator"],
     ];
     for record in record_layouts {
         digest.u64(record.len() as u64);
@@ -1828,6 +2175,7 @@ pub fn protocol_layout_digest() -> Digest {
 pub enum RequestKind {
     GetCapabilities,
     Execute,
+    PollCompletions,
     DropSession,
     Shutdown,
     CopyKv,
@@ -1842,9 +2190,10 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::GetCapabilities,
         Self::Execute,
+        Self::PollCompletions,
         Self::DropSession,
         Self::Shutdown,
         Self::CopyKv,
@@ -1862,6 +2211,7 @@ impl RequestKind {
         match self {
             Self::GetCapabilities => "get_capabilities",
             Self::Execute => "execute",
+            Self::PollCompletions => "poll_completions",
             Self::DropSession => "drop_session",
             Self::Shutdown => "shutdown",
             Self::CopyKv => "copy_kv",
@@ -1879,11 +2229,24 @@ impl RequestKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRef {
-    pub session_id: RequestId,
-    pub epoch: u64,
-    pub version: u64,
+    pub version: VersionRef,
     pub digest: Digest,
     pub locator: String,
+}
+
+impl SnapshotRef {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.version.validate()?;
+        anyhow::ensure!(
+            self.version.is_fixed(),
+            "snapshot reference version is not fixed"
+        );
+        anyhow::ensure!(
+            is_digest(&self.digest) && self.locator == self.digest,
+            "snapshot reference artifact digest or locator is invalid"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1891,6 +2254,7 @@ pub struct WorkerRequest {
     pub kind: RequestKind,
     pub call_id: Option<u64>,
     pub batch: Option<Batch>,
+    pub step_id: Option<u64>,
     pub session_id: Option<RequestId>,
     pub copies: Option<Vec<(BlockId, BlockId)>>,
     pub adapter_id: Option<u32>,
@@ -1905,6 +2269,7 @@ impl WorkerRequest {
             kind,
             call_id: None,
             batch: None,
+            step_id: None,
             session_id: None,
             copies: None,
             adapter_id: None,
@@ -1921,6 +2286,12 @@ impl WorkerRequest {
         Self {
             batch: Some(batch),
             ..Self::bare(RequestKind::Execute)
+        }
+    }
+    pub fn poll_completions(step_id: u64) -> Self {
+        Self {
+            step_id: Some(step_id),
+            ..Self::bare(RequestKind::PollCompletions)
         }
     }
     pub fn drop_session(session_id: RequestId) -> Self {
@@ -2200,11 +2571,16 @@ impl CanonicalDigest {
                 self.string(semantic_digest);
             }
             Point::Device {
+                point_index,
                 selected_point,
                 producer_plan_digest,
             } => {
                 self.u8(1);
-                self.product_ref(selected_point);
+                self.u32(*point_index);
+                self.u8(u8::from(selected_point.is_some()));
+                if let Some(selected_point) = selected_point {
+                    self.product_ref(selected_point);
+                }
                 self.string(producer_plan_digest);
             }
         }
@@ -2217,6 +2593,12 @@ impl CanonicalDigest {
         self.u64(value.max_latent_bytes);
         self.u64(value.max_completion_bytes);
         self.u64(value.max_transfer_bytes);
+    }
+
+    fn credit_vector(&mut self, value: CreditVector) {
+        for dimension in CreditDimension::ALL {
+            self.u64(value.get(dimension));
+        }
     }
 
     fn rng(&mut self, value: &Rng) {

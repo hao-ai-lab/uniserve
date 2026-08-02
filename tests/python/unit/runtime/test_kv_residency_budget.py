@@ -4,15 +4,24 @@ import dataclasses
 
 import pytest
 
-from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
+from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL_SPEC
 from uniserve_worker.foundation.runtime_config import (
     graph_memory_budget_bytes,
     graph_padding_block_count,
 )
 from uniserve_worker.foundation.sizing import ceil_div, derive_runtime_kv_capacity
 from uniserve_worker.runtime import capabilities as capabilities_module
-from uniserve_worker.runtime.capabilities import _kv_residency_shape, _scratch_capacity_tokens
-from uniserve_worker.spec import PerBranch, ResourcePlan
+from uniserve_worker.runtime.capabilities import (
+    _kv_residency_shape,
+    _scratch_capacity_tokens,
+    resolve_capabilities,
+)
+from uniserve_worker.runtime.latent_capacity import (
+    latent_generation_bytes,
+    latent_store_capacity_bytes,
+)
+from uniserve_worker.runtime.product_capacity import device_product_arena_bytes
+from uniserve_worker.spec import OperationType, PerBranch, ResourcePlan
 
 pytestmark = pytest.mark.unit
 
@@ -133,3 +142,49 @@ def test_declared_token_capacity_sizes_the_request_pool_exactly():
     )
 
     assert capacity.token_capacity == 131072
+
+
+def test_sequence_capabilities_provision_every_bounded_device_product_slot() -> None:
+    operations = tuple(
+        operation
+        for operation in TEST_MODEL_SPEC.operations
+        if operation.kind
+        in {
+            OperationType.SEQUENCE_EXTEND,
+            OperationType.SEQUENCE_DECODE,
+            OperationType.SEQUENCE_VERIFY,
+        }
+    )
+    spec = dataclasses.replace(TEST_MODEL_SPEC, operations=operations, flow=None)
+    deployment = dataclasses.replace(TEST_DEPLOYMENT, device="cuda:0")
+
+    caps = resolve_capabilities(spec, deployment, pipeline_depth=2)
+    worker = caps.execution_constraints.route_capabilities[0].credits.worker
+
+    assert worker.latent_artifact_bytes >= device_product_arena_bytes(
+        worker.device_products,
+        1,
+        max_speculative_points=caps.execution_constraints.max_speculative_points,
+        max_product_bytes=1,
+    )
+
+
+def test_flow_capabilities_cover_committed_and_successor_latent_generations() -> None:
+    caps = resolve_capabilities(TEST_MODEL_SPEC, TEST_DEPLOYMENT, pipeline_depth=2)
+    credits = caps.execution_constraints.route_capabilities[0].credits
+    flow = TEST_MODEL_SPEC.flow
+    assert flow is not None
+    generation_bytes = latent_generation_bytes(
+        caps.max_latent_size,
+        flow.latent_channels,
+        flow.latent_patch_size,
+    )
+    capacity_bytes = latent_store_capacity_bytes(
+        caps.max_latent_size,
+        flow.latent_channels,
+        flow.latent_patch_size,
+    )
+
+    assert capacity_bytes == 2 * generation_bytes
+    assert credits.per_request.latent_artifact_bytes >= capacity_bytes
+    assert credits.worker.latent_artifact_bytes >= capacity_bytes

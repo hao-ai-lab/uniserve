@@ -17,19 +17,20 @@
 //! response extractor returns `None` on any unexpected shape so the caller
 //! falls back to `depythonize` (identical values, identical errors).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_wire::{
-    Admission, Batch, Bounds, CloseReason, CompletionRecord, CompletionReport, Control, DType,
-    DimBound, Disposition, Domain, DrawLayout, EncodeMode, ErrorCode, ErrorOperationIdentity,
-    FinishFlags, GenAdmission, GenMode, KvAllocation, LogicalLengths, OpId, OpStatus, Operation,
-    Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
-    RequestKind, ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
-    TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, Work, WorkerRequest,
+    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
+    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, EncodeMode,
+    ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, GenMode,
+    KvAllocation, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point,
+    PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
+    ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenMode, TokenSpan,
+    TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats, WorkerRequest,
     WorkerResponse,
 };
 
@@ -55,6 +56,7 @@ pub(crate) fn execute_request_to_py<'py>(
             .map(|batch| batch_to_py(py, batch))
             .transpose()?,
     )?;
+    dict.set_item(intern!(py, "step_id"), request.step_id)?;
     dict.set_item(intern!(py, "session_id"), request.session_id.map(|id| id.0))?;
     match &request.copies {
         Some(copies) => dict.set_item(
@@ -94,9 +96,9 @@ fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyDic
         })?,
     )?;
     dict.set_item(
-        intern!(py, "operations"),
-        dict_list(py, &batch.operations, |operation| {
-            operation_to_py(py, operation, &mut context)
+        intern!(py, "partitions"),
+        dict_list(py, &batch.partitions, |partition| {
+            batch_partition_to_py(py, partition, &mut context)
         })?,
     )?;
     dict.set_item(
@@ -109,6 +111,35 @@ fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyDic
         intern!(py, "input_products"),
         dict_list(py, &batch.input_products, |payload| {
             product_payload_to_py(py, payload, &mut context)
+        })?,
+    )?;
+    Ok(dict)
+}
+
+fn batch_partition_to_py<'py>(
+    py: Python<'py>,
+    partition: &BatchPartition,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "partition_id"), partition.partition_id)?;
+    dict.set_item(intern!(py, "submission_group"), partition.submission_group)?;
+    dict.set_item(intern!(py, "collective_seq"), partition.collective_seq)?;
+    dict.set_item(intern!(py, "domain"), domain_py(py, partition.domain))?;
+    dict.set_item(intern!(py, "route"), partition.route.0)?;
+    dict.set_item(
+        intern!(py, "execution"),
+        execution_capability_py(py, partition.execution),
+    )?;
+    dict.set_item(
+        intern!(py, "attention"),
+        attention_regime_py(py, partition.attention),
+    )?;
+    dict.set_item(intern!(py, "shape_class"), partition.shape_class)?;
+    dict.set_item(
+        intern!(py, "operations"),
+        dict_list(py, &partition.operations, |operation| {
+            operation_to_py(py, operation, context)
         })?,
     )?;
     Ok(dict)
@@ -405,14 +436,19 @@ fn version_ref_to_py<'py>(
             point.set_item(intern!(py, "value"), value)?;
         }
         Point::Device {
+            point_index,
             selected_point,
             producer_plan_digest,
         } => {
             point.set_item(intern!(py, "kind"), intern!(py, "device"))?;
             let value = PyDict::new(py);
+            value.set_item(intern!(py, "point_index"), *point_index)?;
             value.set_item(
                 intern!(py, "selected_point"),
-                product_ref_to_py(py, selected_point, context)?,
+                selected_point
+                    .as_ref()
+                    .map(|selected_point| product_ref_to_py(py, selected_point, context))
+                    .transpose()?,
             )?;
             value.set_item(
                 intern!(py, "producer_plan_digest"),
@@ -655,10 +691,12 @@ fn product_payload_to_py<'py>(
 }
 
 fn snapshot_to_py<'py>(py: Python<'py>, snapshot: &SnapshotRef) -> PyResult<Bound<'py, PyDict>> {
+    let mut context = RequestConversion::new(py);
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "session_id"), snapshot.session_id.0)?;
-    dict.set_item(intern!(py, "epoch"), snapshot.epoch)?;
-    dict.set_item(intern!(py, "version"), snapshot.version)?;
+    dict.set_item(
+        intern!(py, "version"),
+        version_ref_to_py(py, &snapshot.version, &mut context)?,
+    )?;
     dict.set_item(intern!(py, "digest"), snapshot.digest.as_str())?;
     dict.set_item(intern!(py, "locator"), snapshot.locator.as_str())?;
     Ok(dict)
@@ -668,6 +706,7 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
     match kind {
         RequestKind::GetCapabilities => intern!(py, "get_capabilities"),
         RequestKind::Execute => intern!(py, "execute"),
+        RequestKind::PollCompletions => intern!(py, "poll_completions"),
         RequestKind::DropSession => intern!(py, "drop_session"),
         RequestKind::Shutdown => intern!(py, "shutdown"),
         RequestKind::CopyKv => intern!(py, "copy_kv"),
@@ -686,6 +725,25 @@ fn domain_py<'py>(py: Python<'py>, domain: Domain) -> &'py Bound<'py, PyString> 
     match domain {
         Domain::Und => intern!(py, "und"),
         Domain::Gen => intern!(py, "gen"),
+    }
+}
+
+fn execution_capability_py<'py>(
+    py: Python<'py>,
+    capability: ExecutionCapability,
+) -> &'py Bound<'py, PyString> {
+    match capability {
+        ExecutionCapability::DomainHomogeneous => intern!(py, "domain_homogeneous"),
+        ExecutionCapability::TensorizedMixed => intern!(py, "tensorized_mixed"),
+    }
+}
+
+fn attention_regime_py<'py>(py: Python<'py>, regime: AttentionRegime) -> &'py Bound<'py, PyString> {
+    match regime {
+        AttentionRegime::None => intern!(py, "none"),
+        AttentionRegime::Causal => intern!(py, "causal"),
+        AttentionRegime::Bidirectional => intern!(py, "bidirectional"),
+        AttentionRegime::Hybrid => intern!(py, "hybrid"),
     }
 }
 
@@ -801,6 +859,21 @@ pub(crate) fn try_completion_response_from_py(
 fn completion_report_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionReport> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
+    let partitions = get(dict, intern!(py, "partitions"))?;
+    let partitions = partitions.cast::<PyList>().ok()?;
+    let mut partition_reports = Vec::with_capacity(partitions.len());
+    for item in partitions.iter() {
+        partition_reports.push(partition_completion_from_py(&item)?);
+    }
+    Some(CompletionReport {
+        step_id: u64_of(&get(dict, intern!(py, "step_id"))?)?,
+        partitions: partition_reports,
+    })
+}
+
+fn partition_completion_from_py(value: &Bound<'_, PyAny>) -> Option<PartitionCompletion> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
     let completions = get(dict, intern!(py, "completions"))?;
     let completions = completions.cast::<PyList>().ok()?;
     let mut records = Vec::with_capacity(completions.len());
@@ -818,18 +891,97 @@ fn completion_report_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionRepor
     let registration = RegistrationAck {
         visible: bool_of(&get(registration, intern!(py, "visible"))?)?,
     };
-    // The Python worker never attaches forward stats to a completion report;
-    // anything but absent/None goes back through the reflective path.
-    if !absent_or_none(dict, intern!(py, "forward_stats"))? {
-        return None;
-    }
-    Some(CompletionReport {
-        step_id: u64_of(&get(dict, intern!(py, "step_id"))?)?,
+    let forward_stats = match dict.get_item(intern!(py, "forward_stats")).ok()? {
+        None => None,
+        Some(value) if value.is_none() => None,
+        Some(value) => Some(forward_stats_from_py(&value)?),
+    };
+    Some(PartitionCompletion {
+        partition_id: u32_of(&get(dict, intern!(py, "partition_id"))?)?,
         completions: records,
         products: payloads,
         registration,
         worker_exec_us: opt_u64(dict, intern!(py, "worker_exec_us"))?,
-        forward_stats: None,
+        forward_stats,
+    })
+}
+
+fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    Some(WorkerForwardStats {
+        mode_counts: u64_map(dict, intern!(py, "mode_counts"))?,
+        mode_tokens: u64_map(dict, intern!(py, "mode_tokens"))?,
+        mode_us: u64_map(dict, intern!(py, "mode_us"))?,
+        component_us: u64_map(dict, intern!(py, "component_us"))?,
+        attention_launches: u64_of(&get(dict, intern!(py, "attention_launches"))?)?,
+        attention_us: u64_of(&get(dict, intern!(py, "attention_us"))?)?,
+        attention_backend_counts: u64_map(dict, intern!(py, "attention_backend_counts"))?,
+        cuda_graph_captures: u64_of(&get(dict, intern!(py, "cuda_graph_captures"))?)?,
+        cuda_graph_replays: u64_of(&get(dict, intern!(py, "cuda_graph_replays"))?)?,
+        cuda_graph_misses: u64_of(&get(dict, intern!(py, "cuda_graph_misses"))?)?,
+        cuda_graph_fallbacks: u64_of(&get(dict, intern!(py, "cuda_graph_fallbacks"))?)?,
+        cuda_graph_unpadded_tokens: u64_of(&get(dict, intern!(py, "cuda_graph_unpadded_tokens"))?)?,
+        cuda_graph_padded_tokens: u64_of(&get(dict, intern!(py, "cuda_graph_padded_tokens"))?)?,
+        cuda_graph_runtime_mode_counts: u64_map(
+            dict,
+            intern!(py, "cuda_graph_runtime_mode_counts"),
+        )?,
+        text_decode_token_relay_hits: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_token_relay_hits"),
+        )?)?,
+        text_decode_token_relay_misses: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_token_relay_misses"),
+        )?)?,
+        text_decode_position_relay_hits: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_position_relay_hits"),
+        )?)?,
+        text_decode_position_relay_misses: u64_of(&get(
+            dict,
+            intern!(py, "text_decode_position_relay_misses"),
+        )?)?,
+        flashinfer_decode_plan_calls: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_calls"),
+        )?)?,
+        flashinfer_decode_plan_reuses: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_reuses"),
+        )?)?,
+        flashinfer_decode_plan_rows: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_rows"),
+        )?)?,
+        flashinfer_decode_plan_indices: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_plan_indices"),
+        )?)?,
+        flashinfer_decode_graph_plan_calls: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_graph_plan_calls"),
+        )?)?,
+        flashinfer_decode_graph_plan_reuses: u64_of(&get(
+            dict,
+            intern!(py, "flashinfer_decode_graph_plan_reuses"),
+        )?)?,
+        spec_verify_rows: u64_of(&get(dict, intern!(py, "spec_verify_rows"))?)?,
+        spec_verify_draft_tokens: u64_of(&get(dict, intern!(py, "spec_verify_draft_tokens"))?)?,
+        spec_verify_accepted_tokens: u64_of(&get(
+            dict,
+            intern!(py, "spec_verify_accepted_tokens"),
+        )?)?,
+        spec_verify_rejected_tokens: u64_of(&get(
+            dict,
+            intern!(py, "spec_verify_rejected_tokens"),
+        )?)?,
+        spec_verify_committed_tokens: u64_of(&get(
+            dict,
+            intern!(py, "spec_verify_committed_tokens"),
+        )?)?,
+        spec_verify_path_counts: u64_map(dict, intern!(py, "spec_verify_path_counts"))?,
     })
 }
 
@@ -1068,6 +1220,16 @@ fn string_of(value: &Bound<'_, PyAny>) -> Option<String> {
     Some(value.cast::<PyString>().ok()?.to_str().ok()?.to_owned())
 }
 
+fn u64_map(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<BTreeMap<String, u64>> {
+    let values = get(dict, key)?;
+    let values = values.cast::<PyDict>().ok()?;
+    let mut result = BTreeMap::new();
+    for (key, value) in values.iter() {
+        result.insert(string_of(&key)?, u64_of(&value)?);
+    }
+    Some(result)
+}
+
 fn u32_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u32>> {
     let list = value.cast::<PyList>().ok()?;
     let mut values = Vec::with_capacity(list.len());
@@ -1206,7 +1368,8 @@ mod tests {
             request_key: request_key(seed),
             producer_op_id,
             point: Point::Device {
-                selected_point,
+                point_index: 0,
+                selected_point: Some(selected_point),
                 producer_plan_digest: digest(seed + 1),
             },
         }
@@ -1323,6 +1486,21 @@ mod tests {
         )
     }
 
+    fn partition(operations: Vec<Operation>) -> BatchPartition {
+        let first = operations.first().expect("partition needs operations");
+        BatchPartition {
+            partition_id: 1,
+            submission_group: 1,
+            collective_seq: 1,
+            domain: first.domain,
+            route: first.route,
+            execution: ExecutionCapability::DomainHomogeneous,
+            attention: AttentionRegime::Hybrid,
+            shape_class: 0,
+            operations,
+        }
+    }
+
     /// A batch exercising every closed wire variant: all 12 work variants over
     /// fixed and device parents, und+gen admissions with every sampling and
     /// image field populated, all three control kinds across every disposition
@@ -1427,7 +1605,18 @@ mod tests {
                 reason,
             });
         }
-        Batch::new(11, admissions, operations)
+        let partitions = operations
+            .into_iter()
+            .enumerate()
+            .map(|(index, operation)| {
+                let mut partition = partition(vec![operation]);
+                partition.partition_id = index as u32 + 1;
+                partition.submission_group = index as u32 + 1;
+                partition.collective_seq = index as u64 + 1;
+                partition
+            })
+            .collect();
+        Batch::new(11, admissions, partitions)
             .with_controls(controls)
             .with_input_products(input_products)
     }
@@ -1465,11 +1654,16 @@ mod tests {
             request.adapter_path = Some("/adapters/a".to_owned());
             request.product_handles = Some(vec![1, u64::MAX]);
             request.snapshot = Some(SnapshotRef {
-                session_id: RequestId(6),
-                epoch: 7,
-                version: 8,
+                version: VersionRef {
+                    request_key: RequestKey::new(1, RequestId(6), 7),
+                    producer_op_id: OpId(8),
+                    point: Point::Fixed {
+                        point_index: 8,
+                        semantic_digest: digest(8),
+                    },
+                },
                 digest: digest(9),
-                locator: "snap://9".to_owned(),
+                locator: digest(9),
             });
             assert_matches_pythonize(py, &request);
         });
@@ -1482,7 +1676,10 @@ mod tests {
             let mut request = WorkerRequest::execute(Batch::new(
                 0,
                 Vec::new(),
-                vec![operation(1, Work::Token(TokenMode::Extend))],
+                vec![partition(vec![operation(
+                    1,
+                    Work::Token(TokenMode::Extend),
+                )])],
             ));
             assert_matches_pythonize(py, &request);
             request.batch = None;
@@ -1589,45 +1786,42 @@ mod tests {
             .collect();
         let mut response = WorkerResponse::completion_report(CompletionReport {
             step_id: 42,
-            completions,
-            products: vec![
-                ProductPayload {
-                    product: product_ref(95),
-                    bytes: vec![1, 2, 3, 254, 255],
-                },
-                ProductPayload {
-                    product: product_ref(96),
-                    bytes: Vec::new(),
-                },
-            ],
-            registration: RegistrationAck { visible: true },
-            worker_exec_us: Some(1234),
-            forward_stats: None,
+            partitions: vec![PartitionCompletion {
+                partition_id: 1,
+                completions,
+                products: vec![
+                    ProductPayload {
+                        product: product_ref(95),
+                        bytes: vec![1, 2, 3, 254, 255],
+                    },
+                    ProductPayload {
+                        product: product_ref(96),
+                        bytes: Vec::new(),
+                    },
+                ],
+                registration: RegistrationAck { visible: true },
+                worker_exec_us: Some(1234),
+                forward_stats: Some(WorkerForwardStats {
+                    mode_counts: BTreeMap::from([("text".to_owned(), 1)]),
+                    mode_tokens: BTreeMap::from([("text".to_owned(), records as u64)]),
+                    mode_us: BTreeMap::from([("text".to_owned(), 789)]),
+                    component_us: BTreeMap::from([
+                        ("forward".to_owned(), 789),
+                        ("text_sample".to_owned(), 23),
+                    ]),
+                    cuda_graph_replays: 1,
+                    cuda_graph_unpadded_tokens: records as u64,
+                    cuda_graph_padded_tokens: 64,
+                    cuda_graph_runtime_mode_counts: BTreeMap::from([(
+                        "graph_replay".to_owned(),
+                        1,
+                    )]),
+                    ..WorkerForwardStats::default()
+                }),
+            }],
         });
         response.call_id = Some(9);
         response
-    }
-
-    /// The dict shape `app.py::_finalize_response` actually emits: identical
-    /// to `pythonize(&WorkerResponse)` except the Python `to_wire` writes no
-    /// `forward_stats` key at all.
-    fn python_worker_shaped_dict<'py>(
-        py: Python<'py>,
-        response: &WorkerResponse,
-    ) -> Bound<'py, PyAny> {
-        let dict = pythonize(py, response).unwrap();
-        let report = dict
-            .cast::<PyDict>()
-            .unwrap()
-            .get_item("completion_report")
-            .unwrap()
-            .unwrap();
-        report
-            .cast::<PyDict>()
-            .unwrap()
-            .del_item("forward_stats")
-            .unwrap();
-        dict
     }
 
     #[test]
@@ -1638,23 +1832,15 @@ mod tests {
                 completion_response(6),
                 WorkerResponse::completion_report(CompletionReport {
                     step_id: 0,
-                    completions: Vec::new(),
-                    products: Vec::new(),
-                    registration: RegistrationAck::default(),
-                    worker_exec_us: None,
-                    forward_stats: None,
+                    partitions: Vec::new(),
                 }),
             ] {
-                for dict in [
-                    pythonize(py, &response).unwrap(),
-                    python_worker_shaped_dict(py, &response),
-                ] {
-                    let reflective: WorkerResponse = depythonize(&dict).unwrap();
-                    let extracted = try_completion_response_from_py(&dict)
-                        .expect("extractor must accept the worker's result shape");
-                    assert_eq!(extracted, reflective);
-                    assert_eq!(extracted, response);
-                }
+                let dict = pythonize(py, &response).unwrap();
+                let reflective: WorkerResponse = depythonize(&dict).unwrap();
+                let extracted = try_completion_response_from_py(&dict)
+                    .expect("extractor must accept the worker's result shape");
+                assert_eq!(extracted, reflective);
+                assert_eq!(extracted, response);
             }
         });
     }
@@ -1724,6 +1910,15 @@ mod tests {
                     .unwrap()
                     .cast_into::<PyDict>()
                     .unwrap()
+                    .get_item("partitions")
+                    .unwrap()
+                    .unwrap()
+                    .cast_into::<PyList>()
+                    .unwrap()
+                    .get_item(0)
+                    .unwrap()
+                    .cast_into::<PyDict>()
+                    .unwrap()
                     .get_item("completions")
                     .unwrap()
                     .unwrap()
@@ -1748,7 +1943,10 @@ mod tests {
             // coercing here) preserves depythonize's semantics exactly.
             let reflective: WorkerResponse = depythonize(&dict).unwrap();
             let report = reflective.completion_report.unwrap();
-            assert_eq!(report.completions[0].committed_tokens, vec![1]);
+            assert_eq!(
+                report.completions().next().unwrap().committed_tokens,
+                vec![1]
+            );
 
             // A shape both paths reject: a string where tokens belong.
             let dict = pythonize(py, &response).unwrap();
@@ -1785,7 +1983,7 @@ mod tests {
     /// A steady-state r16 decode step: 35 token-decode operations over device
     /// parents, a couple of controls, and small forced-token input payloads.
     fn decode_batch_request(ops: u64) -> WorkerRequest {
-        let operations = (0..ops)
+        let operations: Vec<Operation> = (0..ops)
             .map(|index| {
                 let seed = 1 + index;
                 let key = request_key(seed);
@@ -1847,7 +2045,7 @@ mod tests {
             })
             .collect();
         WorkerRequest::execute(
-            Batch::new(77, Vec::new(), operations)
+            Batch::new(77, Vec::new(), vec![partition(operations)])
                 .with_controls(controls)
                 .with_input_products(input_products),
         )
@@ -1865,7 +2063,7 @@ mod tests {
             let request = decode_batch_request(OPS);
             assert_matches_pythonize(py, &request);
             let response = completion_response(OPS as usize);
-            let response_dict = python_worker_shaped_dict(py, &response);
+            let response_dict = pythonize(py, &response).unwrap();
             assert_eq!(
                 try_completion_response_from_py(&response_dict).unwrap(),
                 depythonize::<WorkerResponse>(&response_dict).unwrap()

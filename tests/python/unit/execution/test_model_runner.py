@@ -334,14 +334,19 @@ def test_graph_store_executes_decode_in_smallest_reserved_bucket(monkeypatch):
     assert int(padded.decode_page_offsets[-1]) == 0
 
 
-def _prefill_batch(pool: PagedKVPool, query_lens: tuple[int, ...]) -> ForwardBatch:
+def _prefill_batch(
+    pool: PagedKVPool,
+    query_lens: tuple[int, ...],
+    *,
+    selection: TokenSelection = TokenSelection.LAST_LOGITS,
+) -> ForwardBatch:
     source_rows = tuple(
         TokenRow(
             row_id=row,
             inputs=TokenIds(torch.arange(length, dtype=torch.long) + row * 100),
             positions=torch.arange(length, dtype=torch.long),
             output_slot=row,
-            selection=TokenSelection.LAST_LOGITS,
+            selection=selection,
         )
         for row, length in enumerate(query_lens)
     )
@@ -388,6 +393,47 @@ def _prefill_batch(pool: PagedKVPool, query_lens: tuple[int, ...]) -> ForwardBat
             output=EmptyOutputView(),
         ),
     )
+
+
+def test_graph_store_executes_unqualified_full_logits_prefill_eagerly(monkeypatch):
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=12,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        reserved_tail_blocks=2,
+    )
+    model = _MixedModel()
+    graph = GraphStore(
+        enabled=True,
+        prefill_enabled=True,
+        cache=TEST_MODEL_SPEC.cache,
+        block_size=4,
+        spec_digest="d" * 64,
+        memory_budget_bytes=1 << 30,
+        prefill_token_sizes=(8, 16),
+    )
+    monkeypatch.setattr(graph, "_cuda_batch", lambda _batch: True)
+
+    first = graph.execute(
+        "verify",
+        _prefill_batch(pool, (2, 3), selection=TokenSelection.ALL_LOGITS),
+        model,
+        eligible=True,
+    )
+    second = graph.execute(
+        "verify",
+        _prefill_batch(pool, (3, 4), selection=TokenSelection.ALL_LOGITS),
+        model,
+        eligible=True,
+    )
+
+    assert first.path == "eager"
+    assert second.path == "eager"
+    assert tuple(row.value.value.shape for row in first.output.rows) == ((2, 1), (3, 1))
+    assert tuple(row.value.value.shape for row in second.output.rows) == ((3, 1), (4, 1))
 
 
 def test_graph_store_reuses_prefill_token_bucket_across_ragged_shapes(monkeypatch):
@@ -487,7 +533,7 @@ def test_token_staging_packs_mixed_host_and_device_rows():
             selection=TokenSelection.HIDDEN,
         ),
     )
-    stager = TensorStager(capacity=2)
+    stager = TensorStager(capacity=2, byte_capacity=1 << 20)
 
     staged = _stage_rows(rows, device, stager.acquire(device))
     token_rows = tuple(row for row in staged if isinstance(row, TokenRow))
@@ -518,7 +564,7 @@ def test_staging_capacity_becomes_available_after_event_query(
     monkeypatch.setattr(torch.cuda, "Event", event_factory)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: object())
     device = torch.device("cuda:0")
-    stager = TensorStager(capacity=1)
+    stager = TensorStager(capacity=1, byte_capacity=1 << 20)
     first = stager.acquire(device)
     stager.mark_submitted(first, device)
 
@@ -528,6 +574,16 @@ def test_staging_capacity_becomes_available_after_event_query(
     events[0].ready = True
     successor = stager.acquire(device)
     assert successor.generation != first.generation
+
+
+def test_staging_byte_capacity_rejects_growth_without_mutating_usage() -> None:
+    stager = TensorStager(capacity=1, byte_capacity=16)
+    slot = stager.acquire("cpu")
+    assert slot.int_buffer("tokens", 4, pin=False).numel() == 4
+    assert stager.allocated_bytes == 16
+    with pytest.raises(ResourceError, match="byte credit"):
+        slot.int_buffer("positions", 1, pin=False)
+    assert stager.allocated_bytes == 16
 
 
 def test_graph_residency_stops_growing_with_batch_shape_diversity(monkeypatch):

@@ -7,7 +7,14 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from threading import RLock
 
-from ..batch import CompletionRecord, CompletionReport, Operation, RegistrationAck
+from ..batch import (
+    BatchPartition,
+    CompletionRecord,
+    CompletionReport,
+    Operation,
+    PartitionCompletion,
+    RegistrationAck,
+)
 from ..foundation.errors import invalid_descriptor
 
 
@@ -19,6 +26,15 @@ class ReplayRecord:
     digest: str
     step_id: int
     result: CompletionRecord
+    registration_visible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredReplay:
+    digest: str
+    step_id: int
+    result: CompletionRecord
+    registration_visible: bool
 
 
 class ReplayStore:
@@ -26,9 +42,7 @@ class ReplayStore:
         if capacity < 1:
             raise ValueError("replay capacity must be positive")
         self.capacity = int(capacity)
-        self._records: OrderedDict[tuple[int, int, int], tuple[str, int, CompletionRecord]] = (
-            OrderedDict()
-        )
+        self._records: OrderedDict[tuple[int, int, int], _StoredReplay] = OrderedDict()
         self._lock = RLock()
 
     @staticmethod
@@ -38,38 +52,60 @@ class ReplayStore:
 
     def lookup(
         self,
-        operations: Sequence[Operation],
+        partitions: Sequence[BatchPartition],
     ) -> CompletionReport | None:
+        operations = tuple(
+            operation for partition in partitions for operation in partition.operations
+        )
         with self._lock:
-            found: list[tuple[int, CompletionRecord]] = []
+            found: list[_StoredReplay] = []
             missing = 0
             for operation in operations:
                 record = self._records.get(self._key(operation))
                 if record is None:
                     missing += 1
                     continue
-                digest, step_id, result = record
-                if digest != operation.plan_digest:
+                if record.digest != operation.plan_digest:
                     raise invalid_descriptor(
                         f"operation {operation.op_id} conflicts with its committed digest"
                     )
                 self._records.move_to_end(self._key(operation))
-                found.append((step_id, result))
+                found.append(record)
             if missing == len(operations):
                 return None
             if missing:
                 raise invalid_descriptor(
                     "execution batch mixes committed and uncommitted operations"
                 )
-            steps = {step_id for step_id, _result in found}
+            steps = {record.step_id for record in found}
             if len(steps) != 1:
                 raise invalid_descriptor(
                     "execution batch replay records belong to different submissions"
                 )
+            by_identity = {
+                (record.result.request_key, int(record.result.op_id)): record
+                for record in found
+            }
             return CompletionReport(
                 step_id=next(iter(steps)),
-                completions=tuple(result for _step, result in found),
-                registration=RegistrationAck(visible=True),
+                partitions=tuple(
+                    PartitionCompletion(
+                        partition_id=partition.partition_id,
+                        completions=tuple(
+                            by_identity[(operation.request_key, int(operation.op_id))].result
+                            for operation in partition.operations
+                        ),
+                        registration=RegistrationAck(
+                            visible=all(
+                                by_identity[
+                                    (operation.request_key, int(operation.op_id))
+                                ].registration_visible
+                                for operation in partition.operations
+                            )
+                        ),
+                    )
+                    for partition in partitions
+                ),
             )
 
     def commit_atomic(
@@ -91,14 +127,27 @@ class ReplayStore:
                     raise invalid_descriptor("terminal completion identity does not match operation")
                 key = self._key(operation)
                 existing = next_records.get(key)
-                if existing is not None and existing[0] != operation.plan_digest:
+                if existing is not None and existing.digest != operation.plan_digest:
                     raise invalid_descriptor(
                         f"operation {operation.op_id} conflicts with its committed digest"
                     )
-                next_records[key] = (
-                    operation.plan_digest,
-                    result.step_id,
-                    completion,
+                partition = next(
+                    (
+                        partition
+                        for partition in result.partitions
+                        if completion in partition.completions
+                    ),
+                    None,
+                )
+                if partition is None:
+                    raise invalid_descriptor(
+                        "terminal completion has no partition registration result"
+                    )
+                next_records[key] = _StoredReplay(
+                    digest=operation.plan_digest,
+                    step_id=result.step_id,
+                    result=completion,
+                    registration_visible=partition.registration.visible,
                 )
                 next_records.move_to_end(key)
             while len(next_records) > self.capacity:
@@ -131,12 +180,20 @@ class ReplayStore:
     ) -> None:
         requested = {int(value) for value in session_ids}
         with self._lock:
-            for key, (digest, step_id, result) in tuple(self._records.items()):
+            for key, record in tuple(self._records.items()):
                 if key[0] in requested:
-                    mapped = mapper(result)
-                    if (mapped.request_key, mapped.op_id) != (result.request_key, result.op_id):
+                    mapped = mapper(record.result)
+                    if (mapped.request_key, mapped.op_id) != (
+                        record.result.request_key,
+                        record.result.op_id,
+                    ):
                         raise invalid_descriptor("replay result rewrite changed operation identity")
-                    self._records[key] = (digest, step_id, mapped)
+                    self._records[key] = _StoredReplay(
+                        digest=record.digest,
+                        step_id=record.step_id,
+                        result=mapped,
+                        registration_visible=record.registration_visible,
+                    )
 
     def snapshot_records(self, session_ids: set[int]) -> tuple[ReplayRecord, ...]:
         requested = {int(value) for value in session_ids}
@@ -146,12 +203,13 @@ class ReplayStore:
                     session_id=key[0],
                     epoch=key[1],
                     op_id=key[2],
-                    digest=value[0],
-                    step_id=value[1],
-                    result=value[2],
+                    digest=value.digest,
+                    step_id=value.step_id,
+                    result=value.result,
+                    registration_visible=value.registration_visible,
                 )
                 for key, value in self._records.items()
-                if key[0] in requested
+                if key[0] in requested and _snapshot_ready(value.result)
             )
 
     def restore_records(
@@ -160,7 +218,7 @@ class ReplayStore:
         records: Sequence[ReplayRecord],
     ) -> None:
         requested = {int(value) for value in session_ids}
-        staged: list[tuple[tuple[int, int, int], tuple[str, int, CompletionRecord]]] = []
+        staged: list[tuple[tuple[int, int, int], _StoredReplay]] = []
         for record in records:
             key = (record.session_id, record.epoch, record.op_id)
             if record.session_id not in requested:
@@ -173,7 +231,17 @@ class ReplayStore:
                 raise invalid_descriptor("replay snapshot result identity does not match its key")
             if record.step_id < 0 or len(record.digest) != 64:
                 raise invalid_descriptor("replay snapshot record is incomplete")
-            staged.append((key, (record.digest, record.step_id, record.result)))
+            staged.append(
+                (
+                    key,
+                    _StoredReplay(
+                        digest=record.digest,
+                        step_id=record.step_id,
+                        result=record.result,
+                        registration_visible=record.registration_visible,
+                    ),
+                )
+            )
         with self._lock:
             next_records = OrderedDict(
                 (key, value) for key, value in self._records.items() if key[0] not in requested
@@ -185,6 +253,34 @@ class ReplayStore:
             while len(next_records) > self.capacity:
                 next_records.popitem(last=False)
             self._records = next_records
+
+
+def _snapshot_ready(record: CompletionRecord) -> bool:
+    lengths = record.logical_lengths
+    span = record.token_span
+    timing = record.timing_counters
+    scalar_values = (
+        record.selected_point,
+        lengths.token_len,
+        lengths.kv_visible_len,
+        lengths.latent_len,
+        lengths.kv_reserved_len,
+        lengths.kv_initialized_len,
+        lengths.kv_committed_len,
+        lengths.kv_published_len,
+        span.base,
+        span.len,
+        timing.queued_us,
+        timing.device_us,
+        timing.copy_us,
+        timing.host_us,
+    )
+    return (
+        type(record.semantic_digest) is str
+        and all(type(value) is int for value in scalar_values)
+        and all(type(value) is int for value in record.committed_tokens)
+        and all(type(value) is int for value in record.product_generations)
+    )
 
 
 __all__ = ["ReplayRecord", "ReplayStore"]

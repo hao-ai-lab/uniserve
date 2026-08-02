@@ -18,8 +18,6 @@ _SamplingKernel = Callable[
     ],
     tuple[torch.Tensor, torch.Tensor],
 ]
-
-
 def _sample_top_k_tensor(
     logits: torch.Tensor,
     draws: torch.Tensor,

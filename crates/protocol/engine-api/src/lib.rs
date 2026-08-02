@@ -43,6 +43,56 @@ pub struct PositionLogprobs {
     pub entries: Vec<TokenLogprob>,
 }
 
+/// Visible modality associated with one scheduler publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicModality {
+    Text,
+    Image,
+}
+
+/// Exact fixed state point that semantically owns a visible publication.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SemanticRoot {
+    pub producer_op_id: u64,
+    pub point_index: u32,
+    pub semantic_digest: String,
+}
+
+/// Scheduler publication identity carried with a visible event through every
+/// decoding and protocol layer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PublicCommit {
+    pub event_seq: u64,
+    pub modality: PublicModality,
+    pub committed_at: f64,
+    pub semantic_root: SemanticRoot,
+}
+
+impl PublicCommit {
+    pub fn validate_for(&self, modality: PublicModality) -> Result<(), &'static str> {
+        if self.event_seq == 0 {
+            return Err("public event sequence must be positive");
+        }
+        if self.modality != modality {
+            return Err("public event modality does not match its payload");
+        }
+        if !self.committed_at.is_finite() || self.committed_at < 0.0 {
+            return Err("public commit timestamp must be finite and nonnegative");
+        }
+        if self.semantic_root.semantic_digest.len() != 64
+            || !self
+                .semantic_root
+                .semantic_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("public semantic digest must be lowercase SHA-256 hex");
+        }
+        Ok(())
+    }
+}
+
 /// Typed text and image event stream emitted to callers.
 #[derive(Debug, Clone)]
 pub enum GenEvent {
@@ -53,6 +103,7 @@ pub enum GenEvent {
     TextToken {
         id: u32,
         logprob: Option<f32>,
+        public_commit: Option<PublicCommit>,
     },
     /// Ranked candidates for the just-emitted token, including the sampled token.
     TokenLogprobs {
@@ -83,6 +134,7 @@ pub enum GenEvent {
         bytes: u64,
         sha256: String,
         pixels_png_b64: String,
+        public_commit: Option<PublicCommit>,
     },
     Finished {
         reason: FinishReason,
@@ -523,6 +575,7 @@ mod tests {
             .send(GenEvent::TextToken {
                 id: 7,
                 logprob: None,
+                public_commit: None,
             })
             .unwrap();
         submission
@@ -530,6 +583,7 @@ mod tests {
             .send(GenEvent::TextToken {
                 id: 8,
                 logprob: None,
+                public_commit: None,
             })
             .unwrap();
 

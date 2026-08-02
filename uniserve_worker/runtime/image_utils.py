@@ -1,20 +1,19 @@
 """Shared image output helpers."""
+
 from __future__ import annotations
 
 import base64
 import io
 
-import numpy as np
 import torch
 from PIL import Image
 
 __all__ = [
-    'pil_image_to_png_bytes',
-    'pil_image_to_png_b64',
-    'png_bytes_to_b64',
-    'to_uint8_image',
-    'tensor_to_png_bytes',
-    'tensor_to_png_b64',
+    "pil_image_to_png_bytes",
+    "pil_image_to_png_b64",
+    "png_bytes_to_b64",
+    "quantize_image_hwc",
+    "uint8_image_to_png_base64_bytes",
 ]
 
 
@@ -40,12 +39,12 @@ def pil_image_to_png_b64(image: Image.Image) -> str:
     return png_bytes_to_b64(pil_image_to_png_bytes(image))
 
 
-def to_uint8_image(
+def quantize_image_hwc(
     tensor: torch.Tensor,
     *,
     value_range: tuple[float, float] = (-1.0, 1.0),
-) -> np.ndarray:
-    """Convert a CHW (or NCHW, first item taken) float image tensor to HWC uint8.
+) -> torch.Tensor:
+    """Quantize one CHW/NCHW image to contiguous HWC uint8 on its source device.
 
     ``value_range`` is the ``(lo, hi)`` span the tensor's values occupy; it is
     rescaled to ``[0, 1]``, clamped, and quantized to ``[0, 255]``. The single
@@ -53,24 +52,26 @@ def to_uint8_image(
     is the diffusion latent-decode convention; pass ``(0, 1)`` for tensors that
     are already in normalized image space.
     """
-    image = tensor.detach().float()
+    image = tensor.detach()
     if image.ndim == 4:
+        if int(image.shape[0]) != 1:
+            raise ValueError("image quantization requires a single-item batch")
         image = image[0]
+    if image.ndim != 3 or int(image.shape[0]) != 3:
+        raise ValueError("image quantization requires RGB CHW pixels")
+    image = image.float()
     lo, hi = float(value_range[0]), float(value_range[1])
     span = hi - lo
     if span != 0:
         image = (image - lo) / span
     image = image.clamp(0, 1)
-    return (image.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+    return (image.permute(1, 2, 0) * 255.0).round().to(dtype=torch.uint8).contiguous()
 
 
-def tensor_to_png_bytes(
-    batch: torch.Tensor,
-    *,
-    value_range: tuple[float, float] = (-1.0, 1.0),
-) -> bytes:
-    return pil_image_to_png_bytes(Image.fromarray(to_uint8_image(batch, value_range=value_range)))
+def uint8_image_to_png_base64_bytes(image: torch.Tensor) -> bytes:
+    """Encode a query-ready CPU HWC uint8 tensor without observing a device value."""
 
-
-def tensor_to_png_b64(batch: torch.Tensor, *, value_range: tuple[float, float] = (-1.0, 1.0)) -> str:
-    return png_bytes_to_b64(tensor_to_png_bytes(batch, value_range=value_range))
+    if image.device.type != "cpu" or image.dtype is not torch.uint8 or image.ndim != 3:
+        raise ValueError("PNG encoding requires a CPU HWC uint8 tensor")
+    png = pil_image_to_png_bytes(Image.fromarray(image.numpy()))
+    return base64.b64encode(png)

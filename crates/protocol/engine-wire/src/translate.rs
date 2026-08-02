@@ -219,24 +219,29 @@ pub async fn run_event_adapter<Emit, EmitFuture>(
     // after the `TextToken`. When logprobs are NOT requested, holding the token
     // would delay it until the *next* token (a full decode step, ~25ms),
     // inflating streaming TTFT; so in that case we emit immediately.
-    let mut pending: Option<(u32, Option<f32>)> = None;
+    let mut pending: Option<(u32, Option<f32>, Option<uniserve_engine_api::PublicCommit>)> = None;
 
-    let token_output = |id: u32, lp: Option<f32>, candidates: Option<Vec<SemanticTokenLogprob>>| {
-        EngineCoreOutput {
-            request_id: request_id.clone(),
-            new_token_ids: vec![id],
-            new_logprobs: if want_logprobs {
-                build_logprobs(id, lp, candidates)
-            } else {
-                None
-            },
-            ..Default::default()
-        }
-    };
+    let token_output =
+        |id: u32,
+         lp: Option<f32>,
+         candidates: Option<Vec<SemanticTokenLogprob>>,
+         public_commit: Option<uniserve_engine_api::PublicCommit>| {
+            EngineCoreOutput {
+                request_id: request_id.clone(),
+                new_token_ids: vec![id],
+                new_logprobs: if want_logprobs {
+                    build_logprobs(id, lp, candidates)
+                } else {
+                    None
+                },
+                public_commit,
+                ..Default::default()
+            }
+        };
     macro_rules! flush_pending {
         () => {
-            if let Some((pid, plp)) = pending.take()
-                && !emit(token_output(pid, plp, None)).await
+            if let Some((pid, plp, public_commit)) = pending.take()
+                && !emit(token_output(pid, plp, None, public_commit)).await
             {
                 break;
             }
@@ -245,18 +250,22 @@ pub async fn run_event_adapter<Emit, EmitFuture>(
 
     while let Some(ev) = events.recv().await {
         match ev {
-            GenEvent::TextToken { id, logprob } => {
+            GenEvent::TextToken {
+                id,
+                logprob,
+                public_commit,
+            } => {
                 flush_pending!();
                 if want_logprobs {
                     // Coalesce with the TokenLogprobs emitted in this same step.
-                    pending = Some((id, logprob));
-                } else if !emit(token_output(id, logprob, None)).await {
+                    pending = Some((id, logprob, public_commit));
+                } else if !emit(token_output(id, logprob, None, public_commit)).await {
                     break;
                 }
             }
             GenEvent::TokenLogprobs { id, candidates } => {
-                let (pid, plp) = pending.take().unwrap_or((id, None));
-                if !emit(token_output(pid, plp, Some(candidates))).await {
+                let (pid, plp, public_commit) = pending.take().unwrap_or((id, None, None));
+                if !emit(token_output(pid, plp, Some(candidates), public_commit)).await {
                     break;
                 }
             }
@@ -340,9 +349,10 @@ pub async fn run_event_adapter<Emit, EmitFuture>(
                 bytes,
                 sha256,
                 pixels_png_b64,
+                public_commit,
             } => {
                 flush_pending!();
-                let output = generation_image_output(
+                let mut output = generation_image_output(
                     &request_id,
                     WireImageEvent::Done {
                         image_id,
@@ -353,6 +363,7 @@ pub async fn run_event_adapter<Emit, EmitFuture>(
                         png_b64: pixels_png_b64,
                     },
                 );
+                output.public_commit = public_commit;
                 if !emit(output).await {
                     break;
                 }
@@ -426,6 +437,23 @@ fn generation_image_output(request_id: &str, image: WireImageEvent) -> EngineCor
 /// reconstructed from the sampled-first logprobs encoding of
 /// [`build_logprobs`].
 pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
+    if let Some(commit) = output.public_commit.as_ref() {
+        let modality = if !output.new_token_ids.is_empty() {
+            Some(uniserve_engine_api::PublicModality::Text)
+        } else if output.generation.as_ref().is_some_and(|generation| {
+            matches!(generation.image.as_ref(), Some(WireImageEvent::Done { .. }))
+        }) {
+            Some(uniserve_engine_api::PublicModality::Image)
+        } else {
+            None
+        };
+        let valid = modality.is_some_and(|modality| commit.validate_for(modality).is_ok());
+        if !valid {
+            return vec![GenEvent::Error {
+                message: "engine output carried an invalid public commit identity".to_string(),
+            }];
+        }
+    }
     let mut events = Vec::new();
 
     if let Some(evs) = &output.events {
@@ -451,7 +479,11 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
     for (i, &id) in output.new_token_ids.iter().enumerate() {
         let pos = positions.get(i);
         let logprob = pos.and_then(|p| p.entries.first()).map(|e| e.logprob);
-        events.push(GenEvent::TextToken { id, logprob });
+        events.push(GenEvent::TextToken {
+            id,
+            logprob,
+            public_commit: output.public_commit.clone(),
+        });
         if let Some(position) = pos {
             events.push(GenEvent::TokenLogprobs {
                 id,
@@ -519,6 +551,7 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
                 bytes,
                 sha256,
                 pixels_png_b64: png_b64,
+                public_commit: output.public_commit.clone(),
             },
         });
     }
@@ -563,6 +596,7 @@ mod tests {
         GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
         GenerationResourceBounds, ImageIngestRecipe, ImageKvEffect, ImageParams, UndVisibility,
     };
+    use uniserve_engine_api::{PublicCommit, PublicModality, SemanticRoot};
 
     fn canonical_generation_request() -> GenerationRequest {
         let constraint = GenerationConstraint::Default;
@@ -680,6 +714,16 @@ mod tests {
             GenEvent::TextToken {
                 id: 11,
                 logprob: None,
+                public_commit: Some(PublicCommit {
+                    event_seq: 1,
+                    modality: PublicModality::Text,
+                    committed_at: 1.0,
+                    semantic_root: SemanticRoot {
+                        producer_op_id: 7,
+                        point_index: 1,
+                        semantic_digest: "1".repeat(64),
+                    },
+                }),
             },
             GenEvent::ImageBegin {
                 image_id: 1,
@@ -699,6 +743,16 @@ mod tests {
                 bytes: 3,
                 sha256: "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78".into(),
                 pixels_png_b64: "QUJD".into(),
+                public_commit: Some(PublicCommit {
+                    event_seq: 5,
+                    modality: PublicModality::Image,
+                    committed_at: 2.0,
+                    semantic_root: SemanticRoot {
+                        producer_op_id: 9,
+                        point_index: 2,
+                        semantic_digest: "2".repeat(64),
+                    },
+                }),
             },
             GenEvent::Finished {
                 reason: FinishReason::Eos,
@@ -746,6 +800,20 @@ mod tests {
             kinds,
             vec!["text", "begin", "step", "commit", "done", "finished"]
         );
+        assert!(matches!(
+            &roundtripped[0],
+            GenEvent::TextToken {
+                public_commit: Some(PublicCommit { event_seq: 1, .. }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &roundtripped[4],
+            GenEvent::ImageDone {
+                public_commit: Some(PublicCommit { event_seq: 5, .. }),
+                ..
+            }
+        ));
         match &roundtripped[5] {
             GenEvent::Finished {
                 reason,

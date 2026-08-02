@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import logging
 import math
 import struct
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
@@ -19,6 +19,7 @@ import torch
 
 from uniserve_worker.batch import (
     Batch,
+    BatchPartition,
     CompletionRecord,
     CompletionReport,
     DevicePoint,
@@ -26,12 +27,15 @@ from uniserve_worker.batch import (
     DrawLayout,
     DType,
     EncodeMode,
+    ExecutionCapability,
     FinishFlags,
     FixedPoint,
+    GenMode,
     ImageParams,
     LogicalLengths,
     Operation,
     OpStatus,
+    PartitionCompletion,
     ProductKind,
     ProductPayload,
     ProductRef,
@@ -47,13 +51,15 @@ from uniserve_worker.batch import (
     TokenSpan,
     TransferMode,
     VersionRef,
+    WorkerForwardStats,
+    WorkVariant,
     decode_sampling_state_bytes,
     decode_token_product_bytes,
 )
 from uniserve_worker.batch import (
     ErrorCode as ProtocolErrorCode,
 )
-from uniserve_worker.capabilities import work_operation_type
+from uniserve_worker.capabilities import operation_type
 from uniserve_worker.forward import (
     AttentionSelection,
     AttnPlan,
@@ -78,7 +84,6 @@ from uniserve_worker.forward import (
     PackedAttentionPlan,
     PagedDecodePlan,
     PagedVarlenPlan,
-    PatchInput,
     RouteId,
     TokenEmbeddings,
     TokenHidden,
@@ -94,8 +99,14 @@ from uniserve_worker.forward import (
     EncodeKind as ForwardEncodeKind,
 )
 from uniserve_worker.foundation.errors import (
+    ErrorCode as WorkerErrorCode,
+)
+from uniserve_worker.foundation.errors import (
+    WorkerError,
     capability_mismatch,
+    classify,
     invalid_descriptor,
+    should_capture_trace,
     unsupported_operation,
 )
 from uniserve_worker.foundation.sizing import bucketed_length
@@ -109,14 +120,17 @@ from uniserve_worker.nn.diffusion.schedule import (
     ScheduleShiftDomain,
     x_pred_to_velocity,
 )
+from uniserve_worker.nn.mesh import BroadcastTransport
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.nn.vision.patching import patchify_batch, unpatchify_batch
 from uniserve_worker.runtime.adapter_store import AdapterStore
 from uniserve_worker.runtime.completion_store import (
     CompletionArena,
+    CompletionByteCapture,
     CompletionCapture,
     CompletionLease,
 )
+from uniserve_worker.runtime.cpu_tasks import BoundedCpuTaskPool, CpuTaskReservation
 from uniserve_worker.runtime.execution_trace import (
     ExecutionPhase,
     ExecutionTrace,
@@ -131,17 +145,20 @@ from uniserve_worker.runtime.host_staging import (
     fill_cpu_ints,
     is_pinned,
 )
-from uniserve_worker.runtime.image_utils import tensor_to_png_b64
-from uniserve_worker.runtime.kv_store import KvEntry, KvStore, KvTxn
+from uniserve_worker.runtime.image_utils import (
+    quantize_image_hwc,
+    uint8_image_to_png_base64_bytes,
+)
+from uniserve_worker.runtime.kv_store import KvEntry, KvSnapshot, KvStore, KvTxn
 from uniserve_worker.runtime.latent_store import LatentRecord, LatentStore, LatentTxn, LatentTxnView
 from uniserve_worker.runtime.mesh_store import MeshStore
 from uniserve_worker.runtime.product_store import (
     DeviceProductContinuationBatch,
     DeviceProductRead,
+    DeviceProductScalarBatch,
     DeviceProductTable,
     DeviceProductWrite,
     EncodedImageProduct,
-    FrameCollectionProduct,
     ImageRange,
     ImageTensorProduct,
     LatentFeatureProduct,
@@ -165,7 +182,15 @@ from uniserve_worker.runtime.rng import (
     semantic_sampling_seed,
     uniform_samples,
 )
-from uniserve_worker.runtime.transfer import Locator, Transport, fetch_locator
+from uniserve_worker.runtime.transfer import (
+    TRANSFER_DESCRIPTOR_PREFIX,
+    Locator,
+    TransferTicket,
+    Transport,
+    decode_transfer_descriptor,
+    encode_transfer_descriptor,
+    fetch_locator,
+)
 from uniserve_worker.spec import (
     DeploymentOverlay,
     FeatureLayout,
@@ -196,8 +221,10 @@ from ._forward_plan import (
     OutputSlot,
     TransactionId,
 )
-from ._inputs import PreparedImage, prepare_image, prepare_tensor_image
-from .model_runner import ModelRunner, RunObservation
+from ._inputs import PreparedImage, patch_grid_shape, prepare_image, prepare_tensor_image
+from .model_runner import ModelRunner, RunObservation, RunPath
+
+logger = logging.getLogger(__name__)
 
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
@@ -207,6 +234,8 @@ TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 @dataclass(slots=True)
 class _ForwardTask:
     operation: Operation
+    session: RequestSession
+    weights: WeightSet
     stage: OperationStageSpec
     route: RouteSpec
     row: ForwardRow
@@ -744,6 +773,177 @@ class _CompletionLogprobPayload:
         return self.finalize()
 
 
+class _CompletionTransferPayload:
+    __slots__ = (
+        "kind",
+        "descriptor_value",
+        "locators",
+        "producer_plan_digest",
+        "transport",
+        "_value",
+    )
+
+    def __init__(
+        self,
+        kind: str,
+        descriptor_value: dict[str, object],
+        locators: tuple[Locator, ...],
+        producer_plan_digest: str,
+        transport: Transport,
+    ) -> None:
+        self.kind = kind
+        self.descriptor_value = descriptor_value
+        self.locators = locators
+        self.producer_plan_digest = producer_plan_digest
+        self.transport = transport
+        self._value: bytes | None = None
+
+    def ready(self) -> bool:
+        return self._value is not None or all(
+            self.transport.ready(locator) for locator in self.locators
+        )
+
+    def max_encoded_bytes(self) -> int:
+        return len(
+            encode_transfer_descriptor(
+                self.kind,
+                self.descriptor_value,
+                self.producer_plan_digest,
+            )
+        )
+
+    def finalize(self) -> bytes:
+        if self._value is None:
+            if not self.ready():
+                raise RuntimeError("transport descriptor was observed before producer readiness")
+            self._value = encode_transfer_descriptor(
+                self.kind,
+                self.descriptor_value,
+                self.producer_plan_digest,
+            )
+        return self._value
+
+    def __bytes__(self) -> bytes:
+        return self.finalize()
+
+
+class _CompletionImagePayload:
+    """Pinned D2H image capture followed by bounded asynchronous PNG encoding."""
+
+    __slots__ = (
+        "capture",
+        "reservation",
+        "max_bytes",
+        "publish",
+        "discard",
+        "_future",
+        "_value",
+        "_submission_error",
+        "_discarded",
+        "_published",
+    )
+
+    def __init__(
+        self,
+        capture: CompletionByteCapture,
+        reservation: CpuTaskReservation,
+        max_bytes: int,
+        publish: Callable[[bytes], None],
+        discard: Callable[[], None],
+    ) -> None:
+        self.capture = capture
+        self.reservation = reservation
+        self.max_bytes = int(max_bytes)
+        self.publish = publish
+        self.discard = discard
+        self._future: Any | None = None
+        self._value: bytes | None = None
+        self._submission_error: Exception | None = None
+        self._discarded = False
+        self._published = False
+
+    def ready(self) -> bool:
+        if self._value is not None or self._submission_error is not None:
+            return True
+        if self._future is None:
+            if not self.capture.ready():
+                return False
+            try:
+                self._future = self.reservation.submit(
+                    uint8_image_to_png_base64_bytes,
+                    self.capture.tensor(),
+                )
+            except Exception as error:
+                self._submission_error = error
+                return True
+        return bool(self._future.done())
+
+    def max_encoded_bytes(self) -> int:
+        return self.max_bytes
+
+    def finalize(self) -> bytes:
+        if self._value is not None:
+            return self._value
+        if not self.ready():
+            raise RuntimeError("image payload was observed before CPU encoding was ready")
+        try:
+            if self._submission_error is not None:
+                raise self._submission_error
+            if self._future is None:
+                raise RuntimeError("image encoding task lost its CPU future")
+            value = self._future.result(timeout=0)
+            if not isinstance(value, bytes) or not value:
+                raise RuntimeError("image encoding task produced an invalid payload")
+            if len(value) > self.max_bytes:
+                raise RuntimeError("encoded image exceeds its registered product byte bound")
+            if not self._published:
+                self.publish(value)
+                self._published = True
+            self._value = value
+        except Exception:
+            self._discard_once()
+            raise
+        return self._value
+
+    def _discard_once(self) -> None:
+        if not self._discarded:
+            self._discarded = True
+            self.discard()
+
+    def __bytes__(self) -> bytes:
+        return self.finalize()
+
+    def __del__(self) -> None:
+        self.reservation.abandon()
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedTransferInput:
+    product: ProductRef
+    kind: str
+    descriptor_value: dict[str, object]
+    producer_plan_digest: str
+    locators: tuple[Locator, ...]
+    tickets: tuple[TransferTicket, ...]
+
+    def ready(self) -> bool:
+        return all(ticket.ready() for ticket in self.tickets)
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        if not self.ready():
+            raise RuntimeError("prepared transfer input was observed before readiness")
+        return tuple(ticket.result() for ticket in self.tickets)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedExecution:
+    batch: Batch
+    transfers: tuple[_PreparedTransferInput, ...]
+
+    def ready(self) -> bool:
+        return all(transfer.ready() for transfer in self.transfers)
+
+
 _COMPLETION_FIELD_NAMES: tuple[str, ...] = tuple(
     completion_field.name for completion_field in dataclass_fields(CompletionRecord)
 )
@@ -802,6 +1002,8 @@ class _PendingDigest:
         "_selected_point",
         "_selected_runtime",
         "_resolved_callback",
+        "_completion_tasks",
+        "_completion_error",
     )
 
     def __init__(
@@ -813,6 +1015,7 @@ class _PendingDigest:
         row: int,
         predicated_parent: Callable[[], tuple[VersionRef, ResolvedRuntimeState]],
         resolved_callback: Callable[[CompletionRecord, str, str], None] | None = None,
+        completion_tasks: tuple[_CompletionImagePayload, ...] = (),
     ) -> None:
         self._record = record
         self._parent = parent
@@ -825,17 +1028,24 @@ class _PendingDigest:
         self._observed = False
         self._invalid_sampling = False
         self._predicated = False
-        self._predicated_parent = predicated_parent
+        self._predicated_parent: Callable[[], tuple[VersionRef, ResolvedRuntimeState]] | None = (
+            predicated_parent
+        )
         self._selected_point = record.selected_point
         self._selected_runtime: ResolvedRuntimeState | None = None
         self._resolved_callback = resolved_callback
+        self._completion_tasks = completion_tasks
+        self._completion_error = False
 
     def ready(self) -> bool:
         if self._value is not None:
             return True
         if isinstance(self._parent, _PendingDigest) and not self._parent.ready():
             return False
-        return self._lease is not None and self._lease.ready()
+        if self._lease is None or not self._lease.ready():
+            return False
+        task_readiness = tuple(task.ready() for task in self._completion_tasks)
+        return all(task_readiness)
 
     def resolve(self) -> str:
         if self._value is None:
@@ -844,32 +1054,45 @@ class _PendingDigest:
             parent = (
                 self._parent.resolve() if isinstance(self._parent, _PendingDigest) else self._parent
             )
-            # The digest packs each committed token via ``__index__``, which
-            # finalizes a deferred token exactly as ``int(value)`` would, so
-            # the record is hashed in place without a concrete-token copy.
             try:
-                value = self._record.compute_semantic_digest(
+                for task in self._completion_tasks:
+                    task.finalize()
+            except Exception:
+                self._completion_error = True
+                self._value = _completion_error_record(self._record).compute_semantic_digest(
                     parent_semantic=cast(str, parent),
                     plan_digest=self._plan_digest,
                 )
-                if self._resolved_callback is not None:
-                    self._resolved_callback(self._record, value, cast(str, parent))
-                self._value = value
-            except _PredicatedOperation:
-                self._predicated = True
-                self._value = cast(str, parent)
-                selected, runtime = self._predicated_parent()
-                point = selected.point
-                if not isinstance(point, FixedPoint):
-                    raise RuntimeError("predicated operation selected a non-fixed parent")
-                self._selected_point = int(point.point_index)
-                self._selected_runtime = runtime
-            except _InvalidSamplingDistribution:
-                self._invalid_sampling = True
-                self._value = _invalid_sampling_record(self._record).compute_semantic_digest(
-                    parent_semantic=cast(str, parent),
-                    plan_digest=self._plan_digest,
-                )
+            else:
+                try:
+                    # The digest packs each committed token via ``__index__``, which
+                    # finalizes a deferred token exactly as ``int(value)`` would, so
+                    # the record is hashed in place without a concrete-token copy.
+                    value = self._record.compute_semantic_digest(
+                        parent_semantic=cast(str, parent),
+                        plan_digest=self._plan_digest,
+                    )
+                    if self._resolved_callback is not None:
+                        self._resolved_callback(self._record, value, cast(str, parent))
+                    self._value = value
+                except _PredicatedOperation:
+                    self._predicated = True
+                    self._value = cast(str, parent)
+                    predicated_parent = self._predicated_parent
+                    if predicated_parent is None:
+                        raise RuntimeError("predicated completion lost its parent resolver")
+                    selected, runtime = predicated_parent()
+                    point = selected.point
+                    if not isinstance(point, FixedPoint):
+                        raise RuntimeError("predicated operation selected a non-fixed parent")
+                    self._selected_point = int(point.point_index)
+                    self._selected_runtime = runtime
+                except _InvalidSamplingDistribution:
+                    self._invalid_sampling = True
+                    self._value = _invalid_sampling_record(self._record).compute_semantic_digest(
+                        parent_semantic=cast(str, parent),
+                        plan_digest=self._plan_digest,
+                    )
             lease = self._lease
             if lease is None:
                 raise RuntimeError("completion digest lost its arena lease")
@@ -894,6 +1117,11 @@ class _PendingDigest:
     def predicated(self) -> bool:
         self.resolve()
         return self._predicated
+
+    @property
+    def completion_error(self) -> bool:
+        self.resolve()
+        return self._completion_error
 
     @property
     def selected_point(self) -> int:
@@ -948,6 +1176,12 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
         resolved = digest.resolve()
         copy_us, host_us = digest.completion_timing()
         timing = replace(record.timing_counters, copy_us=copy_us, host_us=host_us)
+        if digest.completion_error:
+            return replace(
+                _completion_error_record(record),
+                semantic_digest=resolved,
+                timing_counters=timing,
+            )
         if digest.invalid_sampling:
             return replace(
                 _invalid_sampling_record(record),
@@ -998,6 +1232,18 @@ def _invalid_sampling_record(record: CompletionRecord) -> CompletionRecord:
     )
 
 
+def _completion_error_record(record: CompletionRecord) -> CompletionRecord:
+    return replace(
+        record,
+        status=OpStatus.ERROR,
+        token_span=replace(record.token_span, len=0),
+        committed_tokens=(),
+        finish_flags=FinishFlags(),
+        product_generations=(),
+        error_code=ProtocolErrorCode.COMPUTE_ERROR,
+    )
+
+
 def _predicated_record(
     record: CompletionRecord,
     selected_point: int,
@@ -1028,9 +1274,28 @@ def completion_report_ready(report: CompletionReport) -> bool:
     """True once every completion's deferred token/digest/artifact can be read
     without a stall."""
 
-    return all(_record_ready(record) for record in report.completions) and all(
-        not isinstance(product.payload, _CompletionLogprobPayload) or product.payload.ready()
-        for product in report.products
+    record_readiness = tuple(_record_ready(record) for record in report.completions)
+    payload_readiness = tuple(
+        _completion_payload_ready(product.payload) for product in report.products
+    )
+    return all(record_readiness) and all(payload_readiness)
+
+
+def partition_completion_ready(partition: PartitionCompletion) -> bool:
+    record_readiness = tuple(_record_ready(record) for record in partition.completions)
+    payload_readiness = tuple(
+        _completion_payload_ready(product.payload) for product in partition.products
+    )
+    return all(record_readiness) and all(payload_readiness)
+
+
+def _completion_payload_ready(payload: object) -> bool:
+    return (
+        not isinstance(
+            payload,
+            (_CompletionImagePayload, _CompletionLogprobPayload, _CompletionTransferPayload),
+        )
+        or payload.ready()
     )
 
 
@@ -1043,35 +1308,53 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
     :func:`completion_report_ready`, so everything resolves here.
     """
 
-    completions = tuple(
-        _finalized_record(record) if _record_ready(record) else record
-        for record in report.completions
-    )
-    products = tuple(
-        replace(product, payload=product.payload.finalize())
-        if isinstance(product.payload, _CompletionLogprobPayload) and product.payload.ready()
-        else product
-        for product in report.products
-    )
-    for product in products:
-        if isinstance(product.payload, bytes) and len(product.payload) > int(
-            product.product.max_bytes
-        ):
-            raise invalid_descriptor("completion product exceeds its registered product byte bound")
-    nonpublishing_ops = {
-        int(record.op_id) for record in completions if record.status is not OpStatus.OK
-    }
-    if nonpublishing_ops:
-        products = tuple(
+    changed = False
+    partitions: list[PartitionCompletion] = []
+    for partition in report.partitions:
+        completions = tuple(
+            _finalized_record(record) if _record_ready(record) else record
+            for record in partition.completions
+        )
+        nonpublishing_ops = {
+            int(record.op_id) for record in completions if record.status is not OpStatus.OK
+        }
+        retained_products = tuple(
             product
-            for product in products
+            for product in partition.products
             if int(product.product.producer_op_id) not in nonpublishing_ops
         )
-    if all(new is old for new, old in zip(completions, report.completions, strict=True)) and all(
-        new is old for new, old in zip(products, report.products, strict=True)
-    ):
-        return report
-    return replace(report, completions=completions, products=products)
+        products = tuple(
+            replace(product, payload=product.payload.finalize())
+            if isinstance(
+                product.payload,
+                (
+                    _CompletionImagePayload,
+                    _CompletionLogprobPayload,
+                    _CompletionTransferPayload,
+                ),
+            )
+            and product.payload.ready()
+            else product
+            for product in retained_products
+        )
+        for product in products:
+            if (
+                isinstance(product.payload, bytes)
+                and not product.payload.startswith(TRANSFER_DESCRIPTOR_PREFIX)
+                and len(product.payload) > int(product.product.max_bytes)
+            ):
+                raise invalid_descriptor(
+                    "completion product exceeds its registered product byte bound"
+                )
+        if (
+            not all(new is old for new, old in zip(completions, partition.completions, strict=True))
+            or len(products) != len(partition.products)
+            or not all(new is old for new, old in zip(products, partition.products))
+        ):
+            changed = True
+            partition = replace(partition, completions=completions, products=products)
+        partitions.append(partition)
+    return replace(report, partitions=tuple(partitions)) if changed else report
 
 
 _ExecutorTask: TypeAlias = _ForwardTask | _SampleTask
@@ -1088,8 +1371,63 @@ def _reference_operation_identity(reference: ProductRef) -> _OperationIdentity:
     return reference.request_key, int(reference.producer_op_id)
 
 
+def _unique_scopes(scopes: Sequence[_ExecutionScope]) -> tuple[_ExecutionScope, ...]:
+    unique: list[_ExecutionScope] = []
+    seen: set[int] = set()
+    for scope in scopes:
+        identity = id(scope)
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(scope)
+    return tuple(unique)
+
+
+def _protocol_error_code(code: str) -> ProtocolErrorCode:
+    if code == WorkerErrorCode.RESOURCE_ERROR:
+        return ProtocolErrorCode.RESOURCE_EXHAUSTED
+    if code == WorkerErrorCode.COMPUTE_ERROR:
+        return ProtocolErrorCode.COMPUTE_ERROR
+    if code in {WorkerErrorCode.INVARIANT_VIOLATION, WorkerErrorCode.FATAL_WORKER_FAILURE}:
+        return ProtocolErrorCode.INTERNAL
+    return ProtocolErrorCode.INVALID_OPERATION
+
+
+@dataclass(slots=True)
+class _RowIdentity:
+    next_value: int = 0
+
+    def acquire(self) -> int:
+        value = self.next_value
+        self.next_value += 1
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class _PartitionLayout:
+    operations: tuple[Operation, ...]
+    sessions: tuple[RequestSession, ...]
+    kv_entries: tuple[KvEntry, ...]
+    weights: tuple[WeightSet, ...]
+    identities: tuple[_OperationIdentity, ...]
+
+    def __post_init__(self) -> None:
+        width = len(self.operations)
+        if not all(
+            len(values) == width
+            for values in (
+                self.sessions,
+                self.kv_entries,
+                self.weights,
+                self.identities,
+            )
+        ):
+            raise RuntimeError("partition layout columns are not aligned")
+
+
 @dataclass(slots=True)
 class _ExecutionScope:
+    partition: BatchPartition
+    started_ns: int
     transaction: StepTxn
     completion: CompletionLease
     kv: KvTxn
@@ -1097,6 +1435,9 @@ class _ExecutionScope:
     latent_view: LatentTxnView
     products: ProductTxn
     product_view: ProductView
+    layout: _PartitionLayout | None = None
+    prepared_transfers: dict[ProductRef, _PreparedTransferInput] = field(default_factory=dict)
+    stage_publications: dict[_OperationIdentity, tuple[Locator, ...]] = field(default_factory=dict)
     published: list[Locator] = field(default_factory=list)
     observations: list[RunObservation] = field(default_factory=list)
     component_us: dict[str, int] = field(default_factory=dict)
@@ -1120,12 +1461,12 @@ class _ExecutionScope:
     )
     sampling_states: dict[_OperationIdentity, SamplingState] = field(default_factory=dict)
     device_continuation: DeviceProductContinuationBatch | None = None
-    next_row_id: int = 0
+    row_identity: _RowIdentity = field(default_factory=_RowIdentity)
+    registration_visible: bool = False
+    cpu_tasks: dict[_OperationIdentity, CpuTaskReservation] = field(default_factory=dict)
 
     def row_id(self) -> int:
-        value = self.next_row_id
-        self.next_row_id += 1
-        return value
+        return self.row_identity.acquire()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1160,6 +1501,7 @@ class _Outcome:
     committed_tokens: tuple[int | _CompletionToken, ...] = ()
     products: tuple[ProductPayload, ...] = ()
     selection: _SpeculativeSelection | None = None
+    completion_tasks: tuple[_CompletionImagePayload, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1200,6 +1542,8 @@ class ModelExecutor:
         pipeline_depth: int = 1,
         defer_sampling: bool = False,
         completion_payload_bytes: int,
+        cpu_task_capacity: int,
+        pinned_staging_capacity: int,
     ) -> None:
         if not allowed_operation_types:
             raise ValueError("executor must accept at least one operation type")
@@ -1264,12 +1608,20 @@ class ModelExecutor:
             if deployment.generation_device is not None:
                 completion_devices.append(deployment.generation_device)
         self._completions = CompletionArena(
-            depth=pipeline_depth,
+            depth=pipeline_depth * max_operations,
             token_capacity=completion_words,
+            total_token_capacity=pipeline_depth * completion_words,
             devices=tuple(completion_devices),
             event_pool=products.device_events,
         )
-        self._tensor_stager = TensorStager(capacity=pipeline_depth * max_operations)
+        self._tensor_stager = TensorStager(
+            capacity=pipeline_depth * max_operations,
+            byte_capacity=int(pinned_staging_capacity),
+        )
+        self._cpu_tasks = BoundedCpuTaskPool(
+            capacity=int(cpu_task_capacity),
+            workers=min(4, int(cpu_task_capacity)),
+        )
         self._routes = {} if spec is None else {route.name: route for route in spec.routes}
         self._operation_stages = (
             {}
@@ -1286,9 +1638,109 @@ class ModelExecutor:
             )
             == 1
         }
+        self._collective_history: OrderedDict[int, str] = OrderedDict()
+        self._transport_publications: dict[_OperationIdentity, tuple[Locator, ...]] = {}
 
-    def execute(self, batch: Batch) -> CompletionReport:
+    def close(self) -> None:
+        self._cpu_tasks.close()
+
+    def prepare(self, batch: Batch) -> PreparedExecution | None:
+        """Submit every declared cross-stage read without waiting for it."""
+
+        entries = tuple(
+            payload
+            for payload in batch.input_products
+            if payload.payload.startswith(TRANSFER_DESCRIPTOR_PREFIX)
+        )
+        if not entries:
+            return None
+        transport = self.transport
+        if transport is None:
+            raise capability_mismatch("cross-stage input requires a configured transport")
+        transfers: list[_PreparedTransferInput] = []
+        for entry in entries:
+            kind, value, producer_plan_digest = decode_transfer_descriptor(entry.payload)
+            locators: tuple[Locator, ...]
+            if kind == "tensor":
+                if set(value) != {
+                    "height",
+                    "locator",
+                    "payload_kind",
+                    "width",
+                }:
+                    raise invalid_descriptor("tensor transfer entry has an invalid shape")
+                raw_locator = value["locator"]
+                if not isinstance(raw_locator, dict):
+                    raise invalid_descriptor("tensor transfer entry locator is invalid")
+                main = Locator.from_wire(raw_locator)
+                locators = (main,)
+                if (
+                    value["payload_kind"]
+                    not in {ProductKind.VISION_FEATURE.value, ProductKind.LATENT_FEATURE.value}
+                    or not isinstance(value["height"], int)
+                    or isinstance(value["height"], bool)
+                    or not isinstance(value["width"], int)
+                    or isinstance(value["width"], bool)
+                    or int(value["height"]) < 1
+                    or int(value["width"]) < 1
+                    or main.nbytes > entry.product.max_bytes
+                    or math.prod(main.shape) > entry.product.shape_bound.max_elements
+                ):
+                    raise invalid_descriptor("tensor transfer metadata exceeds its product bounds")
+            else:
+                if set(value) != {"snapshot"}:
+                    raise invalid_descriptor("KV transfer entry has an invalid shape")
+                snapshot = KvSnapshot.from_wire(value["snapshot"])
+                if entry.product.kind is not ProductKind.KV:
+                    raise invalid_descriptor("KV transfer entry names a non-KV product")
+                locators = tuple(Locator.from_wire_json(raw) for raw in snapshot.locators)
+            transfers.append(
+                _PreparedTransferInput(
+                    product=entry.product,
+                    kind=kind,
+                    descriptor_value=value,
+                    producer_plan_digest=producer_plan_digest,
+                    locators=locators,
+                    tickets=tuple(transport.fetch_async(locator) for locator in locators),
+                )
+            )
+        return PreparedExecution(batch=batch, transfers=tuple(transfers))
+
+    def execute_prepared(self, prepared: PreparedExecution) -> CompletionReport:
+        if not prepared.ready():
+            raise RuntimeError("prepared execution was observed before transfer readiness")
+        return self.execute(prepared.batch, prepared=prepared.transfers)
+
+    def complete_startup(self) -> None:
+        """Retire pre-admission collective identities before serving traffic."""
+
+        if self.sessions.session_ids():
+            raise RuntimeError("startup completed with resident request sessions")
+        self._collective_history.clear()
+
+    def execute(
+        self,
+        batch: Batch,
+        *,
+        prepared: tuple[_PreparedTransferInput, ...] = (),
+    ) -> CompletionReport:
         """Execute one canonical batch with replay-before-mutation semantics."""
+
+        return self._execute(batch, prepared=prepared, propagate_errors=False)
+
+    def execute_startup(self, batch: Batch) -> CompletionReport:
+        """Execute pre-admission work with transactional error propagation."""
+
+        return self._execute(batch, prepared=(), propagate_errors=True)
+
+    def _execute(
+        self,
+        batch: Batch,
+        *,
+        prepared: tuple[_PreparedTransferInput, ...],
+        propagate_errors: bool,
+    ) -> CompletionReport:
+        """Shared transactional execution for startup and admitted traffic."""
 
         started = time.perf_counter_ns()
         operations = _trace_envelopes(batch.operations)
@@ -1316,12 +1768,10 @@ class ModelExecutor:
             self._apply_release_controls(batch)
             return CompletionReport(
                 step_id=batch.step_id,
-                completions=(),
-                registration=RegistrationAck(visible=True),
-                worker_exec_us=(time.perf_counter_ns() - started) // 1000,
+                partitions=(),
             )
         try:
-            replayed = self.replay.lookup(batch.operations)
+            replayed = self.replay.lookup(batch.partitions)
         except BaseException as error:
             self.trace.emit(ExecutionPhase.REPLAY, operations, error=error)
             raise
@@ -1331,7 +1781,14 @@ class ModelExecutor:
                 replace(
                     replayed,
                     step_id=batch.step_id,
-                    worker_exec_us=(time.perf_counter_ns() - started) // 1000,
+                    partitions=tuple(
+                        replace(
+                            partition,
+                            worker_exec_us=(time.perf_counter_ns() - started) // 1000,
+                            forward_stats=WorkerForwardStats(),
+                        )
+                        for partition in replayed.partitions
+                    ),
                 )
             )
             self.trace.emit(
@@ -1341,32 +1798,217 @@ class ModelExecutor:
             )
             return report
 
-        completion = self._completions.reserve(
-            len(batch.operations),
-            devices=self._completion_devices(batch.operations),
+        row_identity = _RowIdentity()
+        reports: dict[int, PartitionCompletion] = {}
+        groups: dict[int, list[BatchPartition]] = {}
+        for partition in batch.partitions:
+            groups.setdefault(partition.submission_group, []).append(partition)
+
+        for partitions in groups.values():
+            scopes: list[_ExecutionScope] = []
+            for partition in partitions:
+                try:
+                    scopes.append(
+                        self._open_partition(
+                            batch,
+                            partition,
+                            row_identity,
+                            prepared,
+                        )
+                    )
+                except BaseException as error:
+                    classified = self._classify_partition_failure(
+                        partition,
+                        error,
+                        phase="partition registration",
+                    )
+                    if propagate_errors or classified.fatal:
+                        for scope in scopes:
+                            self._rollback_partition(scope, classified)
+                        raise classified
+                    reports[partition.partition_id] = self._registration_error_partition(
+                        batch.step_id,
+                        partition,
+                        classified,
+                        started,
+                    )
+
+            if not scopes:
+                continue
+            try:
+                outcomes, execution_errors = self._execute_partition_group(tuple(scopes))
+            except BaseException as error:
+                classified = self._classify_partition_failure(
+                    partitions[0],
+                    error,
+                    phase="partition execution",
+                )
+                for scope in scopes:
+                    self._rollback_partition(scope, classified)
+                if propagate_errors or classified.fatal:
+                    raise classified
+                for scope in scopes:
+                    reports[scope.partition.partition_id] = self._error_partition(
+                        batch.step_id,
+                        scope,
+                        classified,
+                        started,
+                    )
+                continue
+
+            if propagate_errors and execution_errors:
+                first_partition = next(
+                    partition
+                    for partition in partitions
+                    if partition.partition_id in execution_errors
+                )
+                classified = self._classify_partition_failure(
+                    first_partition,
+                    execution_errors[first_partition.partition_id],
+                    phase="partition execution",
+                )
+                for scope in scopes:
+                    self._rollback_partition(scope, classified)
+                raise classified
+
+            for scope in scopes:
+                partition_error = execution_errors.get(scope.partition.partition_id)
+                if partition_error is not None:
+                    classified = self._classify_partition_failure(
+                        scope.partition,
+                        partition_error,
+                        phase="partition execution",
+                    )
+                    self._rollback_partition(scope, classified)
+                    if propagate_errors or classified.fatal:
+                        raise classified
+                    reports[scope.partition.partition_id] = self._error_partition(
+                        batch.step_id,
+                        scope,
+                        classified,
+                        started,
+                    )
+                    continue
+                partition_outcomes = outcomes[scope.partition.partition_id]
+                try:
+                    reports[scope.partition.partition_id] = self._commit_partition(
+                        batch.step_id,
+                        scope,
+                        partition_outcomes,
+                        started,
+                    )
+                except BaseException as error:
+                    classified = self._classify_partition_failure(
+                        scope.partition,
+                        error,
+                        phase="partition commit",
+                    )
+                    self._rollback_partition(scope, classified)
+                    if propagate_errors or classified.fatal:
+                        raise classified
+                    reports[scope.partition.partition_id] = self._error_partition(
+                        batch.step_id,
+                        scope,
+                        classified,
+                        started,
+                    )
+
+        self._apply_release_controls(batch)
+        report = CompletionReport(
+            step_id=batch.step_id,
+            partitions=tuple(reports[partition.partition_id] for partition in batch.partitions),
         )
-        transaction_started = time.perf_counter_ns()
+        report = finalize_completion_report(report)
+        self.trace.emit(
+            ExecutionPhase.COMMIT,
+            operations,
+            duration_us=(time.perf_counter_ns() - started) // 1000,
+        )
+        return report
+
+    def _classify_partition_failure(
+        self,
+        partition: BatchPartition,
+        error: BaseException,
+        *,
+        phase: str,
+    ) -> WorkerError:
+        operations = tuple(
+            (
+                int(operation.request_key.session_id),
+                int(operation.request_key.epoch),
+                int(operation.op_id),
+            )
+            for operation in partition.operations
+        )
+        sole = partition.operations[0] if len(partition.operations) == 1 else None
+        classified = classify(
+            error,
+            context=phase,
+            phase=phase,
+            operations=operations,
+            req_id=None if sole is None else int(sole.request_key.session_id),
+            op_id=None if sole is None else int(sole.op_id),
+            op_kind=None if sole is None else sole.work.variant.value,
+            route=str(partition.route),
+        )
+        self._log_partition_failure(partition, classified, cause=error)
+        return classified
+
+    @staticmethod
+    def _log_partition_failure(
+        partition: BatchPartition,
+        error: WorkerError,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        capture_trace = should_capture_trace(str(error.code))
+        log = logger.error if capture_trace else logger.warning
+        log(
+            "partition failed: %s [code=%s partition_id=%s route=%s operations=%s]",
+            error.message,
+            error.code,
+            partition.partition_id,
+            partition.route,
+            error.operations,
+            exc_info=(type(cause), cause, cause.__traceback__)
+            if capture_trace and cause is not None
+            else None,
+        )
+
+    def _open_partition(
+        self,
+        batch: Batch,
+        partition: BatchPartition,
+        row_identity: _RowIdentity,
+        prepared: tuple[_PreparedTransferInput, ...],
+    ) -> _ExecutionScope:
+        operations = partition.operations
+        traced = _trace_envelopes(operations)
+        started = time.perf_counter_ns()
+        completion = self._completions.reserve(
+            len(operations),
+            token_capacity=self._partition_completion_words(operations),
+            devices=self._completion_devices(operations),
+        )
         try:
             transaction = self.sessions.begin_step(
                 batch.step_id,
-                batch.operations,
+                operations,
                 (self.kv, self.latents, self.products),
             )
         except BaseException as error:
+            completion.abandon()
             self.trace.emit(
                 ExecutionPhase.TRANSACTION_OPEN,
-                operations,
-                duration_us=(time.perf_counter_ns() - transaction_started) // 1000,
+                traced,
+                duration_us=(time.perf_counter_ns() - started) // 1000,
                 error=error,
             )
-            completion.abandon()
             raise
-        self.trace.emit(
-            ExecutionPhase.TRANSACTION_OPEN,
-            operations,
-            duration_us=(time.perf_counter_ns() - transaction_started) // 1000,
-        )
         scope = _ExecutionScope(
+            partition=partition,
+            started_ns=started,
             transaction=transaction,
             completion=completion,
             kv=cast(KvTxn, transaction.store_transaction(self.kv)),
@@ -1374,154 +2016,378 @@ class ModelExecutor:
             latent_view=cast(LatentTxn, transaction.store_transaction(self.latents)).view(),
             products=cast(ProductTxn, transaction.store_transaction(self.products)),
             product_view=cast(ProductTxn, transaction.store_transaction(self.products)).view(),
+            prepared_transfers={
+                transfer.product: transfer
+                for transfer in prepared
+                if transfer.product
+                in {reference for operation in operations for reference in operation.inputs}
+            },
+            row_identity=row_identity,
+        )
+        self.trace.emit(
+            ExecutionPhase.TRANSACTION_OPEN,
+            traced,
+            duration_us=(time.perf_counter_ns() - started) // 1000,
+        )
+        request_keys = {operation.request_key for operation in operations}
+        admissions = tuple(
+            admission for admission in batch.admissions if admission.request_key in request_keys
+        )
+        declared_inputs = {reference for operation in operations for reference in operation.inputs}
+        input_products = tuple(
+            payload for payload in batch.input_products if payload.product in declared_inputs
         )
         try:
-            # Atomic registration: admit new authorities, bind each operation's
-            # declared parent and output products, and admit KV blocks before any
-            # device work runs. A rejection here rolls back with no side effect.
-            self.sessions.prepare(batch)
-            for admission in batch.admissions:
+            for admission in admissions:
+                self.sessions.admit(admission)
+            self.sessions.validate_operations(operations, admissions)
+            self._reserve_cpu_tasks(operations, scope)
+            for admission in admissions:
                 self.kv.admit(admission)
-            self._apply_new_kv_blocks(batch.operations, scope)
-            self._reserve_outputs(batch.operations, scope)
-            self._stage_input_products(batch, scope)
-            self._consume_predicates(batch.operations, scope)
-            outcomes = self._execute_operations(batch.operations, scope)
-            self._finish_device_reads(scope)
-            self._publish_predicates(scope)
-            if scope.device_continuation is not None:
-                self.products.device_products.validate_continuation(scope.device_continuation)
-            continuation_writes = (
-                frozenset(id(write) for write in scope.device_continuation.writes)
-                if scope.device_continuation is not None
-                else frozenset()
+            self._apply_new_kv_blocks(operations, scope)
+            aligned_sessions = transaction.aligned_sessions()
+            scope.layout = _PartitionLayout(
+                operations=operations,
+                sessions=aligned_sessions,
+                kv_entries=scope.kv.entries(
+                    tuple(operation.request_key.session_id for operation in operations)
+                ),
+                weights=tuple(self._weights(session) for session in aligned_sessions),
+                identities=tuple(_operation_identity(operation) for operation in operations),
             )
-            self.products.device_products.validate_writes(
-                tuple(
-                    write for write in scope.device_writes if id(write) not in continuation_writes
+            self._reserve_outputs(operations, scope)
+            self._stage_input_products(input_products, scope)
+            self._consume_predicates(operations, scope)
+            scope.registration_visible = True
+            return scope
+        except BaseException:
+            self._rollback_partition(scope)
+            raise
+
+    @staticmethod
+    def _partition_completion_words(operations: tuple[Operation, ...]) -> int:
+        return max(
+            1,
+            SAMPLING_COMPLETION_FIELDS * len(operations)
+            + sum(
+                (int(operation.bounds.max_completion_bytes) + 3) // 4 for operation in operations
+            ),
+        )
+
+    def _execute_partition_group(
+        self,
+        scopes: tuple[_ExecutionScope, ...],
+    ) -> tuple[dict[int, tuple[_Outcome, ...]], dict[int, BaseException]]:
+        if len(scopes) == 1:
+            scope = scopes[0]
+            return (
+                {
+                    scope.partition.partition_id: self._execute_operations(
+                        scope.partition.operations,
+                        scope,
+                    )
+                },
+                {},
+            )
+        drivers: list[tuple[int, int, _Driver, _ExecutionScope]] = []
+        for scope_index, scope in enumerate(scopes):
+            for operation_index, operation in enumerate(scope.partition.operations):
+                drivers.append(
+                    (scope_index, operation_index, self._driver(operation, scope), scope)
                 )
+        flat_outcomes, errors = self._drive_partitioned(tuple(drivers))
+        grouped: list[list[_Outcome | None]] = [
+            [None] * len(scope.partition.operations) for scope in scopes
+        ]
+        for (scope_index, operation_index, _driver, _scope), outcome in zip(
+            drivers,
+            flat_outcomes,
+            strict=True,
+        ):
+            if outcome is not None:
+                grouped[scope_index][operation_index] = outcome
+        outcomes: dict[int, tuple[_Outcome, ...]] = {}
+        for scope, partition_outcomes in zip(scopes, grouped, strict=True):
+            partition_id = scope.partition.partition_id
+            if partition_id in errors:
+                continue
+            if any(outcome is None for outcome in partition_outcomes):
+                raise RuntimeError("successful partition did not resolve every operation")
+            outcomes[partition_id] = tuple(
+                cast(_Outcome, outcome) for outcome in partition_outcomes
             )
-            completion.seal()
-            self.trace.emit(
-                ExecutionPhase.POSTPROCESS,
+        return outcomes, errors
+
+    def _commit_partition(
+        self,
+        step_id: int,
+        scope: _ExecutionScope,
+        outcomes: tuple[_Outcome, ...],
+        started: int,
+    ) -> PartitionCompletion:
+        partition = scope.partition
+        operations = partition.operations
+        self._finish_device_reads(scope)
+        self._publish_predicates(scope)
+        if scope.device_continuation is not None:
+            self.products.device_products.validate_continuation(scope.device_continuation)
+        continuation_writes = (
+            frozenset(id(write) for write in scope.device_continuation.writes)
+            if scope.device_continuation is not None
+            else frozenset()
+        )
+        self.products.device_products.validate_writes(
+            tuple(write for write in scope.device_writes if id(write) not in continuation_writes)
+        )
+        scope.completion.seal()
+        records: list[CompletionRecord] = []
+        committed: dict[int, VersionRef] = {}
+        report_products: list[ProductPayload] = []
+        pending_by_session: dict[int, _PendingDigest] = {}
+        resolved_runtime: dict[int, ResolvedRuntimeState] = {}
+        layout = scope.layout
+        if layout is None or layout.operations != operations:
+            raise RuntimeError("partition commit lost its aligned transaction layout")
+        for row, (operation, session, entry, outcome) in enumerate(
+            zip(
                 operations,
-                duration_us=(time.perf_counter_ns() - started) // 1000,
+                layout.sessions,
+                layout.kv_entries,
+                outcomes,
+                strict=True,
             )
-            records: list[CompletionRecord] = []
-            committed: dict[int, VersionRef] = {}
-            report_products: list[ProductPayload] = []
-            pending_by_session: dict[int, _PendingDigest] = {}
-            resolved_runtime: dict[int, ResolvedRuntimeState] = {}
-            for row, (operation, outcome) in enumerate(
-                zip(batch.operations, outcomes, strict=True)
-            ):
-                self._validate_completion_products(operation, outcome.products)
+        ):
+            self._validate_completion_products(operation, outcome.products)
+            if self.deployment is None or int(self.deployment.tp_rank) == 0:
                 report_products.extend(outcome.products)
-                session = self.sessions.get(operation.request_key.session_id)
-                # The base point and parent semantic come from the fixed parent
-                # directly, or from the session's tracked committed point for a
-                # device-relay successor whose parent carries no host point index.
-                parent_semantic = _parent_semantic(operation, session)
-                placeholder = CompletionRecord(
+            parent_semantic = _parent_semantic(operation, session)
+            placeholder = CompletionRecord(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                completion_slot_generation=scope.completion.generation,
+                status=outcome.status,
+                selected_point=cast(int, outcome.selected_point),
+                logical_lengths=outcome.logical_lengths,
+                token_span=outcome.token_span,
+                committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
+                finish_flags=outcome.finish_flags,
+                product_generations=outcome.product_generations,
+                semantic_digest="0" * 64,
+                error_code=None,
+                timing_counters=TimingCounters(),
+            )
+            pending = _PendingDigest(
+                placeholder,
+                parent_semantic,
+                operation.plan_digest,
+                scope.completion,
+                row,
+                partial(self._finalize_predicated_runtime, operation),
+                (
+                    partial(self._finalize_speculative_runtime, operation, outcome.selection)
+                    if outcome.selection is not None
+                    else None
+                ),
+                completion_tasks=outcome.completion_tasks,
+            )
+            records.append(replace(placeholder, semantic_digest=cast(str, pending)))
+            if operation.advances_state:
+                committed[operation.request_key.session_id] = VersionRef(
                     request_key=operation.request_key,
-                    op_id=operation.op_id,
-                    completion_slot_generation=completion.generation,
-                    status=outcome.status,
-                    selected_point=cast(int, outcome.selected_point),
-                    logical_lengths=outcome.logical_lengths,
-                    token_span=outcome.token_span,
-                    committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
-                    finish_flags=outcome.finish_flags,
-                    product_generations=outcome.product_generations,
-                    semantic_digest="0" * 64,
-                    error_code=None,
-                    timing_counters=TimingCounters(),
+                    producer_op_id=operation.op_id,
+                    point=FixedPoint(cast(int, outcome.selected_point), cast(str, pending)),
                 )
-                # The digest includes ``committed_tokens`` and is therefore
-                # finalized from the pinned completion row after query-only
-                # readiness, either opportunistically here or in the progress
-                # loop before response serialization.
-                pending = _PendingDigest(
+                pending_by_session[operation.request_key.session_id] = pending
+                extents = entry.extents()
+                resolved_runtime[operation.request_key.session_id] = ResolvedRuntimeState(
+                    logical_position=session.logical_position,
+                    rng_counter=session.rng_counter,
+                    latent_product=session.latent_product,
+                    flow_step=session.flow_step,
+                    kv_reserved_len=extents.reserved,
+                    kv_initialized_len=extents.initialized,
+                    kv_visible_len=outcome.logical_lengths.kv_visible_len,
+                    kv_committed_len=extents.committed,
+                    kv_published_len=extents.published,
+                )
+            else:
+                committed[operation.request_key.session_id] = operation.parent
+        partition_report = PartitionCompletion(
+            partition_id=partition.partition_id,
+            completions=tuple(records),
+            products=tuple(report_products),
+            registration=RegistrationAck(visible=True),
+            worker_exec_us=(time.perf_counter_ns() - scope.started_ns) // 1000,
+            forward_stats=_forward_stats(scope.observations, scope.component_us),
+        )
+        report = CompletionReport(step_id=step_id, partitions=(partition_report,))
+        self.replay.commit_atomic(
+            operations,
+            report,
+            lambda publish: scope.transaction.commit(
+                committed,
+                resolved_runtime,
+                publish=publish,
+            ),
+        )
+        for identity, locators in scope.stage_publications.items():
+            existing = self._transport_publications.get(identity)
+            if existing is not None and existing != locators:
+                raise RuntimeError("committed transport publication identity was reused")
+            self._transport_publications[identity] = locators
+        for session_id, pending in pending_by_session.items():
+            if pending.ready():
+                self.sessions.get(session_id).resolved_digest = pending.resolve()
+        return partition_report
+
+    def _rollback_partition(
+        self,
+        scope: _ExecutionScope,
+        error: BaseException | None = None,
+    ) -> None:
+        self._finish_device_reads(scope)
+        for reservation in scope.cpu_tasks.values():
+            reservation.abandon()
+        scope.transaction.rollback()
+        scope.completion.abandon()
+        self.products.device_products.abandon_writes(tuple(scope.device_writes))
+        self._release_locators(scope.published)
+        self.trace.emit(
+            ExecutionPhase.ROLLBACK,
+            _trace_envelopes(scope.partition.operations),
+            error=error,
+        )
+
+    def _reserve_cpu_tasks(
+        self,
+        operations: tuple[Operation, ...],
+        scope: _ExecutionScope,
+    ) -> None:
+        for operation in operations:
+            if operation.work.variant is not WorkVariant.MATERIALIZE:
+                continue
+            identity = _operation_identity(operation)
+            if identity in scope.cpu_tasks:
+                raise invalid_descriptor("materialization repeats its CPU task identity")
+            scope.cpu_tasks[identity] = self._cpu_tasks.reserve()
+
+    def _registration_error_partition(
+        self,
+        step_id: int,
+        partition: BatchPartition,
+        error: WorkerError,
+        started: int,
+    ) -> PartitionCompletion:
+        generation = 1
+        report = self._build_error_partition(
+            partition,
+            generation,
+            False,
+            error,
+            started,
+            WorkerForwardStats(),
+        )
+        self.replay.commit_atomic(
+            partition.operations,
+            CompletionReport(step_id=step_id, partitions=(report,)),
+            lambda publish: publish(),
+        )
+        return report
+
+    def _error_partition(
+        self,
+        step_id: int,
+        scope: _ExecutionScope,
+        error: WorkerError,
+        started: int,
+    ) -> PartitionCompletion:
+        report = self._build_error_partition(
+            scope.partition,
+            scope.completion.generation,
+            scope.registration_visible,
+            error,
+            scope.started_ns,
+            _forward_stats(scope.observations, scope.component_us),
+        )
+        self.replay.commit_atomic(
+            scope.partition.operations,
+            CompletionReport(step_id=step_id, partitions=(report,)),
+            lambda publish: publish(),
+        )
+        return report
+
+    def _build_error_partition(
+        self,
+        partition: BatchPartition,
+        generation: int,
+        registration_visible: bool,
+        error: WorkerError,
+        started: int,
+        forward_stats: WorkerForwardStats,
+    ) -> PartitionCompletion:
+        protocol_code = _protocol_error_code(error.code)
+        records: list[CompletionRecord] = []
+        for operation in partition.operations:
+            session = self.sessions.peek(operation.request_key.session_id)
+            point = operation.parent.point
+            selected_point = (
+                point.point_index
+                if isinstance(point, FixedPoint)
+                else 0
+                if session is None
+                else session.version
+            )
+            parent_semantic = (
+                point.semantic_digest
+                if isinstance(point, FixedPoint)
+                else "0" * 64
+                if session is None
+                else session.resolved_digest
+            )
+            lengths = LogicalLengths()
+            if session is not None:
+                entry = self.kv.get(operation.request_key.session_id)
+                extents = entry.extents()
+                lengths = LogicalLengths(
+                    token_len=session.logical_position,
+                    kv_visible_len=extents.visible,
+                    latent_len=session.flow_step,
+                    kv_reserved_len=extents.reserved,
+                    kv_initialized_len=extents.initialized,
+                    kv_committed_len=extents.committed,
+                    kv_published_len=extents.published,
+                )
+            placeholder = CompletionRecord(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                completion_slot_generation=max(1, generation),
+                status=OpStatus.ERROR,
+                selected_point=selected_point,
+                logical_lengths=lengths,
+                token_span=TokenSpan(base=lengths.token_len, len=0),
+                committed_tokens=(),
+                finish_flags=FinishFlags(),
+                product_generations=(),
+                semantic_digest="0" * 64,
+                error_code=protocol_code,
+                timing_counters=TimingCounters(),
+            )
+            records.append(
+                replace(
                     placeholder,
-                    parent_semantic,
-                    operation.plan_digest,
-                    completion,
-                    row,
-                    partial(self._finalize_predicated_runtime, operation),
-                    (
-                        partial(
-                            self._finalize_speculative_runtime,
-                            operation,
-                            outcome.selection,
-                        )
-                        if outcome.selection is not None
-                        else None
+                    semantic_digest=placeholder.compute_semantic_digest(
+                        parent_semantic,
+                        operation.plan_digest,
                     ),
                 )
-                record = replace(placeholder, semantic_digest=cast(str, pending))
-                records.append(record)
-                if operation.advances_state:
-                    committed[operation.request_key.session_id] = VersionRef(
-                        request_key=operation.request_key,
-                        producer_op_id=operation.op_id,
-                        point=FixedPoint(cast(int, outcome.selected_point), cast(str, pending)),
-                    )
-                    pending_by_session[operation.request_key.session_id] = pending
-                    extents = self.kv.get(operation.request_key.session_id).extents()
-                    resolved_runtime[operation.request_key.session_id] = ResolvedRuntimeState(
-                        logical_position=session.logical_position,
-                        rng_counter=session.rng_counter,
-                        kv_reserved_len=extents.reserved,
-                        kv_initialized_len=extents.initialized,
-                        kv_visible_len=outcome.logical_lengths.kv_visible_len,
-                        kv_committed_len=extents.committed,
-                        kv_published_len=extents.published,
-                    )
-                else:
-                    committed[operation.request_key.session_id] = operation.parent
-            report = CompletionReport(
-                step_id=batch.step_id,
-                completions=tuple(records),
-                products=tuple(report_products),
-                registration=RegistrationAck(visible=True),
-                worker_exec_us=(time.perf_counter_ns() - started) // 1000,
             )
-            self.replay.commit_atomic(
-                batch.operations,
-                report,
-                lambda publish: transaction.commit(
-                    committed,
-                    resolved_runtime,
-                    publish=publish,
-                ),
-            )
-            self._apply_release_controls(batch)
-            # Finalize every row already detected ready. Other rows remain owned
-            # by their completion generations and are revisited by the progress
-            # loop without blocking execution or unrelated response dispatch.
-            for session_id, pending in pending_by_session.items():
-                if pending.ready():
-                    self.sessions.get(session_id).resolved_digest = pending.resolve()
-            report = finalize_completion_report(report)
-            self.trace.emit(
-                ExecutionPhase.COMMIT,
-                operations,
-                duration_us=(time.perf_counter_ns() - started) // 1000,
-            )
-            return report
-        except BaseException as error:
-            self._finish_device_reads(scope)
-            transaction.rollback()
-            completion.abandon()
-            self.products.device_products.abandon_writes(tuple(scope.device_writes))
-            self._release_locators(scope.published)
-            self.trace.emit(
-                ExecutionPhase.ROLLBACK,
-                operations,
-                duration_us=(time.perf_counter_ns() - started) // 1000,
-                error=error,
-            )
-            raise
+        return PartitionCompletion(
+            partition_id=partition.partition_id,
+            completions=tuple(records),
+            registration=RegistrationAck(visible=registration_visible),
+            worker_exec_us=(time.perf_counter_ns() - started) // 1000,
+            forward_stats=forward_stats,
+        )
 
     def _finalize_predicated_runtime(
         self,
@@ -1579,6 +2445,8 @@ class ModelExecutor:
             runtime = ResolvedRuntimeState(
                 logical_position=selection.base_logical_position + point_index,
                 rng_counter=selection.base_rng_counter + point_index,
+                latent_product=self.sessions.get(operation.request_key.session_id).latent_product,
+                flow_step=self.sessions.get(operation.request_key.session_id).flow_step,
                 kv_reserved_len=extents.reserved,
                 kv_initialized_len=extents.initialized,
                 kv_visible_len=selection.base_kv_visible + point_index,
@@ -1613,9 +2481,63 @@ class ModelExecutor:
         ):
             raise invalid_descriptor("execution batch exceeds the deployment operation limit")
         for operation in batch.operations:
-            operation_type = work_operation_type(operation.work)
-            if operation_type not in self.allowed_operation_types:
-                raise unsupported_operation(operation_type.value, operation.request_key.session_id)
+            selected_type = operation_type(operation)
+            if selected_type not in self.allowed_operation_types:
+                raise unsupported_operation(selected_type.value, operation.request_key.session_id)
+        groups: dict[int, list[BatchPartition]] = defaultdict(list)
+        for partition in batch.partitions:
+            groups[partition.submission_group].append(partition)
+        for partitions in groups.values():
+            first = partitions[0]
+            if first.execution is not ExecutionCapability.TENSORIZED_MIXED:
+                continue
+            if self.spec is None:
+                raise invalid_descriptor("tensorized mixed submission has no declared model route")
+            primary_stages = tuple(
+                self._primary_stage(operation_type(operation))
+                for partition in partitions
+                for operation in partition.operations
+            )
+            model_routes = {stage.route for stage in primary_stages}
+            if len(model_routes) != 1:
+                raise invalid_descriptor(
+                    "tensorized mixed submission spans distinct model runner routes"
+                )
+            route = self._routes[next(iter(model_routes))]
+            row_kinds = frozenset(stage.row for stage in primary_stages)
+            if not any(
+                row_kinds <= frozenset(combination) for combination in route.mixed_combinations
+            ):
+                raise invalid_descriptor(
+                    "tensorized mixed submission is outside the route capability proof"
+                )
+        group_identities: list[tuple[int, str]] = []
+        for submission_group, partitions in groups.items():
+            collective_seq = partitions[0].collective_seq
+            identity = hashlib.sha256()
+            identity.update(int(submission_group).to_bytes(4, "little"))
+            identity.update(int(collective_seq).to_bytes(8, "little"))
+            for partition in sorted(partitions, key=lambda value: value.partition_id):
+                identity.update(int(partition.partition_id).to_bytes(4, "little"))
+                identity.update(int(partition.route).to_bytes(4, "little"))
+                identity.update(partition.domain.value.encode("ascii"))
+                identity.update(partition.execution.value.encode("ascii"))
+                for operation in partition.operations:
+                    identity.update(operation.plan_digest.encode("ascii"))
+            group_identities.append((int(collective_seq), identity.hexdigest()))
+        for collective_seq, identity in sorted(group_identities):
+            existing = self._collective_history.get(collective_seq)
+            if existing is not None:
+                if existing != identity:
+                    raise invalid_descriptor("collective sequence was reused with different work")
+                continue
+            if self._collective_history and collective_seq <= next(
+                reversed(self._collective_history)
+            ):
+                raise invalid_descriptor("collective sequence does not advance")
+            self._collective_history[collective_seq] = identity
+            while len(self._collective_history) > 4096:
+                self._collective_history.popitem(last=False)
 
     def _completion_devices(self, operations: tuple[Operation, ...]) -> tuple[str, ...]:
         deployment = self.deployment
@@ -1774,10 +2696,23 @@ class ModelExecutor:
                 )
             payload_bound = (
                 product.payload.max_encoded_bytes()
-                if isinstance(product.payload, _CompletionLogprobPayload)
+                if isinstance(
+                    product.payload,
+                    (
+                        _CompletionImagePayload,
+                        _CompletionLogprobPayload,
+                        _CompletionTransferPayload,
+                    ),
+                )
                 else len(product.payload)
             )
-            if payload_bound > int(reference.max_bytes):
+            transferred = isinstance(product.payload, _CompletionTransferPayload)
+            if transferred and reference.storage_class in {
+                StorageClass.HOST_STAGING,
+                StorageClass.COMPLETION_ARENA,
+            }:
+                raise invalid_descriptor("host-visible output cannot carry a transfer entry")
+            if not transferred and payload_bound > int(reference.max_bytes):
                 raise invalid_descriptor(
                     "completion product exceeds its registered product byte bound"
                 )
@@ -1797,16 +2732,19 @@ class ModelExecutor:
             point = operation.parent.point
             if isinstance(point, DevicePoint):
                 selected = point.selected_point
-                if selected.kind is not ProductKind.SELECTED_POINT:
-                    raise invalid_descriptor("device parent does not name a selected-point product")
-                selected_read = self.products.device_products.consume(
-                    selected,
-                    consumer_op_id=operation.op_id,
-                    producer_plan_digest=point.producer_plan_digest,
-                    device=self._operation_device(operation),
-                )
-                scope.device_reads.append(selected_read)
-                scope.selected_point_reads[operation_identity] = selected_read
+                if selected is not None:
+                    if selected.kind is not ProductKind.SELECTED_POINT:
+                        raise invalid_descriptor(
+                            "device parent does not name a selected-point product"
+                        )
+                    selected_read = self.products.device_products.consume(
+                        selected,
+                        consumer_op_id=operation.op_id,
+                        producer_plan_digest=point.producer_plan_digest,
+                        device=self._operation_device(operation),
+                    )
+                    scope.device_reads.append(selected_read)
+                    scope.selected_point_reads[operation_identity] = selected_read
             predicate = operation.predicate
             if predicate is None:
                 continue
@@ -1878,11 +2816,30 @@ class ModelExecutor:
         scope.device_reads.clear()
 
     def _apply_release_controls(self, batch: Batch) -> None:
-        self.products.device_products.release_operations(
+        releases = tuple(
             (control.request_key, control.op_id)
             for control in batch.controls
             if isinstance(control, Release)
         )
+        self.products.device_products.release_operations(releases)
+        self.latents.release_operations(releases)
+        self.kv.release_operations(releases)
+        if self.transport is not None:
+            for identity in releases:
+                self._release_locators(self._transport_publications.pop(identity, ()))
+
+    def drop_session(self, session_id: int) -> None:
+        """Release stage publications owned by one dropped request."""
+
+        if self.transport is None:
+            return
+        selected = tuple(
+            identity
+            for identity in self._transport_publications
+            if int(identity[0].session_id) == int(session_id)
+        )
+        for identity in selected:
+            self._release_locators(self._transport_publications.pop(identity))
 
     def _apply_new_kv_blocks(
         self,
@@ -1902,7 +2859,11 @@ class ModelExecutor:
             if operation.new_kv_blocks:
                 scope.kv.append_kv_blocks(operation.request_key.session_id, operation.new_kv_blocks)
 
-    def _stage_input_products(self, batch: Batch, scope: _ExecutionScope) -> None:
+    def _stage_input_products(
+        self,
+        input_products: Sequence[ProductPayload],
+        scope: _ExecutionScope,
+    ) -> None:
         """Bind host-supplied input product values into the step product store.
 
         The submission batch carries each operation's input values as
@@ -1914,8 +2875,71 @@ class ModelExecutor:
         the ``LogitsProduct.draft_token_ids`` channel the drivers already read.
         """
 
-        for entry in batch.input_products:
+        for entry in input_products:
             product = entry.product
+            if entry.payload.startswith(TRANSFER_DESCRIPTOR_PREFIX):
+                transfer = scope.prepared_transfers.get(product)
+                if transfer is None or not transfer.ready():
+                    raise invalid_descriptor(
+                        "cross-stage input has no query-ready prepared transfer"
+                    )
+                if transfer.kind == "kv":
+                    snapshot = KvSnapshot.from_wire(transfer.descriptor_value["snapshot"])
+                    if self.transport is None:
+                        raise capability_mismatch(
+                            "cross-stage KV input requires a configured transport"
+                        )
+                    scope.kv.import_snapshot(
+                        product.request_key.session_id,
+                        snapshot,
+                        self.transport,
+                        transferred_tensors=transfer.tensors(),
+                    )
+                    scope.kv.stage_publication(product, snapshot)
+                    continue
+                tensors = transfer.tensors()
+                if not tensors:
+                    raise invalid_descriptor("tensor transfer produced no resident value")
+                binding = self.products.device_products.bind_outputs(
+                    (
+                        (
+                            product,
+                            transfer.producer_plan_digest,
+                            self._operation_device(scope.partition.operations[0]),
+                        ),
+                    )
+                )[0]
+                scope.device_writes.append(binding)
+                resident = self.products.device_products.publish_write(binding, tensors[0])
+                payload_kind = str(transfer.descriptor_value["payload_kind"])
+                height = int(transfer.descriptor_value["height"])
+                width = int(transfer.descriptor_value["width"])
+                if payload_kind == ProductKind.VISION_FEATURE.value:
+                    payload: VisionFeatureProduct | LatentFeatureProduct = VisionFeatureProduct(
+                        features=resident,
+                        height=height,
+                        width=width,
+                        source_base64=None,
+                    )
+                elif payload_kind == ProductKind.LATENT_FEATURE.value and len(tensors) == 1:
+                    payload = LatentFeatureProduct(
+                        latent=resident,
+                        height=height,
+                        width=width,
+                        source_base64=None,
+                    )
+                else:
+                    raise invalid_descriptor("tensor transfer payload geometry is invalid")
+                handle = self._input_product_handle(product)
+                scope.product_view.put(
+                    ProductRecord(
+                        handle=handle,
+                        session_id=product.request_key.session_id,
+                        payload=payload,
+                    )
+                )
+                self.sessions.get(product.request_key.session_id).product_handles.add(handle)
+                continue
             if product.kind is ProductKind.SAMPLING_STATE:
                 scope.sampling_states[_reference_operation_identity(product)] = (
                     decode_sampling_state_bytes(entry.payload)
@@ -1946,7 +2970,11 @@ class ModelExecutor:
         if kind == "token":
             return self._sequence_driver(operation, scope)
         if kind == "gen":
-            return self._flow_driver(operation, scope)
+            if operation.work.mode == GenMode.TRANSITION.value:
+                return self._transition_driver(operation, scope)
+            if operation.work.mode == GenMode.FLOW.value:
+                return self._flow_driver(operation, scope)
+            raise invalid_descriptor("generation operation names an unknown mode")
         if kind == "encode":
             return self._encode_driver(operation, scope)
         if kind == "materialize":
@@ -1972,24 +3000,35 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> tuple[_Outcome, ...]:
         build_started = time.perf_counter_ns()
-        sessions: list[RequestSession] = []
         starts: list[int] = []
         tasks: list[_ForwardTask] = []
         current_tokens = self._resolve_decode_tokens(operations, scope)
-        for operation, current in zip(operations, current_tokens, strict=True):
-            session = self.sessions.get(operation.request_key.session_id)
+        layout = scope.layout
+        if layout is None or layout.operations != operations:
+            raise RuntimeError("partition transaction lost its aligned session view")
+        sessions = layout.sessions
+        for operation, session, entry, weights, current in zip(
+            operations,
+            sessions,
+            layout.kv_entries,
+            layout.weights,
+            current_tokens,
+            strict=True,
+        ):
             if session.sampling is None:
                 raise invalid_descriptor("sequence operation has no admitted sampling state")
             start = session.logical_position
-            sessions.append(session)
             starts.append(start)
             tasks.append(
                 self._token_task(
                     operation,
+                    session,
                     (current,),
                     (start,),
                     TokenSelection.LAST_LOGITS,
                     scope,
+                    entry=entry,
+                    weights=weights,
                 )
             )
 
@@ -2025,18 +3064,20 @@ class ModelExecutor:
             device_products=self.products.device_products,
             device_reads=tuple(scope.device_reads),
             device_continuation=scope.device_continuation,
+            selection_broadcast=self._broadcast_tp_selection,
         )
         _record_component(scope, "text_sample", sample_started)
         finalize_started = time.perf_counter_ns()
         self._publish_token_products(operations, samples, scope)
-        self._publish_decode_selection_products(
-            operations,
-            samples,
-            scope,
-        )
         outcomes: list[_Outcome] = []
-        for operation, start, sampled in zip(operations, starts, samples, strict=True):
-            session = self.sessions.get(operation.request_key.session_id)
+        for operation, session, entry, start, sampled in zip(
+            operations,
+            sessions,
+            layout.kv_entries,
+            starts,
+            samples,
+            strict=True,
+        ):
             session.rng_counter += 1
             session.logical_position = start + 1
             # Keep the sampled token deferred: materializing it here (``int()``)
@@ -2047,11 +3088,12 @@ class ModelExecutor:
                 self._token_outcome(
                     operation,
                     scope,
+                    session=session,
+                    kv_entry=entry,
                     base=start,
                     tokens=1,
                     committed_tokens=(sampled.token_id,),
                     sample=sampled,
-                    selection_products_published=True,
                 )
             )
         _record_component(scope, "text_finalize", finalize_started)
@@ -2091,6 +3133,167 @@ class ModelExecutor:
             active = next_active
         return tuple(completed[index] for index in range(len(drivers)))
 
+    def _drive_partitioned(
+        self,
+        drivers: tuple[tuple[int, int, _Driver, _ExecutionScope], ...],
+    ) -> tuple[tuple[_Outcome | None, ...], dict[int, BaseException]]:
+        active: dict[int, tuple[_Driver, tuple[_ExecutorTask, ...], _ExecutionScope]] = {}
+        completed: dict[int, _Outcome] = {}
+        errors: dict[int, BaseException] = {}
+        for index, (_scope_index, _operation_index, driver, scope) in enumerate(drivers):
+            partition_id = scope.partition.partition_id
+            if partition_id in errors:
+                continue
+            try:
+                active[index] = (driver, next(driver), scope)
+            except StopIteration as done:
+                completed[index] = done.value
+            except BaseException as error:
+                errors[partition_id] = error
+                active = {
+                    active_index: value
+                    for active_index, value in active.items()
+                    if value[2].partition.partition_id != partition_id
+                }
+        while active:
+            flat: list[tuple[int, int, _ExecutorTask, _ExecutionScope]] = []
+            for driver_index, (_driver, tasks, scope) in active.items():
+                for task_index, task in enumerate(tasks):
+                    flat.append((driver_index, task_index, task, scope))
+            if not flat:
+                raise RuntimeError("execution driver yielded an empty task wave")
+            outputs, wave_errors = self._run_partitioned_task_wave(
+                tuple((task, scope) for _driver, _task, task, scope in flat)
+            )
+            errors.update(wave_errors)
+            by_driver: dict[int, list[Any | None]] = {
+                index: [None] * len(tasks) for index, (_driver, tasks, _scope) in active.items()
+            }
+            for (driver_index, task_index, _task, _scope), output in zip(
+                flat,
+                outputs,
+                strict=True,
+            ):
+                by_driver[driver_index][task_index] = output
+            next_active: dict[
+                int,
+                tuple[_Driver, tuple[_ExecutorTask, ...], _ExecutionScope],
+            ] = {}
+            for driver_index, (driver, _tasks, scope) in active.items():
+                partition_id = scope.partition.partition_id
+                if partition_id in errors:
+                    continue
+                try:
+                    next_active[driver_index] = (
+                        driver,
+                        driver.send(tuple(by_driver[driver_index])),
+                        scope,
+                    )
+                except StopIteration as done:
+                    completed[driver_index] = done.value
+                except BaseException as error:
+                    errors[partition_id] = error
+                    next_active = {
+                        active_index: value
+                        for active_index, value in next_active.items()
+                        if value[2].partition.partition_id != partition_id
+                    }
+            active = next_active
+        return (
+            tuple(completed.get(index) for index in range(len(drivers))),
+            errors,
+        )
+
+    def _run_partitioned_task_wave(
+        self,
+        tasks: tuple[tuple[_ExecutorTask, _ExecutionScope], ...],
+    ) -> tuple[tuple[Any | None, ...], dict[int, BaseException]]:
+        result: list[Any | None] = [None] * len(tasks)
+        errors: dict[int, BaseException] = {}
+        forward = tuple(
+            (index, task, scope)
+            for index, (task, scope) in enumerate(tasks)
+            if isinstance(task, _ForwardTask)
+        )
+        if forward:
+            indexes = tuple(index for index, _task, _scope in forward)
+            outputs = self._run_partitioned_wave(
+                tuple((cast(_ForwardTask, task), scope) for _index, task, scope in forward)
+            )
+            for index, output in zip(indexes, outputs, strict=True):
+                result[index] = output
+        sampling: dict[int, list[tuple[int, _SampleTask, _ExecutionScope]]] = defaultdict(list)
+        for index, (task, scope) in enumerate(tasks):
+            if isinstance(task, _SampleTask):
+                sampling[scope.partition.partition_id].append((index, task, scope))
+        for candidates in sampling.values():
+            scope = candidates[0][2]
+            try:
+                outputs = _sample_task_batch(
+                    tuple(task for _index, task, _scope in candidates),
+                    scope.completion,
+                    device_products=self.products.device_products,
+                    device_reads=tuple(scope.device_reads),
+                    selection_broadcast=self._broadcast_tp_selection,
+                )
+            except BaseException as error:
+                errors[scope.partition.partition_id] = error
+                continue
+            for (index, _task, _scope), output in zip(candidates, outputs, strict=True):
+                result[index] = output
+        if any(
+            value is None and scope.partition.partition_id not in errors
+            for value, (_task, scope) in zip(result, tasks, strict=True)
+        ):
+            raise RuntimeError("executor task wave contains an unknown task type")
+        return tuple(result), errors
+
+    def _run_partitioned_wave(
+        self,
+        tasks: tuple[tuple[_ForwardTask, _ExecutionScope], ...],
+    ) -> tuple[ForwardRowOutput, ...]:
+        if self.runner is None:
+            raise capability_mismatch("system-only executor received a neural operation")
+        grouped: dict[
+            tuple[object, ...],
+            list[tuple[int, _ForwardTask, _ExecutionScope]],
+        ] = defaultdict(list)
+        for index, (task, scope) in enumerate(tasks):
+            grouped[(scope.partition.submission_group, *self._group_key(task))].append(
+                (index, task, scope)
+            )
+        groups: list[list[tuple[int, _ForwardTask, _ExecutionScope]]] = []
+        for candidates in grouped.values():
+            kinds = frozenset(task.row_kind for _index, task, _scope in candidates)
+            route = candidates[0][1].route
+            legal_mixed = any(
+                kinds <= frozenset(combination) for combination in route.mixed_combinations
+            )
+            if len(kinds) > 1 and not legal_mixed:
+                raise invalid_descriptor(
+                    "tensorized mixed submission is outside the model runner capability"
+                )
+            groups.append(candidates)
+
+        result: list[ForwardRowOutput | None] = [None] * len(tasks)
+        for group in groups:
+            indexes = tuple(index for index, _task, _scope in group)
+            group_tasks = tuple(task for _index, task, _scope in group)
+            group_scopes = tuple(scope for _index, _task, scope in group)
+            target = torch.device(self._route_device(group_tasks[0].route))
+            for scope in _unique_scopes(group_scopes):
+                scope.completion.register_device(target)
+            plan = self._forward_plan(group_tasks, group_scopes[0])
+            output = self.runner.run(plan)
+            observation = self.runner.last_observation
+            if observation is None:
+                raise RuntimeError("model runner returned without an execution observation")
+            for scope in _unique_scopes(group_scopes):
+                scope.observations.append(observation)
+            for index, row_output in zip(indexes, output.rows, strict=True):
+                result[index] = row_output
+        return tuple(cast(ForwardRowOutput, value) for value in result)
+
     def _run_task_wave(
         self,
         tasks: tuple[_ExecutorTask, ...],
@@ -2120,6 +3323,7 @@ class ModelExecutor:
                     scope.completion,
                     device_products=self.products.device_products,
                     device_reads=tuple(scope.device_reads),
+                    selection_broadcast=self._broadcast_tp_selection,
                 ),
                 strict=True,
             ):
@@ -2166,16 +3370,22 @@ class ModelExecutor:
                 result[index] = row_output
         return tuple(cast(ForwardRowOutput, value) for value in result)
 
+    def _broadcast_tp_selection(self, value: torch.Tensor) -> torch.Tensor:
+        if self.mesh is None or self.mesh.mesh.tp_size <= 1:
+            return value
+        transport = self.mesh.mesh.transport("tp")
+        if not isinstance(transport, BroadcastTransport):
+            raise RuntimeError("designated-rank sampling requires TP broadcast transport")
+        return transport.broadcast(value, src=0)
+
     def _group_key(self, task: _ForwardTask) -> tuple[object, ...]:
-        session = self.sessions.get(task.operation.request_key.session_id)
-        weights = self._weights(session)
         return (
             task.route.name,
             self._route_device(task.route),
             task.route.dtype,
             task.route.topology_axes,
-            weights.digest,
-            weights.version,
+            task.weights.digest,
+            task.weights.version,
             self._hard_shape_key(task.route, task.row),
         )
 
@@ -2188,16 +3398,10 @@ class ModelExecutor:
         device = self._route_device(route)
         target = torch.device(device)
         scope.completion.register_device(target)
-        weights = self._weights(self.sessions.get(tasks[0].operation.request_key.session_id))
-        if any(
-            self._weights(self.sessions.get(task.operation.request_key.session_id)) is not weights
-            for task in tasks
-        ):
+        weights = tasks[0].weights
+        if any(task.weights is not weights for task in tasks):
             if any(
-                self._weights(self.sessions.get(task.operation.request_key.session_id)).digest
-                != weights.digest
-                or self._weights(self.sessions.get(task.operation.request_key.session_id)).version
-                != weights.version
+                task.weights.digest != weights.digest or task.weights.version != weights.version
                 for task in tasks
             ):
                 raise RuntimeError("forward group contains different immutable weight sets")
@@ -2300,15 +3504,15 @@ class ModelExecutor:
         pure_token_decode = all(
             isinstance(task.row, TokenRow) and task.query_tokens == 1 for task in tasks
         )
-        image_capable = any(
-            self.sessions.get(task.operation.request_key.session_id).image is not None
-            for task in tasks
-        )
-        if RouteRowKind.FLOW in route.row_kinds and (not pure_token_decode or image_capable):
+        if RouteRowKind.FLOW in route.row_kinds and not pure_token_decode:
             return self._packed_attention_plan(tasks, scope, device, staging_slot)
-        sessions = tuple(task.operation.request_key.session_id for task in tasks)
         query_lens = tuple(task.query_tokens for task in tasks)
-        view = scope.kv.view(sessions, query_lens=query_lens)
+        if any(task.entry is None for task in tasks):
+            raise RuntimeError("paged attention task has no aligned KV entry")
+        view = scope.kv.view_entries(
+            tuple(cast(KvEntry, task.entry) for task in tasks),
+            query_lens=query_lens,
+        )
         block_table = view.block_table(device, slot=staging_slot)
         cache_seqlens = view.cache_seqlens(device, slot=staging_slot)
         kv_lens = tuple(
@@ -2606,6 +3810,7 @@ class ModelExecutor:
         scores_prompt = bool(sampling.return_prompt_logprobs or int(sampling.n_prompt_logprobs) > 0)
         task = self._token_task(
             operation,
+            session,
             tokens,
             tuple(range(start, start + len(tokens))),
             TokenSelection.ALL_LOGITS if scores_prompt else TokenSelection.LAST_LOGITS,
@@ -2776,7 +3981,6 @@ class ModelExecutor:
                 width=payload.width,
                 conditioning_position=position,
                 features=read.tensor,
-                grid=payload.grid,
                 sample_token=samples_continuation,
                 close_image=closes_feedback,
                 retain_image=True,
@@ -2816,6 +4020,7 @@ class ModelExecutor:
         start = session.logical_position
         task = self._token_task(
             operation,
+            session,
             (current,),
             (start,),
             TokenSelection.LAST_LOGITS,
@@ -2867,6 +4072,7 @@ class ModelExecutor:
         tokens: tuple[int | torch.Tensor, ...] = (current, *draft)
         task = self._token_task(
             operation,
+            session,
             tokens,
             tuple(range(start, start + len(tokens))),
             TokenSelection.ALL_LOGITS,
@@ -2920,15 +4126,19 @@ class ModelExecutor:
         operation: Operation,
         scope: _ExecutionScope,
         *,
+        session: RequestSession | None = None,
+        kv_entry: KvEntry | None = None,
         base: int,
         tokens: int | _CompletionDerivedInteger | _CompletionSpeculativePoint,
         committed_tokens: tuple[int | _CompletionToken, ...],
         sample: _SampleResult | None = None,
         selection: _SpeculativeSelection | None = None,
-        selection_products_published: bool = False,
     ) -> _Outcome:
-        session = self.sessions.get(operation.request_key.session_id)
-        extents = self.kv.get(operation.request_key.session_id).extents()
+        if session is None:
+            session = self.sessions.get(operation.request_key.session_id)
+        extents = (
+            self.kv.get(operation.request_key.session_id) if kv_entry is None else kv_entry
+        ).extents()
         visible = (
             extents.visible
             if selection is None
@@ -2945,7 +4155,7 @@ class ModelExecutor:
                 selection.base_logical_position,
             )
         )
-        if sample is not None and not selection_products_published:
+        if sample is not None and selection is not None:
             self._publish_selection_products(
                 operation,
                 sample,
@@ -2976,12 +4186,16 @@ class ModelExecutor:
     def _token_task(
         self,
         operation: Operation,
+        session: RequestSession,
         token_ids: tuple[int | torch.Tensor, ...],
         positions: tuple[int, ...],
         selection: TokenSelection,
         scope: _ExecutionScope,
+        *,
+        entry: KvEntry | None = None,
+        weights: WeightSet | None = None,
     ) -> _ForwardTask:
-        stage = self._primary_stage(work_operation_type(operation.work))
+        stage = self._primary_stage(operation_type(operation))
         if stage.row is not RouteRowKind.TOKEN:
             raise invalid_descriptor("sequence operation primary stage is not a token row")
         if len(token_ids) != len(positions) or not token_ids:
@@ -3003,10 +4217,12 @@ class ModelExecutor:
         )
         return _ForwardTask(
             operation=operation,
+            session=session,
+            weights=self._weights(session) if weights is None else weights,
             stage=stage,
             route=self._route(stage),
             row=row,
-            entry=self.kv.get(operation.request_key.session_id),
+            entry=self.kv.get(operation.request_key.session_id) if entry is None else entry,
             write_kv=True,
             causal=True,
             base_point=int(positions[0]),
@@ -3202,53 +4418,6 @@ class ModelExecutor:
             _tagged_token_values(packed, packed_flags),
         )
 
-    def _publish_decode_selection_products(
-        self,
-        operations: tuple[Operation, ...],
-        samples: tuple[_SampleResult, ...],
-        scope: _ExecutionScope,
-    ) -> None:
-        if len(operations) != len(samples):
-            raise RuntimeError("decode selection publication rows do not align")
-        selected_writes: list[DeviceProductWrite] = []
-        device_tokens: list[torch.Tensor] = []
-        for operation, sample in zip(operations, samples, strict=True):
-            if int(operation.bounds.max_points) != 1:
-                raise RuntimeError("decode selection publication requires one selected point")
-            if sample.device_token is None:
-                raise RuntimeError("device selection products require a device token")
-            operation_identity = _operation_identity(operation)
-            selected_write = scope.selected_point_writes.get(operation_identity)
-            if selected_write is None:
-                raise invalid_descriptor("token operation is missing its selected-point product")
-            selected_writes.append(selected_write)
-            device_tokens.append(sample.device_token)
-
-        device_names = {str(device_token.device) for device_token in device_tokens}
-        if len(device_names) > 1:
-            for device_name in sorted(device_names):
-                indexes = tuple(
-                    index
-                    for index, device_token in enumerate(device_tokens)
-                    if str(device_token.device) == device_name
-                )
-                self._publish_decode_selection_products(
-                    tuple(operations[index] for index in indexes),
-                    tuple(samples[index] for index in indexes),
-                    scope,
-                )
-            return
-
-        selected_points = torch.ones(
-            len(device_tokens),
-            dtype=torch.long,
-            device=device_tokens[0].device,
-        )
-        self.products.device_products.publish_writes(
-            tuple(selected_writes),
-            selected_points,
-        )
-
     def _publish_selection_products(
         self,
         operation: Operation,
@@ -3333,8 +4502,7 @@ class ModelExecutor:
         draft_token_ids: tuple[int, ...] = (),
     ) -> _SampleTask:
         sampling = _require_sampling(session)
-        operation_identity = _operation_identity(operation)
-        state = scope.sampling_states.get(operation_identity, SamplingState())
+        state = scope.sampling_states.get(_operation_identity(operation), SamplingState())
         allowed_token_ids = (
             state.allowed_token_ids
             if state.allowed_token_ids is not None
@@ -3353,9 +4521,6 @@ class ModelExecutor:
                     }
                 )
             )
-        rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
-        if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
-            raise invalid_descriptor("sampling task positions do not align with its logits")
         rng = operation.rng
         if float(sampling.temperature) > 0.0:
             if rng is None or rng.draw_layout is not DrawLayout.TARGET_SAMPLING:
@@ -3399,10 +4564,14 @@ class ModelExecutor:
                 )
             )
         descriptor_rows = tuple(descriptors)
-        plain_greedy = not draft_token_ids and all(
-            _plain_greedy_row(row) for row in descriptor_rows
+        operation_identity = _operation_identity(operation)
+        rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
+        if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
+            raise invalid_descriptor("sampling task positions do not align with its logits")
+        device_greedy = not draft_token_ids and all(
+            _device_greedy_row(row) for row in descriptor_rows
         )
-        if plain_greedy:
+        if device_greedy:
             draws = None
             penalty_token_ids = None
             penalty_counts = None
@@ -3421,7 +4590,7 @@ class ModelExecutor:
         finish_product = scope.finish_writes.get(operation_identity)
         continuation_product = scope.continuation_writes.get(operation_identity)
         predicate_value = scope.predicate_values.get(operation_identity)
-        finish_set = set(finish_token_ids)
+        finish_set = set(descriptor_rows[0].finish_token_ids)
         terminal_draft_prefix = next(
             (index + 1 for index, token_id in enumerate(draft_token_ids) if token_id in finish_set),
             None,
@@ -3443,6 +4612,82 @@ class ModelExecutor:
             tagged_predicate=False if predicate_value is None else predicate_value[1],
         )
 
+    def _transition_driver(
+        self,
+        operation: Operation,
+        scope: _ExecutionScope,
+    ) -> _Driver:
+        if False:  # pragma: no cover - keeps the driver protocol uniform
+            yield ()
+        spec = cast(ModelSpec, self.spec)
+        if spec.flow is None:
+            raise invalid_descriptor("generation transition requires a declared FlowSpec")
+        session_id = operation.request_key.session_id
+        conditioning = tuple(
+            reference for reference in operation.inputs if reference.kind is ProductKind.KV
+        )
+        latent_outputs = tuple(
+            reference for reference in operation.outputs if reference.kind is ProductKind.LATENT
+        )
+        if len(conditioning) != 1 or len(latent_outputs) != 1:
+            raise invalid_descriptor(
+                "generation transition requires one exact conditioning input and latent output"
+            )
+        self.kv.validate_conditioning(session_id, conditioning[0])
+        session = self.sessions.get(session_id)
+        image = session.image
+        if image is None:
+            raise invalid_descriptor("generation transition has no admitted image parameters")
+        if session.latent_product is not None or session.flow_step != 0:
+            raise invalid_descriptor("generation transition repeats an active latent trajectory")
+        rng = operation.rng
+        if rng is None or rng.draw_layout is not DrawLayout.FLOW_NOISE:
+            raise invalid_descriptor(
+                "generation transition requires semantic flow-noise RNG coordinates"
+            )
+        if int(rng.seed) != int(image.seed or 0):
+            raise invalid_descriptor(
+                "generation transition seed disagrees with admitted image seed"
+            )
+        if int(rng.semantic_index_base) < 1:
+            raise invalid_descriptor("flow-noise semantic image index must be positive")
+        output = latent_outputs[0]
+        if int(output.generation) < 1:
+            raise invalid_descriptor("generation transition latent has no logical generation")
+        initial = self._initial_latent(operation, image.height, image.width, session)
+        write = _bound_device_write(scope, output)
+        resident = self.products.device_products.publish_write(write, initial)
+        scope.operation_writes[_operation_identity(operation)] = write
+        scope.latents.write(
+            LatentRecord(
+                reference=output,
+                producer_plan_digest=operation.plan_digest,
+                value=resident,
+                step=0,
+                height=image.height,
+                width=image.width,
+            )
+        )
+        session.latent_product = output
+        length = self.kv.get(session_id).length
+        extents = self.kv.get(session_id).extents()
+        return _Outcome(
+            status=OpStatus.OK,
+            selected_point=1,
+            logical_lengths=LogicalLengths(
+                token_len=session.logical_position,
+                kv_visible_len=length,
+                latent_len=0,
+                kv_reserved_len=extents.reserved,
+                kv_initialized_len=extents.initialized,
+                kv_committed_len=extents.committed,
+                kv_published_len=extents.published,
+            ),
+            token_span=TokenSpan(base=session.logical_position, len=0),
+            finish_flags=FinishFlags(),
+            product_generations=_output_generations(operation),
+        )
+
     def _flow_driver(
         self,
         operation: Operation,
@@ -3456,48 +4701,54 @@ class ModelExecutor:
         conditioning = tuple(
             reference for reference in operation.inputs if reference.kind is ProductKind.KV
         )
-        if len(conditioning) != 1:
-            raise invalid_descriptor("flow operation requires one exact KV publication")
+        latent_inputs = tuple(
+            reference for reference in operation.inputs if reference.kind is ProductKind.LATENT
+        )
+        latent_outputs = tuple(
+            reference for reference in operation.outputs if reference.kind is ProductKind.LATENT
+        )
+        if len(conditioning) != 1 or len(latent_inputs) != 1 or len(latent_outputs) != 1:
+            raise invalid_descriptor(
+                "flow operation requires exact conditioning and one latent input/output generation"
+            )
         self.kv.validate_conditioning(session_id, conditioning[0])
         session = self.sessions.get(session_id)
         image = session.image
         if image is None:
             raise invalid_descriptor("flow operation has no admitted image parameters")
-        rng = operation.rng
-        if rng is None or rng.draw_layout is not DrawLayout.FLOW_NOISE:
-            raise invalid_descriptor("flow operation requires semantic flow-noise RNG coordinates")
-        if int(rng.seed) != int(image.seed or 0):
-            raise invalid_descriptor("operation flow-noise seed disagrees with admitted image seed")
-        if int(rng.semantic_index_base) < 1:
-            raise invalid_descriptor("flow-noise semantic image index must be positive")
-        latent_handle = _stable_handle(session_id, operation.request_key.epoch, 0, "latent")
+        if operation.rng is not None:
+            raise invalid_descriptor("flow continuation must inherit transition RNG state")
+        latent_input = latent_inputs[0]
+        latent_output = latent_outputs[0]
+        if (
+            int(latent_input.generation) < 1
+            or int(latent_output.generation) < 1
+            or latent_input == latent_output
+        ):
+            raise invalid_descriptor("flow latent generations are invalid")
+        if session.latent_product != latent_input:
+            raise invalid_descriptor("flow operation does not name the current latent generation")
+        latent_read = self.products.device_products.consume(
+            latent_input,
+            consumer_op_id=operation.op_id,
+            device=self._operation_device(operation),
+        )
+        scope.device_reads.append(latent_read)
         start_step = session.flow_step
         remaining = int(image.steps) - start_step
         step_count = (
             remaining
-            if operation.bounds.max_points <= 0
-            else min(int(operation.bounds.max_points), remaining)
+            if operation.bounds.max_tokens <= 0
+            else min(int(operation.bounds.max_tokens), remaining)
         )
         if step_count < 0 or start_step + step_count > image.steps:
             raise invalid_descriptor("flow operation exceeds the declared schedule")
         conditioning_position = session.logical_position
         image_prompt = image.image_prompts[0] if image.image_prompts else ""
-        record = scope.latents.read(latent_handle)
+        record = scope.latents.read(latent_input)
         if record is None:
-            if start_step != 0:
-                raise invalid_descriptor("flow continuation references a missing latent")
-            value = self._initial_latent(operation, image.height, image.width, session)
-            record = LatentRecord(
-                handle=latent_handle,
-                session_id=session_id,
-                value=value,
-                step=0,
-                height=image.height,
-                width=image.width,
-            )
-            scope.latents.write(record)
-            session.latent_handle = latent_handle
-        if record.session_id != session_id:
+            raise invalid_descriptor("flow continuation references a missing latent generation")
+        if record.reference.request_key.session_id != session_id:
             raise invalid_descriptor("flow latent belongs to another session")
         if record.step != start_step or session.flow_step != start_step:
             raise invalid_descriptor("flow operation start step does not match committed state")
@@ -3510,16 +4761,15 @@ class ModelExecutor:
             direction=ScheduleDirection(flow.schedule_direction),
             shift_domain=ScheduleShiftDomain(flow.schedule_shift_domain),
         )
-        current = record.value
+        current = latent_read.tensor
         for step in range(start_step, start_step + step_count):
             t, t_next = schedule.pair(
                 step,
                 device=current.device,
                 dtype=torch.float32,
             )
-            use_cfg = (
-                float(image.cfg_interval[0]) <= float(t.item()) <= float(image.cfg_interval[1])
-            )
+            host_t = schedule.scalar(step)
+            use_cfg = float(image.cfg_interval[0]) <= host_t <= float(image.cfg_interval[1])
             guide = build_flow_cfg_plan(
                 cfg_text_scale=float(image.cfg_text_scale),
                 cfg_img_scale=float(image.cfg_img_scale),
@@ -3542,8 +4792,7 @@ class ModelExecutor:
                 )
                 query = self._flow_physical_tokens(record.height, record.width)
                 entry, created = scope.kv.scratch_entry(
-                    session_id,
-                    latent_handle,
+                    latent_input,
                     branch.value,
                     capacity_tokens=(
                         self.kv.get(session_id).length if copy_conditioning else len(prefix)
@@ -3597,8 +4846,19 @@ class ModelExecutor:
             updated = euler_step(neural_current, velocity, t, t_next)
             current = self._flow_store_latent(updated, record.height, record.width)
             record = replace(record, value=current, step=step + 1)
-            scope.latents.write(record)
             session.flow_step = step + 1
+        write = _bound_device_write(scope, latent_output)
+        resident = self.products.device_products.publish_write(write, current)
+        scope.operation_writes[_operation_identity(operation)] = write
+        scope.latents.write(
+            replace(
+                record,
+                reference=latent_output,
+                producer_plan_digest=operation.plan_digest,
+                value=resident,
+            )
+        )
+        session.latent_product = latent_output
         length = self.kv.get(session_id).length
         extents = self.kv.get(session_id).extents()
         return _Outcome(
@@ -3726,6 +4986,7 @@ class ModelExecutor:
         branch: Branch,
         scope: _ExecutionScope,
     ) -> _ForwardTask:
+        session = self.sessions.get(operation.request_key.session_id)
         primary = self._primary_stage(OperationType.FLOW)
         route = self._route(primary)
         if RouteRowKind.TOKEN not in route.row_kinds:
@@ -3742,6 +5003,8 @@ class ModelExecutor:
         )
         return _ForwardTask(
             operation=operation,
+            session=session,
+            weights=self._weights(session),
             stage=stage,
             route=route,
             row=row,
@@ -3766,6 +5029,7 @@ class ModelExecutor:
         width: int,
         scope: _ExecutionScope,
     ) -> _ForwardTask:
+        session = self.sessions.get(operation.request_key.session_id)
         flow = cast(ModelSpec, self.spec).flow
         assert flow is not None
         stage = self._primary_stage(OperationType.FLOW)
@@ -3817,6 +5081,8 @@ class ModelExecutor:
         )
         return _ForwardTask(
             operation=operation,
+            session=session,
+            weights=self._weights(session),
             stage=stage,
             route=self._route(stage),
             row=row,
@@ -3963,6 +5229,7 @@ class ModelExecutor:
         operation: Operation,
         *,
         products: tuple[ProductPayload, ...] = (),
+        completion_tasks: tuple[_CompletionImagePayload, ...] = (),
     ) -> _Outcome:
         session = self.sessions.get(operation.request_key.session_id)
         extents = self.kv.get(operation.request_key.session_id).extents()
@@ -3982,6 +5249,7 @@ class ModelExecutor:
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
             products=products,
+            completion_tasks=completion_tasks,
         )
 
     def _encode_driver(
@@ -3993,7 +5261,7 @@ class ModelExecutor:
         image_spec = spec.inputs.images
         if image_spec is None:
             raise invalid_descriptor("encode operation requires declared image transforms")
-        operation_type = work_operation_type(operation.work)
+        selected_type = operation_type(operation)
         mode = EncodeMode(cast(str, operation.work.mode))
         session_id = operation.request_key.session_id
         feature_outputs = tuple(
@@ -4010,7 +5278,7 @@ class ModelExecutor:
             raise invalid_descriptor("encode feature output requires a positive generation")
         payload: VisionFeatureProduct | LatentFeatureProduct
         source = self._encode_source(operation, scope)
-        stage = self._primary_stage(operation_type)
+        stage = self._primary_stage(selected_type)
         if stage.row is not RouteRowKind.ENCODE:
             raise invalid_descriptor("encode primary stage is not an encode row")
         target_device = torch.device(self._route_device(self._route(stage)))
@@ -4035,12 +5303,8 @@ class ModelExecutor:
         outputs = yield (task,)
         features = _encode_features(outputs[0]).detach()
         if mode is EncodeMode.VISION:
-            grid = (
-                prepared.inputs.grid.detach() if isinstance(prepared.inputs, PatchInput) else None
-            )
             payload = VisionFeatureProduct(
                 features=features,
-                grid=grid,
                 height=prepared.height,
                 width=prepared.width,
                 source_base64=source_base64,
@@ -4073,7 +5337,34 @@ class ModelExecutor:
         )
         session = self.sessions.get(session_id)
         session.product_handles.add(handle)
-        return self._non_state_outcome(operation)
+        products: tuple[ProductPayload, ...] = ()
+        if (
+            self.transport is not None
+            and self.transport.name != "local"
+            and (self.deployment is None or int(self.deployment.tp_rank) == 0)
+        ):
+            locator = self.transport.publish_async(resident)
+            scope.published.append(locator)
+            scope.stage_publications[_operation_identity(operation)] = (locator,)
+            descriptor = _CompletionTransferPayload(
+                "tensor",
+                {
+                    "locator": locator.to_wire(),
+                    "payload_kind": feature_output.kind.value,
+                    "height": payload.height,
+                    "width": payload.width,
+                },
+                (locator,),
+                operation.plan_digest,
+                self.transport,
+            )
+            products = (
+                ProductPayload(
+                    product=feature_output,
+                    payload=cast(bytes, descriptor),
+                ),
+            )
+        return self._non_state_outcome(operation, products=products)
 
     def _materialize_driver(
         self,
@@ -4082,16 +5373,29 @@ class ModelExecutor:
     ) -> _Driver:
         session_id = operation.request_key.session_id
         session = self.sessions.get(session_id)
-        operation_type = work_operation_type(operation.work)
-        latent_handle = session.latent_handle
-        if latent_handle is None:
+        selected_type = operation_type(operation)
+        latent_inputs = tuple(
+            reference for reference in operation.inputs if reference.kind is ProductKind.LATENT
+        )
+        if not latent_inputs:
             return self._materialize_frames(operation, scope)
+        if len(latent_inputs) != 1:
+            raise invalid_descriptor("materialization requires one exact latent generation")
+        latent_input = latent_inputs[0]
+        if int(latent_input.generation) < 1 or session.latent_product != latent_input:
+            raise invalid_descriptor("materialization does not name the current latent generation")
+        latent_read = self.products.device_products.consume(
+            latent_input,
+            consumer_op_id=operation.op_id,
+            device=self._operation_device(operation),
+        )
+        scope.device_reads.append(latent_read)
         spec = cast(ModelSpec, self.spec)
         flow = spec.flow
         if flow is None:
             raise invalid_descriptor("image materialization requires a declared FlowSpec")
-        latent_record = scope.latents.read(latent_handle)
-        if latent_record is None or latent_record.session_id != session_id:
+        latent_record = scope.latents.read(latent_input)
+        if latent_record is None or latent_record.reference.request_key.session_id != session_id:
             raise invalid_descriptor("materialization latent is not resident for this session")
         image_params = session.image
         if image_params is None:
@@ -4100,17 +5404,19 @@ class ModelExecutor:
             raise invalid_descriptor("image materialization requires a completed latent trajectory")
 
         if flow.materialization is MaterializationKind.DECODE_ROUTE:
-            stage = self._primary_stage(operation_type)
+            stage = self._primary_stage(selected_type)
             if stage.row is not RouteRowKind.DECODE:
                 raise invalid_descriptor("decode materialization requires a decode primary stage")
             row_id = scope.row_id()
             task = _ForwardTask(
                 operation=operation,
+                session=session,
+                weights=self._weights(session),
                 stage=stage,
                 route=self._route(stage),
                 row=DecodeRow(
                     row_id=row_id,
-                    latent=latent_record.value,
+                    latent=latent_read.tensor,
                     image_height=latent_record.height,
                     image_width=latent_record.width,
                     output_slot=row_id,
@@ -4122,22 +5428,19 @@ class ModelExecutor:
         elif flow.materialization is MaterializationKind.RGB_LATENT:
             if any(
                 stage.purpose is OperationStagePurpose.PRIMARY
-                for stage in self._stages(operation_type)
+                for stage in self._stages(selected_type)
             ):
                 raise invalid_descriptor(
                     "RGB-latent materialization must not declare a decode route"
                 )
-            image_tensor = latent_record.value.detach()
+            image_tensor = latent_read.tensor.detach()
             image_range = ImageRange.SIGNED_UNIT
         else:
             raise invalid_descriptor("model declares an unknown image materialization kind")
 
-        # Materialize owns the bounded PNG/base64 artifact as well as the
-        # independently fenced resident image used by a later feedback encode.
-        png = tensor_to_png_b64(
-            image_tensor,
-            value_range=(-1.0, 1.0) if image_range is ImageRange.SIGNED_UNIT else (0.0, 1.0),
-        )
+        # Materialize owns the independently fenced resident image used by a
+        # later feedback encode and a query-ready CPU encoding continuation.
+        artifact = _artifact_product_ref(operation)
         resident_outputs = tuple(
             output
             for output in operation.outputs
@@ -4172,23 +5475,26 @@ class ModelExecutor:
                 )
             )
             session.product_handles.add(image_handle)
-        self._append_frame(operation, png, scope)
-        scope.latents.delete(latent_handle)
-        scope.kv.release_generation(session_id, latent_handle)
-        session.latent_handle = None
+        image_task = self._defer_image_encoding(
+            operation,
+            image_tensor,
+            image_range,
+            scope,
+            max_bytes=int(artifact.max_bytes),
+            discard_handles=tuple(int(output.generation) for output in resident_outputs),
+        )
+        session.latent_product = None
         session.flow_step = 0
         products = (
             ProductPayload(
-                product=_artifact_product_ref(operation),
-                # The Artifact product carries the base64 PNG string as bytes: the
-                # scheduler recovers it via String::from_utf8 and hands it to
-                # validate_png_artifact, which base64-decodes it back to the PNG.
-                payload=png.encode("ascii"),
+                product=artifact,
+                payload=cast(bytes, image_task),
             ),
         )
         return self._non_state_outcome(
             operation,
             products=products,
+            completion_tasks=(image_task,),
         )
 
     def _transfer_driver(
@@ -4211,8 +5517,8 @@ class ModelExecutor:
                 raise invalid_descriptor("KV publication requires one KV output product")
             if any(reference.kind is ProductKind.KV for reference in operation.inputs):
                 raise invalid_descriptor("KV publication is rooted only by its fixed parent")
-            expected_base = self.kv.destination_base(session_id, "gen")
-            snapshot = self.kv.publish(
+            expected_base = scope.kv.destination_base(session_id, "gen")
+            snapshot = scope.kv.publish_kv(
                 session_id,
                 source_version=operation.parent,
                 source_digest=point.semantic_digest,
@@ -4223,15 +5529,16 @@ class ModelExecutor:
             )
             for encoded in snapshot.locators:
                 scope.published.append(Locator.from_wire_json(encoded))
-            payload = json.dumps(
-                snapshot.to_wire(),
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
+            payload = _CompletionTransferPayload(
+                "kv",
+                {"snapshot": snapshot.to_wire()},
+                tuple(Locator.from_wire_json(encoded) for encoded in snapshot.locators),
+                operation.plan_digest,
+                self.transport,
+            )
             return self._non_state_outcome(
                 operation,
-                products=(ProductPayload(product=outputs[0], payload=payload),),
+                products=(ProductPayload(product=outputs[0], payload=cast(bytes, payload)),),
             )
         if mode == TransferMode.KV_INSTALL.value:
             inputs = tuple(
@@ -4240,11 +5547,16 @@ class ModelExecutor:
             outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
             if len(inputs) != 1 or len(outputs) != 1:
                 raise invalid_descriptor("KV installation requires one input and one output")
-            snapshot = self.kv.install_publication(
+            snapshot = scope.kv.install_publication(
                 session_id,
                 inputs[0],
                 outputs[0],
                 self.transport,
+                transferred_tensors=(
+                    None
+                    if (prepared := scope.prepared_transfers.get(inputs[0])) is None
+                    else prepared.tensors()
+                ),
             )
             return self._non_state_outcome(
                 operation,
@@ -4297,6 +5609,7 @@ class ModelExecutor:
         stage: OperationStageSpec,
         scope: _ExecutionScope,
     ) -> _ForwardTask:
+        session = self.sessions.get(operation.request_key.session_id)
         row_id = scope.row_id()
         row = EncodeRow(
             row_id=row_id,
@@ -4306,7 +5619,14 @@ class ModelExecutor:
             inputs=prepared.inputs,
             output_slot=row_id,
         )
-        return _ForwardTask(operation=operation, stage=stage, route=self._route(stage), row=row)
+        return _ForwardTask(
+            operation=operation,
+            session=session,
+            weights=self._weights(session),
+            stage=stage,
+            route=self._route(stage),
+            row=row,
+        )
 
     def _state_driver(
         self,
@@ -4318,7 +5638,6 @@ class ModelExecutor:
         width: int,
         conditioning_position: int,
         features: torch.Tensor | None = None,
-        grid: torch.Tensor | None = None,
         image: torch.Tensor | None = None,
         image_range: ImageRange = ImageRange.SIGNED_UNIT,
         latent: torch.Tensor | None = None,
@@ -4346,7 +5665,6 @@ class ModelExecutor:
                 task = self._encode_task(operation, EncodeMode.VISION, prepared, stage, scope)
                 outputs = yield (task,)
                 features = _encode_features(outputs[0]).detach()
-                grid = prepared.inputs.grid if isinstance(prepared.inputs, PatchInput) else None
                 continue
             if stage.row is RouteRowKind.TOKEN:
                 if features is None:
@@ -4355,7 +5673,8 @@ class ModelExecutor:
                     operation,
                     stage,
                     features,
-                    grid,
+                    height,
+                    width,
                     conditioning_position,
                     scope,
                     close_image=close_image,
@@ -4424,13 +5743,15 @@ class ModelExecutor:
         operation: Operation,
         stage: OperationStageSpec,
         features: torch.Tensor,
-        grid: torch.Tensor | None,
+        height: int,
+        width: int,
         conditioning_position: int,
         scope: _ExecutionScope,
         *,
         close_image: bool,
         logits: bool,
     ) -> _ForwardTask:
+        session = self.sessions.get(operation.request_key.session_id)
         images = cast(ModelSpec, self.spec).inputs.images
         injection = None if images is None else images.feature_injection
         if injection is None:
@@ -4462,9 +5783,10 @@ class ModelExecutor:
         inputs = segments[0] if len(segments) == 1 else TokenSegments(tuple(segments))
         positions = self._vision_positions(
             injection.positions,
-            grid,
             int(embeddings.shape[0]),
             conditioning_position,
+            height=height,
+            width=width,
             leading=leading,
             trailing=trailing,
             close_image=close_image,
@@ -4479,6 +5801,8 @@ class ModelExecutor:
         )
         return _ForwardTask(
             operation=operation,
+            session=session,
+            weights=self._weights(session),
             stage=stage,
             route=self._route(stage),
             row=row,
@@ -4503,10 +5827,11 @@ class ModelExecutor:
     def _vision_positions(
         self,
         layout: PositionLayout,
-        grid: torch.Tensor | None,
         feature_tokens: int,
         conditioning_position: int,
         *,
+        height: int,
+        width: int,
         leading: bool,
         trailing: bool,
         close_image: bool,
@@ -4514,9 +5839,13 @@ class ModelExecutor:
         query = int(leading) + feature_tokens + int(trailing)
         if layout is PositionLayout.TEMPORAL:
             return torch.full((query,), int(conditioning_position), dtype=torch.long)
-        if grid is None or grid.numel() != 2:
-            raise invalid_descriptor("temporal-spatial feature injection requires one image grid")
-        raw_height, raw_width = (int(value) for value in grid.reshape(-1).tolist())
+        images = cast(ModelSpec, self.spec).inputs.images
+        transform = None if images is None else images.vit
+        if not isinstance(transform, ImagePatchSpec):
+            raise invalid_descriptor(
+                "temporal-spatial feature injection requires a patch image transform"
+            )
+        raw_height, raw_width = patch_grid_shape(transform, height, width)
         factor_squared, remainder = divmod(raw_height * raw_width, feature_tokens)
         factor = math.isqrt(factor_squared)
         if remainder or factor < 1 or factor * factor != factor_squared:
@@ -4550,6 +5879,7 @@ class ModelExecutor:
         conditioning_position: int,
         scope: _ExecutionScope,
     ) -> _ForwardTask:
+        session = self.sessions.get(operation.request_key.session_id)
         flow = cast(ModelSpec, self.spec).flow
         if flow is None or flow.latent_layout is not LatentLayout.PATCH_TOKENS:
             raise invalid_descriptor("flow state publication requires patch-token latents")
@@ -4582,6 +5912,8 @@ class ModelExecutor:
         indexes = torch.stack((temporal, torch.zeros_like(temporal), torch.zeros_like(temporal)))
         return _ForwardTask(
             operation=operation,
+            session=session,
+            weights=self._weights(session),
             stage=stage,
             route=self._route(stage),
             row=row,
@@ -4597,46 +5929,69 @@ class ModelExecutor:
         operation: Operation,
         scope: _ExecutionScope,
     ) -> _Outcome:
-        session_id = operation.request_key.session_id
-        frame_handle = _stable_handle(session_id, operation.request_key.epoch, 0, "frames")
         image, metadata = self._fetch_product_tensor(operation, scope)
         if _metadata_string(metadata, "payload_kind", "") != "image_nchw":
             raise invalid_descriptor("frame materialization source is not an image tensor")
         value_range = ImageRange(
             _metadata_string(metadata, "value_range", ImageRange.SIGNED_UNIT.value)
         )
-        png = tensor_to_png_b64(
+        image_task = self._defer_image_encoding(
+            operation,
             image,
-            value_range=(-1.0, 1.0) if value_range is ImageRange.SIGNED_UNIT else (0.0, 1.0),
+            value_range,
+            scope,
+            max_bytes=int(operation.bounds.max_completion_bytes),
+            discard_handles=(),
         )
-        self._append_frame(operation, png, scope)
-        frames = scope.product_view.require(frame_handle).payload
-        if not isinstance(frames, FrameCollectionProduct):
-            raise RuntimeError("frame collection publication produced the wrong product variant")
-        return self._non_state_outcome(operation)
+        return self._non_state_outcome(operation, completion_tasks=(image_task,))
 
-    def _append_frame(
+    def _defer_image_encoding(
         self,
         operation: Operation,
-        png_base64: str,
+        image: torch.Tensor,
+        value_range: ImageRange,
         scope: _ExecutionScope,
-    ) -> None:
+        *,
+        max_bytes: int,
+        discard_handles: tuple[int, ...],
+    ) -> _CompletionImagePayload:
+        if max_bytes < 1:
+            raise invalid_descriptor("image materialization requires a positive completion bound")
+        quantized = quantize_image_hwc(
+            image,
+            value_range=((-1.0, 1.0) if value_range is ImageRange.SIGNED_UNIT else (0.0, 1.0)),
+        )
+        if int(quantized.numel()) > max_bytes:
+            raise invalid_descriptor("image staging exceeds its registered completion byte bound")
+        capture = scope.completion.capture_bytes(quantized)
+        identity = _operation_identity(operation)
+        reservation = scope.cpu_tasks.get(identity)
+        if reservation is None:
+            raise RuntimeError("materialization has no registered CPU task credit")
         session_id = operation.request_key.session_id
+        epoch = int(operation.request_key.epoch)
         handle = _stable_handle(session_id, operation.request_key.epoch, 0, "frames")
-        existing = scope.product_view.get(handle)
-        frames = (
-            existing.payload.frames
-            if existing is not None and isinstance(existing.payload, FrameCollectionProduct)
-            else ()
+
+        def publish(value: bytes) -> None:
+            session = self.sessions.peek(session_id)
+            if session is None or int(session.epoch) != epoch:
+                return
+            self.products.append_encoded_frame(session_id, handle, value.decode("ascii"))
+            session.product_handles.add(handle)
+
+        def discard() -> None:
+            if not discard_handles:
+                return
+            self.products.release(discard_handles)
+            self.sessions.discard_product_handles(set(discard_handles))
+
+        return _CompletionImagePayload(
+            capture,
+            reservation,
+            max_bytes,
+            publish,
+            discard,
         )
-        scope.product_view.put(
-            ProductRecord(
-                handle=handle,
-                session_id=session_id,
-                payload=FrameCollectionProduct((*frames, EncodedImageProduct(png_base64))),
-            )
-        )
-        self.sessions.get(session_id).product_handles.add(handle)
 
     def _publish_tensor(
         self,
@@ -4907,6 +6262,51 @@ def _record_component(scope: _ExecutionScope, name: str, started_ns: int) -> Non
     scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
 
 
+def _forward_stats(
+    observations: Sequence[RunObservation],
+    component_us: Mapping[str, int] | None = None,
+) -> WorkerForwardStats:
+    route_counts: dict[str, int] = {}
+    route_rows: dict[str, int] = {}
+    route_us: dict[str, int] = {}
+    path_counts: dict[str, int] = {}
+    captures = 0
+    replays = 0
+    fallbacks = 0
+    graph_unpadded_tokens = 0
+    graph_padded_tokens = 0
+    for observation in observations:
+        route_counts[observation.route] = route_counts.get(observation.route, 0) + 1
+        route_rows[observation.route] = route_rows.get(observation.route, 0) + int(
+            observation.row_count
+        )
+        route_us[observation.route] = route_us.get(observation.route, 0) + int(
+            observation.duration_us
+        )
+        path_counts[observation.path.value] = path_counts.get(observation.path.value, 0) + 1
+        captures += observation.path is RunPath.GRAPH_CAPTURE
+        replays += observation.path is RunPath.GRAPH_REPLAY
+        fallbacks += observation.path is RunPath.GRAPH_FALLBACK
+        graph_unpadded_tokens += int(observation.graph_unpadded_tokens)
+        graph_padded_tokens += int(observation.graph_padded_tokens)
+    components = {"forward": sum(route_us.values())}
+    for name, value in (component_us or {}).items():
+        components[str(name)] = components.get(str(name), 0) + max(0, int(value))
+    return WorkerForwardStats(
+        mode_counts=route_counts,
+        mode_tokens=route_rows,
+        mode_us=route_us,
+        component_us=components,
+        cuda_graph_captures=int(captures),
+        cuda_graph_replays=int(replays),
+        cuda_graph_misses=int(fallbacks),
+        cuda_graph_fallbacks=int(fallbacks),
+        cuda_graph_unpadded_tokens=graph_unpadded_tokens,
+        cuda_graph_padded_tokens=graph_padded_tokens,
+        cuda_graph_runtime_mode_counts=path_counts,
+    )
+
+
 def _row_tensor_shape(row: ForwardRow) -> tuple[int, ...]:
     if isinstance(row, TokenRow):
         return (_token_input_length(row),)
@@ -5019,7 +6419,7 @@ def _sampling_task_tensors(
     )
 
 
-def _plain_greedy_row(row: _SamplingRow) -> bool:
+def _device_greedy_row(row: _SamplingRow) -> bool:
     parameters = row.parameters
     return (
         float(parameters.temperature) <= 0.0
@@ -5027,7 +6427,6 @@ def _plain_greedy_row(row: _SamplingRow) -> bool:
         and int(row.n_logprobs) == 0
         and not parameters.logprob_token_ids
         and row.allowed is None
-        and not row.suppress
         and not parameters.logit_bias
         and parameters.repetition_penalty == 1.0
         and parameters.frequency_penalty == 0.0
@@ -5043,6 +6442,7 @@ def _sample_task_batch(
     device_products: DeviceProductTable | None = None,
     device_reads: tuple[DeviceProductRead, ...] = (),
     device_continuation: DeviceProductContinuationBatch | None = None,
+    selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[_SampleResult, ...]:
     """Shape and draw every compatible sampling row in each device batch."""
 
@@ -5058,8 +6458,10 @@ def _sample_task_batch(
             or int(task.logits.shape[0]) != len(task.rows)
         ):
             raise invalid_descriptor("sampling task logits must be shaped [rows, vocab]")
-        plain_greedy = not task.draft_token_ids and all(_plain_greedy_row(row) for row in task.rows)
-        if plain_greedy:
+        device_greedy = not task.draft_token_ids and all(
+            _device_greedy_row(row) for row in task.rows
+        )
+        if device_greedy:
             if (
                 any(
                     value is not None
@@ -5108,7 +6510,11 @@ def _sample_task_batch(
             raise capability_mismatch("vocabulary exceeds the device token decision range")
         if any(value < 0 or value >= vocab for value in task.draft_token_ids):
             raise invalid_descriptor("speculative draft token is outside the model vocabulary")
-        sampling_path = -1 if plain_greedy else _fused_top_k(task, vocab)
+        sampling_path = (
+            (-2 if any(row.suppress for row in task.rows) else -1)
+            if device_greedy
+            else _fused_top_k(task, vocab)
+        )
         penalty_width = (
             int(cast(torch.Tensor, task.penalty_token_ids).shape[1]) if sampling_path > 0 else 0
         )
@@ -5117,15 +6523,17 @@ def _sample_task_batch(
     result: list[_SampleResult | None] = [None] * len(tasks)
     for (_device, _vocab, sampling_path, _penalty_width), compatible in grouped.items():
         indexes, group = zip(*compatible, strict=True)
-        if sampling_path == -1:
-            sampled_group = _sample_plain_greedy_group(
+        if sampling_path < 0:
+            sampled_group = _sample_device_greedy_group(
                 tuple(group),
                 completion,
+                apply_suppression=sampling_path == -2,
                 device_products=device_products,
                 device_reads=device_reads,
                 device_continuation=(
                     device_continuation if len(compatible) == len(tasks) else None
                 ),
+                selection_broadcast=selection_broadcast,
             )
         elif sampling_path > 0:
             sampled_group = _sample_fused_top_k_group(
@@ -5134,6 +6542,7 @@ def _sample_task_batch(
                 completion,
                 device_products=device_products,
                 device_reads=device_reads,
+                selection_broadcast=selection_broadcast,
             )
         else:
             sampled_group = _sample_task_group(
@@ -5141,25 +6550,36 @@ def _sample_task_batch(
                 completion,
                 device_products=device_products,
                 device_reads=device_reads,
+                selection_broadcast=selection_broadcast,
             )
         for index, sampled in zip(indexes, sampled_group, strict=True):
             result[index] = sampled
     return tuple(cast(_SampleResult, value) for value in result)
 
 
-def _sample_plain_greedy_group(
+def _sample_device_greedy_group(
     tasks: tuple[_SampleTask, ...],
     completion: CompletionLease | None,
     *,
+    apply_suppression: bool,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
     device_continuation: DeviceProductContinuationBatch | None,
+    selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[_SampleResult, ...]:
     logits = packed_tensor_views(tuple(task.logits for task in tasks))
     if logits is None:
         logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     else:
         logits = logits.reshape(len(tasks), -1)
+    selection_logits = logits
+    if apply_suppression:
+        selection_logits = logits.to(dtype=torch.float32, copy=True)
+        vocab = int(selection_logits.shape[1])
+        for row_index, task in enumerate(tasks):
+            for token_id in dict.fromkeys(int(value) for value in task.rows[0].suppress):
+                if 0 <= token_id < vocab:
+                    selection_logits[row_index, token_id].fill_(float("-inf"))
     product_table: DeviceProductTable | None
     if device_continuation is not None:
         if device_products is None:
@@ -5184,26 +6604,60 @@ def _sample_plain_greedy_group(
             else None
         )
     packed_output = product_batch.tensor if product_batch is not None else None
+    finish_indexes = tuple(
+        index for index, task in enumerate(tasks) if task.finish_product is not None
+    )
+    finish_writes = tuple(
+        cast(DeviceProductWrite, tasks[index].finish_product) for index in finish_indexes
+    )
+    finish_batch: DeviceProductScalarBatch | None = None
+    if finish_writes and device_products is not None:
+        finish_batch = device_products.producer_scalar_batch(finish_writes)
+    grouped_publication = (
+        product_table is not None
+        and product_batch is not None
+        and (not finish_writes or finish_batch is not None)
+    )
     if packed_output is None or int(packed_output.numel()) != len(tasks):
-        device_tokens = torch.argmax(logits, dim=-1)
+        device_tokens = torch.argmax(selection_logits, dim=-1)
+        max_values = None
+    elif grouped_publication:
+        device_tokens = packed_output
+        max_values = torch.empty(
+            len(tasks),
+            dtype=selection_logits.dtype,
+            device=selection_logits.device,
+        )
+        torch.max(selection_logits, dim=-1, out=(max_values, device_tokens))
     else:
         device_tokens = packed_output
-        torch.argmax(logits, dim=-1, out=device_tokens)
+        max_values = None
+        torch.argmax(selection_logits, dim=-1, out=device_tokens)
     valid = (
-        ~torch.isnan(logits).any(dim=-1)
-        & ~torch.isposinf(logits).any(dim=-1)
-        & torch.isfinite(logits).any(dim=-1)
+        torch.isfinite(max_values)
+        if max_values is not None
+        else (
+            ~torch.isnan(selection_logits).any(dim=-1)
+            & ~torch.isposinf(selection_logits).any(dim=-1)
+            & torch.isfinite(selection_logits).any(dim=-1)
+        )
     )
+    if selection_broadcast is not None:
+        selection_broadcast(device_tokens)
     active = _sample_predicates(tasks, device_tokens.device)
-    device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
-        tasks,
-        device_tokens,
-        valid,
-        active,
-        torch.zeros_like(active, dtype=torch.bool),
-        device_products,
-        device_reads,
-    )
+    if grouped_publication:
+        device_finish = _device_finish_values(tasks, device_tokens, valid & active)
+        continuation_values = active & valid & ~device_finish
+    else:
+        device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
+            tasks,
+            device_tokens,
+            valid,
+            active,
+            torch.zeros_like(active, dtype=torch.bool),
+            device_products,
+            device_reads,
+        )
     span = _capture_sample_span(
         valid,
         active,
@@ -5218,7 +6672,26 @@ def _sample_plain_greedy_group(
     )
     published = product_table is not None
     if product_table is not None:
-        if device_continuation is not None:
+        if grouped_publication:
+            side_batches: tuple[DeviceProductScalarBatch, ...] = ()
+            if finish_batch is not None:
+                finish_batch.tensor.copy_(
+                    _select_device_values(device_finish, finish_indexes),
+                )
+                side_batches = (finish_batch,)
+            if device_continuation is None:
+                product_table.publish_scalar_group(
+                    (*side_batches, cast(DeviceProductScalarBatch, product_batch)),
+                    after_reads=device_reads,
+                )
+            else:
+                product_table.publish_continuation_group(
+                    device_continuation,
+                    side_batches,
+                    after_reads=device_reads,
+                )
+            device_finish = None
+        elif device_continuation is not None:
             product_table.publish_continuation(
                 device_continuation,
                 None if product_batch is not None else tagged_tokens,
@@ -5279,6 +6752,7 @@ def _sample_fused_top_k_group(
     *,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
+    selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[_SampleResult, ...]:
     rows = tuple(task.rows[0] for task in tasks)
     logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
@@ -5300,6 +6774,8 @@ def _sample_fused_top_k_group(
         parameters,
         top_k,
     )
+    if selection_broadcast is not None:
+        selection_broadcast(tokens)
     active = _sample_predicates(tasks, tokens.device)
     device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
         tasks,
@@ -5366,6 +6842,7 @@ def _sample_task_group(
     *,
     device_products: DeviceProductTable | None,
     device_reads: tuple[DeviceProductRead, ...],
+    selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[_SampleResult, ...]:
     device = tasks[0].logits.device
     vocab = int(tasks[0].logits.shape[1])
@@ -5429,6 +6906,20 @@ def _sample_task_group(
     points = torch.stack(selected_points)
     terminal_finish = torch.stack(terminal_finishes)
     task_tokens = torch.where(terminal_finish, torch.stack(terminal_tokens), task_tokens)
+    if selection_broadcast is not None:
+        selection = torch.stack(
+            (
+                task_tokens.to(dtype=torch.int64),
+                counts.to(dtype=torch.int64),
+                points.to(dtype=torch.int64),
+                terminal_finish.to(dtype=torch.int64),
+            )
+        )
+        selection_broadcast(selection)
+        task_tokens = selection[0].to(dtype=task_tokens.dtype)
+        counts = selection[1].to(dtype=counts.dtype)
+        points = selection[2].to(dtype=points.dtype)
+        terminal_finish = selection[3].to(dtype=torch.bool)
 
     task_valid = torch.stack(
         tuple(
@@ -6160,6 +7651,7 @@ def _requires_device_product_binding(reference: ProductRef) -> bool:
         and reference.kind
         in {
             ProductKind.ARTIFACT,
+            ProductKind.LATENT,
             ProductKind.LATENT_FEATURE,
             ProductKind.VISION_FEATURE,
         }

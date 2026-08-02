@@ -7,9 +7,9 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from ..batch import Batch, CompletionReport
-from ..capabilities import RequestKind, ResponseKind, work_operation_type
-from ..execution.executor import completion_report_ready, finalize_completion_report
+from ..batch import Batch, CompletionReport, SnapshotRef
+from ..capabilities import RequestKind, ResponseKind, operation_type
+from ..execution.executor import finalize_completion_report, partition_completion_ready
 from ..foundation.env import env_int
 from ..foundation.errors import (
     WorkerError,
@@ -18,7 +18,6 @@ from ..foundation.errors import (
     should_capture_trace,
     unsupported_control,
 )
-from ..runtime.snapshot_store import SnapshotRef
 from ..worker.protocol import Worker
 from .metrics import MetricsService
 from .process import WorkerIpcTransport
@@ -27,6 +26,58 @@ from .profiler import WorkerProfiler
 __all__ = ["WorkerServer", "dispatch"]
 
 logger = logging.getLogger(__name__)
+
+
+class _PendingExecution:
+    def __init__(
+        self,
+        worker: Worker,
+        prepared: object,
+        operation_types: list[str],
+        metrics: MetricsService,
+        started: int,
+    ) -> None:
+        self.worker = worker
+        self.prepared = prepared
+        self.operation_types = operation_types
+        self.metrics = metrics
+        self.started = started
+
+    def ready(self) -> bool:
+        query = getattr(self.prepared, "ready", None)
+        if not callable(query):
+            raise invalid_descriptor("prepared execution has no readiness query")
+        return bool(query())
+
+    def resolve(self) -> CompletionReport:
+        if not self.ready():
+            raise RuntimeError("pending execution was observed before transfer readiness")
+        execute = getattr(self.worker, "execute_prepared", None)
+        if not callable(execute):
+            raise invalid_descriptor("worker cannot execute prepared transfer inputs")
+        result = execute(self.prepared)
+        if not isinstance(result, CompletionReport):
+            raise RuntimeError("prepared worker execution returned an invalid report")
+        self.metrics.record_execute(
+            self.metrics.now_ns() - self.started,
+            self.operation_types,
+        )
+        return result
+
+    def record_failure(self, error: BaseException) -> WorkerError:
+        classified = classify(error, context="execute")
+        self.metrics.record_error(str(classified.code))
+        include_trace = should_capture_trace(str(classified.code))
+        log = logger.exception if include_trace else logger.warning
+        log(
+            "deferred worker execution failed: %s [code=%s session_id=%s op_id=%s operation=%s]",
+            classified.message,
+            classified.code,
+            classified.req_id,
+            classified.op_id,
+            classified.op_kind,
+        )
+        return classified
 
 
 def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
@@ -110,9 +161,7 @@ def _integer_pairs(
     return tuple(pairs)
 
 
-def _integers(
-    request: Mapping[str, Any], field: str, kind: RequestKind
-) -> tuple[int, ...]:
+def _integers(request: Mapping[str, Any], field: str, kind: RequestKind) -> tuple[int, ...]:
     value = _required(request, field, kind)
     if not isinstance(value, (list, tuple)) or any(
         not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in value
@@ -149,10 +198,17 @@ def _execute(worker: Worker, request: Mapping[str, Any], metrics: MetricsService
             f"execution batch contains work variants outside worker capabilities: {names!r}"
         )
     started = metrics.now_ns()
-    result = worker.execute(batch)
-    duration = metrics.now_ns() - started
-    operation_types = [work_operation_type(value.work).value for value in batch.operations]
-    metrics.record_execute(duration, operation_types)
+    operation_types = [operation_type(value).value for value in batch.operations]
+    prepare = getattr(worker, "prepare_execute", None)
+    prepared = prepare(batch) if callable(prepare) else None
+    if prepared is not None:
+        pending = _PendingExecution(worker, prepared, operation_types, metrics, started)
+        if not pending.ready():
+            return _response(ResponseKind.RESULT, completion_report=pending)
+        result = pending.resolve()
+    else:
+        result = worker.execute(batch)
+        metrics.record_execute(metrics.now_ns() - started, operation_types)
     # Carry the report object so the progress loop can query its completion
     # events and serialize only records whose pinned copies are ready.
     return _response(ResponseKind.RESULT, completion_report=result)
@@ -167,8 +223,27 @@ def _response_ready(response: Mapping[str, Any]) -> bool:
     """
 
     result = response.get("completion_report")
+    if isinstance(result, _PendingExecution):
+        if not result.ready():
+            return False
+        if not isinstance(response, dict):
+            raise RuntimeError("pending execution response is not mutable")
+        try:
+            result = result.resolve()
+            response["completion_report"] = result
+        except BaseException as error:
+            classified = result.record_failure(error)
+            fields = classified.to_wire()
+            fields.pop("kind", None)
+            call_id = response.get("call_id")
+            response.clear()
+            response.update(_response(ResponseKind.ERROR, **fields))
+            response["call_id"] = call_id
+            return True
     if isinstance(result, CompletionReport):
-        return completion_report_ready(result)
+        return not result.partitions or any(
+            partition_completion_ready(partition) for partition in result.partitions
+        )
     return True
 
 
@@ -205,9 +280,7 @@ def _control(
         reference = worker.snapshot_session(_integer(request, "session_id", kind))
         return _response(ResponseKind.SNAPSHOT, snapshot=reference.to_wire())
     elif kind is RequestKind.RESTORE_SESSION:
-        worker.restore_session(
-            SnapshotRef.from_wire(_required(request, "snapshot", kind))
-        )
+        worker.restore_session(SnapshotRef.from_wire(_required(request, "snapshot", kind)))
     else:
         raise unsupported_control(kind.value)
     return None
@@ -229,6 +302,8 @@ def dispatch(
         )
     if kind is RequestKind.EXECUTE:
         return _execute(worker, request, service)
+    if kind is RequestKind.POLL_COMPLETIONS:
+        raise invalid_descriptor("completion polling is owned by the worker server")
     if kind is RequestKind.GET_METRICS:
         return _response(ResponseKind.METRICS, metrics=service.snapshot())
     if kind is RequestKind.GET_PRESSURE:
@@ -255,6 +330,7 @@ class WorkerServer:
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
         self.pipeline_depth = max(1, int(worker.contract.capabilities.pipeline_depth))
+        self._pending_completion_reports: dict[int, CompletionReport] = {}
 
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         raw_kind = request.get("kind")
@@ -263,7 +339,17 @@ class WorkerServer:
             if self._execute_count > self._terminate_after:
                 os._exit(1)
         try:
-            if raw_kind == RequestKind.EXECUTE.value:
+            if raw_kind == RequestKind.POLL_COMPLETIONS.value:
+                step_id = request.get("step_id")
+                if not isinstance(step_id, int) or isinstance(step_id, bool) or step_id < 0:
+                    raise invalid_descriptor("poll_completions requires an unsigned step id")
+                report = self._pending_completion_reports.get(step_id)
+                if report is None:
+                    raise invalid_descriptor(
+                        f"poll_completions names step {step_id} with no pending partitions"
+                    )
+                response = _response(ResponseKind.RESULT, completion_report=report)
+            elif raw_kind == RequestKind.EXECUTE.value:
                 with self.profiler.step("uniserve.worker.execute"):
                     response = dispatch(self.worker, request, self.metrics)
             else:
@@ -276,6 +362,7 @@ class WorkerServer:
                 None,
                 RequestKind.GET_CAPABILITIES,
                 RequestKind.EXECUTE,
+                RequestKind.POLL_COMPLETIONS,
                 RequestKind.GET_METRICS,
                 RequestKind.GET_PRESSURE,
                 RequestKind.SHUTDOWN,
@@ -312,6 +399,7 @@ class WorkerServer:
             None,
             RequestKind.GET_CAPABILITIES,
             RequestKind.EXECUTE,
+            RequestKind.POLL_COMPLETIONS,
             RequestKind.GET_METRICS,
             RequestKind.GET_PRESSURE,
             RequestKind.SHUTDOWN,
@@ -333,6 +421,35 @@ class WorkerServer:
     def respond(self, response: dict[str, Any]) -> None:
         if self.ipc_endpoint is None:
             raise RuntimeError("worker server has no IPC endpoint")
+        result = response.get("completion_report")
+        if isinstance(result, CompletionReport):
+            ready_partitions = []
+            pending_partitions = []
+            for partition in result.partitions:
+                target = (
+                    ready_partitions
+                    if partition_completion_ready(partition)
+                    else pending_partitions
+                )
+                target.append(partition)
+            ready = tuple(ready_partitions)
+            pending = tuple(pending_partitions)
+            if result.partitions and not ready:
+                raise RuntimeError(
+                    "completion response was selected before any partition was ready"
+                )
+            if pending:
+                self._pending_completion_reports[result.step_id] = CompletionReport(
+                    step_id=result.step_id,
+                    partitions=pending,
+                )
+            else:
+                self._pending_completion_reports.pop(result.step_id, None)
+            response = dict(response)
+            response["completion_report"] = CompletionReport(
+                step_id=result.step_id,
+                partitions=ready,
+            )
         started = self.metrics.now_ns()
         self.ipc_endpoint.respond(_finalize_response(response))
         self.metrics.record_pipeline("send", self.metrics.now_ns() - started)

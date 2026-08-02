@@ -13,15 +13,16 @@ use uniserve_openai_types::{
     AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
     ChatImageType, ChatLogProbs, ChatMessage, ChatMessageDelta, ChatModality, ContentPart,
-    FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent, ToolCall, ToolCallDelta,
-    Usage,
+    FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent, StreamPublicCommit,
+    StreamSemanticRoot, ToolCall, ToolCallDelta, Usage,
 };
 use uniserve_serving::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt as _,
 };
 use uniserve_serving::text::DecodedLogprobs;
 use uniserve_serving::{
-    CandidateId, FinishStatus, ImageGenerationPolicy, ModalityPolicy, ServeEvent,
+    CandidateId, FinishStatus, ImageGenerationPolicy, ModalityPolicy, PublicCommit, PublicModality,
+    ServeEvent,
 };
 
 use crate::openai::ApiError;
@@ -345,6 +346,7 @@ pub async fn chat_completion_chunk_stream(
     // starts or ends, omit its token metadata as well as its visible delta.
     let mut inside_hidden_reasoning = false;
     let mut suppress_current_update_metadata = false;
+    let mut pending_public_commit: Option<PublicCommit> = None;
 
     // If the client requested logprobs or token_ids, we need to buffer chunks until
     // we receive the separate `LogprobsDelta` event, so that we can emit one
@@ -377,6 +379,13 @@ pub async fn chat_completion_chunk_stream(
                     .await;
                 }
             }
+            Ok(ServeEvent::PublicCommit { commit }) => {
+                if pending_public_commit.replace(commit).is_some() {
+                    bail_server_error!(
+                        "visible output publication arrived before the preceding publication was consumed"
+                    );
+                }
+            }
             Ok(ServeEvent::TextDelta {
                 text,
                 token_ids,
@@ -387,15 +396,12 @@ pub async fn chat_completion_chunk_stream(
                     let kind = AssistantBlockKind::Text;
                     if let Some(pending_chunk) = pending_chunk.as_mut() {
                         pending_chunk.push_block_delta(kind, text);
+                        pending_chunk.public_commit = pending_public_commit.take();
                     } else {
-                        y.yield_ok(block_delta_chunk(
-                            &request_id,
-                            &response_model,
-                            created,
-                            kind,
-                            text,
-                        ))
-                        .await;
+                        let mut chunk =
+                            block_delta_chunk(&request_id, &response_model, created, kind, text);
+                        attach_public_commit(&mut chunk, pending_public_commit.take());
+                        y.yield_ok(chunk).await;
                     }
                 }
                 if !token_ids.is_empty() || logprobs.is_some() {
@@ -442,15 +448,12 @@ pub async fn chat_completion_chunk_stream(
                 if include_delta {
                     if let Some(pending_chunk) = pending_chunk.as_mut() {
                         pending_chunk.push_block_delta(kind, delta);
+                        pending_chunk.public_commit = pending_public_commit.take();
                     } else {
-                        y.yield_ok(block_delta_chunk(
-                            &request_id,
-                            &response_model,
-                            created,
-                            kind,
-                            delta,
-                        ))
-                        .await;
+                        let mut chunk =
+                            block_delta_chunk(&request_id, &response_model, created, kind, delta);
+                        attach_public_commit(&mut chunk, pending_public_commit.take());
+                        y.yield_ok(chunk).await;
                     }
                 } else {
                     suppress_current_update_metadata = true;
@@ -533,13 +536,9 @@ pub async fn chat_completion_chunk_stream(
                 let png_b64 = pixels_png_b64.ok_or_else(|| {
                     server_error!("image completion ended without an inline PNG artifact")
                 })?;
-                y.yield_ok(image_delta_chunk(
-                    &request_id,
-                    &response_model,
-                    created,
-                    png_b64,
-                ))
-                .await;
+                let mut chunk = image_delta_chunk(&request_id, &response_model, created, png_b64);
+                attach_public_commit(&mut chunk, pending_public_commit.take());
+                y.yield_ok(chunk).await;
                 image_step_counts.entry(image_id.clone()).or_default();
                 completed_image_ids.push(image_id);
             }
@@ -803,6 +802,7 @@ struct PendingChatChunk {
     logprobs: Option<ChatLogProbs>,
     /// Per-update output token IDs for the same decoded update.
     token_ids: Option<Vec<u32>>,
+    public_commit: Option<PublicCommit>,
 }
 
 impl PendingChatChunk {
@@ -880,6 +880,7 @@ impl PendingChatChunk {
         }
 
         let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
+        attach_public_commit(&mut chunk, self.public_commit.take());
         chunk.choices.push(ChatCompletionStreamChoice {
             delta: self.take_delta(),
             logprobs,
@@ -900,6 +901,23 @@ impl PendingChatChunk {
             images: self.delta.images.take(),
         }
     }
+}
+
+fn attach_public_commit(chunk: &mut ChatCompletionStreamResponse, commit: Option<PublicCommit>) {
+    chunk.public_commit = commit.map(|commit| StreamPublicCommit {
+        event_seq: commit.event_seq,
+        modality: match commit.modality {
+            PublicModality::Text => "text",
+            PublicModality::Image => "image",
+        }
+        .to_string(),
+        committed_at: commit.committed_at,
+        semantic_root: StreamSemanticRoot {
+            producer_op_id: commit.semantic_root.producer_op_id,
+            point_index: commit.semantic_root.point_index,
+            semantic_digest: commit.semantic_root.semantic_digest,
+        },
+    });
 }
 
 /// Append one text fragment to an optional OpenAI delta string field.
@@ -1160,7 +1178,8 @@ mod tests {
     };
     use uniserve_serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
     use uniserve_serving::{
-        AdapterSelection, CandidateId, FinishStatus, ModelContext, ServeError, ServeEvent,
+        AdapterSelection, CandidateId, FinishStatus, ModelContext, PublicCommit, PublicModality,
+        SemanticRoot, ServeError, ServeEvent,
     };
 
     use super::{
@@ -1169,6 +1188,19 @@ mod tests {
     };
     use crate::openai::lora::LoraModelResolution;
     use crate::openai::utils::ResolvedRequestContext;
+
+    fn public_commit(event_seq: u64, modality: PublicModality) -> PublicCommit {
+        PublicCommit {
+            event_seq,
+            modality,
+            committed_at: event_seq as f64,
+            semantic_root: SemanticRoot {
+                producer_op_id: event_seq,
+                point_index: event_seq as u32,
+                semantic_digest: format!("{event_seq:064x}"),
+            },
+        }
+    }
 
     #[test]
     fn native_chat_request_preserves_sampling_controls() {
@@ -1413,6 +1445,9 @@ mod tests {
                 prompt_token_ids: vec![1],
                 prompt_logprobs: None,
             }),
+            Ok(ServeEvent::PublicCommit {
+                commit: public_commit(1, PublicModality::Text),
+            }),
             Ok(ServeEvent::ReasoningDelta {
                 candidate_id: CandidateId::PRIMARY,
                 text: "plan".to_string(),
@@ -1459,6 +1494,9 @@ mod tests {
                 image_id: "0".to_string(),
                 step: 3,
                 elapsed_us: 1,
+            }),
+            Ok(ServeEvent::PublicCommit {
+                commit: public_commit(2, PublicModality::Image),
             }),
             Ok(ServeEvent::ImageDone {
                 candidate_id: CandidateId::PRIMARY,
@@ -1526,6 +1564,18 @@ mod tests {
                 .iter()
                 .any(|choice| choice.delta.images.is_some())
         }));
+        let commits = chunks
+            .iter()
+            .filter_map(|chunk| chunk.public_commit.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commits
+                .iter()
+                .map(|commit| (commit.event_seq, commit.modality.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "text"), (2, "image")]
+        );
+        assert_eq!(commits[0].semantic_root.point_index, 1);
         let usage = chunks
             .iter()
             .find_map(|chunk| chunk.usage.as_ref())

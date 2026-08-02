@@ -97,12 +97,10 @@ def prepare_tensor_image(
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 
     if isinstance(transform, ImagePatchSpec):
-        resized_height, resized_width = _bounded_grid_shape(
+        resized_height, resized_width = _patch_image_shape(
+            transform,
             source_height,
             source_width,
-            factor=int(round(int(transform.patch_size) / float(transform.downsample_ratio))),
-            minimum=int(transform.min_pixels),
-            maximum=int(transform.max_pixels),
         )
         value = _resize_tensor(value, resized_height, resized_width)
         normalized = _normalize_tensor(value, transform.normalization)
@@ -174,19 +172,39 @@ def _decode_rgb(encoded: str) -> Image.Image:
 
 
 def _resize_patch_image(image: Image.Image, spec: ImagePatchSpec) -> Image.Image:
-    factor = int(round(int(spec.patch_size) / float(spec.downsample_ratio)))
-    height, width = _bounded_grid_shape(
-        image.height,
-        image.width,
-        factor=factor,
-        minimum=int(spec.min_pixels),
-        maximum=int(spec.max_pixels),
-    )
+    height, width = _patch_image_shape(spec, image.height, image.width)
     return vision.resize(
         image,
         (height, width),
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
+    )
+
+
+def patch_grid_shape(
+    spec: ImagePatchSpec,
+    source_height: int,
+    source_width: int,
+) -> tuple[int, int]:
+    """Return the host-known patch grid for one declared image geometry."""
+
+    height, width = _patch_image_shape(spec, source_height, source_width)
+    patch = int(spec.patch_size)
+    return height // patch, width // patch
+
+
+def _patch_image_shape(
+    spec: ImagePatchSpec,
+    source_height: int,
+    source_width: int,
+) -> tuple[int, int]:
+    factor = int(round(int(spec.patch_size) / float(spec.downsample_ratio)))
+    return _bounded_grid_shape(
+        source_height,
+        source_width,
+        factor=factor,
+        minimum=int(spec.min_pixels),
+        maximum=int(spec.max_pixels),
     )
 
 

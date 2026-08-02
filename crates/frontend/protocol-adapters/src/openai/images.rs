@@ -212,6 +212,7 @@ pub async fn collect_image_generation(
             }
             ServeEvent::Accepted { .. }
             | ServeEvent::Scheduled { .. }
+            | ServeEvent::PublicCommit { .. }
             | ServeEvent::TextDelta { .. }
             | ServeEvent::InternalTextDelta { .. }
             | ServeEvent::ReasoningDelta { .. }

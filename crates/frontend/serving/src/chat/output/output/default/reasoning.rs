@@ -166,6 +166,7 @@ pub async fn reasoning_event_stream(
                 token_ids,
                 logprobs,
                 finished,
+                ..
             } => {
                 for next in state.process_delta(delta) {
                     y.yield_ok(next).await;
@@ -290,12 +291,14 @@ mod tests {
                 delta: "abc".to_string(),
                 token_ids: vec![],
                 logprobs: None,
+                public_commit: None,
                 finished: None,
             }),
             Ok(DecodedTextEvent::TextDelta {
                 delta: "def".to_string(),
                 token_ids: vec![],
                 logprobs: None,
+                public_commit: None,
                 finished: Some(crate::text::Finished {
                     prompt_token_count: 3,
                     output_token_count: 0,
@@ -365,6 +368,7 @@ mod tests {
                         }],
                     }],
                 }),
+                public_commit: None,
                 finished: None,
             }),
         ]);
@@ -420,12 +424,14 @@ mod tests {
                 delta: "thought ".to_string(),
                 token_ids: vec![],
                 logprobs: None,
+                public_commit: None,
                 finished: None,
             }),
             Ok(DecodedTextEvent::TextDelta {
                 delta: "done</think>OK".to_string(),
                 token_ids: vec![],
                 logprobs: None,
+                public_commit: None,
                 finished: None,
             }),
         ]);
@@ -478,12 +484,14 @@ mod tests {
                 delta: "thought ".to_string(),
                 token_ids: vec![],
                 logprobs: None,
+                public_commit: None,
                 finished: None,
             }),
             Ok(DecodedTextEvent::TextDelta {
                 delta: "done</think>OK".to_string(),
                 token_ids: vec![],
                 logprobs: None,
+                public_commit: None,
                 finished: None,
             }),
         ]);

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 use uniserve_engine_gateway::generation::{
     GenEvent, GenerationEventStream, GenerationFinishReason, GenerationPositionLogprobs,
+    PublicCommit,
 };
 use uniserve_model_profile::tokenizer::{DynTokenizer, IncrementalDecoder};
 
@@ -57,6 +58,7 @@ pub enum DecodedTextEvent {
         delta: String,
         token_ids: Vec<u32>,
         logprobs: Option<DecodedLogprobs>,
+        public_commit: Option<PublicCommit>,
         finished: Option<Finished>,
     },
 }
@@ -123,6 +125,7 @@ pub async fn decoded_text_event_stream(
     let mut scheduled_at = None;
     let mut started = false;
     let mut pending_token = None;
+    let mut last_public_commit = None;
     let mut output_token_count = 0_usize;
     let mut accumulated_token_ids = Vec::new();
     let mut accumulated_logprobs: Option<DecodedLogprobs> = None;
@@ -156,8 +159,12 @@ pub async fn decoded_text_event_stream(
     }
 
     macro_rules! consume_token {
-        ($token_id:expr, $positions:expr) => {{
+        ($token_id:expr, $positions:expr, $public_commit:expr) => {{
             let token_id = $token_id;
+            let public_commit: Option<PublicCommit> = $public_commit;
+            if public_commit.is_some() {
+                last_public_commit = public_commit.clone();
+            }
             let positions: Vec<GenerationPositionLogprobs> = $positions;
             let decoded_logprobs = (!positions.is_empty())
                 .then(|| {
@@ -210,6 +217,7 @@ pub async fn decoded_text_event_stream(
                     delta,
                     token_ids,
                     logprobs,
+                    public_commit: public_commit.or_else(|| last_public_commit.clone()),
                     finished: Some(Finished {
                         prompt_token_count,
                         output_token_count,
@@ -227,6 +235,7 @@ pub async fn decoded_text_event_stream(
                     delta: decoded.delta,
                     token_ids: vec![token_id],
                     logprobs: decoded_logprobs,
+                    public_commit,
                     finished: None,
                 })
                 .await;
@@ -260,7 +269,9 @@ pub async fn decoded_text_event_stream(
                 }
                 emit_start_if_ready!();
             }
-            GenEvent::TextToken { id, .. } => {
+            GenEvent::TextToken {
+                id, public_commit, ..
+            } => {
                 emit_start_if_ready!();
                 if !started {
                     return Err(Error::MalformedOutput {
@@ -276,16 +287,18 @@ pub async fn decoded_text_event_stream(
                     });
                 }
                 if generated_logprobs_requested {
-                    pending_token = Some(id);
+                    pending_token = Some((id, public_commit));
                 } else {
-                    consume_token!(id, Vec::new());
+                    consume_token!(id, Vec::new(), public_commit);
                 }
             }
             GenEvent::TokenLogprobs { id, candidates } => {
-                let pending = pending_token.take().ok_or_else(|| Error::MalformedOutput {
-                    request_id: request_id.clone(),
-                    message: "engine returned token logprobs without a pending token".to_string(),
-                })?;
+                let (pending, public_commit) =
+                    pending_token.take().ok_or_else(|| Error::MalformedOutput {
+                        request_id: request_id.clone(),
+                        message: "engine returned token logprobs without a pending token"
+                            .to_string(),
+                    })?;
                 if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -296,7 +309,8 @@ pub async fn decoded_text_event_stream(
                     id,
                     vec![GenerationPositionLogprobs {
                         entries: candidates,
-                    }]
+                    }],
+                    public_commit
                 );
             }
             GenEvent::Finished {
@@ -333,6 +347,7 @@ pub async fn decoded_text_event_stream(
                     delta,
                     token_ids,
                     logprobs,
+                    public_commit: last_public_commit,
                     finished: Some(Finished {
                         prompt_token_count,
                         output_token_count: completion_tokens,

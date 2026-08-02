@@ -96,6 +96,19 @@ def _png_data_url(width: int = 2, height: int = 3) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+def _public_commit(event_seq: int, modality: str, committed_at: float) -> dict[str, object]:
+    return {
+        "event_seq": event_seq,
+        "modality": modality,
+        "committed_at": committed_at,
+        "semantic_root": {
+            "producer_op_id": event_seq,
+            "point_index": event_seq,
+            "semantic_digest": f"{event_seq:064x}",
+        },
+    }
+
+
 def _successful_image_record(
     request_id: str = "a", *, width: int = 2, height: int = 3
 ) -> RequestRecord:
@@ -269,7 +282,11 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
     record = RequestRecord(request_id="openai-default", task="default")
     record.start_time = 10.0
     events = [
-        {"choices": [{"delta": {"content": "a"}}], "_client_t": 11.0},
+        {
+            "choices": [{"delta": {"content": "a"}}],
+            "public_commit": _public_commit(1, "text", 1.0),
+            "_client_t": 11.0,
+        },
         {
             "choices": [
                 {
@@ -283,10 +300,19 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
                     }
                 }
             ],
+            "public_commit": _public_commit(2, "image", 3.0),
             "_client_t": 13.0,
         },
-        {"choices": [{"delta": {"content": "b"}}], "_client_t": 14.0},
-        {"choices": [{"delta": {"content": "c"}}], "_client_t": 14.25},
+        {
+            "choices": [{"delta": {"content": "b"}}],
+            "public_commit": _public_commit(3, "text", 4.0),
+            "_client_t": 14.0,
+        },
+        {
+            "choices": [{"delta": {"content": "c"}}],
+            "public_commit": _public_commit(4, "text", 4.25),
+            "_client_t": 14.25,
+        },
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
         {
             "usage": {
@@ -322,24 +348,28 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
             "client_time": 11.0,
             "text_bytes": 1,
             "image_count": 0,
+            "public_commit": _public_commit(1, "text", 1.0),
         },
         {
             "modalities": ["image"],
             "client_time": 13.0,
             "text_bytes": 0,
             "image_count": 1,
+            "public_commit": _public_commit(2, "image", 3.0),
         },
         {
             "modalities": ["text"],
             "client_time": 14.0,
             "text_bytes": 1,
             "image_count": 0,
+            "public_commit": _public_commit(3, "text", 4.0),
         },
         {
             "modalities": ["text"],
             "client_time": 14.25,
             "text_bytes": 1,
             "image_count": 0,
+            "public_commit": _public_commit(4, "text", 4.25),
         },
     ]
     assert record.finish_reason == "stop"
@@ -387,30 +417,35 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
                 "client_time": 0.5,
                 "text_bytes": 5,
                 "image_count": 0,
+                "public_commit": _public_commit(1, "text", 10.0),
             },
             {
                 "modalities": ["text"],
                 "client_time": 0.75,
                 "text_bytes": 8,
                 "image_count": 0,
+                "public_commit": _public_commit(2, "text", 10.2),
             },
             {
                 "modalities": ["image"],
                 "client_time": 3.0,
                 "text_bytes": 0,
                 "image_count": 1,
+                "public_commit": _public_commit(3, "image", 12.0),
             },
             {
                 "modalities": ["text"],
                 "client_time": 3.5,
                 "text_bytes": 4,
                 "image_count": 0,
+                "public_commit": _public_commit(4, "text", 12.4),
             },
             {
                 "modalities": ["text"],
                 "client_time": 3.7,
                 "text_bytes": 3,
                 "image_count": 0,
+                "public_commit": _public_commit(5, "text", 12.6),
             },
         ],
         decoded_images=[inspect_image_bytes(_png_bytes())],
@@ -427,12 +462,22 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
     timing = summary["metrics"]["modality_interleave"]["transition_timing"]
     assert timing["valid"] is True
     assert timing["timestamp_coverage"] == 1.0
+    assert timing["public_commit_coverage"] == 1.0
     assert timing["transition_sample_coverage"] == 1.0
     assert timing["request_signatures"] == {"interleave-1": "text->image->text"}
     assert timing["transition_latency_ms"]["count"] == 2
     assert timing["transition_latency_ms"]["mean"] == pytest.approx(1375.0)
     assert timing["text_to_image_transition_latency_ms"]["mean"] == pytest.approx(2250.0)
     assert timing["image_to_text_transition_latency_ms"]["mean"] == pytest.approx(500.0)
+    assert timing["server_transition_latency_ms"]["count"] == 2
+    assert timing["server_text_to_image_transition_latency_ms"]["mean"] == pytest.approx(1800.0)
+    assert timing["server_image_to_text_transition_latency_ms"]["mean"] == pytest.approx(400.0)
+    assert timing["client_delivery_transition_delta_ms"]["mean"] == pytest.approx(275.0)
+    correlations = timing["boundary_correlations"]["interleave-1"]
+    assert [(item["source_event_seq"], item["destination_event_seq"]) for item in correlations] == [
+        (2, 3),
+        (3, 4),
+    ]
     digest = timing["latency_definition_digest"]
     assert isinstance(digest, str) and len(digest) == 64
 
@@ -446,6 +491,7 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
                 "client_time": 3.0,
                 "text_bytes": 0,
                 "image_count": 1,
+                "public_commit": _public_commit(3, "image", 12.0),
             }
         ],
     )
@@ -478,6 +524,21 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
                 "client_time": None,
                 "text_bytes": 5,
                 "image_count": 0,
+            },
+            {
+                "modalities": ["image"],
+                "client_time": 2.0,
+                "text_bytes": 0,
+                "image_count": 1,
+            },
+        ],
+        [
+            {
+                "modalities": ["text"],
+                "client_time": 1.0,
+                "text_bytes": 5,
+                "image_count": 0,
+                "public_commit": _public_commit(1, "text", 1.0),
             },
             {
                 "modalities": ["image"],

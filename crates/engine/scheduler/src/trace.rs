@@ -13,7 +13,6 @@ pub enum TraceEventKind {
     Admitted,
     OpSubmitted,
     OpResolved,
-    Preempted,
     Finished,
 }
 

@@ -29,7 +29,6 @@ from uniserve_worker.forward import (
     TokenEmbeddings,
     TokenHidden,
     TokenIds,
-    TokenLogits,
     TokenOutput,
     TokenRow,
     TokenSegments,
@@ -525,8 +524,7 @@ def _validate_tensors(
 
 def _output_tensor(output: TokenOutput | FlowOutput | EncodeOutput | DecodeOutput) -> torch.Tensor:
     if isinstance(output, TokenOutput):
-        value = output.value
-        return value.value if isinstance(value, (TokenLogits, TokenHidden)) else value.value
+        return output.value.value
     if isinstance(output, FlowOutput):
         return output.prediction
     if isinstance(output, EncodeOutput):

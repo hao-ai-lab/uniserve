@@ -32,6 +32,8 @@ def _runtime(point: int, *, initialized: int = 4, committed: int = 0) -> Resolve
     return ResolvedRuntimeState(
         logical_position=point,
         rng_counter=point,
+        latent_product=None,
+        flow_step=0,
         kv_reserved_len=4,
         kv_initialized_len=initialized,
         kv_visible_len=point,
@@ -198,11 +200,73 @@ def test_commit_requires_the_selected_operation_to_name_the_current_parent() -> 
     assert session.applied_control_seq == 0
 
 
+def test_operation_with_stale_epoch_is_rejected_before_registration() -> None:
+    sessions = SessionStore()
+    admission, _session = _admit(sessions)
+    stale_key = RequestKey(
+        admission.request_key.authority_id,
+        admission.request_key.session_id,
+        admission.request_key.epoch - 1,
+    )
+    stale = _verify_operation(
+        stale_key,
+        VersionRef(stale_key, 0, FixedPoint(0, admission.digest)),
+    )
+
+    with pytest.raises(WorkerError, match="stale epoch"):
+        sessions.validate_operations((stale,), ())
+
+
+def test_control_sequence_gap_cannot_advance_or_close_the_lineage() -> None:
+    sessions = SessionStore()
+    admission, session = _admit(sessions)
+
+    with pytest.raises(WorkerError, match="does not follow"):
+        sessions.apply_controls(
+            (
+                Close(
+                    request_key=admission.request_key,
+                    control_seq=2,
+                    cutoff=session.committed_version(),
+                    reason=CloseReason.CANCELLED,
+                ),
+            )
+        )
+
+    assert session.applied_control_seq == 0
+    assert session.terminal_cutoff is None
+
+
+def test_close_cutoff_rejects_every_later_operation() -> None:
+    sessions = SessionStore()
+    admission, session = _admit(sessions)
+    cutoff = session.committed_version()
+    sessions.apply_controls(
+        (
+            Close(
+                request_key=admission.request_key,
+                control_seq=1,
+                cutoff=cutoff,
+                reason=CloseReason.CANCELLED,
+            ),
+        )
+    )
+    descendant = _verify_operation(admission.request_key, cutoff)
+
+    with pytest.raises(WorkerError, match="closed request lineage"):
+        sessions.validate_operations((descendant,), ())
+
+    assert session.committed_version() == cutoff
+    assert session.resolved_version() == cutoff
+
+
 def test_runtime_state_enforces_the_five_extent_order() -> None:
     with pytest.raises(WorkerError, match="not monotonically contained"):
         ResolvedRuntimeState(
             logical_position=1,
             rng_counter=1,
+            latent_product=None,
+            flow_step=0,
             kv_reserved_len=4,
             kv_initialized_len=2,
             kv_visible_len=3,

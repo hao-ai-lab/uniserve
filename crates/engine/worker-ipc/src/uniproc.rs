@@ -4,7 +4,7 @@
 //! results. Worker-resident tensors, KV pages, and latents never cross this
 //! boundary.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -244,8 +244,17 @@ struct PendingRecord {
     pending: Pending,
 }
 
+fn release_consumed_request(record: PendingRecord) -> OutstandingKind {
+    let PendingRecord { kind, pending } = record;
+    drop(pending);
+    kind
+}
+
 enum OutstandingKind {
-    Batch { step_id: u64 },
+    Batch {
+        step_id: u64,
+        remaining_partitions: HashSet<u32>,
+    },
     Control,
 }
 
@@ -395,7 +404,7 @@ impl UniprocExecutor {
         defer_sampling: bool,
         worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
-        let depth = effective_worker_pipeline_depth(pipeline_depth, tp_size);
+        let depth = pipeline_depth.max(1);
         let max_payload = req_slot_cap.max(resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
         // The host is authoritative for the boundary mode: resolve it once and
@@ -523,6 +532,8 @@ impl UniprocExecutor {
             ),
             kind => bail!("unexpected capabilities response kind: {kind:?}"),
         };
+        caps.validate()
+            .context("worker reported invalid capabilities during startup")?;
         let host_depth = self.depth as u32;
         anyhow::ensure!(
             caps.pipeline_depth == host_depth,
@@ -619,7 +630,11 @@ impl UniprocExecutor {
             let record = self.pending.remove(&call_id).ok_or_else(|| {
                 anyhow::anyhow!("pending record {call_id} disappeared while routing response")
             })?;
-            self.route(call_id, record.kind, frame)?;
+            // Consuming a partial execute response ends this physical IPC
+            // request. Release its iceoryx active-request credit before routing
+            // can submit the continuation poll for the remaining partitions.
+            let kind = release_consumed_request(record);
+            self.route(call_id, kind, frame)?;
             drained += 1;
         }
         Ok(drained)
@@ -639,7 +654,10 @@ impl UniprocExecutor {
             bail!("worker response echoed call id {echoed}, expected {call_id}");
         }
         match kind {
-            OutstandingKind::Batch { step_id } => self.route_batch(step_id, wr),
+            OutstandingKind::Batch {
+                step_id,
+                remaining_partitions,
+            } => self.route_batch(step_id, remaining_partitions, wr),
             OutstandingKind::Control => {
                 let (ok, snapshot) = match wr.kind {
                     ResponseKind::Ok => (true, None),
@@ -675,7 +693,12 @@ impl UniprocExecutor {
         }
     }
 
-    fn route_batch(&mut self, step_id: u64, wr: WorkerResponse) -> anyhow::Result<()> {
+    fn route_batch(
+        &mut self,
+        step_id: u64,
+        mut remaining_partitions: HashSet<u32>,
+        wr: WorkerResponse,
+    ) -> anyhow::Result<()> {
         match wr.kind {
             ResponseKind::Result => {
                 let r = wr
@@ -687,7 +710,21 @@ impl UniprocExecutor {
                         r.step_id
                     );
                 }
+                for partition in &r.partitions {
+                    anyhow::ensure!(
+                        remaining_partitions.remove(&partition.partition_id),
+                        "worker returned duplicate or unknown partition {} for step {step_id}",
+                        partition.partition_id
+                    );
+                }
+                anyhow::ensure!(
+                    !r.partitions.is_empty() || remaining_partitions.is_empty(),
+                    "worker returned an empty partial completion for step {step_id}"
+                );
                 enqueue_ready(&mut self.ready, r);
+                if !remaining_partitions.is_empty() {
+                    self.submit_completion_poll(step_id, remaining_partitions)?;
+                }
                 Ok(())
             }
             ResponseKind::Error => {
@@ -710,6 +747,28 @@ impl UniprocExecutor {
             }
             kind => bail!("unexpected execute response kind: {kind:?}"),
         }
+    }
+
+    fn submit_completion_poll(
+        &mut self,
+        step_id: u64,
+        remaining_partitions: HashSet<u32>,
+    ) -> anyhow::Result<()> {
+        let call_id = self.alloc_call_id();
+        let mut request = WorkerRequest::poll_completions(step_id);
+        request.call_id = Some(call_id);
+        let pending = self.send_request_checked(&request, "completion poll")?;
+        self.pending.insert(
+            call_id,
+            PendingRecord {
+                kind: OutstandingKind::Batch {
+                    step_id,
+                    remaining_partitions,
+                },
+                pending,
+            },
+        );
+        Ok(())
     }
 
     fn wait_for_one_response(&mut self) -> anyhow::Result<()> {
@@ -816,6 +875,11 @@ impl Executor for UniprocExecutor {
             self.ensure_slot()?;
         }
         let step_id = batch.step_id;
+        let remaining_partitions = batch
+            .partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .collect::<HashSet<_>>();
         let call_id = self.alloc_call_id();
         let mut req = WorkerRequest::execute(batch);
         req.call_id = Some(call_id);
@@ -823,7 +887,10 @@ impl Executor for UniprocExecutor {
         self.pending.insert(
             call_id,
             PendingRecord {
-                kind: OutstandingKind::Batch { step_id },
+                kind: OutstandingKind::Batch {
+                    step_id,
+                    remaining_partitions,
+                },
                 pending,
             },
         );
@@ -1003,32 +1070,18 @@ pub(crate) fn nano_id() -> u64 {
     (nanos << 16) | (seq & 0xffff)
 }
 
-fn effective_worker_pipeline_depth(requested: usize, tp_size: u32) -> usize {
-    let requested = requested.max(1);
-    if tp_size > 1 {
-        // Tensor-parallel ranks must enter collectives in the same order. A
-        // per-rank Python pipeline can let one rank finalize an older response
-        // while another rank starts the next forward, which is illegal for NCCL.
-        1
-    } else {
-        requested
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{effective_worker_pipeline_depth, enqueue_ready, nano_id};
+    use super::{OutstandingKind, PendingRecord, enqueue_ready, nano_id, release_consumed_request};
     use std::collections::{HashSet, VecDeque};
-    use uniserve_worker_wire::{CompletionReport, RegistrationAck};
+    use std::time::Duration;
+    use uniserve_worker_ipc_core::{ClientEndpoint, Header, ServerEndpoint};
+    use uniserve_worker_wire::CompletionReport;
 
     fn report(step_id: u64) -> CompletionReport {
         CompletionReport {
             step_id,
-            completions: Vec::new(),
-            products: Vec::new(),
-            registration: RegistrationAck::default(),
-            worker_exec_us: None,
-            forward_stats: None,
+            partitions: Vec::new(),
         }
     }
 
@@ -1046,14 +1099,6 @@ mod tests {
     }
 
     #[test]
-    fn tensor_parallel_workers_do_not_pipeline_across_collectives() {
-        assert_eq!(effective_worker_pipeline_depth(4, 1), 4);
-        assert_eq!(effective_worker_pipeline_depth(0, 1), 1);
-        assert_eq!(effective_worker_pipeline_depth(4, 2), 1);
-        assert_eq!(effective_worker_pipeline_depth(4, 8), 1);
-    }
-
-    #[test]
     fn ready_reports_preserve_worker_readiness_order() {
         let mut ready = VecDeque::new();
         enqueue_ready(&mut ready, report(9));
@@ -1061,5 +1106,57 @@ mod tests {
 
         assert_eq!(ready.pop_front().map(|value| value.step_id), Some(9));
         assert_eq!(ready.pop_front().map(|value| value.step_id), Some(4));
+    }
+
+    #[test]
+    fn consumed_response_releases_its_physical_request_credit() {
+        let service = format!(
+            "uniserve/worker/credit_{}_{}",
+            std::process::id(),
+            nano_id()
+        );
+        let mut server = ServerEndpoint::bind_with(&service, 64, 2, false).unwrap();
+        let client = ClientEndpoint::connect_with(&service, 64, 2, false).unwrap();
+        let header = |call_id| Header {
+            call_id,
+            ..Header::default()
+        };
+
+        let first = client.send_raw(header(1), &[]).unwrap();
+        let second = client.send_raw(header(2), &[]).unwrap();
+        assert_eq!(server.recv().unwrap().header.call_id, 1);
+        assert_eq!(server.recv().unwrap().header.call_id, 2);
+        server.respond_raw(header(1), &[]).unwrap();
+        assert_eq!(
+            client
+                .recv_response_timeout(&first, Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .header
+                .call_id,
+            1
+        );
+
+        let kind = release_consumed_request(PendingRecord {
+            kind: OutstandingKind::Control,
+            pending: first,
+        });
+        assert!(matches!(kind, OutstandingKind::Control));
+        let third = client.send_raw(header(3), &[]).unwrap();
+        assert_eq!(server.recv().unwrap().header.call_id, 3);
+
+        server.respond_raw(header(2), &[]).unwrap();
+        server.respond_raw(header(3), &[]).unwrap();
+        for (pending, call_id) in [(second, 2), (third, 3)] {
+            assert_eq!(
+                client
+                    .recv_response_timeout(&pending, Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .header
+                    .call_id,
+                call_id
+            );
+        }
     }
 }

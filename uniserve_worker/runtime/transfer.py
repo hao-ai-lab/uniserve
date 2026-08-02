@@ -21,6 +21,7 @@ Backends (one chosen per worker via :func:`make_transport`):
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -36,7 +37,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_error
+from ..foundation.product_transfer import (
+    MAX_TRANSFER_DESCRIPTOR_BYTES,
+    TRANSFER_DESCRIPTOR_PREFIX,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -44,6 +49,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Locator",
     "Transport",
+    "TransferTicket",
     "LocalTransport",
     "ShmTransport",
     "CudaIpcTransport",
@@ -52,8 +58,10 @@ __all__ = [
     "make_transport",
     "TransportKind",
     "TRANSPORTS",
+    "TRANSFER_DESCRIPTOR_PREFIX",
+    "decode_transfer_descriptor",
+    "encode_transfer_descriptor",
 ]
-
 
 class TransportKind(StrEnum):
     LOCAL = "local"
@@ -132,6 +140,56 @@ class Locator:
         if not isinstance(value, dict):
             raise invalid_descriptor("locator wire value must be a JSON object")
         return Locator.from_wire(value)
+
+
+def encode_transfer_descriptor(
+    kind: str,
+    value: dict[str, object],
+    producer_plan_digest: str,
+) -> bytes:
+    if kind not in {"tensor", "kv"}:
+        raise invalid_descriptor("transport entry kind is invalid")
+    if not _is_sha256(producer_plan_digest):
+        raise invalid_descriptor("transport entry producer plan digest is invalid")
+    encoded = TRANSFER_DESCRIPTOR_PREFIX + _canonical_json(
+        {
+            "kind": kind,
+            "producer_plan_digest": producer_plan_digest,
+            "value": value,
+        }
+    )
+    if len(encoded) > MAX_TRANSFER_DESCRIPTOR_BYTES:
+        raise invalid_descriptor("transport entry exceeds its descriptor bound")
+    return encoded
+
+
+def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object], str]:
+    if not raw.startswith(TRANSFER_DESCRIPTOR_PREFIX):
+        raise invalid_descriptor("transport entry prefix is invalid")
+    if len(raw) > MAX_TRANSFER_DESCRIPTOR_BYTES:
+        raise invalid_descriptor("transport entry exceeds its descriptor bound")
+    try:
+        value = json.loads(raw[len(TRANSFER_DESCRIPTOR_PREFIX) :])
+    except json.JSONDecodeError as error:
+        raise invalid_descriptor(f"transport entry JSON is invalid: {error}") from error
+    if _canonical_json(value) != raw[len(TRANSFER_DESCRIPTOR_PREFIX) :]:
+        raise invalid_descriptor("transport entry JSON is not canonical")
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "producer_plan_digest",
+        "value",
+    }:
+        raise invalid_descriptor("transport entry has an invalid shape")
+    kind = value["kind"]
+    if kind not in {"tensor", "kv"}:
+        raise invalid_descriptor("transport entry kind is invalid")
+    digest = value["producer_plan_digest"]
+    if not isinstance(digest, str) or not _is_sha256(digest):
+        raise invalid_descriptor("transport entry producer plan digest is invalid")
+    descriptor_value = value["value"]
+    if not isinstance(descriptor_value, dict):
+        raise invalid_descriptor("transport entry value is invalid")
+    return kind, descriptor_value, digest
 
 
 def fetch_locator(transport: "Transport", locator: Locator) -> "torch.Tensor":
@@ -269,6 +327,16 @@ class Transport(ABC):
     def fetch(self, locator: Locator) -> "torch.Tensor":
         """Read-driven: materialize the located tensor on this worker."""
 
+    def fetch_async(self, locator: Locator) -> "TransferTicket":
+        """Submit a read without waiting for remote or device progress."""
+
+        raise capability_mismatch(f"{self.name} transport does not support asynchronous reads")
+
+    def ready(self, locator: Locator) -> bool:
+        """Query producer readiness without waiting."""
+
+        return True
+
     def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
         """Write-driven: write ``tensor`` to the remote buffer ``locator`` names.
 
@@ -284,23 +352,132 @@ class Transport(ABC):
         """Tear down the transport (engine, segments)."""
 
 
+class TransferTicket(ABC):
+    """One bounded transfer whose readiness is query-only on request threads."""
+
+    @abstractmethod
+    def ready(self) -> bool:
+        """Return whether the result can be obtained without waiting."""
+
+    @abstractmethod
+    def result(self) -> "torch.Tensor":
+        """Return the completed value, rejecting observation before readiness."""
+
+
+class _ImmediateTransferTicket(TransferTicket):
+    def __init__(self, value: "torch.Tensor") -> None:
+        self._value = value
+
+    def ready(self) -> bool:
+        return True
+
+    def result(self) -> "torch.Tensor":
+        return self._value
+
+
+class _FutureTransferTicket(TransferTicket):
+    def __init__(self, future: "concurrent.futures.Future[torch.Tensor]") -> None:
+        self._future = future
+
+    def ready(self) -> bool:
+        return self._future.done()
+
+    def result(self) -> "torch.Tensor":
+        if not self.ready():
+            raise RuntimeError("transfer ticket was observed before readiness")
+        return self._future.result()
+
+
+class _ByteCapacity:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = int(capacity)
+        if self.capacity < 1:
+            raise ValueError("transfer byte capacity must be positive")
+        self.used = 0
+        self._lock = threading.Lock()
+
+    def acquire(self, amount: int) -> None:
+        value = int(amount)
+        if value < 0:
+            raise ValueError("transfer byte reservation must not be negative")
+        with self._lock:
+            projected = self.used + value
+            if projected > self.capacity:
+                raise resource_error(
+                    f"transfer byte credit is exhausted ({projected}>{self.capacity})"
+                )
+            self.used = projected
+
+    def release(self, amount: int) -> None:
+        value = int(amount)
+        with self._lock:
+            if value < 0 or value > self.used:
+                raise RuntimeError("transfer byte release exceeds the live reservation")
+            self.used -= value
+
+
+class _BoundedTransferPool:
+    def __init__(
+        self,
+        *,
+        workers: int,
+        capacity: int,
+        byte_capacity: int | _ByteCapacity,
+        name: str,
+    ) -> None:
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix=name,
+        )
+        self._credits = threading.BoundedSemaphore(capacity)
+        self._bytes = (
+            byte_capacity if isinstance(byte_capacity, _ByteCapacity) else _ByteCapacity(byte_capacity)
+        )
+
+    def submit(self, operation: Any, *args: Any, nbytes: int) -> TransferTicket:
+        if not self._credits.acquire(blocking=False):
+            raise resource_error("asynchronous transfer ticket capacity is exhausted")
+        bytes_acquired = False
+        try:
+            self._bytes.acquire(nbytes)
+            bytes_acquired = True
+            future = self._executor.submit(operation, *args)
+        except BaseException:
+            if bytes_acquired:
+                self._bytes.release(nbytes)
+            self._credits.release()
+            raise
+        def release(_future: object) -> None:
+            self._bytes.release(nbytes)
+            self._credits.release()
+
+        future.add_done_callback(release)
+        return _FutureTransferTicket(future)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=False)
+
+
 class LocalTransport(Transport):
     """Same process, zero copy. The locator is a counter into a local table."""
 
     name = "local"
     supports_async_publication = True
 
-    def __init__(self) -> None:
+    def __init__(self, *, byte_capacity: int) -> None:
         self._table: dict[int, "torch.Tensor"] = {}
         self._next = 0
         self._lock = threading.Lock()
         self._session = f"local:{uuid.uuid4().hex}"
+        self._bytes = _ByteCapacity(byte_capacity)
 
     def session(self) -> str:
         return self._session
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
         t = tensor.detach()
+        nbytes = _nbytes(t)
+        self._bytes.acquire(nbytes)
         with self._lock:
             key = self._next
             self._next += 1
@@ -308,7 +485,7 @@ class LocalTransport(Transport):
         return Locator(
             transport="local",
             session=self._session,
-            nbytes=_nbytes(t),
+            nbytes=nbytes,
             dtype=_dtype_to_str(t.dtype),
             shape=tuple(t.shape),
             device=str(t.device),
@@ -325,6 +502,9 @@ class LocalTransport(Transport):
             raise invalid_descriptor(f"local locator {key} not registered (released?)")
         return t
 
+    def fetch_async(self, locator: Locator) -> TransferTicket:
+        return _ImmediateTransferTicket(self.fetch(locator))
+
     def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
         if locator.session != self._session:
             raise invalid_descriptor("local locator belongs to another transport session")
@@ -339,11 +519,16 @@ class LocalTransport(Transport):
         if locator.session != self._session:
             return
         with self._lock:
-            self._table.pop(int(locator.handle.decode()), None)
+            removed = self._table.pop(int(locator.handle.decode()), None)
+        if removed is not None:
+            self._bytes.release(locator.nbytes)
 
     def close(self) -> None:
         with self._lock:
+            values = tuple(self._table.values())
             self._table.clear()
+        for value in values:
+            self._bytes.release(_nbytes(value))
 
 
 class ShmTransport(Transport):
@@ -362,13 +547,15 @@ class ShmTransport(Transport):
     supports_async_publication = True
     _MAX_LIVE_SEGMENTS = 256
 
-    def __init__(self) -> None:
+    def __init__(self, *, byte_capacity: int) -> None:
         from collections import OrderedDict
 
         self._segments: "OrderedDict[str, Any]" = OrderedDict()  # name -> SharedMemory (LRU)
         self._pending: dict[str, tuple[Any, Any]] = {}
         self._release_pending: set[str] = set()
+        self._publication_bytes: dict[str, int] = {}
         self._lock = threading.Lock()
+        self._bytes = _ByteCapacity(byte_capacity)
         self._publication_queue: queue.Queue[tuple[str, Any, int, Any, Any] | None] = queue.Queue()
         self._publication_worker = threading.Thread(
             target=self._complete_publications,
@@ -376,6 +563,12 @@ class ShmTransport(Transport):
             daemon=True,
         )
         self._publication_worker.start()
+        self._reads = _BoundedTransferPool(
+            workers=2,
+            capacity=self._MAX_LIVE_SEGMENTS,
+            byte_capacity=self._bytes,
+            name="uniserve-shm-read",
+        )
 
     def _complete_publications(self) -> None:
         import torch
@@ -416,7 +609,9 @@ class ShmTransport(Transport):
                     self._release_pending.discard(name)
                     if release:
                         self._segments.pop(name, None)
+                        released_bytes = self._publication_bytes.pop(name, 0)
                 if release:
+                    self._bytes.release(released_bytes)
                     shm.close()
                     try:
                         shm.unlink()
@@ -439,18 +634,20 @@ class ShmTransport(Transport):
             shm.unlink()
             raise RuntimeError("shared-memory segment has no writable buffer")
         memoryview(shm_buffer)[:nbytes] = bytes(raw.numpy())
-        evicted: list[Any] = []
+        try:
+            self._bytes.acquire(nbytes)
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
         with self._lock:
+            if len(self._segments) >= self._MAX_LIVE_SEGMENTS:
+                shm.close()
+                shm.unlink()
+                self._bytes.release(nbytes)
+                raise resource_error("shared-memory transport publication capacity is exhausted")
             self._segments[shm.name] = shm
-            while len(self._segments) > self._MAX_LIVE_SEGMENTS:
-                _, old = self._segments.popitem(last=False)
-                evicted.append(old)
-        for old in evicted:
-            old.close()
-            try:
-                old.unlink()
-            except FileNotFoundError:
-                pass
+            self._publication_bytes[shm.name] = nbytes
         return Locator(
             transport="shm",
             session=self.name,
@@ -477,26 +674,27 @@ class ShmTransport(Transport):
         shm = shared_memory.SharedMemory(create=True, size=max(1, nbytes + 1))
         shm_buffer = shm.buf
         if shm_buffer is None:
+            shm.close()
+            shm.unlink()
             raise RuntimeError("shared-memory segment has no writable buffer")
         shm_buffer[0] = 0
+        try:
+            self._bytes.acquire(nbytes)
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
 
-        evicted: list[Any] = []
         with self._lock:
+            if len(self._segments) >= self._MAX_LIVE_SEGMENTS:
+                shm.close()
+                shm.unlink()
+                self._bytes.release(nbytes)
+                raise resource_error("shared-memory transport publication capacity is exhausted")
             self._segments[shm.name] = shm
+            self._publication_bytes[shm.name] = nbytes
             self._pending[shm.name] = (host, event)
-            while len(self._segments) > self._MAX_LIVE_SEGMENTS:
-                name, old = self._segments.popitem(last=False)
-                if name in self._pending:
-                    self._segments[name] = old
-                    break
-                evicted.append(old)
         self._publication_queue.put((shm.name, shm, nbytes, host, event))
-        for old in evicted:
-            old.close()
-            try:
-                old.unlink()
-            except FileNotFoundError:
-                pass
         return Locator(
             transport="shm",
             session=self.name,
@@ -539,6 +737,24 @@ class ShmTransport(Transport):
             out = out.to(locator.device)
         return out
 
+    def ready(self, locator: Locator) -> bool:
+        header = int(locator.meta.get("ready_header_bytes", 0))
+        if header == 0:
+            return True
+        from multiprocessing import shared_memory
+
+        try:
+            shm = shared_memory.SharedMemory(name=locator.handle.decode())
+        except FileNotFoundError:
+            return False
+        try:
+            return bool(shm.buf is not None and int(shm.buf[0]) != 0)
+        finally:
+            shm.close()
+
+    def fetch_async(self, locator: Locator) -> TransferTicket:
+        return self._reads.submit(self.fetch, locator, nbytes=locator.nbytes)
+
     def release(self, locator: Locator) -> None:
         name = locator.handle.decode()
         with self._lock:
@@ -546,9 +762,11 @@ class ShmTransport(Transport):
             if pending:
                 self._release_pending.add(name)
             shm = self._segments.pop(name, None)
+            released_bytes = 0 if pending else self._publication_bytes.pop(name, 0)
         if pending:
             return
         if shm is not None:
+            self._bytes.release(released_bytes)
             shm.close()
             try:
                 shm.unlink()
@@ -558,10 +776,14 @@ class ShmTransport(Transport):
     def close(self) -> None:
         self._publication_queue.put(None)
         self._publication_worker.join()
+        self._reads.close()
         with self._lock:
-            segs = list(self._segments.values())
+            segs = list(self._segments.items())
             self._segments.clear()
-        for shm in segs:
+            publication_bytes = self._publication_bytes
+            self._publication_bytes = {}
+        for name, shm in segs:
+            self._bytes.release(publication_bytes.get(name, 0))
             shm.close()
             try:
                 shm.unlink()
@@ -578,27 +800,53 @@ class CudaIpcTransport(Transport):
     name = "cuda_ipc"
     supports_async_publication = True
 
-    def __init__(self) -> None:
-        self._alive: dict[int, "torch.Tensor"] = {}  # data_ptr -> kept-alive tensor
+    def __init__(self, *, byte_capacity: int) -> None:
+        self._alive: dict[str, tuple["torch.Tensor", "torch.cuda.Event"]] = {}
         self._lock = threading.Lock()
+        self._bytes = _ByteCapacity(byte_capacity)
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
         from torch.multiprocessing.reductions import reduce_tensor
 
         if not tensor.is_cuda:
             raise invalid_descriptor("cuda_ipc transport requires a CUDA tensor")
-        t = tensor.detach().contiguous()
+        import torch
+
+        source = tensor.detach().contiguous()
+        nbytes = _nbytes(source)
+        self._bytes.acquire(nbytes)
+        try:
+            t = source.clone()
+        except BaseException:
+            self._bytes.release(nbytes)
+            raise
+        event = torch.cuda.Event(interprocess=True)
+        event.record(torch.cuda.current_stream(source.device))
+        publication_id = uuid.uuid4().hex
         with self._lock:
-            self._alive[int(t.data_ptr())] = t  # source storage must outlive the read
-        rebuild, args = reduce_tensor(t)
+            if len(self._alive) >= 256:
+                self._bytes.release(nbytes)
+                raise resource_error("CUDA IPC publication capacity is exhausted")
+            self._alive[publication_id] = (t, event)
+        try:
+            rebuild, args = reduce_tensor(t)
+        except BaseException:
+            with self._lock:
+                self._alive.pop(publication_id, None)
+            self._bytes.release(nbytes)
+            raise
         return Locator(
             transport="cuda_ipc",
             session=self.name,
-            nbytes=_nbytes(t),
+            nbytes=nbytes,
             dtype=_dtype_to_str(t.dtype),
             shape=tuple(t.shape),
             device=str(t.device),
             handle=pickle.dumps((rebuild, args), protocol=pickle.HIGHEST_PROTOCOL),
+            meta={
+                "event_handle_b64": base64.b64encode(event.ipc_handle()).decode("ascii"),
+                "publication_id": publication_id,
+            },
         )
 
     def _open(self, locator: Locator) -> "torch.Tensor":
@@ -606,19 +854,39 @@ class CudaIpcTransport(Transport):
         return rebuild(*args)  # view into the producer's VRAM
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
+        import torch
+
+        event_handle = locator.meta.get("event_handle_b64")
+        if not isinstance(event_handle, str):
+            raise invalid_descriptor("CUDA IPC locator has no producer event")
+        event = torch.cuda.Event.from_ipc_handle(
+            torch.device(locator.device),
+            base64.b64decode(event_handle.encode("ascii")),
+        )
+        torch.cuda.current_stream(torch.device(locator.device)).wait_event(event)
         return self._open(locator).clone()
+
+    def fetch_async(self, locator: Locator) -> TransferTicket:
+        return _ImmediateTransferTicket(self.fetch(locator))
 
     def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
         self._open(locator).copy_(tensor.detach())
 
     def release(self, locator: Locator) -> None:
-        # The producer drops its kept-alive tensor when the host releases the
-        # handle; we cannot match a specific ptr from the consumer side cheaply.
-        return None
+        publication_id = locator.meta.get("publication_id")
+        if not isinstance(publication_id, str):
+            return
+        with self._lock:
+            removed = self._alive.pop(publication_id, None)
+        if removed is not None:
+            self._bytes.release(locator.nbytes)
 
     def close(self) -> None:
         with self._lock:
+            alive = tuple(self._alive.values())
             self._alive.clear()
+        for tensor, _event in alive:
+            self._bytes.release(_nbytes(tensor))
 
 
 class MooncakeTransport(Transport):
@@ -640,6 +908,7 @@ class MooncakeTransport(Transport):
         protocol: str = "rdma",
         hostname: str | None = None,
         metadata_server: str = "P2PHANDSHAKE",
+        byte_capacity: int,
     ) -> None:
         _ensure_mooncake_runtime()
         from mooncake.engine import TransferEngine
@@ -654,30 +923,60 @@ class MooncakeTransport(Transport):
             )
         port = self.engine.get_rpc_port()
         self._session = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-        self._registered: set[int] = set()  # register-once, by data_ptr
+        self._registered: dict[int, int] = {}
         self._alive: dict[int, "torch.Tensor"] = {}
+        self._producer_events: dict[int, "torch.cuda.Event"] = {}
         self._lock = threading.Lock()
+        self._bytes = _ByteCapacity(byte_capacity)
+        self._reads = _BoundedTransferPool(
+            workers=2,
+            capacity=256,
+            byte_capacity=self._bytes,
+            name="uniserve-mooncake-read",
+        )
 
     def session(self) -> str:
         return self._session
 
-    def _register_once(self, ptr: int, nbytes: int) -> None:
+    def _register_once(self, ptr: int, nbytes: int) -> bool:
         with self._lock:
-            if ptr in self._registered:
-                return
+            registered = self._registered.get(ptr)
+            if registered is not None:
+                if registered != nbytes:
+                    raise invalid_descriptor(
+                        "Mooncake buffer address was reused with a different byte extent"
+                    )
+                return False
         rc = self.engine.register_memory(ptr, nbytes)
         if rc != 0:
             raise capability_mismatch(f"Mooncake register_memory failed (code {rc})")
         with self._lock:
-            self._registered.add(ptr)
+            self._registered[ptr] = nbytes
+        return True
 
-    def publish(self, tensor: "torch.Tensor") -> Locator:
+    def _unregister(self, ptr: int) -> None:
+        with self._lock:
+            registered = self._registered.pop(ptr, None)
+        if registered is not None:
+            self.engine.unregister_memory(ptr)
+
+    def _publish_owned(
+        self,
+        tensor: "torch.Tensor",
+        event: "torch.cuda.Event | None" = None,
+    ) -> Locator:
         t = tensor.detach().contiguous()
         ptr = int(t.data_ptr())
         nbytes = _nbytes(t)
-        self._register_once(ptr, nbytes)
+        try:
+            self._register_once(ptr, nbytes)
+        except BaseException:
+            self._bytes.release(nbytes)
+            raise
         with self._lock:
-            self._alive[ptr] = t  # keep the source buffer alive for remote reads
+            self._alive[ptr] = t
+            if event is not None:
+                self._producer_events[ptr] = event
         return Locator(
             transport="mooncake",
             session=self._session,
@@ -688,6 +987,45 @@ class MooncakeTransport(Transport):
             addr=ptr,
         )
 
+    def publish(self, tensor: "torch.Tensor") -> Locator:
+        nbytes = _nbytes(tensor)
+        self._bytes.acquire(nbytes)
+        try:
+            owned = tensor.detach().clone()
+        except BaseException:
+            self._bytes.release(nbytes)
+            raise
+        return self._publish_owned(owned)
+
+    def publish_async(self, tensor: "torch.Tensor") -> Locator:
+        import torch
+
+        nbytes = _nbytes(tensor)
+        self._bytes.acquire(nbytes)
+        try:
+            owned = tensor.detach().clone()
+        except BaseException:
+            self._bytes.release(nbytes)
+            raise
+        try:
+            event = None
+            if owned.is_cuda:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(owned.device))
+        except BaseException:
+            self._bytes.release(nbytes)
+            raise
+        return self._publish_owned(owned, event)
+
+    def ready(self, locator: Locator) -> bool:
+        with self._lock:
+            event = self._producer_events.get(int(locator.addr))
+            alive = int(locator.addr) in self._alive
+        return alive and (event is None or bool(event.query()))
+
+    def fetch_async(self, locator: Locator) -> TransferTicket:
+        return self._reads.submit(self.fetch, locator, nbytes=locator.nbytes)
+
     def fetch(self, locator: Locator) -> "torch.Tensor":
         import torch
 
@@ -695,32 +1033,49 @@ class MooncakeTransport(Transport):
             locator.shape, dtype=_dtype_from_str(locator.dtype), device=locator.device
         )
         dptr = int(dst.data_ptr())
-        self._register_once(dptr, locator.nbytes)
-        rc = self.engine.transfer_sync_read(locator.session, dptr, locator.addr, locator.nbytes)
-        if rc != 0:
-            raise capability_mismatch(f"Mooncake transfer_sync_read failed (code {rc})")
-        return dst
+        registered_here = self._register_once(dptr, locator.nbytes)
+        try:
+            rc = self.engine.transfer_sync_read(locator.session, dptr, locator.addr, locator.nbytes)
+            if rc != 0:
+                raise capability_mismatch(f"Mooncake transfer_sync_read failed (code {rc})")
+            return dst
+        finally:
+            if registered_here:
+                self._unregister(dptr)
 
     def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
         t = tensor.contiguous()
         ptr = int(t.data_ptr())
-        self._register_once(ptr, _nbytes(t))
-        rc = self.engine.transfer_sync_write(locator.session, ptr, locator.addr, locator.nbytes)
-        if rc != 0:
-            raise capability_mismatch(f"Mooncake transfer_sync_write failed (code {rc})")
+        registered_here = self._register_once(ptr, _nbytes(t))
+        try:
+            rc = self.engine.transfer_sync_write(locator.session, ptr, locator.addr, locator.nbytes)
+            if rc != 0:
+                raise capability_mismatch(f"Mooncake transfer_sync_write failed (code {rc})")
+        finally:
+            if registered_here:
+                self._unregister(ptr)
 
     def release(self, locator: Locator) -> None:
+        ptr = int(locator.addr)
         with self._lock:
-            self._alive.pop(int(locator.addr), None)
+            removed = self._alive.pop(ptr, None)
+            self._producer_events.pop(ptr, None)
+        self._unregister(ptr)
+        if removed is not None:
+            self._bytes.release(locator.nbytes)
 
     def close(self) -> None:
+        self._reads.close()
         with self._lock:
             ptrs = list(self._registered)
-            self._registered.clear()
+            alive = tuple(self._alive.values())
             self._alive.clear()
+            self._producer_events.clear()
+        for tensor in alive:
+            self._bytes.release(_nbytes(tensor))
         for ptr in ptrs:
             try:
-                self.engine.unregister_memory(ptr)
+                self._unregister(ptr)
             except Exception:
                 pass
 
@@ -771,15 +1126,16 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
             f"unknown transport {raw_name!r}; expected one of {TRANSPORTS}"
         ) from exc
     if kind is TransportKind.LOCAL:
-        return LocalTransport()
+        return LocalTransport(byte_capacity=int(cfg["byte_capacity"]))
     if kind is TransportKind.SHM:
-        return ShmTransport()
+        return ShmTransport(byte_capacity=int(cfg["byte_capacity"]))
     if kind is TransportKind.CUDA_IPC:
-        return CudaIpcTransport()
+        return CudaIpcTransport(byte_capacity=int(cfg["byte_capacity"]))
     if kind is TransportKind.MOONCAKE:
         return MooncakeTransport(
             device_name=str(cfg["device_name"]),
             protocol=str(cfg["protocol"]),
             hostname=cfg.get("hostname"),
+            byte_capacity=int(cfg["byte_capacity"]),
         )
     raise AssertionError(f"unhandled transport kind {kind!r}")

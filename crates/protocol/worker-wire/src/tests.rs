@@ -199,6 +199,64 @@ fn execute_round_trip(batch: Batch) -> Batch {
     decoded.batch.unwrap()
 }
 
+fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> {
+    let mut groups: Vec<(Domain, RouteId, Vec<Operation>)> = Vec::new();
+    for operation in operations {
+        if let Some((_, _, members)) = groups
+            .iter_mut()
+            .find(|(domain, route, _)| *domain == operation.domain && *route == operation.route)
+        {
+            members.push(operation);
+        } else {
+            groups.push((operation.domain, operation.route, vec![operation]));
+        }
+    }
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, (domain, route, operations))| BatchPartition {
+            partition_id: index as u32 + 1,
+            submission_group: index as u32 + 1,
+            collective_seq: index as u64 + 1,
+            domain,
+            route,
+            execution: ExecutionCapability::DomainHomogeneous,
+            attention: AttentionRegime::Hybrid,
+            shape_class: 0,
+            operations,
+        })
+        .collect()
+}
+
+fn batch_with_operations(
+    step_id: u64,
+    admissions: Vec<Admission>,
+    operations: Vec<Operation>,
+) -> Batch {
+    Batch::new(step_id, admissions, partitions_for_operations(operations))
+}
+
+fn partition_report(
+    step_id: u64,
+    completions: Vec<CompletionRecord>,
+    products: Vec<ProductPayload>,
+    visible: bool,
+    worker_exec_us: Option<u64>,
+    forward_stats: Option<WorkerForwardStats>,
+) -> CompletionReport {
+    CompletionReport {
+        step_id,
+        partitions: vec![PartitionCompletion {
+            partition_id: 1,
+            completions,
+            products,
+            registration: RegistrationAck { visible },
+            worker_exec_us,
+            forward_stats,
+        }],
+    }
+}
+
 #[test]
 fn every_work_variant_round_trips_through_the_wire() {
     let variants = [
@@ -222,9 +280,13 @@ fn every_work_variant_round_trips_through_the_wire() {
             "work table effect mismatch"
         );
         let operation = operation_for(work, OpId(100 + index as u64), advances);
-        let batch = execute_round_trip(Batch::new(1, Vec::new(), vec![operation.clone()]));
-        assert_eq!(batch.operations[0], operation);
-        assert_eq!(batch.operations[0].work, work);
+        let batch = execute_round_trip(batch_with_operations(
+            1,
+            Vec::new(),
+            vec![operation.clone()],
+        ));
+        assert_eq!(batch.operations().next().unwrap(), &operation);
+        assert_eq!(batch.operations().next().unwrap().work, work);
     }
 }
 
@@ -234,7 +296,8 @@ fn version_ref_device_point_round_trips() {
         request_key: request_key(),
         producer_op_id: OpId(9),
         point: Point::Device {
-            selected_point: selected_point_product(OpId(9)),
+            point_index: 0,
+            selected_point: Some(selected_point_product(OpId(9))),
             producer_plan_digest: digest_string(0xcc),
         },
     };
@@ -256,17 +319,20 @@ fn version_ref_device_point_round_trips() {
         None,
         0,
     );
-    let batch = execute_round_trip(Batch::new(2, Vec::new(), vec![operation]));
-    assert_eq!(batch.operations[0].parent, device_parent);
+    let batch = execute_round_trip(batch_with_operations(2, Vec::new(), vec![operation]));
+    assert_eq!(batch.operations().next().unwrap().parent, device_parent);
 }
 
 #[test]
 fn operation_carries_new_kv_blocks_across_the_wire() {
     let base = token_decode_operation();
     assert_eq!(base.new_kv_blocks, vec![BlockId(7)]);
-    let batch = execute_round_trip(Batch::new(9, Vec::new(), vec![base.clone()]));
-    assert_eq!(batch.operations[0].new_kv_blocks, vec![BlockId(7)]);
-    assert_eq!(batch.operations[0], base);
+    let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
+    assert_eq!(
+        batch.operations().next().unwrap().new_kv_blocks,
+        vec![BlockId(7)]
+    );
+    assert_eq!(batch.operations().next().unwrap(), &base);
     // The appended KV blocks are a registration field: changing them changes the
     // plan digest.
     let mut more = token_decode_operation();
@@ -279,17 +345,17 @@ fn completion_report_round_trips_records_and_product_payloads() {
     let mut logprob = output_product(OpId(11));
     logprob.output_index = 2;
     logprob.kind = ProductKind::Logprob;
-    let report = CompletionReport {
-        step_id: 5,
-        completions: vec![completion_record()],
-        products: vec![ProductPayload {
+    let report = partition_report(
+        5,
+        vec![completion_record()],
+        vec![ProductPayload {
             product: logprob,
             bytes: vec![1, 2, 3, 4],
         }],
-        registration: RegistrationAck { visible: true },
-        worker_exec_us: Some(10),
-        forward_stats: None,
-    };
+        true,
+        Some(10),
+        None,
+    );
     let response = WorkerResponse::completion_report(report.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
     assert_eq!(decoded.completion_report.unwrap(), report);
@@ -305,17 +371,17 @@ fn completion_product_value_respects_its_registered_bound() {
     logprob.shape_bound = ShapeBound {
         dims: vec![DimBound::Static(3)],
     };
-    let report = CompletionReport {
-        step_id: 5,
-        completions: vec![completion_record()],
-        products: vec![ProductPayload {
+    let report = partition_report(
+        5,
+        vec![completion_record()],
+        vec![ProductPayload {
             product: logprob,
             bytes: vec![1, 2, 3, 4],
         }],
-        registration: RegistrationAck { visible: true },
-        worker_exec_us: Some(10),
-        forward_stats: None,
-    };
+        true,
+        Some(10),
+        None,
+    );
 
     assert!(report.validate().is_err());
 }
@@ -325,18 +391,19 @@ fn error_completion_round_trips_with_its_error_code() {
     let mut record = completion_record();
     record.status = OpStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
-    let report = CompletionReport {
-        step_id: 6,
-        completions: vec![record.clone()],
-        products: Vec::new(),
-        registration: RegistrationAck { visible: false },
-        worker_exec_us: None,
-        forward_stats: None,
-    };
+    let report = partition_report(6, vec![record.clone()], Vec::new(), false, None, None);
     let decoded =
         decode_response(&encode_response(&WorkerResponse::completion_report(report)).unwrap())
             .unwrap();
-    assert_eq!(decoded.completion_report.unwrap().completions[0], record);
+    assert_eq!(
+        decoded
+            .completion_report
+            .unwrap()
+            .completions()
+            .next()
+            .unwrap(),
+        &record
+    );
 }
 
 #[test]
@@ -359,7 +426,7 @@ fn every_control_variant_round_trips_through_the_wire() {
         request_key: request_key(),
         op_id: OpId(11),
     };
-    let batch = Batch::new(3, vec![admission()], vec![token_decode_operation()])
+    let batch = batch_with_operations(3, vec![admission()], vec![token_decode_operation()])
         .with_controls(vec![commit.clone(), close.clone(), release.clone()]);
     let decoded = execute_round_trip(batch);
     assert_eq!(decoded.controls, vec![commit, close, release]);
@@ -367,7 +434,7 @@ fn every_control_variant_round_trips_through_the_wire() {
 
 #[test]
 fn admission_round_trips_and_binds_its_operation() {
-    let batch = execute_round_trip(Batch::new(
+    let batch = execute_round_trip(batch_with_operations(
         4,
         vec![admission()],
         vec![token_decode_operation()],
@@ -457,7 +524,10 @@ fn batch_rejects_two_operations_for_one_request() {
     let batch = Batch {
         step_id: 1,
         admissions: Vec::new(),
-        operations: vec![token_decode_operation(), token_decode_operation()],
+        partitions: partitions_for_operations(vec![
+            token_decode_operation(),
+            token_decode_operation(),
+        ]),
         controls: Vec::new(),
         input_products: Vec::new(),
     };
@@ -515,7 +585,7 @@ fn batch_carries_host_supplied_input_product_values() {
     let mut operation = token_decode_operation();
     operation.inputs.push(token_input);
     operation.plan_digest = operation.compute_plan_digest();
-    let batch = Batch::new(1, vec![admission()], vec![operation])
+    let batch = batch_with_operations(1, vec![admission()], vec![operation])
         .with_input_products(vec![payload.clone()]);
     let decoded = execute_round_trip(batch);
     assert_eq!(decoded.input_products, vec![payload.clone()]);
@@ -535,7 +605,7 @@ fn batch_rejects_a_conflicting_control_identity() {
         public_event_limit: limit,
         disposition: Disposition::Publish,
     };
-    let batch = Batch::new(1, vec![admission()], vec![token_decode_operation()])
+    let batch = batch_with_operations(1, vec![admission()], vec![token_decode_operation()])
         .with_controls(vec![commit(1), commit(2)]);
     assert!(batch.validate().is_err());
 }
@@ -550,7 +620,7 @@ fn batch_allows_a_duplicate_identical_control() {
         public_event_limit: 1,
         disposition: Disposition::Publish,
     };
-    let batch = Batch::new(1, vec![admission()], vec![token_decode_operation()])
+    let batch = batch_with_operations(1, vec![admission()], vec![token_decode_operation()])
         .with_controls(vec![commit.clone(), commit]);
     assert!(batch.validate().is_ok());
 }
@@ -580,7 +650,8 @@ fn commit_control_requires_a_fixed_selected_version() {
         request_key: request_key(),
         producer_op_id: OpId(9),
         point: Point::Device {
-            selected_point: selected_point_product(OpId(9)),
+            point_index: 0,
+            selected_point: Some(selected_point_product(OpId(9))),
             producer_plan_digest: digest_string(0xcc),
         },
     };
@@ -740,7 +811,8 @@ fn comprehensive_batch() -> Batch {
                 request_key: key,
                 producer_op_id: OpId(9),
                 point: Point::Device {
-                    selected_point: product_for(key, OpId(9), 0, ProductKind::SelectedPoint),
+                    point_index: 0,
+                    selected_point: Some(product_for(key, OpId(9), 0, ProductKind::SelectedPoint)),
                     producer_plan_digest: digest_string(0xcc),
                 },
             }
@@ -859,16 +931,21 @@ fn comprehensive_batch() -> Batch {
         product: input_product,
         bytes: encode_token_product_bytes(&[7, 8, 9, 10]),
     }];
-    Batch::new(42, vec![und_admission, gen_admission], operations)
+    batch_with_operations(42, vec![und_admission, gen_admission], operations)
         .with_controls(controls)
         .with_input_products(input_products)
 }
 
 fn snapshot_fixture() -> SnapshotRef {
     SnapshotRef {
-        session_id: RequestId(9),
-        epoch: 3,
-        version: 17,
+        version: VersionRef {
+            request_key: RequestKey::new(1, RequestId(9), 3),
+            producer_op_id: OpId(17),
+            point: Point::Fixed {
+                point_index: 17,
+                semantic_digest: digest_string(0xdc),
+            },
+        },
         digest: digest_string(0xdd),
         locator: digest_string(0xdd),
     }
@@ -881,6 +958,7 @@ fn request_fixtures() -> Vec<WorkerRequest> {
     vec![
         WorkerRequest::get_capabilities(),
         execute,
+        WorkerRequest::poll_completions(42),
         WorkerRequest::drop_session(RequestId(42)),
         WorkerRequest::shutdown(),
         WorkerRequest::copy_kv(vec![(BlockId(1), BlockId(2)), (BlockId(3), BlockId(4))]),
@@ -930,12 +1008,31 @@ fn full_caps() -> EngineCaps {
         adapter_mode: AdapterMode::PerRequest,
         execution_constraints: ExecutionConstraints {
             max_batch_operations: 64,
+            route_capabilities: vec![RouteExecutionCapability {
+                route: RouteId(0),
+                supported_work: WorkVariant::ALL.to_vec(),
+                tensorized_mixed: true,
+                sampling_ownership: SamplingOwnership::DesignatedRank,
+                preemptible: false,
+                credits: ExecutionConstraints::default().route_capabilities[0].credits,
+            }],
             ..ExecutionConstraints::default()
         },
         resource_classes: vec![ResourceClass::KvBlock, ResourceClass::Adapter],
         model_spec_digest: digest_string(0x21),
         weight_digest: digest_string(0x22),
-        restored_sessions: vec![RequestId(5), RequestId(6)],
+        restored_snapshots: vec![
+            SnapshotRef {
+                version: VersionRef::admission_root(session_key(5), OpId(1), digest_string(0x23)),
+                digest: digest_string(0x24),
+                locator: digest_string(0x24),
+            },
+            SnapshotRef {
+                version: VersionRef::admission_root(session_key(6), OpId(1), digest_string(0x25)),
+                digest: digest_string(0x26),
+                locator: digest_string(0x26),
+            },
+        ],
         ..EngineCaps::default()
     };
     caps.route_capability_digest = caps.compute_route_capability_digest();
@@ -1050,14 +1147,14 @@ fn full_completion_report() -> CompletionReport {
             bytes: (0..=255).collect(),
         },
     ];
-    CompletionReport {
-        step_id: 5,
-        completions: vec![ok_record, predicated_record, error_record],
+    partition_report(
+        5,
+        vec![ok_record, predicated_record, error_record],
         products,
-        registration: RegistrationAck { visible: true },
-        worker_exec_us: Some(1234),
-        forward_stats: Some(full_forward_stats()),
-    }
+        true,
+        Some(1234),
+        Some(full_forward_stats()),
+    )
 }
 
 fn full_metrics() -> WorkerMetrics {
@@ -1263,7 +1360,7 @@ fn decode_step_batch(operations: usize) -> Batch {
             )
         })
         .collect();
-    Batch::new(1, Vec::new(), ops)
+    batch_with_operations(1, Vec::new(), ops)
 }
 
 #[test]
@@ -1273,6 +1370,9 @@ fn bench_decode_unpack_vs_accessor() {
     let request_bytes = encode_request(&request).unwrap();
     let mut payload_batch = decode_step_batch(35);
     let payload_operation = payload_batch
+        .partitions
+        .first_mut()
+        .expect("decode benchmark has a partition")
         .operations
         .first_mut()
         .expect("decode benchmark has operations");
@@ -1296,7 +1396,7 @@ fn bench_decode_unpack_vs_accessor() {
         }]));
     let payload_request_bytes = encode_request(&payload_request).unwrap();
     let mut report = full_completion_report();
-    report.products[1].bytes = vec![0xa5; 4 << 20];
+    report.partitions[0].products[1].bytes = vec![0xa5; 4 << 20];
     let response_bytes = encode_response(&WorkerResponse::completion_report(report)).unwrap();
 
     let time = |mut run: Box<dyn FnMut()>| {

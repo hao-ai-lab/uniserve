@@ -415,6 +415,7 @@ mod tests {
                 bytes: 123,
                 sha256: "a".repeat(64),
                 pixels_png_b64: String::new(),
+                public_commit: None,
             },
         ];
         let contract = native_image_contract(&events).expect("native image contract");

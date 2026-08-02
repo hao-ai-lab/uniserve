@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 
-from ..batch import Batch, CompletionReport
+from ..batch import Batch, CompletionReport, SnapshotRef
 from ..capabilities import RequestKind, ResourceClass, work_variants_for_operation_types
 from ..execution import ModelExecutor
 from ..foundation.errors import unsupported_control
@@ -16,7 +16,7 @@ from ..runtime.mover import Mover
 from ..runtime.product_store import ProductRecord, ProductStore
 from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
-from ..runtime.snapshot_store import SnapshotProvider, SnapshotRef
+from ..runtime.snapshot_store import SnapshotProvider
 from ..runtime.transfer import Locator
 from ..spec import OperationType
 from .protocol import WorkerContract, model_free_capabilities
@@ -60,22 +60,31 @@ class SystemWorker:
             supported_controls=controls,
             resource_classes=(ResourceClass.ENCODER_OUTPUT,),
             pipeline_depth=pipeline_depth,
+            completion_payload_bytes=completion_payload_bytes,
         )
         self._contract = WorkerContract.compile(
             declared,
             allowed_operation_types=allowed_operation_types,
+            implemented_operation_types=allowed_operation_types,
             pipeline_depth=pipeline_depth,
             owner=type(self).__name__,
         )
         self.sessions = SessionStore()
         self.kv = KvStore()
         self.latents = LatentStore()
-        self.products = ProductStore()
+        self.products = ProductStore(
+            device_product_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
+                0
+            ].credits.worker.latent_artifact_bytes,
+        )
         self.replay = ReplayStore()
         self.mover = Mover(
             transfer_backend=transfer_backend,
             mooncake_device=mooncake_device,
             mooncake_protocol=mooncake_protocol,
+            transfer_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
+                0
+            ].credits.worker.transfer_bytes,
             cross_process=True,
         )
         self.trace = ExecutionTrace(hashlib.sha256(b"uniserve-system-worker").hexdigest())
@@ -99,6 +108,16 @@ class SystemWorker:
             trace=self.trace,
             pipeline_depth=pipeline_depth,
             completion_payload_bytes=completion_payload_bytes,
+            cpu_task_capacity=int(
+                self._contract.capabilities.execution_constraints.route_capabilities[
+                    0
+                ].credits.worker.cpu_tasks
+            ),
+            pinned_staging_capacity=int(
+                self._contract.capabilities.execution_constraints.route_capabilities[
+                    0
+                ].credits.worker.pinned_completion_staging_bytes
+            ),
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:
@@ -121,15 +140,15 @@ class SystemWorker:
                 adapters=None,
                 transport=self.mover.transport,
             )
-            restored = (
-                self.snapshot_provider.restore_latest() if restore_snapshots else ()
-            )
+            restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
             self._contract = replace(
                 self._contract,
                 capabilities=replace(
                     self._contract.capabilities,
-                    restored_sessions=tuple(
-                        sorted(reference.session_id for reference in restored)
+                    restored_snapshots=tuple(
+                        sorted(
+                            restored, key=lambda reference: reference.version.request_key.session_id
+                        )
                     ),
                 ),
             )
@@ -138,14 +157,11 @@ class SystemWorker:
     def contract(self) -> WorkerContract:
         return self._contract
 
+    def warmup(self) -> None:
+        self.executor.complete_startup()
+
     def execute(self, batch: Batch) -> CompletionReport:
-        result = self.executor.execute(batch)
-        if self.snapshot_provider is not None:
-            result = self.snapshot_provider.snapshot_execution(
-                {operation.request_key.session_id for operation in batch.operations},
-                result,
-            )
-        return result
+        return self.executor.execute(batch)
 
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
@@ -189,9 +205,7 @@ class SystemWorker:
         )
         self._release_records(records)
         self.products.release(tuple(int(handle) for handle in handles))
-        affected = self.sessions.discard_product_handles({int(handle) for handle in handles})
-        if self.snapshot_provider is not None and affected:
-            self.snapshot_provider.snapshot_sessions(affected)
+        self.sessions.discard_product_handles({int(handle) for handle in handles})
 
     def reset_prefix_cache(self) -> None:
         raise unsupported_control(RequestKind.RESET_PREFIX_CACHE.value)
@@ -221,6 +235,8 @@ class SystemWorker:
             }
         ]
 
+    def close(self) -> None:
+        self.executor.close()
         self.mover.close()
 
     def _release_records(self, records: tuple[ProductRecord, ...]) -> None:

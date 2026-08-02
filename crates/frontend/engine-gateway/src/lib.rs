@@ -23,7 +23,7 @@ pub use error::{Error, Result};
 pub use generation::{
     EngineSamplingParams, GenEvent, GenerationConstraint, GenerationEventStream,
     GenerationFinishReason, GenerationPositionLogprobs, GenerationSubmission,
-    GenerationTokenLogprob, ImageParams,
+    GenerationTokenLogprob, ImageParams, PublicCommit, PublicModality, SemanticRoot,
 };
 pub use mock::{MockClientMessage, MockEngine};
 pub use zmq::{EngineId, TransportMode, ZmqClientConfig, ZmqEngineCoreClient};
@@ -107,8 +107,9 @@ pub mod transport {
         EngineAppControl, EngineCoreClient, EngineCoreOutputStream, EngineCoreStreamOutput,
         EngineId, EngineSamplingParams, Error, GenEvent, GenerationConstraint,
         GenerationEventStream, GenerationFinishReason, GenerationSubmission, ImageParams,
-        InProcessEngineClient, MockClientMessage, MockEngine, Result, StreamCancelCause,
-        StreamControl, StreamControlRequest, TransportMode, ZmqClientConfig, ZmqEngineCoreClient,
+        InProcessEngineClient, MockClientMessage, MockEngine, PublicCommit, PublicModality, Result,
+        SemanticRoot, StreamCancelCause, StreamControl, StreamControlRequest, TransportMode,
+        ZmqClientConfig, ZmqEngineCoreClient,
     };
     pub use super::{generation, metrics, zmq};
 }

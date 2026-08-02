@@ -2,19 +2,21 @@
 //!
 //! A staged topology partitions each execution batch by exact [`WorkVariant`],
 //! sends every session admission to a pool before that pool's first operation
-//! for the session, and restores the scheduler's original operation order when
-//! pool completions arrive. A worker-local device product is directly reachable
+//! for the session, and publishes each independently ready partition by identity.
+//! A worker-local device product is directly reachable
 //! only within its producing pool. Cross-pool movement requires a declared
 //! `Transfer(Product)` whose destination reference belongs to the consumer.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerKind};
 use uniserve_worker_wire::{
-    Admission, Batch, CompletionRecord, CompletionReport, Control, EngineCaps, Operation,
-    ProductPayload, RegistrationAck, RequestKey, WorkVariant, WorkerForwardStats,
+    Admission, Batch, BatchPartition, CompletionReport, Control, EngineCaps, Operation,
+    ProductPayload, ProductRef, RequestKey, RouteExecutionCapability, RouteId,
+    TRANSFER_DESCRIPTOR_PREFIX, WorkVariant, is_transfer_descriptor,
 };
 
 struct PoolEntry {
@@ -23,13 +25,61 @@ struct PoolEntry {
 
 struct PendingStep {
     expected_pools: u64,
-    routes: Vec<usize>,
-    operations: Vec<Operation>,
-    outputs: Vec<Option<CompletionRecord>>,
-    products: Vec<ProductPayload>,
-    registration_visible: bool,
-    worker_exec_us: u64,
-    forward_stats: Option<WorkerForwardStats>,
+    partitions: Vec<BatchPartition>,
+    partition_routes: HashMap<u32, usize>,
+    returned_partitions: HashSet<u32>,
+}
+
+#[derive(Clone)]
+struct ProductRoute {
+    pool_index: usize,
+    producer_plan_digest: String,
+}
+
+fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, String)> {
+    anyhow::ensure!(
+        is_transfer_descriptor(bytes),
+        "cross-stage product has no transfer descriptor frame"
+    );
+    let encoded = &bytes[TRANSFER_DESCRIPTOR_PREFIX.len()..];
+    let value: serde_json::Value = serde_json::from_slice(encoded)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor is not an object"))?;
+    anyhow::ensure!(
+        object.len() == 3
+            && object.contains_key("kind")
+            && object.contains_key("producer_plan_digest")
+            && object.contains_key("value"),
+        "cross-stage transfer descriptor has an invalid shape"
+    );
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor has no kind"))?;
+    anyhow::ensure!(
+        matches!(kind, "tensor" | "kv")
+            && object
+                .get("value")
+                .is_some_and(serde_json::Value::is_object),
+        "cross-stage transfer descriptor has an invalid kind or value"
+    );
+    let digest = object
+        .get("producer_plan_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor has no plan digest"))?;
+    anyhow::ensure!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "cross-stage transfer descriptor plan digest is invalid"
+    );
+    anyhow::ensure!(
+        serde_json::to_vec(&value)? == encoded,
+        "cross-stage transfer descriptor is not canonical JSON"
+    );
+    Ok((kind.to_string(), digest.to_string()))
 }
 
 /// Routes a canonical typed batch across the pools of a staged topology.
@@ -42,6 +92,9 @@ pub struct StageRouter {
     ready: VecDeque<CompletionReport>,
     admissions: HashMap<RequestKey, Admission>,
     admitted_pools: HashSet<(usize, RequestKey)>,
+    operation_routes: HashMap<(RequestKey, uniserve_worker_wire::OpId), usize>,
+    product_routes: HashMap<ProductRef, ProductRoute>,
+    transfer_products: HashMap<ProductRef, ProductPayload>,
     next_call_id: u64,
 }
 
@@ -67,6 +120,14 @@ impl StageRouter {
         let mut routing = HashMap::new();
         for (index, (kind, executor)) in pools.iter().enumerate() {
             let caps = executor.caps();
+            caps.validate()
+                .with_context(|| format!("staged pool {index} reported invalid capabilities"))?;
+            anyhow::ensure!(
+                executor.pipeline_depth() == caps.pipeline_depth.max(1) as usize,
+                "staged pool {index} executor depth {} disagrees with capability depth {}",
+                executor.pipeline_depth(),
+                caps.pipeline_depth.max(1),
+            );
             for variant in kind.supported_work() {
                 if !caps.supported_work.contains(variant) {
                     continue;
@@ -102,6 +163,9 @@ impl StageRouter {
             ready: VecDeque::new(),
             admissions: HashMap::new(),
             admitted_pools: HashSet::new(),
+            operation_routes: HashMap::new(),
+            product_routes: HashMap::new(),
+            transfer_products: HashMap::new(),
             next_call_id: 1,
         })
     }
@@ -202,6 +266,85 @@ impl StageRouter {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
+        merged.execution_constraints.max_speculative_points = pools
+            .iter()
+            .map(|pool| {
+                pool.exec
+                    .caps()
+                    .execution_constraints
+                    .max_speculative_points
+            })
+            .min()
+            .unwrap_or(1);
+        merged.execution_constraints.device_sequence_lengths = pools.iter().all(|pool| {
+            pool.exec
+                .caps()
+                .execution_constraints
+                .device_sequence_lengths
+        });
+        merged.execution_constraints.device_append_offsets = pools
+            .iter()
+            .all(|pool| pool.exec.caps().execution_constraints.device_append_offsets);
+        merged.execution_constraints.incremental_kv_publication = pools.iter().all(|pool| {
+            pool.exec
+                .caps()
+                .execution_constraints
+                .incremental_kv_publication
+        });
+        let mut route_capabilities: HashMap<RouteId, RouteExecutionCapability> = HashMap::new();
+        for pool in pools {
+            for capability in pool.exec.caps().execution_constraints.route_capabilities {
+                match route_capabilities.get_mut(&capability.route) {
+                    Some(existing) => {
+                        anyhow::ensure!(
+                            existing.sampling_ownership == capability.sampling_ownership,
+                            "staged pools disagree on sampling ownership for route {}",
+                            capability.route.0
+                        );
+                        existing.tensorized_mixed &= capability.tensorized_mixed;
+                        existing.preemptible &= capability.preemptible;
+                        extend_unique(&mut existing.supported_work, capability.supported_work);
+                        existing.credits.per_request = existing
+                            .credits
+                            .per_request
+                            .checked_add(capability.credits.per_request)
+                            .context("staged route per-request credit sum overflowed")?;
+                    }
+                    None => {
+                        route_capabilities.insert(capability.route, capability);
+                    }
+                }
+            }
+        }
+        let aggregate_worker_credits =
+            pools
+                .iter()
+                .try_fold(uniserve_worker_wire::CreditVector::ZERO, |total, pool| {
+                    let capacity = pool
+                        .exec
+                        .caps()
+                        .execution_constraints
+                        .route_capabilities
+                        .first()
+                        .map(|capability| capability.credits.worker)
+                        .context("staged pool has no route credit capacity")?;
+                    total
+                        .checked_add(capacity)
+                        .context("staged worker credit sum overflowed")
+                })?;
+        for capability in route_capabilities.values_mut() {
+            let owning_pools = capability
+                .supported_work
+                .iter()
+                .filter_map(|variant| routing.get(variant).copied())
+                .collect::<HashSet<_>>();
+            capability.tensorized_mixed &= owning_pools.len() == 1;
+            capability.preemptible &= owning_pools.len() == 1;
+            capability.credits.worker = aggregate_worker_credits;
+        }
+        let mut route_capabilities = route_capabilities.into_values().collect::<Vec<_>>();
+        route_capabilities.sort_unstable_by_key(|capability| capability.route.0);
+        merged.execution_constraints.route_capabilities = route_capabilities;
 
         let flow = routed_caps(WorkVariant::GenFlow);
         merged.max_latent_size = flow.as_ref().map_or(0, |caps| caps.max_latent_size);
@@ -233,6 +376,9 @@ impl StageRouter {
         if let Some(decode) = routed_caps(WorkVariant::TokenDecode) {
             merged.adapter_mode = decode.adapter_mode;
         }
+        merged.restored_snapshots.clear();
+        merged.route_capability_digest = merged.compute_route_capability_digest();
+        merged.validate()?;
         Ok(merged)
     }
 
@@ -285,12 +431,24 @@ impl StageRouter {
     /// running this request's operation in this batch; a control for a request
     /// with no operation this batch is broadcast to every pool that has admitted
     /// the request.
-    fn control_pools(&self, batch: &Batch, request_key: RequestKey) -> Vec<usize> {
-        if let Some(pool_index) = batch
-            .operations
-            .iter()
-            .find(|operation| operation.request_key == request_key)
-            .and_then(|operation| self.routing.get(&operation.work.variant()).copied())
+    fn control_pools(&self, control: &Control) -> Vec<usize> {
+        let (request_key, producer_op_id) = match control {
+            Control::Commit {
+                request_key,
+                selected,
+                ..
+            } => (*request_key, selected.producer_op_id),
+            Control::Close {
+                request_key,
+                cutoff,
+                ..
+            } => (*request_key, cutoff.producer_op_id),
+            Control::Release { request_key, op_id } => (*request_key, *op_id),
+        };
+        if let Some(pool_index) = self
+            .operation_routes
+            .get(&(request_key, producer_op_id))
+            .copied()
         {
             return vec![pool_index];
         }
@@ -303,19 +461,24 @@ impl StageRouter {
         &mut self,
         pool_index: usize,
         step_id: u64,
-        operations: Vec<Operation>,
+        partitions: Vec<BatchPartition>,
         controls: Vec<Control>,
         input_products: Vec<ProductPayload>,
     ) -> anyhow::Result<bool> {
-        if operations.is_empty() && controls.is_empty() {
+        if partitions.is_empty() && controls.is_empty() {
             return Ok(false);
         }
+        let operations = partitions
+            .iter()
+            .flat_map(|partition| partition.operations.iter())
+            .cloned()
+            .collect::<Vec<_>>();
         let admissions = self.admissions_for(pool_index, &operations)?;
         let request_keys = admissions
             .iter()
             .map(|admission| admission.request_key)
             .collect::<Vec<_>>();
-        let partition = Batch::new(step_id, admissions, operations)
+        let partition = Batch::new(step_id, admissions, partitions)
             .with_controls(controls)
             .with_input_products(input_products);
         partition.validate()?;
@@ -339,6 +502,8 @@ impl StageRouter {
     }
 
     fn route_result(&mut self, pool_index: usize, report: CompletionReport) -> anyhow::Result<()> {
+        report.validate()?;
+        let mut report = report;
         let step_id = report.step_id;
         let pool_bit = Self::pool_bit(pool_index);
         {
@@ -350,42 +515,97 @@ impl StageRouter {
                 step.expected_pools & pool_bit != 0,
                 "pool {pool_index} returned a duplicate or unexpected result for step {step_id}"
             );
-            let slots = step
-                .routes
+            let expected_partition_ids = step
+                .partition_routes
                 .iter()
-                .enumerate()
-                .filter_map(|(slot, route)| (*route == pool_index).then_some(slot))
-                .collect::<Vec<_>>();
+                .filter_map(|(partition_id, route)| (*route == pool_index).then_some(*partition_id))
+                .collect::<HashSet<_>>();
             anyhow::ensure!(
-                slots.len() == report.completions.len(),
-                "pool {pool_index} returned {} completions for step {step_id}, expected {}",
-                report.completions.len(),
-                slots.len()
+                !report.partitions.is_empty() || expected_partition_ids.is_empty(),
+                "pool {pool_index} returned an empty partial report for step {step_id}"
             );
-            for (slot, completion) in slots.into_iter().zip(report.completions) {
+            for partition in &report.partitions {
                 anyhow::ensure!(
-                    step.outputs[slot].is_none(),
-                    "pool {pool_index} returned operation slot {slot} twice for step {step_id}"
+                    expected_partition_ids.contains(&partition.partition_id),
+                    "pool {pool_index} returned unexpected partition {} for step {step_id}",
+                    partition.partition_id
                 );
-                let operation = &step.operations[slot];
+                let planned = step
+                    .partitions
+                    .iter()
+                    .find(|planned| planned.partition_id == partition.partition_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "partition {} disappeared from pending step {step_id}",
+                            partition.partition_id
+                        )
+                    })?;
                 anyhow::ensure!(
-                    completion.request_key == operation.request_key
-                        && completion.op_id == operation.op_id,
-                    "pool {pool_index} completion identity does not match operation slot {slot} for step {step_id}"
+                    planned.operations.len() == partition.completions.len()
+                        && planned.operations.iter().zip(&partition.completions).all(
+                            |(operation, completion)| {
+                                operation.request_key == completion.request_key
+                                    && operation.op_id == completion.op_id
+                            }
+                        ),
+                    "pool {pool_index} completion identities do not match partition {} for step {step_id}",
+                    partition.partition_id
                 );
-                step.outputs[slot] = Some(completion);
+                anyhow::ensure!(
+                    step.returned_partitions.insert(partition.partition_id),
+                    "pool {pool_index} returned a partition twice for step {step_id}"
+                );
             }
-            step.expected_pools &= !pool_bit;
-            step.products.extend(report.products);
-            step.worker_exec_us = step
-                .worker_exec_us
-                .saturating_add(report.worker_exec_us.unwrap_or(0));
-            // A step is registration-visible only when every contributing
-            // partition reports its registration visible.
-            step.registration_visible &= report.registration.visible;
-            if step.forward_stats.is_none() {
-                step.forward_stats = report.forward_stats;
+            if expected_partition_ids
+                .iter()
+                .all(|partition_id| step.returned_partitions.contains(partition_id))
+            {
+                step.expected_pools &= !pool_bit;
             }
+        }
+        for partition in &mut report.partitions {
+            let mut visible_products = Vec::with_capacity(partition.products.len());
+            for product in partition.products.drain(..) {
+                if !is_transfer_descriptor(&product.bytes) {
+                    visible_products.push(product);
+                    continue;
+                }
+                let route = self.product_routes.get(&product.product).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pool {pool_index} returned an unplanned cross-stage product {:?}",
+                        product.product
+                    )
+                })?;
+                anyhow::ensure!(
+                    route.pool_index == pool_index,
+                    "pool {pool_index} returned a cross-stage product owned by pool {}",
+                    route.pool_index
+                );
+                let (kind, producer_plan_digest) = transfer_identity(&product.bytes)?;
+                anyhow::ensure!(
+                    producer_plan_digest == route.producer_plan_digest,
+                    "cross-stage product plan digest conflicts with its producer"
+                );
+                if let Some(existing) = self.transfer_products.get(&product.product) {
+                    anyhow::ensure!(
+                        existing == &product,
+                        "cross-stage product identity was reused with conflicting transport bytes"
+                    );
+                } else {
+                    self.transfer_products
+                        .insert(product.product.clone(), product.clone());
+                }
+                if kind == "kv" {
+                    visible_products.push(ProductPayload {
+                        product: product.product,
+                        bytes: Vec::new(),
+                    });
+                }
+            }
+            partition.products = visible_products;
+        }
+        if !report.partitions.is_empty() {
+            self.ready.push_back(report);
         }
         self.try_complete(step_id)
     }
@@ -402,26 +622,16 @@ impl StageRouter {
             .pending
             .remove(&step_id)
             .ok_or_else(|| anyhow::anyhow!("pending step {step_id} disappeared"))?;
-        let completions = step
-            .outputs
-            .into_iter()
-            .enumerate()
-            .map(|(slot, output)| {
-                output.ok_or_else(|| {
-                    anyhow::anyhow!("stage merge missed operation slot {slot} for step {step_id}")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        self.ready.push_back(CompletionReport {
-            step_id,
-            completions,
-            products: step.products,
-            registration: RegistrationAck {
-                visible: step.registration_visible,
-            },
-            worker_exec_us: Some(step.worker_exec_us),
-            forward_stats: step.forward_stats,
-        });
+        anyhow::ensure!(
+            step.returned_partitions.len() == step.partitions.len(),
+            "stage execution finished without every planned partition"
+        );
+        if step.partitions.is_empty() {
+            self.ready.push_back(CompletionReport {
+                step_id,
+                partitions: Vec::new(),
+            });
+        }
         Ok(())
     }
 
@@ -447,6 +657,12 @@ impl StageRouter {
             .retain(|request_key, _| request_key.session_id != session_id);
         self.admitted_pools
             .retain(|(_, request_key)| request_key.session_id != session_id);
+        self.operation_routes
+            .retain(|(request_key, _), _| request_key.session_id != session_id);
+        self.product_routes
+            .retain(|product, _| product.request_key.session_id != session_id);
+        self.transfer_products
+            .retain(|product, _| product.request_key.session_id != session_id);
     }
 }
 
@@ -482,44 +698,92 @@ impl Executor for StageRouter {
         );
         self.cache_admissions(&batch.admissions)?;
 
-        let mut partitions = (0..self.pools.len())
+        let mut pool_partitions = (0..self.pools.len())
             .map(|_| Vec::new())
-            .collect::<Vec<Vec<Operation>>>();
+            .collect::<Vec<Vec<BatchPartition>>>();
         let mut partition_inputs = (0..self.pools.len())
             .map(|_| Vec::new())
             .collect::<Vec<Vec<ProductPayload>>>();
-        let mut routes = Vec::with_capacity(batch.operations.len());
+        let mut partition_routes = HashMap::with_capacity(batch.partitions.len());
         let mut input_routes = HashMap::new();
-        for operation in &batch.operations {
-            let variant = operation.work.variant();
-            let pool_index = self.routing.get(&variant).copied().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "StageRouter has no pool for work variant {variant:?} in request {:?}",
-                    operation.request_key
-                )
-            })?;
-            // A generation flow routed to a pool other than the pool that runs
-            // the request's token lineage consumes its conditioning across the
-            // stage boundary; that dependency must be named by a declared input
-            // product so the consuming pool can resolve it from the data plane.
-            if variant == WorkVariant::GenFlow {
-                let token_pool = self
-                    .routing
-                    .get(&WorkVariant::TokenDecode)
-                    .or_else(|| self.routing.get(&WorkVariant::TokenExtend));
-                if token_pool.is_some_and(|token_pool| *token_pool != pool_index) {
-                    anyhow::ensure!(
-                        !operation.inputs.is_empty(),
-                        "cross-pool generation flow for request {:?} names no input product for its conditioning",
+        let mut group_pools = HashMap::new();
+        for partition in &batch.partitions {
+            let mut pool_index = None;
+            for operation in &partition.operations {
+                let variant = operation.work.variant();
+                let operation_pool = self.routing.get(&variant).copied().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "StageRouter has no pool for work variant {variant:?} in request {:?}",
                         operation.request_key
+                    )
+                })?;
+                if let Some(existing) = self
+                    .operation_routes
+                    .insert((operation.request_key, operation.op_id), operation_pool)
+                {
+                    anyhow::ensure!(
+                        existing == operation_pool,
+                        "operation identity was routed to conflicting staged pools"
+                    );
+                }
+                for output in &operation.outputs {
+                    let route = ProductRoute {
+                        pool_index: operation_pool,
+                        producer_plan_digest: operation.plan_digest.clone(),
+                    };
+                    if let Some(existing) = self.product_routes.get(output) {
+                        anyhow::ensure!(
+                            existing.pool_index == route.pool_index
+                                && existing.producer_plan_digest == route.producer_plan_digest,
+                            "product identity was routed with conflicting producer provenance"
+                        );
+                    } else {
+                        self.product_routes.insert(output.clone(), route);
+                    }
+                }
+                anyhow::ensure!(
+                    pool_index.is_none_or(|index| index == operation_pool),
+                    "partition {} spans staged pools; scheduler partition ownership is not executable",
+                    partition.partition_id
+                );
+                pool_index = Some(operation_pool);
+                if variant == WorkVariant::GenFlow {
+                    let token_pool = self
+                        .routing
+                        .get(&WorkVariant::TokenDecode)
+                        .or_else(|| self.routing.get(&WorkVariant::TokenExtend));
+                    if token_pool.is_some_and(|token_pool| *token_pool != operation_pool) {
+                        anyhow::ensure!(
+                            !operation.inputs.is_empty(),
+                            "cross-pool generation flow for request {:?} names no input product for its conditioning",
+                            operation.request_key
+                        );
+                    }
+                }
+                for input in &operation.inputs {
+                    anyhow::ensure!(
+                        input_routes
+                            .insert(input.clone(), operation_pool)
+                            .is_none_or(|existing| existing == operation_pool),
+                        "one input product is consumed across staged pools"
                     );
                 }
             }
-            for input in &operation.inputs {
-                input_routes.insert(input.clone(), pool_index);
-            }
-            routes.push(pool_index);
-            partitions[pool_index].push(operation.clone());
+            let Some(pool_index) = pool_index else {
+                anyhow::bail!(
+                    "validated partition {} has no routed operation",
+                    partition.partition_id
+                );
+            };
+            anyhow::ensure!(
+                group_pools
+                    .insert(partition.submission_group, pool_index)
+                    .is_none_or(|existing| existing == pool_index),
+                "submission group {} spans staged pools and cannot share one physical runner call",
+                partition.submission_group
+            );
+            partition_routes.insert(partition.partition_id, pool_index);
+            pool_partitions[pool_index].push(partition.clone());
         }
         for payload in &batch.input_products {
             let pool_index = input_routes.get(&payload.product).copied().ok_or_else(|| {
@@ -530,13 +794,50 @@ impl Executor for StageRouter {
             })?;
             partition_inputs[pool_index].push(payload.clone());
         }
+        let mut cross_pool_consumers = HashSet::new();
+        for partition in &batch.partitions {
+            let consumer_pool = partition_routes[&partition.partition_id];
+            for operation in &partition.operations {
+                for input in &operation.inputs {
+                    if input.storage_class == uniserve_worker_wire::StorageClass::HostStaging {
+                        continue;
+                    }
+                    let producer = self.product_routes.get(input).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cross-stage input {:?} has no exact producer provenance",
+                            input
+                        )
+                    })?;
+                    if producer.pool_index == consumer_pool {
+                        continue;
+                    }
+                    let payload = self.transfer_products.get(input).ok_or_else(|| {
+                        anyhow::anyhow!("cross-stage input {:?} is not producer-ready", input)
+                    })?;
+                    anyhow::ensure!(
+                        !partition_inputs[consumer_pool]
+                            .iter()
+                            .any(|existing| existing.product == *input),
+                        "cross-stage input payload is supplied more than once"
+                    );
+                    partition_inputs[consumer_pool].push(payload.clone());
+                    cross_pool_consumers.insert((input.request_key, input.producer_op_id));
+                }
+            }
+        }
 
         let mut pool_controls = (0..self.pools.len())
             .map(|_| Vec::new())
             .collect::<Vec<Vec<Control>>>();
         for control in &batch.controls {
             let request_key = control.request_key();
-            let targets = self.control_pools(&batch, request_key);
+            if let Control::Release { request_key, op_id } = control {
+                anyhow::ensure!(
+                    !cross_pool_consumers.contains(&(*request_key, *op_id)),
+                    "a cross-stage producer cannot be released in its consumer submission"
+                );
+            }
+            let targets = self.control_pools(control);
             anyhow::ensure!(
                 !targets.is_empty(),
                 "stage router received a control for request {request_key:?} that is not admitted to any pool"
@@ -547,7 +848,7 @@ impl Executor for StageRouter {
         }
 
         let mut expected_pools = 0;
-        for (pool_index, ((operations, controls), input_products)) in partitions
+        for (pool_index, ((partitions, controls), input_products)) in pool_partitions
             .into_iter()
             .zip(pool_controls)
             .zip(partition_inputs)
@@ -556,27 +857,32 @@ impl Executor for StageRouter {
             if self.submit_partition(
                 pool_index,
                 batch.step_id,
-                operations,
+                partitions,
                 controls,
                 input_products,
             )? {
                 expected_pools |= Self::pool_bit(pool_index);
             }
         }
-        let operation_count = batch.operations.len();
         self.pending.insert(
             batch.step_id,
             PendingStep {
                 expected_pools,
-                routes,
-                operations: batch.operations,
-                outputs: (0..operation_count).map(|_| None).collect(),
-                products: Vec::new(),
-                registration_visible: true,
-                worker_exec_us: 0,
-                forward_stats: None,
+                partitions: batch.partitions,
+                partition_routes,
+                returned_partitions: HashSet::new(),
             },
         );
+        for control in &batch.controls {
+            if let Control::Release { request_key, op_id } = control {
+                self.transfer_products.retain(|product, _| {
+                    product.request_key != *request_key || product.producer_op_id != *op_id
+                });
+                self.product_routes.retain(|product, _| {
+                    product.request_key != *request_key || product.producer_op_id != *op_id
+                });
+            }
+        }
         Ok(())
     }
 
@@ -691,13 +997,14 @@ impl Executor for StageRouter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use uniserve_core::{RequestId, SamplingParams};
     use uniserve_worker_wire::{
-        Bounds, DType, DimBound, Domain, KvAllocation, OpId, PointRange, ProductKind, ProductRef,
-        RouteId, ShapeBound, StorageClass, TokenMode, UndAdmission, VersionRef, Work,
-        encode_token_product_bytes,
+        AttentionRegime, Bounds, DType, DimBound, Domain, ExecutionCapability, KvAllocation, OpId,
+        OpStatus, PointRange, ProductKind, ProductRef, RegistrationAck, RouteId, ShapeBound,
+        StorageClass, TokenMode, UndAdmission, VersionRef, Work, encode_token_product_bytes,
     };
 
     use super::*;
@@ -707,13 +1014,60 @@ mod tests {
         submissions: Arc<Mutex<Vec<Batch>>>,
     }
 
+    struct ReportingExecutor {
+        caps: EngineCaps,
+        submissions: Arc<Mutex<Vec<Batch>>>,
+        reports: Arc<Mutex<VecDeque<CompletionReport>>>,
+    }
+
+    impl Executor for ReportingExecutor {
+        fn caps(&self) -> EngineCaps {
+            self.caps.clone()
+        }
+
+        fn pipeline_depth(&self) -> usize {
+            self.caps.pipeline_depth.max(1) as usize
+        }
+
+        fn in_flight(&self) -> usize {
+            self.reports.lock().unwrap().len()
+        }
+
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            batch.validate()?;
+            self.submissions.lock().unwrap().push(batch);
+            Ok(())
+        }
+
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            Ok(self.reports.lock().unwrap().pop_front())
+        }
+
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.poll()?
+                .ok_or_else(|| anyhow::anyhow!("reporting executor has no completion"))
+        }
+
+        fn control(&mut self, _operation: ControlOp) -> anyhow::Result<u64> {
+            Ok(1)
+        }
+
+        fn control_wait(
+            &mut self,
+            _operation: ControlOp,
+            _targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            Ok(Vec::new())
+        }
+    }
+
     impl Executor for RecordingExecutor {
         fn caps(&self) -> EngineCaps {
             self.caps.clone()
         }
 
         fn pipeline_depth(&self) -> usize {
-            1
+            self.caps.pipeline_depth.max(1) as usize
         }
 
         fn in_flight(&self) -> usize {
@@ -750,6 +1104,19 @@ mod tests {
     fn caps(work: WorkVariant) -> EngineCaps {
         let mut caps = EngineCaps {
             supported_work: vec![work],
+            execution_constraints: uniserve_worker_wire::ExecutionConstraints {
+                route_capabilities: vec![RouteExecutionCapability {
+                    route: RouteId(0),
+                    supported_work: vec![work],
+                    tensorized_mixed: false,
+                    sampling_ownership: uniserve_worker_wire::SamplingOwnership::DesignatedRank,
+                    preemptible: false,
+                    credits: uniserve_worker_wire::ExecutionConstraints::default()
+                        .route_capabilities[0]
+                        .credits,
+                }],
+                ..Default::default()
+            },
             max_vit_grid_tokens: 64,
             max_vision_feature_bytes: 1 << 20,
             ..EngineCaps::default()
@@ -797,6 +1164,82 @@ mod tests {
                 dims: vec![DimBound::Static(elements)],
             },
             point_range: PointRange::default(),
+        }
+    }
+
+    fn feature_product(request_key: RequestKey, op_id: OpId) -> ProductRef {
+        ProductRef {
+            request_key,
+            producer_op_id: op_id,
+            output_index: 0,
+            generation: 41,
+            kind: ProductKind::VisionFeature,
+            storage_class: StorageClass::LatentArena,
+            dtype: DType::F32,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(4)],
+            },
+            point_range: PointRange::default(),
+        }
+    }
+
+    fn transfer_descriptor(plan_digest: &str) -> Vec<u8> {
+        let value = serde_json::json!({
+            "kind": "tensor",
+            "producer_plan_digest": plan_digest,
+            "value": {
+                "height": 16,
+                "locator": {
+                    "addr": 0,
+                    "device": "cuda:0",
+                    "dtype": "float32",
+                    "handle_b64": "",
+                    "meta": {},
+                    "nbytes": 16,
+                    "session": "producer",
+                    "shape": [4],
+                    "transport": "cuda_ipc",
+                    "version": 1
+                },
+                "payload_kind": "vision_feature",
+                "width": 16
+            }
+        });
+        let mut bytes = TRANSFER_DESCRIPTOR_PREFIX.to_vec();
+        bytes.extend(serde_json::to_vec(&value).unwrap());
+        bytes
+    }
+
+    fn completion_report(
+        step_id: u64,
+        partition_id: u32,
+        operation: &Operation,
+        product: ProductPayload,
+    ) -> CompletionReport {
+        CompletionReport {
+            step_id,
+            partitions: vec![uniserve_worker_wire::PartitionCompletion {
+                partition_id,
+                completions: vec![uniserve_worker_wire::CompletionRecord {
+                    request_key: operation.request_key,
+                    op_id: operation.op_id,
+                    completion_slot_generation: 1,
+                    status: OpStatus::Ok,
+                    selected_point: 0,
+                    logical_lengths: Default::default(),
+                    token_span: Default::default(),
+                    committed_tokens: Vec::new(),
+                    finish_flags: Default::default(),
+                    product_generations: vec![product.product.generation],
+                    semantic_digest: "2".repeat(64),
+                    error_code: None,
+                    timing_counters: Default::default(),
+                }],
+                products: vec![product],
+                registration: RegistrationAck { visible: true },
+                worker_exec_us: Some(1),
+                forward_stats: Default::default(),
+            }],
         }
     }
 
@@ -879,7 +1322,30 @@ mod tests {
                 Batch::new(
                     7,
                     vec![admission(encode_key), admission(prefill_key)],
-                    vec![encode, prefill],
+                    vec![
+                        BatchPartition {
+                            partition_id: 1,
+                            submission_group: 1,
+                            collective_seq: 1,
+                            domain: Domain::Und,
+                            route: RouteId(0),
+                            execution: ExecutionCapability::DomainHomogeneous,
+                            attention: AttentionRegime::None,
+                            shape_class: 0,
+                            operations: vec![encode],
+                        },
+                        BatchPartition {
+                            partition_id: 2,
+                            submission_group: 2,
+                            collective_seq: 2,
+                            domain: Domain::Und,
+                            route: RouteId(0),
+                            execution: ExecutionCapability::DomainHomogeneous,
+                            attention: AttentionRegime::Causal,
+                            shape_class: 0,
+                            operations: vec![prefill],
+                        },
+                    ],
                 )
                 .with_input_products(vec![
                     ProductPayload {
@@ -897,7 +1363,12 @@ mod tests {
         let encoder_batches = encoder_submissions.lock().unwrap();
         assert_eq!(encoder_batches.len(), 1);
         assert_eq!(
-            encoder_batches[0].operations[0].work.variant(),
+            encoder_batches[0]
+                .operations()
+                .next()
+                .unwrap()
+                .work
+                .variant(),
             WorkVariant::EncodeVision
         );
         assert_eq!(
@@ -911,7 +1382,12 @@ mod tests {
         let prefill_batches = prefill_submissions.lock().unwrap();
         assert_eq!(prefill_batches.len(), 1);
         assert_eq!(
-            prefill_batches[0].operations[0].work.variant(),
+            prefill_batches[0]
+                .operations()
+                .next()
+                .unwrap()
+                .work
+                .variant(),
             WorkVariant::TokenExtend
         );
         assert_eq!(
@@ -924,5 +1400,202 @@ mod tests {
         assert!(
             router.device_products_reachable(WorkVariant::EncodeVision, WorkVariant::EncodeVision)
         );
+    }
+
+    #[test]
+    fn exact_cross_stage_product_is_gated_stored_and_injected() {
+        let encoder_submissions = Arc::new(Mutex::new(Vec::new()));
+        let consumer_submissions = Arc::new(Mutex::new(Vec::new()));
+        let encoder_reports = Arc::new(Mutex::new(VecDeque::new()));
+        let consumer_reports = Arc::new(Mutex::new(VecDeque::new()));
+        let encoder = ReportingExecutor {
+            caps: caps(WorkVariant::EncodeVision),
+            submissions: Arc::clone(&encoder_submissions),
+            reports: Arc::clone(&encoder_reports),
+        };
+        let consumer = ReportingExecutor {
+            caps: caps(WorkVariant::TokenExtend),
+            submissions: Arc::clone(&consumer_submissions),
+            reports: Arc::clone(&consumer_reports),
+        };
+        let mut router = StageRouter::try_new(vec![
+            (WorkerKind::Encoder, Box::new(encoder)),
+            (WorkerKind::Prefill, Box::new(consumer)),
+        ])
+        .unwrap();
+        let key = request_key(91);
+        let encode_op_id = OpId(11);
+        let image = host_input(key, encode_op_id, 40, ProductKind::Artifact, DType::U8, 4);
+        let feature = feature_product(key, encode_op_id);
+        let encode = Operation::registered(
+            key,
+            encode_op_id,
+            VersionRef::admission_root(key, OpId(1), "0".repeat(64)),
+            Work::Encode(uniserve_worker_wire::EncodeMode::Vision),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_latent_bytes: 16,
+                ..Bounds::default()
+            },
+            vec![image.clone()],
+            vec![feature.clone()],
+            Vec::new(),
+            None,
+            None,
+            0,
+        );
+        let payload = ProductPayload {
+            product: feature.clone(),
+            bytes: transfer_descriptor(&encode.plan_digest),
+        };
+        let encode_report = completion_report(1, 1, &encode, payload.clone());
+        router
+            .submit(
+                Batch::new(
+                    1,
+                    vec![admission(key)],
+                    vec![BatchPartition {
+                        partition_id: 1,
+                        submission_group: 1,
+                        collective_seq: 1,
+                        domain: Domain::Und,
+                        route: RouteId(0),
+                        execution: ExecutionCapability::DomainHomogeneous,
+                        attention: AttentionRegime::None,
+                        shape_class: 0,
+                        operations: vec![encode],
+                    }],
+                )
+                .with_input_products(vec![ProductPayload {
+                    product: image,
+                    bytes: vec![1, 2, 3, 4],
+                }]),
+            )
+            .unwrap();
+        let consume = Operation::registered(
+            key,
+            OpId(12),
+            VersionRef::admission_root(key, OpId(1), "0".repeat(64)),
+            Work::Token(TokenMode::Extend),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_tokens: 1,
+                ..Bounds::default()
+            },
+            vec![feature.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
+        );
+        let consumer_batch = Batch::new(
+            2,
+            Vec::new(),
+            vec![BatchPartition {
+                partition_id: 2,
+                submission_group: 2,
+                collective_seq: 2,
+                domain: Domain::Und,
+                route: RouteId(0),
+                execution: ExecutionCapability::DomainHomogeneous,
+                attention: AttentionRegime::Causal,
+                shape_class: 0,
+                operations: vec![consume],
+            }],
+        );
+        let pending_error = router
+            .submit(consumer_batch.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            pending_error.contains("not producer-ready"),
+            "got: {pending_error}"
+        );
+
+        encoder_reports.lock().unwrap().push_back(encode_report);
+        let producer_report = router.poll().unwrap().unwrap();
+        assert!(producer_report.products().next().is_none());
+
+        router.submit(consumer_batch).unwrap();
+        let batches = consumer_submissions.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].input_products, vec![payload]);
+    }
+
+    #[test]
+    fn cross_stage_product_rejects_conflicting_producer_digest() {
+        let submissions = Arc::new(Mutex::new(Vec::new()));
+        let reports = Arc::new(Mutex::new(VecDeque::new()));
+        let encoder = ReportingExecutor {
+            caps: caps(WorkVariant::EncodeVision),
+            submissions,
+            reports: Arc::clone(&reports),
+        };
+        let mut router =
+            StageRouter::try_new(vec![(WorkerKind::Encoder, Box::new(encoder))]).unwrap();
+        let key = request_key(92);
+        let op_id = OpId(13);
+        let image = host_input(key, op_id, 43, ProductKind::Artifact, DType::U8, 4);
+        let feature = feature_product(key, op_id);
+        let encode = Operation::registered(
+            key,
+            op_id,
+            VersionRef::admission_root(key, OpId(1), "0".repeat(64)),
+            Work::Encode(uniserve_worker_wire::EncodeMode::Vision),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_latent_bytes: 16,
+                ..Bounds::default()
+            },
+            vec![image.clone()],
+            vec![feature.clone()],
+            Vec::new(),
+            None,
+            None,
+            0,
+        );
+        let report = completion_report(
+            3,
+            3,
+            &encode,
+            ProductPayload {
+                product: feature,
+                bytes: transfer_descriptor(&"f".repeat(64)),
+            },
+        );
+        router
+            .submit(
+                Batch::new(
+                    3,
+                    vec![admission(key)],
+                    vec![BatchPartition {
+                        partition_id: 3,
+                        submission_group: 3,
+                        collective_seq: 3,
+                        domain: Domain::Und,
+                        route: RouteId(0),
+                        execution: ExecutionCapability::DomainHomogeneous,
+                        attention: AttentionRegime::None,
+                        shape_class: 0,
+                        operations: vec![encode],
+                    }],
+                )
+                .with_input_products(vec![ProductPayload {
+                    product: image,
+                    bytes: vec![1, 2, 3, 4],
+                }]),
+            )
+            .unwrap();
+        reports.lock().unwrap().push_back(report);
+
+        let error = router.poll().unwrap_err().to_string();
+        assert!(error.contains("plan digest conflicts with its producer"));
     }
 }

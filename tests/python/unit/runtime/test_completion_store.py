@@ -89,3 +89,48 @@ def test_abandoned_query_ready_completion_returns_capacity() -> None:
     lease.abandon()
 
     assert arena.reserve(1).generation != lease.generation
+
+
+def test_partition_leases_share_one_bounded_completion_byte_credit_pool() -> None:
+    arena = CompletionArena(depth=3, token_capacity=4, total_token_capacity=4)
+    first = arena.reserve(1, token_capacity=2)
+    second = arena.reserve(1, token_capacity=2)
+    first.seal()
+    second.seal()
+
+    with pytest.raises(ResourceError):
+        arena.reserve(1, token_capacity=1)
+
+    first.observe(0, first.generation)
+    successor = arena.reserve(1, token_capacity=2)
+    assert successor.generation >= 1
+
+
+def test_completion_generation_owns_disjoint_token_and_image_byte_ranges() -> None:
+    arena = CompletionArena(depth=1, token_capacity=4)
+    lease = arena.reserve(1)
+    tokens = lease.capture(torch.tensor([17, 29], dtype=torch.long))
+    pixels = torch.tensor(
+        [[[1, 2, 3], [4, 5, 6]]],
+        dtype=torch.uint8,
+    )
+    image = lease.capture_bytes(pixels)
+    lease.seal()
+
+    assert tokens.values() == (17, 29)
+    assert torch.equal(image.tensor(), pixels)
+    generation = lease.generation
+    lease.observe(0, generation)
+
+    assert arena.reserve(1).generation != generation
+
+
+def test_completion_generation_enforces_one_shared_token_and_byte_bound() -> None:
+    arena = CompletionArena(depth=1, token_capacity=2)
+    lease = arena.reserve(1)
+    lease.capture(torch.tensor([7], dtype=torch.long))
+
+    with pytest.raises(ResourceError):
+        lease.capture_bytes(torch.ones(9, dtype=torch.uint8))
+
+    lease.abandon()

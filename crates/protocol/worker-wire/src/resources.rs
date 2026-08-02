@@ -1,28 +1,19 @@
-//! Resource plane types.
+//! Resource classes and the canonical finite-credit vector.
 //!
-//! Makes resources first-class without moving tensors across the boundary. The
-//! host owns logical resource identity + policy (it issues [`ResourceLease`]s and
-//! asserts [`ResourceInvariant`]s via the host-side `uniserve_kv::ResourceLedger`); the
-//! worker owns physical device storage and reports [`ResourcePressure`]. Every
-//! field here is an id / class / count / scalar — never a tensor.
+//! Physical stores continue to report class-specific pressure, while admission
+//! and operation registration use one atomic vector. Every component is a hard
+//! maximum in the unit named by [`CreditDimension`].
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::RequestId;
 
-/// The kinds of resource the engine accounts for. A worker declares
-/// which classes it manages in `EngineCaps::resource_classes`.
+/// The kinds of physical resource exposed by worker store telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceClass {
-    /// Logical KV-cache blocks (paged or model-native).
     KvBlock,
-    /// Cached encoder outputs (ViT/VAE embeddings), referenced by handle.
     EncoderOutput,
-    /// Denoise image latents resident during generation.
     ImageLatent,
-    /// Transient denoise/CFG scratch.
     Scratch,
-    /// Resident LoRA adapter weights.
     Adapter,
 }
 
@@ -37,69 +28,218 @@ impl ResourceClass {
         }
     }
 
-    /// the single authoritative accounting **unit** for each class.
-    /// Both sides MUST account this class in this unit: the host
-    /// [`ResourceLease::capacity`] it issues and the worker's
-    /// physical-store pressure it reports for the same class must have the same
-    /// magnitude. KV leases and reports blocks; scratch leases and reports token
-    /// slots.
     pub fn unit(&self) -> &'static str {
         match self {
-            // Logical KV-cache blocks (pages), not tokens.
-            ResourceClass::KvBlock => "blocks",
-            // Cached encoder outputs, referenced by handle.
+            ResourceClass::KvBlock => "pages",
             ResourceClass::EncoderOutput => "handles",
-            // Image latent residency, counted in latent tokens.
-            ResourceClass::ImageLatent => "latent_tokens",
-            // Transient denoise/CFG scratch, counted in physical token slots.
-            ResourceClass::Scratch => "tokens",
-            // Resident LoRA adapter slots.
+            ResourceClass::ImageLatent => "bytes",
+            ResourceClass::Scratch => "bytes",
             ResourceClass::Adapter => "adapters",
         }
     }
 }
 
-/// An opaque logical handle to a resource instance. `id` is host-assigned; for a
-/// KV span it is the lease id, for an encoder output it mirrors the worker's
-/// `encoder_handle`, etc. Physical storage stays worker-private.
+/// One dimension of the admission and registration credit vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ResourceHandle {
-    pub class: ResourceClass,
-    pub id: u64,
-}
-
-/// The reuse / release / preemption policy attached to a lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LeasePolicy {
-    /// Released when the owning request completes or is dropped (default).
-    #[default]
-    PerRequest,
-    /// Eligible for eviction/reuse under pressure (e.g. prefix-cache blocks).
-    Evictable,
-    /// Pinned until explicitly released (e.g. an in-flight denoise latent —
-    /// evicting it discards expensive diffusion work).
-    Pinned,
+#[repr(u8)]
+pub enum CreditDimension {
+    RegisteredOperations,
+    ExecutionSlots,
+    CompletionSlots,
+    DeviceProducts,
+    KvPages,
+    RollbackDeltas,
+    LatentArtifactBytes,
+    PinnedCompletionStagingBytes,
+    TransferBytes,
+    TransferTickets,
+    CpuTasks,
+    OutputJournalBytes,
 }
 
-/// A host-issued resource lease: who owns it, how much, and its lifetime policy
-///. Auditable ownership — the ledger asserts every lease is
-/// released after the owner finishes / is dropped / is preempted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceLease {
-    pub handle: ResourceHandle,
-    pub owner_request: RequestId,
-    /// Capacity in the class's authoritative unit ([`ResourceClass::unit`]).
-    /// KvBlock = blocks, EncoderOutput = handles, ImageLatent = latent
-    /// tokens, Scratch = CFG branch slots, Adapter = adapter slots. The host
-    /// issues this and the worker's pressure for the same class must report the
-    /// same magnitude — see [`ResourceClass::unit`] for the full contract.
-    pub capacity: u64,
-    pub policy: LeasePolicy,
+impl CreditDimension {
+    pub const ALL: [Self; 12] = [
+        Self::RegisteredOperations,
+        Self::ExecutionSlots,
+        Self::CompletionSlots,
+        Self::DeviceProducts,
+        Self::KvPages,
+        Self::RollbackDeltas,
+        Self::LatentArtifactBytes,
+        Self::PinnedCompletionStagingBytes,
+        Self::TransferBytes,
+        Self::TransferTickets,
+        Self::CpuTasks,
+        Self::OutputJournalBytes,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RegisteredOperations => "registered_operations",
+            Self::ExecutionSlots => "execution_slots",
+            Self::CompletionSlots => "completion_slots",
+            Self::DeviceProducts => "device_products",
+            Self::KvPages => "kv_pages",
+            Self::RollbackDeltas => "rollback_deltas",
+            Self::LatentArtifactBytes => "latent_artifact_bytes",
+            Self::PinnedCompletionStagingBytes => "pinned_completion_staging_bytes",
+            Self::TransferBytes => "transfer_bytes",
+            Self::TransferTickets => "transfer_tickets",
+            Self::CpuTasks => "cpu_tasks",
+            Self::OutputJournalBytes => "output_journal_bytes",
+        }
+    }
+
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::LatentArtifactBytes
+            | Self::PinnedCompletionStagingBytes
+            | Self::TransferBytes
+            | Self::OutputJournalBytes => "bytes",
+            Self::KvPages => "pages",
+            Self::RegisteredOperations
+            | Self::ExecutionSlots
+            | Self::CompletionSlots
+            | Self::DeviceProducts
+            | Self::RollbackDeltas
+            | Self::TransferTickets
+            | Self::CpuTasks => "count",
+        }
+    }
 }
 
-/// Worker-reported pressure for one resource class. Used == in use,
-/// evictable == reusable under pressure, free == headroom. All counts.
+/// Complete finite resource reservation. Arithmetic is checked so accounting
+/// faults cannot be hidden by saturation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CreditVector {
+    pub registered_operations: u64,
+    pub execution_slots: u64,
+    pub completion_slots: u64,
+    pub device_products: u64,
+    pub kv_pages: u64,
+    pub rollback_deltas: u64,
+    pub latent_artifact_bytes: u64,
+    pub pinned_completion_staging_bytes: u64,
+    pub transfer_bytes: u64,
+    pub transfer_tickets: u64,
+    pub cpu_tasks: u64,
+    pub output_journal_bytes: u64,
+}
+
+impl CreditVector {
+    pub const ZERO: Self = Self {
+        registered_operations: 0,
+        execution_slots: 0,
+        completion_slots: 0,
+        device_products: 0,
+        kv_pages: 0,
+        rollback_deltas: 0,
+        latent_artifact_bytes: 0,
+        pinned_completion_staging_bytes: 0,
+        transfer_bytes: 0,
+        transfer_tickets: 0,
+        cpu_tasks: 0,
+        output_journal_bytes: 0,
+    };
+
+    pub fn get(self, dimension: CreditDimension) -> u64 {
+        match dimension {
+            CreditDimension::RegisteredOperations => self.registered_operations,
+            CreditDimension::ExecutionSlots => self.execution_slots,
+            CreditDimension::CompletionSlots => self.completion_slots,
+            CreditDimension::DeviceProducts => self.device_products,
+            CreditDimension::KvPages => self.kv_pages,
+            CreditDimension::RollbackDeltas => self.rollback_deltas,
+            CreditDimension::LatentArtifactBytes => self.latent_artifact_bytes,
+            CreditDimension::PinnedCompletionStagingBytes => self.pinned_completion_staging_bytes,
+            CreditDimension::TransferBytes => self.transfer_bytes,
+            CreditDimension::TransferTickets => self.transfer_tickets,
+            CreditDimension::CpuTasks => self.cpu_tasks,
+            CreditDimension::OutputJournalBytes => self.output_journal_bytes,
+        }
+    }
+
+    pub fn set(&mut self, dimension: CreditDimension, value: u64) {
+        match dimension {
+            CreditDimension::RegisteredOperations => self.registered_operations = value,
+            CreditDimension::ExecutionSlots => self.execution_slots = value,
+            CreditDimension::CompletionSlots => self.completion_slots = value,
+            CreditDimension::DeviceProducts => self.device_products = value,
+            CreditDimension::KvPages => self.kv_pages = value,
+            CreditDimension::RollbackDeltas => self.rollback_deltas = value,
+            CreditDimension::LatentArtifactBytes => self.latent_artifact_bytes = value,
+            CreditDimension::PinnedCompletionStagingBytes => {
+                self.pinned_completion_staging_bytes = value;
+            }
+            CreditDimension::TransferBytes => self.transfer_bytes = value,
+            CreditDimension::TransferTickets => self.transfer_tickets = value,
+            CreditDimension::CpuTasks => self.cpu_tasks = value,
+            CreditDimension::OutputJournalBytes => self.output_journal_bytes = value,
+        }
+    }
+
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        let mut result = Self::ZERO;
+        for dimension in CreditDimension::ALL {
+            result.set(
+                dimension,
+                self.get(dimension).checked_add(other.get(dimension))?,
+            );
+        }
+        Some(result)
+    }
+
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        let mut result = Self::ZERO;
+        for dimension in CreditDimension::ALL {
+            result.set(
+                dimension,
+                self.get(dimension).checked_sub(other.get(dimension))?,
+            );
+        }
+        Some(result)
+    }
+
+    pub fn contains(self, requested: Self) -> bool {
+        CreditDimension::ALL
+            .into_iter()
+            .all(|dimension| requested.get(dimension) <= self.get(dimension))
+    }
+
+    pub fn first_exhausted(self, used: Self, requested: Self) -> Option<CreditDimension> {
+        CreditDimension::ALL.into_iter().find(|dimension| {
+            used.get(*dimension)
+                .checked_add(requested.get(*dimension))
+                .is_none_or(|projected| projected > self.get(*dimension))
+        })
+    }
+
+    pub fn is_zero(self) -> bool {
+        CreditDimension::ALL
+            .into_iter()
+            .all(|dimension| self.get(dimension) == 0)
+    }
+}
+
+/// Per-route request maximum and the worker-wide capacity that backs it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RouteCreditLimits {
+    pub per_request: CreditVector,
+    pub worker: CreditVector,
+}
+
+impl RouteCreditLimits {
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.worker.contains(self.per_request),
+            "route per-request credits exceed worker-wide credits"
+        );
+        Ok(())
+    }
+}
+
+/// Worker-reported pressure for one physical resource class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourcePressure {
     pub class: ResourceClass,
@@ -109,77 +249,56 @@ pub struct ResourcePressure {
     pub free: u64,
 }
 
-/// A lifecycle event for a lease — the audit trail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceEventKind {
-    Issued,
-    Released,
-    Evicted,
-    InvariantViolation,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct ResourceEvent {
-    pub kind: ResourceEventKind,
-    pub class: ResourceClass,
-    pub owner_request: RequestId,
-    pub capacity: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn resource_class_strings_roundtrip() {
-        for c in [
-            ResourceClass::KvBlock,
-            ResourceClass::EncoderOutput,
-            ResourceClass::ImageLatent,
-            ResourceClass::Scratch,
-            ResourceClass::Adapter,
-        ] {
-            // snake_case serde matches as_str (the worker-declared wire form).
-            let json = serde_json::to_string(&c).unwrap();
-            assert_eq!(json.trim_matches('"'), c.as_str());
-        }
+    fn credit_vector_arithmetic_and_exhaustion_are_dimension_exact() {
+        let capacity = CreditVector {
+            registered_operations: 4,
+            execution_slots: 2,
+            completion_slots: 2,
+            transfer_bytes: 1024,
+            ..CreditVector::ZERO
+        };
+        let first = CreditVector {
+            registered_operations: 2,
+            execution_slots: 1,
+            completion_slots: 1,
+            transfer_bytes: 768,
+            ..CreditVector::ZERO
+        };
+        let used = CreditVector::ZERO.checked_add(first).unwrap();
+        assert_eq!(used.checked_sub(first), Some(CreditVector::ZERO));
+        let second = CreditVector {
+            transfer_bytes: 512,
+            ..CreditVector::ZERO
+        };
+        assert_eq!(
+            capacity.first_exhausted(used, second),
+            Some(CreditDimension::TransferBytes)
+        );
     }
 
-    /// pin the authoritative accounting unit per class so a future
-    /// change can't silently re-introduce a host/worker unit divergence (e.g.
-    /// leasing KvBlock in tokens again, or Scratch in branch slots). This is the
-    /// single source the host lease and the worker `ResourceRuntime` both follow.
     #[test]
-    fn resource_class_units_are_pinned() {
-        assert_eq!(ResourceClass::KvBlock.unit(), "blocks");
-        assert_eq!(ResourceClass::EncoderOutput.unit(), "handles");
-        assert_eq!(ResourceClass::ImageLatent.unit(), "latent_tokens");
-        assert_eq!(ResourceClass::Scratch.unit(), "tokens");
-        assert_eq!(ResourceClass::Adapter.unit(), "adapters");
-    }
-
-    #[test]
-    fn lease_and_pressure_are_plain_descriptors() {
-        let lease = ResourceLease {
-            handle: ResourceHandle {
-                class: ResourceClass::KvBlock,
-                id: 7,
+    fn route_limits_cover_every_per_request_dimension() {
+        let per_request = CreditVector {
+            registered_operations: 2,
+            kv_pages: 16,
+            output_journal_bytes: 4096,
+            ..CreditVector::ZERO
+        };
+        RouteCreditLimits {
+            per_request,
+            worker: CreditVector {
+                registered_operations: 8,
+                kv_pages: 64,
+                output_journal_bytes: 16_384,
+                ..CreditVector::ZERO
             },
-            owner_request: RequestId(3),
-            capacity: 1024,
-            policy: LeasePolicy::Pinned,
-        };
-        assert_eq!(lease.handle.id, 7);
-        assert_eq!(lease.policy, LeasePolicy::Pinned);
-
-        let p = ResourcePressure {
-            class: ResourceClass::Scratch,
-            total: 100,
-            used: 30,
-            evictable: 0,
-            free: 70,
-        };
-        assert_eq!((p.used, p.free), (30, 70));
+        }
+        .validate()
+        .unwrap();
     }
 }

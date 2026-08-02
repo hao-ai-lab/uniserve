@@ -5,13 +5,13 @@ import torch
 
 from tests.python.fixtures.depth_one import (
     commit_resolved,
+    execution_batch,
     root_parent,
     token_operation,
     und_admission,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
-    Batch,
     Commit,
     DevicePoint,
     Disposition,
@@ -38,7 +38,7 @@ pytestmark = [
 ]
 
 
-def test_token_selected_point_and_finish_outputs_are_fenced_after_sampling_submission() -> None:
+def test_token_and_finish_outputs_are_fenced_after_sampling_submission() -> None:
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     admission = und_admission(29, block_ids=(0,))
     operation, token_input = token_operation(
@@ -50,7 +50,7 @@ def test_token_selected_point_and_finish_outputs_are_fenced_after_sampling_submi
     )
 
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(operation,),
@@ -58,27 +58,20 @@ def test_token_selected_point_and_finish_outputs_are_fenced_after_sampling_submi
         )
     )
     token = next(output for output in operation.outputs if output.kind is ProductKind.TOKEN)
-    selected = next(
-        output for output in operation.outputs if output.kind is ProductKind.SELECTED_POINT
-    )
     finish = next(output for output in operation.outputs if output.kind is ProductKind.FINISH)
-    token_read, selected_read, finish_read = (
-        worker.products.device_products.consume_batch(
-            (
-                (token, 2, operation.plan_digest, "cuda:0"),
-                (selected, 2, operation.plan_digest, "cuda:0"),
-                (finish, 2, operation.plan_digest, "cuda:0"),
-            ),
-            device="cuda:0",
-        )
+    token_read, finish_read = worker.products.device_products.consume_batch(
+        (
+            (token, 2, operation.plan_digest, "cuda:0"),
+            (finish, 2, operation.plan_digest, "cuda:0"),
+        ),
+        device="cuda:0",
     )
 
     assert token_read._write.producer_event is not None
-    assert selected_read._write.producer_event is not None
     assert finish_read._write.producer_event is not None
-    torch.testing.assert_close(selected_read.tensor, torch.tensor([1], device="cuda:0"))
+    assert token_read._write.producer_event is finish_read._write.producer_event
     worker.products.device_products.record_readers(
-        (token_read, selected_read, finish_read),
+        (token_read, finish_read),
         device="cuda:0",
     )
 
@@ -97,8 +90,8 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         tokens=(3, 4),
     )
     worker.execute(
-        Batch(
-            step_id=100,
+        execution_batch(
+            step_id=0,
             admissions=(warm_admission,),
             operations=(warm_operation,),
             input_products=(warm_input,),
@@ -124,7 +117,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
 
     monkeypatch.setattr(CompletionLease, "ready", gated_ready)
     parent_report = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(parent,),
@@ -136,10 +129,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
     device_parent = VersionRef(
         admission.request_key,
         parent.op_id,
-        DevicePoint(
-            next(output for output in parent.outputs if output.kind is ProductKind.SELECTED_POINT),
-            parent.plan_digest,
-        ),
+        DevicePoint(1, None, parent.plan_digest),
     )
     successor_template, _ = token_operation(
         admission.request_key,
@@ -162,7 +152,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         rng=successor_template.rng,
     )
     successor_report = worker.execute(
-        Batch(
+        execution_batch(
             step_id=2,
             admissions=(),
             operations=(successor,),
@@ -185,7 +175,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         FixedPoint(parent_record.selected_point, parent_record.semantic_digest),
     )
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=3,
             admissions=(),
             operations=(),
@@ -228,7 +218,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
 
     monkeypatch.setattr(CompletionLease, "ready", gated_ready)
     parent_report = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(pipelined,),
             operations=(parent,),
@@ -242,12 +232,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         parent=VersionRef(
             pipelined.request_key,
             parent.op_id,
-            DevicePoint(
-                next(
-                    output for output in parent.outputs if output.kind is ProductKind.SELECTED_POINT
-                ),
-                parent.plan_digest,
-            ),
+            DevicePoint(1, None, parent.plan_digest),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
@@ -255,7 +240,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         rng=Rng(seed=917, semantic_index_base=3, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
     successor_report = worker.execute(
-        Batch(
+        execution_batch(
             step_id=2,
             admissions=(),
             operations=(successor,),
@@ -279,7 +264,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
     serial_parent_report = serial_worker.execute(
-        Batch(
+        execution_batch(
             step_id=11,
             admissions=(serial,),
             operations=(serial_parent,),
@@ -300,7 +285,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         control_seq=commit.control_seq,
     )
     serial_successor_report = serial_worker.execute(
-        Batch(
+        execution_batch(
             step_id=12,
             admissions=(),
             operations=(serial_successor,),

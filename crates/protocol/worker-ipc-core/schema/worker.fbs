@@ -19,6 +19,9 @@ enum WorkVariant : ubyte {
 }
 
 enum Domain : ubyte { Und, Gen }
+enum ExecutionCapability : ubyte { DomainHomogeneous, TensorizedMixed }
+enum AttentionRegime : ubyte { None, Causal, Bidirectional, Hybrid }
+enum SamplingOwnership : ubyte { DesignatedRank, DeterministicSharded }
 
 enum ProductKind : ubyte {
   Token,
@@ -67,6 +70,7 @@ enum CloseReason : ubyte { Completed, Cancelled, Error, Preempted }
 enum ReqKind : ubyte {
   GetCapabilities,
   Execute,
+  PollCompletions,
   DropSession,
   Shutdown,
   CopyKv,
@@ -91,9 +95,7 @@ table BlockPair { src:uint; dst:uint; }
 table StringU64Pair { key:string; value:ulong; }
 
 table SnapshotRef {
-  session_id:ulong;
-  epoch:ulong;
-  version:ulong;
+  version:VersionRef;
   digest:string;
   locator:string;
 }
@@ -161,6 +163,36 @@ table ExecutionConstraints {
   device_sequence_lengths:bool;
   device_append_offsets:bool;
   incremental_kv_publication:bool;
+  route_capabilities:[RouteExecutionCapability];
+}
+
+table RouteExecutionCapability {
+  route:uint;
+  supported_work:[WorkVariant];
+  tensorized_mixed:bool;
+  sampling_ownership:SamplingOwnership;
+  preemptible:bool;
+  credits:RouteCreditLimits;
+}
+
+table CreditVector {
+  registered_operations:ulong;
+  execution_slots:ulong;
+  completion_slots:ulong;
+  device_products:ulong;
+  kv_pages:ulong;
+  rollback_deltas:ulong;
+  latent_artifact_bytes:ulong;
+  pinned_completion_staging_bytes:ulong;
+  transfer_bytes:ulong;
+  transfer_tickets:ulong;
+  cpu_tasks:ulong;
+  output_journal_bytes:ulong;
+}
+
+table RouteCreditLimits {
+  per_request:CreditVector;
+  worker:CreditVector;
 }
 
 table ResourcePressure {
@@ -203,7 +235,7 @@ table EngineCaps {
   weight_digest:string;
   protocol_layout_digest:string;
   route_capability_digest:string;
-  restored_sessions:[ulong];
+  restored_snapshots:[SnapshotRef];
 }
 
 // ---- Identities and the four protocol records -----------------------------
@@ -220,6 +252,7 @@ table PointFixed {
 }
 
 table PointDevice {
+  point_index:uint;
   selected_point:ProductRef;
   producer_plan_digest:string;
 }
@@ -385,10 +418,22 @@ table Admission {
   adapter_id:uint = null;
 }
 
+table BatchPartition {
+  partition_id:uint;
+  submission_group:uint;
+  collective_seq:ulong;
+  domain:Domain;
+  route:uint;
+  execution:ExecutionCapability;
+  attention:AttentionRegime;
+  shape_class:ulong;
+  operations:[Operation];
+}
+
 table Batch {
   step_id:ulong;
   admissions:[Admission];
-  operations:[Operation];
+  partitions:[BatchPartition];
   controls:[ControlEnvelope];
   input_products:[ProductPayload];
 }
@@ -405,13 +450,18 @@ table ProductPayload {
   bytes:[ubyte];
 }
 
-table CompletionReport {
-  step_id:ulong;
+table PartitionCompletion {
+  partition_id:uint;
   completions:[CompletionRecord];
   products:[ProductPayload];
   registration:RegistrationAck;
   worker_exec_us:ulong = null;
   forward_stats:WorkerForwardStats;
+}
+
+table CompletionReport {
+  step_id:ulong;
+  partitions:[PartitionCompletion];
 }
 
 table WorkerForwardStats {
@@ -471,6 +521,7 @@ table WorkerRequest {
   kind:ReqKind;
   call_id:ulong = null;
   batch:Batch;
+  step_id:ulong = null;
   session_id:ulong = null;
   copies:[BlockPair];
   adapter_id:uint = null;

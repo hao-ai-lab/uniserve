@@ -67,12 +67,8 @@ impl SpecDecodeAccounting {
         }
         let mut seq =
             Vec::with_capacity(st.context.prompt_ids.len() + st.replay.generated_ids.len() + 1);
-        if let Some(recompute) = st.replay.recompute_ids.as_ref() {
-            seq.extend_from_slice(recompute);
-        } else {
-            seq.extend_from_slice(&st.context.prompt_ids);
-            seq.extend_from_slice(&st.replay.generated_ids);
-        }
+        seq.extend_from_slice(&st.context.prompt_ids);
+        seq.extend_from_slice(&st.replay.generated_ids);
         if seq.last().copied() != Some(current_token) {
             seq.push(current_token);
         }

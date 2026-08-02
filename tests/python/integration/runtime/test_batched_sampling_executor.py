@@ -16,6 +16,7 @@ import pytest
 
 from tests.python.fixtures.depth_one import (
     commit_resolved,
+    execution_batch,
     root_parent,
     token_operation,
     und_admission,
@@ -23,7 +24,6 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
-    Batch,
     DrawLayout,
     DType,
     ErrorCode,
@@ -120,6 +120,7 @@ def _observe_sample_batches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, 
         device_products=None,
         device_reads=(),
         device_continuation=None,
+        selection_broadcast=None,
     ):
         observed.append((len(tasks), sum(len(task.rows) for task in tasks)))
         return implementation(
@@ -128,6 +129,7 @@ def _observe_sample_batches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, 
             device_products=device_products,
             device_reads=device_reads,
             device_continuation=device_continuation,
+            selection_broadcast=selection_broadcast,
         )
 
     monkeypatch.setattr(executor_module, "_sample_task_batch", wrapped)
@@ -163,7 +165,7 @@ def test_inline_rows_from_one_round_share_one_sampling_batch(
     observed = _observe_sample_batches(monkeypatch)
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(first, second),
             operations=(first_op, second_op),
@@ -188,7 +190,7 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
             tokens=(3, 4),
         )
         worker.execute(
-            Batch(
+            execution_batch(
                 step_id=1 + index,
                 admissions=(admission,),
                 operations=(extend,),
@@ -216,7 +218,7 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
     observed = _observe_sample_batches(monkeypatch)
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=9,
             admissions=(),
             operations=tuple(decode_ops),
@@ -229,15 +231,7 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
     expected = _next_token(_next_token(4))
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
-    for consumer_op_id, operation in enumerate(decode_ops, start=20):
-        selected = next(
-            output for output in operation.outputs if output.kind is ProductKind.SELECTED_POINT
-        )
-        assert worker.products.device_products.consume(
-            selected,
-            consumer_op_id=consumer_op_id,
-            device="cpu",
-        ).tensor.tolist() == [1]
+    assert tuple(completion.selected_point for completion in result.completions) == (1, 1)
 
 
 def test_admission_finish_policy_drives_the_device_finish_product() -> None:
@@ -258,7 +252,7 @@ def test_admission_finish_policy_drives_the_device_finish_product() -> None:
     )
 
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(operation,),
@@ -302,7 +296,7 @@ def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:
     )
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(first, second),
             operations=(first_op, second_op),
@@ -338,7 +332,7 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
         logprobs=True,
     )
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
         )
     )
@@ -355,7 +349,7 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
     observed = _observe_sample_batches(monkeypatch)
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=2,
             admissions=(),
             operations=(verify,),
@@ -404,7 +398,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
         tokens=(3, 4),
     )
     prime = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(extend,),
@@ -422,7 +416,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
     )
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=2,
             admissions=(),
             operations=(verify,),
@@ -462,7 +456,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
         tokens=(3, 4),
     )
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(extend,),
@@ -480,7 +474,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
     )
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=2,
             admissions=(),
             operations=(verify,),
@@ -520,7 +514,7 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         logprobs=True,
     )
     first_result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(first,),
@@ -538,7 +532,7 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         control_seq=commit.control_seq,
     )
     second_result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=2,
             admissions=(),
             operations=(second,),
@@ -582,7 +576,7 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
     )
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(operation,),
@@ -609,7 +603,7 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
     )
 
     result = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(operation,),

@@ -18,7 +18,6 @@ use uniserve_engine_wire::stats::{
 pub struct SchedStatsReporter {
     last_prefix_queries: u64,
     last_prefix_hit_tokens: u64,
-    last_preemptions: u64,
     last_queue_wait_count: u64,
     last_queue_wait_us_total: u64,
     last_spec_drafts: u64,
@@ -45,10 +44,6 @@ impl SchedStatsReporter {
         } else {
             0.0
         };
-
-        let preemptions = stats.general.preemptions.load(Ordering::Relaxed);
-        let delta_preemptions = preemptions.saturating_sub(self.last_preemptions);
-        self.last_preemptions = preemptions;
 
         let prefix_queries = stats.prefix.queries.load(Ordering::Relaxed);
         let prefix_hit_tokens = stats.prefix.hit_tokens.load(Ordering::Relaxed);
@@ -102,8 +97,7 @@ impl SchedStatsReporter {
                     queries: delta_queries * block_size as u64,
                     hits: delta_hit_tokens,
                 },
-                // Preemption observability on the wire: per-update count of preempted requests.
-                preempted_requests: delta_preemptions,
+                preempted_requests: 0,
                 ..Default::default()
             },
             spec_decoding_stats: self.spec_decoding_stats(stats),

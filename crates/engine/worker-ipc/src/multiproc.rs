@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError, WorkerLossError};
-use uniserve_worker_wire::{Batch, CompletionRecord, CompletionReport, EngineCaps, Point};
+use uniserve_worker_wire::{
+    Batch, CompletionRecord, CompletionReport, EngineCaps, Point, SamplingOwnership, SnapshotRef,
+};
 
 use crate::WorkerLaunchConfig;
 
@@ -96,31 +98,67 @@ pub struct MultiprocExecutor {
     inflight: usize,
     next_call_id: u64,
     pending_batches: BTreeMap<u64, Batch>,
+    pending_partitions: BTreeMap<u64, BTreeSet<u32>>,
+    last_collective_seq: u64,
     spawn_spec: Option<MultiprocSpawnSpec>,
     known_sessions: BTreeSet<RequestId>,
+    dirty_sessions: BTreeSet<RequestId>,
 }
 
 impl MultiprocExecutor {
-    pub fn new(workers: Vec<Box<dyn Executor>>) -> Self {
+    pub fn new(workers: Vec<Box<dyn Executor>>) -> anyhow::Result<Self> {
         Self::from_workers(workers, None)
     }
 
     fn from_workers(
         workers: Vec<Box<dyn Executor>>,
         spawn_spec: Option<MultiprocSpawnSpec>,
-    ) -> Self {
-        assert!(!workers.is_empty(), "need >= 1 worker");
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
-        let mut caps = workers[0].caps();
-        caps.rank.tp_size = n as u32;
-        let depth = workers
-            .iter()
-            .map(|w| w.pipeline_depth())
-            .min()
-            .unwrap_or(1)
-            .max(1);
+        let tp_size = u32::try_from(n).context("TP world size exceeds the wire representation")?;
+        let caps = workers[0].caps();
+        let mut canonical = caps.clone();
+        canonical.rank.tp_rank = 0;
+        canonical.restored_snapshots.clear();
+        let mut restored_versions = None;
+        for (rank, worker) in workers.iter().enumerate() {
+            let rank_caps = worker.caps();
+            rank_caps
+                .validate()
+                .with_context(|| format!("TP rank {rank} reported invalid capabilities"))?;
+            anyhow::ensure!(
+                rank_caps.rank.tp_rank == rank as u32 && rank_caps.rank.tp_size == tp_size,
+                "TP rank {rank} reported topology ({}/{}) for launched topology ({rank}/{tp_size})",
+                rank_caps.rank.tp_rank,
+                rank_caps.rank.tp_size,
+            );
+            anyhow::ensure!(
+                worker.pipeline_depth() == rank_caps.pipeline_depth.max(1) as usize,
+                "TP rank {rank} executor depth {} disagrees with capability depth {}",
+                worker.pipeline_depth(),
+                rank_caps.pipeline_depth.max(1),
+            );
+            let rank_restored = restored_snapshot_versions(&rank_caps.restored_snapshots);
+            if let Some(expected) = &restored_versions {
+                anyhow::ensure!(
+                    expected == &rank_restored,
+                    "TP rank {rank} restored snapshot versions disagree with rank 0"
+                );
+            } else {
+                restored_versions = Some(rank_restored);
+            }
+            let mut normalized = rank_caps;
+            normalized.rank.tp_rank = 0;
+            normalized.restored_snapshots.clear();
+            anyhow::ensure!(
+                normalized == canonical,
+                "TP rank {rank} capabilities disagree with rank 0"
+            );
+        }
+        let depth = caps.pipeline_depth.max(1) as usize;
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
-        Self {
+        Ok(Self {
             workers,
             buffers,
             caps,
@@ -128,9 +166,12 @@ impl MultiprocExecutor {
             inflight: 0,
             next_call_id: 1,
             pending_batches: BTreeMap::new(),
+            pending_partitions: BTreeMap::new(),
+            last_collective_seq: 0,
             spawn_spec,
             known_sessions: BTreeSet::new(),
-        }
+            dirty_sessions: BTreeSet::new(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -300,7 +341,7 @@ impl MultiprocExecutor {
             worker_config: worker_config.clone(),
         };
         let workers = spec.launch()?;
-        Ok(Self::from_workers(workers, Some(spec)))
+        Self::from_workers(workers, Some(spec))
     }
 
     fn pump_once(&mut self) -> anyhow::Result<()> {
@@ -357,7 +398,7 @@ impl MultiprocExecutor {
         self.install_replacement(workers, &spec)?;
         self.spawn_spec = Some(spec);
 
-        let restored_by_rank = self.replacement_restored_sessions();
+        let restored_by_rank = self.replacement_restored_snapshots();
         let reconstructable = self.reconstructable_admissions();
         let required = self
             .known_sessions
@@ -365,9 +406,7 @@ impl MultiprocExecutor {
             .copied()
             .collect::<BTreeSet<_>>();
         if !snapshots_enabled
-            || restored_by_rank
-                .iter()
-                .any(|restored| !required.is_subset(restored))
+            || !self.recovery_checkpoint_complete(&restored_by_rank, &reconstructable, &required)
         {
             self.discard_sessions_after_loss()?;
             return Err(WorkerLossError {
@@ -382,7 +421,11 @@ impl MultiprocExecutor {
         }
 
         for (rank, restored) in restored_by_rank.iter().enumerate() {
-            for session_id in restored.difference(&self.known_sessions).copied() {
+            for session_id in restored
+                .keys()
+                .filter(|session_id| !required.contains(session_id))
+                .copied()
+            {
                 let worker = &mut self.workers[rank];
                 let acknowledgments =
                     worker.control_wait(ControlOp::DropSession(session_id), None)?;
@@ -429,23 +472,39 @@ impl MultiprocExecutor {
         Ok(())
     }
 
-    fn replacement_restored_sessions(&self) -> Vec<BTreeSet<RequestId>> {
+    fn replacement_restored_snapshots(&self) -> Vec<BTreeMap<RequestId, SnapshotRef>> {
         self.workers
             .iter()
-            .map(|worker| {
-                worker
-                    .caps()
-                    .restored_sessions
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-            })
+            .map(|worker| restored_snapshot_map(worker.caps().restored_snapshots))
             .collect()
     }
 
+    fn recovery_checkpoint_complete(
+        &self,
+        restored_by_rank: &[BTreeMap<RequestId, SnapshotRef>],
+        reconstructable: &BTreeSet<RequestId>,
+        required: &BTreeSet<RequestId>,
+    ) -> bool {
+        self.dirty_sessions.is_subset(reconstructable)
+            && required.iter().all(|session_id| {
+                let Some(first) = restored_by_rank
+                    .first()
+                    .and_then(|restored| restored.get(session_id))
+                else {
+                    return false;
+                };
+                restored_by_rank.iter().all(|restored| {
+                    restored
+                        .get(session_id)
+                        .is_some_and(|snapshot| snapshot.version == first.version)
+                })
+            })
+    }
+
     fn discard_sessions_after_loss(&mut self) -> anyhow::Result<()> {
-        let restored_by_rank = self.replacement_restored_sessions();
+        let restored_by_rank = self.replacement_restored_snapshots();
         for (rank, restored) in restored_by_rank.into_iter().enumerate() {
-            for session_id in restored {
+            for session_id in restored.into_keys() {
                 let worker = &mut self.workers[rank];
                 let acknowledgments =
                     worker.control_wait(ControlOp::DropSession(session_id), None)?;
@@ -457,9 +516,11 @@ impl MultiprocExecutor {
             }
         }
         self.pending_batches.clear();
+        self.pending_partitions.clear();
         self.buffers.iter_mut().for_each(VecDeque::clear);
         self.inflight = 0;
         self.known_sessions.clear();
+        self.dirty_sessions.clear();
         Ok(())
     }
 
@@ -467,7 +528,7 @@ impl MultiprocExecutor {
         self.pending_batches
             .values()
             .flat_map(|batch| {
-                batch.operations.iter().filter_map(|operation| {
+                batch.operations().filter_map(|operation| {
                     // A depth-one admission root: point zero of the request's
                     // admission operation. Only such operations can be replayed
                     // from a fresh admission after a rank group is replaced.
@@ -495,9 +556,16 @@ impl MultiprocExecutor {
         match operation {
             ControlOp::DropSession(session_id) => {
                 self.known_sessions.remove(session_id);
+                self.dirty_sessions.remove(session_id);
             }
             ControlOp::RestoreSession(snapshot) => {
-                self.known_sessions.insert(snapshot.session_id);
+                let session_id = snapshot.version.request_key.session_id;
+                self.known_sessions.insert(session_id);
+                self.dirty_sessions.remove(&session_id);
+            }
+            ControlOp::CopyKv(_) | ControlOp::ReleaseProducts(_) => {
+                self.dirty_sessions
+                    .extend(self.known_sessions.iter().copied());
             }
             _ => {}
         }
@@ -522,7 +590,7 @@ impl MultiprocExecutor {
         if self.buffers.iter().any(|buffer| buffer.is_empty()) {
             return Ok(None);
         }
-        let Some(step_id) = self.joinable_step_id() else {
+        let Some((step_id, partition_ids)) = self.joinable_report_key() else {
             return Ok(None);
         };
 
@@ -530,7 +598,9 @@ impl MultiprocExecutor {
         for buffer in &mut self.buffers {
             let pos = buffer
                 .iter()
-                .position(|report| report.step_id == step_id)
+                .position(|report| {
+                    report.step_id == step_id && report_partition_ids(report) == partition_ids
+                })
                 .ok_or_else(|| {
                     anyhow::anyhow!("joinable step {step_id} disappeared from rank buffer")
                 })?;
@@ -539,32 +609,62 @@ impl MultiprocExecutor {
             })?);
         }
 
+        let batch = self
+            .pending_batches
+            .get(&step_id)
+            .ok_or_else(|| anyhow::anyhow!("joined step {step_id} has no pending batch"))?;
+        for (rank, report) in per_rank.iter_mut().enumerate() {
+            validate_and_order_rank_report(batch, report, rank)?;
+        }
         let mut out = per_rank.remove(0);
         for (rank, report) in per_rank.iter().enumerate() {
-            merge_rank_report(step_id, &mut out, report, rank + 1)?;
+            merge_rank_report(&self.caps, batch, &mut out, report, rank + 1)?;
         }
-        out.worker_exec_us = per_rank
-            .iter()
-            .filter_map(|report| report.worker_exec_us)
-            .chain(out.worker_exec_us)
-            .max();
-        self.inflight = self.inflight.saturating_sub(1);
-        self.pending_batches.remove(&step_id);
+        let remaining = self
+            .pending_partitions
+            .get_mut(&step_id)
+            .ok_or_else(|| anyhow::anyhow!("joined step {step_id} has no partition ledger"))?;
+        for partition_id in partition_ids {
+            anyhow::ensure!(
+                remaining.remove(&partition_id),
+                "joined step {step_id} repeated partition {partition_id}"
+            );
+        }
+        if remaining.is_empty() {
+            self.inflight = self.inflight.saturating_sub(1);
+            self.pending_batches.remove(&step_id);
+            self.pending_partitions.remove(&step_id);
+        }
         Ok(Some(out))
     }
 
-    fn joinable_step_id(&self) -> Option<u64> {
+    fn joinable_report_key(&self) -> Option<(u64, Vec<u32>)> {
         self.buffers[0]
             .iter()
             .filter_map(|report| {
                 let step_id = report.step_id;
+                let partition_ids = report_partition_ids(report);
                 self.buffers
                     .iter()
-                    .all(|buffer| buffer.iter().any(|item| item.step_id == step_id))
-                    .then_some(step_id)
+                    .all(|buffer| {
+                        buffer.iter().any(|item| {
+                            item.step_id == step_id && report_partition_ids(item) == partition_ids
+                        })
+                    })
+                    .then_some((step_id, partition_ids))
             })
             .min()
     }
+}
+
+fn report_partition_ids(report: &CompletionReport) -> Vec<u32> {
+    let mut ids = report
+        .partitions
+        .iter()
+        .map(|partition| partition.partition_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
 }
 
 /// Join one step's per-rank completion reports into rank 0's. Tensor-parallel
@@ -572,39 +672,161 @@ impl MultiprocExecutor {
 /// semantic completion for each operation; only the per-rank product shards
 /// differ and are concatenated in rank order.
 fn merge_rank_report(
-    step_id: u64,
+    caps: &EngineCaps,
+    batch: &Batch,
     rank0: &mut CompletionReport,
     rankn: &CompletionReport,
     rank: usize,
 ) -> anyhow::Result<()> {
+    let step_id = batch.step_id;
     if rankn.step_id != step_id {
         anyhow::bail!(
             "rank {rank} completion report step_id mismatch while joining step {step_id}: got {}",
             rankn.step_id
         );
     }
-    if rankn.completions.len() != rank0.completions.len() {
+    if rankn.partitions.len() != rank0.partitions.len() {
         anyhow::bail!(
-            "rank {rank} report for step {step_id} has {} completions, expected {}",
-            rankn.completions.len(),
-            rank0.completions.len()
+            "rank {rank} report for step {step_id} has {} partitions, expected {}",
+            rankn.partitions.len(),
+            rank0.partitions.len()
         );
     }
-    for (idx, (canonical, actual)) in rank0
-        .completions
+    for (partition_index, (canonical_partition, actual_partition)) in rank0
+        .partitions
         .iter_mut()
-        .zip(&rankn.completions)
+        .zip(&rankn.partitions)
         .enumerate()
     {
-        if let Err(error) = merge_completion_record(canonical, actual) {
-            anyhow::bail!(
-                "rank {rank} report for step {step_id} completion {idx} differs from rank 0: {error:#}"
+        let planned = batch
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == canonical_partition.partition_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rank join received unplanned partition {} for step {step_id}",
+                    canonical_partition.partition_id
+                )
+            })?;
+        let ownership = route_sampling_ownership(caps, planned.route)?;
+        anyhow::ensure!(
+            canonical_partition.partition_id == actual_partition.partition_id,
+            "rank {rank} report for step {step_id} partition {partition_index} identity differs from rank 0"
+        );
+        anyhow::ensure!(
+            canonical_partition.completions.len() == actual_partition.completions.len(),
+            "rank {rank} report for step {step_id} partition {} has {} completions, expected {}",
+            canonical_partition.partition_id,
+            actual_partition.completions.len(),
+            canonical_partition.completions.len()
+        );
+        for (completion_index, (canonical, actual)) in canonical_partition
+            .completions
+            .iter_mut()
+            .zip(&actual_partition.completions)
+            .enumerate()
+        {
+            if let Err(error) = merge_completion_record(canonical, actual, ownership) {
+                anyhow::bail!(
+                    "rank {rank} report for step {step_id} partition {} completion {completion_index} differs from rank 0: {error:#}",
+                    canonical_partition.partition_id
+                );
+            }
+        }
+        match ownership {
+            SamplingOwnership::DesignatedRank => anyhow::ensure!(
+                actual_partition.products.is_empty(),
+                "rank {rank} published host products for designated-rank partition {}",
+                canonical_partition.partition_id
+            ),
+            SamplingOwnership::DeterministicSharded => canonical_partition
+                .products
+                .extend(actual_partition.products.iter().cloned()),
+        }
+        canonical_partition.worker_exec_us = canonical_partition
+            .worker_exec_us
+            .into_iter()
+            .chain(actual_partition.worker_exec_us)
+            .max();
+    }
+    Ok(())
+}
+
+fn route_sampling_ownership(
+    caps: &EngineCaps,
+    route: uniserve_worker_wire::RouteId,
+) -> anyhow::Result<SamplingOwnership> {
+    caps.execution_constraints
+        .route_capabilities
+        .iter()
+        .find(|capability| capability.route == route)
+        .map(|capability| capability.sampling_ownership)
+        .ok_or_else(|| anyhow::anyhow!("route {} has no sampling ownership capability", route.0))
+}
+
+fn validate_and_order_rank_report(
+    batch: &Batch,
+    report: &mut CompletionReport,
+    rank: usize,
+) -> anyhow::Result<()> {
+    report.validate()?;
+    anyhow::ensure!(
+        report.step_id == batch.step_id,
+        "rank {rank} returned step {} for pending step {}",
+        report.step_id,
+        batch.step_id
+    );
+    let report_count = report.partitions.len();
+    let returned = report_partition_ids(report)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        report_count > 0 || batch.partitions.is_empty(),
+        "rank {rank} returned an empty partial report for step {}",
+        batch.step_id
+    );
+    let mut ordered = Vec::with_capacity(report_count);
+    for planned in &batch.partitions {
+        if !returned.contains(&planned.partition_id) {
+            continue;
+        }
+        let index = report
+            .partitions
+            .iter()
+            .position(|partition| partition.partition_id == planned.partition_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rank {rank} omitted partition {} for step {} collective {}",
+                    planned.partition_id,
+                    batch.step_id,
+                    planned.collective_seq
+                )
+            })?;
+        let actual = report.partitions.swap_remove(index);
+        anyhow::ensure!(
+            actual.completions.len() == planned.operations.len(),
+            "rank {rank} partition {} returned {} completions for {} operations",
+            planned.partition_id,
+            actual.completions.len(),
+            planned.operations.len()
+        );
+        for (operation, completion) in planned.operations.iter().zip(&actual.completions) {
+            anyhow::ensure!(
+                operation.request_key == completion.request_key
+                    && operation.op_id == completion.op_id,
+                "rank {rank} partition {} completion order disagrees with collective {}",
+                planned.partition_id,
+                planned.collective_seq
             );
         }
+        ordered.push(actual);
     }
-    // Report-level product payloads are per-rank shards; concatenate them in
-    // rank order (rank 0's, then rank 1's, ...).
-    rank0.products.extend(rankn.products.iter().cloned());
+    anyhow::ensure!(
+        ordered.len() == report_count,
+        "rank {rank} returned an unplanned partition for step {}",
+        batch.step_id
+    );
+    report.partitions = ordered;
     Ok(())
 }
 
@@ -614,6 +836,7 @@ fn merge_rank_report(
 fn merge_completion_record(
     canonical: &mut CompletionRecord,
     rank_completion: &CompletionRecord,
+    ownership: SamplingOwnership,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         canonical.request_key == rank_completion.request_key
@@ -630,9 +853,15 @@ fn merge_completion_record(
             && canonical.finish_flags == rank_completion.finish_flags,
         "completion result fields diverged"
     );
-    canonical
-        .product_generations
-        .extend(rank_completion.product_generations.iter().copied());
+    match ownership {
+        SamplingOwnership::DesignatedRank => anyhow::ensure!(
+            canonical.product_generations == rank_completion.product_generations,
+            "designated-rank product generations diverged"
+        ),
+        SamplingOwnership::DeterministicSharded => canonical
+            .product_generations
+            .extend(rank_completion.product_generations.iter().copied()),
+    }
     Ok(())
 }
 
@@ -641,14 +870,40 @@ fn validate_replacement_caps(
     actual: &EngineCaps,
     rank: usize,
 ) -> anyhow::Result<()> {
+    actual
+        .validate()
+        .with_context(|| format!("replacement rank {rank} reported invalid capabilities"))?;
     let mut normalized_expected = expected.clone();
     normalized_expected.rank.tp_rank = rank as u32;
-    normalized_expected.restored_sessions = actual.restored_sessions.clone();
+    normalized_expected.restored_snapshots.clear();
+    let mut normalized_actual = actual.clone();
+    normalized_actual.restored_snapshots.clear();
     anyhow::ensure!(
-        &normalized_expected == actual,
+        normalized_expected == normalized_actual,
         "replacement rank {rank} capabilities changed"
     );
     Ok(())
+}
+
+fn restored_snapshot_versions(
+    snapshots: &[SnapshotRef],
+) -> BTreeMap<RequestId, uniserve_worker_wire::VersionRef> {
+    snapshots
+        .iter()
+        .map(|snapshot| {
+            (
+                snapshot.version.request_key.session_id,
+                snapshot.version.clone(),
+            )
+        })
+        .collect()
+}
+
+fn restored_snapshot_map(snapshots: Vec<SnapshotRef>) -> BTreeMap<RequestId, SnapshotRef> {
+    snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.version.request_key.session_id, snapshot))
+        .collect()
 }
 
 fn allocate_tp_init_method() -> anyhow::Result<String> {
@@ -680,19 +935,58 @@ impl Executor for MultiprocExecutor {
     }
 
     fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+        batch.validate()?;
         anyhow::ensure!(
             !self.pending_batches.contains_key(&batch.step_id),
             "step {} is already in flight",
             batch.step_id
         );
         let step_id = batch.step_id;
-        let sessions = batch
-            .operations
+        let mut collective_sequences = batch
+            .partitions
             .iter()
+            .map(|partition| partition.collective_seq)
+            .collect::<Vec<_>>();
+        collective_sequences.sort_unstable();
+        collective_sequences.dedup();
+        anyhow::ensure!(
+            collective_sequences
+                .windows(2)
+                .all(|window| window[0] < window[1])
+                && collective_sequences
+                    .first()
+                    .is_none_or(|sequence| *sequence > self.last_collective_seq),
+            "step {step_id} collective order does not advance beyond {}",
+            self.last_collective_seq
+        );
+        let sessions = batch
+            .operations()
             .map(|operation| operation.request_key.session_id)
             .collect::<Vec<_>>();
         self.pending_batches.insert(step_id, batch.clone());
+        self.pending_partitions.insert(
+            step_id,
+            batch
+                .partitions
+                .iter()
+                .map(|partition| partition.partition_id)
+                .collect(),
+        );
         self.known_sessions.extend(sessions);
+        self.dirty_sessions.extend(
+            batch
+                .operations()
+                .map(|operation| operation.request_key.session_id)
+                .chain(
+                    batch
+                        .controls
+                        .iter()
+                        .map(|control| control.request_key().session_id),
+                ),
+        );
+        if let Some(sequence) = collective_sequences.last() {
+            self.last_collective_seq = *sequence;
+        }
         self.inflight += 1;
         for (rank, worker) in self.workers.iter_mut().enumerate() {
             if let Err(error) = worker
@@ -886,7 +1180,35 @@ impl Executor for MultiprocExecutor {
                 self.recover_workers(&error)?;
                 continue;
             }
-            self.apply_control_session_effect(&op, acks.iter().all(|ack| ack.ok));
+            let succeeded = acks.iter().all(|ack| ack.ok);
+            if succeeded && let ControlOp::SnapshotSession(session_id) = &op {
+                let references = acks
+                    .iter()
+                    .map(|ack| {
+                        ack.snapshot.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "rank {} acknowledged session {} snapshot without a reference",
+                                ack.rank,
+                                session_id.0
+                            )
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                anyhow::ensure!(
+                    !references.is_empty(),
+                    "session snapshot control selected no tensor-parallel rank"
+                );
+                let first = references[0];
+                anyhow::ensure!(
+                    references.iter().all(|reference| {
+                        reference.version.request_key.session_id == *session_id
+                            && reference.version == first.version
+                    }),
+                    "tensor-parallel snapshot ranks disagree on session, epoch, or version"
+                );
+                self.dirty_sessions.remove(session_id);
+            }
+            self.apply_control_session_effect(&op, succeeded);
             return Ok(acks);
         }
     }
@@ -900,16 +1222,18 @@ impl Executor for MultiprocExecutor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::time::Duration;
 
-    use super::{MultiprocExecutor, device_for_rank};
+    use super::{MultiprocExecutor, device_for_rank, report_partition_ids};
     use uniserve_core::RequestId;
     use uniserve_executor::{ControlAck, ControlOp, Executor};
     use uniserve_worker_wire::{
-        Batch, CompletionRecord, CompletionReport, DType, EngineCaps, FinishFlags, LogicalLengths,
-        OpId, OpStatus, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-        RequestKey, ShapeBound, StorageClass, TimingCounters, TokenSpan,
+        AttentionRegime, Batch, BatchPartition, Bounds, CompletionRecord, CompletionReport, DType,
+        Domain, EngineCaps, ExecutionCapability, FinishFlags, LogicalLengths, OpId, OpStatus,
+        Operation, PartitionCompletion, PointRange, ProductKind, ProductPayload, ProductRef,
+        RegistrationAck, RequestKey, RouteId, SamplingOwnership, ShapeBound, SnapshotRef,
+        StorageClass, TimingCounters, TokenMode, TokenSpan, VersionRef, Work,
     };
 
     #[test]
@@ -919,6 +1243,57 @@ mod tests {
         assert_eq!(device_for_rank("cuda:0", 1, 4), "cuda:0");
         assert_eq!(device_for_rank("cpu", 1, 4), "cpu");
         assert_eq!(device_for_rank("cuda", 0, 1), "cuda");
+    }
+
+    #[test]
+    fn multiproc_construction_requires_exact_rank_capability_agreement() {
+        let exec = MultiprocExecutor::new(vec![fake_worker(0, 2), fake_worker(1, 2)]).unwrap();
+        assert_eq!(exec.caps.rank.tp_rank, 0);
+        assert_eq!(exec.caps.rank.tp_size, 2);
+        assert_eq!(exec.pipeline_depth(), 2);
+
+        let topology_error = MultiprocExecutor::new(vec![fake_worker(0, 2), fake_worker(0, 2)])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            topology_error.contains("reported topology"),
+            "got: {topology_error}"
+        );
+
+        let mut disagreeing_caps = fake_caps(1, 2);
+        disagreeing_caps.num_blocks += 1;
+        let capability_error = MultiprocExecutor::new(vec![
+            fake_worker(0, 2),
+            Box::new(FakeExec {
+                caps: disagreeing_caps,
+                queued: VecDeque::new(),
+            }),
+        ])
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            capability_error.contains("capabilities disagree"),
+            "got: {capability_error}"
+        );
+
+        let mut invalid_protocol = fake_caps(1, 2);
+        invalid_protocol.protocol_layout_digest = "0".repeat(64);
+        let protocol_error = MultiprocExecutor::new(vec![
+            fake_worker(0, 2),
+            Box::new(FakeExec {
+                caps: invalid_protocol,
+                queued: VecDeque::new(),
+            }),
+        ])
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            protocol_error.contains("invalid capabilities"),
+            "got: {protocol_error}"
+        );
     }
 
     #[test]
@@ -933,6 +1308,7 @@ mod tests {
     fn multiproc_join_matches_by_step_id_without_consuming_unmatched_front() {
         let mut exec = fake_multiproc(2);
         exec.inflight = 2;
+        queue_pending(&mut exec, &[1, 2]);
         exec.buffers[0].push_back(result(2, 20));
         exec.buffers[0].push_back(result(1, 10));
         exec.buffers[1].push_back(result(1, 10));
@@ -949,6 +1325,7 @@ mod tests {
     fn multiproc_join_rejects_rank_token_divergence() {
         let mut exec = fake_multiproc(2);
         exec.inflight = 1;
+        queue_pending(&mut exec, &[1]);
         exec.buffers[0].push_back(result(1, 10));
         exec.buffers[1].push_back(result(1, 11));
 
@@ -959,42 +1336,260 @@ mod tests {
     }
 
     #[test]
+    fn multiproc_join_requires_identical_selected_point_and_semantic_digest() {
+        let mut selected = fake_multiproc(2);
+        selected.inflight = 1;
+        queue_pending(&mut selected, &[1]);
+        selected.buffers[0].push_back(result(1, 10));
+        let mut selected_divergence = result(1, 10);
+        selected_divergence.partitions[0].completions[0].selected_point = 1;
+        selected.buffers[1].push_back(selected_divergence);
+        let selected_error = selected.try_join().unwrap_err().to_string();
+        assert!(
+            selected_error.contains("completion 0 differs"),
+            "got: {selected_error}"
+        );
+
+        let mut digest = fake_multiproc(2);
+        digest.inflight = 1;
+        queue_pending(&mut digest, &[1]);
+        digest.buffers[0].push_back(result(1, 10));
+        let mut digest_divergence = result(1, 10);
+        digest_divergence.partitions[0].completions[0].semantic_digest = "1".repeat(64);
+        digest.buffers[1].push_back(digest_divergence);
+        let digest_error = digest.try_join().unwrap_err().to_string();
+        assert!(
+            digest_error.contains("completion 0 differs"),
+            "got: {digest_error}"
+        );
+    }
+
+    #[test]
+    fn worker_recovery_accepts_only_exact_or_fresh_admission_state() {
+        let mut exec = fake_multiproc(2);
+        let session = RequestId(7);
+        exec.known_sessions.insert(session);
+        exec.dirty_sessions.insert(session);
+        let restored = vec![
+            BTreeMap::from([(session, snapshot(session, 0))]),
+            BTreeMap::from([(session, snapshot(session, 1))]),
+        ];
+        let reconstructable = BTreeSet::new();
+        let required = BTreeSet::from([session]);
+
+        assert!(!exec.recovery_checkpoint_complete(&restored, &reconstructable, &required,));
+
+        exec.dirty_sessions.clear();
+        assert!(exec.recovery_checkpoint_complete(&restored, &reconstructable, &required,));
+
+        let incomplete = vec![
+            BTreeMap::from([(session, snapshot(session, 0))]),
+            BTreeMap::new(),
+        ];
+        assert!(!exec.recovery_checkpoint_complete(&incomplete, &reconstructable, &required,));
+
+        let mut conflicting = snapshot(session, 1);
+        conflicting.version.producer_op_id = OpId(2);
+        let ambiguous = vec![
+            BTreeMap::from([(session, snapshot(session, 0))]),
+            BTreeMap::from([(session, conflicting)]),
+        ];
+        assert!(!exec.recovery_checkpoint_complete(&ambiguous, &reconstructable, &required,));
+
+        exec.dirty_sessions.insert(session);
+        assert!(exec.recovery_checkpoint_complete(
+            &[BTreeMap::new(), BTreeMap::new()],
+            &BTreeSet::from([session]),
+            &BTreeSet::new(),
+        ));
+    }
+
+    fn snapshot(session_id: RequestId, rank: u8) -> SnapshotRef {
+        SnapshotRef {
+            version: VersionRef::admission_root(
+                RequestKey::new(1, session_id, 1),
+                OpId(1),
+                "a".repeat(64),
+            ),
+            digest: format!("{rank:x}").repeat(64),
+            locator: format!("{rank:x}").repeat(64),
+        }
+    }
+
+    #[test]
     fn multiproc_join_concatenates_rank_ordered_products() {
         // The tensor-parallel join concatenates each completion's
         // `product_generations` and the report-level `products` in rank order,
         // while the semantic completion is required to be identical per rank.
         let mut exec = fake_multiproc(2);
+        exec.caps.execution_constraints.route_capabilities[0].sampling_ownership =
+            SamplingOwnership::DeterministicSharded;
+        exec.caps.route_capability_digest = exec.caps.compute_route_capability_digest();
         exec.inflight = 1;
+        queue_pending(&mut exec, &[1]);
         exec.buffers[0].push_back(result_with_products(1, vec![10, 11], 100));
         exec.buffers[1].push_back(result_with_products(1, vec![20, 21], 200));
 
         let joined = exec.try_join().unwrap().unwrap();
 
         assert_eq!(
-            joined.completions[0].product_generations,
+            joined.partitions[0].completions[0].product_generations,
             vec![10, 11, 20, 21]
         );
-        assert_eq!(joined.products.len(), 2);
-        assert_eq!(joined.products[0].product.generation, 100);
-        assert_eq!(joined.products[1].product.generation, 200);
+        assert_eq!(joined.partitions[0].products.len(), 2);
+        assert_eq!(joined.partitions[0].products[0].product.generation, 100);
+        assert_eq!(joined.partitions[0].products[1].product.generation, 200);
 
         // Identity / committed-token divergence across ranks is still rejected.
         let mut exec = fake_multiproc(2);
+        exec.caps.execution_constraints.route_capabilities[0].sampling_ownership =
+            SamplingOwnership::DeterministicSharded;
+        exec.caps.route_capability_digest = exec.caps.compute_route_capability_digest();
         exec.inflight = 1;
+        queue_pending(&mut exec, &[1]);
         exec.buffers[0].push_back(result_with_products(1, vec![10], 100));
         let mut diverged = result_with_products(1, vec![20], 200);
-        diverged.completions[0].committed_tokens = vec![99];
+        diverged.partitions[0].completions[0].committed_tokens = vec![99];
         exec.buffers[1].push_back(diverged);
 
         let error = exec.try_join().unwrap_err().to_string();
         assert!(error.contains("completion 0 differs"), "got: {error}");
     }
 
+    #[test]
+    fn multiproc_join_releases_each_partition_when_every_rank_reports_it() {
+        let mut exec = fake_multiproc(2);
+        let batch = two_partition_batch(1);
+        exec.pending_partitions.insert(1, BTreeSet::from([1, 2]));
+        exec.pending_batches.insert(1, batch);
+        exec.inflight = 1;
+        exec.buffers[0].push_back(partition_result(1, 1, 7, 1, 10));
+        exec.buffers[1].push_back(partition_result(1, 1, 7, 1, 10));
+
+        let first = exec.try_join().unwrap().unwrap();
+
+        assert_eq!(report_partition_ids(&first), vec![1]);
+        assert_eq!(exec.inflight, 1);
+        assert_eq!(exec.pending_partitions.get(&1), Some(&BTreeSet::from([2])));
+
+        exec.buffers[0].push_back(partition_result(1, 2, 8, 2, 20));
+        exec.buffers[1].push_back(partition_result(1, 2, 8, 2, 20));
+
+        let second = exec.try_join().unwrap().unwrap();
+
+        assert_eq!(report_partition_ids(&second), vec![2]);
+        assert_eq!(exec.inflight, 0);
+        assert!(!exec.pending_batches.contains_key(&1));
+        assert!(!exec.pending_partitions.contains_key(&1));
+    }
+
     fn fake_multiproc(n: usize) -> MultiprocExecutor {
-        let workers = (0..n)
-            .map(|_| Box::new(FakeExec::default()) as Box<dyn Executor>)
-            .collect();
-        MultiprocExecutor::new(workers)
+        let workers = (0..n).map(|rank| fake_worker(rank, n)).collect();
+        MultiprocExecutor::new(workers).unwrap()
+    }
+
+    fn fake_caps(rank: usize, world_size: usize) -> EngineCaps {
+        let mut caps = EngineCaps::default();
+        caps.rank.tp_rank = rank as u32;
+        caps.rank.tp_size = world_size as u32;
+        caps.pipeline_depth = 2;
+        caps
+    }
+
+    fn fake_worker(rank: usize, world_size: usize) -> Box<dyn Executor> {
+        Box::new(FakeExec {
+            caps: fake_caps(rank, world_size),
+            queued: VecDeque::new(),
+        })
+    }
+
+    fn queue_pending(exec: &mut MultiprocExecutor, step_ids: &[u64]) {
+        for step_id in step_ids {
+            let batch = test_batch(*step_id);
+            exec.pending_partitions.insert(
+                *step_id,
+                batch
+                    .partitions
+                    .iter()
+                    .map(|partition| partition.partition_id)
+                    .collect(),
+            );
+            exec.pending_batches.insert(*step_id, batch);
+        }
+    }
+
+    fn test_batch(step_id: u64) -> Batch {
+        let key = RequestKey::new(1, RequestId(7), 1);
+        let operation = Operation::registered(
+            key,
+            OpId(step_id.max(1)),
+            VersionRef::admission_root(key, OpId(1), "0".repeat(64)),
+            Work::Token(TokenMode::Decode),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_tokens: 1,
+                ..Bounds::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
+        );
+        Batch::new(
+            step_id,
+            Vec::new(),
+            vec![BatchPartition {
+                partition_id: 1,
+                submission_group: 1,
+                collective_seq: step_id.max(1),
+                domain: Domain::Und,
+                route: RouteId(0),
+                execution: ExecutionCapability::DomainHomogeneous,
+                attention: AttentionRegime::Causal,
+                shape_class: 0,
+                operations: vec![operation],
+            }],
+        )
+    }
+
+    fn two_partition_batch(step_id: u64) -> Batch {
+        let mut batch = test_batch(step_id);
+        let key = RequestKey::new(1, RequestId(8), 1);
+        let operation = Operation::registered(
+            key,
+            OpId(2),
+            VersionRef::admission_root(key, OpId(1), "0".repeat(64)),
+            Work::Token(TokenMode::Decode),
+            RouteId(0),
+            Domain::Und,
+            Bounds {
+                max_points: 1,
+                max_tokens: 1,
+                ..Bounds::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
+        );
+        batch.partitions.push(BatchPartition {
+            partition_id: 2,
+            submission_group: 2,
+            collective_seq: step_id.max(1) + 1,
+            domain: Domain::Und,
+            route: RouteId(0),
+            execution: ExecutionCapability::DomainHomogeneous,
+            attention: AttentionRegime::Causal,
+            shape_class: 0,
+            operations: vec![operation],
+        });
+        batch
     }
 
     fn completion(
@@ -1022,11 +1617,36 @@ mod tests {
     fn result(step_id: u64, sampled_token_id: u32) -> CompletionReport {
         CompletionReport {
             step_id,
-            completions: vec![completion(step_id, vec![sampled_token_id], Vec::new())],
-            products: Vec::new(),
-            registration: RegistrationAck::default(),
-            worker_exec_us: Some(step_id),
-            forward_stats: None,
+            partitions: vec![PartitionCompletion {
+                partition_id: 1,
+                completions: vec![completion(step_id, vec![sampled_token_id], Vec::new())],
+                products: Vec::new(),
+                registration: RegistrationAck::default(),
+                worker_exec_us: Some(step_id),
+                forward_stats: None,
+            }],
+        }
+    }
+
+    fn partition_result(
+        step_id: u64,
+        partition_id: u32,
+        session_id: u64,
+        op_id: u64,
+        sampled_token_id: u32,
+    ) -> CompletionReport {
+        let mut record = completion(op_id, vec![sampled_token_id], Vec::new());
+        record.request_key = RequestKey::new(1, RequestId(session_id), 1);
+        CompletionReport {
+            step_id,
+            partitions: vec![PartitionCompletion {
+                partition_id,
+                completions: vec![record],
+                products: Vec::new(),
+                registration: RegistrationAck::default(),
+                worker_exec_us: Some(step_id),
+                forward_stats: None,
+            }],
         }
     }
 
@@ -1037,11 +1657,14 @@ mod tests {
     ) -> CompletionReport {
         CompletionReport {
             step_id,
-            completions: vec![completion(step_id, vec![10], product_generations)],
-            products: vec![product_payload(payload_generation)],
-            registration: RegistrationAck::default(),
-            worker_exec_us: Some(step_id),
-            forward_stats: None,
+            partitions: vec![PartitionCompletion {
+                partition_id: 1,
+                completions: vec![completion(step_id, vec![10], product_generations)],
+                products: vec![product_payload(payload_generation)],
+                registration: RegistrationAck::default(),
+                worker_exec_us: Some(step_id),
+                forward_stats: None,
+            }],
         }
     }
 
@@ -1062,14 +1685,14 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeExec {
+        caps: EngineCaps,
         queued: VecDeque<CompletionReport>,
     }
 
     impl Executor for FakeExec {
         fn caps(&self) -> EngineCaps {
-            EngineCaps::default()
+            self.caps.clone()
         }
 
         fn pipeline_depth(&self) -> usize {

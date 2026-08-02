@@ -86,6 +86,27 @@ class FlowMatchSchedule:
             raise IndexError(index)
         return steps[index], steps[index + 1]
 
+    def scalar(self, index: int) -> float:
+        """Return one host schedule coordinate without observing a device tensor."""
+
+        if self.num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        if index < 0 or index > self.num_steps:
+            raise IndexError(index)
+        start, stop = _DIRECTION_ENDPOINTS[self.direction]
+        value = start + (stop - start) * (float(index) / float(self.num_steps))
+        if self.shift == 1.0:
+            return value
+        if self.shift <= 0:
+            raise ValueError("shift must be positive")
+        if self.shift_domain is ScheduleShiftDomain.TIME:
+            return self.shift * value / (1.0 + (self.shift - 1.0) * value)
+        if self.shift_domain is ScheduleShiftDomain.SIGMA:
+            sigma = 1.0 - value
+            shifted = self.shift * sigma / (1.0 + (self.shift - 1.0) * sigma)
+            return 1.0 - shifted
+        raise ValueError(f"unknown shift domain {self.shift_domain!r}")
+
 
 # Direction -> (linspace start, stop) for the base timesteps, and shift-domain ->
 # the method that applies the shift transform. Splitting the two enum decisions

@@ -23,9 +23,9 @@ use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
     Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, EngineCaps,
     ErrorCode, ExecutionConstraints, FinishFlags, GenMode, LogicalLengths, OpStatus, Operation,
-    Point, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, SamplingState,
-    TimingCounters, TokenMode, TokenSpan, TransferMode, Work, WorkVariant,
-    decode_sampling_state_bytes,
+    PartitionCompletion, Point, ProductKind, ProductPayload, ProductRef, RegistrationAck,
+    RequestKind, SamplingState, TimingCounters, TokenMode, TokenSpan, TransferMode, Work,
+    WorkVariant, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -235,6 +235,7 @@ struct SimSession {
     kv_published_len: u32,
     emitted: usize,
     flow_step: u16,
+    predicate_values: HashMap<ProductRef, bool>,
     terminal: BTreeMap<u64, RecordedCompletion>,
 }
 
@@ -254,6 +255,7 @@ impl SimSession {
             kv_published_len: 0,
             emitted: 0,
             flow_step: 0,
+            predicate_values: HashMap::new(),
             terminal: BTreeMap::new(),
         }
     }
@@ -313,6 +315,43 @@ impl SimEngine {
             ],
             execution_constraints: ExecutionConstraints {
                 max_batch_operations: 1024,
+                route_capabilities: vec![uniserve_worker_wire::RouteExecutionCapability {
+                    route: uniserve_worker_wire::RouteId(0),
+                    supported_work: WorkVariant::ALL.to_vec(),
+                    tensorized_mixed: true,
+                    sampling_ownership: uniserve_worker_wire::SamplingOwnership::DesignatedRank,
+                    preemptible: false,
+                    credits: uniserve_worker_wire::RouteCreditLimits {
+                        per_request: uniserve_worker_wire::CreditVector {
+                            registered_operations: 2,
+                            execution_slots: 2,
+                            completion_slots: 2,
+                            device_products: 32,
+                            kv_pages: 4096,
+                            rollback_deltas: 34,
+                            latent_artifact_bytes: 1 << 28,
+                            pinned_completion_staging_bytes: 1 << 26,
+                            transfer_bytes: 1 << 24,
+                            transfer_tickets: 2,
+                            cpu_tasks: 1,
+                            output_journal_bytes: 1 << 30,
+                        },
+                        worker: uniserve_worker_wire::CreditVector {
+                            registered_operations: 1024,
+                            execution_slots: 1024,
+                            completion_slots: 1024,
+                            device_products: 16_384,
+                            kv_pages: 4096,
+                            rollback_deltas: 17_408,
+                            latent_artifact_bytes: 1 << 36,
+                            pinned_completion_staging_bytes: 1 << 36,
+                            transfer_bytes: 1 << 34,
+                            transfer_tickets: 1024,
+                            cpu_tasks: 256,
+                            output_journal_bytes: 1 << 40,
+                        },
+                    },
+                }],
                 ..ExecutionConstraints::default()
             },
             model_spec_digest: "0".repeat(64),
@@ -510,11 +549,30 @@ impl SimEngine {
                         return Ok((record, Vec::new()));
                     };
                     record.finish_flags.eos = output.token == self.fake_eos;
-                    if let Some(state) = sampling_state {
+                    if let Some(state) = sampling_state.as_ref() {
                         record.finish_flags.stop =
                             state.finish_token_ids.binary_search(&output.token).is_ok()
                                 && !record.finish_flags.eos;
                         record.finish_flags.length = state.force_finish;
+                    }
+                    let admitted_stops = session
+                        .admission
+                        .und
+                        .as_ref()
+                        .map_or(&[][..], |und| und.finish_token_ids.as_slice());
+                    let continuation = admitted_stops.binary_search(&output.token).is_err()
+                        && sampling_state.as_ref().is_none_or(|state| {
+                            !state.force_finish
+                                && state.finish_token_ids.binary_search(&output.token).is_err()
+                        });
+                    if let Some(token_product) = operation
+                        .outputs
+                        .iter()
+                        .find(|output| output.kind == ProductKind::Token)
+                    {
+                        session
+                            .predicate_values
+                            .insert(token_product.clone(), continuation);
                     }
                     record.token_span = TokenSpan {
                         base: index as u32,
@@ -633,6 +691,38 @@ impl SimEngine {
         record.semantic_digest =
             record.compute_semantic_digest(&parent_semantic, &operation.plan_digest);
         Ok((record, products))
+    }
+
+    fn predicated_completion(operation: &Operation, session: &SimSession) -> CompletionRecord {
+        let mut record = CompletionRecord {
+            request_key: operation.request_key,
+            op_id: operation.op_id,
+            completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
+            status: OpStatus::Predicated,
+            selected_point: session.point_index,
+            logical_lengths: LogicalLengths {
+                token_len: session.logical_position,
+                kv_visible_len: session.kv_visible_len,
+                kv_reserved_len: session.kv_visible_len,
+                kv_initialized_len: session.kv_visible_len,
+                kv_committed_len: session.kv_visible_len,
+                kv_published_len: session.kv_published_len,
+                ..LogicalLengths::default()
+            },
+            token_span: TokenSpan {
+                base: session.emitted.min(u32::MAX as usize) as u32,
+                len: 0,
+            },
+            committed_tokens: Vec::new(),
+            finish_flags: FinishFlags::default(),
+            product_generations: Vec::new(),
+            semantic_digest: String::new(),
+            error_code: None,
+            timing_counters: TimingCounters::default(),
+        };
+        record.semantic_digest =
+            record.compute_semantic_digest(&session.committed_semantic, &operation.plan_digest);
+        record
     }
 
     pub fn set_pipeline_depth(&mut self, depth: u32) {
@@ -771,113 +861,155 @@ impl ModelEngine for SimEngine {
             }
         }
         let input_products = batch.input_products;
-
-        let mut completions = Vec::with_capacity(batch.operations.len());
-        let mut products = Vec::new();
-        for operation in batch.operations {
-            let mut session = self
-                .sessions
-                .get(&operation.request_key.session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "session {} has no admission",
-                        operation.request_key.session_id.0
-                    )
-                })?;
-            if let Some(recorded) = session.terminal.get(&operation.op_id.0) {
-                anyhow::ensure!(
-                    recorded.plan_digest == operation.plan_digest,
-                    "operation {} plan digest conflicts with its terminal record",
-                    operation.op_id.0
-                );
-                completions.push(recorded.completion.clone());
-                products.extend(recorded.products.clone());
-                continue;
-            }
-            anyhow::ensure!(
-                operation.request_key == session.admission.request_key,
-                "operation identity {:?} does not match its admitted lineage",
-                operation.request_key
-            );
-            match &operation.parent.point {
-                Point::Fixed {
-                    point_index,
-                    semantic_digest,
-                } => {
-                    anyhow::ensure!(
-                        *point_index == session.point_index,
-                        "operation {} ({}) parent point {} does not match session point {}",
-                        operation.op_id.0,
-                        operation.work.variant().as_wire_str(),
-                        point_index,
-                        session.point_index
-                    );
-                    anyhow::ensure!(
-                        *semantic_digest == session.committed_semantic,
-                        "operation {} ({}) parent semantic digest does not match the committed point",
-                        operation.op_id.0,
-                        operation.work.variant().as_wire_str()
-                    );
-                }
-                Point::Device {
-                    selected_point,
-                    producer_plan_digest,
-                } => {
-                    // A device-relay successor roots on its predecessor's
-                    // selected point before host observation. By the time it
-                    // runs, the predecessor has committed and advanced this
-                    // session, so its point is the current session point and its
-                    // terminal record names the referenced producer. The base
-                    // point is the session's tracked point, not the absent
-                    // device point index.
-                    let producer_op_id = operation.parent.producer_op_id.0;
-                    let recorded = session.terminal.get(&producer_op_id).ok_or_else(|| {
+        let mut partition_reports = Vec::with_capacity(batch.partitions.len());
+        for partition in batch.partitions {
+            let mut completions = Vec::with_capacity(partition.operations.len());
+            let mut products = Vec::new();
+            for operation in partition.operations {
+                let mut session = self
+                    .sessions
+                    .get(&operation.request_key.session_id)
+                    .cloned()
+                    .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "device parent names unknown predecessor op {producer_op_id}"
+                            "session {} has no admission",
+                            operation.request_key.session_id.0
                         )
                     })?;
+                if let Some(recorded) = session.terminal.get(&operation.op_id.0) {
                     anyhow::ensure!(
-                        recorded.plan_digest == *producer_plan_digest,
-                        "device parent producer plan digest does not match its predecessor"
+                        recorded.plan_digest == operation.plan_digest,
+                        "operation {} plan digest conflicts with its terminal record",
+                        operation.op_id.0
                     );
-                    anyhow::ensure!(
-                        selected_point.producer_op_id.0 == producer_op_id,
-                        "device parent selected point is not produced by its named predecessor"
-                    );
-                    anyhow::ensure!(
-                        recorded.completion.selected_point == session.point_index,
-                        "device parent predecessor is not the session's committed point"
-                    );
+                    completions.push(recorded.completion.clone());
+                    products.extend(recorded.products.clone());
+                    continue;
                 }
-            }
+                anyhow::ensure!(
+                    operation.request_key == session.admission.request_key,
+                    "operation identity {:?} does not match its admitted lineage",
+                    operation.request_key
+                );
+                match &operation.parent.point {
+                    Point::Fixed {
+                        point_index,
+                        semantic_digest,
+                    } => {
+                        anyhow::ensure!(
+                            *point_index == session.point_index,
+                            "operation {} ({}) parent point {} does not match session point {}",
+                            operation.op_id.0,
+                            operation.work.variant().as_wire_str(),
+                            point_index,
+                            session.point_index
+                        );
+                        anyhow::ensure!(
+                            *semantic_digest == session.committed_semantic,
+                            "operation {} ({}) parent semantic digest does not match the committed point",
+                            operation.op_id.0,
+                            operation.work.variant().as_wire_str()
+                        );
+                    }
+                    Point::Device {
+                        point_index,
+                        selected_point,
+                        producer_plan_digest,
+                    } => {
+                        // A device-relay successor roots on its predecessor's
+                        // selected point before host observation. By the time it
+                        // runs, the predecessor has committed and advanced this
+                        // session, so its point is the current session point and its
+                        // terminal record names the referenced producer. The base
+                        // point is the session's tracked point, not the absent
+                        // device point index.
+                        let producer_op_id = operation.parent.producer_op_id.0;
+                        let recorded = session.terminal.get(&producer_op_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "device parent names unknown predecessor op {producer_op_id}"
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            recorded.plan_digest == *producer_plan_digest,
+                            "device parent producer plan digest does not match its predecessor"
+                        );
+                        if let Some(selected_point) = selected_point {
+                            anyhow::ensure!(
+                                selected_point.producer_op_id.0 == producer_op_id,
+                                "device parent selected point is not produced by its named predecessor"
+                            );
+                        } else {
+                            anyhow::ensure!(
+                                *point_index == recorded.completion.selected_point,
+                                "static device parent point does not match its predecessor"
+                            );
+                        }
+                        anyhow::ensure!(
+                            recorded.completion.selected_point == session.point_index,
+                            "device parent predecessor is not the session's committed point"
+                        );
+                    }
+                }
 
-            let (completion, op_products) =
-                self.execute_operation(&operation, &mut session, &input_products)?;
-            if operation.advances_state && completion.status != OpStatus::Error {
-                session.point_index = completion.selected_point;
-                session.committed_semantic = completion.semantic_digest.clone();
+                if let Some(predicate) = operation.predicate.as_ref() {
+                    let predicate_value = session
+                        .predicate_values
+                        .get(predicate)
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "operation {} predicate names an unresolved product",
+                                operation.op_id.0
+                            )
+                        })?;
+                    if !predicate_value {
+                        let completion = Self::predicated_completion(&operation, &session);
+                        session.terminal.insert(
+                            operation.op_id.0,
+                            RecordedCompletion {
+                                plan_digest: operation.plan_digest.clone(),
+                                completion: completion.clone(),
+                                products: Vec::new(),
+                            },
+                        );
+                        self.sessions
+                            .insert(operation.request_key.session_id, session);
+                        completions.push(completion);
+                        continue;
+                    }
+                }
+
+                let (completion, op_products) =
+                    self.execute_operation(&operation, &mut session, &input_products)?;
+                if operation.advances_state && completion.status == OpStatus::Ok {
+                    session.point_index = completion.selected_point;
+                    session.committed_semantic = completion.semantic_digest.clone();
+                }
+                session.terminal.insert(
+                    operation.op_id.0,
+                    RecordedCompletion {
+                        plan_digest: operation.plan_digest.clone(),
+                        completion: completion.clone(),
+                        products: op_products.clone(),
+                    },
+                );
+                self.sessions
+                    .insert(operation.request_key.session_id, session);
+                completions.push(completion);
+                products.extend(op_products);
             }
-            session.terminal.insert(
-                operation.op_id.0,
-                RecordedCompletion {
-                    plan_digest: operation.plan_digest.clone(),
-                    completion: completion.clone(),
-                    products: op_products.clone(),
-                },
-            );
-            self.sessions
-                .insert(operation.request_key.session_id, session);
-            completions.push(completion);
-            products.extend(op_products);
+            partition_reports.push(PartitionCompletion {
+                partition_id: partition.partition_id,
+                completions,
+                products,
+                registration: RegistrationAck { visible: true },
+                worker_exec_us: None,
+                forward_stats: None,
+            });
         }
         Ok(CompletionReport {
             step_id,
-            completions,
-            products,
-            registration: RegistrationAck { visible: true },
-            worker_exec_us: None,
-            forward_stats: None,
+            partitions: partition_reports,
         })
     }
 
@@ -891,8 +1023,9 @@ impl ModelEngine for SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_wire::{
-        Bounds, DType, Domain, KvAllocation, OpId, PointRange, ProductRef, RequestKey, RouteId,
-        ShapeBound, StorageClass, UndAdmission, VersionRef,
+        AttentionRegime, BatchPartition, Bounds, DType, Domain, ExecutionCapability, KvAllocation,
+        OpId, PointRange, ProductRef, RequestKey, RouteId, ShapeBound, StorageClass, UndAdmission,
+        VersionRef,
     };
 
     fn request_key() -> RequestKey {
@@ -961,7 +1094,21 @@ mod tests {
             None,
             0,
         );
-        Batch::new(step_id, vec![admission], vec![operation])
+        Batch::new(
+            step_id,
+            vec![admission],
+            vec![BatchPartition {
+                partition_id: 1,
+                submission_group: 1,
+                collective_seq: step_id.max(1),
+                domain: Domain::Und,
+                route: RouteId(0),
+                execution: ExecutionCapability::DomainHomogeneous,
+                attention: AttentionRegime::Causal,
+                shape_class: 0,
+                operations: vec![operation],
+            }],
+        )
     }
 
     #[test]
@@ -969,8 +1116,7 @@ mod tests {
         let mut engine = SimEngine::new();
         let first = engine.execute(batch(4, 17)).expect("first execution");
         let replay = engine.execute(batch(5, 17)).expect("replay execution");
-        assert_eq!(first.completions, replay.completions);
-        assert_eq!(first.products, replay.products);
+        assert_eq!(first.partitions, replay.partitions);
     }
 
     #[test]
@@ -979,10 +1125,11 @@ mod tests {
         // `1000 + (9*7 + 0) % 5000 = 1063`; greedy default sampling commits it.
         let mut engine = SimEngine::new();
         let report = engine.execute(batch(1, 3)).expect("execution");
-        assert_eq!(report.completions.len(), 1);
-        assert_eq!(report.completions[0].committed_tokens, vec![1063]);
-        assert_eq!(report.completions[0].selected_point, 1);
-        assert!(report.registration.visible);
+        let completion = report.completions().next().unwrap();
+        assert_eq!(report.completions().count(), 1);
+        assert_eq!(completion.committed_tokens, vec![1063]);
+        assert_eq!(completion.selected_point, 1);
+        assert!(report.partitions[0].registration.visible);
     }
 
     #[test]
