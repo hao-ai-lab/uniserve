@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "construction_anchor": {
+    "source_commit": "14126aea91f7739c4a1660738e2feb82ad8979b6",
+    "source_clean": true,
+    "artifact_contract": "legacy_matrix",
+    "artifacts": {
+      "qwen3_sharegpt_r16": {
+        "root": "artifacts/qualification/decode_runtime/anchor/qwen3_sharegpt/uniserve_r16",
+        "manifest_sha256": "c18caaadf8f5ca0e7e86d245978ea637b295f62a7dc28b57c0bf6630f7857246"
+      },
+      "sensenova_t2i_c32": {
+        "root": "artifacts/qualification/decode_runtime/anchor/sensenova_mjhq_t2i/uniserve_c32",
+        "manifest_sha256": "9b32a572cc7aaf7a897ad8cb2e8325c14f219d6c61a22e94c5bfe130f2ae3f51"
+      },
+      "sensenova_i2t_c32": {
+        "root": "artifacts/qualification/decode_runtime/anchor/sensenova_beans_i2t/uniserve_c32",
+        "manifest_sha256": "958ccbda95e87c596057453d0d3c5cff7c3ef01584ebaf58ab5a68fd7f96e564"
+      },
+      "sensenova_greedy_interleave_c4": {
+        "root": "artifacts/qualification/decode_runtime/anchor/sensenova_ueval_interleave/uniserve_c4",
+        "manifest_sha256": "223793d4a964fc584a9d9880a5f23f306d22b667094e9c4f6c242c6eb999a6c2"
+      }
+    }
+  },
+  "performance_reference": {
+    "source_commit": "8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5",
+    "source_tree": "df134b999e6f00dbd40d6397e3da4349d3a05881",
+    "artifact_source_tree": "a4e8179698d2d95a13e0c16395080418c67910cf",
+    "source_clean": false,
+    "qualification_eligible": false,
+    "required_action": "matched_reference_measurement",
+    "artifacts": {
+      "qwen3_sharegpt_r16": {
+        "root": "artifacts/qualification/decode_runtime/checkpoint/qwen3_sharegpt/uniserve_r16",
+        "manifest_sha256": "9702330bc40640e7f74653be16b5413baf21ce680c28fac1f6be0469eebe2c93"
+      },
+      "sensenova_t2i_c32": {
+        "root": "artifacts/qualification/decode_runtime/checkpoint/sensenova_mjhq_t2i/uniserve_c32",
+        "manifest_sha256": "81a464078a37998fddfef10e5ccaac650e4bf37f2d0f81f6ad697021e4b97515"
+      },
+      "sensenova_i2t_c32": {
+        "root": "artifacts/qualification/decode_runtime/checkpoint/sensenova_beans_i2t/uniserve_c32",
+        "manifest_sha256": "b3440ebf85249769cb6c4aeff0a2bfd9e43fd65b02923dfbd42570012812c022"
+      },
+      "sensenova_default_travel": {
+        "root": "artifacts/qualification/decode_runtime/default_travel_tp1",
+        "summary_sha256": "6dee8f9dab727c9cb5b2ae30216c0802f551bbeb96b02252c0505ded30ffecc7"
+      }
+    }
+  },
+  "profile_anchors": {
+    "sensenova_stochastic_interleave_c4": {
+      "source_commit": "5a1538848aad017828f8995391efcff921ecce29",
+      "source_tree": "34244e72b18edfb3f64f7266db643d463fce3a51",
+      "benchmark_profile": "main",
+      "group": "sensenova-uniserve-stochastic",
+      "point": "sensenova_ueval_stochastic_interleave_uniserve",
+      "load_case_set": "interleave_qualification",
+      "load_case_id": "c4",
+      "benchmark_definition_fingerprint": "61a87ed9c2a24f0b5256d3535f2aa82ae0253f21d9b0ddf711dfc534f1668c64",
+      "artifact_root": "artifacts/qualification/generation_runtime/reference/sensenova_ueval_stochastic_interleave/uniserve_c4",
+      "status": "pending_measurement"
+    }
+  }
+}

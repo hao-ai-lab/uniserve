@@ -472,6 +472,9 @@
           {"id": "c8", "request_rate": "inf", "max_concurrency": 8},
           {"id": "c16", "request_rate": "inf", "max_concurrency": 16}
         ],
+        "interleave_qualification": [
+          {"id": "c4", "request_rate": "inf", "max_concurrency": 4}
+        ],
         "image_concurrency": [
           {"id": "c1", "request_rate": "inf", "max_concurrency": 1},
           {"id": "c32", "request_rate": "inf", "max_concurrency": 32}
@@ -508,6 +511,12 @@
             "sensenova_mjhq_t2i_uniserve",
             "sensenova_beans_i2t_uniserve",
             "sensenova_ueval_interleave_uniserve"
+          ]
+        },
+        "sensenova-uniserve-stochastic": {
+          "server": "benchmark/server/sensenova-uniserve",
+          "points": [
+            "sensenova_ueval_stochastic_interleave_uniserve"
           ]
         },
         "sensenova-omni": {
@@ -671,6 +680,46 @@
             "repetition_penalty": 1.0,
             "frequency_penalty": 0.0,
             "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "disable_ignore_eos": true,
+            "steps": 50,
+            "denoise_updates": 50,
+            "width": 2048,
+            "height": 1152,
+            "wire": "openai_chat",
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+            "image_think": false,
+            "image_t_eps": 0.02,
+            "runtime_profile_id": "sensenova-u1",
+            "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "default",
+            "preprocessing": "ueval_prompt_text_v1",
+            "acceptance_min_success": 32,
+            "acceptance_min_images_per_success": 1.0
+          }
+        },
+        "sensenova_ueval_stochastic_interleave_uniserve": {
+          "load_case_set": "interleave_qualification",
+          "name": "sensenova-uniserve-stochastic-interleave-{load_id}",
+          "output": "sensenova_ueval_stochastic_interleave/uniserve_{load_id}",
+          "harness": {
+            "task": "interleave",
+            "model": "SenseNova-U1",
+            "dataset": "ueval",
+            "dataset_revision": "fdeac6654b113d20e7e89d496167a4a5bb55bc66",
+            "num_prompts": 32,
+            "max_tokens": 8192,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 50,
+            "min_p": 0.05,
+            "repetition_penalty": 1.05,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.1,
             "sampling_seed": 42,
             "disable_ignore_eos": true,
             "steps": 50,
