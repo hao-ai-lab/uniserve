@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uniserve.local/schemas/generation-runtime-references.schema.json",
+  "title": "Generation runtime qualification references",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "construction_anchor", "performance_reference", "profile_anchors"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "construction_anchor": {"$ref": "#/$defs/reference_set"},
+    "performance_reference": {
+      "allOf": [
+        {"$ref": "#/$defs/reference_set"},
+        {
+          "type": "object",
+          "required": ["source_tree", "artifact_source_tree", "qualification_eligible", "required_action"],
+          "properties": {
+            "source_tree": {"$ref": "#/$defs/tree"},
+            "artifact_source_tree": {"$ref": "#/$defs/tree"},
+            "qualification_eligible": {"type": "boolean"},
+            "required_action": {"enum": ["none", "matched_reference_measurement"]}
+          }
+        }
+      ]
+    },
+    "profile_anchors": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_commit",
+          "source_tree",
+          "benchmark_profile",
+          "group",
+          "point",
+          "load_case_set",
+          "load_case_id",
+          "benchmark_definition_fingerprint",
+          "artifact_root",
+          "status"
+        ],
+        "properties": {
+          "source_commit": {"$ref": "#/$defs/commit"},
+          "source_tree": {"$ref": "#/$defs/tree"},
+          "benchmark_profile": {"type": "string", "minLength": 1},
+          "group": {"type": "string", "minLength": 1},
+          "point": {"type": "string", "minLength": 1},
+          "load_case_set": {"type": "string", "minLength": 1},
+          "load_case_id": {"type": "string", "minLength": 1},
+          "benchmark_definition_fingerprint": {"$ref": "#/$defs/sha256"},
+          "artifact_root": {"$ref": "#/$defs/path"},
+          "status": {"enum": ["pending_measurement", "qualified"]}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "reference_set": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["source_commit", "source_clean", "artifacts"],
+      "properties": {
+        "source_commit": {"$ref": "#/$defs/commit"},
+        "source_clean": {"type": "boolean"},
+        "artifacts": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["root"],
+            "properties": {
+              "root": {"$ref": "#/$defs/path"},
+              "manifest_sha256": {"$ref": "#/$defs/sha256"},
+              "summary_sha256": {"$ref": "#/$defs/sha256"}
+            },
+            "anyOf": [
+              {"required": ["manifest_sha256"]},
+              {"required": ["summary_sha256"]}
+            ]
+          }
+        }
+      }
+    },
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"}
+  }
+}
