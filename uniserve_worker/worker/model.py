@@ -8,12 +8,27 @@ from dataclasses import replace
 
 from torch import nn
 
-from ..batch import Batch, CompletionReport, ProductRef, RequestKey, StorageClass
+from ..batch import (
+    Admission,
+    AttentionRegime,
+    Batch,
+    BatchPartition,
+    CompletionReport,
+    Domain,
+    ExecutionCapability,
+    Operation,
+    OpStatus,
+    ProductPayload,
+    ProductRef,
+    RequestKey,
+    SnapshotRef,
+    StorageClass,
+)
 from ..capabilities import RequestKind
 from ..execution import ModelExecutor, ModelRunner
 from ..execution.executor import completion_report_ready, finalize_completion_report
 from ..forward import AttentionSelection
-from ..foundation.errors import capability_mismatch
+from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import ExecutionConfig, graph_memory_budget_bytes
 from ..foundation.sizing import device_total_bytes
 from ..nn.mesh import DeviceMesh
@@ -22,6 +37,7 @@ from ..runtime.capabilities import resolve_capabilities
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.graph_store import GraphStore
 from ..runtime.kv_store import KvStore
+from ..runtime.latent_capacity import latent_store_capacity_bytes
 from ..runtime.latent_store import LatentStore
 from ..runtime.mesh_store import MeshStore
 from ..runtime.mover import Mover
@@ -29,7 +45,7 @@ from ..runtime.product_store import ProductStore
 from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.residency import ResidencyStore
-from ..runtime.snapshot_store import SnapshotProvider, SnapshotRef
+from ..runtime.snapshot_store import SnapshotProvider
 from ..spec import DeploymentOverlay, ModelSpec, OperationType, RouteRowKind, resolved_digest
 from .protocol import WorkerContract
 
@@ -38,10 +54,55 @@ logger = logging.getLogger(__name__)
 _TOKEN_DEVICE_PRODUCT_COUNT = 5
 
 
+def _warmup_batch(
+    *,
+    step_id: int,
+    admissions: tuple[Admission, ...],
+    operations: tuple[Operation, ...],
+    input_products: tuple[ProductPayload, ...] = (),
+) -> Batch:
+    groups: list[tuple[Domain, int, list[Operation]]] = []
+    for operation in operations:
+        existing = next(
+            (
+                members
+                for domain, route, members in groups
+                if domain is operation.domain and route == operation.route
+            ),
+            None,
+        )
+        if existing is None:
+            groups.append((operation.domain, operation.route, [operation]))
+        else:
+            existing.append(operation)
+    partitions = tuple(
+        BatchPartition(
+            partition_id=index,
+            submission_group=index,
+            collective_seq=max(1, int(step_id) * 16 + index),
+            domain=domain,
+            route=route,
+            execution=ExecutionCapability.DOMAIN_HOMOGENEOUS,
+            attention=AttentionRegime.HYBRID,
+            shape_class=0,
+            operations=tuple(members),
+        )
+        for index, (domain, route, members) in enumerate(groups, start=1)
+    )
+    return Batch(
+        step_id=step_id,
+        admissions=admissions,
+        partitions=partitions,
+        input_products=input_products,
+    )
+
+
 def _warmup_token_outputs(
     request_key: RequestKey,
     op_id: int,
     first_generation: int,
+    *,
+    finish_candidate: bool = False,
 ) -> tuple[ProductRef, ...]:
     from ..batch import (
         DType,
@@ -51,24 +112,22 @@ def _warmup_token_outputs(
         StorageClass,
     )
 
-    definitions = (
-        (0, ProductKind.TOKEN, DType.U32, ShapeBound()),
-        (1, ProductKind.SELECTED_POINT, DType.U32, ShapeBound()),
-        (4, ProductKind.FINISH, DType.U8, ShapeBound()),
-    )
+    definitions = [(0, ProductKind.TOKEN, DType.U32, ShapeBound())]
+    if finish_candidate:
+        definitions.append((4, ProductKind.FINISH, DType.U8, ShapeBound()))
     return tuple(
         ProductRef(
             request_key=request_key,
             producer_op_id=op_id,
             output_index=output_index,
-            generation=first_generation + output_index,
+            generation=first_generation + generation_offset,
             kind=kind,
             storage_class=StorageClass.DEVICE_TENSOR,
             dtype=dtype,
             shape_bound=shape,
             point_range=PointRange(base_point=0, max_points=1),
         )
-        for output_index, kind, dtype, shape in definitions
+        for generation_offset, (output_index, kind, dtype, shape) in enumerate(definitions)
     )
 
 
@@ -119,6 +178,8 @@ class ModelWorker:
             deployment,
             model_spec_digest=self.model_spec_digest,
             weight_digest=self.weight_digest,
+            pipeline_depth=int(pipeline_depth),
+            completion_payload_bytes=int(completion_payload_bytes),
         )
         if snapshot_dir is not None:
             declared = replace(
@@ -132,9 +193,8 @@ class ModelWorker:
         self._contract = WorkerContract.compile(
             declared,
             allowed_operation_types=allowed_operation_types,
-            system_operation_types=frozenset(
-                {OperationType.SEQUENCE_SAMPLE, OperationType.MATERIALIZE_FRAME}
-            ),
+            implemented_operation_types=frozenset(model_spec.operation_types())
+            | frozenset({OperationType.SEQUENCE_SAMPLE, OperationType.MATERIALIZE_FRAME}),
             pipeline_depth=pipeline_depth,
             owner=type(self).__name__,
         )
@@ -146,10 +206,16 @@ class ModelWorker:
         )
         self.kv = KvStore(self.residency.kv)
         self.sessions = SessionStore()
-        self.latents = LatentStore(
-            capacity_tokens=int(self._contract.capabilities.max_latent_size),
-            downsample=(1 if model_spec.flow is None else int(model_spec.flow.latent_downsample)),
+        latent_capacity_bytes = (
+            0
+            if model_spec.flow is None
+            else latent_store_capacity_bytes(
+                int(self._contract.capabilities.max_latent_size),
+                int(model_spec.flow.latent_channels),
+                int(model_spec.flow.latent_patch_size),
+            )
         )
+        self.latents = LatentStore(capacity_bytes=latent_capacity_bytes)
         self.products = ProductStore(
             encoder_cache_budget=model_spec.inputs.encoder_cache_budget,
             device_product_capacity=max(
@@ -158,12 +224,22 @@ class ModelWorker:
                 * int(pipeline_depth)
                 * int(deployment.max_batch_operations),
             ),
+            device_product_byte_capacity=max(
+                1,
+                self._contract.capabilities.execution_constraints.route_capabilities[
+                    0
+                ].credits.worker.latent_artifact_bytes
+                - latent_capacity_bytes,
+            ),
         )
         self.replay = ReplayStore()
         self.mover = Mover(
             transfer_backend=transfer_backend,
             mooncake_device=mooncake_device,
             mooncake_protocol=mooncake_protocol,
+            transfer_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
+                0
+            ].credits.worker.transfer_bytes,
             cross_process=bool(cross_process),
         )
         self.graphs = GraphStore(
@@ -200,7 +276,18 @@ class ModelWorker:
             pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
             completion_payload_bytes=completion_payload_bytes,
+            cpu_task_capacity=int(
+                self._contract.capabilities.execution_constraints.route_capabilities[
+                    0
+                ].credits.worker.cpu_tasks
+            ),
+            pinned_staging_capacity=int(
+                self._contract.capabilities.execution_constraints.route_capabilities[
+                    0
+                ].credits.worker.pinned_completion_staging_bytes
+            ),
         )
+        self._warmup_step_id = 0
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:
             caps = self._contract.capabilities
@@ -229,7 +316,11 @@ class ModelWorker:
                 self._contract,
                 capabilities=replace(
                     self._contract.capabilities,
-                    restored_sessions=tuple(sorted(reference.session_id for reference in restored)),
+                    restored_snapshots=tuple(
+                        sorted(
+                            restored, key=lambda reference: reference.version.request_key.session_id
+                        )
+                    ),
                 ),
             )
             logger.info("restored %d durable worker sessions", len(restored))
@@ -258,16 +349,25 @@ class ModelWorker:
         return min(blocks, int(pool.leasable_num_blocks))
 
     def execute(self, batch: Batch) -> CompletionReport:
-        result = self.executor.execute(batch)
-        if self.snapshot_provider is not None:
-            result = self.snapshot_provider.snapshot_execution(
-                {operation.request_key.session_id for operation in batch.operations},
-                result,
-            )
-        return result
+        return self.executor.execute(batch)
 
-    def _execute_warmup(self, batch: Batch) -> CompletionReport:
-        report = self.executor.execute(batch)
+    def prepare_execute(self, batch: Batch) -> object | None:
+        return self.executor.prepare(batch)
+
+    def execute_prepared(self, prepared: object) -> CompletionReport:
+        from ..execution.executor import PreparedExecution
+
+        if not isinstance(prepared, PreparedExecution):
+            raise invalid_descriptor("prepared execution has an invalid type")
+        return self.executor.execute_prepared(prepared)
+
+    def _execute_warmup(
+        self,
+        batch: Batch,
+        *,
+        retain_device_outputs: bool = False,
+    ) -> CompletionReport:
+        report = self.executor.execute_startup(batch)
         while not completion_report_ready(report):
             time.sleep(0.00005)
         finalized = finalize_completion_report(report)
@@ -277,31 +377,53 @@ class ModelWorker:
             for output in operation.outputs
             if output.storage_class is StorageClass.DEVICE_TENSOR
         )
-        self.products.release(device_generations)
+        failures = tuple(
+            completion
+            for completion in finalized.completions
+            if completion.status is OpStatus.ERROR
+        )
+        if failures or not retain_device_outputs:
+            self.products.release(device_generations)
+        if failures:
+            details = ", ".join(
+                f"session={completion.request_key.session_id} op={completion.op_id} "
+                f"code={completion.error_code.value if completion.error_code is not None else 'internal'}"
+                for completion in failures
+            )
+            raise RuntimeError(f"startup warmup execution failed: {details}")
         return finalized
 
+    def _build_warmup_batch(
+        self,
+        *,
+        admissions: tuple[Admission, ...],
+        operations: tuple[Operation, ...],
+        input_products: tuple[ProductPayload, ...] = (),
+    ) -> Batch:
+        self._warmup_step_id += 1
+        return _warmup_batch(
+            step_id=self._warmup_step_id,
+            admissions=admissions,
+            operations=operations,
+            input_products=input_products,
+        )
+
     def warmup(self) -> None:
-        """Pay first-use kernel JIT before the worker is reachable.
+        """Complete pre-admission kernel JIT and open the serving epoch.
 
         The ``fa4_cute`` attention backend JIT-compiles its CUTLASS kernels the
         first time each variant runs, costing tens of seconds on the first real
-        request. Warmup runs representative operations through the real
-        execution path to move that compilation ahead of readiness. Every
-        failure is swallowed: a warmup problem must never block serving.
+        request. Representative operations run through the real execution path;
+        startup succeeds only after every configured warmup completes and its
+        private collective identities are retired.
         """
 
         import torch
 
-        if torch.device(self.deployment.device).type != "cuda":
-            return
-        try:
+        if torch.device(self.deployment.device).type == "cuda":
             self._warmup_sequence()
-        except Exception:  # noqa: BLE001 - warmup must never block serving.
-            logger.warning("sequence warmup failed; first request stays cold", exc_info=True)
-        try:
             self._warmup_flow()
-        except Exception:  # noqa: BLE001 - warmup must never block serving.
-            logger.warning("flow warmup failed; first flow step stays cold", exc_info=True)
+        self.executor.complete_startup()
 
     def _warmup_image_geometry(self) -> tuple[int, int]:
         """Largest square image whose latent grid fits the declared capacity."""
@@ -329,8 +451,8 @@ class ModelWorker:
 
         from ..batch import (
             Admission,
-            Batch,
             Bounds,
+            DevicePoint,
             Domain,
             DType,
             FixedPoint,
@@ -352,7 +474,7 @@ class ModelWorker:
             encode_token_product_bytes,
         )
 
-        types = self._contract.capabilities.operation_types
+        types = self._contract.effective_operation_types
         if OperationType.SEQUENCE_EXTEND not in types:
             return
         pool = self.kv.pool
@@ -400,11 +522,10 @@ class ModelWorker:
 
         next_product_generation = 1
 
-        def token_op(
+        def prompt_op(
             sid: int,
             op_id: int,
             parent: VersionRef,
-            mode: TokenMode,
             tokens: tuple[int, ...],
         ) -> tuple[Operation, ProductPayload]:
             nonlocal next_product_generation
@@ -425,7 +546,7 @@ class ModelWorker:
                 request_key=keys[sid],
                 op_id=op_id,
                 parent=parent,
-                work=Work.token(mode),
+                work=Work.token(TokenMode.EXTEND),
                 route=0,
                 domain=Domain.UND,
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
@@ -436,26 +557,49 @@ class ModelWorker:
                 product=token_ref, payload=encode_token_product_bytes(tokens)
             )
 
-        step_id = 0
+        def decode_op(sid: int, op_id: int, predecessor: Operation) -> Operation:
+            nonlocal next_product_generation
+            token_output = next(
+                output for output in predecessor.outputs if output.kind is ProductKind.TOKEN
+            )
+            outputs = _warmup_token_outputs(keys[sid], op_id, next_product_generation)
+            next_product_generation += len(outputs)
+            return Operation.registered(
+                request_key=keys[sid],
+                op_id=op_id,
+                parent=VersionRef(
+                    keys[sid],
+                    predecessor.op_id,
+                    DevicePoint(1, None, predecessor.plan_digest),
+                ),
+                work=Work.token(TokenMode.DECODE),
+                route=0,
+                domain=Domain.UND,
+                bounds=Bounds(max_points=1, max_tokens=1),
+                outputs=outputs,
+                predicate=token_output,
+            )
+
         op_ids = {sid: 0 for sid in session_ids}
+        predecessors: dict[int, Operation] = {}
         try:
             operations = []
             payloads = []
             for sid in session_ids:
                 root = VersionRef(keys[sid], 0, FixedPoint(0, admissions[sid].digest))
                 op_ids[sid] += 1
-                operation, payload = token_op(sid, op_ids[sid], root, TokenMode.EXTEND, (0,))
+                operation, payload = prompt_op(sid, op_ids[sid], root, (0,))
                 operations.append(operation)
                 payloads.append(payload)
-            step_id += 1
             self._execute_warmup(
-                Batch(
-                    step_id=step_id,
+                self._build_warmup_batch(
                     admissions=tuple(admissions[sid] for sid in session_ids),
                     operations=tuple(operations),
                     input_products=tuple(payloads),
-                )
+                ),
+                retain_device_outputs=OperationType.SEQUENCE_DECODE in types,
             )
+            predecessors.update(zip(session_ids, operations, strict=True))
             if OperationType.SEQUENCE_DECODE not in types:
                 return
             repeats = 2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
@@ -463,38 +607,37 @@ class ModelWorker:
                 selected = session_ids[:batch_size]
                 for _ in range(repeats):
                     operations = []
-                    payloads = []
                     for sid in selected:
-                        parent = self.sessions.get(sid).committed_version()
                         op_ids[sid] += 1
-                        operation, payload = token_op(
-                            sid, op_ids[sid], parent, TokenMode.DECODE, (0,)
-                        )
-                        operations.append(operation)
-                        payloads.append(payload)
-                    step_id += 1
+                        operations.append(decode_op(sid, op_ids[sid], predecessors[sid]))
                     self._execute_warmup(
-                        Batch(
-                            step_id=step_id,
+                        self._build_warmup_batch(
                             admissions=(),
                             operations=tuple(operations),
-                            input_products=tuple(payloads),
+                        ),
+                        retain_device_outputs=True,
+                    )
+                    self.products.release(
+                        tuple(
+                            int(output.generation)
+                            for sid in selected
+                            for output in predecessors[sid].outputs
+                            if output.storage_class is StorageClass.DEVICE_TENSOR
                         )
                     )
+                    predecessors.update(zip(selected, operations, strict=True))
         finally:
             device = torch.device(self.deployment.device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             for sid in session_ids:
-                if self.sessions.peek(sid) is not None:
-                    self.drop_session(sid)
+                self.drop_session(sid)
 
     def _warmup_prefill_graphs(self) -> None:
         """Capture the paged-prefill CUDA graph for every configured token bucket."""
 
         from ..batch import (
             Admission,
-            Batch,
             Bounds,
             Domain,
             DType,
@@ -546,7 +689,6 @@ class ModelWorker:
             return
         logger.info("warming %d paged-prefill CUDA graph token buckets", len(token_buckets))
         session_id = 0
-        step_id = 0
         for token_count in token_buckets:
             block_count = (token_count + int(pool.block_size) - 1) // int(pool.block_size)
             tokens = (0,) * token_count
@@ -555,7 +697,6 @@ class ModelWorker:
             # no replay or session state carries between rounds.
             for _ in range(2):
                 session_id += 1
-                step_id += 1
                 rk = RequestKey(0, session_id, 1)
                 admission = Admission.create(
                     rk,
@@ -588,8 +729,7 @@ class ModelWorker:
                 )
                 try:
                     self._execute_warmup(
-                        Batch(
-                            step_id=step_id,
+                        self._build_warmup_batch(
                             admissions=(admission,),
                             operations=(operation,),
                             input_products=(
@@ -601,15 +741,13 @@ class ModelWorker:
                         )
                     )
                 finally:
-                    if self.sessions.peek(session_id) is not None:
-                        self.drop_session(session_id)
+                    self.drop_session(session_id)
 
     def _warmup_flow(self) -> None:
         """Drive one denoise quantum through the real flow forward path."""
 
         from ..batch import (
             Admission,
-            Batch,
             Bounds,
             DeviceDim,
             Domain,
@@ -625,6 +763,7 @@ class ModelWorker:
             RequestKey,
             Rng,
             ShapeBound,
+            StaticDim,
             StorageClass,
             TransferMode,
             VersionRef,
@@ -632,7 +771,7 @@ class ModelWorker:
         )
 
         if (
-            OperationType.FLOW not in self._contract.capabilities.operation_types
+            OperationType.FLOW not in self._contract.effective_operation_types
             or self.model_spec.flow is None
         ):
             return
@@ -671,33 +810,86 @@ class ModelWorker:
                 outputs=(conditioning,),
             )
             self._execute_warmup(
-                Batch(step_id=3, admissions=(admission,), operations=(publication,))
+                self._build_warmup_batch(admissions=(admission,), operations=(publication,))
             )
-            flow = Operation.registered(
+            max_latent_elements = max(
+                1,
+                (height // int(self.model_spec.flow.latent_downsample))
+                * (width // int(self.model_spec.flow.latent_downsample))
+                * int(self.model_spec.flow.latent_channels)
+                * int(self.model_spec.flow.latent_patch_size) ** 2,
+            )
+            initial_latent = ProductRef(
+                request_key=rk,
+                producer_op_id=2,
+                output_index=0,
+                generation=5,
+                kind=ProductKind.LATENT,
+                storage_class=StorageClass.LATENT_ARENA,
+                dtype=DType.BF16,
+                shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
+                point_range=PointRange(),
+            )
+            transition_ready = ProductRef(
+                request_key=rk,
+                producer_op_id=2,
+                output_index=1,
+                generation=6,
+                kind=ProductKind.COMPLETION,
+                storage_class=StorageClass.DEVICE_TENSOR,
+                dtype=DType.U32,
+                shape_bound=ShapeBound((StaticDim(1),)),
+                point_range=PointRange(),
+            )
+            transition = Operation.registered(
                 request_key=rk,
                 op_id=2,
                 parent=root,
-                work=Work("gen", "flow"),
+                work=Work("gen", "transition"),
                 route=0,
                 domain=Domain.GEN,
-                bounds=Bounds(max_points=1),
+                bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=max_latent_elements * 2),
                 inputs=(conditioning,),
+                outputs=(initial_latent, transition_ready),
                 rng=Rng(
                     seed=0,
                     semantic_index_base=1,
                     draw_layout=DrawLayout.FLOW_NOISE,
                 ),
             )
+            self._execute_warmup(self._build_warmup_batch(admissions=(), operations=(transition,)))
+            next_latent = ProductRef(
+                request_key=rk,
+                producer_op_id=3,
+                output_index=0,
+                generation=7,
+                kind=ProductKind.LATENT,
+                storage_class=StorageClass.LATENT_ARENA,
+                dtype=DType.BF16,
+                shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
+                point_range=PointRange(),
+            )
+            flow = Operation.registered(
+                request_key=rk,
+                op_id=3,
+                parent=self.sessions.get(session_id).committed_version(),
+                work=Work("gen", "flow"),
+                route=0,
+                domain=Domain.GEN,
+                bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=max_latent_elements * 2),
+                inputs=(conditioning, initial_latent),
+                outputs=(next_latent,),
+            )
             self._execute_warmup(
-                Batch(step_id=4, admissions=(), operations=(flow,), input_products=())
+                self._build_warmup_batch(admissions=(), operations=(flow,), input_products=())
             )
         finally:
-            if self.sessions.peek(session_id) is not None:
-                self.drop_session(session_id)
+            self.drop_session(session_id)
 
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
         session = self.sessions.peek(session_id)
+        self.executor.drop_session(session_id)
         self._release_records(self.products.session_records(session_id))
         self.products.drop(session_id)
         self.latents.drop_session(session_id)
@@ -721,10 +913,6 @@ class ModelWorker:
 
     def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None:
         self.kv.copy(copies)
-        if self.snapshot_provider is not None:
-            session_ids = set(self.sessions.session_ids())
-            if session_ids:
-                self.snapshot_provider.snapshot_sessions(session_ids)
 
     def load_adapter(self, adapter_id: int, adapter_path: str) -> None:
         if self.deployment.adapter_mode == "none":
@@ -751,9 +939,7 @@ class ModelWorker:
         )
         self._release_records(records)
         self.products.release(tuple(int(handle) for handle in handles))
-        affected = self.sessions.discard_product_handles({int(handle) for handle in handles})
-        if self.snapshot_provider is not None and affected:
-            self.snapshot_provider.snapshot_sessions(affected)
+        self.sessions.discard_product_handles({int(handle) for handle in handles})
 
     def reset_prefix_cache(self) -> None:
         return None
@@ -773,14 +959,14 @@ class ModelWorker:
         counts = {
             "kv_block": self.kv.resident_block_count(),
             "scratch": self.kv.scratch_token_count(),
-            "image_latent": self.latents.resident_token_count(),
+            "image_latent": self.latents.resident_byte_count(),
             "encoder_output": self.products.encoder_output_count(),
             "adapter": self.adapter_store.loaded_count(),
         }
         totals = {
             "kv_block": int(caps.num_blocks),
             "scratch": int(caps.scratch_capacity_tokens),
-            "image_latent": int(caps.max_latent_size),
+            "image_latent": int(self.latents.capacity_bytes),
             "encoder_output": int(caps.encoder_cache_budget),
             "adapter": 1,
         }
@@ -789,6 +975,8 @@ class ModelWorker:
             for value in caps.resource_classes
         ]
 
+    def close(self) -> None:
+        self.executor.close()
         self.graphs.close()
         self.mover.close()
 

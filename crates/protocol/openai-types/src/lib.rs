@@ -15,7 +15,8 @@ pub mod structured_outputs;
 pub use chat_completions::{
     AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
-    ChatImageConfig, ChatImageType, ChatMessageDelta, ChatModality,
+    ChatImageConfig, ChatImageType, ChatMessageDelta, ChatModality, StreamPublicCommit,
+    StreamSemanticRoot,
 };
 pub use common::{
     ChatLogProbs, ChatLogProbsContent, ChatMessage, ContentPart, ErrorDetail, ErrorResponse,

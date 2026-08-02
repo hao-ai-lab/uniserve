@@ -6422,6 +6422,7 @@ dependencies = [
  "anyhow",
  "libc",
  "serde",
+ "serde_json",
  "tracing",
  "uniserve-core",
  "uniserve-executor",

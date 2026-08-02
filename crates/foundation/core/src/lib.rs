@@ -1,8 +1,8 @@
 //! Shared IDs, value parameters, and pure helpers.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +93,13 @@ pub fn now_unix_secs_u64() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Process-local monotonic time in fractional seconds from a stable epoch.
+/// Differences between values remain valid across wall-clock adjustments.
+pub fn now_monotonic_secs() -> f64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
 /// Logical KV block id.

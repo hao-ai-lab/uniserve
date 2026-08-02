@@ -23,6 +23,7 @@ from ..batch import (
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
 from .device_events import DeviceEventPool
 from .host_staging import canonical_device
+from .product_capacity import device_product_storage
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
@@ -35,6 +36,15 @@ _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.BF16: torch.bfloat16,
     DType.F32: torch.float32,
 }
+_TORCH_DTYPE_BYTES: Final[dict[torch.dtype, int]] = {
+    torch_dtype: device_product_storage(dtype)[1] for dtype, torch_dtype in _DEVICE_DTYPES.items()
+}
+if any(
+    str(torch_dtype).removeprefix("torch.") != device_product_storage(dtype)[0]
+    or int(torch.empty((), dtype=torch_dtype).element_size()) != device_product_storage(dtype)[1]
+    for dtype, torch_dtype in _DEVICE_DTYPES.items()
+):
+    raise RuntimeError("device-product storage geometry disagrees with torch")
 
 
 def _invariant(message: str) -> WorkerError:
@@ -193,9 +203,14 @@ class DeviceProductTable:
         self,
         *,
         capacity: int,
+        byte_capacity: int,
         event_pool: DeviceEventPool | None = None,
     ) -> None:
         self.capacity = max(1, int(capacity))
+        self.byte_capacity = int(byte_capacity)
+        if self.byte_capacity < 1:
+            raise ValueError("device-product byte capacity must be positive")
+        self._allocated_bytes = 0
         self._slots: dict[str, list[_DeviceSlot]] = {}
         self._occupied_slots: dict[str, int] = {}
         self._free_slots: dict[str, set[int]] = {}
@@ -212,11 +227,75 @@ class DeviceProductTable:
         self._binding_token = object()
         self._lock = RLock()
 
+    @property
+    def allocated_bytes(self) -> int:
+        with self._lock:
+            return self._allocated_bytes
+
+    @staticmethod
+    def _tensor_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+        return int(math.prod(shape)) * _TORCH_DTYPE_BYTES[dtype]
+
+    @staticmethod
+    def _slot_bytes(slot: _DeviceSlot) -> int:
+        if slot.tensor is None or slot.shape is None or math.prod(slot.shape) == 1:
+            return 0
+        return int(slot.tensor.numel()) * int(slot.tensor.element_size())
+
+    def _require_byte_capacity_locked(self, projected: int) -> None:
+        if projected > self.byte_capacity:
+            raise resource_error(
+                f"device-product byte credit is exhausted ({projected}>{self.byte_capacity})"
+            )
+
     def bind_outputs(
         self,
         bindings: tuple[tuple[ProductRef, str, torch.device | str], ...],
     ) -> tuple[DeviceProductWrite, ...]:
         return self.bind_output_batch(bindings).writes
+
+    def restore_published(
+        self,
+        bindings: tuple[
+            tuple[ProductRef, str, torch.Tensor, torch.device | str],
+            ...,
+        ],
+    ) -> tuple[torch.Tensor, ...]:
+        """Install exact checkpoint products as ordinary published generations.
+
+        Restore is an administrative boundary: selected sessions have no
+        runnable work, so their prior bindings are logically released before
+        the checkpoint values are atomically rebound. The resulting entries use
+        the same lookup, generation, event, reader, and reclamation machinery as
+        products created by model execution.
+        """
+
+        if not bindings:
+            return ()
+        session_ids = {
+            int(reference.request_key.session_id)
+            for reference, _digest, _value, _device in bindings
+        }
+        for session_id in session_ids:
+            self.drop_session(session_id)
+        batch = self.bind_output_batch(
+            tuple(
+                (reference, producer_plan_digest, device)
+                for reference, producer_plan_digest, _value, device in bindings
+            )
+        )
+        try:
+            return tuple(
+                self.publish_write(write, value)
+                for write, (_reference, _digest, value, _device) in zip(
+                    batch.writes,
+                    bindings,
+                    strict=True,
+                )
+            )
+        except BaseException:
+            self.abandon_writes(batch.writes)
+            raise
 
     def bind_output_batch(
         self,
@@ -902,14 +981,105 @@ class DeviceProductTable:
                 device=continuation._device,
             )
 
+    def publish_continuation_group(
+        self,
+        continuation: DeviceProductContinuationBatch,
+        scalar_batches: tuple[DeviceProductScalarBatch, ...],
+        *,
+        after_reads: tuple[DeviceProductRead, ...] = (),
+    ) -> None:
+        """Publish prefilled continuation and scalar outputs behind one fence."""
+
+        with self._lock:
+            self._require_continuation_locked(continuation)
+            if continuation._published:
+                raise _invariant("device continuation was published more than once")
+            continuation_scalar = continuation.scalar
+            if continuation_scalar is None:
+                raise invalid_descriptor(
+                    "grouped device continuation requires contiguous scalar outputs"
+                )
+            batches = (*scalar_batches, continuation_scalar)
+            for batch in batches:
+                self._require_live_scalar_batch_locked(batch)
+                if batch._published:
+                    raise _invariant("device product was published more than once")
+                if batch.tensor.device != continuation._device:
+                    raise invalid_descriptor(
+                        "grouped device continuation spans incompatible devices"
+                    )
+            writes = tuple(write for batch in batches for write in batch.writes)
+            if len({id(write) for write in writes}) != len(writes):
+                raise invalid_descriptor("grouped device continuation repeats an output binding")
+
+            event: torch.cuda.Event | None = None
+            if continuation._device.type == "cuda":
+                event, _stream_id = self._record_event_locked(continuation._device)
+            for batch in batches:
+                self._publish_scalar_batch_locked(batch, producer_event=event)
+            continuation._published = True
+            self._record_continuation_readers_locked(
+                continuation,
+                event=event,
+            )
+            self._record_readers_after_write_locked(
+                after_reads,
+                continuation.writes,
+                event=event,
+                device=continuation._device,
+            )
+
+    def publish_scalar_group(
+        self,
+        batches: tuple[DeviceProductScalarBatch, ...],
+        *,
+        after_reads: tuple[DeviceProductRead, ...] = (),
+    ) -> None:
+        """Publish prefilled scalar output batches behind one producer fence."""
+
+        if not batches:
+            raise invalid_descriptor("scalar publication group is empty")
+        with self._lock:
+            device = batches[0].tensor.device
+            for batch in batches:
+                self._require_live_scalar_batch_locked(batch)
+                if batch._published:
+                    raise _invariant("device product was published more than once")
+                if batch.tensor.device != device:
+                    raise invalid_descriptor("scalar publication group spans incompatible devices")
+            writes = tuple(write for batch in batches for write in batch.writes)
+            if len({id(write) for write in writes}) != len(writes):
+                raise invalid_descriptor("scalar publication group repeats an output binding")
+
+            event: torch.cuda.Event | None = None
+            if device.type == "cuda":
+                event, _stream_id = self._record_event_locked(device)
+            for batch in batches:
+                self._publish_scalar_batch_locked(batch, producer_event=event)
+            self._record_readers_after_write_locked(
+                after_reads,
+                writes,
+                event=event,
+                device=device,
+            )
+
     def finish_continuation(
         self,
         continuation: DeviceProductContinuationBatch,
     ) -> None:
-        """Fence pinned parents when continuation execution exits before publish."""
+        """Finalize split publication and fence the continuation's pinned parents."""
 
         with self._lock:
             self._require_continuation_locked(continuation)
+            if not continuation._published:
+                published = tuple(
+                    self._require_write_locked(write).producer_recorded
+                    for write in continuation.writes
+                )
+                if any(published) and not all(published):
+                    raise _invariant("device continuation was only partially published")
+                if all(published):
+                    continuation._published = True
             if continuation._readers_recorded:
                 return
             event: torch.cuda.Event | None = None
@@ -1824,24 +1994,36 @@ class DeviceProductTable:
             raise _invariant("device-product allocation lost its planned physical slot")
         generation = slot.generation + 1
         slot.generation = 1 if generation > _MAX_GENERATION else generation
+        replacing = slot.tensor is None or slot.shape != shape or slot.dtype != dtype
+        projected = self._allocated_bytes
+        scalar = math.prod(shape) == 1
+        arena_key = (name, dtype)
+        arena = self._scalar_arenas.get(arena_key) if scalar else None
+        if replacing:
+            projected -= self._slot_bytes(slot)
+            if scalar:
+                if arena is None:
+                    projected += self.capacity * _TORCH_DTYPE_BYTES[dtype]
+            else:
+                projected += self._tensor_bytes(shape, dtype)
+        self._require_byte_capacity_locked(projected)
         try:
-            if math.prod(shape) == 1:
-                arena_key = (name, dtype)
-                arena = self._scalar_arenas.get(arena_key)
+            if scalar:
                 if arena is None:
                     arena = torch.empty((self.capacity,), dtype=dtype, device=device)
                     self._scalar_arenas[arena_key] = arena
-                if slot.tensor is None or slot.shape != shape or slot.dtype != dtype:
+                if replacing:
                     slot.tensor = arena[slot.index : slot.index + 1].reshape(shape)
                     slot.shape = shape
                     slot.dtype = dtype
-            elif slot.tensor is None or slot.shape != shape or slot.dtype != dtype:
+            elif replacing:
                 slot.tensor = torch.empty(shape, dtype=dtype, device=device)
                 slot.shape = shape
                 slot.dtype = dtype
         except BaseException:
             self._return_slot_locked(slot)
             raise
+        self._allocated_bytes = projected
         return slot
 
     def _prepare_homogeneous_slots_locked(
@@ -1853,29 +2035,56 @@ class DeviceProductTable:
     ) -> None:
         device_name = str(device)
         scalar = math.prod(shape) == 1
-        arena: torch.Tensor | None = None
+        arena_key = (device_name, dtype)
+        arena = self._scalar_arenas.get(arena_key) if scalar else None
+        projected = self._allocated_bytes
+        replacements = [
+            slot
+            for slot in slots
+            if slot.tensor is None or slot.shape != shape or slot.dtype != dtype
+        ]
+        replacement_indices = {slot.index for slot in replacements}
+        for slot in replacements:
+            projected -= self._slot_bytes(slot)
         if scalar:
-            arena_key = (device_name, dtype)
-            arena = self._scalar_arenas.get(arena_key)
             if arena is None:
-                arena = torch.empty((self.capacity,), dtype=dtype, device=device)
-                self._scalar_arenas[arena_key] = arena
+                projected += self.capacity * _TORCH_DTYPE_BYTES[dtype]
+        else:
+            projected += len(replacements) * self._tensor_bytes(shape, dtype)
+        self._require_byte_capacity_locked(projected)
+        pending_arena: torch.Tensor | None = None
+        pending_tensors: dict[int, torch.Tensor] = {}
+        try:
+            if scalar and arena is None:
+                pending_arena = torch.empty((self.capacity,), dtype=dtype, device=device)
+                arena = pending_arena
+            if not scalar:
+                pending_tensors = {
+                    slot.index: torch.empty(shape, dtype=dtype, device=device)
+                    for slot in replacements
+                }
+        except BaseException:
+            self._restore_planned_slots_locked(slots)
+            raise
+        if pending_arena is not None:
+            self._scalar_arenas[arena_key] = pending_arena
         for slot in slots:
             if slot.device_name != device_name or slot.owner is not None:
                 raise _invariant("device-product allocation lost its planned physical slot")
             generation = slot.generation + 1
             slot.generation = 1 if generation > _MAX_GENERATION else generation
             if scalar:
-                if slot.tensor is None or slot.shape != shape or slot.dtype != dtype:
+                if slot.index in replacement_indices:
                     slot.tensor = cast(torch.Tensor, arena)[slot.index : slot.index + 1].reshape(
                         shape
                     )
                     slot.shape = shape
                     slot.dtype = dtype
-            elif slot.tensor is None or slot.shape != shape or slot.dtype != dtype:
-                slot.tensor = torch.empty(shape, dtype=dtype, device=device)
+            elif slot.index in replacement_indices:
+                slot.tensor = pending_tensors[slot.index]
                 slot.shape = shape
                 slot.dtype = dtype
+        self._allocated_bytes = projected
 
     def _return_slot_locked(self, slot: _DeviceSlot) -> None:
         if slot.owner is not None:
@@ -2072,7 +2281,6 @@ class DeviceProductTable:
 @dataclass(frozen=True, slots=True)
 class VisionFeatureProduct:
     features: torch.Tensor
-    grid: torch.Tensor | None
     height: int
     width: int
     source_base64: str | None
@@ -2192,11 +2400,13 @@ class ProductStore:
         *,
         encoder_cache_budget: int = 0,
         device_product_capacity: int = 1,
+        device_product_byte_capacity: int,
     ) -> None:
         self.encoder_cache_budget = int(encoder_cache_budget)
         self.device_events = DeviceEventPool()
         self.device_products = DeviceProductTable(
             capacity=device_product_capacity,
+            byte_capacity=device_product_byte_capacity,
             event_pool=self.device_events,
         )
         self._records: dict[int, ProductRecord] = {}
@@ -2233,6 +2443,28 @@ class ProductStore:
                 if record is not None:
                     self._session_handles.get(record.session_id, set()).discard(handle)
                     self._revisions[handle] = self._revision()
+
+    def append_encoded_frame(self, session_id: int, handle: int, base64_value: str) -> None:
+        """Publish one completed CPU encoding under the session's frame handle."""
+
+        encoded = EncodedImageProduct(base64_value)
+        with self._lock:
+            existing = self._records.get(int(handle))
+            if existing is not None and existing.session_id != int(session_id):
+                raise RuntimeError("frame handle belongs to a different session")
+            frames = (
+                existing.payload.frames
+                if existing is not None and isinstance(existing.payload, FrameCollectionProduct)
+                else ()
+            )
+            record = ProductRecord(
+                handle=int(handle),
+                session_id=int(session_id),
+                payload=FrameCollectionProduct((*frames, encoded)),
+            )
+            self._records[int(handle)] = record
+            self._session_handles.setdefault(int(session_id), set()).add(int(handle))
+            self._revisions[int(handle)] = self._revision()
 
     def session_records(self, session_id: int) -> tuple[ProductRecord, ...]:
         with self._lock:
@@ -2467,7 +2699,6 @@ def _snapshot_payload(payload: ProductPayload) -> ProductPayload:
         return replace(
             payload,
             features=payload.features.detach().cpu().contiguous(),
-            grid=(None if payload.grid is None else payload.grid.detach().cpu().contiguous()),
         )
     if isinstance(payload, LatentFeatureProduct):
         return replace(payload, latent=payload.latent.detach().cpu().contiguous())

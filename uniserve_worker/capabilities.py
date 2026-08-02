@@ -11,7 +11,10 @@ from .batch import (
     AdapterMode as _WireAdapterMode,
 )
 from .batch import (
-    Work,
+    Operation,
+    ProductKind,
+    SamplingOwnership,
+    SnapshotRef,
     WorkVariant,
     protocol_layout_digest,
     route_capability_digest,
@@ -19,33 +22,41 @@ from .batch import (
 from .foundation.errors import capability_mismatch, invalid_descriptor
 from .spec import OperationType
 
-_WORK_OPERATION_TYPES: dict[tuple[str, str | None], OperationType] = {
-    ("token", "extend"): OperationType.SEQUENCE_EXTEND,
-    ("token", "decode"): OperationType.SEQUENCE_DECODE,
-    ("token", "verify"): OperationType.SEQUENCE_VERIFY,
-    ("encode", "vision"): OperationType.ENCODE_VISION,
-    ("encode", "latent"): OperationType.ENCODE_LATENT,
-    ("transfer", "product"): OperationType.TRANSFER_PRODUCT,
-    ("transfer", "kv_publish"): OperationType.TRANSFER_KV,
-    ("transfer", "kv_install"): OperationType.TRANSFER_KV,
-    ("gen", "transition"): OperationType.FLOW,
-    ("gen", "flow"): OperationType.FLOW,
-    ("materialize", None): OperationType.MATERIALIZE_IMAGE,
+_WORK_OPERATION_TYPES: dict[WorkVariant, OperationType] = {
+    WorkVariant.TOKEN_EXTEND: OperationType.SEQUENCE_EXTEND,
+    WorkVariant.TOKEN_DECODE: OperationType.SEQUENCE_DECODE,
+    WorkVariant.TOKEN_VERIFY: OperationType.SEQUENCE_VERIFY,
+    WorkVariant.ENCODE_VISION: OperationType.ENCODE_VISION,
+    WorkVariant.ENCODE_LATENT: OperationType.ENCODE_LATENT,
+    WorkVariant.TRANSFER_PRODUCT: OperationType.TRANSFER_PRODUCT,
+    WorkVariant.TRANSFER_KV_PUBLISH: OperationType.TRANSFER_KV,
+    WorkVariant.TRANSFER_KV_INSTALL: OperationType.TRANSFER_KV,
+    WorkVariant.GEN_TRANSITION: OperationType.FLOW,
+    WorkVariant.GEN_FLOW: OperationType.FLOW,
 }
 
 
-def work_operation_type(work: Work) -> OperationType:
-    """Map one closed ``Work`` leaf onto the route's internal operation type.
+def operation_type(operation: Operation) -> OperationType:
+    """Resolve one registered operation onto its internal execution type.
 
     Sampling is device postprocessing inside ``Token(*)`` and has no route of
     its own, so no ``Work`` variant maps to ``SEQUENCE_SAMPLE``. ``Draft`` has no
-    depth-one route and is rejected until a later checkpoint introduces one.
+    depth-one route. Materialization is resolved from its exact input product:
+    a latent input selects the model image-decode operation while transported or
+    resident image inputs select the model-free frame operation.
     """
 
-    operation_type = _WORK_OPERATION_TYPES.get((work.kind, work.mode))
-    if operation_type is None:
-        raise capability_mismatch(f"work variant {(work.kind, work.mode)!r} has no route")
-    return operation_type
+    variant = operation.work.variant
+    if variant is WorkVariant.MATERIALIZE:
+        return (
+            OperationType.MATERIALIZE_IMAGE
+            if any(reference.kind is ProductKind.LATENT for reference in operation.inputs)
+            else OperationType.MATERIALIZE_FRAME
+        )
+    selected = _WORK_OPERATION_TYPES.get(variant)
+    if selected is None:
+        raise capability_mismatch(f"work variant {variant.value!r} has no route")
+    return selected
 
 
 # The route enum an operation runs under maps onto one or more closed work
@@ -67,21 +78,6 @@ _OPERATION_TYPE_WORK_VARIANTS: dict[OperationType, tuple[WorkVariant, ...]] = {
     OperationType.TRANSFER_KV: (WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL),
 }
 
-_WORK_VARIANT_OPERATION_TYPE: dict[WorkVariant, OperationType] = {
-    WorkVariant.TOKEN_EXTEND: OperationType.SEQUENCE_EXTEND,
-    WorkVariant.TOKEN_DECODE: OperationType.SEQUENCE_DECODE,
-    WorkVariant.TOKEN_VERIFY: OperationType.SEQUENCE_VERIFY,
-    WorkVariant.DRAFT: OperationType.SEQUENCE_VERIFY,
-    WorkVariant.ENCODE_VISION: OperationType.ENCODE_VISION,
-    WorkVariant.ENCODE_LATENT: OperationType.ENCODE_LATENT,
-    WorkVariant.TRANSFER_PRODUCT: OperationType.TRANSFER_PRODUCT,
-    WorkVariant.TRANSFER_KV_PUBLISH: OperationType.TRANSFER_KV,
-    WorkVariant.TRANSFER_KV_INSTALL: OperationType.TRANSFER_KV,
-    WorkVariant.GEN_TRANSITION: OperationType.FLOW,
-    WorkVariant.GEN_FLOW: OperationType.FLOW,
-    WorkVariant.MATERIALIZE: OperationType.MATERIALIZE_IMAGE,
-}
-
 
 def work_variants_for_operation_types(
     operation_types: Sequence[OperationType],
@@ -100,15 +96,10 @@ def work_variants_for_operation_types(
     return tuple(variant for variant in WorkVariant if variant in selected)
 
 
-def work_variant_operation_type(variant: WorkVariant) -> OperationType:
-    """The route operation type one work variant runs under."""
-
-    return _WORK_VARIANT_OPERATION_TYPE[variant]
-
-
 class RequestKind(StrEnum):
     GET_CAPABILITIES = "get_capabilities"
     EXECUTE = "execute"
+    POLL_COMPLETIONS = "poll_completions"
     DROP_SESSION = "drop_session"
     SHUTDOWN = "shutdown"
     COPY_KV = "copy_kv"
@@ -224,18 +215,122 @@ class RankInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class CreditVector:
+    registered_operations: int = 0
+    execution_slots: int = 0
+    completion_slots: int = 0
+    device_products: int = 0
+    kv_pages: int = 0
+    rollback_deltas: int = 0
+    latent_artifact_bytes: int = 0
+    pinned_completion_staging_bytes: int = 0
+    transfer_bytes: int = 0
+    transfer_tickets: int = 0
+    cpu_tasks: int = 0
+    output_journal_bytes: int = 0
+
+    _FIELDS = (
+        "registered_operations",
+        "execution_slots",
+        "completion_slots",
+        "device_products",
+        "kv_pages",
+        "rollback_deltas",
+        "latent_artifact_bytes",
+        "pinned_completion_staging_bytes",
+        "transfer_bytes",
+        "transfer_tickets",
+        "cpu_tasks",
+        "output_journal_bytes",
+    )
+
+    def __post_init__(self) -> None:
+        if any(int(getattr(self, name)) < 0 for name in self._FIELDS):
+            raise invalid_descriptor("credit vector values must not be negative")
+
+    def contains(self, requested: CreditVector) -> bool:
+        return all(getattr(requested, name) <= getattr(self, name) for name in self._FIELDS)
+
+    def digest_values(self) -> tuple[int, ...]:
+        return tuple(int(getattr(self, name)) for name in self._FIELDS)
+
+    @classmethod
+    def from_wire(cls, value: object, where: str) -> CreditVector:
+        data = _map(value, where)
+        return cls(**{name: _uint(data.get(name), f"{where}.{name}") for name in cls._FIELDS})
+
+    def to_wire(self) -> dict[str, int]:
+        return {name: int(getattr(self, name)) for name in self._FIELDS}
+
+
+@dataclass(frozen=True, slots=True)
+class RouteCreditLimits:
+    per_request: CreditVector
+    worker: CreditVector
+
+    def __post_init__(self) -> None:
+        if not self.worker.contains(self.per_request):
+            raise invalid_descriptor("route per-request credits exceed worker-wide credits")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str) -> RouteCreditLimits:
+        data = _map(value, where)
+        return cls(
+            per_request=CreditVector.from_wire(data.get("per_request"), f"{where}.per_request"),
+            worker=CreditVector.from_wire(data.get("worker"), f"{where}.worker"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {"per_request": self.per_request.to_wire(), "worker": self.worker.to_wire()}
+
+
+@dataclass(frozen=True, slots=True)
+class RouteExecutionCapability:
+    route: int
+    supported_work: tuple[WorkVariant, ...]
+    tensorized_mixed: bool
+    sampling_ownership: SamplingOwnership
+    preemptible: bool
+    credits: RouteCreditLimits
+
+    def __post_init__(self) -> None:
+        if self.route < 0:
+            raise invalid_descriptor("route capability id must not be negative")
+        if not self.supported_work or len(set(self.supported_work)) != len(self.supported_work):
+            raise invalid_descriptor("route capability work must be non-empty and unique")
+        if (
+            self.credits.per_request.registered_operations < 1
+            or self.credits.per_request.execution_slots < 1
+            or self.credits.per_request.completion_slots < 1
+        ):
+            raise invalid_descriptor(
+                "route request credits must include registration and execution"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionConstraints:
     max_batch_operations: int
     max_speculative_points: int
     device_sequence_lengths: bool
     device_append_offsets: bool
     incremental_kv_publication: bool
+    route_capabilities: tuple[RouteExecutionCapability, ...]
 
     def __post_init__(self) -> None:
         if self.max_batch_operations < 1:
             raise invalid_descriptor("max_batch_operations must be positive")
         if self.max_speculative_points < 1:
             raise invalid_descriptor("max_speculative_points must be positive")
+        if (
+            tuple(sorted(self.route_capabilities, key=lambda capability: capability.route))
+            != self.route_capabilities
+        ):
+            raise invalid_descriptor("route capabilities must be canonical")
+        if len({capability.route for capability in self.route_capabilities}) != len(
+            self.route_capabilities
+        ):
+            raise invalid_descriptor("route capabilities repeat a route id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,16 +364,9 @@ class EngineCaps:
     resource_classes: tuple[ResourceClass, ...]
     model_spec_digest: str
     weight_digest: str
-    restored_sessions: tuple[int, ...] = ()
+    restored_snapshots: tuple[SnapshotRef, ...] = ()
     protocol_layout_digest: str = ""
     route_capability_digest: str = ""
-
-    @property
-    def operation_types(self) -> tuple[OperationType, ...]:
-        """The route operation types this capability's work variants run under."""
-
-        selected = {work_variant_operation_type(variant) for variant in self.supported_work}
-        return tuple(value for value in OperationType if value in selected)
 
     def __post_init__(self) -> None:
         if self.model_dtype not in {"float16", "bfloat16", "float32"}:
@@ -311,14 +399,32 @@ class EngineCaps:
             raise invalid_descriptor("capabilities must support a work variant")
         if len(set(self.supported_work)) != len(self.supported_work):
             raise invalid_descriptor("capabilities repeat a work variant")
+        routed_work = {
+            variant
+            for capability in self.execution_constraints.route_capabilities
+            for variant in capability.supported_work
+        }
+        if routed_work != set(self.supported_work):
+            raise invalid_descriptor("route capabilities do not cover the declared work")
+        if (
+            len(
+                {
+                    capability.credits.worker
+                    for capability in self.execution_constraints.route_capabilities
+                }
+            )
+            != 1
+        ):
+            raise invalid_descriptor("worker routes disagree on worker-wide credits")
         if len(set(self.supported_controls)) != len(self.supported_controls):
             raise invalid_descriptor("capabilities repeat a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
             raise invalid_descriptor("capabilities repeat a resource class")
-        if len(set(self.restored_sessions)) != len(self.restored_sessions) or any(
-            value < 0 for value in self.restored_sessions
-        ):
-            raise invalid_descriptor("capabilities restored sessions are invalid")
+        restored_session_ids = tuple(
+            reference.version.request_key.session_id for reference in self.restored_snapshots
+        )
+        if restored_session_ids != tuple(sorted(set(restored_session_ids))):
+            raise invalid_descriptor("capabilities restored snapshots are not canonical")
         if self.adapter_mode is not AdapterMode.NONE and not {
             RequestKind.LOAD_ADAPTER,
             RequestKind.UNLOAD_ADAPTER,
@@ -346,6 +452,20 @@ class EngineCaps:
                 self.execution_constraints.device_sequence_lengths,
                 self.execution_constraints.device_append_offsets,
                 self.execution_constraints.incremental_kv_publication,
+                tuple(
+                    (
+                        capability.route,
+                        capability.supported_work,
+                        capability.tensorized_mixed,
+                        capability.sampling_ownership,
+                        capability.preemptible,
+                        (
+                            capability.credits.per_request.digest_values(),
+                            capability.credits.worker.digest_values(),
+                        ),
+                    )
+                    for capability in self.execution_constraints.route_capabilities
+                ),
                 self.kv_dtype,
                 self.model_dtype,
                 self.attention_backend,
@@ -443,6 +563,65 @@ class EngineCaps:
                     ),
                     f"{where}.execution_constraints.incremental_kv_publication",
                 ),
+                route_capabilities=tuple(
+                    RouteExecutionCapability(
+                        route=_uint(
+                            _map(
+                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
+                            ).get("route"),
+                            f"{where}.execution_constraints.route_capabilities[{index}].route",
+                        ),
+                        supported_work=tuple(
+                            _enum(
+                                WorkVariant,
+                                variant,
+                                f"{where}.execution_constraints.route_capabilities[{index}].supported_work[{variant_index}]",
+                            )
+                            for variant_index, variant in enumerate(
+                                _seq(
+                                    _map(
+                                        item,
+                                        f"{where}.execution_constraints.route_capabilities[{index}]",
+                                    ).get("supported_work", ()),
+                                    f"{where}.execution_constraints.route_capabilities[{index}].supported_work",
+                                )
+                            )
+                        ),
+                        tensorized_mixed=_bool(
+                            _map(
+                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
+                            ).get("tensorized_mixed"),
+                            f"{where}.execution_constraints.route_capabilities[{index}].tensorized_mixed",
+                        ),
+                        sampling_ownership=_enum(
+                            SamplingOwnership,
+                            _map(
+                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
+                            ).get("sampling_ownership"),
+                            f"{where}.execution_constraints.route_capabilities[{index}].sampling_ownership",
+                        ),
+                        preemptible=_bool(
+                            _map(
+                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
+                            ).get("preemptible"),
+                            f"{where}.execution_constraints.route_capabilities[{index}].preemptible",
+                        ),
+                        credits=RouteCreditLimits.from_wire(
+                            _map(
+                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
+                            ).get("credits"),
+                            f"{where}.execution_constraints.route_capabilities[{index}].credits",
+                        ),
+                    )
+                    for index, item in enumerate(
+                        _seq(
+                            _map(
+                                data.get("execution_constraints"), f"{where}.execution_constraints"
+                            ).get("route_capabilities", ()),
+                            f"{where}.execution_constraints.route_capabilities",
+                        )
+                    )
+                ),
             ),
             resource_classes=tuple(
                 _enum(ResourceClass, item, f"{where}.resource_classes[{index}]")
@@ -452,10 +631,10 @@ class EngineCaps:
             ),
             model_spec_digest=_str(data.get("model_spec_digest", ""), f"{where}.model_spec_digest"),
             weight_digest=_str(data.get("weight_digest", ""), f"{where}.weight_digest"),
-            restored_sessions=tuple(
-                _uint(item, f"{where}.restored_sessions[{index}]")
+            restored_snapshots=tuple(
+                SnapshotRef.from_wire(item, f"{where}.restored_snapshots[{index}]")
                 for index, item in enumerate(
-                    _seq(data.get("restored_sessions", ()), f"{where}.restored_sessions")
+                    _seq(data.get("restored_snapshots", ()), f"{where}.restored_snapshots")
                 )
             ),
         )
@@ -493,13 +672,24 @@ class EngineCaps:
                 "device_sequence_lengths": self.execution_constraints.device_sequence_lengths,
                 "device_append_offsets": self.execution_constraints.device_append_offsets,
                 "incremental_kv_publication": self.execution_constraints.incremental_kv_publication,
+                "route_capabilities": [
+                    {
+                        "route": capability.route,
+                        "supported_work": [variant.value for variant in capability.supported_work],
+                        "tensorized_mixed": capability.tensorized_mixed,
+                        "sampling_ownership": capability.sampling_ownership.value,
+                        "preemptible": capability.preemptible,
+                        "credits": capability.credits.to_wire(),
+                    }
+                    for capability in self.execution_constraints.route_capabilities
+                ],
             },
             "resource_classes": [value.value for value in self.resource_classes],
             "model_spec_digest": self.model_spec_digest,
             "weight_digest": self.weight_digest,
             "protocol_layout_digest": self.protocol_layout_digest,
             "route_capability_digest": self.route_capability_digest,
-            "restored_sessions": list(self.restored_sessions),
+            "restored_snapshots": [reference.to_wire() for reference in self.restored_snapshots],
         }
 
 

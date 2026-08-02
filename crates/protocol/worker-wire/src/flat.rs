@@ -8,14 +8,15 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 
 use crate::schema::uniserve::wire as fbs;
 use crate::{
-    AdapterMode, Admission, Batch, Bounds, CloseReason, CompletionRecord, CompletionReport,
-    Control, DType, DimBound, Disposition, Domain, DrawLayout, EngineCaps, ErrorCode,
-    ErrorOperationIdentity, ExecutionConstraints, FinishFlags, GenAdmission, KvAllocation,
-    LogicalLengths, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure,
-    ResponseKind, Rng, RouteId, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenSpan,
-    UndAdmission, VersionRef, Work, WorkVariant, WorkerForwardStats, WorkerMetrics, WorkerRequest,
-    WorkerResponse,
+    AdapterMode, Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason,
+    CompletionRecord, CompletionReport, Control, CreditVector, DType, DimBound, Disposition,
+    Domain, DrawLayout, EngineCaps, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
+    ExecutionConstraints, FinishFlags, GenAdmission, KvAllocation, LogicalLengths, OpId, OpStatus,
+    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng,
+    RouteCreditLimits, RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound,
+    SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, Work,
+    WorkVariant, WorkerForwardStats, WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 
 pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -75,6 +76,7 @@ fn request_from_table(request: fbs::WorkerRequest<'_>) -> anyhow::Result<WorkerR
         kind: request_kind_from_fb(request.kind())?,
         call_id: request.call_id(),
         batch: request.batch().map(batch_from_table).transpose()?,
+        step_id: request.step_id(),
         session_id: request.session_id().map(RequestId),
         copies: request.copies().map(|items| {
             items
@@ -145,12 +147,12 @@ fn batch_from_table(batch: fbs::Batch<'_>) -> anyhow::Result<Batch> {
             })
             .transpose()?
             .unwrap_or_default(),
-        operations: batch
-            .operations()
+        partitions: batch
+            .partitions()
             .map(|items| {
                 items
                     .iter()
-                    .map(operation_from_table)
+                    .map(partition_from_table)
                     .collect::<anyhow::Result<_>>()
             })
             .transpose()?
@@ -178,6 +180,31 @@ fn batch_from_table(batch: fbs::Batch<'_>) -> anyhow::Result<Batch> {
     };
     batch.validate()?;
     Ok(batch)
+}
+
+fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<BatchPartition> {
+    let partition = BatchPartition {
+        partition_id: partition.partition_id(),
+        submission_group: partition.submission_group(),
+        collective_seq: partition.collective_seq(),
+        domain: domain_from_fb(partition.domain())?,
+        route: RouteId(partition.route()),
+        execution: execution_capability_from_fb(partition.execution())?,
+        attention: attention_regime_from_fb(partition.attention())?,
+        shape_class: partition.shape_class(),
+        operations: partition
+            .operations()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(operation_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    partition.validate()?;
+    Ok(partition)
 }
 
 fn admission_from_table(admission: fbs::Admission<'_>) -> anyhow::Result<Admission> {
@@ -379,11 +406,11 @@ fn version_ref_from_table(version: fbs::VersionRef<'_>) -> anyhow::Result<Versio
                 .point_as_point_device()
                 .context("device point table is missing")?;
             Point::Device {
-                selected_point: product_ref_from_table(
-                    device
-                        .selected_point()
-                        .context("device point has no selected product")?,
-                )?,
+                point_index: device.point_index(),
+                selected_point: device
+                    .selected_point()
+                    .map(product_ref_from_table)
+                    .transpose()?,
                 producer_plan_digest: required_str(
                     device.producer_plan_digest(),
                     "point.device.producer_plan_digest",
@@ -466,6 +493,26 @@ fn completion_report_from_table(
 ) -> anyhow::Result<CompletionReport> {
     let report = CompletionReport {
         step_id: report.step_id(),
+        partitions: report
+            .partitions()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(partition_completion_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    report.validate()?;
+    Ok(report)
+}
+
+fn partition_completion_from_table(
+    report: fbs::PartitionCompletion<'_>,
+) -> anyhow::Result<PartitionCompletion> {
+    let report = PartitionCompletion {
+        partition_id: report.partition_id(),
         completions: report
             .completions()
             .map(|items| {
@@ -652,13 +699,50 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
         adapter_mode: adapter_mode_from_fb(caps.adapter_mode())?,
         execution_constraints: caps
             .execution_constraints()
-            .map(|constraints| ExecutionConstraints {
-                max_batch_operations: constraints.max_batch_operations(),
-                max_speculative_points: constraints.max_speculative_points(),
-                device_sequence_lengths: constraints.device_sequence_lengths(),
-                device_append_offsets: constraints.device_append_offsets(),
-                incremental_kv_publication: constraints.incremental_kv_publication(),
+            .map(|constraints| -> anyhow::Result<ExecutionConstraints> {
+                Ok(ExecutionConstraints {
+                    max_batch_operations: constraints.max_batch_operations(),
+                    max_speculative_points: constraints.max_speculative_points(),
+                    device_sequence_lengths: constraints.device_sequence_lengths(),
+                    device_append_offsets: constraints.device_append_offsets(),
+                    incremental_kv_publication: constraints.incremental_kv_publication(),
+                    route_capabilities: constraints
+                        .route_capabilities()
+                        .map(|capabilities| {
+                            capabilities
+                                .iter()
+                                .map(|capability| {
+                                    Ok(RouteExecutionCapability {
+                                        route: RouteId(capability.route()),
+                                        supported_work: capability
+                                            .supported_work()
+                                            .map(|variants| {
+                                                variants
+                                                    .iter()
+                                                    .map(work_from_fb)
+                                                    .collect::<anyhow::Result<Vec<_>>>()
+                                            })
+                                            .transpose()?
+                                            .unwrap_or_default(),
+                                        tensorized_mixed: capability.tensorized_mixed(),
+                                        sampling_ownership: sampling_ownership_from_fb(
+                                            capability.sampling_ownership(),
+                                        )?,
+                                        preemptible: capability.preemptible(),
+                                        credits: route_credit_limits_from_table(
+                                            capability
+                                                .credits()
+                                                .context("route capability has no credit limits")?,
+                                        )?,
+                                    })
+                                })
+                                .collect::<anyhow::Result<Vec<_>>>()
+                        })
+                        .transpose()?
+                        .unwrap_or_default(),
+                })
             })
+            .transpose()?
             .context("capabilities have no execution constraints")?,
         resource_classes: caps
             .resource_classes()
@@ -686,9 +770,10 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
             .route_capability_digest()
             .map(str::to_string)
             .context("capabilities.route_capability_digest is missing")?,
-        restored_sessions: caps
-            .restored_sessions()
-            .map(|items| items.iter().map(RequestId).collect())
+        restored_snapshots: caps
+            .restored_snapshots()
+            .map(|items| items.iter().map(snapshot_from_table).collect())
+            .transpose()?
             .unwrap_or_default(),
     };
     caps.validate()?;
@@ -900,24 +985,15 @@ fn required_str(value: Option<&str>, label: &str) -> anyhow::Result<String> {
 
 fn snapshot_from_table(snapshot: fbs::SnapshotRef<'_>) -> anyhow::Result<SnapshotRef> {
     let snapshot = SnapshotRef {
-        session_id: RequestId(snapshot.session_id()),
-        epoch: snapshot.epoch(),
-        version: snapshot.version(),
+        version: version_ref_from_table(
+            snapshot
+                .version()
+                .context("snapshot reference has no exact version")?,
+        )?,
         digest: required_str(snapshot.digest(), "snapshot digest")?,
         locator: required_str(snapshot.locator(), "snapshot locator")?,
     };
-    anyhow::ensure!(
-        snapshot.digest.len() == 64
-            && snapshot
-                .digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "snapshot digest must be a lowercase SHA-256 digest"
-    );
-    anyhow::ensure!(
-        snapshot.locator == snapshot.digest,
-        "snapshot locator must equal its content digest"
-    );
+    snapshot.validate()?;
     Ok(snapshot)
 }
 
@@ -935,6 +1011,7 @@ fn request_to_fb(request: &WorkerRequest) -> anyhow::Result<fbs::WorkerRequestT>
             .map(batch_to_fb)
             .transpose()?
             .map(Box::new),
+        step_id: request.step_id,
         session_id: request.session_id.map(|id| id.0),
         copies: request.copies.as_ref().map(|items| {
             items
@@ -961,6 +1038,7 @@ fn request_from_fb(request: fbs::WorkerRequestT) -> anyhow::Result<WorkerRequest
             .batch
             .map(|batch| batch_from_fb(*batch))
             .transpose()?,
+        step_id: request.step_id,
         session_id: request.session_id.map(RequestId),
         copies: request.copies.map(|items| {
             items
@@ -982,6 +1060,7 @@ fn request_from_fb(request: fbs::WorkerRequestT) -> anyhow::Result<WorkerRequest
 
 fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
     let payload_count = usize::from(request.batch.is_some())
+        + usize::from(request.step_id.is_some())
         + usize::from(request.session_id.is_some())
         + usize::from(request.copies.is_some())
         + usize::from(request.adapter_id.is_some())
@@ -999,6 +1078,10 @@ fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
             );
             batch.validate()?;
         }
+        RequestKind::PollCompletions => anyhow::ensure!(
+            request.step_id.is_some() && payload_count == 1,
+            "poll_completions requires exactly one step id"
+        ),
         RequestKind::DropSession => anyhow::ensure!(
             request.session_id.is_some() && payload_count == 1,
             "drop_session requires exactly one session id"
@@ -1192,11 +1275,11 @@ fn batch_to_fb(batch: &Batch) -> anyhow::Result<fbs::BatchT> {
                 .map(admission_to_fb)
                 .collect::<anyhow::Result<_>>()?,
         ),
-        operations: Some(
+        partitions: Some(
             batch
-                .operations
+                .partitions
                 .iter()
-                .map(operation_to_fb)
+                .map(partition_to_fb)
                 .collect::<anyhow::Result<_>>()?,
         ),
         controls: Some(
@@ -1218,6 +1301,27 @@ fn batch_to_fb(batch: &Batch) -> anyhow::Result<fbs::BatchT> {
     })
 }
 
+fn partition_to_fb(partition: &BatchPartition) -> anyhow::Result<fbs::BatchPartitionT> {
+    partition.validate()?;
+    Ok(fbs::BatchPartitionT {
+        partition_id: partition.partition_id,
+        submission_group: partition.submission_group,
+        collective_seq: partition.collective_seq,
+        domain: domain_to_fb(partition.domain),
+        route: partition.route.0,
+        execution: execution_capability_to_fb(partition.execution),
+        attention: attention_regime_to_fb(partition.attention),
+        shape_class: partition.shape_class,
+        operations: Some(
+            partition
+                .operations
+                .iter()
+                .map(operation_to_fb)
+                .collect::<anyhow::Result<_>>()?,
+        ),
+    })
+}
+
 #[cfg(test)]
 fn batch_from_fb(batch: fbs::BatchT) -> anyhow::Result<Batch> {
     let batch = Batch {
@@ -1228,11 +1332,11 @@ fn batch_from_fb(batch: fbs::BatchT) -> anyhow::Result<Batch> {
             .into_iter()
             .map(admission_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        operations: batch
-            .operations
+        partitions: batch
+            .partitions
             .unwrap_or_default()
             .into_iter()
-            .map(operation_from_fb)
+            .map(partition_from_fb)
             .collect::<anyhow::Result<_>>()?,
         controls: batch
             .controls
@@ -1249,6 +1353,28 @@ fn batch_from_fb(batch: fbs::BatchT) -> anyhow::Result<Batch> {
     };
     batch.validate()?;
     Ok(batch)
+}
+
+#[cfg(test)]
+fn partition_from_fb(partition: fbs::BatchPartitionT) -> anyhow::Result<BatchPartition> {
+    let partition = BatchPartition {
+        partition_id: partition.partition_id,
+        submission_group: partition.submission_group,
+        collective_seq: partition.collective_seq,
+        domain: domain_from_fb(partition.domain)?,
+        route: RouteId(partition.route),
+        execution: execution_capability_from_fb(partition.execution)?,
+        attention: attention_regime_from_fb(partition.attention)?,
+        shape_class: partition.shape_class,
+        operations: partition
+            .operations
+            .unwrap_or_default()
+            .into_iter()
+            .map(operation_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+    };
+    partition.validate()?;
+    Ok(partition)
 }
 
 fn admission_to_fb(admission: &Admission) -> anyhow::Result<fbs::AdmissionT> {
@@ -1530,10 +1656,14 @@ fn version_ref_to_fb(version: &VersionRef) -> fbs::VersionRefT {
                 semantic_digest: Some(semantic_digest.clone()),
             })),
             Point::Device {
+                point_index,
                 selected_point,
                 producer_plan_digest,
             } => fbs::PointT::PointDevice(Box::new(fbs::PointDeviceT {
-                selected_point: Some(Box::new(product_ref_to_fb(selected_point))),
+                point_index: *point_index,
+                selected_point: selected_point
+                    .as_ref()
+                    .map(|value| Box::new(product_ref_to_fb(value))),
                 producer_plan_digest: Some(producer_plan_digest.clone()),
             })),
         },
@@ -1548,11 +1678,11 @@ fn version_ref_from_fb(version: fbs::VersionRefT) -> anyhow::Result<VersionRef> 
             semantic_digest: required_string(fixed.semantic_digest, "point.fixed.semantic_digest")?,
         },
         fbs::PointT::PointDevice(device) => Point::Device {
-            selected_point: product_ref_from_fb(
-                *device
-                    .selected_point
-                    .context("device point has no selected product")?,
-            )?,
+            point_index: device.point_index,
+            selected_point: device
+                .selected_point
+                .map(|value| product_ref_from_fb(*value))
+                .transpose()?,
             producer_plan_digest: required_string(
                 device.producer_plan_digest,
                 "point.device.producer_plan_digest",
@@ -1696,6 +1826,19 @@ fn completion_report_to_fb(report: &CompletionReport) -> anyhow::Result<fbs::Com
     report.validate()?;
     Ok(fbs::CompletionReportT {
         step_id: report.step_id,
+        partitions: Some(
+            report
+                .partitions
+                .iter()
+                .map(partition_completion_to_fb)
+                .collect(),
+        ),
+    })
+}
+
+fn partition_completion_to_fb(report: &PartitionCompletion) -> fbs::PartitionCompletionT {
+    fbs::PartitionCompletionT {
+        partition_id: report.partition_id,
         completions: Some(
             report
                 .completions
@@ -1713,13 +1856,30 @@ fn completion_report_to_fb(report: &CompletionReport) -> anyhow::Result<fbs::Com
             .as_ref()
             .map(forward_stats_to_fb)
             .map(Box::new),
-    })
+    }
 }
 
 #[cfg(test)]
 fn completion_report_from_fb(report: fbs::CompletionReportT) -> anyhow::Result<CompletionReport> {
     let report = CompletionReport {
         step_id: report.step_id,
+        partitions: report
+            .partitions
+            .unwrap_or_default()
+            .into_iter()
+            .map(partition_completion_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+    };
+    report.validate()?;
+    Ok(report)
+}
+
+#[cfg(test)]
+fn partition_completion_from_fb(
+    report: fbs::PartitionCompletionT,
+) -> anyhow::Result<PartitionCompletion> {
+    let report = PartitionCompletion {
+        partition_id: report.partition_id,
         completions: report
             .completions
             .unwrap_or_default()
@@ -1880,6 +2040,104 @@ fn error_operation_from_fb(
 // Capabilities
 // ---------------------------------------------------------------------------
 
+fn credit_vector_from_table(value: fbs::CreditVector<'_>) -> CreditVector {
+    CreditVector {
+        registered_operations: value.registered_operations(),
+        execution_slots: value.execution_slots(),
+        completion_slots: value.completion_slots(),
+        device_products: value.device_products(),
+        kv_pages: value.kv_pages(),
+        rollback_deltas: value.rollback_deltas(),
+        latent_artifact_bytes: value.latent_artifact_bytes(),
+        pinned_completion_staging_bytes: value.pinned_completion_staging_bytes(),
+        transfer_bytes: value.transfer_bytes(),
+        transfer_tickets: value.transfer_tickets(),
+        cpu_tasks: value.cpu_tasks(),
+        output_journal_bytes: value.output_journal_bytes(),
+    }
+}
+
+fn route_credit_limits_from_table(
+    value: fbs::RouteCreditLimits<'_>,
+) -> anyhow::Result<RouteCreditLimits> {
+    let limits = RouteCreditLimits {
+        per_request: credit_vector_from_table(
+            value
+                .per_request()
+                .context("route credit limits have no per-request vector")?,
+        ),
+        worker: credit_vector_from_table(
+            value
+                .worker()
+                .context("route credit limits have no worker vector")?,
+        ),
+    };
+    limits.validate()?;
+    Ok(limits)
+}
+
+fn credit_vector_to_fb(value: CreditVector) -> fbs::CreditVectorT {
+    fbs::CreditVectorT {
+        registered_operations: value.registered_operations,
+        execution_slots: value.execution_slots,
+        completion_slots: value.completion_slots,
+        device_products: value.device_products,
+        kv_pages: value.kv_pages,
+        rollback_deltas: value.rollback_deltas,
+        latent_artifact_bytes: value.latent_artifact_bytes,
+        pinned_completion_staging_bytes: value.pinned_completion_staging_bytes,
+        transfer_bytes: value.transfer_bytes,
+        transfer_tickets: value.transfer_tickets,
+        cpu_tasks: value.cpu_tasks,
+        output_journal_bytes: value.output_journal_bytes,
+    }
+}
+
+fn route_credit_limits_to_fb(value: RouteCreditLimits) -> fbs::RouteCreditLimitsT {
+    fbs::RouteCreditLimitsT {
+        per_request: Some(Box::new(credit_vector_to_fb(value.per_request))),
+        worker: Some(Box::new(credit_vector_to_fb(value.worker))),
+    }
+}
+
+#[cfg(test)]
+fn credit_vector_from_fb(value: fbs::CreditVectorT) -> CreditVector {
+    CreditVector {
+        registered_operations: value.registered_operations,
+        execution_slots: value.execution_slots,
+        completion_slots: value.completion_slots,
+        device_products: value.device_products,
+        kv_pages: value.kv_pages,
+        rollback_deltas: value.rollback_deltas,
+        latent_artifact_bytes: value.latent_artifact_bytes,
+        pinned_completion_staging_bytes: value.pinned_completion_staging_bytes,
+        transfer_bytes: value.transfer_bytes,
+        transfer_tickets: value.transfer_tickets,
+        cpu_tasks: value.cpu_tasks,
+        output_journal_bytes: value.output_journal_bytes,
+    }
+}
+
+#[cfg(test)]
+fn route_credit_limits_from_fb(
+    value: fbs::RouteCreditLimitsT,
+) -> anyhow::Result<RouteCreditLimits> {
+    let limits = RouteCreditLimits {
+        per_request: credit_vector_from_fb(
+            *value
+                .per_request
+                .context("route credit limits have no per-request vector")?,
+        ),
+        worker: credit_vector_from_fb(
+            *value
+                .worker
+                .context("route credit limits have no worker vector")?,
+        ),
+    };
+    limits.validate()?;
+    Ok(limits)
+}
+
 fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
     caps.validate()?;
     Ok(fbs::EngineCapsT {
@@ -1926,6 +2184,27 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
             device_sequence_lengths: caps.execution_constraints.device_sequence_lengths,
             device_append_offsets: caps.execution_constraints.device_append_offsets,
             incremental_kv_publication: caps.execution_constraints.incremental_kv_publication,
+            route_capabilities: Some(
+                caps.execution_constraints
+                    .route_capabilities
+                    .iter()
+                    .map(|capability| fbs::RouteExecutionCapabilityT {
+                        route: capability.route.0,
+                        supported_work: Some(
+                            capability
+                                .supported_work
+                                .iter()
+                                .copied()
+                                .map(work_to_fb)
+                                .collect(),
+                        ),
+                        tensorized_mixed: capability.tensorized_mixed,
+                        sampling_ownership: sampling_ownership_to_fb(capability.sampling_ownership),
+                        preemptible: capability.preemptible,
+                        credits: Some(Box::new(route_credit_limits_to_fb(capability.credits))),
+                    })
+                    .collect(),
+            ),
         })),
         resource_classes: Some(
             caps.resource_classes
@@ -1938,12 +2217,7 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         weight_digest: Some(caps.weight_digest.clone()),
         protocol_layout_digest: Some(caps.protocol_layout_digest.clone()),
         route_capability_digest: Some(caps.route_capability_digest.clone()),
-        restored_sessions: Some(
-            caps.restored_sessions
-                .iter()
-                .map(|session| session.0)
-                .collect(),
-        ),
+        restored_snapshots: Some(caps.restored_snapshots.iter().map(snapshot_to_fb).collect()),
     })
 }
 
@@ -2001,13 +2275,42 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
         adapter_mode: adapter_mode_from_fb(caps.adapter_mode)?,
         execution_constraints: caps
             .execution_constraints
-            .map(|constraints| ExecutionConstraints {
-                max_batch_operations: constraints.max_batch_operations,
-                max_speculative_points: constraints.max_speculative_points,
-                device_sequence_lengths: constraints.device_sequence_lengths,
-                device_append_offsets: constraints.device_append_offsets,
-                incremental_kv_publication: constraints.incremental_kv_publication,
+            .map(|constraints| -> anyhow::Result<ExecutionConstraints> {
+                Ok(ExecutionConstraints {
+                    max_batch_operations: constraints.max_batch_operations,
+                    max_speculative_points: constraints.max_speculative_points,
+                    device_sequence_lengths: constraints.device_sequence_lengths,
+                    device_append_offsets: constraints.device_append_offsets,
+                    incremental_kv_publication: constraints.incremental_kv_publication,
+                    route_capabilities: constraints
+                        .route_capabilities
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|capability| {
+                            Ok(RouteExecutionCapability {
+                                route: RouteId(capability.route),
+                                supported_work: capability
+                                    .supported_work
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(work_from_fb)
+                                    .collect::<anyhow::Result<Vec<_>>>()?,
+                                tensorized_mixed: capability.tensorized_mixed,
+                                sampling_ownership: sampling_ownership_from_fb(
+                                    capability.sampling_ownership,
+                                )?,
+                                preemptible: capability.preemptible,
+                                credits: route_credit_limits_from_fb(
+                                    *capability
+                                        .credits
+                                        .context("route capability has no credit limits")?,
+                                )?,
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                })
             })
+            .transpose()?
             .context("capabilities have no execution constraints")?,
         resource_classes: caps
             .resource_classes
@@ -2027,12 +2330,12 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
         route_capability_digest: caps
             .route_capability_digest
             .context("capabilities.route_capability_digest is missing")?,
-        restored_sessions: caps
-            .restored_sessions
+        restored_snapshots: caps
+            .restored_snapshots
             .unwrap_or_default()
             .into_iter()
-            .map(RequestId)
-            .collect(),
+            .map(snapshot_from_fb)
+            .collect::<anyhow::Result<_>>()?,
     };
     caps.validate()?;
     Ok(caps)
@@ -2427,9 +2730,7 @@ fn required_string(value: Option<String>, label: &str) -> anyhow::Result<String>
 
 fn snapshot_to_fb(snapshot: &SnapshotRef) -> fbs::SnapshotRefT {
     fbs::SnapshotRefT {
-        session_id: snapshot.session_id.0,
-        epoch: snapshot.epoch,
-        version: snapshot.version,
+        version: Some(Box::new(version_ref_to_fb(&snapshot.version))),
         digest: Some(snapshot.digest.clone()),
         locator: Some(snapshot.locator.clone()),
     }
@@ -2438,24 +2739,15 @@ fn snapshot_to_fb(snapshot: &SnapshotRef) -> fbs::SnapshotRefT {
 #[cfg(test)]
 fn snapshot_from_fb(snapshot: fbs::SnapshotRefT) -> anyhow::Result<SnapshotRef> {
     let snapshot = SnapshotRef {
-        session_id: RequestId(snapshot.session_id),
-        epoch: snapshot.epoch,
-        version: snapshot.version,
+        version: version_ref_from_fb(
+            *snapshot
+                .version
+                .context("snapshot reference has no exact version")?,
+        )?,
         digest: required_string(snapshot.digest, "snapshot digest")?,
         locator: required_string(snapshot.locator, "snapshot locator")?,
     };
-    anyhow::ensure!(
-        snapshot.digest.len() == 64
-            && snapshot
-                .digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "snapshot digest must be a lowercase SHA-256 digest"
-    );
-    anyhow::ensure!(
-        snapshot.locator == snapshot.digest,
-        "snapshot locator must equal its content digest"
-    );
+    snapshot.validate()?;
     Ok(snapshot)
 }
 
@@ -2504,6 +2796,59 @@ fn domain_from_fb(domain: fbs::Domain) -> anyhow::Result<Domain> {
     } else {
         bail!("unknown domain {}", domain.0)
     }
+}
+
+fn execution_capability_to_fb(capability: ExecutionCapability) -> fbs::ExecutionCapability {
+    match capability {
+        ExecutionCapability::DomainHomogeneous => fbs::ExecutionCapability::DomainHomogeneous,
+        ExecutionCapability::TensorizedMixed => fbs::ExecutionCapability::TensorizedMixed,
+    }
+}
+
+fn execution_capability_from_fb(
+    capability: fbs::ExecutionCapability,
+) -> anyhow::Result<ExecutionCapability> {
+    Ok(match capability {
+        fbs::ExecutionCapability::DomainHomogeneous => ExecutionCapability::DomainHomogeneous,
+        fbs::ExecutionCapability::TensorizedMixed => ExecutionCapability::TensorizedMixed,
+        other => bail!("unknown execution capability {}", other.0),
+    })
+}
+
+fn attention_regime_to_fb(regime: AttentionRegime) -> fbs::AttentionRegime {
+    match regime {
+        AttentionRegime::None => fbs::AttentionRegime::None,
+        AttentionRegime::Causal => fbs::AttentionRegime::Causal,
+        AttentionRegime::Bidirectional => fbs::AttentionRegime::Bidirectional,
+        AttentionRegime::Hybrid => fbs::AttentionRegime::Hybrid,
+    }
+}
+
+fn attention_regime_from_fb(regime: fbs::AttentionRegime) -> anyhow::Result<AttentionRegime> {
+    Ok(match regime {
+        fbs::AttentionRegime::None => AttentionRegime::None,
+        fbs::AttentionRegime::Causal => AttentionRegime::Causal,
+        fbs::AttentionRegime::Bidirectional => AttentionRegime::Bidirectional,
+        fbs::AttentionRegime::Hybrid => AttentionRegime::Hybrid,
+        other => bail!("unknown attention regime {}", other.0),
+    })
+}
+
+fn sampling_ownership_to_fb(ownership: SamplingOwnership) -> fbs::SamplingOwnership {
+    match ownership {
+        SamplingOwnership::DesignatedRank => fbs::SamplingOwnership::DesignatedRank,
+        SamplingOwnership::DeterministicSharded => fbs::SamplingOwnership::DeterministicSharded,
+    }
+}
+
+fn sampling_ownership_from_fb(
+    ownership: fbs::SamplingOwnership,
+) -> anyhow::Result<SamplingOwnership> {
+    Ok(match ownership {
+        fbs::SamplingOwnership::DesignatedRank => SamplingOwnership::DesignatedRank,
+        fbs::SamplingOwnership::DeterministicSharded => SamplingOwnership::DeterministicSharded,
+        other => bail!("unknown sampling ownership {}", other.0),
+    })
 }
 
 fn product_kind_to_fb(kind: ProductKind) -> fbs::ProductKind {
@@ -2688,6 +3033,7 @@ fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
     match kind {
         RequestKind::GetCapabilities => fbs::ReqKind::GetCapabilities,
         RequestKind::Execute => fbs::ReqKind::Execute,
+        RequestKind::PollCompletions => fbs::ReqKind::PollCompletions,
         RequestKind::DropSession => fbs::ReqKind::DropSession,
         RequestKind::Shutdown => fbs::ReqKind::Shutdown,
         RequestKind::CopyKv => fbs::ReqKind::CopyKv,

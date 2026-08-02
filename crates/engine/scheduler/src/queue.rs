@@ -12,9 +12,6 @@ use crate::scheduler::ReqState;
 pub trait RequestQueue: Send {
     /// Append a newly arrived request.
     fn add_request(&mut self, st: ReqState);
-    /// Re-queue a preempted request so it restarts promptly: at the front
-    /// under FCFS, in priority order (original arrival time) under Priority.
-    fn prepend_request(&mut self, st: ReqState);
     /// The next request admission would consider.
     fn peek_request(&self) -> Option<&ReqState>;
     /// Remove and return the next request.
@@ -36,10 +33,6 @@ pub struct FcfsRequestQueue {
 impl RequestQueue for FcfsRequestQueue {
     fn add_request(&mut self, st: ReqState) {
         self.queue.push_back(st);
-    }
-
-    fn prepend_request(&mut self, st: ReqState) {
-        self.queue.push_front(st);
     }
 
     fn peek_request(&self) -> Option<&ReqState> {
@@ -85,12 +78,6 @@ impl RequestQueue for PriorityRequestQueue {
     fn add_request(&mut self, st: ReqState) {
         let idx = self.insertion_index(&st);
         self.queue.insert(idx, st);
-    }
-
-    fn prepend_request(&mut self, st: ReqState) {
-        // A preempted request keeps its original `queued_at`, so ordered
-        // insertion already places it ahead of same-priority later arrivals.
-        self.add_request(st);
     }
 
     fn peek_request(&self) -> Option<&ReqState> {

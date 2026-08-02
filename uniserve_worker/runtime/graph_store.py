@@ -189,6 +189,11 @@ class GraphStore:
             return _run(forward(batch), "eager", batch, len(batch.rows))
         if isinstance(batch.context.attention, PagedVarlenPlan) and not self.prefill_enabled:
             return _run(forward(batch), "eager", batch, len(batch.rows))
+        if isinstance(batch.context.attention, PagedVarlenPlan) and any(
+            isinstance(row, TokenRow) and row.selection is not TokenSelection.LAST_LOGITS
+            for row in batch.rows
+        ):
+            return _run(forward(batch), "eager", batch, len(batch.rows))
         if isinstance(batch.context.attention, PackedAttentionPlan) and _quantized_kv(batch):
             return _run(forward(batch), "graph_fallback", batch, len(batch.rows))
         decode_geometry = _decode_geometry(

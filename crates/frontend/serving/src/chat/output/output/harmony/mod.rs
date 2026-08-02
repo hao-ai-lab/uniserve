@@ -364,6 +364,7 @@ async fn harmony_assistant_event_stream(
                 token_ids,
                 logprobs,
                 finished,
+                ..
             } => {
                 for event in state.process_token_ids(&token_ids)? {
                     y.yield_ok(event).await;

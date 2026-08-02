@@ -1,7 +1,7 @@
 //! Structured scheduling facts, explainable decisions, and latency history.
 //!
 //! This module provides read-only telemetry around the scheduler's admission
-//! and preemption policy while scheduling authority remains in [`crate::Scheduler`].
+//! and admission policy while scheduling authority remains in [`crate::Scheduler`].
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -20,7 +20,7 @@ pub struct PolicySnapshot {
     pub free_blocks: usize,
     pub total_blocks: usize,
     pub reserved_blocks: usize,
-    pub active_leases: usize,
+    pub active_credit_requests: usize,
     // cache facts
     pub cached_blocks: usize,
     pub prefix_hit_rate: f32,
@@ -29,14 +29,13 @@ pub struct PolicySnapshot {
     pub op_latency_us: Vec<(String, u64)>,
 }
 
-/// Why an admission / preemption / rejection decision was taken.
+/// Why an admission or rejection decision was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyReason {
     Admitted,
     DelayedNoBlocks,
     DelayedScratch,
     DelayedMaxSeqs,
-    Preempted,
     RejectedTooLarge,
 }
 
@@ -47,7 +46,6 @@ impl PolicyReason {
             PolicyReason::DelayedNoBlocks => "delayed_no_blocks",
             PolicyReason::DelayedScratch => "delayed_scratch",
             PolicyReason::DelayedMaxSeqs => "delayed_max_seqs",
-            PolicyReason::Preempted => "preempted",
             PolicyReason::RejectedTooLarge => "rejected_too_large",
         }
     }
@@ -111,7 +109,6 @@ pub struct DecisionLog {
     cap: usize,
     pub admitted: u64,
     pub delayed: u64,
-    pub preempted: u64,
     pub rejected: u64,
 }
 
@@ -122,7 +119,6 @@ impl Default for DecisionLog {
             cap: 256,
             admitted: 0,
             delayed: 0,
-            preempted: 0,
             rejected: 0,
         }
     }
@@ -132,7 +128,6 @@ impl DecisionLog {
     pub fn record(&mut self, d: PolicyDecision) {
         match d.reason {
             PolicyReason::Admitted => self.admitted += 1,
-            PolicyReason::Preempted => self.preempted += 1,
             PolicyReason::RejectedTooLarge => self.rejected += 1,
             PolicyReason::DelayedNoBlocks
             | PolicyReason::DelayedScratch

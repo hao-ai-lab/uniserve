@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 __all__ = ["WorkerIpcTransport", "WorkerServeLoop"]
 
-
 def _request_session_ids(request: Mapping[str, Any]) -> frozenset[int]:
     sessions: set[int] = set()
     direct_session = request.get("session_id")
@@ -23,9 +22,20 @@ def _request_session_ids(request: Mapping[str, Any]) -> frozenset[int]:
     batch = request.get("batch")
     groups: tuple[object, ...]
     if isinstance(batch, Mapping):
+        raw_partitions = batch.get("partitions", ())
+        partition_operations = (
+            tuple(
+                operation
+                for partition in raw_partitions
+                if isinstance(partition, Mapping)
+                for operation in partition.get("operations", ())
+            )
+            if isinstance(raw_partitions, Sequence)
+            else ()
+        )
         groups = (
             batch.get("admissions", ()),
-            batch.get("operations", ()),
+            partition_operations,
             batch.get("controls", ()),
         )
     elif batch is not None:
@@ -54,6 +64,15 @@ def _request_session_ids(request: Mapping[str, Any]) -> frozenset[int]:
             if isinstance(session_id, int) and not isinstance(session_id, bool):
                 sessions.add(session_id)
     return frozenset(sessions)
+
+
+def _response_session_ids(response: Mapping[str, Any]) -> frozenset[int]:
+    report = response.get("completion_report")
+    completions = getattr(report, "completions", ())
+    return frozenset(
+        int(completion.request_key.session_id)
+        for completion in completions
+    )
 
 
 class WorkerIpcTransport(Protocol):
@@ -120,7 +139,7 @@ class WorkerServeLoop:
 
         earlier_sessions: set[int] = set()
         for index, (request, response) in enumerate(self.inflight):
-            request_sessions = _request_session_ids(request)
+            request_sessions = _request_session_ids(request) | _response_session_ids(response)
             lineage_ready = earlier_sessions.isdisjoint(request_sessions)
             if lineage_ready and _response_ready(response):
                 del self.inflight[index]

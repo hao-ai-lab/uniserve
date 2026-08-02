@@ -10,7 +10,7 @@ use crate::logits::{LogitsProcessor, ProcCtx, run_pipeline_checked};
 const CPU_TASK_CAPACITY: usize = 256;
 const CPU_WORKERS: usize = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CpuTaskKey {
     pub request_id: RequestId,
     pub epoch: u64,

@@ -32,6 +32,8 @@ from .common import RequestRecord, _max, _mean, _std, distribution, percentile
 UEVAL_LATENCY_DEFINITION = {
     "clock": "time.perf_counter",
     "event_timestamp": "client_sse_receive_before_parse",
+    "server_public_commit_clock": "server_process_monotonic",
+    "public_commit_correlation": "scheduler_event_sequence_and_fixed_semantic_root",
     "visible_text": "nonempty_content_or_reasoning",
     "visible_image": "received_image_part_that_decodes_and_conforms",
     "segment": "maximal_consecutive_visible_events_of_one_modality",
@@ -271,6 +273,26 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
         for timing in complete_timings
         for value in timing["directional_latencies"]["image_to_text"]
     ]
+    server_transition_latencies = [
+        float(value)
+        for timing in complete_timings
+        for value in timing["server_transition_latencies"]
+    ]
+    server_text_to_image = [
+        float(value)
+        for timing in complete_timings
+        for value in timing["server_directional_latencies"]["text_to_image"]
+    ]
+    server_image_to_text = [
+        float(value)
+        for timing in complete_timings
+        for value in timing["server_directional_latencies"]["image_to_text"]
+    ]
+    delivery_transition_deltas = [
+        float(value)
+        for timing in complete_timings
+        for value in timing["delivery_transition_deltas"]
+    ]
     visible_event_count = sum(int(timing["visible_event_count"]) for timing in timings)
     timestamped_event_count = sum(int(timing["timestamped_event_count"]) for timing in timings)
     expected_transition_count = sum(int(timing["expected_transition_count"]) for timing in timings)
@@ -302,6 +324,21 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
             "non_monotonic_event_count": sum(
                 int(timing["non_monotonic_event_count"]) for timing in timings
             ),
+            "public_commit_event_count": sum(
+                int(timing["public_commit_event_count"]) for timing in timings
+            ),
+            "public_commit_coverage": (
+                sum(int(timing["public_commit_event_count"]) for timing in timings)
+                / visible_event_count
+                if visible_event_count
+                else 0.0
+            ),
+            "public_commit_invalid_count": sum(
+                int(timing["public_commit_invalid_count"]) for timing in timings
+            ),
+            "public_commit_non_monotonic_count": sum(
+                int(timing["public_commit_non_monotonic_count"]) for timing in timings
+            ),
             "expected_transition_count": expected_transition_count,
             "measured_transition_count": measured_transition_count,
             "transition_sample_coverage": (
@@ -316,6 +353,26 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
             "transition_latency_ms": distribution(transition_latencies, scale=1000),
             "text_to_image_transition_latency_ms": distribution(text_to_image, scale=1000),
             "image_to_text_transition_latency_ms": distribution(image_to_text, scale=1000),
+            "server_transition_latency_ms": distribution(
+                server_transition_latencies,
+                scale=1000,
+            ),
+            "server_text_to_image_transition_latency_ms": distribution(
+                server_text_to_image,
+                scale=1000,
+            ),
+            "server_image_to_text_transition_latency_ms": distribution(
+                server_image_to_text,
+                scale=1000,
+            ),
+            "client_delivery_transition_delta_ms": distribution(
+                delivery_transition_deltas,
+                scale=1000,
+            ),
+            "boundary_correlations": {
+                record.request_id: timing["boundary_correlations"]
+                for record, timing in zip(multimodal, timings, strict=True)
+            },
         },
     }
 
@@ -326,7 +383,12 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
     timestamped_event_count = 0
     ambiguous_event_count = 0
     non_monotonic_event_count = 0
+    public_commit_event_count = 0
+    public_commit_invalid_count = 0
+    public_commit_non_monotonic_count = 0
     previous_timestamp: float | None = None
+    previous_public_seq: int | None = None
+    previous_public_timestamp: float | None = None
 
     for event in record.modality_events:
         modalities = event.get("modalities")
@@ -349,9 +411,28 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
         if previous_timestamp is not None and timestamp_f < previous_timestamp:
             non_monotonic_event_count += 1
         previous_timestamp = timestamp_f
+        raw_public_commit = event.get("public_commit")
+        public_commit = _validated_public_commit(raw_public_commit, modality)
+        if public_commit is None:
+            if raw_public_commit is not None:
+                public_commit_invalid_count += 1
+        else:
+            public_commit_event_count += 1
+            event_seq = int(public_commit["event_seq"])
+            committed_at = float(public_commit["committed_at"])
+            if previous_public_seq is not None and event_seq <= previous_public_seq:
+                public_commit_non_monotonic_count += 1
+            if (
+                previous_public_timestamp is not None
+                and committed_at < previous_public_timestamp
+            ):
+                public_commit_non_monotonic_count += 1
+            previous_public_seq = event_seq
+            previous_public_timestamp = committed_at
         if segments and segments[-1]["modality"] == modality:
             segments[-1]["last_timestamp"] = timestamp_f
             segments[-1]["event_count"] = int(segments[-1]["event_count"]) + 1
+            segments[-1]["last_public_commit"] = public_commit
         else:
             segments.append(
                 {
@@ -359,6 +440,8 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
                     "first_timestamp": timestamp_f,
                     "last_timestamp": timestamp_f,
                     "event_count": 1,
+                    "first_public_commit": public_commit,
+                    "last_public_commit": public_commit,
                 }
             )
 
@@ -369,6 +452,13 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
         "text_to_image": [],
         "image_to_text": [],
     }
+    server_transition_latencies: list[float] = []
+    server_directional_latencies: dict[str, list[float]] = {
+        "text_to_image": [],
+        "image_to_text": [],
+    }
+    delivery_transition_deltas: list[float] = []
+    boundary_correlations: list[dict[str, Any]] = []
     for source, destination in zip(segments, segments[1:]):
         latency = float(destination["first_timestamp"]) - float(source["last_timestamp"])
         if latency < 0:
@@ -377,6 +467,31 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
         direction = f"{source['modality']}_to_{destination['modality']}"
         transition_latencies.append(latency)
         directional_latencies[direction].append(latency)
+        source_commit = source["last_public_commit"]
+        destination_commit = destination["first_public_commit"]
+        if source_commit is None or destination_commit is None:
+            continue
+        server_latency = float(destination_commit["committed_at"]) - float(
+            source_commit["committed_at"]
+        )
+        if server_latency < 0:
+            public_commit_non_monotonic_count += 1
+            continue
+        server_transition_latencies.append(server_latency)
+        server_directional_latencies[direction].append(server_latency)
+        delivery_transition_deltas.append(latency - server_latency)
+        boundary_correlations.append(
+            {
+                "direction": direction,
+                "source_event_seq": int(source_commit["event_seq"]),
+                "destination_event_seq": int(destination_commit["event_seq"]),
+                "source_semantic_root": source_commit["semantic_root"],
+                "destination_semantic_root": destination_commit["semantic_root"],
+                "client_latency_ms": latency * 1000.0,
+                "server_commit_latency_ms": server_latency * 1000.0,
+                "client_delivery_delta_ms": (latency - server_latency) * 1000.0,
+            }
+        )
 
     valid = bool(record.modality_events)
     valid = valid and timestamped_event_count == visible_event_count
@@ -385,6 +500,10 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
     valid = valid and len(segments) >= 2
     valid = valid and signature == "->".join(record.output_modalities)
     valid = valid and len(transition_latencies) == expected_transition_count
+    valid = valid and public_commit_event_count == visible_event_count
+    valid = valid and public_commit_invalid_count == 0
+    valid = valid and public_commit_non_monotonic_count == 0
+    valid = valid and len(server_transition_latencies) == expected_transition_count
     return {
         "valid": valid,
         "signature": signature,
@@ -392,13 +511,67 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
         "timestamped_event_count": timestamped_event_count,
         "ambiguous_event_count": ambiguous_event_count,
         "non_monotonic_event_count": non_monotonic_event_count,
+        "public_commit_event_count": public_commit_event_count,
+        "public_commit_invalid_count": public_commit_invalid_count,
+        "public_commit_non_monotonic_count": public_commit_non_monotonic_count,
         "expected_transition_count": expected_transition_count,
         "transition_latencies": transition_latencies if valid else [],
+        "server_transition_latencies": server_transition_latencies if valid else [],
+        "delivery_transition_deltas": delivery_transition_deltas if valid else [],
+        "boundary_correlations": boundary_correlations if valid else [],
         "directional_latencies": directional_latencies
         if valid
         else {
             "text_to_image": [],
             "image_to_text": [],
+        },
+        "server_directional_latencies": server_directional_latencies
+        if valid
+        else {
+            "text_to_image": [],
+            "image_to_text": [],
+        },
+    }
+
+
+def _validated_public_commit(value: Any, modality: str) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or value.get("modality") != modality:
+        return None
+    event_seq = value.get("event_seq")
+    committed_at = value.get("committed_at")
+    semantic_root = value.get("semantic_root")
+    if (
+        isinstance(event_seq, bool)
+        or not isinstance(event_seq, int)
+        or event_seq <= 0
+        or isinstance(committed_at, bool)
+        or not isinstance(committed_at, (int, float))
+        or not math.isfinite(float(committed_at))
+        or not isinstance(semantic_root, dict)
+    ):
+        return None
+    producer_op_id = semantic_root.get("producer_op_id")
+    point_index = semantic_root.get("point_index")
+    semantic_digest = semantic_root.get("semantic_digest")
+    if (
+        isinstance(producer_op_id, bool)
+        or not isinstance(producer_op_id, int)
+        or producer_op_id < 0
+        or isinstance(point_index, bool)
+        or not isinstance(point_index, int)
+        or not 0 <= point_index <= 0xFFFF_FFFF
+        or not isinstance(semantic_digest, str)
+        or len(semantic_digest) != 64
+        or any(character not in "0123456789abcdef" for character in semantic_digest)
+    ):
+        return None
+    return {
+        "event_seq": event_seq,
+        "committed_at": float(committed_at),
+        "semantic_root": {
+            "producer_op_id": producer_op_id,
+            "point_index": point_index,
+            "semantic_digest": semantic_digest,
         },
     }
 

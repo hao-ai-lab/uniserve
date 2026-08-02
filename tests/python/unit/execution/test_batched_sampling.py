@@ -10,7 +10,7 @@ import torch
 
 from uniserve_worker.batch import Operation, SamplingParams
 from uniserve_worker.execution.executor import (
-    _plain_greedy_row,
+    _device_greedy_row,
     _sample_task_batch,
     _SampleTask,
     _sampling_task_tensors,
@@ -52,7 +52,7 @@ def _row(
 
 def _task(logits: torch.Tensor, row: _SamplingRow) -> _SampleTask:
     values = logits.reshape(1, -1)
-    if _plain_greedy_row(row):
+    if _device_greedy_row(row):
         return _SampleTask(_ENVELOPE, values, (row,), None, None, None, None)
     draws = (
         uniform_samples(
@@ -265,6 +265,25 @@ def test_host_visible_greedy_rows_share_the_batched_argmax_result() -> None:
     assert tuple(int(value.device_token.item()) for value in sampled) == (1, 2)
 
 
+def test_deterministic_greedy_rows_select_the_highest_unsuppressed_token() -> None:
+    parameters = SamplingParams(temperature=0.0, top_k=1, top_p=1.0)
+    rows = (
+        _row(parameters, session_seed=7, position=3, suppress=(1, 1, 8)),
+        _row(parameters, session_seed=17, position=9, suppress=(2,)),
+    )
+    logits = (
+        torch.tensor([[0.2, 1.8, 0.7, -0.4]]),
+        torch.tensor([[1.3, 0.4, 2.2, 1.0]]),
+    )
+
+    sampled = _sample_task_batch(
+        tuple(_task(values, row) for values, row in zip(logits, rows, strict=True))
+    )
+
+    assert tuple(value.token_id for value in sampled) == (2, 0)
+    assert tuple(int(value.device_token.item()) for value in sampled) == (2, 0)
+
+
 def test_logprob_values_ranks_and_entry_sets_match_full_vocab_reference() -> None:
     parameters = SamplingParams(
         temperature=0.8,
@@ -346,10 +365,25 @@ def test_verify_selects_the_accepted_terminal_draft_as_the_exact_point() -> None
     assert bool(cast(torch.Tensor, actual.device_finish).item()) is True
 
 
-def test_a_policy_must_leave_a_finite_vocabulary_entry() -> None:
-    parameters = SamplingParams(temperature=0.7)
-    row = _row(parameters, session_seed=61, position=4, allowed=(1,), suppress=(1,))
-
+@pytest.mark.parametrize(
+    "parameters, allowed, suppress",
+    (
+        (SamplingParams(temperature=0.7), (1,), (1,)),
+        (SamplingParams(temperature=0.0), None, (0, 1, 2)),
+    ),
+)
+def test_a_policy_must_leave_a_finite_vocabulary_entry(
+    parameters: SamplingParams,
+    allowed: tuple[int, ...] | None,
+    suppress: tuple[int, ...],
+) -> None:
+    row = _row(
+        parameters,
+        session_seed=61,
+        position=4,
+        allowed=allowed,
+        suppress=suppress,
+    )
     with pytest.raises(WorkerError, match="masked every vocabulary entry"):
         _sample_task_batch((_task(torch.tensor([0.2, 0.8, 0.1]), row),))
 

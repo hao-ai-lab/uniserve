@@ -521,6 +521,9 @@ pub struct EngineCoreOutput {
     pub stop_reason: Option<StopReason>,
     #[serde(default)]
     pub events: Option<Vec<EngineCoreEvent>>,
+    /// Exact scheduler publication identity for a visible text or image output.
+    #[serde(default)]
+    pub public_commit: Option<uniserve_engine_api::PublicCommit>,
     #[serde(default)]
     pub kv_transfer_params: Option<serde_json::Value>,
     #[serde(default)]

@@ -61,6 +61,7 @@ impl<T: TextOutputStream> T {
                         token_ids: delta_token_ids,
                         logprobs: mut delta_logprobs,
                         finished,
+                        ..
                     } => {
                         if let Some(c) = collected.as_mut() {
                             c.text.push_str(&delta);
@@ -164,6 +165,7 @@ mod tests {
                         },
                     ],
                 }),
+                public_commit: None,
                 finished: Some(Finished {
                     prompt_token_count: 2,
                     output_token_count: 2,
@@ -248,6 +250,7 @@ mod tests {
                         },
                     ],
                 }),
+                public_commit: None,
                 finished: None,
             }),
             Ok(DecodedTextEvent::TextDelta {
@@ -281,6 +284,7 @@ mod tests {
                         },
                     ],
                 }),
+                public_commit: None,
                 finished: Some(Finished {
                     prompt_token_count: 2,
                     output_token_count: 5,

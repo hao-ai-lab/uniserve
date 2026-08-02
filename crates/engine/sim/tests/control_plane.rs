@@ -15,7 +15,7 @@ use uniserve_core::{
     ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPlacement,
     TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent};
+use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent, PublicModality};
 use uniserve_executor::{ControlAck, ControlOp, Executor};
 use uniserve_scheduler::{ControlTokens, Scheduler, SchedulerConfig, SchedulingPolicy};
 use uniserve_sim::SimEngine;
@@ -245,11 +245,15 @@ fn text_and_image_requests_complete() {
 #[test]
 fn scheduler_submits_mixed_op_kind_batches() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
+    use uniserve_worker_wire::{
+        Batch, CompletionReport, EngineCaps, ExecutionCapability, WorkVariant,
+    };
+
+    type PartitionLog = Arc<Mutex<Vec<Vec<(ExecutionCapability, u32, Vec<WorkVariant>)>>>>;
 
     struct Recording {
         inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Vec<WorkVariant>>>>,
+        batches: PartitionLog,
     }
 
     impl Executor for Recording {
@@ -267,9 +271,19 @@ fn scheduler_submits_mixed_op_kind_batches() {
         }
         fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
             self.batches.lock().unwrap().push(
-                b.operations
+                b.partitions
                     .iter()
-                    .map(|operation| operation.work.variant())
+                    .map(|partition| {
+                        (
+                            partition.execution,
+                            partition.submission_group,
+                            partition
+                                .operations
+                                .iter()
+                                .map(|operation| operation.work.variant())
+                                .collect(),
+                        )
+                    })
                     .collect(),
             );
             self.inner.submit(b)
@@ -355,25 +369,47 @@ fn scheduler_submits_mixed_op_kind_batches() {
     assert!(image_done, "image request did not finish");
     let batches = batches.lock().unwrap();
     assert!(
-        batches.iter().any(|kinds| {
-            kinds.contains(&WorkVariant::TokenDecode) && kinds.contains(&WorkVariant::GenFlow)
+        batches.iter().any(|partitions| {
+            let token = partitions
+                .iter()
+                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::TokenDecode));
+            let flow = partitions
+                .iter()
+                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::GenFlow));
+            matches!(
+                (token, flow),
+                (
+                    Some((ExecutionCapability::TensorizedMixed, token_group, _)),
+                    Some((ExecutionCapability::TensorizedMixed, flow_group, _)),
+                ) if token_group == flow_group
+            )
         }),
         "expected one batch mixing decode_und and denoise_gen, got {batches:?}",
     );
     assert!(
-        batches.iter().any(|kinds| {
-            kinds.contains(&WorkVariant::TokenDecode) && kinds.contains(&WorkVariant::Materialize)
+        batches.iter().any(|partitions| {
+            let token = partitions
+                .iter()
+                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::TokenDecode));
+            let materialize = partitions
+                .iter()
+                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::Materialize));
+            matches!(
+                (token, materialize),
+                (
+                    Some((ExecutionCapability::DomainHomogeneous, token_group, _)),
+                    Some((ExecutionCapability::DomainHomogeneous, materialize_group, _)),
+                ) if token_group != materialize_group
+            )
         }),
-        "expected one batch mixing decode_und and commit_gen, got {batches:?}",
+        "expected decode_und and commit_gen to retain independent physical submissions, got {batches:?}",
     );
 }
 
 #[test]
 fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, EngineCaps, ExecutionConstraints, WorkVariant,
-    };
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
 
     type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, WorkVariant)>>>>;
 
@@ -397,8 +433,7 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
         }
         fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
             self.batches.lock().unwrap().push(
-                b.operations
-                    .iter()
+                b.operations()
                     .map(|operation| (operation.request_key.session_id, operation.work.variant()))
                     .collect(),
             );
@@ -429,10 +464,9 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(2);
         sim.set_text_len(64);
-        sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
-            max_batch_operations: 1024,
-            ..ExecutionConstraints::default()
-        };
+        sim.mut_caps_for_test()
+            .execution_constraints
+            .max_batch_operations = 1024;
         let batches = Arc::new(Mutex::new(Vec::new()));
         let exec = Recording {
             inner: SimExecutor::new(Box::new(sim)),
@@ -516,12 +550,6 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
                 .any(|(id, kind)| *id == RequestId(3) && *kind == WorkVariant::TokenExtend),
             "the ready prompt should receive prefill service, got {prefill_batch:?}"
         );
-        assert!(
-            prefill_batch
-                .iter()
-                .all(|(_, kind)| *kind != WorkVariant::TokenDecode),
-            "prefill service should retain its own execution lane, got {prefill_batch:?}"
-        );
     }
 
     run();
@@ -530,9 +558,7 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
 #[test]
 fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, EngineCaps, ExecutionConstraints, ResourceClass, WorkVariant,
-    };
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, ResourceClass, WorkVariant};
 
     struct Recording {
         inner: SimExecutor,
@@ -554,8 +580,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
         }
         fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
             self.batches.lock().unwrap().push(
-                b.operations
-                    .iter()
+                b.operations()
                     .map(|operation| operation.work.variant())
                     .collect(),
             );
@@ -586,10 +611,9 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     sim.mut_caps_for_test().resource_classes = vec![ResourceClass::ImageLatent];
     sim.mut_caps_for_test().max_latent_size = 1024;
     sim.mut_caps_for_test().latent_downsample = 16;
-    sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
-        max_batch_operations: 1024,
-        ..ExecutionConstraints::default()
-    };
+    sim.mut_caps_for_test()
+        .execution_constraints
+        .max_batch_operations = 1024;
     let batches = Arc::new(Mutex::new(Vec::new()));
     let exec = Recording {
         inner: SimExecutor::new(Box::new(sim)),
@@ -639,12 +663,12 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     );
     let batches = batches.lock().unwrap();
     assert!(
-        batches.iter().all(|kinds| kinds
-            .iter()
-            .filter(|kind| **kind == WorkVariant::GenFlow)
-            .count()
-            <= 1),
-        "expected at most one denoise_gen per batch under one-image latent cap, got {batches:?}",
+        batches.iter().all(|kinds| {
+            [WorkVariant::GenTransition, WorkVariant::GenFlow]
+                .into_iter()
+                .all(|target| kinds.iter().filter(|kind| **kind == target).count() <= 1)
+        }),
+        "expected every latent-producing batch to respect one-image capacity, got {batches:?}",
     );
 }
 
@@ -676,7 +700,7 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
             self.ops
                 .lock()
                 .unwrap()
-                .extend(batch.operations.iter().map(|op| op.work.variant()));
+                .extend(batch.operations().map(|op| op.work.variant()));
             self.public_event_limits
                 .lock()
                 .unwrap()
@@ -786,13 +810,10 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
 
 #[test]
 fn scheduler_clamps_max_batch_to_worker_caps() {
-    use uniserve_worker_wire::ExecutionConstraints;
-
     let mut sim = SimEngine::new();
-    sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
-        max_batch_operations: 3,
-        ..ExecutionConstraints::default()
-    };
+    sim.mut_caps_for_test()
+        .execution_constraints
+        .max_batch_operations = 3;
     let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
@@ -850,7 +871,7 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
 
         fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
             let in_flight = self.inner.in_flight();
-            for envelope in &batch.operations {
+            for envelope in batch.operations() {
                 let parent = match &envelope.parent.point {
                     Point::Fixed { point_index, .. } => {
                         Some((envelope.parent.producer_op_id, u64::from(*point_index)))
@@ -1025,8 +1046,7 @@ fn staged_product_reachability_uses_a_fixed_handoff_then_same_pool_device_lineag
         fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
             self.operations.lock().unwrap().extend(
                 batch
-                    .operations
-                    .iter()
+                    .operations()
                     .map(|operation| (operation.work.variant(), operation.parent.point.clone())),
             );
             self.inner.submit(batch)
@@ -1155,7 +1175,7 @@ fn stop_token_terminates_with_stop() {
 /// command is observed mid-flight.
 fn run_until_control(abort: bool) -> FinishReason {
     let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000); // effectively never EOS on its own
+    sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
     let sched = Scheduler::new(executor, ctrl(), 32);
@@ -1169,7 +1189,7 @@ fn run_until_control(abort: bool) -> FinishReason {
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
-        1_000_000,
+        1024,
     );
     let mut erx = handle.submit(req).unwrap();
 
@@ -1261,7 +1281,7 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
     }
 
     let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
+    sim.set_text_len(1024);
     sim.set_pipeline_depth(4);
     let controls = Arc::new(Mutex::new(Vec::new()));
     let executor = Recording {
@@ -1279,7 +1299,7 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
-        1_000_000,
+        1024,
     );
     let mut events = handle.submit(request).unwrap();
     let mut consumed_tokens = 0;
@@ -1362,7 +1382,7 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
     assert_eq!(close_seq, committed.last().unwrap().0 + 1);
 
     let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
+    sim.set_text_len(1024);
     sim.set_pipeline_depth(4);
     let stop_controls = Arc::new(Mutex::new(Vec::new()));
     let executor = Recording {
@@ -1379,7 +1399,7 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
-        1_000_000,
+        1024,
     );
     request.stop_strings = vec!["boundary".to_string()];
     let mut events = handle.submit(request).unwrap();
@@ -1738,88 +1758,6 @@ fn chunked_prefill_progresses_with_decode() {
     assert!(t1 > 0 && t2 > 0, "both must produce text (t1={t1} t2={t2})");
 }
 
-/// a high-priority arrival preempts a lower-priority running request; the
-/// preempted request later resumes (recomputing) and both finish. Driven by
-/// manual stepping for determinism.
-#[test]
-fn priority_preemption_and_recompute() {
-    let mut sim = SimEngine::new();
-    sim.set_num_blocks(2); // block 0 padding => exactly 1 usable block
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Priority);
-    let stats = sched.stats_handle();
-
-    // low-priority A, then (later) high-priority B; 1 usable block forces a choice.
-    let mut a = generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        6,
-    );
-    a.priority = 10;
-    let mut arx = sched.submit_for_test(a);
-
-    // Resolve at least one semantic token before preemption so replay crosses
-    // a nonzero control sequence.
-    let mut a_text_before_preemption = 0;
-    for _ in 0..64 {
-        sched.step();
-        while let Ok(event) = arx.try_recv() {
-            if matches!(event, GenEvent::TextToken { .. }) {
-                a_text_before_preemption += 1;
-            }
-        }
-        if a_text_before_preemption > 0 {
-            break;
-        }
-    }
-    assert!(a_text_before_preemption > 0);
-
-    let mut b = generation_request(
-        RequestId(2),
-        text_context(vec![4, 5, 6]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        6,
-    );
-    b.priority = 0; // higher priority (lower value)
-    let mut brx = sched.submit_for_test(b);
-
-    // drive to completion.
-    for _ in 0..2000 {
-        if !sched.step() {
-            break;
-        }
-    }
-
-    use std::sync::atomic::Ordering;
-    assert!(
-        stats.general.preemptions.load(Ordering::Relaxed) >= 1,
-        "expected at least one preemption"
-    );
-
-    let drain = |erx: &mut uniserve_engine_api::EventRx| -> (usize, bool) {
-        let mut text = 0;
-        let mut done = false;
-        while let Ok(ev) = erx.try_recv() {
-            match ev {
-                GenEvent::TextToken { .. } => text += 1,
-                GenEvent::Finished { .. } => done = true,
-                _ => {}
-            }
-        }
-        (text, done)
-    };
-    let (ta_after_preemption, da) = drain(&mut arx);
-    let ta = a_text_before_preemption + ta_after_preemption;
-    let (tb, db) = drain(&mut brx);
-    assert!(db, "high-priority B must finish (text={tb})");
-    assert!(da, "preempted A must resume and finish (text={ta})");
-}
-
 /// Run one text request with the given sampling params and a sim `text_len`,
 /// returning (emitted token ids, whether any logprob was populated, finished).
 fn run_sampling(
@@ -1851,7 +1789,7 @@ fn run_sampling(
     let deadline = Instant::now() + Duration::from_secs(10);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { id, logprob }) => {
+            Ok(GenEvent::TextToken { id, logprob, .. }) => {
                 toks.push(id);
                 if logprob.is_some() {
                     any_logprob = true;
@@ -2133,67 +2071,125 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     );
 }
 
-/// a single generated branch request emits at least two images separated by
-/// text in one stream, and finishes only on a terminal condition.
 #[test]
-fn gen_branch_round_trip_text_image_text_image() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    sim.set_pipeline_depth(2);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let control = ControlTokens { ..ctrl() };
-    let sched = Scheduler::new(executor, control, 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
+fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
+    let mut signatures = Vec::new();
+    for pipeline_depth in [1, 2] {
+        let mut sim = SimEngine::new();
+        sim.set_text_len(1_000_000);
+        sim.set_pipeline_depth(pipeline_depth);
+        let caps = sim.mut_caps_for_test();
+        caps.execution_constraints.route_capabilities[0]
+            .credits
+            .per_request
+            .device_products = 6;
+        caps.route_capability_digest = caps.compute_route_capability_digest();
+        let executor = Box::new(SimExecutor::new(Box::new(sim)));
+        let sched = Scheduler::new(executor, ctrl(), 32);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        let jh = thread::spawn(move || sched.run(rx));
 
-    let req = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_context(vec![1, 2, 3]),
-            SamplingParams {
-                logit_bias: vec![(2222, 1000.0)],
-                ..Default::default()
-            },
-            ImageParams {
-                steps: 3,
-                max_images: 2,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            200,
-        ),
-        TriggerPolicyDescriptor::Token { token_id: 2222 },
-    );
-    let mut erx = handle.submit(req).unwrap();
+        let req = with_trigger(
+            generation_request(
+                RequestId(1),
+                text_context(vec![1, 2, 3]),
+                SamplingParams::default(),
+                ImageParams {
+                    steps: 3,
+                    max_images: 4,
+                    ..Default::default()
+                },
+                GenerationConstraint::Default,
+                200,
+            ),
+            TriggerPolicyDescriptor::Token { token_id: 1008 },
+        );
+        let mut erx = handle.submit(req).unwrap();
 
-    // record the modality sequence: 'T' for a text token, 'I' for an image.
-    let mut seq: Vec<char> = Vec::new();
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenEvent::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
+        let mut signature: Vec<(char, u32)> = Vec::new();
+        let mut publications = Vec::new();
+        let mut image_begins = 0;
+        let mut image_steps = 0;
+        let mut image_commits = 0;
+        let mut finish_reason = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while finish_reason.is_none() && Instant::now() < deadline {
+            match erx.try_recv() {
+                Ok(GenEvent::TextToken {
+                    id,
+                    public_commit: Some(commit),
+                    ..
+                }) => {
+                    assert_eq!(commit.modality, PublicModality::Text);
+                    signature.push(('T', id));
+                    publications.push(commit);
+                }
+                Ok(GenEvent::ImageBegin { .. }) => image_begins += 1,
+                Ok(GenEvent::ImageStep { .. }) => image_steps += 1,
+                Ok(GenEvent::ImageCommit { .. }) => image_commits += 1,
+                Ok(GenEvent::ImageDone {
+                    image_id,
+                    public_commit: Some(commit),
+                    ..
+                }) => {
+                    assert_eq!(commit.modality, PublicModality::Image);
+                    signature.push(('I', image_id));
+                    publications.push(commit);
+                }
+                Ok(GenEvent::TextToken {
+                    public_commit: None,
+                    ..
+                })
+                | Ok(GenEvent::ImageDone {
+                    public_commit: None,
+                    ..
+                }) => panic!("visible event omitted its exact publication identity"),
+                Ok(GenEvent::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
         }
-    }
-    handle.shutdown();
-    let _ = jh.join();
+        handle.shutdown();
+        let _ = jh.join();
 
-    assert!(finished, "generated branch request did not finish");
-    let images = seq.iter().filter(|&&c| c == 'I').count();
-    assert!(
-        images >= 2,
-        "expected >= 2 images, got {images} (seq={:?})",
-        seq
-    );
-    assert!(
-        seq.contains(&'T'),
-        "expected native text tokens around images (seq={:?})",
-        seq
+        assert_eq!(
+            finish_reason,
+            Some(FinishReason::MaxTokens),
+            "generated branch request must finish at its declared text bound"
+        );
+        assert_eq!(
+            signature
+                .iter()
+                .filter(|(modality, _)| *modality == 'I')
+                .count(),
+            4,
+            "request must realize its declared image cap"
+        );
+        assert!(
+            signature.iter().any(|(modality, _)| *modality == 'T'),
+            "request must resume visible Und output"
+        );
+        assert_eq!(image_begins, 4);
+        assert_eq!(image_steps, 12);
+        assert_eq!(image_commits, 4);
+        assert!(publications.windows(2).all(|pair| {
+            pair[0].event_seq < pair[1].event_seq && pair[0].committed_at <= pair[1].committed_at
+        }));
+        assert!(publications.iter().all(|commit| {
+            commit.semantic_root.semantic_digest.len() == 64
+                && commit
+                    .semantic_root
+                    .semantic_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        }));
+        signatures.push(signature);
+    }
+
+    assert_eq!(
+        signatures[0], signatures[1],
+        "device continuation must preserve the depth-one direct-trigger oracle"
     );
 }
 
@@ -2422,6 +2418,12 @@ fn und_only_round_close_trigger_cannot_open_gen() {
 fn gen_branch_model_image_starts_spend_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
+    let caps = sim.mut_caps_for_test();
+    caps.execution_constraints.route_capabilities[0]
+        .credits
+        .per_request
+        .device_products = 10;
+    caps.route_capability_digest = caps.compute_route_capability_digest();
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
     let trig = ControlTokens {
         ..ControlTokens::default()
@@ -2441,11 +2443,11 @@ fn gen_branch_model_image_starts_spend_budget() {
             },
             ImageParams {
                 steps: 3,
-                max_images: 3,
+                max_images: 4,
                 ..Default::default()
             },
             GenerationConstraint::Default,
-            40,
+            64,
         ),
         TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
@@ -2469,7 +2471,7 @@ fn gen_branch_model_image_starts_spend_budget() {
     assert!(finished, "request did not finish (seq={seq:?})");
     let images = seq.iter().filter(|&&c| c == 'I').count();
     assert_eq!(
-        images, 3,
+        images, 4,
         "biased image starts should spend the image budget"
     );
     let first_i = seq.iter().position(|&c| c == 'I').unwrap();
@@ -2605,12 +2607,14 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
 /// complete identically to the single-worker path.
 #[test]
 fn multiworker_executor_drives_scheduler_unchanged() {
-    let mk = || {
+    let mk = |rank| {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(2);
+        sim.mut_caps_for_test().rank.tp_rank = rank;
+        sim.mut_caps_for_test().rank.tp_size = 2;
         Box::new(SimExecutor::new(Box::new(sim))) as Box<dyn Executor>
     };
-    let executor = Box::new(MultiprocExecutor::new(vec![mk(), mk()]));
+    let executor = Box::new(MultiprocExecutor::new(vec![mk(0), mk(1)]).unwrap());
     // rank-aware caps reflect the topology at the handshake.
     assert_eq!(executor.caps().rank.tp_size, 2);
     let sched = Scheduler::new(executor, ctrl(), 32);
@@ -2665,157 +2669,6 @@ fn fcfs_policy_completes_text() {
         assert!(c.finished);
         assert!(c.text > 0);
     }
-}
-
-/// A recording executor verifies that admission state crosses once, operation
-/// leases carry only incremental blocks, and preemption requires readmission.
-#[test]
-fn admissions_are_reissued_after_preemption() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
-
-    #[derive(Default, Clone)]
-    struct Log {
-        admissions: Vec<RequestId>,
-        drops: Vec<RequestId>,
-        blocks_per_op: Vec<(RequestId, WorkVariant, usize)>,
-    }
-
-    struct Recording {
-        inner: SimExecutor,
-        log: Arc<Mutex<Log>>,
-    }
-    impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
-            let mut log = self.log.lock().unwrap();
-            for admission in &b.admissions {
-                log.admissions.push(admission.request_key.session_id);
-            }
-            for operation in &b.operations {
-                // The planner sizes an operation's incremental KV growth into its
-                // page bound. A per-step decode successor stays within the admitted
-                // allocation and grows by zero pages.
-                let block_count = operation.bounds.max_kv_pages as usize;
-                log.blocks_per_op.push((
-                    operation.request_key.session_id,
-                    operation.work.variant(),
-                    block_count,
-                ));
-            }
-            drop(log);
-            self.inner.submit(b)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            if let ControlOp::DropSession(id) = &op {
-                self.log.lock().unwrap().drops.push(*id);
-            }
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            if let ControlOp::DropSession(id) = &op {
-                self.log.lock().unwrap().drops.push(*id);
-            }
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_num_blocks(2); // 1 usable block forces preemption pressure
-    let log = Arc::new(Mutex::new(Log::default()));
-    let exec = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        log: log.clone(),
-    };
-    let mut sched = Scheduler::with_policy(Box::new(exec), ctrl(), 32, SchedulingPolicy::Priority);
-
-    let mut a = generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        6,
-    );
-    a.priority = 10;
-    let _arx = sched.submit_for_test(a);
-    for _ in 0..4 {
-        sched.step();
-    }
-
-    let mut b = generation_request(
-        RequestId(2),
-        text_context(vec![4, 5, 6]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        6,
-    );
-    b.priority = 0;
-    let _brx = sched.submit_for_test(b);
-    for _ in 0..2000 {
-        if !sched.step() {
-            break;
-        }
-    }
-
-    let log = log.lock().unwrap();
-    // Request 1 was preempted and readmitted on resumption.
-    let reg_1 = log.admissions.iter().filter(|r| r.0 == 1).count();
-    let reg_2 = log.admissions.iter().filter(|r| r.0 == 2).count();
-    assert_eq!(
-        reg_2, 1,
-        "request 2 must register exactly once: {:?}",
-        log.admissions
-    );
-    assert_eq!(
-        reg_1, 2,
-        "preempted request 1 must re-register: {:?}",
-        log.admissions
-    );
-    assert!(
-        log.drops.iter().any(|r| r.0 == 1),
-        "preemption must drop the worker record"
-    );
-
-    // Per-step decode successors carry no new blocks while the request stays
-    // within its admitted allocation; only a (re)admitting prefill claims the
-    // incremental pages its recomputed prompt needs.
-    let decode_deltas_1: Vec<usize> = log
-        .blocks_per_op
-        .iter()
-        .filter(|(r, kind, _)| r.0 == 1 && *kind == WorkVariant::TokenDecode)
-        .map(|(_, _, n)| *n)
-        .collect();
-    assert!(
-        !decode_deltas_1.is_empty(),
-        "request 1 must run per-step decode operations"
-    );
-    assert!(
-        decode_deltas_1.iter().all(|&n| n == 0),
-        "per-step decode block deltas must be empty within the admitted allocation: {decode_deltas_1:?}"
-    );
 }
 
 /// Sequence admission carries the prefix-cache reuse boundary: zero for a cold
@@ -3403,7 +3256,7 @@ fn kv_page_ownership_turns_over_after_close_acknowledgement() {
         fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
             {
                 let mut owners = self.owners.lock().unwrap();
-                for operation in &batch.operations {
+                for operation in batch.operations() {
                     let session_id = operation.request_key.session_id;
                     for block in &operation.new_kv_blocks {
                         if let Some(owner) = owners.get(&block.0) {
@@ -3487,14 +3340,14 @@ fn kv_page_ownership_turns_over_after_close_acknowledgement() {
         }
         if finished.len() == receivers.len()
             && scheduler.health_snapshot().in_flight == 0
-            && scheduler.health_snapshot().active_leases == 0
+            && scheduler.health_snapshot().active_credit_requests == 0
         {
             break;
         }
     }
 
     assert_eq!(finished.len(), receivers.len());
-    assert_eq!(scheduler.health_snapshot().active_leases, 0);
+    assert_eq!(scheduler.health_snapshot().active_credit_requests, 0);
     assert_eq!(scheduler.health_snapshot().free_blocks, 1);
     assert!(owners.lock().unwrap().is_empty());
 }
@@ -3591,7 +3444,7 @@ fn lifecycle_trace_and_health_snapshot() {
     // Health snapshot: idle, leak-free, alive (read before draining traces).
     let h = sched.health_snapshot();
     assert_eq!(h.running, 0);
-    assert_eq!(h.active_leases, 0);
+    assert_eq!(h.active_credit_requests, 0);
     assert_eq!(h.resource_invariant_violations, 0);
     assert!(!h.fatal);
     assert!(h.completed_traces >= 1);
@@ -3718,6 +3571,195 @@ fn slow_cpu_continuation_suspends_only_its_request_lineage() {
 }
 
 #[test]
+fn cpu_continuation_timeout_closes_only_its_request_lineage() {
+    use uniserve_scheduler::{LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration};
+
+    struct DelayedProcessor;
+
+    impl LogitsProcessor for DelayedProcessor {
+        fn name(&self) -> &'static str {
+            "delayed"
+        }
+
+        fn declaration(&self) -> ProcessorDeclaration {
+            ProcessorDeclaration {
+                snapshotable: true,
+                deterministic: true,
+                max_output_tokens: 1,
+                max_outstanding_tasks: 1,
+            }
+        }
+
+        fn is_argmax_invariant(&self) -> bool {
+            true
+        }
+
+        fn contribute(&self, context: &ProcCtx<'_>) -> MaskContribution {
+            if context.sampling.seed == Some(11) && context.n_generated == 0 {
+                thread::sleep(Duration::from_millis(200));
+            }
+            MaskContribution::default()
+        }
+    }
+
+    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
+    let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs)
+        .with_logits_processor(Box::new(DelayedProcessor))
+        .with_cpu_task_timeout(Duration::from_millis(25));
+    let mut slow_request = generation_request(
+        RequestId(11),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    slow_request.sampling.seed = Some(11);
+    let mut fast_request = generation_request(
+        RequestId(12),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    fast_request.sampling.seed = Some(12);
+    let mut slow_events = scheduler.submit_for_test(slow_request);
+    let mut fast_events = scheduler.submit_for_test(fast_request);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut slow_reason = None;
+    let mut fast_reason = None;
+    while Instant::now() < deadline && (slow_reason.is_none() || fast_reason.is_none()) {
+        scheduler.step();
+        while let Ok(event) = slow_events.try_recv() {
+            if let GenEvent::Finished { reason, .. } = event {
+                slow_reason = Some(reason);
+            }
+        }
+        while let Ok(event) = fast_events.try_recv() {
+            if let GenEvent::Finished { reason, .. } = event {
+                fast_reason = Some(reason);
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(slow_reason, Some(FinishReason::Error));
+    assert!(fast_reason.is_some_and(|reason| reason != FinishReason::Error));
+}
+
+#[test]
+fn cancellation_storm_reclaims_every_request_credit() {
+    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
+    let mut scheduler = Scheduler::new(executor, ctrl(), 32);
+    let receivers = (1..=128)
+        .map(|request_id| {
+            scheduler.submit_for_test(generation_request(
+                RequestId(request_id),
+                text_context(vec![1, 2, 3]),
+                SamplingParams::default(),
+                ImageParams::default(),
+                GenerationConstraint::UndOnly,
+                8,
+            ))
+        })
+        .collect::<Vec<_>>();
+    drop(receivers);
+
+    for _ in 0..10_000 {
+        scheduler.step();
+        let health = scheduler.health_snapshot();
+        if health.running == 0 && health.pending == 0 && health.in_flight == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_micros(50));
+    }
+
+    let health = scheduler.health_snapshot();
+    assert_eq!(health.running, 0);
+    assert_eq!(health.pending, 0);
+    assert_eq!(health.in_flight, 0);
+    assert_eq!(health.active_credit_requests, 0);
+    assert_eq!(health.resource_invariant_violations, 0);
+}
+
+#[test]
+fn cpu_failure_storm_is_request_local_and_reclaims_every_credit() {
+    use uniserve_scheduler::{LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration};
+
+    struct BoundViolatingProcessor;
+
+    impl LogitsProcessor for BoundViolatingProcessor {
+        fn name(&self) -> &'static str {
+            "bound_violating"
+        }
+
+        fn declaration(&self) -> ProcessorDeclaration {
+            ProcessorDeclaration {
+                snapshotable: true,
+                deterministic: true,
+                max_output_tokens: 1,
+                max_outstanding_tasks: 1,
+            }
+        }
+
+        fn is_argmax_invariant(&self) -> bool {
+            true
+        }
+
+        fn contribute(&self, _context: &ProcCtx<'_>) -> MaskContribution {
+            MaskContribution {
+                allowed: None,
+                suppress: vec![1, 2],
+            }
+        }
+    }
+
+    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
+    let mut scheduler = Scheduler::new(executor, ctrl(), 32)
+        .with_logits_processor(Box::new(BoundViolatingProcessor));
+    let mut receivers = (1..=128)
+        .map(|request_id| {
+            scheduler.submit_for_test(generation_request(
+                RequestId(request_id),
+                text_context(vec![1, 2, 3]),
+                SamplingParams::default(),
+                ImageParams::default(),
+                GenerationConstraint::UndOnly,
+                8,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut failed = HashSet::new();
+    while Instant::now() < deadline && failed.len() < receivers.len() {
+        scheduler.step();
+        for (index, receiver) in receivers.iter_mut().enumerate() {
+            while let Ok(event) = receiver.try_recv() {
+                if matches!(
+                    event,
+                    GenEvent::Finished {
+                        reason: FinishReason::Error,
+                        ..
+                    }
+                ) {
+                    failed.insert(index);
+                }
+            }
+        }
+        thread::sleep(Duration::from_micros(50));
+    }
+
+    assert_eq!(failed.len(), receivers.len());
+    let health = scheduler.health_snapshot();
+    assert_eq!(health.running, 0);
+    assert_eq!(health.pending, 0);
+    assert_eq!(health.in_flight, 0);
+    assert_eq!(health.active_credit_requests, 0);
+    assert_eq!(health.resource_invariant_violations, 0);
+}
+
+#[test]
 fn slow_client_releases_execution_credits_before_output_capacity_returns() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
@@ -3766,11 +3808,11 @@ fn slow_client_releases_execution_credits_before_output_capacity_returns() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline
         && (scheduler.health_snapshot().running > 0
-            || scheduler.health_snapshot().active_leases > 0)
+            || scheduler.health_snapshot().active_credit_requests > 0)
     {
         scheduler.step();
     }
     let health = scheduler.health_snapshot();
     assert_eq!(health.running, 0);
-    assert_eq!(health.active_leases, 0);
+    assert_eq!(health.active_credit_requests, 0);
 }

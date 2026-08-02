@@ -232,7 +232,7 @@
   },
   "plan_digest": "1421d36c6ca33037ed6bfce4e8d5381a6e441e3c8bb63a8fe3096b60ea9c36a1",
   "semantic_digest": "1e6bf630dd738aacf61f1efeed41b2f723a6e0edbecd2892f925b6b79a01763e",
-  "protocol_layout_digest": "53e87a8182c447b6bc0bd609c0eb14710a85ce7d713afb0ca522baba12c7dc63",
+  "protocol_layout_digest": "0d4d5700107ab65be2e722fd1a921a2477af8130c28109c944102676d98675cb",
   "route_capability_sample": {
     "supported_work": [
       "token_decode",
@@ -253,9 +253,53 @@
     "device_sequence_lengths": true,
     "device_append_offsets": true,
     "incremental_kv_publication": true,
+    "route_capabilities": [
+      {
+        "route": 0,
+        "supported_work": [
+          "token_decode",
+          "token_extend",
+          "gen_flow",
+          "encode_vision"
+        ],
+        "tensorized_mixed": true,
+        "sampling_ownership": "designated_rank",
+        "preemptible": false,
+        "credits": {
+          "per_request": [
+            2,
+            2,
+            2,
+            10,
+            64,
+            34,
+            1048576,
+            2097152,
+            1048576,
+            2,
+            1,
+            16777216
+          ],
+          "worker": [
+            16,
+            16,
+            16,
+            80,
+            256,
+            272,
+            16777216,
+            33554432,
+            16777216,
+            16,
+            16,
+            268435456
+          ]
+        }
+      }
+    ],
     "kv_dtype": "bfloat16",
     "model_dtype": "bfloat16",
     "attention_backend": "flashinfer"
   },
-  "route_capability_digest": "157aca3cda9b8a0e1cf04e1ed0627c93278ac2dca7712ed444ecab77789397d7"
+  "route_capability_digest": "f738e7e6304d9f8c98bd847b014c7e14495cf4ef0882bf28998e5a7395eb0368"
 }

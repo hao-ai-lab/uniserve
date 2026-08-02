@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from threading import RLock
 from typing import Protocol, TypeAlias, cast
 
@@ -17,6 +17,7 @@ from ..batch import (
     FixedPoint,
     ImageParams,
     Operation,
+    ProductRef,
     RequestKey,
     SamplingParams,
     VersionRef,
@@ -53,6 +54,8 @@ MAX_SESSION_HISTORY_POINTS = 262_144
 class ResolvedRuntimeState:
     logical_position: int
     rng_counter: int
+    latent_product: ProductRef | None
+    flow_step: int
     kv_reserved_len: int
     kv_initialized_len: int
     kv_visible_len: int
@@ -60,8 +63,13 @@ class ResolvedRuntimeState:
     kv_published_len: int
 
     def __post_init__(self) -> None:
-        if self.logical_position < 0 or self.rng_counter < 0:
+        if self.logical_position < 0 or self.rng_counter < 0 or self.flow_step < 0:
             raise invalid_descriptor("resolved runtime coordinates are negative")
+        if self.latent_product is not None and (
+            self.latent_product.kind.value != "latent"
+            or self.latent_product.storage_class.value != "latent_arena"
+        ):
+            raise invalid_descriptor("resolved runtime latent identity is invalid")
         if not isinstance(self.kv_visible_len, int):
             if not callable(getattr(self.kv_visible_len, "ready", None)) or not (
                 0
@@ -128,7 +136,7 @@ class RequestSession:
     resolved_operations: dict[int, VersionRef] = field(default_factory=dict)
     resolved_parents: dict[int, VersionRef] = field(default_factory=dict)
     terminal_cutoff: VersionRef | None = None
-    latent_handle: int | None = None
+    latent_product: ProductRef | None = None
     product_handles: set[int] = field(default_factory=set)
     prompt_logits_handle: int | None = None
     logical_position: int = 0
@@ -167,6 +175,17 @@ class RequestSession:
             point=FixedPoint(self.version, str(self.resolved_digest)),
         )
 
+    def install_runtime(self, runtime: ResolvedRuntimeState) -> None:
+        if (
+            runtime.latent_product is not None
+            and runtime.latent_product.request_key != self.request_key
+        ):
+            raise invalid_descriptor("resolved runtime latent belongs to another request")
+        self.logical_position = runtime.logical_position
+        self.rng_counter = runtime.rng_counter
+        self.latent_product = runtime.latent_product
+        self.flow_step = runtime.flow_step
+
     @staticmethod
     def point_key(version: VersionRef) -> tuple[int, int]:
         point = version.point
@@ -179,19 +198,6 @@ class RequestSession:
 
     def selected_for_operation(self, op_id: int) -> VersionRef | None:
         return self.resolved_operations.get(int(op_id))
-
-    def rollback_snapshot(self) -> RequestSession:
-        """Capture scalar transaction state without copying the lineage ledger.
-
-        A step appends at most its own selected versions. ``StepTxn`` journals
-        those exact dictionary writes, so the historical cutoff ledger remains
-        shared and rollback cost is independent of generated sequence length.
-        """
-
-        return replace(
-            self,
-            product_handles=set(self.product_handles),
-        )
 
 
 class SessionStore:
@@ -317,6 +323,8 @@ class SessionStore:
         session.resolved_runtime[root_key] = ResolvedRuntimeState(
             logical_position=session.logical_position,
             rng_counter=session.rng_counter,
+            latent_product=None,
+            flow_step=0,
             kv_reserved_len=prefix_len,
             kv_initialized_len=prefix_len,
             kv_visible_len=prefix_len,
@@ -381,8 +389,7 @@ class SessionStore:
                 session.version = int(point.point_index)
                 session.resolved_op_id = int(selected.producer_op_id)
                 session.resolved_digest = point.semantic_digest
-                session.logical_position = runtime.logical_position
-                session.rng_counter = runtime.rng_counter
+                session.install_runtime(runtime)
             return selected, runtime, latest
 
     def finalize_prefixes(
@@ -426,8 +433,7 @@ class SessionStore:
             session.version = int(point.point_index)
             session.resolved_op_id = int(op_id)
             session.resolved_digest = point.semantic_digest
-            session.logical_position = runtime.logical_position
-            session.rng_counter = runtime.rng_counter
+            session.install_runtime(runtime)
             return selected, runtime
 
     def _validate_control_identity(
@@ -517,8 +523,7 @@ class SessionStore:
         session.version = int(point.point_index)
         session.resolved_op_id = int(cutoff.producer_op_id)
         session.resolved_digest = point.semantic_digest
-        session.logical_position = runtime.logical_position
-        session.rng_counter = runtime.rng_counter
+        session.install_runtime(runtime)
         session.terminal_cutoff = cutoff
         session.applied_control_seq = int(control.control_seq)
         session.control_digests[identity] = digest
@@ -570,8 +575,7 @@ class SessionStore:
                 runtime = snapshot.runtime_for(committed)
                 if runtime is None:
                     raise invalid_descriptor("committed session runtime state is missing")
-                snapshot.logical_position = runtime.logical_position
-                snapshot.rng_counter = runtime.rng_counter
+                snapshot.install_runtime(runtime)
                 key = snapshot.point_key(committed)
                 snapshot.resolved_versions = {key: committed}
                 snapshot.resolved_runtime = {key: runtime}
@@ -659,7 +663,7 @@ class SessionStore:
 @dataclass(frozen=True, slots=True)
 class _SessionSnapshot:
     existed: bool
-    value: RequestSession | None
+    values: tuple[object, ...] | None
 
 
 class StepTxn:
@@ -684,8 +688,18 @@ class StepTxn:
         self.sessions = sessions
         self.step_id = int(step_id)
         self.operations = operations
-        self.request_ids = {value.request_key.session_id for value in operations}
-        self._locks = [sessions._lock(value) for value in sorted(self.request_ids)]
+        self.request_ids = frozenset(value.request_key.session_id for value in operations)
+        advancing_counts: dict[int, int] = {}
+        for operation in operations:
+            if operation.advances_state:
+                session_id = int(operation.request_key.session_id)
+                advancing_counts[session_id] = advancing_counts.get(session_id, 0) + 1
+        self._advancing_counts = advancing_counts
+        self._aligned_sessions: tuple[RequestSession, ...] | None = None
+        with sessions._index_lock:
+            self._locks = [
+                sessions._locks.setdefault(value, RLock()) for value in sorted(self.request_ids)
+            ]
         for lock in self._locks:
             lock.acquire()
         self._snapshots = {
@@ -714,6 +728,16 @@ class StepTxn:
                 return transaction
         raise RuntimeError("store is not part of this step transaction")
 
+    def aligned_sessions(self) -> tuple[RequestSession, ...]:
+        """Return sessions in the transaction's canonical operation order."""
+
+        self._require_open()
+        if self._aligned_sessions is None:
+            self._aligned_sessions = tuple(
+                self.sessions.get(operation.request_key.session_id) for operation in self.operations
+            )
+        return self._aligned_sessions
+
     def commit(
         self,
         committed: Mapping[int, VersionRef],
@@ -733,19 +757,17 @@ class StepTxn:
         """
 
         self._require_open()
-        for session_id in self.request_ids:
+        for session_id, advancing_count in self._advancing_counts.items():
             session = self.sessions.get(session_id)
-            additions = sum(
+            additions = advancing_count * (
                 len(tuple(resolved_prefixes.get(session_id, ())))
                 if resolved_prefixes is not None
                 else 1
-                for operation in self.operations
-                if operation.request_key.session_id == session_id and operation.advances_state
             )
             if len(session.resolved_versions) + additions > MAX_SESSION_HISTORY_POINTS:
                 raise invalid_descriptor("request session history capacity is exhausted")
-        for operation in self.operations:
-            session = self.sessions.get(operation.request_key.session_id)
+        operation_sessions = self.aligned_sessions()
+        for operation, session in zip(self.operations, operation_sessions, strict=True):
             parent = operation.parent
             # A fixed parent must equal the semantic commit cursor. A device
             # parent names the latest worker-resolved predecessor, which may be
@@ -762,8 +784,7 @@ class StepTxn:
         try:
             for _store, transaction in self._store_transactions:
                 transaction.prepare()
-            for operation in self.operations:
-                session = self.sessions.get(operation.request_key.session_id)
+            for operation, session in zip(self.operations, operation_sessions, strict=True):
                 parent = operation.parent
                 selected = committed[operation.request_key.session_id]
                 point = selected.point
@@ -857,8 +878,22 @@ class StepTxn:
             for session_id, session_snapshot in self._snapshots.items():
                 if not session_snapshot.existed:
                     self.sessions._sessions.pop(session_id, None)
-                elif session_snapshot.value is not None:
-                    self.sessions._sessions[session_id] = session_snapshot.value
+                elif session_snapshot.values is not None:
+                    session = self.sessions.get(session_id)
+                    (
+                        session.version,
+                        session.resolved_op_id,
+                        session.resolved_digest,
+                        session.latent_product,
+                        product_handles,
+                        session.prompt_logits_handle,
+                        session.logical_position,
+                        session.flow_step,
+                        session.rng_counter,
+                        session.last_op_id,
+                        session.last_step_id,
+                    ) = session_snapshot.values
+                    session.product_handles = cast(set[int], product_handles)
             for store, store_snapshot in reversed(self._store_snapshots):
                 store.restore_requests(self.request_ids, store_snapshot)
         finally:
@@ -868,7 +903,23 @@ class StepTxn:
         session = self.sessions.peek(session_id)
         return _SessionSnapshot(
             existed=session is not None,
-            value=None if session is None else session.rollback_snapshot(),
+            values=(
+                None
+                if session is None
+                else (
+                    session.version,
+                    session.resolved_op_id,
+                    session.resolved_digest,
+                    session.latent_product,
+                    set(session.product_handles),
+                    session.prompt_logits_handle,
+                    session.logical_position,
+                    session.flow_step,
+                    session.rng_counter,
+                    session.last_op_id,
+                    session.last_step_id,
+                )
+            ),
         )
 
     def _record_history_write(

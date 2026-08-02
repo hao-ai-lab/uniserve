@@ -17,6 +17,7 @@ class Mover:
         transfer_backend: str,
         mooncake_device: str,
         mooncake_protocol: str,
+        transfer_byte_capacity: int,
         cross_process: bool = False,
     ) -> None:
         backend = str(transfer_backend)
@@ -27,6 +28,9 @@ class Mover:
         self._backend = backend
         self._mooncake_device = str(mooncake_device)
         self._mooncake_protocol = str(mooncake_protocol)
+        self._transfer_byte_capacity = int(transfer_byte_capacity)
+        if self._transfer_byte_capacity < 1:
+            raise capability_mismatch("transfer byte capacity must be positive")
         self._transport: Transport | None = None
 
     @property
@@ -36,6 +40,7 @@ class Mover:
                 self._backend,
                 device_name=self._mooncake_device,
                 protocol=self._mooncake_protocol,
+                byte_capacity=self._transfer_byte_capacity,
             )
         return self._transport
 

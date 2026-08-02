@@ -8,7 +8,7 @@ use uniserve_core::RequestId;
 use uniserve_executor::{ControlAck, ControlOp, Executor};
 use uniserve_worker_wire::{
     Batch, CompletionRecord, CompletionReport, EngineCaps, FinishFlags, LogicalLengths, OpStatus,
-    Operation, Point, RegistrationAck, TimingCounters, TokenSpan, Work,
+    Operation, PartitionCompletion, Point, RegistrationAck, TimingCounters, TokenSpan, Work,
 };
 
 /// Configurable [`Executor`] double for unit and integration tests.
@@ -126,14 +126,20 @@ impl StubExecutor {
     }
 
     fn echo_result(batch: &Batch) -> CompletionReport {
-        let completions = batch.operations.iter().map(Self::echo_record).collect();
         CompletionReport {
             step_id: batch.step_id,
-            completions,
-            products: Vec::new(),
-            registration: RegistrationAck { visible: true },
-            worker_exec_us: Some(0),
-            forward_stats: None,
+            partitions: batch
+                .partitions
+                .iter()
+                .map(|partition| PartitionCompletion {
+                    partition_id: partition.partition_id,
+                    completions: partition.operations.iter().map(Self::echo_record).collect(),
+                    products: Vec::new(),
+                    registration: RegistrationAck { visible: true },
+                    worker_exec_us: Some(0),
+                    forward_stats: None,
+                })
+                .collect(),
         }
     }
 }
@@ -205,7 +211,8 @@ mod tests {
     use super::*;
     use uniserve_core::SamplingParams;
     use uniserve_worker_wire::{
-        Admission, Bounds, Domain, OpId, RequestKey, RouteId, TokenMode, UndAdmission, VersionRef,
+        Admission, AttentionRegime, BatchPartition, Bounds, Domain, ExecutionCapability, OpId,
+        RequestKey, RouteId, TokenMode, UndAdmission, VersionRef,
     };
 
     fn batch(step_id: u64, session_id: u64) -> Batch {
@@ -242,7 +249,21 @@ mod tests {
             None,
             0,
         );
-        Batch::new(step_id, vec![admission], vec![operation])
+        Batch::new(
+            step_id,
+            vec![admission],
+            vec![BatchPartition {
+                partition_id: 1,
+                submission_group: 1,
+                collective_seq: step_id.max(1),
+                domain: Domain::Und,
+                route: RouteId(0),
+                execution: ExecutionCapability::DomainHomogeneous,
+                attention: AttentionRegime::Causal,
+                shape_class: 0,
+                operations: vec![operation],
+            }],
+        )
     }
 
     #[test]
@@ -253,8 +274,9 @@ mod tests {
         assert_eq!(executor.pipeline_depth(), 4);
         let report = executor.poll().expect("poll").expect("echoed report");
         assert_eq!(report.step_id, 1);
-        assert_eq!(report.completions[0].request_key.session_id, RequestId(7));
-        assert_eq!(report.completions[0].committed_tokens, vec![7]);
+        let completion = report.completions().next().unwrap();
+        assert_eq!(completion.request_key.session_id, RequestId(7));
+        assert_eq!(completion.committed_tokens, vec![7]);
         assert!(executor.poll().expect("poll").is_none());
     }
 

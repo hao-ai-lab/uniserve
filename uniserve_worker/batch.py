@@ -24,6 +24,10 @@ from functools import lru_cache
 from typing import Any, TypeAlias, TypeVar, cast
 
 from .foundation.errors import invalid_descriptor
+from .foundation.product_transfer import (
+    is_transfer_descriptor,
+    validate_transfer_descriptor_frame,
+)
 
 
 class TokenMode(StrEnum):
@@ -66,6 +70,23 @@ class WorkVariant(StrEnum):
 class Domain(StrEnum):
     UND = "und"
     GEN = "gen"
+
+
+class ExecutionCapability(StrEnum):
+    DOMAIN_HOMOGENEOUS = "domain_homogeneous"
+    TENSORIZED_MIXED = "tensorized_mixed"
+
+
+class AttentionRegime(StrEnum):
+    NONE = "none"
+    CAUSAL = "causal"
+    BIDIRECTIONAL = "bidirectional"
+    HYBRID = "hybrid"
+
+
+class SamplingOwnership(StrEnum):
+    DESIGNATED_RANK = "designated_rank"
+    DETERMINISTIC_SHARDED = "deterministic_sharded"
 
 
 class ProductKind(StrEnum):
@@ -178,6 +199,7 @@ _DRAW_LAYOUT_INDEX = {member: index for index, member in enumerate(DrawLayout)}
 _DISPOSITION_INDEX = {member: index for index, member in enumerate(Disposition)}
 _CLOSE_REASON_INDEX = {member: index for index, member in enumerate(CloseReason)}
 _ADAPTER_MODE_INDEX = {member: index for index, member in enumerate(AdapterMode)}
+_SAMPLING_OWNERSHIP_INDEX = {member: index for index, member in enumerate(SamplingOwnership)}
 
 # The native worker transport attaches this process-local token only after the
 # decoded Rust Batch has passed its complete wire validation. Direct Python
@@ -259,7 +281,7 @@ class _Digest:
             encode(value)
 
 
-# Field-name lists of the four records, in declaration order, copied verbatim
+# Field-name lists of the protocol records, in declaration order, copied verbatim
 # from the Rust `protocol_layout_digest` source. They fix the byte layout of the
 # startup agreement digest and must not be reordered or extended here — the goal
 # is byte-identical cross-language agreement, not layout completeness.
@@ -307,6 +329,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "error_code",
         "timing_counters",
     ),
+    ("version", "digest", "locator"),
 )
 
 
@@ -360,6 +383,16 @@ def route_capability_digest(
     device_sequence_lengths: bool,
     device_append_offsets: bool,
     incremental_kv_publication: bool,
+    route_capabilities: Sequence[
+        tuple[
+            int,
+            Sequence[WorkVariant],
+            bool,
+            SamplingOwnership,
+            bool,
+            tuple[Sequence[int], Sequence[int]],
+        ]
+    ],
     kv_dtype: str,
     model_dtype: str,
     attention_backend: str,
@@ -387,6 +420,31 @@ def route_capability_digest(
     digest.boolean(device_sequence_lengths)
     digest.boolean(device_append_offsets)
     digest.boolean(incremental_kv_publication)
+    ordered_capabilities = sorted(route_capabilities, key=lambda capability: capability[0])
+    digest.u64(len(ordered_capabilities))
+    for (
+        route,
+        supported_route_work,
+        tensorized_mixed,
+        sampling_ownership,
+        preemptible,
+        credits,
+    ) in ordered_capabilities:
+        digest.u32(route)
+        variants = sorted(
+            {_WORK_VARIANT_MEMBERS.index(WorkVariant(variant)) for variant in supported_route_work}
+        )
+        digest.u64(len(variants))
+        for variant in variants:
+            digest.u8(variant)
+        digest.boolean(tensorized_mixed)
+        digest.u8(_SAMPLING_OWNERSHIP_INDEX[SamplingOwnership(sampling_ownership)])
+        digest.boolean(preemptible)
+        per_request, worker = credits
+        if len(per_request) != 12 or len(worker) != 12:
+            raise ValueError("route credit digest requires all twelve dimensions")
+        for value in (*per_request, *worker):
+            digest.u64(int(value))
     digest.string(kv_dtype)
     digest.string(model_dtype)
     digest.string(attention_backend)
@@ -822,7 +880,8 @@ class FixedPoint:
 
 @dataclass(frozen=True, slots=True)
 class DevicePoint:
-    selected_point: ProductRef
+    point_index: int
+    selected_point: ProductRef | None
     producer_plan_digest: str
 
 
@@ -856,8 +915,15 @@ class VersionRef:
         elif kind == "device":
             inner = _map(payload, f"{where}.point.value")
             point = DevicePoint(
-                selected_point=ProductRef.from_wire(
-                    inner.get("selected_point"), f"{where}.point.value.selected_point"
+                point_index=_uint(
+                    inner.get("point_index"), f"{where}.point.value.point_index"
+                ),
+                selected_point=(
+                    None
+                    if inner.get("selected_point") is None
+                    else ProductRef.from_wire(
+                        inner.get("selected_point"), f"{where}.point.value.selected_point"
+                    )
                 ),
                 producer_plan_digest=_str(
                     inner.get("producer_plan_digest"),
@@ -885,7 +951,12 @@ class VersionRef:
             point = {
                 "kind": "device",
                 "value": {
-                    "selected_point": self.point.selected_point.to_wire(),
+                    "point_index": self.point.point_index,
+                    "selected_point": (
+                        None
+                        if self.point.selected_point is None
+                        else self.point.selected_point.to_wire()
+                    ),
                     "producer_plan_digest": self.point.producer_plan_digest,
                 },
             }
@@ -894,6 +965,37 @@ class VersionRef:
             "producer_op_id": self.producer_op_id,
             "point": point,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRef:
+    version: VersionRef
+    digest: str
+    locator: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version.point, FixedPoint):
+            raise invalid_descriptor("snapshot reference version must be fixed")
+        if not _is_digest(self.version.point.semantic_digest):
+            raise invalid_descriptor("snapshot reference semantic digest is invalid")
+        if not _is_digest(self.digest) or self.locator != self.digest:
+            raise invalid_descriptor("snapshot reference artifact digest or locator is invalid")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "version": self.version.to_wire(),
+            "digest": self.digest,
+            "locator": self.locator,
+        }
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "snapshot") -> SnapshotRef:
+        data = _map(value, where)
+        return cls(
+            version=VersionRef.from_wire(data.get("version"), f"{where}.version"),
+            digest=_str(data.get("digest"), f"{where}.digest"),
+            locator=_str(data.get("locator"), f"{where}.locator"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1132,24 +1234,36 @@ class Operation:
             output_indices.add(product.output_index)
         if isinstance(self.parent.point, DevicePoint):
             selected = self.parent.point.selected_point
-            if (
-                selected.request_key != self.parent.request_key
-                or selected.producer_op_id != self.parent.producer_op_id
-            ):
-                raise invalid_descriptor(
-                    "device version selected point is not owned by its producer"
-                )
-            if selected.generation < 1:
-                raise invalid_descriptor("device version selected point has no logical generation")
-            if (
-                selected.kind is not ProductKind.SELECTED_POINT
-                or selected.storage_class is not StorageClass.DEVICE_TENSOR
-                or selected.dtype is not DType.U32
-                or selected.shape_bound.max_elements != 1
-            ):
-                raise invalid_descriptor(
-                    "device version does not name a scalar selected-point product"
-                )
+            if selected is None:
+                if self.parent.point.point_index < 1:
+                    raise invalid_descriptor(
+                        "a static device version must name a positive producer point"
+                    )
+            else:
+                if self.parent.point.point_index != 0:
+                    raise invalid_descriptor(
+                        "a dynamic device version also declares a fixed point"
+                    )
+                if (
+                    selected.request_key != self.parent.request_key
+                    or selected.producer_op_id != self.parent.producer_op_id
+                ):
+                    raise invalid_descriptor(
+                        "device version selected point is not owned by its producer"
+                    )
+                if selected.generation < 1:
+                    raise invalid_descriptor(
+                        "device version selected point has no logical generation"
+                    )
+                if (
+                    selected.kind is not ProductKind.SELECTED_POINT
+                    or selected.storage_class is not StorageClass.DEVICE_TENSOR
+                    or selected.dtype is not DType.U32
+                    or selected.shape_bound.max_elements != 1
+                ):
+                    raise invalid_descriptor(
+                        "device version does not name a scalar selected-point product"
+                    )
         if self.predicate is not None:
             continuation_token = (
                 self.predicate.kind is ProductKind.TOKEN
@@ -1783,21 +1897,140 @@ class Admission:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchPartition:
+    partition_id: int
+    submission_group: int
+    collective_seq: int
+    domain: Domain
+    route: int
+    execution: ExecutionCapability
+    attention: AttentionRegime
+    shape_class: int
+    operations: tuple[Operation, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            min(
+                self.partition_id,
+                self.submission_group,
+                self.collective_seq,
+            )
+            < 1
+        ):
+            raise invalid_descriptor("batch partition identity must be positive")
+        if self.route < 0 or self.shape_class < 0:
+            raise invalid_descriptor("batch partition route and shape class must be unsigned")
+        if not self.operations:
+            raise invalid_descriptor("batch partition must carry at least one operation")
+        if any(
+            operation.domain is not self.domain or operation.route != self.route
+            for operation in self.operations
+        ):
+            raise invalid_descriptor("batch partition operation disagrees with its domain or route")
+
+    @classmethod
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "batch partition",
+        *,
+        _validated_wire: bool = False,
+    ) -> BatchPartition:
+        data = _map(value, where)
+        return cls(
+            partition_id=_uint(data.get("partition_id"), f"{where}.partition_id"),
+            submission_group=_uint(data.get("submission_group"), f"{where}.submission_group"),
+            collective_seq=_uint(data.get("collective_seq"), f"{where}.collective_seq"),
+            domain=Domain(_str(data.get("domain"), f"{where}.domain")),
+            route=_uint(data.get("route"), f"{where}.route"),
+            execution=ExecutionCapability(_str(data.get("execution"), f"{where}.execution")),
+            attention=AttentionRegime(_str(data.get("attention"), f"{where}.attention")),
+            shape_class=_uint(data.get("shape_class"), f"{where}.shape_class"),
+            operations=tuple(
+                Operation.from_wire(
+                    item,
+                    f"{where}.operations[{index}]",
+                    _validated_wire=_validated_wire,
+                )
+                for index, item in enumerate(
+                    _seq(data.get("operations", ()), f"{where}.operations")
+                )
+            ),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "partition_id": self.partition_id,
+            "submission_group": self.submission_group,
+            "collective_seq": self.collective_seq,
+            "domain": self.domain.value,
+            "route": self.route,
+            "execution": self.execution.value,
+            "attention": self.attention.value,
+            "shape_class": self.shape_class,
+            "operations": [operation.to_wire() for operation in self.operations],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Batch:
     step_id: int
     admissions: tuple[Admission, ...] = ()
-    operations: tuple[Operation, ...] = ()
+    partitions: tuple[BatchPartition, ...] = ()
     controls: tuple[Control, ...] = ()
     input_products: tuple[ProductPayload, ...] = ()
 
     def __post_init__(self) -> None:
         self.validate()
 
+    @property
+    def operations(self) -> tuple[Operation, ...]:
+        return tuple(
+            operation for partition in self.partitions for operation in partition.operations
+        )
+
     def validate(self) -> None:
-        if not self.operations and not self.controls:
+        if not self.partitions and not self.controls:
             raise invalid_descriptor(
                 "a submission batch must carry at least one operation or control"
             )
+        partition_ids = [partition.partition_id for partition in self.partitions]
+        if len(set(partition_ids)) != len(partition_ids):
+            raise invalid_descriptor("a submission batch repeats a partition id")
+        groups: dict[int, list[BatchPartition]] = {}
+        for partition in self.partitions:
+            groups.setdefault(partition.submission_group, []).append(partition)
+        for partitions in groups.values():
+            execution = partitions[0].execution
+            collective_seq = partitions[0].collective_seq
+            attention = partitions[0].attention
+            shape_class = partitions[0].shape_class
+            if any(
+                partition.execution is not execution
+                or partition.collective_seq != collective_seq
+                or partition.attention is not attention
+                or partition.shape_class != shape_class
+                for partition in partitions
+            ):
+                raise invalid_descriptor(
+                    "physical submission partitions disagree on execution, attention, shape, or collective order"
+                )
+            if execution is ExecutionCapability.DOMAIN_HOMOGENEOUS:
+                if len(partitions) != 1:
+                    raise invalid_descriptor(
+                        "a domain-homogeneous submission group must contain one partition"
+                    )
+            else:
+                domains = {partition.domain for partition in partitions}
+                routes = {partition.route for partition in partitions}
+                if len(partitions) < 2 or len(domains) != len(partitions):
+                    raise invalid_descriptor(
+                        "a tensorized-mixed submission group must contain distinct domains"
+                    )
+                if len(routes) != 1:
+                    raise invalid_descriptor(
+                        "a tensorized-mixed submission group spans route capabilities"
+                    )
         request_keys = [operation.request_key for operation in self.operations]
         if len(set(request_keys)) != len(request_keys):
             raise invalid_descriptor(
@@ -1837,14 +2070,20 @@ class Batch:
                 raise invalid_descriptor(
                     "an input product payload is not declared by any operation"
                 )
-            if product.storage_class is not StorageClass.HOST_STAGING:
+            transferred = is_transfer_descriptor(payload.payload)
+            if product.storage_class is StorageClass.HOST_STAGING and transferred:
                 raise invalid_descriptor(
-                    "an input product payload does not name host-staging storage"
+                    "host-staging input cannot carry a cross-stage transfer descriptor"
                 )
+            if product.storage_class is not StorageClass.HOST_STAGING:
+                try:
+                    validate_transfer_descriptor_frame(payload.payload)
+                except ValueError as error:
+                    raise invalid_descriptor(str(error)) from error
             if product in supplied_inputs:
                 raise invalid_descriptor("a submission batch repeats an input product payload")
             supplied_inputs.add(product)
-            if product.kind is ProductKind.TOKEN:
+            if product.kind is ProductKind.TOKEN and not transferred:
                 if (
                     len(decode_token_product_bytes(payload.payload))
                     > product.shape_bound.max_elements
@@ -1852,7 +2091,7 @@ class Batch:
                     raise invalid_descriptor(
                         "token input product exceeds its registered element bound"
                     )
-            elif len(payload.payload) > product.max_bytes:
+            elif not transferred and len(payload.payload) > product.max_bytes:
                 raise invalid_descriptor("input product payload exceeds its registered byte bound")
         for product in declared_inputs:
             if (
@@ -1872,14 +2111,14 @@ class Batch:
                 _seq(data.get("admissions", ()), "execute batch.admissions")
             )
         )
-        operations = tuple(
-            Operation.from_wire(
+        partitions = tuple(
+            BatchPartition.from_wire(
                 item,
-                f"execute batch.operations[{index}]",
+                f"execute batch.partitions[{index}]",
                 _validated_wire=validated_wire,
             )
             for index, item in enumerate(
-                _seq(data.get("operations", ()), "execute batch.operations")
+                _seq(data.get("partitions", ()), "execute batch.partitions")
             )
         )
         controls = tuple(
@@ -1898,14 +2137,14 @@ class Batch:
             set_field = object.__setattr__
             set_field(batch, "step_id", step_id)
             set_field(batch, "admissions", admissions)
-            set_field(batch, "operations", operations)
+            set_field(batch, "partitions", partitions)
             set_field(batch, "controls", controls)
             set_field(batch, "input_products", input_products)
             return batch
         return cls(
             step_id=step_id,
             admissions=admissions,
-            operations=operations,
+            partitions=partitions,
             controls=controls,
             input_products=input_products,
         )
@@ -1914,7 +2153,7 @@ class Batch:
         return {
             "step_id": self.step_id,
             "admissions": [value.to_wire() for value in self.admissions],
-            "operations": [value.to_wire() for value in self.operations],
+            "partitions": [value.to_wire() for value in self.partitions],
             "controls": [control_to_wire(value) for value in self.controls],
             "input_products": [value.to_wire() for value in self.input_products],
         }
@@ -2074,18 +2313,116 @@ def decode_sampling_state_bytes(data: bytes) -> SamplingState:
 
 
 @dataclass(frozen=True, slots=True)
-class CompletionReport:
-    step_id: int
+class WorkerForwardStats:
+    mode_counts: Mapping[str, int] = field(default_factory=dict)
+    mode_tokens: Mapping[str, int] = field(default_factory=dict)
+    mode_us: Mapping[str, int] = field(default_factory=dict)
+    component_us: Mapping[str, int] = field(default_factory=dict)
+    attention_launches: int = 0
+    attention_us: int = 0
+    attention_backend_counts: Mapping[str, int] = field(default_factory=dict)
+    cuda_graph_captures: int = 0
+    cuda_graph_replays: int = 0
+    cuda_graph_misses: int = 0
+    cuda_graph_fallbacks: int = 0
+    cuda_graph_unpadded_tokens: int = 0
+    cuda_graph_padded_tokens: int = 0
+    cuda_graph_runtime_mode_counts: Mapping[str, int] = field(default_factory=dict)
+    text_decode_token_relay_hits: int = 0
+    text_decode_token_relay_misses: int = 0
+    text_decode_position_relay_hits: int = 0
+    text_decode_position_relay_misses: int = 0
+    flashinfer_decode_plan_calls: int = 0
+    flashinfer_decode_plan_reuses: int = 0
+    flashinfer_decode_plan_rows: int = 0
+    flashinfer_decode_plan_indices: int = 0
+    flashinfer_decode_graph_plan_calls: int = 0
+    flashinfer_decode_graph_plan_reuses: int = 0
+    spec_verify_rows: int = 0
+    spec_verify_draft_tokens: int = 0
+    spec_verify_accepted_tokens: int = 0
+    spec_verify_rejected_tokens: int = 0
+    spec_verify_committed_tokens: int = 0
+    spec_verify_path_counts: Mapping[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "worker forward stats") -> WorkerForwardStats:
+        data = _map(value, where)
+
+        def counter_map(name: str) -> dict[str, int]:
+            values = _map(data.get(name, {}), f"{where}.{name}")
+            return {
+                _str(key, f"{where}.{name}.key"): _uint(raw, f"{where}.{name}.{key}")
+                for key, raw in values.items()
+            }
+
+        map_fields = {
+            name: counter_map(name)
+            for name in (
+                "mode_counts",
+                "mode_tokens",
+                "mode_us",
+                "component_us",
+                "attention_backend_counts",
+                "cuda_graph_runtime_mode_counts",
+                "spec_verify_path_counts",
+            )
+        }
+        scalar_fields = {
+            name: _uint(data.get(name, 0), f"{where}.{name}")
+            for name in (
+                "attention_launches",
+                "attention_us",
+                "cuda_graph_captures",
+                "cuda_graph_replays",
+                "cuda_graph_misses",
+                "cuda_graph_fallbacks",
+                "cuda_graph_unpadded_tokens",
+                "cuda_graph_padded_tokens",
+                "text_decode_token_relay_hits",
+                "text_decode_token_relay_misses",
+                "text_decode_position_relay_hits",
+                "text_decode_position_relay_misses",
+                "flashinfer_decode_plan_calls",
+                "flashinfer_decode_plan_reuses",
+                "flashinfer_decode_plan_rows",
+                "flashinfer_decode_plan_indices",
+                "flashinfer_decode_graph_plan_calls",
+                "flashinfer_decode_graph_plan_reuses",
+                "spec_verify_rows",
+                "spec_verify_draft_tokens",
+                "spec_verify_accepted_tokens",
+                "spec_verify_rejected_tokens",
+                "spec_verify_committed_tokens",
+            )
+        }
+        return cls(**map_fields, **scalar_fields)
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            name: dict(value) if isinstance(value, Mapping) else value
+            for name, value in ((name, getattr(self, name)) for name in self.__dataclass_fields__)
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionCompletion:
+    partition_id: int
     completions: tuple[CompletionRecord, ...]
     products: tuple[ProductPayload, ...] = ()
     registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
+    forward_stats: WorkerForwardStats | None = None
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "completion report") -> CompletionReport:
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "partition completion",
+    ) -> PartitionCompletion:
         data = _map(value, where)
         return cls(
-            step_id=_uint(data.get("step_id"), f"{where}.step_id"),
+            partition_id=_uint(data.get("partition_id"), f"{where}.partition_id"),
             completions=tuple(
                 CompletionRecord.from_wire(item, f"{where}.completions[{index}]")
                 for index, item in enumerate(
@@ -2100,15 +2437,72 @@ class CompletionReport:
                 data.get("registration", {}), f"{where}.registration"
             ),
             worker_exec_us=_optional_uint(data.get("worker_exec_us"), f"{where}.worker_exec_us"),
+            forward_stats=(
+                None
+                if data.get("forward_stats") is None
+                else WorkerForwardStats.from_wire(data["forward_stats"], f"{where}.forward_stats")
+            ),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "partition_id": self.partition_id,
+            "completions": [value.to_wire() for value in self.completions],
+            "products": [value.to_wire() for value in self.products],
+            "registration": self.registration.to_wire(),
+            "worker_exec_us": self.worker_exec_us,
+            "forward_stats": None if self.forward_stats is None else self.forward_stats.to_wire(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionReport:
+    step_id: int
+    partitions: tuple[PartitionCompletion, ...]
+
+    @property
+    def completions(self) -> tuple[CompletionRecord, ...]:
+        return tuple(
+            completion for partition in self.partitions for completion in partition.completions
+        )
+
+    @property
+    def products(self) -> tuple[ProductPayload, ...]:
+        return tuple(product for partition in self.partitions for product in partition.products)
+
+    @property
+    def registration(self) -> RegistrationAck:
+        return RegistrationAck(
+            visible=bool(self.partitions)
+            and all(partition.registration.visible for partition in self.partitions)
+        )
+
+    @property
+    def worker_exec_us(self) -> int | None:
+        values = tuple(
+            partition.worker_exec_us
+            for partition in self.partitions
+            if partition.worker_exec_us is not None
+        )
+        return None if not values else max(values)
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "completion report") -> CompletionReport:
+        data = _map(value, where)
+        return cls(
+            step_id=_uint(data.get("step_id"), f"{where}.step_id"),
+            partitions=tuple(
+                PartitionCompletion.from_wire(item, f"{where}.partitions[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("partitions", ()), f"{where}.partitions")
+                )
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
         return {
             "step_id": self.step_id,
-            "completions": [value.to_wire() for value in self.completions],
-            "products": [value.to_wire() for value in self.products],
-            "registration": self.registration.to_wire(),
-            "worker_exec_us": self.worker_exec_us,
+            "partitions": [partition.to_wire() for partition in self.partitions],
         }
 
 
@@ -2163,7 +2557,9 @@ def _digest_version_ref(digest: _Digest, value: VersionRef) -> None:
         digest.buf += _PACK_QQQQB(
             key.authority_id, key.session_id, key.epoch, value.producer_op_id, 1
         )
-        _digest_product_ref(digest, point.selected_point)
+        digest.buf += _PACK_IB(point.point_index, int(point.selected_point is not None))
+        if point.selected_point is not None:
+            _digest_product_ref(digest, point.selected_point)
         digest.string(point.producer_plan_digest)
 
 
@@ -2564,11 +2960,19 @@ def _fast_version_ref(value: object) -> VersionRef | None:
             return None
         point = FixedPoint(point_index, semantic_digest)
     elif tag == "device":
-        selected_point = _fast_product_ref(payload.get("selected_point"))
+        point_index = payload.get("point_index")
+        raw_selected_point = payload.get("selected_point")
+        selected_point = (
+            None if raw_selected_point is None else _fast_product_ref(raw_selected_point)
+        )
         producer_plan_digest = payload.get("producer_plan_digest")
-        if selected_point is None or type(producer_plan_digest) is not str:
+        if (
+            not (type(point_index) is int and point_index >= 0)
+            or (raw_selected_point is not None and selected_point is None)
+            or type(producer_plan_digest) is not str
+        ):
             return None
-        point = DevicePoint(selected_point, producer_plan_digest)
+        point = DevicePoint(point_index, selected_point, producer_plan_digest)
     else:
         return None
     reference = object.__new__(VersionRef)

@@ -47,8 +47,12 @@ _QUERY_BUDGET = 16
 class TensorStager:
     """Bounded generation-safe staging storage for one execution pipeline."""
 
-    def __init__(self, *, capacity: int) -> None:
+    def __init__(self, *, capacity: int, byte_capacity: int) -> None:
         self.capacity = max(1, int(capacity))
+        self.byte_capacity = int(byte_capacity)
+        if self.byte_capacity < 1:
+            raise ValueError("staging byte capacity must be positive")
+        self._allocated_bytes = 0
         self._slots: list[dict[str, torch.Tensor]] = [{} for _ in range(self.capacity)]
         self._completion_events: list[dict[str, torch.cuda.Event]] = [
             {} for _ in range(self.capacity)
@@ -59,6 +63,28 @@ class TensorStager:
         self._available: deque[int] = deque()
         self._pending: deque[int] = deque()
         self._pin_memory_supported = True
+
+    @property
+    def allocated_bytes(self) -> int:
+        return self._allocated_bytes
+
+    def _install_buffer(
+        self,
+        slot: dict[str, torch.Tensor],
+        key: str,
+        buffer: torch.Tensor,
+    ) -> torch.Tensor:
+        existing = slot.get(key)
+        prior = 0 if existing is None else int(existing.numel()) * int(existing.element_size())
+        current = int(buffer.numel()) * int(buffer.element_size())
+        projected = self._allocated_bytes - prior + current
+        if projected > self.byte_capacity:
+            raise resource_error(
+                f"staging byte credit is exhausted ({projected}>{self.byte_capacity})"
+            )
+        slot[key] = buffer
+        self._allocated_bytes = projected
+        return buffer
 
     def acquire(self, device: torch.device | str) -> TensorStagingSlot:
         target = canonical_device(device)
@@ -138,7 +164,7 @@ class TensorStager:
             except RuntimeError:
                 self._pin_memory_supported = False
                 buffer = torch.empty(int(numel), dtype=dtype)
-            slot[key] = buffer
+            buffer = self._install_buffer(slot, key, buffer)
         return buffer[: int(numel)]
 
     def _device_buffer(
@@ -160,7 +186,7 @@ class TensorStager:
             or buffer.device != target
         ):
             buffer = torch.empty(int(numel), dtype=dtype, device=target)
-            slot[key] = buffer
+            buffer = self._install_buffer(slot, key, buffer)
         return buffer[: int(numel)]
 
 

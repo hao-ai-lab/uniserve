@@ -39,7 +39,7 @@ def test_consumer_submission_precedes_producer_host_observation() -> None:
     device = torch.device("cuda:0")
     producer = torch.cuda.Stream(device=device)
     consumer = torch.cuda.Stream(device=device)
-    table = DeviceProductTable(capacity=1)
+    table = DeviceProductTable(capacity=1, byte_capacity=1 << 20)
     reference = _reference(11, 5)
     table.bind_outputs(((reference, "ab" * 32, device),))
     source = torch.tensor([73], dtype=torch.long, device=device)
@@ -71,7 +71,7 @@ def test_slot_reuse_waits_for_every_recorded_reader_event() -> None:
     producer = torch.cuda.Stream(device=device)
     fast_consumer = torch.cuda.Stream(device=device)
     delayed_consumer = torch.cuda.Stream(device=device)
-    table = DeviceProductTable(capacity=1)
+    table = DeviceProductTable(capacity=1, byte_capacity=1 << 20)
     first = _reference(21, 8)
     table.bind_outputs(((first, "cd" * 32, device),))
 
@@ -108,7 +108,7 @@ def test_slot_reuse_waits_for_every_recorded_reader_event() -> None:
 def test_batched_producer_writes_registered_scalar_storage_directly() -> None:
     configured_device = torch.device("cuda")
     device = torch.device("cuda", torch.cuda.current_device())
-    table = DeviceProductTable(capacity=8)
+    table = DeviceProductTable(capacity=8, byte_capacity=1 << 20)
     references = tuple(_reference(31 + index, 11 + index) for index in range(4))
     writes = table.bind_outputs(
         tuple((reference, "ab" * 32, configured_device) for reference in references)
@@ -180,7 +180,7 @@ def test_batched_producer_writes_registered_scalar_storage_directly() -> None:
 
 def test_row_product_publication_uses_one_completion_event() -> None:
     device = torch.device("cuda:0")
-    table = DeviceProductTable(capacity=3)
+    table = DeviceProductTable(capacity=3, byte_capacity=1 << 20)
     references = tuple(_reference(71 + index, 31 + index, elements=4) for index in range(3))
     writes = table.bind_outputs(tuple((reference, "ab" * 32, device) for reference in references))
     values = torch.tensor(

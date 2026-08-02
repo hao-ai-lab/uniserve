@@ -17,17 +17,18 @@ from safetensors.torch import load_file, save_file
 
 from ..batch import (
     CompletionRecord,
-    CompletionReport,
     FixedPoint,
     ImageParams,
+    ProductRef,
     RequestKey,
     SamplingParams,
+    SnapshotRef,
     TokenMode,
     VersionRef,
 )
 from ..foundation.errors import invalid_descriptor
 from .adapter_store import AdapterSnapshot, AdapterStore
-from .kv_store import KvBranchState, KvCommittedState, KvPageState, KvStore
+from .kv_store import KvBranchState, KvCommittedState, KvPageState, KvSnapshot, KvStore
 from .latent_store import LatentRecord, LatentStore
 from .product_store import (
     EncodedImageProduct,
@@ -45,43 +46,8 @@ from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
 from .transfer import Locator, Transport, fetch_locator
 
-SNAPSHOT_FORMAT_VERSION = 4
+SNAPSHOT_FORMAT_VERSION = 8
 _ASSET_PREFIX = "asset:"
-
-
-@dataclass(frozen=True, slots=True)
-class SnapshotRef:
-    session_id: int
-    epoch: int
-    version: int
-    digest: str
-    locator: str
-
-    def __post_init__(self) -> None:
-        if min(self.session_id, self.epoch, self.version) < 0:
-            raise invalid_descriptor("snapshot reference identity must be non-negative")
-        if not _is_digest(self.digest) or self.locator != self.digest:
-            raise invalid_descriptor("snapshot reference digest or locator is invalid")
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "session_id": self.session_id,
-            "epoch": self.epoch,
-            "version": self.version,
-            "digest": self.digest,
-            "locator": self.locator,
-        }
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "snapshot") -> SnapshotRef:
-        data = _mapping(value, where)
-        return cls(
-            session_id=_uint(data.get("session_id"), f"{where}.session_id"),
-            epoch=_uint(data.get("epoch"), f"{where}.epoch"),
-            version=_uint(data.get("version"), f"{where}.version"),
-            digest=_string(data.get("digest"), f"{where}.digest"),
-            locator=_string(data.get("locator"), f"{where}.locator"),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,17 +102,6 @@ class SnapshotProvider:
         references, _ = self._snapshot_sessions(session_ids)
         return references
 
-    def snapshot_execution(
-        self,
-        session_ids: set[int],
-        report: CompletionReport,
-    ) -> CompletionReport:
-        requested = {int(value) for value in session_ids}
-        if {completion.request_key.session_id for completion in report.completions} != requested:
-            raise invalid_descriptor("completion report does not match its snapshot session set")
-        self._snapshot_sessions(requested)
-        return report
-
     def _snapshot_sessions(
         self,
         session_ids: set[int],
@@ -165,10 +120,17 @@ class SnapshotProvider:
                 ).kv_visible_len
                 for session in sessions
             }
+            committed_latents = {
+                session.latent_product for session in sessions if session.latent_product is not None
+            }
             manifest, tensors, locator_assets = self._encode(
                 sessions=sessions,
                 kv=self.kv.snapshot_committed(requested, committed_kv_lengths),
-                latents=self.latents.snapshot_records(requested),
+                latents=tuple(
+                    record
+                    for record in self.latents.snapshot_records(requested)
+                    if record.reference in committed_latents
+                ),
                 products=self.products.snapshot_records(requested),
                 replay=self.replay.snapshot_records(requested),
                 adapter=None if self.adapters is None else self.adapters.snapshot(),
@@ -176,9 +138,7 @@ class SnapshotProvider:
             digest = self._write_object(manifest, tensors)
             refs = tuple(
                 SnapshotRef(
-                    session_id=session.session_id,
-                    epoch=session.epoch,
-                    version=session.version,
+                    version=session.committed_version(),
                     digest=digest,
                     locator=digest,
                 )
@@ -187,14 +147,16 @@ class SnapshotProvider:
             catalog = self._read_catalog()
             entries = cast(dict[str, object], catalog["sessions"])
             for ref in refs:
-                entries[str(ref.session_id)] = ref.to_wire()
-                self._current_refs[ref.session_id] = ref
+                session_id = ref.version.request_key.session_id
+                entries[str(session_id)] = ref.to_wire()
+                self._current_refs[session_id] = ref
             catalog["adapter"] = self._adapter_catalog_entry(digest, manifest.get("adapter"))
             self._write_catalog(catalog)
             replacements = {
                 raw: self._durable_locator(raw, digest, key) for raw, key in locator_assets.items()
             }
             self.products.rewrite_locators(requested, replacements)
+            self.kv.rewrite_locators(requested, replacements)
             return refs, replacements
 
     def snapshot_global(self) -> None:
@@ -225,17 +187,18 @@ class SnapshotProvider:
 
     def restore(self, reference: SnapshotRef) -> None:
         with self._lock:
-            if self._current_refs.get(reference.session_id) == reference:
+            session_id = reference.version.request_key.session_id
+            if self._current_refs.get(session_id) == reference:
                 return
             manifest, tensors = self._load_object(reference.locator)
-            decoded = self._decode(manifest, tensors, {reference.session_id})
+            decoded = self._decode(manifest, tensors, {session_id})
             if len(decoded.sessions) != 1:
                 raise invalid_descriptor("snapshot reference does not select one session")
             session = decoded.sessions[0]
-            if (session.epoch, session.version) != (reference.epoch, reference.version):
+            if session.committed_version() != reference.version:
                 raise invalid_descriptor("snapshot reference version does not match its payload")
             self._restore(decoded)
-            self._current_refs[reference.session_id] = reference
+            self._current_refs[session_id] = reference
 
     def restore_latest(self) -> tuple[SnapshotRef, ...]:
         with self._lock:
@@ -247,7 +210,7 @@ class SnapshotProvider:
             )
             groups: dict[str, set[int]] = {}
             for ref in refs:
-                groups.setdefault(ref.locator, set()).add(ref.session_id)
+                groups.setdefault(ref.locator, set()).add(ref.version.request_key.session_id)
             decoded_groups: list[_DecodedSnapshot] = []
             try:
                 for locator, session_ids in groups.items():
@@ -272,14 +235,15 @@ class SnapshotProvider:
             if decoded.sessions or adapter is not None:
                 self._restore(decoded)
             actual = {
-                session.session_id: (session.epoch, session.version) for session in decoded.sessions
+                session.session_id: session.committed_version() for session in decoded.sessions
             }
             for ref in refs:
-                if actual.get(ref.session_id) != (ref.epoch, ref.version):
+                session_id = ref.version.request_key.session_id
+                if actual.get(session_id) != ref.version:
                     raise invalid_descriptor(
-                        f"catalog snapshot identity conflicts for session {ref.session_id}"
+                        f"catalog snapshot identity conflicts for session {session_id}"
                     )
-            self._current_refs = {ref.session_id: ref for ref in refs}
+            self._current_refs = {ref.version.request_key.session_id: ref for ref in refs}
             return refs
 
     def _encode(
@@ -329,7 +293,7 @@ class SnapshotProvider:
         manifest.update(
             {
                 "sessions": [self._session_to_json(value) for value in sessions],
-                "kv": [self._kv_to_json(value, tensor) for value in kv],
+                "kv": [self._kv_to_json(value, tensor, locator) for value in kv],
                 "latents": [
                     self._latent_to_json(value, index, tensor)
                     for index, value in enumerate(latents)
@@ -346,6 +310,7 @@ class SnapshotProvider:
                         "digest": value.digest,
                         "step_id": value.step_id,
                         "result": value.result.to_wire(),
+                        "registration_visible": value.registration_visible,
                     }
                     for value in replay
                 ],
@@ -374,8 +339,8 @@ class SnapshotProvider:
         )
         if {session.session_id for session in sessions} != selected:
             raise invalid_descriptor("snapshot does not contain every selected session")
-        kv = tuple(
-            self._kv_from_json(value, tensors)
+        raw_kv = tuple(
+            value
             for value in _sequence(manifest.get("kv"), "snapshot.kv")
             if _uint(
                 _mapping(value, "snapshot.kv[]").get("session_id"),
@@ -410,9 +375,12 @@ class SnapshotProvider:
             )
             in selected
         )
-        required_assets = {key for value in raw_products for key in _asset_references(value)}
+        required_assets = {
+            key for value in (*raw_kv, *raw_products) for key in _asset_references(value)
+        }
         assets, published_assets = self._restore_assets(manifest, tensors, required_assets)
         try:
+            kv = tuple(self._kv_from_json(value, tensors, assets) for value in raw_kv)
             products = tuple(
                 self._product_from_json(value, tensors, assets) for value in raw_products
             )
@@ -457,6 +425,29 @@ class SnapshotProvider:
             self.kv.restore_committed(decoded.kv, session_ids)
             self.latents.restore_records(session_ids, decoded.latents)
             self.products.restore_records(session_ids, decoded.products)
+            restored_latents = self.products.device_products.restore_published(
+                tuple(
+                    (
+                        record.reference,
+                        record.producer_plan_digest,
+                        record.value,
+                        self.device,
+                    )
+                    for record in decoded.latents
+                )
+            )
+            if restored_latents:
+                self.latents.restore_records(
+                    session_ids,
+                    tuple(
+                        replace(record, value=value)
+                        for record, value in zip(
+                            decoded.latents,
+                            restored_latents,
+                            strict=True,
+                        )
+                    ),
+                )
             self.sessions.restore_sessions(decoded.sessions, session_ids)
             self.replay.restore_records(session_ids, decoded.replay)
             if self.adapters is not None:
@@ -465,10 +456,34 @@ class SnapshotProvider:
                 self.adapters.restore(decoded.adapter)
             elif decoded.adapter is not None:
                 raise invalid_descriptor("model-free worker received adapter snapshot state")
+            self.kv.retain_restored_publications(decoded.kv, self.transport)
         except BaseException:
             self.kv.restore_committed(prior_kv, session_ids)
             self.latents.restore_records(session_ids, prior_latents)
             self.products.restore_records(session_ids, prior_products)
+            restored_latents = self.products.device_products.restore_published(
+                tuple(
+                    (
+                        record.reference,
+                        record.producer_plan_digest,
+                        record.value,
+                        self.device,
+                    )
+                    for record in prior_latents
+                )
+            )
+            if restored_latents:
+                self.latents.restore_records(
+                    session_ids,
+                    tuple(
+                        replace(record, value=value)
+                        for record, value in zip(
+                            prior_latents,
+                            restored_latents,
+                            strict=True,
+                        )
+                    ),
+                )
             self.sessions.restore_sessions(prior_sessions, session_ids)
             self.replay.restore_records(session_ids, prior_replay)
             if self.adapters is not None and prior_adapter is not None:
@@ -484,10 +499,10 @@ class SnapshotProvider:
         if {state.session_id for state in decoded.kv} != selected:
             raise invalid_descriptor("snapshot KV state does not align with sessions")
         kv_by_session = {state.session_id: state for state in decoded.kv}
-        latent_by_handle = {record.handle: record for record in decoded.latents}
+        latent_by_reference = {record.reference: record for record in decoded.latents}
         product_by_handle = {record.handle: record for record in decoded.products}
-        if len(latent_by_handle) != len(decoded.latents):
-            raise invalid_descriptor("snapshot repeats a latent handle")
+        if len(latent_by_reference) != len(decoded.latents):
+            raise invalid_descriptor("snapshot repeats a latent product reference")
         if len(product_by_handle) != len(decoded.products):
             raise invalid_descriptor("snapshot repeats a product handle")
         adapter_id = None if decoded.adapter is None else decoded.adapter.adapter_id
@@ -501,11 +516,11 @@ class SnapshotProvider:
                 raise invalid_descriptor(
                     f"session {session.session_id} adapter identity is not restorable"
                 )
-            if session.latent_handle is not None:
-                latent = latent_by_handle.get(session.latent_handle)
-                if latent is None or latent.session_id != session.session_id:
+            if session.latent_product is not None:
+                latent = latent_by_reference.get(session.latent_product)
+                if latent is None or latent.reference.request_key.session_id != session.session_id:
                     raise invalid_descriptor(
-                        f"session {session.session_id} latent handle is not restorable"
+                        f"session {session.session_id} latent product is not restorable"
                     )
             required_products = set(session.product_handles)
             if session.prompt_logits_handle is not None:
@@ -665,6 +680,10 @@ class SnapshotProvider:
             "resolved_runtime": {
                 "logical_position": runtime.logical_position,
                 "rng_counter": runtime.rng_counter,
+                "latent_product": (
+                    None if runtime.latent_product is None else runtime.latent_product.to_wire()
+                ),
+                "flow_step": runtime.flow_step,
                 "kv_reserved_len": runtime.kv_reserved_len,
                 "kv_initialized_len": runtime.kv_initialized_len,
                 "kv_visible_len": runtime.kv_visible_len,
@@ -703,7 +722,9 @@ class SnapshotProvider:
                     ).semantic_digest,
                 }
             ),
-            "latent_handle": session.latent_handle,
+            "latent_product": (
+                None if session.latent_product is None else session.latent_product.to_wire()
+            ),
             "product_handles": sorted(session.product_handles),
             "prompt_logits_handle": session.prompt_logits_handle,
             "logical_position": session.logical_position,
@@ -775,6 +796,18 @@ class SnapshotProvider:
                 runtime_data.get("rng_counter"),
                 "snapshot session.resolved_runtime.rng_counter",
             ),
+            latent_product=(
+                None
+                if runtime_data.get("latent_product") is None
+                else ProductRef.from_wire(
+                    runtime_data["latent_product"],
+                    "snapshot session.resolved_runtime.latent_product",
+                )
+            ),
+            flow_step=_uint(
+                runtime_data.get("flow_step"),
+                "snapshot session.resolved_runtime.flow_step",
+            ),
             kv_reserved_len=_uint(
                 runtime_data.get("kv_reserved_len"),
                 "snapshot session.resolved_runtime.kv_reserved_len",
@@ -836,8 +869,10 @@ class SnapshotProvider:
             ),
             control_digests=control_digests,
             terminal_cutoff=terminal_cutoff,
-            latent_handle=_optional_uint(
-                data.get("latent_handle"), "snapshot session.latent_handle"
+            latent_product=(
+                None
+                if data.get("latent_product") is None
+                else ProductRef.from_wire(data["latent_product"], "snapshot session.latent_product")
             ),
             product_handles=set(
                 _uint_tuple(data.get("product_handles"), "snapshot session.product_handles")
@@ -875,6 +910,7 @@ class SnapshotProvider:
     def _kv_to_json(
         state: KvCommittedState,
         tensor: Any,
+        locator: Any,
     ) -> dict[str, object]:
         return {
             "session_id": state.session_id,
@@ -894,7 +930,7 @@ class SnapshotProvider:
             "pages": _pages_to_json(state.pages, f"kv.{state.session_id}.pages", tensor),
             "branches": [
                 {
-                    "generation": branch.generation,
+                    "owner": branch.owner.to_wire(),
                     "branch": branch.branch,
                     "length": branch.length,
                     "block_count": branch.block_count,
@@ -906,17 +942,58 @@ class SnapshotProvider:
                 }
                 for index, branch in enumerate(state.branches)
             ],
+            "publications": [
+                {
+                    "product": product.to_wire(),
+                    "publication": {
+                        **publication.to_wire(),
+                        "locators": [
+                            locator(
+                                raw,
+                                f"kv.{state.session_id}.publications.{index}.{locator_index}",
+                            )
+                            for locator_index, raw in enumerate(publication.locators)
+                        ],
+                    },
+                }
+                for index, (product, publication) in enumerate(state.publications)
+            ],
+            "destination_bases": [
+                {
+                    "destination": destination,
+                    "version": version.to_wire(),
+                    "extent": extent,
+                    "block_ids": list(block_ids),
+                    "group_id": group_id,
+                    "scale_identity": scale_identity,
+                }
+                for destination, version, extent, block_ids, group_id, scale_identity in (
+                    state.destination_bases
+                )
+            ],
+            "installed_bases": [
+                {
+                    "destination": destination,
+                    "version": version.to_wire(),
+                    "extent": extent,
+                }
+                for destination, version, extent in state.installed_bases
+            ],
         }
 
     @staticmethod
     def _kv_from_json(
         value: object,
         tensors: Mapping[str, torch.Tensor],
+        assets: Mapping[str, str],
     ) -> KvCommittedState:
         data = _mapping(value, "snapshot KV")
         branches = tuple(
             KvBranchState(
-                generation=_uint(branch.get("generation"), "snapshot KV branch.generation"),
+                owner=ProductRef.from_wire(
+                    branch.get("owner"),
+                    "snapshot KV branch.owner",
+                ),
                 branch=_string(branch.get("branch"), "snapshot KV branch.branch"),
                 length=_uint(branch.get("length"), "snapshot KV branch.length"),
                 block_count=_uint(branch.get("block_count"), "snapshot KV branch.block_count"),
@@ -941,6 +1018,64 @@ class SnapshotProvider:
             )
             for item in (_mapping(raw, "snapshot KV publication"),)
         )
+        publications: list[tuple[ProductRef, KvSnapshot]] = []
+        for raw in _sequence(data.get("publications"), "snapshot KV.publications"):
+            item = _mapping(raw, "snapshot KV publication identity")
+            publication = dict(
+                _mapping(item.get("publication"), "snapshot KV publication descriptor")
+            )
+            publication["locators"] = [
+                _resolve_asset(
+                    _string(locator, "snapshot KV publication.locators[]"),
+                    assets,
+                )
+                for locator in _sequence(
+                    publication.get("locators"),
+                    "snapshot KV publication.locators",
+                )
+            ]
+            publications.append(
+                (
+                    ProductRef.from_wire(
+                        item.get("product"),
+                        "snapshot KV publication.product",
+                    ),
+                    KvSnapshot.from_wire(publication),
+                )
+            )
+        destination_bases = tuple(
+            (
+                _string(item.get("destination"), "snapshot KV destination base.destination"),
+                VersionRef.from_wire(
+                    item.get("version"),
+                    "snapshot KV destination base.version",
+                ),
+                _uint(item.get("extent"), "snapshot KV destination base.extent"),
+                _uint_tuple(
+                    item.get("block_ids"),
+                    "snapshot KV destination base.block_ids",
+                ),
+                _uint(item.get("group_id"), "snapshot KV destination base.group_id"),
+                _string(
+                    item.get("scale_identity"),
+                    "snapshot KV destination base.scale_identity",
+                ),
+            )
+            for raw in _sequence(data.get("destination_bases"), "snapshot KV.destination_bases")
+            for item in (_mapping(raw, "snapshot KV destination base"),)
+        )
+        installed_bases = tuple(
+            (
+                _string(item.get("destination"), "snapshot KV installed base.destination"),
+                VersionRef.from_wire(
+                    item.get("version"),
+                    "snapshot KV installed base.version",
+                ),
+                _uint(item.get("extent"), "snapshot KV installed base.extent"),
+            )
+            for raw in _sequence(data.get("installed_bases"), "snapshot KV.installed_bases")
+            for item in (_mapping(raw, "snapshot KV installed base"),)
+        )
         return KvCommittedState(
             session_id=_uint(data.get("session_id"), "snapshot KV.session_id"),
             block_ids=_uint_tuple(data.get("block_ids"), "snapshot KV.block_ids"),
@@ -958,6 +1093,9 @@ class SnapshotProvider:
             scale_identity=_string(data.get("scale_identity"), "snapshot KV.scale_identity"),
             pages=_pages_from_json(data.get("pages"), tensors, "snapshot KV.pages"),
             branches=branches,
+            publications=tuple(publications),
+            destination_bases=destination_bases,
+            installed_bases=installed_bases,
         )
 
     @staticmethod
@@ -967,8 +1105,9 @@ class SnapshotProvider:
         tensor: Any,
     ) -> dict[str, object]:
         return {
-            "handle": record.handle,
-            "session_id": record.session_id,
+            "reference": record.reference.to_wire(),
+            "producer_plan_digest": record.producer_plan_digest,
+            "session_id": record.reference.request_key.session_id,
             "value": tensor(f"latents.{index}.value", record.value),
             "step": record.step,
             "height": record.height,
@@ -981,9 +1120,17 @@ class SnapshotProvider:
         tensors: Mapping[str, torch.Tensor],
     ) -> LatentRecord:
         data = _mapping(value, "snapshot latent")
+        reference = ProductRef.from_wire(data.get("reference"), "snapshot latent.reference")
+        if reference.request_key.session_id != _uint(
+            data.get("session_id"), "snapshot latent.session_id"
+        ):
+            raise invalid_descriptor("snapshot latent session identity conflicts")
         return LatentRecord(
-            handle=_uint(data.get("handle"), "snapshot latent.handle"),
-            session_id=_uint(data.get("session_id"), "snapshot latent.session_id"),
+            reference=reference,
+            producer_plan_digest=_digest(
+                data.get("producer_plan_digest"),
+                "snapshot latent.producer_plan_digest",
+            ),
             value=_tensor(tensors, data.get("value"), "snapshot latent.value").to(self.device),
             step=_uint(data.get("step"), "snapshot latent.step"),
             height=_uint(data.get("height"), "snapshot latent.height"),
@@ -1030,6 +1177,10 @@ class SnapshotProvider:
             digest=_digest(data.get("digest"), "snapshot replay.digest"),
             step_id=_uint(data.get("step_id"), "snapshot replay.step_id"),
             result=CompletionRecord.from_wire(data.get("result"), "snapshot replay.result"),
+            registration_visible=_bool(
+                data.get("registration_visible"),
+                "snapshot replay.registration_visible",
+            ),
         )
 
     @staticmethod
@@ -1218,7 +1369,6 @@ def _product_payload_to_json(
         return {
             "kind": "vision_feature",
             "features": tensor(f"{prefix}.features", payload.features),
-            "grid": (None if payload.grid is None else tensor(f"{prefix}.grid", payload.grid)),
             "height": payload.height,
             "width": payload.width,
             "source_base64": payload.source_base64,
@@ -1267,11 +1417,6 @@ def _product_payload_from_json(
         return VisionFeatureProduct(
             features=_tensor(tensors, data.get("features"), "snapshot product payload.features").to(
                 device
-            ),
-            grid=(
-                None
-                if data.get("grid") is None
-                else _tensor(tensors, data["grid"], "snapshot product payload.grid").to(device)
             ),
             height=_uint(data.get("height"), "snapshot product payload.height"),
             width=_uint(data.get("width"), "snapshot product payload.width"),
@@ -1433,6 +1578,12 @@ def _optional_uint(value: object, where: str) -> int | None:
     return None if value is None else _uint(value, where)
 
 
+def _bool(value: object, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise invalid_descriptor(f"{where} must be a boolean")
+    return value
+
+
 def _uint_tuple(value: object, where: str) -> tuple[int, ...]:
     return tuple(
         _uint(item, f"{where}[{index}]") for index, item in enumerate(_sequence(value, where))
@@ -1483,4 +1634,4 @@ def _fsync_dir(path: Path) -> None:
         os.close(descriptor)
 
 
-__all__ = ["SNAPSHOT_FORMAT_VERSION", "SnapshotProvider", "SnapshotRef"]
+__all__ = ["SNAPSHOT_FORMAT_VERSION", "SnapshotProvider"]

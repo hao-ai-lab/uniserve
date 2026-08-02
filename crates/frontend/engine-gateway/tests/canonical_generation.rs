@@ -97,7 +97,8 @@ async fn canonical_submission_preserves_request_and_transport_metadata() {
         events.next().await,
         Some(GenEvent::TextToken {
             id: 31,
-            logprob: None
+            logprob: None,
+            public_commit: None,
         })
     ));
     assert!(matches!(

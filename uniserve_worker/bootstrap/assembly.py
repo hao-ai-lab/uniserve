@@ -162,9 +162,8 @@ def run_worker(config: WorkerLaunchConfig) -> None:
         },
     )
     worker = assemble_worker(config)
-    # Pay first-use attention-kernel JIT before the worker becomes reachable, so
-    # the first served request is warm rather than absorbing tens of seconds of
-    # CUTLASS compilation.
+    # Admission begins only after the configured first-use kernel work succeeds
+    # and the worker opens a clean serving collective epoch.
     worker.warmup()
     WorkerServer(worker, endpoint).serve()
 

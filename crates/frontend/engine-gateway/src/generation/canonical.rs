@@ -13,7 +13,8 @@ pub use uniserve_core::{
 use uniserve_core::{GenerationRequest, now_unix_secs};
 pub use uniserve_engine_api::{
     FinishReason as GenerationFinishReason, GenEvent,
-    PositionLogprobs as GenerationPositionLogprobs, TokenLogprob as GenerationTokenLogprob,
+    PositionLogprobs as GenerationPositionLogprobs, PublicCommit, PublicModality, SemanticRoot,
+    TokenLogprob as GenerationTokenLogprob,
 };
 
 /// Transport metadata wrapped around one pure canonical generation request.
@@ -249,9 +250,13 @@ mod tests {
     async fn canonical_stream_cancels_at_its_consumed_text_token_prefix() {
         let (tx, rx) = generation_event_channel();
         for id in 1..=3 {
-            tx.send(GenEvent::TextToken { id, logprob: None })
-                .await
-                .unwrap();
+            tx.send(GenEvent::TextToken {
+                id,
+                logprob: None,
+                public_commit: None,
+            })
+            .await
+            .unwrap();
         }
         let cancellation = Arc::new(Mutex::new(None));
         let recorded = Arc::clone(&cancellation);

@@ -13,6 +13,7 @@ from uniserve_worker.batch import (
     ShapeBound,
     StorageClass,
 )
+from uniserve_worker.runtime.product_capacity import device_product_scalar_arena_bytes
 from uniserve_worker.runtime.product_store import (
     DeviceProductTable,
     ProductRecord,
@@ -23,13 +24,27 @@ from uniserve_worker.runtime.product_store import (
 pytestmark = pytest.mark.unit
 
 
+def test_device_product_byte_contract_covers_every_scalar_storage_arena() -> None:
+    capacity = 7
+    table = DeviceProductTable(
+        capacity=capacity,
+        byte_capacity=device_product_scalar_arena_bytes(capacity, 1),
+    )
+
+    for index, dtype in enumerate(DType, start=1):
+        reference = _device_ref(op_id=index, generation=index, dtype=dtype)
+        (write,) = table.bind_outputs(((reference, f"{index:064x}", "cpu"),))
+        table.abandon_writes((write,))
+
+    assert table.allocated_bytes == device_product_scalar_arena_bytes(capacity, 1)
+
+
 def _vision_record(handle: int, session_id: int) -> ProductRecord:
     return ProductRecord(
         handle=handle,
         session_id=session_id,
         payload=VisionFeatureProduct(
             features=torch.full((2, 3), float(handle)),
-            grid=torch.tensor([[1, 2]], dtype=torch.long),
             height=16,
             width=32,
             source_base64=f"image-{handle}",
@@ -68,7 +83,11 @@ def _device_ref(
 
 
 def test_encoder_product_lifetime_is_owned_by_explicit_handle_release() -> None:
-    store = ProductStore(encoder_cache_budget=1, device_product_capacity=1)
+    store = ProductStore(
+        encoder_cache_budget=1,
+        device_product_capacity=1,
+        device_product_byte_capacity=1 << 20,
+    )
     reference = ProductRef(
         request_key=RequestKey(1, 1, 3),
         producer_op_id=11,
@@ -91,7 +110,6 @@ def test_encoder_product_lifetime_is_owned_by_explicit_handle_release() -> None:
         session_id=cached.session_id,
         payload=VisionFeatureProduct(
             features=resident,
-            grid=cached.payload.grid,
             height=cached.payload.height,
             width=cached.payload.width,
             source_base64=cached.payload.source_base64,
@@ -136,7 +154,7 @@ def test_encoder_product_lifetime_is_owned_by_explicit_handle_release() -> None:
 
 
 def test_device_product_access_validates_logical_and_physical_generations() -> None:
-    table = DeviceProductTable(capacity=1)
+    table = DeviceProductTable(capacity=1, byte_capacity=1 << 20)
     reference = _device_ref(op_id=11, generation=5)
     table.bind_outputs(((reference, "ab" * 32, "cpu"),))
     published = table.publish(reference, torch.tensor([41], dtype=torch.long))
@@ -168,7 +186,7 @@ def test_device_product_access_validates_logical_and_physical_generations() -> N
 
 
 def test_device_product_slot_reuse_advances_the_physical_generation() -> None:
-    table = DeviceProductTable(capacity=1)
+    table = DeviceProductTable(capacity=1, byte_capacity=1 << 20)
     first = _device_ref(op_id=21, generation=8)
     (first_write,) = table.bind_outputs(((first, "cd" * 32, "cpu"),))
     table.publish(first, torch.tensor([7], dtype=torch.long))
@@ -188,7 +206,7 @@ def test_device_product_slot_reuse_advances_the_physical_generation() -> None:
 def test_device_product_registration_failure_preserves_atomic_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    table = DeviceProductTable(capacity=2)
+    table = DeviceProductTable(capacity=2, byte_capacity=1 << 20)
     first = _device_ref(op_id=31, generation=10)
     second = _device_ref(op_id=32, generation=11, dtype=DType.U8)
     allocate = torch.empty
@@ -224,8 +242,33 @@ def test_device_product_registration_failure_preserves_atomic_capacity(
     assert table.consume(second, consumer_op_id=42).tensor.tolist() == [1]
 
 
+def test_device_product_byte_exhaustion_preserves_capacity_and_reclaims_slots() -> None:
+    table = DeviceProductTable(capacity=2, byte_capacity=16)
+    oversized = _device_ref(op_id=41, generation=12, elements=3)
+
+    with pytest.raises(Exception, match="device-product byte credit is exhausted"):
+        table.bind_outputs(((oversized, "ab" * 32, "cpu"),))
+
+    assert table.allocated_bytes == 0
+
+    first = _device_ref(op_id=42, generation=13)
+    second = _device_ref(op_id=43, generation=14)
+    writes = table.bind_outputs(
+        (
+            (first, "cd" * 32, "cpu"),
+            (second, "ef" * 32, "cpu"),
+        )
+    )
+    table.publish_batch((first, second), torch.tensor([19, 23], dtype=torch.long))
+
+    assert table.allocated_bytes == 16
+    assert {write.slot.index for write in writes} == {0, 1}
+    assert table.consume(first, consumer_op_id=51).tensor.tolist() == [19]
+    assert table.consume(second, consumer_op_id=52).tensor.tolist() == [23]
+
+
 def test_compatible_product_batch_binds_one_contiguous_producer_range() -> None:
-    table = DeviceProductTable(capacity=6)
+    table = DeviceProductTable(capacity=6, byte_capacity=1 << 20)
     retained = tuple(_device_ref(op_id=51 + index, generation=20 + index) for index in range(4))
     table.bind_outputs(tuple((reference, "ab" * 32, "cpu") for reference in retained))
     table.publish_batch(retained, torch.tensor([1, 2, 3, 4], dtype=torch.long))
@@ -245,7 +288,7 @@ def test_compatible_product_batch_binds_one_contiguous_producer_range() -> None:
 
 
 def test_scalar_output_groups_retain_independent_direct_producer_ranges() -> None:
-    table = DeviceProductTable(capacity=6)
+    table = DeviceProductTable(capacity=6, byte_capacity=1 << 20)
     finish = tuple(
         _device_ref(
             op_id=71 + index,
@@ -283,7 +326,7 @@ def test_scalar_output_groups_retain_independent_direct_producer_ranges() -> Non
 
 
 def test_row_output_batch_publishes_each_registered_tensor_shape() -> None:
-    table = DeviceProductTable(capacity=3)
+    table = DeviceProductTable(capacity=3, byte_capacity=1 << 20)
     references = tuple(
         _device_ref(op_id=91 + index, generation=60 + index, elements=3) for index in range(3)
     )
@@ -315,7 +358,7 @@ def test_row_output_batch_publishes_each_registered_tensor_shape() -> None:
 
 
 def test_mixed_shape_generations_reuse_compatible_resident_storage() -> None:
-    table = DeviceProductTable(capacity=4)
+    table = DeviceProductTable(capacity=4, byte_capacity=1 << 20)
     first = tuple(
         _device_ref(
             op_id=101 + index,
@@ -325,9 +368,7 @@ def test_mixed_shape_generations_reuse_compatible_resident_storage() -> None:
         )
         for index, elements in enumerate((2, 4, 2, 4))
     )
-    first_writes = table.bind_outputs(
-        tuple((reference, "ab" * 32, "cpu") for reference in first)
-    )
+    first_writes = table.bind_outputs(tuple((reference, "ab" * 32, "cpu") for reference in first))
     for write, elements in zip(first_writes, (2, 4, 2, 4), strict=True):
         table.publish_write(write, torch.arange(elements, dtype=torch.long))
     first_storage = {
@@ -352,9 +393,7 @@ def test_mixed_shape_generations_reuse_compatible_resident_storage() -> None:
         )
         for index, elements in enumerate((4, 2, 4, 2))
     )
-    second_writes = table.bind_outputs(
-        tuple((reference, "cd" * 32, "cpu") for reference in second)
-    )
+    second_writes = table.bind_outputs(tuple((reference, "cd" * 32, "cpu") for reference in second))
     second_storage = {
         elements: {
             write.slot.tensor.untyped_storage().data_ptr()
@@ -368,7 +407,7 @@ def test_mixed_shape_generations_reuse_compatible_resident_storage() -> None:
 
 
 def test_operation_release_covers_continuation_and_regular_outputs() -> None:
-    table = DeviceProductTable(capacity=3)
+    table = DeviceProductTable(capacity=3, byte_capacity=1 << 20)
     parent = _device_ref(op_id=71, generation=40)
     (parent_write,) = table.bind_outputs(((parent, "ab" * 32, "cpu"),))
     table.publish_write(parent_write, torch.tensor([5], dtype=torch.long))
@@ -393,3 +432,28 @@ def test_operation_release_covers_continuation_and_regular_outputs() -> None:
     table.release_operation(token.request_key, token.producer_op_id)
 
     assert table.reclaim_ready() == 2
+
+
+def test_continuation_accepts_complete_split_publication() -> None:
+    table = DeviceProductTable(capacity=2, byte_capacity=1 << 20)
+    parent = _device_ref(op_id=81, generation=50)
+    (parent_write,) = table.bind_outputs(((parent, "ab" * 32, "cpu"),))
+    table.publish_write(parent_write, torch.tensor([5], dtype=torch.long))
+
+    token = _device_ref(op_id=82, generation=51)
+    continuation = table.bind_scalar_continuation(
+        outputs=((token, "cd" * 32),),
+        parents=((parent, token.producer_op_id, "ab" * 32),),
+        device="cpu",
+    )
+    token_batch = continuation.scalar
+    assert token_batch is not None
+    token_batch.tensor.fill_(7)
+    table.publish_scalar_batch(token_batch)
+
+    table.finish_continuation(continuation)
+    table.validate_continuation(continuation)
+
+    (read,) = table.consume_batch(((token, 83, "cd" * 32, "cpu"),))
+    assert int(read.tensor.item()) == 7
+    table.record_readers((read,), device="cpu")

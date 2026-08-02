@@ -81,6 +81,7 @@ impl ContentEvent {
                 token_ids,
                 logprobs,
                 finished,
+                ..
             } => {
                 let mut events = Vec::new();
                 if !delta.is_empty() {

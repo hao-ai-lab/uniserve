@@ -12,6 +12,9 @@ from collections.abc import Sequence
 
 from uniserve_worker.batch import (
     Admission,
+    AttentionRegime,
+    Batch,
+    BatchPartition,
     Bounds,
     Commit,
     DeviceDim,
@@ -20,6 +23,7 @@ from uniserve_worker.batch import (
     DrawLayout,
     DType,
     EncodeMode,
+    ExecutionCapability,
     FixedPoint,
     GenAdmission,
     ImageParams,
@@ -44,6 +48,70 @@ from uniserve_worker.batch import (
 )
 
 AUTHORITY = 0
+
+
+def execution_batch(
+    *,
+    step_id: int,
+    admissions: Sequence[Admission] = (),
+    operations: Sequence[Operation] = (),
+    input_products: Sequence[ProductPayload] = (),
+    controls: Sequence[object] = (),
+) -> Batch:
+    """Build the explicit physical partitions used by executor behavior tests."""
+
+    by_route: dict[int, list[Operation]] = {}
+    for operation in operations:
+        by_route.setdefault(int(operation.route), []).append(operation)
+    partitions: list[BatchPartition] = []
+    partition_id = 1
+    for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
+        domains = tuple(
+            domain
+            for domain in (Domain.UND, Domain.GEN)
+            if any(op.domain is domain for op in routed)
+        )
+        execution = (
+            ExecutionCapability.TENSORIZED_MIXED
+            if len(domains) > 1
+            else ExecutionCapability.DOMAIN_HOMOGENEOUS
+        )
+        variants = {operation.work.variant for operation in routed}
+        attention = (
+            AttentionRegime.HYBRID
+            if any(variant.value == "gen_flow" for variant in variants)
+            else AttentionRegime.CAUSAL
+            if any(
+                variant.value.startswith("token_") or variant.value == "draft"
+                for variant in variants
+            )
+            else AttentionRegime.NONE
+        )
+        for domain in domains:
+            domain_operations = tuple(
+                operation for operation in routed if operation.domain is domain
+            )
+            partitions.append(
+                BatchPartition(
+                    partition_id=partition_id,
+                    submission_group=group_id,
+                    collective_seq=int(step_id) * 1024 + group_id + 1,
+                    domain=domain,
+                    route=route,
+                    execution=execution,
+                    attention=attention,
+                    shape_class=0,
+                    operations=domain_operations,
+                )
+            )
+            partition_id += 1
+    return Batch(
+        step_id=int(step_id),
+        admissions=tuple(admissions),
+        partitions=tuple(partitions),
+        input_products=tuple(input_products),
+        controls=tuple(controls),
+    )
 
 
 def request_key(session_id: int, epoch: int = 1) -> RequestKey:
@@ -192,9 +260,9 @@ def token_operation(
         shape_bound=ShapeBound(),
         point_range=PointRange(),
     )
-    outputs = [token_output, selected_point_output]
+    outputs = [token_output]
     if mode is TokenMode.VERIFY:
-        outputs.extend((accepted_span_output, continuation_output))
+        outputs.extend((selected_point_output, accepted_span_output, continuation_output))
     if produces_finish_candidate:
         outputs.append(finish_output)
     if logprobs:
@@ -299,26 +367,48 @@ def encode_operation(
     return operation, payload
 
 
-def flow_operation(
+def gen_transition_operation(
     rk: RequestKey,
     *,
     op_id: int,
     parent: VersionRef,
     conditioning: ProductRef,
-    steps: int,
     seed: int = 29,
     image_index: int = 1,
     control_seq: int = 0,
-) -> Operation:
-    return Operation.registered(
+) -> tuple[Operation, ProductRef]:
+    latent = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=0,
+        generation=op_id * 3 + 1,
+        kind=ProductKind.LATENT,
+        storage_class=StorageClass.LATENT_ARENA,
+        dtype=DType.BF16,
+        shape_bound=ShapeBound((DeviceDim(4_096),)),
+        point_range=PointRange(),
+    )
+    ready = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=1,
+        generation=op_id * 3 + 2,
+        kind=ProductKind.COMPLETION,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.U32,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(),
+    )
+    operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work("gen", "flow"),
+        work=Work("gen", "transition"),
         route=0,
         domain=Domain.GEN,
-        bounds=Bounds(max_points=int(steps)),
+        bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
         inputs=(conditioning,),
+        outputs=(latent, ready),
         rng=Rng(
             seed=int(seed),
             semantic_index_base=int(image_index),
@@ -326,6 +416,43 @@ def flow_operation(
         ),
         control_seq=control_seq,
     )
+    return operation, latent
+
+
+def flow_operation(
+    rk: RequestKey,
+    *,
+    op_id: int,
+    parent: VersionRef,
+    conditioning: ProductRef,
+    latent: ProductRef,
+    steps: int,
+    control_seq: int = 0,
+) -> tuple[Operation, ProductRef]:
+    output = ProductRef(
+        request_key=rk,
+        producer_op_id=op_id,
+        output_index=0,
+        generation=op_id * 3 + 1,
+        kind=ProductKind.LATENT,
+        storage_class=StorageClass.LATENT_ARENA,
+        dtype=DType.BF16,
+        shape_bound=latent.shape_bound,
+        point_range=PointRange(),
+    )
+    operation = Operation.registered(
+        request_key=rk,
+        op_id=op_id,
+        parent=parent,
+        work=Work("gen", "flow"),
+        route=0,
+        domain=Domain.GEN,
+        bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
+        inputs=(conditioning, latent),
+        outputs=(output,),
+        control_seq=control_seq,
+    )
+    return operation, output
 
 
 def kv_publication_operation(
@@ -365,6 +492,7 @@ def materialize_operation(
     *,
     op_id: int,
     parent: VersionRef,
+    latent: ProductRef,
     feedback_source: bool = False,
     control_seq: int = 0,
 ) -> Operation:
@@ -406,6 +534,7 @@ def materialize_operation(
             max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,
         ),
+        inputs=(latent,),
         outputs=outputs,
         control_seq=control_seq,
     )
@@ -466,7 +595,9 @@ __all__ = [
     "AUTHORITY",
     "commit_resolved",
     "encode_operation",
+    "execution_batch",
     "flow_operation",
+    "gen_transition_operation",
     "gen_admission",
     "materialize_operation",
     "kv_publication_operation",

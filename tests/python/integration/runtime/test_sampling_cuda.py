@@ -27,12 +27,18 @@ pytestmark = [
 _ENVELOPE = cast(Operation, None)
 
 
-def _task(logits: torch.Tensor, parameters: SamplingParams, position: int) -> _SampleTask:
+def _task(
+    logits: torch.Tensor,
+    parameters: SamplingParams,
+    position: int,
+    *,
+    suppress: tuple[int, ...] = (),
+) -> _SampleTask:
     row = _SamplingRow(
         parameters=parameters,
         recent_counts=(),
         allowed=None,
-        suppress=(),
+        suppress=suppress,
         draw_seed=sampling_draw_seed(int(parameters.seed or 0), position),
         n_logprobs=int(parameters.n_logprobs),
         finish_token_ids=(3,),
@@ -82,6 +88,12 @@ def test_supported_device_sampling_returns_before_any_host_scalar_observation(
             SamplingParams(temperature=0.9, top_k=3, seed=43),
             13,
         ),
+        _task(
+            torch.tensor([0.2, 1.7, 2.1, 0.4], device=device),
+            SamplingParams(),
+            17,
+            suppress=(2,),
+        ),
     )
     warm_arena = CompletionArena(
         depth=1,
@@ -116,10 +128,11 @@ def test_supported_device_sampling_returns_before_any_host_scalar_observation(
         if time.monotonic() >= deadline:
             raise TimeoutError("sampling completion did not become query-ready")
 
-    observation_order = (2, 0, 3, 1)
+    observation_order = (2, 0, 4, 3, 1)
     observed = {index: int(sampled[index].token_id) for index in observation_order}
     tokens = tuple(observed[index] for index in range(len(sampled)))
     assert tokens[0] == 2
+    assert tokens[4] == 1
     assert float(cast(object, sampled[2].logprob)) <= 0.0
     top = sampled[2].top_logprobs
     assert top is not None

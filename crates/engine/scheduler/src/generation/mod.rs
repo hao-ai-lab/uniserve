@@ -6,10 +6,11 @@ use uniserve_core::{
     ImageKvEffect, RequestId, SamplingParams, SegmentPlacement, UndTokenAction,
 };
 use uniserve_worker_wire::{
-    Bounds, CompletionRecord, DType, DimBound, Domain, DrawLayout, EncodeMode, GenMode, OpId,
-    OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
-    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode, TransferMode,
-    VersionRef, Work, WorkVariant, encode_sampling_state_bytes, encode_token_product_bytes,
+    Bounds, CompletionRecord, CreditVector, DType, DimBound, Domain, DrawLayout, EncodeMode,
+    GenMode, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    RequestKey, ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode,
+    TransferMode, VersionRef, Work, WorkVariant, encode_sampling_state_bytes,
+    encode_token_product_bytes,
 };
 
 use crate::image_artifact::png_artifact_dims_b64;
@@ -206,15 +207,15 @@ fn token_outputs(
         max_points,
     };
     let point_range = token.point_range;
-    let mut selected_point = output_product(
-        1,
-        ProductKind::SelectedPoint,
-        StorageClass::DeviceTensor,
-        DType::U32,
-    );
-    selected_point.point_range = point_range;
-    let mut outputs = vec![token, selected_point];
+    let mut outputs = vec![token];
     if max_points > 1 {
+        let mut selected_point = output_product(
+            1,
+            ProductKind::SelectedPoint,
+            StorageClass::DeviceTensor,
+            DType::U32,
+        );
+        selected_point.point_range = point_range;
         let mut accepted_span = bounded_product(
             2,
             ProductKind::AcceptedSpan,
@@ -235,7 +236,7 @@ fn token_outputs(
             },
         );
         continuation.point_range = point_range;
-        outputs.extend([accepted_span, continuation]);
+        outputs.extend([selected_point, accepted_span, continuation]);
     }
     if produces_finish_candidate {
         outputs.push(output_product(
@@ -422,6 +423,7 @@ pub enum GenerationPhase {
     DecodeUnd,
     CloseKv,
     PublishKv,
+    TransitionGen,
     DenoiseGen,
     CommitGen,
     FeedbackEncode,
@@ -457,7 +459,7 @@ impl GenerationCursor {
                 prompt_logprobs_emitted: 0,
                 mm_cursor: 0,
                 acquired_encoder_pins: Vec::new(),
-                transient_encoder_handles: Vec::new(),
+                transient_encoder_products: Vec::new(),
                 pending_image_step: 0,
                 encoded_product: None,
                 round_closing: false,
@@ -478,6 +480,7 @@ impl GenerationCursor {
                 steps_done: 0,
                 image_hw: (0, 0),
                 conditioning: None,
+                latent: None,
             },
             feedback: FeedbackCursor {
                 image_b64: None,
@@ -492,14 +495,14 @@ impl GenerationCursor {
                 worstcase_blocks,
                 worker_image_latent_units: 0,
                 host_scratch_tokens: 0,
+                latent_credit_bytes: 0,
+                scratch_credit_pages: 0,
             },
             replay: ReplayCursor {
-                preempted: false,
                 block_hashes: Vec::new(),
                 prefix_cached_blocks: 0,
                 blocks_cached: false,
                 generated_ids: Vec::new(),
-                recompute_ids: None,
                 replayability: Replayability::Replayable,
             },
             applied_op_ids: HashSet::new(),
@@ -600,6 +603,22 @@ impl GenerationCursor {
                 if self.image_gen.conditioning.is_none() {
                     return Err(CursorApplyError::MissingOperationId);
                 }
+                self.lifecycle.phase = GenerationPhase::TransitionGen;
+            }
+            TransitionDelta::TransitionGen { .. } => {
+                let operation = transition
+                    .operation
+                    .as_ref()
+                    .ok_or(CursorApplyError::MissingOperationId)?;
+                self.image_gen.latent = operation
+                    .outputs
+                    .iter()
+                    .find(|product| product.kind == ProductKind::Latent)
+                    .cloned();
+                if self.image_gen.latent.is_none() {
+                    return Err(CursorApplyError::MissingLatentProduct);
+                }
+                self.image_gen.steps_done = 0;
                 self.lifecycle.phase = GenerationPhase::DenoiseGen;
             }
             TransitionDelta::DenoiseGen {
@@ -613,6 +632,18 @@ impl GenerationCursor {
                     .image_gen
                     .steps_done
                     .max(steps_completed.max(start_step.saturating_add(step_count)));
+                let operation = transition
+                    .operation
+                    .as_ref()
+                    .ok_or(CursorApplyError::MissingOperationId)?;
+                self.image_gen.latent = operation
+                    .outputs
+                    .iter()
+                    .find(|product| product.kind == ProductKind::Latent)
+                    .cloned();
+                if self.image_gen.latent.is_none() {
+                    return Err(CursorApplyError::MissingLatentProduct);
+                }
             }
             TransitionDelta::CommitGen { .. } | TransitionDelta::EncodeFeedbackStep { .. } => {}
             TransitionDelta::FeedbackState {
@@ -693,6 +724,7 @@ impl GenerationCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CursorApplyError {
     MissingOperationId,
+    MissingLatentProduct,
     DuplicateOperation { op_id: u64 },
 }
 
@@ -719,7 +751,7 @@ pub struct ContextCursor {
     pub(crate) prompt_logprobs_emitted: usize,
     pub(crate) mm_cursor: usize,
     pub(crate) acquired_encoder_pins: Vec<EncoderCachePin>,
-    pub(crate) transient_encoder_handles: Vec<u64>,
+    pub(crate) transient_encoder_products: Vec<ProductRef>,
     pub(crate) pending_image_step: usize,
     pub(crate) encoded_product: Option<ProductRef>,
     pub(crate) round_closing: bool,
@@ -752,6 +784,9 @@ pub struct GenCursor {
     /// The published KV product a denoise op conditions on, captured from the
     /// producing operation's completion products.
     pub(crate) conditioning: Option<ProductRef>,
+    /// The immutable generation-owned latent produced by the transition or
+    /// latest flow quantum.
+    pub(crate) latent: Option<ProductRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -770,16 +805,16 @@ pub struct ResourceCursor {
     pub(crate) worstcase_blocks: usize,
     pub(crate) worker_image_latent_units: u64,
     pub(crate) host_scratch_tokens: u64,
+    pub(crate) latent_credit_bytes: u64,
+    pub(crate) scratch_credit_pages: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayCursor {
-    pub(crate) preempted: bool,
     pub(crate) block_hashes: Vec<u64>,
     pub(crate) prefix_cached_blocks: usize,
     pub(crate) blocks_cached: bool,
     pub(crate) generated_ids: Vec<u32>,
-    pub(crate) recompute_ids: Option<Vec<u32>>,
     pub(crate) replayability: Replayability,
 }
 
@@ -847,6 +882,9 @@ impl CursorProjection {
                 self.phase = GenerationPhase::PublishKv;
             }
             TransitionDelta::PublishKv { .. } => {
+                self.phase = GenerationPhase::TransitionGen;
+            }
+            TransitionDelta::TransitionGen { .. } => {
                 self.phase = GenerationPhase::DenoiseGen;
             }
             TransitionDelta::DenoiseGen { .. } => {}
@@ -924,6 +962,11 @@ pub(crate) enum TransitionIntent {
     PublishKv {
         image_id: u32,
     },
+    TransitionGen {
+        image_id: u32,
+        latent_units: u64,
+        conditioning: ProductRef,
+    },
     CloseKv {
         image_id: u32,
         position: u32,
@@ -938,10 +981,12 @@ pub(crate) enum TransitionIntent {
         cfg: CfgParams,
         latent_units: u64,
         host_scratch_tokens: u64,
-        conditioning: Option<ProductRef>,
+        conditioning: ProductRef,
+        latent: ProductRef,
     },
     CommitGen {
         image_id: u32,
+        latent: ProductRef,
     },
     EncodeFeedback {
         image_id: u32,
@@ -1019,6 +1064,22 @@ fn encode_outputs(
     );
     feature.generation = handle;
     Ok(vec![feature])
+}
+
+/// One immutable image-latent generation. The output remains addressed by its
+/// exact operation identity and logical generation until the scheduler releases
+/// it after all registered readers have fenced.
+fn latent_output(
+    output_index: u16,
+    resources: &uniserve_core::GenerationResourceBounds,
+) -> Result<ProductRef, PlanningError> {
+    Ok(bounded_product(
+        output_index,
+        ProductKind::Latent,
+        StorageClass::LatentArena,
+        DType::BF16,
+        dynamic_element_bound(resources.max_image_latent_bytes, DType::BF16)?,
+    ))
 }
 
 /// Side-effect-free planner for scheduler-local worker transitions.
@@ -1304,6 +1365,45 @@ impl GenerationPlanner {
                     0,
                 )
             }
+            TransitionIntent::TransitionGen {
+                image_id,
+                latent_units,
+                conditioning,
+            } => {
+                if !request.behavior.gen_output {
+                    return Err(PlanningError::GenerationBranchDisabled);
+                }
+                (
+                    Wire {
+                        work: Work::Gen(GenMode::Transition),
+                        domain: Domain::Gen,
+                        inputs: vec![conditioning],
+                        outputs: vec![
+                            latent_output(0, &request.resources)?,
+                            output_product(
+                                1,
+                                ProductKind::Completion,
+                                StorageClass::DeviceTensor,
+                                DType::U32,
+                            ),
+                        ],
+                        new_blocks: Vec::new(),
+                        draft_token_ids: Vec::new(),
+                        token_cost: 1,
+                        cfg_branches: 1,
+                        allowed_text_tokens: None,
+                        expected_prompt_token_ids: None,
+                        input_tokens: Vec::new(),
+                        input_image_bytes: None,
+                        sampling_state: None,
+                    },
+                    TransitionDelta::TransitionGen { image_id },
+                    Vec::new(),
+                    cursor.replayability,
+                    latent_units,
+                    0,
+                )
+            }
             TransitionIntent::CloseKv {
                 image_id,
                 position,
@@ -1344,6 +1444,7 @@ impl GenerationPlanner {
                 latent_units,
                 host_scratch_tokens,
                 conditioning,
+                latent,
             } => {
                 if !request.behavior.gen_output {
                     return Err(PlanningError::GenerationBranchDisabled);
@@ -1353,8 +1454,8 @@ impl GenerationPlanner {
                     Wire {
                         work: Work::Gen(GenMode::Flow),
                         domain: Domain::Gen,
-                        inputs: conditioning.into_iter().collect(),
-                        outputs: Vec::new(),
+                        inputs: vec![conditioning, latent],
+                        outputs: vec![latent_output(0, &request.resources)?],
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: usize::from(step_count),
@@ -1376,7 +1477,7 @@ impl GenerationPlanner {
                     host_scratch_tokens,
                 )
             }
-            TransitionIntent::CommitGen { image_id } => {
+            TransitionIntent::CommitGen { image_id, latent } => {
                 if !request.behavior.gen_output {
                     return Err(PlanningError::GenerationBranchDisabled);
                 }
@@ -1389,7 +1490,7 @@ impl GenerationPlanner {
                     Wire {
                         work: Work::Materialize,
                         domain: Domain::Gen,
-                        inputs: Vec::new(),
+                        inputs: vec![latent],
                         outputs: materialize_outputs(request, feedback)?,
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
@@ -1525,6 +1626,10 @@ impl GenerationPlanner {
         };
         let operation_variant = wire.work.variant();
         let is_flow = operation_variant == WorkVariant::GenFlow;
+        let produces_latent = matches!(
+            operation_variant,
+            WorkVariant::GenTransition | WorkVariant::GenFlow
+        );
         let is_materialize = operation_variant == WorkVariant::Materialize;
         let produces_token = wire
             .outputs
@@ -1537,7 +1642,7 @@ impl GenerationPlanner {
                 .then_some(request.resources.max_kv_tokens)
         });
         let new_blocks_len = wire.new_blocks.len();
-        let max_latent_bytes = if is_flow {
+        let max_latent_bytes = if produces_latent {
             request.resources.max_image_latent_bytes
         } else {
             wire.outputs
@@ -1568,7 +1673,7 @@ impl GenerationPlanner {
             new_blocks: new_blocks_len,
             kv_target_tokens,
             host_scratch_tokens: if is_flow { host_scratch_tokens } else { 0 },
-            latent_units: if is_flow { latent_units } else { 0 },
+            latent_units: if produces_latent { latent_units } else { 0 },
             cfg_branches: wire.cfg_branches,
             encoder_pins,
             replayability_after_apply,
@@ -1591,6 +1696,7 @@ impl GenerationPlanner {
                 operation_variant,
                 WorkVariant::EncodeLatent | WorkVariant::EncodeVision
             ),
+            expects_latent_generation: produces_latent,
             expects_image_artifact: is_materialize,
             expected_image_hw: is_materialize
                 .then_some((request.image.height, request.image.width)),
@@ -1659,7 +1765,7 @@ impl GenerationPlanner {
             max_transfer_bytes,
         };
         let rng = match &delta {
-            TransitionDelta::DenoiseGen { image_id, .. } => Some(Rng {
+            TransitionDelta::TransitionGen { image_id } => Some(Rng {
                 seed: request.image.seed.unwrap_or(0),
                 semantic_index_base: u64::from(*image_id),
                 draw_layout: DrawLayout::FlowNoise,
@@ -1684,6 +1790,7 @@ impl GenerationPlanner {
             rng,
             control_seq: 0,
             operation: None,
+            reserved_credits: CreditVector::ZERO,
             operation_variant,
             request_id: request.request_id,
             draft_token_ids: wire.draft_token_ids,
@@ -1777,6 +1884,7 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
         } => physical_position.saturating_add(1),
         TransitionDelta::EncodeImageStep { .. }
         | TransitionDelta::PublishKv { .. }
+        | TransitionDelta::TransitionGen { .. }
         | TransitionDelta::DenoiseGen { .. }
         | TransitionDelta::CommitGen { .. }
         | TransitionDelta::EncodeFeedbackStep { .. } => return None,
@@ -1867,6 +1975,8 @@ pub(crate) struct PlannedTransition {
     pub(crate) rng: Option<Rng>,
     pub(crate) control_seq: u64,
     pub(crate) operation: Option<Operation>,
+    /// Exact operation-scoped vector acquired before registration.
+    pub(crate) reserved_credits: CreditVector,
     pub(crate) operation_variant: WorkVariant,
     pub(crate) request_id: RequestId,
     pub(crate) draft_token_ids: Vec<u32>,
@@ -2150,6 +2260,9 @@ pub(crate) enum TransitionDelta {
     PublishKv {
         image_id: u32,
     },
+    TransitionGen {
+        image_id: u32,
+    },
     DenoiseGen {
         image_id: u32,
         start_step: u16,
@@ -2182,6 +2295,7 @@ impl TransitionDelta {
             Self::DecodeUnd { .. } => "decode_und",
             Self::CloseKv { .. } => "close_kv",
             Self::PublishKv { .. } => "publish_kv",
+            Self::TransitionGen { .. } => "transition_gen",
             Self::DenoiseGen { .. } => "denoise_gen",
             Self::CommitGen { .. } => "commit_gen",
             Self::EncodeFeedbackStep { .. } => "encode_feedback_step",
@@ -2229,6 +2343,7 @@ pub(crate) struct ImageKvExpectation {
 pub(crate) struct TransitionValidation {
     pub(crate) expected_denoise_step: Option<u16>,
     pub(crate) expects_encoder_handle: bool,
+    pub(crate) expects_latent_generation: bool,
     pub(crate) expects_image_artifact: bool,
     pub(crate) expected_image_hw: Option<(u32, u32)>,
     pub(crate) requires_kv_publication: bool,
@@ -2274,6 +2389,16 @@ impl TransitionValidation {
         let encoder_handle = record.product_generations.first().map(|g| u64::from(*g));
         if self.expects_encoder_handle && encoder_handle.filter(|handle| *handle != 0).is_none() {
             return Err(TransitionValidationError::MissingEncoderHandle);
+        }
+        if self.expects_latent_generation
+            && record
+                .product_generations
+                .first()
+                .copied()
+                .filter(|generation| *generation != 0)
+                .is_none()
+        {
+            return Err(TransitionValidationError::MissingLatentGeneration);
         }
         // The artifact rides as a base64 PNG string; dimension validation reads
         // only the IHDR header from the base64 prefix. Decoding the full frame
@@ -2500,6 +2625,7 @@ pub(crate) enum TransitionValidationError {
         actual: u16,
     },
     MissingEncoderHandle,
+    MissingLatentGeneration,
     MissingImageArtifact,
     InvalidImageArtifact,
     MissingKvPublication,
@@ -2707,42 +2833,40 @@ mod tests {
     }
 
     #[test]
-    fn planner_coordinates_flow_noise_by_semantic_image() {
+    fn planner_coordinates_transition_noise_by_semantic_image() {
         let mut request = request(19, vec![11, 12]);
         request.constraint = GenerationConstraint::Default;
         request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 };
         request.behavior =
             GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
         request.image.seed = Some(29);
+        request.resources.max_image_latent_bytes = 128;
+        let mut conditioning = bounded_product(
+            0,
+            ProductKind::Kv,
+            StorageClass::PagedKv,
+            DType::U8,
+            dynamic_element_bound(128, DType::U8).unwrap(),
+        );
+        conditioning.generation = 7;
 
         let transition = GenerationPlanner::new()
             .plan(
                 &request,
                 CursorProjection {
-                    phase: GenerationPhase::DenoiseGen,
+                    phase: GenerationPhase::TransitionGen,
                     prompt_cursor: 2,
                     logical_pos: 2,
                     physical_kv_len: 2,
                     replayability: Replayability::NotReplayable,
                 },
-                TransitionIntent::DenoiseGen {
+                TransitionIntent::TransitionGen {
                     image_id: 3,
-                    start_step: 0,
-                    step_count: 1,
-                    cfg: CfgParams {
-                        branch_count: 3,
-                        text_scale: 1.0,
-                        img_scale: 1.0,
-                        renorm_type: String::new(),
-                        renorm_min: 0.0,
-                        interval: (0.0, 1.0),
-                    },
                     latent_units: 64,
-                    host_scratch_tokens: 64,
-                    conditioning: None,
+                    conditioning,
                 },
             )
-            .expect("plan flow denoise");
+            .expect("plan generation transition");
 
         assert_eq!(
             transition.rng,
@@ -3021,6 +3145,8 @@ mod tests {
         });
         request.behavior =
             GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+        request.resources.max_image_latent_bytes = 128;
+        let latent = latent_output(0, &request.resources).expect("bounded latent");
 
         let transition = GenerationPlanner::new()
             .plan(
@@ -3032,7 +3158,10 @@ mod tests {
                     physical_kv_len: 2,
                     replayability: Replayability::NotReplayable,
                 },
-                TransitionIntent::CommitGen { image_id: 1 },
+                TransitionIntent::CommitGen {
+                    image_id: 1,
+                    latent,
+                },
             )
             .expect("plan image materialization");
         assert_eq!(transition.outputs.len(), 2);

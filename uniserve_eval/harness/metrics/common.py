@@ -174,6 +174,7 @@ class RequestRecord:
                     "modalities": list(event.get("modalities", [])),
                     "text_bytes": int(event.get("text_bytes", 0)),
                     "image_count": int(event.get("image_count", 0)),
+                    "public_commit": event.get("public_commit"),
                     "client_offset_ms": (
                         (float(event["client_time"]) - self.start_time) * 1000.0
                         if isinstance(event.get("client_time"), (int, float))

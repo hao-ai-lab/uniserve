@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from tests.python.fixtures.depth_one import root_parent, token_operation, und_admission
+from tests.python.fixtures.depth_one import (
+    execution_batch,
+    root_parent,
+    token_operation,
+    und_admission,
+)
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
-    Batch,
     Close,
     CloseReason,
     Commit,
@@ -37,7 +41,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         tokens=(3, 4),
     )
     parent_report = worker.execute(
-        Batch(
+        execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(parent,),
@@ -51,19 +55,14 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         parent=VersionRef(
             admission.request_key,
             parent.op_id,
-            DevicePoint(
-                next(
-                    output for output in parent.outputs if output.kind is ProductKind.SELECTED_POINT
-                ),
-                parent.plan_digest,
-            ),
+            DevicePoint(1, None, parent.plan_digest),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
         predicate=continuation,
     )
     successor_report = worker.execute(
-        Batch(
+        execution_batch(
             step_id=2,
             admissions=(),
             operations=(successor,),
@@ -79,14 +78,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         parent=VersionRef(
             admission.request_key,
             successor.op_id,
-            DevicePoint(
-                next(
-                    output
-                    for output in successor.outputs
-                    if output.kind is ProductKind.SELECTED_POINT
-                ),
-                successor.plan_digest,
-            ),
+            DevicePoint(1, None, successor.plan_digest),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
@@ -94,7 +86,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
     )
     descendant_report = finalize_completion_report(
         worker.execute(
-            Batch(
+            execution_batch(
                 step_id=3,
                 admissions=(),
                 operations=(descendant,),
@@ -143,7 +135,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         disposition=Disposition.PUBLISH,
     )
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=4,
             admissions=(),
             operations=(),
@@ -160,7 +152,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
     )
     later_completion = finalize_completion_report(
         worker.execute(
-            Batch(
+            execution_batch(
                 step_id=5,
                 admissions=(),
                 operations=(later,),
@@ -182,7 +174,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         disposition=Disposition.PUBLISH,
     )
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=6,
             admissions=(),
             operations=(),
@@ -190,7 +182,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         )
     )
     worker.execute(
-        Batch(
+        execution_batch(
             step_id=7,
             admissions=(),
             operations=(),

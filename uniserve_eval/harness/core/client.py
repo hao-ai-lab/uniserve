@@ -345,6 +345,7 @@ def _parse_openai(
                     ),
                     "text_bytes": len(content.encode("utf-8")),
                     "image_count": len(images),
+                    "public_commit": event.get("public_commit"),
                 }
             )
         if content:

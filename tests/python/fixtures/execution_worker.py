@@ -20,6 +20,9 @@ def execution_worker(
     block_size: int = 16,
     device: str = "cpu",
     pipeline_depth: int = 1,
+    snapshot_dir: str | None = None,
+    restore_snapshots: bool = False,
+    transfer_backend: str = "local",
 ) -> ModelWorker:
     ready = StubModel() if model is None else model
     deployment = replace(stub_deployment(block_size), device=device)
@@ -37,10 +40,13 @@ def execution_worker(
         tokenizer=None,
         allowed_operation_types=ready.spec.operation_types(),
         defer_sampling=defer_sampling,
+        transfer_backend=transfer_backend,
         mooncake_device="",
         mooncake_protocol="rdma",
         pipeline_depth=pipeline_depth,
         completion_payload_bytes=1 << 16,
+        snapshot_dir=snapshot_dir,
+        restore_snapshots=restore_snapshots,
     )
 
 

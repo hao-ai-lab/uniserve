@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use uniserve_core::{BlockId, RequestId};
 use uniserve_worker_wire::{
-    AdapterMode, Bounds, CompletionRecord, DType, DimBound, Domain, DrawLayout, EngineCaps,
-    ExecutionConstraints, FinishFlags, LogicalLengths, OpId, OpStatus, Operation, Point,
-    PointRange, ProductKind, ProductRef, RequestKey, Rng, RouteId, ShapeBound, StorageClass,
-    TimingCounters, TokenMode, TokenSpan, VersionRef, Work, WorkVariant, protocol_layout_digest,
+    AdapterMode, Bounds, CompletionRecord, CreditDimension, CreditVector, DType, DimBound, Domain,
+    DrawLayout, EngineCaps, ExecutionConstraints, FinishFlags, LogicalLengths, OpId, OpStatus,
+    Operation, Point, PointRange, ProductKind, ProductRef, RequestKey, Rng, RouteCreditLimits,
+    RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound, StorageClass, TimingCounters,
+    TokenMode, TokenSpan, VersionRef, Work, WorkVariant, protocol_layout_digest,
 };
 
 fn digest_string(seed: u8) -> String {
@@ -227,6 +228,48 @@ fn emit_digest_parity_fixture() {
         adapter_mode: AdapterMode::PerRequest,
         execution_constraints: ExecutionConstraints {
             max_batch_operations: 16,
+            route_capabilities: vec![RouteExecutionCapability {
+                route: RouteId(0),
+                supported_work: vec![
+                    WorkVariant::TokenDecode,
+                    WorkVariant::TokenExtend,
+                    WorkVariant::GenFlow,
+                    WorkVariant::EncodeVision,
+                ],
+                tensorized_mixed: true,
+                sampling_ownership: SamplingOwnership::DesignatedRank,
+                preemptible: false,
+                credits: RouteCreditLimits {
+                    per_request: CreditVector {
+                        registered_operations: 2,
+                        execution_slots: 2,
+                        completion_slots: 2,
+                        device_products: 10,
+                        kv_pages: 64,
+                        rollback_deltas: 34,
+                        latent_artifact_bytes: 1 << 20,
+                        pinned_completion_staging_bytes: 1 << 21,
+                        transfer_bytes: 1 << 20,
+                        transfer_tickets: 2,
+                        cpu_tasks: 1,
+                        output_journal_bytes: 1 << 24,
+                    },
+                    worker: CreditVector {
+                        registered_operations: 16,
+                        execution_slots: 16,
+                        completion_slots: 16,
+                        device_products: 80,
+                        kv_pages: 256,
+                        rollback_deltas: 272,
+                        latent_artifact_bytes: 1 << 24,
+                        pinned_completion_staging_bytes: 1 << 25,
+                        transfer_bytes: 1 << 24,
+                        transfer_tickets: 16,
+                        cpu_tasks: 16,
+                        output_journal_bytes: 1 << 28,
+                    },
+                },
+            }],
             ..ExecutionConstraints::default()
         },
         kv_dtype: "bfloat16".into(),
@@ -261,6 +304,20 @@ fn emit_digest_parity_fixture() {
             "device_sequence_lengths": caps.execution_constraints.device_sequence_lengths,
             "device_append_offsets": caps.execution_constraints.device_append_offsets,
             "incremental_kv_publication": caps.execution_constraints.incremental_kv_publication,
+            "route_capabilities": caps.execution_constraints.route_capabilities.iter().map(|capability| serde_json::json!({
+                "route": capability.route.0,
+                "supported_work": capability.supported_work.iter().map(|variant| variant.as_wire_str()).collect::<Vec<_>>(),
+                "tensorized_mixed": capability.tensorized_mixed,
+                "sampling_ownership": match capability.sampling_ownership {
+                    SamplingOwnership::DesignatedRank => "designated_rank",
+                    SamplingOwnership::DeterministicSharded => "deterministic_sharded",
+                },
+                "preemptible": capability.preemptible,
+                "credits": {
+                    "per_request": CreditDimension::ALL.map(|dimension| capability.credits.per_request.get(dimension)),
+                    "worker": CreditDimension::ALL.map(|dimension| capability.credits.worker.get(dimension)),
+                },
+            })).collect::<Vec<_>>(),
             "kv_dtype": caps.kv_dtype,
             "model_dtype": caps.model_dtype,
             "attention_backend": caps.attention_backend,

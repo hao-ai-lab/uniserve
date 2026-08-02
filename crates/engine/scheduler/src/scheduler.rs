@@ -6,19 +6,18 @@
 //! `ForwardBatch` assembly is lane-aware for text prefill/decode and may still
 //! mix compatible non-text ops; workers preserve one result per submitted op.
 //!
-//! Scheduling follows vLLM-style budgeted, chunked-prefill, preempting scheduling:
+//! Scheduling uses budgeted, chunked-prefill admission with exact resident state:
 //! - waiting requests live in a [`RequestQueue`] (FCFS deque or priority
 //!   ordering) and admission consumes the queue head;
 //! - scheduling is bounded by the `max_num_batched_tokens` / `max_num_seqs`
 //!   pair with vLLM's clip rule (`min(num_new_tokens, token_budget)`);
-//! - worst-case reservation is a per-request admission attribute: default and
-//!   image-output requests allocate their worst-case KV at admission and are
-//!   never preempted; text requests are budgeted and preemptible.
+//! - worst-case reservation is a per-request admission attribute; requests whose
+//!   exact physical state cannot be relocated remain resident and apply queue
+//!   backpressure when capacity is exhausted.
 //!
 //! The worker contract is a stateful diff: a request's static state crosses once
 //! as [`NewRequestData`]; per-step ops carry only deltas (new block ids, new
-//! tokens, per-step masks). Preemption resets the diff state (`drop_request` plus
-//! re-registration on resumption).
+//! tokens, and per-step masks).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
@@ -61,7 +60,6 @@ pub struct GeneralStats {
     pub pending: AtomicUsize,
     /// Requests gated on grammar compilation (vLLM's skipped_waiting).
     pub skipped_waiting: AtomicUsize,
-    pub preemptions: AtomicU64,
     pub in_flight: AtomicUsize,
 }
 
@@ -180,13 +178,17 @@ use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities};
 use uniserve_core::{HashAlgo, RequestId};
-use uniserve_engine_api::{Command, EventTx, FinishReason, GenEvent, GenerationSubmission};
+use uniserve_engine_api::{
+    Command, EventTx, FinishReason, GenEvent, GenerationSubmission, PublicCommit, PublicModality,
+    SemanticRoot,
+};
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
-    Admission, Batch, CloseReason, CompletionRecord, CompletionReport, Control, Disposition,
-    EngineCaps, GenAdmission, KvAllocation, OpId, OpStatus, Operation, Point, ProductKind,
-    ProductPayload, ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef,
-    WorkVariant, WorkerForwardStats,
+    Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
+    CompletionReport, Control, CreditVector, Disposition, EngineCaps, ExecutionCapability,
+    GenAdmission, KvAllocation, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload,
+    ProductRef, RequestKey, ResourceClass, RouteCreditLimits, SamplingState, StorageClass,
+    UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
 };
 
 use crate::grammar::{GrammarCompiler, GrammarMatcher};
@@ -201,6 +203,11 @@ enum AssemblyLane {
     Decode,
     Other,
 }
+
+type RouteDomainOperations = Vec<(
+    uniserve_worker_wire::RouteId,
+    Vec<(uniserve_worker_wire::Domain, Vec<Operation>)>,
+)>;
 
 const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
 /// maximum time the fully-idle scheduler blocks on the command channel
@@ -223,6 +230,7 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<GenEvent> {
         bytes: metadata.bytes,
         sha256: metadata.sha256,
         pixels_png_b64,
+        public_commit: None,
     })
 }
 
@@ -361,7 +369,7 @@ impl Default for ControlTokens {
 }
 
 /// Waiting-queue ordering policy (vLLM's `scheduler_config.policy`): FCFS or
-/// priority. Both are budgeted, chunked-prefill, preempting schedulers;
+/// priority. Both are budgeted, chunked-prefill schedulers;
 /// [`ReqState::reserve_worstcase`] toggles worst-case reservation per request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -503,10 +511,7 @@ impl ReqState {
     }
 
     pub(crate) fn effective_prompt(&self) -> &[u32] {
-        self.replay
-            .recompute_ids
-            .as_deref()
-            .unwrap_or(&self.context.prompt_ids)
+        &self.context.prompt_ids
     }
 
     fn pending_image_step(&self) -> Option<ImageIngestStep> {
@@ -548,7 +553,7 @@ pub struct Scheduler {
     /// When sleeping, admission is paused (engine idled).
     sleeping: bool,
     /// An acknowledged reset waits for submitted ops to resolve before it can
-    /// preempt request state and invalidate cache ownership atomically.
+    /// invalidate cache ownership atomically.
     pending_prefix_reset: Option<PendingPrefixCacheReset>,
     /// Pluggable host-side logits-processor pipeline.
     logits_pipeline: Vec<Arc<dyn crate::logits::LogitsProcessor>>,
@@ -573,6 +578,10 @@ pub struct Scheduler {
     skipped_waiting: HashMap<RequestId, ReqState>,
     grammar_compiler: GrammarCompiler,
     cpu_continuations: CpuContinuationPool,
+    cpu_task_timeout: Duration,
+    /// Request-local continuation deadlines, bounded by the CPU task pool. This
+    /// keeps the scheduler hot path independent of the number of active requests.
+    cpu_deadlines: HashMap<CpuTaskKey, Instant>,
     reserved_blocks: usize,
     step_id: u64,
     /// Ordered submitted-but-unresolved operations for each request. The front
@@ -599,14 +608,19 @@ pub struct Scheduler {
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
-    /// Per-request lease accounting and invariant checks (observe-only).
-    ledger: crate::resources::ResourceLedger,
+    /// Atomic per-request finite-credit ownership.
+    ledger: crate::resources::CreditLedger,
+    /// Device-product credit retained until a successor completion makes the
+    /// producer's reader-safe release observable.
+    product_credits: HashMap<ProductRef, CreditVector>,
     /// Explainable policy decisions and per-op latency history.
     decisions: crate::policy::DecisionLog,
     latency: crate::policy::LatencyHistory,
     planner: GenerationPlanner,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
+    /// Partition ids still expected for each submitted batch.
+    batch_partitions: HashMap<u64, HashSet<u32>>,
     /// Ordered semantic controls waiting to cross the worker boundary.
     pending_controls: VecDeque<Control>,
     /// Controls attached to an in-flight batch, retained until its ack report.
@@ -616,6 +630,7 @@ pub struct Scheduler {
     /// Monotonic op ids and archived lifecycle traces.
     next_op_id: u64,
     next_product_generation: u64,
+    next_collective_seq: u64,
     next_epoch: u64,
     completed_traces: VecDeque<crate::trace::RequestTrace>,
     trace_sink: Option<crate::bench_trace::SchedulerTraceSink>,
@@ -636,7 +651,7 @@ pub struct HealthSnapshot {
     pub free_blocks: usize,
     pub total_blocks: usize,
     pub reserved_blocks: usize,
-    pub active_leases: usize,
+    pub active_credit_requests: usize,
     pub resource_invariant_violations: u64,
     pub completed_traces: usize,
     pub last_worker_exec_us: u64,
@@ -697,10 +712,21 @@ fn close_reason(reason: &FinishReason) -> CloseReason {
     }
 }
 
-fn canonical_finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
+/// Tokens that stop a device-relay successor before host semantic resolution.
+///
+/// Terminal stop/EOS tokens end the request. A direct Gen trigger instead ends
+/// the current Und continuation window: the sampled trigger remains
+/// host-visible and opens the image branch, while an already registered text
+/// successor resolves as a predicate no-op.
+fn canonical_continuation_stop_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
     let mut finish_token_ids = request.stop_token_ids.clone();
     if !request.sampling.ignore_eos {
         finish_token_ids.extend(eos.iter().copied());
+    }
+    if request.behavior.gen_output
+        && let Some(trigger) = request.policy.trigger.direct_token()
+    {
+        finish_token_ids.push(trigger);
     }
     finish_token_ids.sort_unstable();
     finish_token_ids.dedup();
@@ -726,6 +752,7 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
         TransitionValidationError::VersionMismatch { .. } => "version_mismatch",
         TransitionValidationError::DenoiseStepMismatch { .. } => "denoise_step_mismatch",
         TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
+        TransitionValidationError::MissingLatentGeneration => "missing_latent_generation",
         TransitionValidationError::MissingImageArtifact => "missing_image_artifact",
         TransitionValidationError::InvalidImageArtifact => "invalid_image_artifact",
         TransitionValidationError::MissingKvPublication => "missing_kv_publication",
@@ -771,6 +798,7 @@ fn transition_validation_error_str(error: &TransitionValidationError) -> &'stati
 fn cursor_apply_error_str(error: &CursorApplyError) -> &'static str {
     match error {
         CursorApplyError::MissingOperationId => "missing_operation_id",
+        CursorApplyError::MissingLatentProduct => "missing_latent_product",
         CursorApplyError::DuplicateOperation { .. } => "duplicate_operation",
     }
 }
@@ -783,6 +811,7 @@ fn phase_str(phase: Phase) -> &'static str {
         Phase::DecodeUnd => "decode_und",
         Phase::CloseKv => "close_kv",
         Phase::PublishKv => "publish_kv",
+        Phase::TransitionGen => "transition_gen",
         Phase::DenoiseGen => "denoise_gen",
         Phase::CommitGen => "commit_gen",
         Phase::FeedbackEncode => "feedback_encode",
@@ -834,6 +863,7 @@ struct InflightOp {
     started: Instant,
     /// Worst-case public events reserved before this operation was registered.
     output_credit_bound: usize,
+    credits: CreditVector,
 }
 
 struct PendingFinish {
@@ -884,6 +914,12 @@ impl Scheduler {
         mut config: SchedulerConfig,
     ) -> Self {
         let caps = executor.caps();
+        let credit_capacity = caps
+            .execution_constraints
+            .route_capabilities
+            .first()
+            .map(|capability| capability.credits.worker)
+            .expect("validated worker capabilities have a route credit vector");
         let cpu_waker = executor.command_waker();
         let max_batch_ops = caps.execution_constraints.max_batch_operations as usize;
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
@@ -979,6 +1015,8 @@ impl Scheduler {
             skipped_waiting: HashMap::new(),
             grammar_compiler: GrammarCompiler::with_waker(cpu_waker.clone()),
             cpu_continuations: CpuContinuationPool::new(cpu_waker),
+            cpu_task_timeout: Duration::from_secs(30),
+            cpu_deadlines: HashMap::new(),
             reserved_blocks: 0,
             step_id: 0,
             inflight_ops: HashMap::new(),
@@ -988,16 +1026,19 @@ impl Scheduler {
             flow_exclusive_batch,
             spec_decode,
             fatal: false,
-            ledger: crate::resources::ResourceLedger::new(),
+            ledger: crate::resources::CreditLedger::new(credit_capacity),
+            product_credits: HashMap::new(),
             decisions: crate::policy::DecisionLog::default(),
             latency: crate::policy::LatencyHistory::new(),
             planner: GenerationPlanner::new(),
             batch_started: HashMap::new(),
+            batch_partitions: HashMap::new(),
             pending_controls: VecDeque::new(),
             control_batches: HashMap::new(),
             authority_id: 1,
             next_op_id: 1,
             next_product_generation: 1,
+            next_collective_seq: 1,
             next_epoch: 1,
             completed_traces: VecDeque::new(),
             trace_sink,
@@ -1031,6 +1072,15 @@ impl Scheduler {
         );
         self.logits_pipeline.push(Arc::from(p));
         self.custom_logits_processors = self.custom_logits_processors.saturating_add(1);
+        self
+    }
+    /// Set the request-local deadline for one deterministic CPU continuation.
+    pub fn with_cpu_task_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "CPU continuation timeout must be positive"
+        );
+        self.cpu_task_timeout = timeout;
         self
     }
     /// Configure the per-step token budget.
@@ -1087,7 +1137,7 @@ impl Scheduler {
             free_blocks: self.bm.free_blocks(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
-            active_leases: self.ledger.total_active(),
+            active_credit_requests: self.ledger.active_requests(),
             cached_blocks: self.bm.cached_blocks(),
             prefix_hit_rate: if pq > 0 { ph as f32 / pq as f32 } else { 0.0 },
             mm_cache_hit_rate: if mq > 0 { mh as f32 / mq as f32 } else { 0.0 },
@@ -1126,7 +1176,7 @@ impl Scheduler {
             free_blocks: self.bm.free_blocks(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
-            active_leases: self.ledger.total_active(),
+            active_credit_requests: self.ledger.active_requests(),
             resource_invariant_violations: self.ledger.stats.invariant_violations,
             completed_traces: self.completed_traces.len(),
             last_worker_exec_us: self
@@ -1565,10 +1615,11 @@ impl Scheduler {
             let _ = reply.send(Ok(false));
             return;
         }
-        if !reset_running_requests && !self.running.is_empty() {
+        if !self.running.is_empty() {
             let _ = reply.send(Ok(false));
             return;
         }
+        let _ = reset_running_requests;
         self.pending_prefix_reset = Some(PendingPrefixCacheReset { reply });
         self.progress_prefix_cache_reset();
     }
@@ -1582,14 +1633,6 @@ impl Scheduler {
             .pending_prefix_reset
             .take()
             .expect("prefix reset presence checked above");
-        if self
-            .running
-            .values()
-            .any(|state| !state.is_replayable_text())
-        {
-            let _ = pending.reply.send(Ok(false));
-            return true;
-        }
         if self.control_allowed(&ControlOp::ResetPrefixCache)
             && let Err(error) = self
                 .executor
@@ -1597,11 +1640,6 @@ impl Scheduler {
         {
             let _ = pending.reply.send(Err(error.to_string()));
             return true;
-        }
-
-        let running = self.order.clone();
-        for request_id in running {
-            self.requeue_for_recompute(request_id);
         }
         self.bm.reset_prefix_cache();
         self.publish_cache_stats();
@@ -1745,10 +1783,8 @@ impl Scheduler {
             .resources
             .max_kv_tokens
             .div_ceil(self.caps.block_size as usize);
-        // Non-text multimodal requests are not safely preemptible once they
-        // start producing image/text state. Reserve their configured bounded KV
-        // envelope at admission so excess concurrency queues instead of
-        // exhausting KV after all requests have become resident.
+        // Multimodal requests reserve their configured bounded KV envelope at
+        // admission so excess concurrency queues instead of exhausting KV.
         let reserve_worstcase = !context.images.is_empty() || req.behavior.gen_output;
         // A request with staged images usually encodes them before prefill.
         // Context-image requests prefill the text before each image position,
@@ -1830,6 +1866,106 @@ impl Scheduler {
         )
     }
 
+    fn route_credit_limits(&self, route: uniserve_worker_wire::RouteId) -> RouteCreditLimits {
+        self.caps
+            .execution_constraints
+            .route_capabilities
+            .iter()
+            .find(|capability| capability.route == route)
+            .map(|capability| capability.credits)
+            .expect("planned route has a negotiated credit declaration")
+    }
+
+    fn request_base_credits(&self, state: &ReqState) -> CreditVector {
+        let text_event_bytes = 4096_u64
+            .saturating_add(u64::from(state.req.sampling.n_logprobs).saturating_mul(16))
+            .saturating_add(u64::from(state.req.sampling.n_prompt_logprobs).saturating_mul(16));
+        let image_event_bytes = if state.req.behavior.gen_output {
+            let raw = u64::from(state.req.image.height).saturating_mul(
+                u64::from(state.req.image.width)
+                    .saturating_mul(3)
+                    .saturating_add(1),
+            );
+            raw.saturating_mul(2)
+                .saturating_add(1 << 20)
+                .div_ceil(3)
+                .saturating_mul(4)
+        } else {
+            0
+        };
+        CreditVector {
+            kv_pages: state.resources.worstcase_blocks as u64,
+            cpu_tasks: u64::from(self.cpu_continuation_required(state)),
+            output_journal_bytes: text_event_bytes
+                .max(image_event_bytes)
+                .saturating_mul(OUTPUT_JOURNAL_CAPACITY as u64),
+            ..CreditVector::ZERO
+        }
+    }
+
+    fn operation_credits(transition: &PlannedTransition) -> CreditVector {
+        let device_products = transition
+            .outputs
+            .iter()
+            .filter(|output| {
+                output.storage_class == StorageClass::DeviceTensor
+                    || output.storage_class == StorageClass::LatentArena
+            })
+            .count() as u64;
+        let latent_artifact_bytes = transition
+            .outputs
+            .iter()
+            .filter(|output| output.storage_class == StorageClass::LatentArena)
+            .map(ProductRef::max_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let staging_bytes = transition
+            .bounds
+            .max_completion_bytes
+            .saturating_add(u64::from(transition.bounds.max_tokens).saturating_mul(32))
+            .saturating_add(u64::from(transition.bounds.max_kv_pages).saturating_mul(8))
+            .saturating_add(256);
+        CreditVector {
+            registered_operations: 1,
+            execution_slots: 1,
+            completion_slots: 1,
+            device_products,
+            rollback_deltas: u64::from(transition.bounds.max_points),
+            latent_artifact_bytes,
+            pinned_completion_staging_bytes: staging_bytes,
+            transfer_bytes: transition.bounds.max_transfer_bytes,
+            transfer_tickets: u64::from(transition.bounds.max_transfer_bytes > 0),
+            cpu_tasks: u64::from(transition.work.variant() == WorkVariant::Materialize),
+            ..CreditVector::ZERO
+        }
+    }
+
+    fn transition_persistent_credits(&self, transition: &PlannedTransition) -> CreditVector {
+        let Some(state) = self.running.get(&transition.request_id) else {
+            return CreditVector::ZERO;
+        };
+        let latent_artifact_bytes =
+            if transition.resources.latent_units > 0 && state.resources.latent_credit_bytes == 0 {
+                transition.bounds.max_latent_bytes
+            } else {
+                0
+            };
+        let kv_pages = if transition.resources.host_scratch_tokens > 0
+            && state.resources.scratch_credit_pages == 0
+        {
+            transition
+                .resources
+                .host_scratch_tokens
+                .div_ceil(u64::from(self.caps.block_size).max(1))
+        } else {
+            0
+        };
+        CreditVector {
+            kv_pages,
+            latent_artifact_bytes,
+            ..CreditVector::ZERO
+        }
+    }
+
     fn cap_max_vae_grid_tokens(&self) -> usize {
         if self.caps.max_vae_grid_tokens > 0 {
             self.caps.max_vae_grid_tokens as usize
@@ -1907,7 +2043,7 @@ impl Scheduler {
             * ceil_div_u64((width as u64).max(1), downsample)
     }
 
-    fn denoise_worker_image_latent_additional(&self, id: RequestId) -> Option<u64> {
+    fn worker_image_latent_additional(&self, id: RequestId, requested_units: u64) -> Option<u64> {
         if !self.worker_tracks_image_latent() {
             return Some(0);
         }
@@ -1915,12 +2051,17 @@ impl Scheduler {
         if st.resources.worker_image_latent_units > 0 {
             Some(0)
         } else {
-            Some(self.worker_image_latent_units_for(st).max(1))
+            Some(requested_units)
         }
     }
 
     fn can_schedule_denoise(&self, id: RequestId) -> bool {
-        let Some(additional) = self.denoise_worker_image_latent_additional(id) else {
+        let requested_units = self
+            .running
+            .get(&id)
+            .map(|st| self.worker_image_latent_units_for(st).max(1))
+            .unwrap_or(0);
+        let Some(additional) = self.worker_image_latent_additional(id, requested_units) else {
             return false;
         };
         let worker_capacity_ok = additional == 0
@@ -1935,33 +2076,45 @@ impl Scheduler {
         worker_capacity_ok && host_scratch_ok
     }
 
-    fn reserve_transition_resources(&mut self, transition: &PlannedTransition) -> bool {
+    fn reserve_transition_resources(&mut self, transition: &mut PlannedTransition) -> bool {
         let id = transition.request_id;
         let resources = &transition.resources;
+        let Some(additional_latent_units) =
+            self.worker_image_latent_additional(id, resources.latent_units)
+        else {
+            return false;
+        };
+        if additional_latent_units > 0
+            && self
+                .worker_image_latent_used()
+                .saturating_add(additional_latent_units)
+                > self.caps.max_latent_size as u64
+        {
+            return false;
+        }
+        let operation_credits = Self::operation_credits(transition);
+        let persistent_credits = self.transition_persistent_credits(transition);
+        let Some(reservation) = operation_credits.checked_add(persistent_credits) else {
+            return false;
+        };
+        let limits = self.route_credit_limits(transition.route);
+        if self
+            .ledger
+            .try_acquire(id, reservation, limits.per_request)
+            .is_err()
+        {
+            return false;
+        }
         let needs_host_scratch = self
             .running
             .get(&id)
             .is_some_and(|st| st.resources.host_scratch_tokens == 0)
             && resources.host_scratch_tokens > 0;
         if needs_host_scratch && !self.bm.reserve_scratch(id, resources.host_scratch_tokens) {
+            let _ = self.ledger.release(id, reservation);
             return false;
         }
-        if resources.latent_units > 0 {
-            self.ledger.ensure(
-                id,
-                uniserve_worker_wire::ResourceClass::ImageLatent,
-                resources.latent_units,
-                uniserve_worker_wire::LeasePolicy::Pinned,
-            );
-        }
-        if resources.host_scratch_tokens > 0 {
-            self.ledger.ensure(
-                id,
-                uniserve_worker_wire::ResourceClass::Scratch,
-                resources.host_scratch_tokens,
-                uniserve_worker_wire::LeasePolicy::PerRequest,
-            );
-        }
+        transition.reserved_credits = operation_credits;
         if let Some(st) = self.running.get_mut(&id) {
             st.resources.worker_image_latent_units = st
                 .resources
@@ -1971,23 +2124,42 @@ impl Scheduler {
                 .resources
                 .host_scratch_tokens
                 .max(resources.host_scratch_tokens);
+            st.resources.latent_credit_bytes = st
+                .resources
+                .latent_credit_bytes
+                .max(persistent_credits.latent_artifact_bytes);
+            st.resources.scratch_credit_pages = st
+                .resources
+                .scratch_credit_pages
+                .max(persistent_credits.kv_pages);
         }
         true
     }
 
     fn release_transition_resources(&mut self, id: RequestId, transition: &PlannedTransition) {
         for class in &transition.resources.release_on_apply {
-            self.ledger.release_class(id, *class);
             match class {
                 uniserve_worker_wire::ResourceClass::ImageLatent => {
                     if let Some(st) = self.running.get_mut(&id) {
+                        let credit = CreditVector {
+                            latent_artifact_bytes: st.resources.latent_credit_bytes,
+                            ..CreditVector::ZERO
+                        };
+                        let _ = self.ledger.release(id, credit);
                         st.resources.worker_image_latent_units = 0;
+                        st.resources.latent_credit_bytes = 0;
                     }
                 }
                 uniserve_worker_wire::ResourceClass::Scratch => {
                     self.bm.release_scratch(id);
                     if let Some(st) = self.running.get_mut(&id) {
+                        let credit = CreditVector {
+                            kv_pages: st.resources.scratch_credit_pages,
+                            ..CreditVector::ZERO
+                        };
+                        let _ = self.ledger.release(id, credit);
                         st.resources.host_scratch_tokens = 0;
+                        st.resources.scratch_credit_pages = 0;
                     }
                 }
                 _ => {}
@@ -2002,9 +2174,7 @@ impl Scheduler {
     }
 
     fn cpu_tasks_pending(&self) -> bool {
-        self.running
-            .values()
-            .any(|state| state.cpu_pending.is_some())
+        !self.cpu_deadlines.is_empty()
     }
 
     /// One loop iteration of the schedule-ahead loop. Returns true if any work
@@ -2038,6 +2208,7 @@ impl Scheduler {
         let _span = tracing::trace_span!("scheduler.step").entered();
         let mut progressed = self.flush_output_journals();
         progressed |= self.drain_cpu_continuations();
+        progressed |= self.expire_cpu_continuations();
         // 1. Resolve one completed batch. Refilling immediately after one
         // completion preserves an occupied execution slot when multiple
         // responses become ready together at pipeline depth greater than one.
@@ -2142,7 +2313,7 @@ impl Scheduler {
         self.stats
             .resources
             .active
-            .store(self.ledger.total_active(), Ordering::Relaxed);
+            .store(self.ledger.active_requests(), Ordering::Relaxed);
         self.stats
             .resources
             .invariant_violations
@@ -2287,6 +2458,8 @@ impl Scheduler {
                     Ok(_) => {
                         self.retiring_sessions.remove(&id);
                         self.bm.release(id);
+                        self.product_credits
+                            .retain(|product, _| product.request_key.session_id != id);
                         self.ledger.release_request(id);
                         self.ledger.assert_released(id);
                     }
@@ -2308,11 +2481,12 @@ impl Scheduler {
     ///
     /// Such a successor roots on a device version reference (`Point::Device`).
     /// A successor may depend on the predecessor's worker-local sampled-token
-    /// state only when committing one token cannot change host control flow:
-    /// the deterministic greedy text-decode subset whose next transition is
-    /// identical before and after the predecessor result becomes host-visible.
-    /// Every guard below matches the depth-one serial oracle so the pipelined
-    /// output stays token-identical.
+    /// state for the deterministic greedy subset. Replayability is not required:
+    /// the admitted session and its exact KV state remain resident until close.
+    /// Tokens that require host control flow, including a direct Gen trigger,
+    /// clear the worker's device continuation predicate so a registered
+    /// successor becomes a semantic no-op. Every guard below matches the
+    /// depth-one serial oracle so the pipelined output stays token-identical.
     fn can_queue_decode_successor(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -2324,7 +2498,8 @@ impl Scheduler {
             || state.cancelled
             || self.pending_finishes.contains_key(&id)
             || self.custom_logits_processors > 0
-            || !state.is_replayable_text()
+            || !matches!(state.lifecycle.phase, Phase::Prefill | Phase::DecodeUnd)
+            || (state.lifecycle.phase == Phase::Prefill && state.starts_gen_after_context())
             || !Self::device_token_relay_eligible(state)
         {
             return false;
@@ -2365,7 +2540,7 @@ impl Scheduler {
 
     fn device_token_relay_eligible(state: &ReqState) -> bool {
         let sampling = &state.req.sampling;
-        !state.req.behavior.gen_output
+        (!state.req.behavior.gen_output || state.req.policy.trigger.direct_token().is_some())
             && state.grammar.is_none()
             && state.req.stop_strings.is_empty()
             && state.req.stop_token_ids.is_empty()
@@ -2398,7 +2573,8 @@ impl Scheduler {
                 && state.is_replayable_text()
                 && state.lifecycle.phase == Phase::DecodeUnd
                 && !state.ingest.round_closing
-                && !state.req.behavior.gen_output
+                && (!state.req.behavior.gen_output
+                    || state.req.policy.trigger.direct_token().is_some())
                 && state.grammar.is_none()
         })
     }
@@ -2479,6 +2655,8 @@ impl Scheduler {
             match self.cpu_continuations.try_submit(task) {
                 Ok(()) => {
                     state.cpu_pending = Some(key);
+                    self.cpu_deadlines
+                        .insert(key, Instant::now() + self.cpu_task_timeout);
                     progressed = true;
                 }
                 Err(task) => {
@@ -2499,6 +2677,7 @@ impl Scheduler {
         }
         let mut failed = Vec::new();
         for result in ready {
+            self.cpu_deadlines.remove(&result.key);
             let Some(state) = self.running.get_mut(&result.key.request_id) else {
                 continue;
             };
@@ -2526,6 +2705,38 @@ impl Scheduler {
             self.finish_after_inflight(id, FinishReason::Error, None);
         }
         true
+    }
+
+    fn expire_cpu_continuations(&mut self) -> bool {
+        if self.cpu_deadlines.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        let expired = self
+            .cpu_deadlines
+            .iter()
+            .filter_map(|(key, deadline)| (*deadline <= now).then_some(*key))
+            .collect::<Vec<_>>();
+        let mut failed = Vec::new();
+        for key in expired {
+            self.cpu_deadlines.remove(&key);
+            if let Some(state) = self.running.get_mut(&key.request_id)
+                && state.cpu_pending == Some(key)
+            {
+                state.cpu_pending = None;
+                state.cpu_generation = state.cpu_generation.saturating_add(1);
+                failed.push(key.request_id);
+            }
+        }
+        for id in &failed {
+            tracing::error!(
+                request_id = id.0,
+                timeout_ms = self.cpu_task_timeout.as_millis(),
+                "CPU semantic continuation exceeded its request-local deadline"
+            );
+            self.finish_after_inflight(*id, FinishReason::Error, None);
+        }
+        !failed.is_empty()
     }
 
     fn output_credit_ready(&self, id: RequestId) -> bool {
@@ -2579,6 +2790,7 @@ impl Scheduler {
             .entry(request_id)
             .or_default()
             .push_back(InflightOp {
+                credits: transition.reserved_credits,
                 transition,
                 op_id,
                 spec_tokens,
@@ -2601,6 +2813,48 @@ impl Scheduler {
         }
         let inflight = queue.pop_front().expect("front checked above");
         let empty = queue.is_empty();
+        let parent_op_id = inflight
+            .transition
+            .operation
+            .as_ref()
+            .map_or(0, |operation| operation.parent.producer_op_id.0);
+        let product_credits = inflight
+            .transition
+            .operation
+            .as_ref()
+            .into_iter()
+            .flat_map(|operation| operation.outputs.iter())
+            .filter(|output| {
+                matches!(
+                    output.storage_class,
+                    StorageClass::DeviceTensor | StorageClass::LatentArena
+                )
+            })
+            .map(|output| {
+                let credit = CreditVector {
+                    device_products: 1,
+                    latent_artifact_bytes: if inflight.transition.resources.latent_units == 0
+                        && output.storage_class == StorageClass::LatentArena
+                    {
+                        output.max_bytes()
+                    } else {
+                        0
+                    },
+                    ..CreditVector::ZERO
+                };
+                (output.clone(), credit)
+            })
+            .collect::<Vec<_>>();
+        let product_credit = product_credits
+            .iter()
+            .try_fold(CreditVector::ZERO, |total, (_, credit)| {
+                total.checked_add(*credit)
+            })
+            .expect("bounded operation product credits fit one vector");
+        let transient_credit = inflight
+            .credits
+            .checked_sub(product_credit)
+            .expect("product credit is a sub-vector of operation credit");
         let result = (
             Some(inflight.transition),
             inflight.spec_tokens,
@@ -2609,7 +2863,48 @@ impl Scheduler {
         if empty {
             self.inflight_ops.remove(&id);
         }
+        let _ = self.ledger.release(id, transient_credit);
+        for (product, credit) in product_credits {
+            self.product_credits.insert(product, credit);
+        }
+        if parent_op_id > 0 {
+            self.release_operation_product_credits(id, parent_op_id);
+        }
         result
+    }
+
+    fn release_operation_product_credits(&mut self, id: RequestId, op_id: u64) {
+        let products = self
+            .product_credits
+            .keys()
+            .filter(|product| {
+                product.request_key.session_id == id && product.producer_op_id.0 == op_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.release_product_credits(products);
+    }
+
+    fn release_product_credits(&mut self, products: Vec<ProductRef>) {
+        for product in products {
+            if let Some(credit) = self.product_credits.remove(&product) {
+                let _ = self.ledger.release(product.request_key.session_id, credit);
+            }
+        }
+    }
+
+    fn release_products(&mut self, products: Vec<ProductRef>) {
+        if products.is_empty() {
+            return;
+        }
+        self.release_product_credits(products.clone());
+        let mut handles = products
+            .into_iter()
+            .map(|product| u64::from(product.generation))
+            .collect::<Vec<_>>();
+        handles.sort_unstable();
+        handles.dedup();
+        self.gated_control(ControlOp::ReleaseProducts(handles));
     }
 
     /// Failure policy after an executor/worker error.
@@ -2664,23 +2959,66 @@ impl Scheduler {
     }
 
     fn apply_result(&mut self, report: CompletionReport) {
-        // worker-reported batch compute time (one value per batch).
-        let CompletionReport {
-            step_id: result_step_id,
-            completions,
-            products,
-            worker_exec_us,
-            forward_stats,
-            ..
-        } = report;
-        if let Some(controls) = self.control_batches.remove(&result_step_id) {
-            self.acknowledge_controls(&controls);
+        let result_step_id = report.step_id;
+        let returned_partitions = report
+            .partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .collect::<Vec<_>>();
+        let batch_complete = if let Some(pending) = self.batch_partitions.get_mut(&result_step_id) {
+            for partition_id in &returned_partitions {
+                if !pending.remove(partition_id) {
+                    tracing::error!(
+                        step_id = result_step_id,
+                        partition_id,
+                        "executor returned a duplicate or unknown partition"
+                    );
+                    self.fatal = true;
+                }
+            }
+            pending.is_empty()
+        } else {
+            tracing::error!(
+                step_id = result_step_id,
+                "executor returned a result for an unknown batch"
+            );
+            self.fatal = true;
+            false
+        };
+        let worker_exec_us = report
+            .partitions
+            .iter()
+            .filter_map(|partition| partition.worker_exec_us)
+            .reduce(u64::saturating_add);
+        let forward_stats = report
+            .partitions
+            .iter()
+            .filter_map(|partition| partition.forward_stats.clone())
+            .collect::<Vec<_>>();
+        let products = report
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.products.iter().cloned())
+            .collect::<Vec<_>>();
+        let completions = report
+            .partitions
+            .into_iter()
+            .flat_map(|partition| partition.completions)
+            .collect::<Vec<_>>();
+        if batch_complete {
+            self.batch_partitions.remove(&result_step_id);
+            if let Some(controls) = self.control_batches.remove(&result_step_id) {
+                self.acknowledge_controls(&controls);
+            }
         }
         let batch_roundtrip_us = self
             .batch_started
-            .remove(&result_step_id)
+            .get(&result_step_id)
             .map(|start| start.elapsed().as_micros() as u64)
             .unwrap_or(0);
+        if batch_complete {
+            self.batch_started.remove(&result_step_id);
+        }
         let worker_us = worker_exec_us.unwrap_or(0);
         if let Some(w) = worker_exec_us {
             self.stats
@@ -2704,10 +3042,15 @@ impl Scheduler {
             .batch_timing_count
             .fetch_add(1, Ordering::Relaxed);
         let trace_enabled = self.trace_enabled();
-        let forward_stats_trace = trace_enabled
-            .then(|| forward_stats.as_ref().map(worker_forward_stats_trace))
-            .flatten();
-        self.record_worker_forward_stats(forward_stats.as_ref());
+        let forward_stats_trace = trace_enabled.then(|| {
+            forward_stats
+                .iter()
+                .map(worker_forward_stats_trace)
+                .collect::<Vec<_>>()
+        });
+        for stats in &forward_stats {
+            self.record_worker_forward_stats(Some(stats));
+        }
         let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completions.len()));
         let mut progress_ops = trace_enabled.then(|| Vec::with_capacity(completions.len()));
         let mut to_resolve = Vec::with_capacity(completions.len());
@@ -2855,15 +3198,6 @@ impl Scheduler {
                     .is_some_and(|operation| operation.advances_state);
             let latest_device_version = if advanced {
                 transition.operation.as_ref().and_then(|operation| {
-                    let selected_point = operation
-                        .outputs
-                        .iter()
-                        .find(|output| {
-                            output.kind == ProductKind::SelectedPoint
-                                && output.storage_class
-                                    == uniserve_worker_wire::StorageClass::DeviceTensor
-                        })
-                        .cloned();
                     let token = operation
                         .outputs
                         .iter()
@@ -2873,20 +3207,19 @@ impl Scheduler {
                                     == uniserve_worker_wire::StorageClass::DeviceTensor
                         })
                         .cloned();
-                    selected_point
-                        .zip(token)
-                        .map(|(selected_point, token)| ResidentDeviceVersion {
-                            producer: operation.work.variant(),
-                            token,
-                            version: VersionRef {
-                                request_key: operation.request_key,
-                                producer_op_id: operation.op_id,
-                                point: Point::Device {
-                                    selected_point,
-                                    producer_plan_digest: operation.plan_digest.clone(),
-                                },
+                    token.map(|token| ResidentDeviceVersion {
+                        producer: operation.work.variant(),
+                        token,
+                        version: VersionRef {
+                            request_key: operation.request_key,
+                            producer_op_id: operation.op_id,
+                            point: Point::Device {
+                                point_index: record.selected_point,
+                                selected_point: None,
+                                producer_plan_digest: operation.plan_digest.clone(),
                             },
-                        })
+                        },
+                    })
                 })
             } else {
                 None
@@ -2935,6 +3268,22 @@ impl Scheduler {
                 }
             }
             self.release_transition_resources(id, &transition);
+            if matches!(
+                operation_variant,
+                WorkVariant::GenFlow | WorkVariant::Materialize
+            ) {
+                let consumed_latents = transition
+                    .operation
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|operation| operation.inputs.iter())
+                    .filter(|product| product.kind == ProductKind::Latent)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !consumed_latents.is_empty() {
+                    self.release_products(consumed_latents);
+                }
+            }
             let priority = match operation_variant {
                 WorkVariant::GenFlow
                 | WorkVariant::Materialize
@@ -2946,6 +3295,13 @@ impl Scheduler {
                 .get(&id)
                 .map_or(0, |state| state.public_token_seq);
             if record.status == OpStatus::Predicated {
+                let unused_products = transition
+                    .operation
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|operation| operation.outputs.iter().cloned())
+                    .collect();
+                self.release_products(unused_products);
                 self.finish_pending_if_idle(id);
             } else {
                 to_resolve.push((
@@ -2979,7 +3335,13 @@ impl Scheduler {
                 WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
             );
             if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
-                self.resolve(id, transition, view, draft_token_ids);
+                self.resolve(
+                    id,
+                    transition,
+                    view,
+                    draft_token_ids,
+                    prefix_versions.clone(),
+                );
             }
             if token_operation {
                 let mut commit_without_decoder_event = None;
@@ -3182,6 +3544,7 @@ impl Scheduler {
         // failed here, so drop their pending submit-timestamps too — otherwise
         // `batch_started` accumulates orphaned entries for every failed batch.
         self.batch_started.clear();
+        self.batch_partitions.clear();
         for id in ids {
             if self.running.contains_key(&id) {
                 self.emit(
@@ -3198,6 +3561,7 @@ impl Scheduler {
     fn fail_all_running(&mut self, message: &str) {
         self.inflight_ops.clear();
         self.batch_started.clear();
+        self.batch_partitions.clear();
         let ids = self.running.keys().copied().collect::<Vec<_>>();
         for id in ids {
             self.emit(
@@ -3235,7 +3599,7 @@ impl Scheduler {
     /// Admission: consume the waiting-queue head while budgets allow (vLLM's
     /// posture — head-of-line, `max_num_seqs`-capped). Reserving requests
     /// allocate their full worst-case KV here, which is what makes them
-    /// Preemption-exempt by construction.
+    /// resident for its complete lifetime.
     fn admit(&mut self) {
         if self.sleeping {
             return;
@@ -3264,6 +3628,28 @@ impl Scheduler {
             let Some(head) = self.pending.peek_request() else {
                 break;
             };
+            let request_id = head.req.request_id;
+            let admission_credits = self.request_base_credits(head);
+            let credit_limits = self.route_credit_limits(uniserve_worker_wire::RouteId(0));
+            if !credit_limits.per_request.contains(admission_credits) {
+                let st = self.pending.pop_request().expect("queue head was present");
+                self.record_decision(
+                    request_id,
+                    crate::policy::PolicyReason::RejectedTooLarge,
+                    st.resources.worstcase_blocks,
+                );
+                let _ = st.event_tx.send(GenEvent::Rejected {
+                    message: "request exceeds the route credit declaration".into(),
+                });
+                continue;
+            }
+            if self
+                .ledger
+                .can_acquire(request_id, admission_credits, credit_limits.per_request)
+                .is_err()
+            {
+                break;
+            }
 
             if head.resources.reserve_worstcase {
                 let need = head.resources.worstcase_blocks;
@@ -3361,22 +3747,20 @@ impl Scheduler {
                 }
             }
 
-            // No room now. Under Priority, a higher-priority arrival preempts a
-            // lower-priority budgeted running request to be admitted; retry if
-            // a victim was freed, else stop (the queue is ordered, so later
-            // entries can't fit either).
-            let head_priority = self.pending.peek_request().map(|s| s.req.priority);
-            if let Some(prio) = head_priority
-                && self.preempt_for_admission(prio)
-            {
-                continue;
-            }
+            // Exact checkpoints retain their physical KV identity. Until the
+            // configured route provides relocatable checkpoint storage, a
+            // resident request remains non-preemptible and admission queues.
             break;
         }
     }
 
     fn admit_running(&mut self, mut st: ReqState) {
         let id = st.req.request_id;
+        let credits = self.request_base_credits(&st);
+        let limits = self.route_credit_limits(uniserve_worker_wire::RouteId(0));
+        self.ledger
+            .try_acquire(id, credits, limits.per_request)
+            .expect("admission credit was preflighted against an unchanged ledger");
         let q = st.queued_at;
         let scheduled_at = now();
         let queue_wait_us = ((scheduled_at - q).max(0.0) * 1_000_000.0) as u64;
@@ -3392,11 +3776,6 @@ impl Scheduler {
             .timing
             .queue_wait_us_max
             .fetch_max(queue_wait_us, Ordering::Relaxed);
-        // lease KvBlock capacity in BLOCKS, the same unit the worker's
-        // ResourceRuntime accounts (`len(new_blocks)` against `num_blocks`).
-        // Capacity is counted in blocks, not tokens multiplied by `block_size`.
-        // `resources.rs` (ResourceLease::capacity) is the unit authority: KvBlock is blocks.
-        let kv_capacity = st.resources.worstcase_blocks as u64;
         let generation = behavior_str(&st.req);
         let phase = phase_str(st.lifecycle.phase);
         let prompt_tokens = st.context.prompt_ids.len();
@@ -3439,13 +3818,6 @@ impl Scheduler {
             "reserved_blocks": self.reserved_blocks,
             "reserved_encoder_entries": self.reserved_encoder_entries,
         }));
-        // lease this request's KV residency (released at finish/drop/preempt).
-        self.ledger.issue(
-            id,
-            uniserve_worker_wire::ResourceClass::KvBlock,
-            kv_capacity,
-            uniserve_worker_wire::LeasePolicy::PerRequest,
-        );
         let bs = self.caps.block_size as usize;
         if let Some(st) = self.running.get_mut(&id) {
             self.prefix_cache.lookup(st, &mut self.bm, &self.stats, bs);
@@ -3471,7 +3843,7 @@ impl Scheduler {
         if ops.is_empty() && lane == Some(AssemblyLane::Prefill) {
             // Prefill runs first *if possible* (SGLang's order). When no
             // prefill op could actually be built (e.g. blocked on KV memory
-            // it may not preempt), fall through to the decode lane instead of
+            // it cannot displace), fall through to the decode lane instead of
             // idling — otherwise a starved waiting prompt would stall ready
             // decodes forever.
             return self.assemble_pass(&ids, Some(AssemblyLane::Decode));
@@ -3615,118 +3987,90 @@ impl Scheduler {
             {
                 continue;
             }
-            // Build an op; on a block-budget miss, preempt a budgeted victim
-            // and retry — else skip this request for the step.
-            let mut tries = 0usize;
-            loop {
-                let op_budget = if mixed_prefill {
-                    budget.min(mixed_left)
+            // Build one operation when its exact resident resources fit.
+            let op_budget = if mixed_prefill {
+                budget.min(mixed_left)
+            } else {
+                budget
+            };
+            if let Some(mut op) = self.next_transition(id, op_budget) {
+                if mixed_prefill {
+                    mixed_left = mixed_left.saturating_sub(planned_op_token_cost(&op));
+                }
+                budget = budget.saturating_sub(planned_op_token_cost(&op));
+                // Stateful-diff contract: a request's static state and
+                // initial block allocation cross once, ahead of its
+                // first op; the op then carries only deltas.
+                let finish_token_ids = self
+                    .running
+                    .get(&id)
+                    .map(|state| canonical_continuation_stop_token_ids(&state.req, &self.ctrl.eos))
+                    .unwrap_or_default();
+                if let Some(st) = self.running.get_mut(&id)
+                    && !st.resources.worker_registered
+                {
+                    st.resources.worker_registered = true;
+                    let initial_blocks = std::mem::take(&mut op.new_blocks);
+                    let request_key = RequestKey::new(self.authority_id, id, st.epoch);
+                    let admission = Admission::new(
+                        request_key,
+                        Some(UndAdmission {
+                            sampling: st.req.sampling.clone(),
+                            negative_token_ids: st.context.negative_prompt_ids.clone(),
+                            finish_token_ids,
+                            kv: KvAllocation {
+                                block_ids: initial_blocks,
+                                prefix_len: st.ingest.prompt_cursor,
+                                group_id: 0,
+                            },
+                        }),
+                        st.req.behavior.gen_output.then(|| GenAdmission {
+                            image: st.req.image.clone(),
+                        }),
+                        st.req.lora_id,
+                    )
+                    .expect("validated request produces a valid admission");
+                    // The admission-root version is produced by the synthetic
+                    // admission, identified by operation-id 0 — the sentinel the
+                    // worker seeds as its initial committed version — so the first
+                    // operation's fixed parent matches the worker's committed state.
+                    st.resolved_semantic = admission.digest.clone();
+                    st.resolved_producer_op_id = 0;
+                    st.committed_semantic = admission.digest.clone();
+                    st.committed_producer_op_id = 0;
+                    st.latest_device_version = None;
+                    st.admission_digest = Some(admission.digest.clone());
+                    st.token_cutoffs.clear();
+                    st.token_cutoffs.insert(
+                        st.public_token_seq,
+                        VersionRef {
+                            request_key,
+                            producer_op_id: OpId(0),
+                            point: Point::Fixed {
+                                point_index: 0,
+                                semantic_digest: admission.digest.clone(),
+                            },
+                        },
+                    );
+                    admissions.push(admission);
+                }
+                if !self.reserve_transition_resources(&mut op) {
+                    self.return_unsent_blocks(id, &op);
+                    tracing::debug!(
+                        request_id = id.0,
+                        "operation registration is paused by finite-credit pressure"
+                    );
+                    continue;
+                }
+                selected.insert(id);
+                let placed_flow = op.operation_variant == WorkVariant::GenFlow;
+                if mixed_prefill {
+                    mixed_ops.push(op);
                 } else {
-                    budget
-                };
-                match self.next_transition(id, op_budget) {
-                    Some(mut op) => {
-                        if mixed_prefill {
-                            mixed_left = mixed_left.saturating_sub(planned_op_token_cost(&op));
-                        }
-                        budget = budget.saturating_sub(planned_op_token_cost(&op));
-                        // Stateful-diff contract: a request's static state and
-                        // initial block allocation cross once, ahead of its
-                        // first op; the op then carries only deltas.
-                        let finish_token_ids = self
-                            .running
-                            .get(&id)
-                            .map(|state| canonical_finish_token_ids(&state.req, &self.ctrl.eos))
-                            .unwrap_or_default();
-                        if let Some(st) = self.running.get_mut(&id)
-                            && !st.resources.worker_registered
-                        {
-                            st.resources.worker_registered = true;
-                            let initial_blocks = std::mem::take(&mut op.new_blocks);
-                            let request_key = RequestKey::new(self.authority_id, id, st.epoch);
-                            let admission = Admission::new(
-                                request_key,
-                                Some(UndAdmission {
-                                    sampling: st.req.sampling.clone(),
-                                    negative_token_ids: st.context.negative_prompt_ids.clone(),
-                                    finish_token_ids,
-                                    kv: KvAllocation {
-                                        block_ids: initial_blocks,
-                                        prefix_len: st.ingest.prompt_cursor,
-                                        group_id: 0,
-                                    },
-                                }),
-                                st.req.behavior.gen_output.then(|| GenAdmission {
-                                    image: st.req.image.clone(),
-                                }),
-                                st.req.lora_id,
-                            )
-                            .expect("validated request produces a valid admission");
-                            // The admission-root version is produced by the synthetic
-                            // admission, identified by operation-id 0 — the sentinel the
-                            // worker seeds as its initial committed version — so the first
-                            // operation's fixed parent matches the worker's committed state.
-                            st.resolved_semantic = admission.digest.clone();
-                            st.resolved_producer_op_id = 0;
-                            st.committed_semantic = admission.digest.clone();
-                            st.committed_producer_op_id = 0;
-                            st.latest_device_version = None;
-                            st.admission_digest = Some(admission.digest.clone());
-                            st.token_cutoffs.clear();
-                            st.token_cutoffs.insert(
-                                st.public_token_seq,
-                                VersionRef {
-                                    request_key,
-                                    producer_op_id: OpId(0),
-                                    point: Point::Fixed {
-                                        point_index: 0,
-                                        semantic_digest: admission.digest.clone(),
-                                    },
-                                },
-                            );
-                            admissions.push(admission);
-                        }
-                        if !self.reserve_transition_resources(&op) {
-                            tracing::error!(
-                                request_id = id.0,
-                                "planned resource reservation failed after readiness check"
-                            );
-                            self.finish(id, FinishReason::Error);
-                            break;
-                        }
-                        selected.insert(id);
-                        let placed_flow = op.operation_variant == WorkVariant::GenFlow;
-                        if mixed_prefill {
-                            mixed_ops.push(op);
-                        } else {
-                            ops.push(op);
-                        }
-                        if self.flow_exclusive_batch && placed_flow {
-                            budget = 0;
-                        }
-                        break;
-                    }
-                    None => {
-                        if self
-                            .running
-                            .get(&id)
-                            .map(|st| st.image_gen.branch_pending)
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
-                        // A mixed rider must not preempt running decodes to
-                        // make room for itself; it waits for a prefill-lane
-                        // step instead.
-                        if mixed_prefill {
-                            break;
-                        }
-                        if tries < self.running.len() && self.preempt_one(id, &selected) {
-                            tries += 1;
-                            continue;
-                        }
-                        break;
-                    }
+                    ops.push(op);
+                }
+                if self.flow_exclusive_batch && placed_flow {
+                    budget = 0;
                 }
             }
         }
@@ -3847,6 +4191,7 @@ impl Scheduler {
             Phase::DecodeUnd => WorkVariant::TokenDecode,
             Phase::CloseKv => WorkVariant::TokenExtend,
             Phase::PublishKv => WorkVariant::TransferKvPublish,
+            Phase::TransitionGen => WorkVariant::GenTransition,
             Phase::DenoiseGen => WorkVariant::GenFlow,
             Phase::CommitGen => WorkVariant::Materialize,
             Phase::FeedbackEncode => {
@@ -3858,186 +4203,6 @@ impl Scheduler {
             }
             Phase::FeedbackState => WorkVariant::TokenExtend,
         })
-    }
-
-    fn preemptible(&self, id: RequestId) -> bool {
-        self.running.get(&id).is_some_and(|st| {
-            if st.resources.reserve_worstcase
-                || !st.is_replayable_text()
-                || st.semantic_commit.is_some()
-                || st.cpu_pending.is_some()
-            {
-                return false;
-            }
-            // generated branch replay is too expensive under high concurrency: even
-            // prompt-only victims can quickly become prompt++generated victims and
-            // churn the same long prefix forever. Keep these requests resident.
-            if st.continues_after_gen_commit() {
-                return false;
-            }
-            true
-        })
-    }
-
-    /// Preemption under decode-growth pressure: free a budgeted victim so
-    /// `protect` can grow. FCFS evicts the last-admitted budgeted running
-    /// request; Priority evicts a strictly lower-priority request. Never
-    /// touches a request with an op in flight (its KV is being written), the
-    /// protected requester, a higher/equal-priority request under Priority, or
-    /// a worst-case-reserving request (their blocks are pre-allocated and
-    /// eviction would discard diffusion work).
-    fn preempt_one(&mut self, protect: RequestId, selected: &HashSet<RequestId>) -> bool {
-        let protect_priority = self.running.get(&protect).map(|st| st.req.priority);
-        let candidates: Vec<RequestId> = self
-            .order
-            .iter()
-            .copied()
-            .filter(|x| *x != protect && !selected.contains(x) && !self.has_inflight(*x))
-            .filter(|x| self.preemptible(*x))
-            .filter(|x| {
-                self.config.policy != SchedulingPolicy::Priority
-                    || protect_priority
-                        .map(|priority| self.running[x].req.priority > priority)
-                        .unwrap_or(false)
-            })
-            .collect();
-        if candidates.is_empty() {
-            return false;
-        }
-        let victim = match self.config.policy {
-            SchedulingPolicy::Priority => *candidates
-                .iter()
-                .max_by_key(|x| self.running[x].req.priority)
-                .unwrap(),
-            SchedulingPolicy::Fcfs => *candidates.last().unwrap(), // most-recently-admitted
-        };
-        self.do_preempt(victim);
-        true
-    }
-
-    /// Preemption under admission pressure (Priority policy): free a strictly
-    /// lower-priority budgeted running request so a higher-priority pending
-    /// request can be admitted. Returns true if a victim was preempted.
-    fn preempt_for_admission(&mut self, requester_priority: i32) -> bool {
-        if self.config.policy != SchedulingPolicy::Priority {
-            return false;
-        }
-        let victim = self
-            .order
-            .iter()
-            .copied()
-            .filter(|x| !self.has_inflight(*x))
-            .filter(|x| self.preemptible(*x))
-            .filter(|x| self.running[x].req.priority > requester_priority)
-            .max_by_key(|x| self.running[x].req.priority);
-        match victim {
-            Some(v) => {
-                self.do_preempt(v);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Release a victim's blocks, reset it for recompute (KV rebuilt over
-    /// `prompt ++ generated`), and re-queue it so it restarts promptly. The
-    /// worker's control record is dropped; resumption re-registers.
-    fn do_preempt(&mut self, victim: RequestId) {
-        self.requeue_for_recompute(victim);
-    }
-
-    fn requeue_for_recompute(&mut self, victim: RequestId) {
-        let mut st = match self.running.remove(&victim) {
-            Some(s) => s,
-            None => return,
-        };
-        self.order.retain(|x| *x != victim);
-        self.reserved_encoder_entries = self
-            .reserved_encoder_entries
-            .saturating_sub(st.req.resources.encoder_cache_keys.len());
-        if st.resources.reserve_worstcase {
-            self.reserved_blocks = self
-                .reserved_blocks
-                .saturating_sub(st.resources.worstcase_blocks);
-        }
-        let mut free_encoder_handles = std::mem::take(&mut st.ingest.transient_encoder_handles);
-        for pin in &st.ingest.acquired_encoder_pins {
-            if let Some(product) = self.enc_cache.release(pin.key, &pin.product) {
-                free_encoder_handles.push(u64::from(product.generation));
-            }
-        }
-        if !free_encoder_handles.is_empty() {
-            self.gated_control(ControlOp::ReleaseProducts(free_encoder_handles));
-        }
-        self.bm.release(victim);
-        // a preempted request is re-queued and re-admitted (which re-issues
-        // its lease), so release its current leases now to avoid a stale double.
-        self.ledger.release_request(victim);
-        if let Err(error) = self
-            .executor
-            .control_wait(ControlOp::DropSession(victim), None)
-        {
-            tracing::warn!(
-                request_id = victim.0,
-                %error,
-                "preemption drop_request control failed"
-            );
-        }
-        let mut recompute = st.context.prompt_ids.clone();
-        recompute.extend_from_slice(&st.replay.generated_ids);
-        let generated_ids = std::mem::take(&mut st.replay.generated_ids);
-        let generated_count = st.und.tokens_emitted;
-        let text_since_image = st.und.text_since_image;
-        let prompt_logprobs_emitted = st.ingest.prompt_logprobs_emitted;
-        let worstcase_blocks = st.resources.worstcase_blocks;
-        let reserve_worstcase = st.resources.reserve_worstcase;
-        st.cursor = GenerationCursor::new(Phase::Prefill, worstcase_blocks, reserve_worstcase);
-        st.epoch = self.next_epoch;
-        st.version = 0;
-        st.admission_digest = None;
-        st.resolved_semantic = String::new();
-        st.resolved_producer_op_id = 0;
-        st.committed_version = 0;
-        st.committed_semantic = String::new();
-        st.committed_producer_op_id = 0;
-        st.control_seq = 0;
-        st.public_event_limit = 0;
-        st.token_cutoffs.clear();
-        st.semantic_commit = None;
-        st.cancel_cutoff = None;
-        st.cpu_masks = None;
-        st.cpu_tokens_to_advance.clear();
-        st.cpu_generation = 0;
-        st.latest_device_version = None;
-        self.pending_controls
-            .retain(|control| control.request_key().session_id != victim);
-        self.next_epoch = self.next_epoch.saturating_add(1);
-        st.replay.generated_ids = generated_ids;
-        st.replay.recompute_ids = Some(recompute);
-        st.replay.preempted = true;
-        st.und.tokens_emitted = generated_count;
-        st.und.text_since_image = text_since_image;
-        st.ingest.prompt_logprobs_emitted = prompt_logprobs_emitted;
-        st.trace.push(crate::trace::TraceEvent::at(
-            crate::trace::TraceEventKind::Preempted,
-        ));
-        self.trace_record(json!({
-            "event": "request_preempted",
-            "at_s": now(),
-            "request_id": victim.0,
-            "generated_tokens": st.replay.generated_ids.len(),
-            "prompt_tokens": st.context.prompt_ids.len(),
-            "reset_phase": phase_str(st.lifecycle.phase),
-            "pending_before_requeue": self.pending.len(),
-            "running": self.running.len(),
-            "free_blocks": self.bm.free_blocks(),
-        }));
-        self.pending.prepend_request(st);
-        self.stats
-            .general
-            .preemptions
-            .fetch_add(1, Ordering::Relaxed);
-        self.record_decision(victim, crate::policy::PolicyReason::Preempted, 0);
     }
 
     fn submit_batch(
@@ -4119,12 +4284,15 @@ impl Scheduler {
                         request_key,
                         producer_op_id: predecessor.op_id,
                         point: Point::Device {
-                            selected_point: predecessor
-                                .outputs
-                                .iter()
-                                .find(|output| output.kind == ProductKind::SelectedPoint)
-                                .cloned()
-                                .expect("token predecessor has a selected-point product"),
+                            point_index: u32::from(predecessor.bounds.max_points == 1),
+                            selected_point: (predecessor.bounds.max_points > 1).then(|| {
+                                predecessor
+                                    .outputs
+                                    .iter()
+                                    .find(|output| output.kind == ProductKind::SelectedPoint)
+                                    .cloned()
+                                    .expect("multi-point predecessor has a selected-point product")
+                            }),
                             producer_plan_digest: predecessor.plan_digest.clone(),
                         },
                     },
@@ -4322,11 +4490,18 @@ impl Scheduler {
             })
             .collect::<Vec<_>>();
         controls.extend(releases);
-        let batch = Batch::new(self.step_id, admissions, wire_ops)
+        let partitions = self.partition_batch(wire_ops);
+        let partition_ids = partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .collect::<HashSet<_>>();
+        self.batch_partitions.insert(step, partition_ids);
+        let batch = Batch::new(step, admissions, partitions)
             .with_controls(controls.clone())
             .with_input_products(input_products);
         if let Err(e) = self.executor.submit(batch) {
             self.batch_started.remove(&step);
+            self.batch_partitions.remove(&step);
             self.trace_record(json!({
                 "event": "batch_submit_failed",
                 "at_s": now(),
@@ -4355,6 +4530,127 @@ impl Scheduler {
                     .fetch_max(count, Ordering::Relaxed);
             }
         }
+    }
+
+    fn partition_batch(&mut self, operations: Vec<Operation>) -> Vec<BatchPartition> {
+        let mut routes: RouteDomainOperations = Vec::new();
+        for operation in operations {
+            let route = operation.route;
+            let domain = operation.domain;
+            let groups = if let Some((_, groups)) =
+                routes.iter_mut().find(|(candidate, _)| *candidate == route)
+            {
+                groups
+            } else {
+                routes.push((route, Vec::new()));
+                &mut routes.last_mut().expect("route was inserted").1
+            };
+            if let Some((_, members)) = groups
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == domain)
+            {
+                members.push(operation);
+            } else {
+                groups.push((domain, vec![operation]));
+            }
+        }
+        let mut partitions = Vec::new();
+        let mut next_partition_id = 1u32;
+        let mut next_submission_group = 1u32;
+        for (route, groups) in routes {
+            let mixed_capable = self
+                .caps
+                .execution_constraints
+                .route_capabilities
+                .iter()
+                .any(|capability| capability.route == route && capability.tensorized_mixed);
+            let mut mixed_candidates = Vec::new();
+            let mut homogeneous = Vec::new();
+            for (domain, operations) in groups {
+                if !mixed_capable {
+                    homogeneous.push((domain, operations));
+                    continue;
+                }
+                let (candidates, independent): (Vec<_>, Vec<_>) = operations
+                    .into_iter()
+                    .partition(|operation| tensorized_mixed_runner_work(operation.work.variant()));
+                if !candidates.is_empty() {
+                    mixed_candidates.push((domain, candidates));
+                }
+                if !independent.is_empty() {
+                    homogeneous.push((domain, independent));
+                }
+            }
+            let candidate_variants = mixed_candidates
+                .iter()
+                .flat_map(|(_, operations)| {
+                    operations.iter().map(|operation| operation.work.variant())
+                })
+                .collect::<HashSet<_>>();
+            let tensorized_mixed = mixed_candidates.len() > 1
+                && candidate_variants.contains(&WorkVariant::GenFlow)
+                && candidate_variants.iter().any(|variant| {
+                    matches!(
+                        variant,
+                        WorkVariant::TokenExtend
+                            | WorkVariant::TokenDecode
+                            | WorkVariant::TokenVerify
+                            | WorkVariant::Draft
+                    )
+                });
+            if !tensorized_mixed {
+                homogeneous.append(&mut mixed_candidates);
+            }
+            if tensorized_mixed {
+                let collective_seq = {
+                    let value = self.next_collective_seq.max(1);
+                    self.next_collective_seq = value.saturating_add(1);
+                    value
+                };
+                let attention = partition_attention(
+                    &mixed_candidates
+                        .iter()
+                        .flat_map(|(_, operations)| operations.iter().cloned())
+                        .collect::<Vec<_>>(),
+                );
+                for (domain, operations) in mixed_candidates {
+                    partitions.push(BatchPartition {
+                        partition_id: next_partition_id,
+                        submission_group: next_submission_group,
+                        collective_seq,
+                        domain,
+                        route,
+                        execution: ExecutionCapability::TensorizedMixed,
+                        attention,
+                        shape_class: 0,
+                        operations,
+                    });
+                    next_partition_id = next_partition_id.saturating_add(1);
+                }
+                next_submission_group = next_submission_group.saturating_add(1);
+            }
+            for (domain, operations) in homogeneous {
+                let collective_seq = {
+                    let value = self.next_collective_seq.max(1);
+                    self.next_collective_seq = value.saturating_add(1);
+                    value
+                };
+                partitions.push(BatchPartition {
+                    partition_id: next_partition_id,
+                    submission_group: next_submission_group,
+                    collective_seq,
+                    domain,
+                    route,
+                    execution: ExecutionCapability::DomainHomogeneous,
+                    attention: partition_attention(&operations),
+                    shape_class: 0,
+                    operations,
+                });
+                next_partition_id = next_partition_id.saturating_add(1);
+                next_submission_group = next_submission_group.saturating_add(1);
+            }
+        }
+        partitions
     }
 
     fn generated_trigger_matches(st: &ReqState) -> bool {
@@ -4410,9 +4706,17 @@ impl Scheduler {
         new
     }
 
+    fn return_unsent_blocks(&mut self, id: RequestId, transition: &PlannedTransition) {
+        if let Some(state) = self.running.get_mut(&id) {
+            state.resources.blocks_sent = state
+                .resources
+                .blocks_sent
+                .saturating_sub(transition.new_blocks.len());
+        }
+    }
+
     /// Build the next op for a running request, given the remaining per-step token
-    /// `budget`. Returns `None` only when the block budget can't be satisfied
-    /// (the caller may preempt a budgeted victim and retry).
+    /// `budget`. Returns `None` when the block budget cannot be satisfied.
     /// Data-plane causality gate: whether the request's next op may be dispatched
     /// given that its input tensors must be reachable on the worker that will run
     /// that will run it. Delegates to the executor, which is the `StageRouter`
@@ -4507,6 +4811,17 @@ impl Scheduler {
                 )
             }
             Phase::DecodeUnd => {
+                let projected_successor = self.has_inflight(id);
+                let mut sampling_state = self.sampling_state(id);
+                if projected_successor {
+                    let state = self.running.get(&id)?;
+                    sampling_state.force_finish = state
+                        .und
+                        .tokens_emitted
+                        .saturating_add(self.inflight_len(id))
+                        .saturating_add(1)
+                        >= state.req.max_und_tokens;
+                }
                 let st = self.running.get(&id)?;
                 // The prior committed token this decode continues from. It is
                 // attached as a host input only when no exact selected-point
@@ -4514,23 +4829,8 @@ impl Scheduler {
                 let input_token = st.und.next_token;
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
-                let projected_successor = self.has_inflight(id);
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let tok = if relay_input { 0 } else { st.und.next_token };
-                let sampling_state = if projected_successor {
-                    SamplingState {
-                        finish_token_ids: canonical_finish_token_ids(&st.req, &self.ctrl.eos),
-                        force_finish: st
-                            .und
-                            .tokens_emitted
-                            .saturating_add(self.inflight_len(id))
-                            .saturating_add(1)
-                            >= st.req.max_und_tokens,
-                        ..SamplingState::default()
-                    }
-                } else {
-                    self.sampling_state(id)
-                };
                 let spec_token_ids =
                     if !projected_successor && budget > 1 && self.supports_spec_decode() {
                         self.running.get(&id).and_then(|st| {
@@ -4605,6 +4905,21 @@ impl Scheduler {
                     },
                 )
             }
+            Phase::TransitionGen => {
+                let st = self.running.get(&id)?;
+                let conditioning = st.image_gen.conditioning.clone()?;
+                let image_id = st.image_gen.image_id;
+                let latent_units = self.worker_image_latent_units_for(st).max(1);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::TransitionGen {
+                        image_id,
+                        latent_units,
+                        conditioning,
+                    },
+                )
+            }
             Phase::DenoiseGen => {
                 // The flow runs exactly `image.steps` denoise quanta; once they
                 // are all done, advance to the commit phase and plan its
@@ -4639,7 +4954,8 @@ impl Scheduler {
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
                 let host_scratch_tokens = self.denoise_host_scratch_tokens(st);
                 let image_id = st.image_gen.image_id;
-                let conditioning = st.image_gen.conditioning.clone();
+                let conditioning = st.image_gen.conditioning.clone()?;
+                let latent = st.image_gen.latent.clone()?;
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
@@ -4652,14 +4968,20 @@ impl Scheduler {
                         latent_units,
                         host_scratch_tokens,
                         conditioning,
+                        latent,
                     },
                 )
             }
             Phase::CommitGen => {
                 let st = self.running.get(&id)?;
                 let image_id = st.image_gen.image_id;
+                let latent = st.image_gen.latent.clone()?;
                 let projection = self.projected_cursor(id)?;
-                self.plan_intent(id, projection, TransitionIntent::CommitGen { image_id })
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::CommitGen { image_id, latent },
+                )
             }
             Phase::FeedbackEncode => {
                 let st = self.running.get(&id)?;
@@ -4958,7 +5280,7 @@ impl Scheduler {
                 counts.into_iter().collect()
             })
             .unwrap_or_default();
-        let finish_token_ids = canonical_finish_token_ids(&state.req, &self.ctrl.eos);
+        let finish_token_ids = canonical_continuation_stop_token_ids(&state.req, &self.ctrl.eos);
         SamplingState {
             recent_counts,
             allowed_token_ids,
@@ -4985,6 +5307,7 @@ impl Scheduler {
         id: RequestId,
         view: SequenceView,
         draft_token_ids: Vec<u32>,
+        prefix_versions: &[VersionRef],
     ) {
         self.bm.activate(id);
         let accepted =
@@ -5005,7 +5328,14 @@ impl Scheduler {
             };
             st.und.tokens_emitted += 1;
             let top_logprobs = is_sampled.then(|| view.top_logprobs.clone());
-            if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_sampled) {
+            if self.emit_or_finish_und_token(
+                id,
+                tok,
+                logprob,
+                top_logprobs,
+                is_sampled,
+                prefix_versions.get(index),
+            ) {
                 return;
             }
             if let Some(st) = self.running.get_mut(&id) {
@@ -5017,7 +5347,12 @@ impl Scheduler {
         }
     }
 
-    fn resolve_decode_text(&mut self, id: RequestId, view: SequenceView) {
+    fn resolve_decode_text(
+        &mut self,
+        id: RequestId,
+        view: SequenceView,
+        prefix_versions: &[VersionRef],
+    ) {
         self.bm.activate(id);
         if self
             .running
@@ -5088,7 +5423,14 @@ impl Scheduler {
                 tok
             };
             let top_logprobs = is_last.then(|| view.top_logprobs.clone());
-            if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_last) {
+            if self.emit_or_finish_und_token(
+                id,
+                tok,
+                logprob,
+                top_logprobs,
+                is_last,
+                prefix_versions.get(idx),
+            ) {
                 return;
             }
             if let Some(st) = self.running.get_mut(&id) {
@@ -5118,6 +5460,7 @@ impl Scheduler {
         transition: PlannedTransition,
         mut view: SequenceView,
         draft_token_ids: Vec<u32>,
+        prefix_versions: Vec<VersionRef>,
     ) {
         let operation_variant = transition.operation_variant;
         if !view.prompt_logprobs.is_empty() {
@@ -5125,10 +5468,10 @@ impl Scheduler {
             self.resolve_prompt_logprobs(id, positions);
         }
         if operation_variant == WorkVariant::TokenVerify && !draft_token_ids.is_empty() {
-            return self.resolve_spec_decode_text(id, view, draft_token_ids);
+            return self.resolve_spec_decode_text(id, view, draft_token_ids, &prefix_versions);
         }
         if operation_variant == WorkVariant::TokenDecode {
-            return self.resolve_decode_text(id, view);
+            return self.resolve_decode_text(id, view, &prefix_versions);
         }
         match operation_variant {
             WorkVariant::TokenExtend => {
@@ -5212,6 +5555,7 @@ impl Scheduler {
                             view.sampled_logprob,
                             Some(view.top_logprobs.clone()),
                             true,
+                            prefix_versions.last(),
                         ) {
                             return;
                         }
@@ -5256,7 +5600,6 @@ impl Scheduler {
                 }
                 let (starts_gen_after_context, can_open_gen_branch) = {
                     let st = self.running.get_mut(&id).unwrap();
-                    st.replay.recompute_ids = None;
                     st.und.tokens_emitted += 1;
                     (st.starts_gen_after_context(), st.can_open_gen_branch())
                 };
@@ -5314,6 +5657,7 @@ impl Scheduler {
                     logprob,
                     Some(view.top_logprobs.clone()),
                     true,
+                    prefix_versions.last(),
                 ) {
                     return;
                 }
@@ -5382,7 +5726,8 @@ impl Scheduler {
                     let Some(event) = image_done_event(image_id, image_b64) else {
                         return self.finish(id, FinishReason::Error);
                     };
-                    self.emit(id, event);
+                    let root = self.fixed_version(id);
+                    self.emit_visible(id, event, root.as_ref(), PublicModality::Image);
                 }
                 self.bm.activate(id);
                 let (continues_after_gen_commit, feedback_source) = {
@@ -5427,15 +5772,8 @@ impl Scheduler {
                         st.feedback.source_product = source_product;
                         st.feedback.encoded_product = None;
                         st.lifecycle.phase = Phase::FeedbackEncode;
-                        if let Some(generation) = st
-                            .feedback
-                            .source_product
-                            .as_ref()
-                            .map(|source| source.generation)
-                        {
-                            st.ingest
-                                .transient_encoder_handles
-                                .push(u64::from(generation));
+                        if let Some(product) = st.feedback.source_product.clone() {
+                            st.ingest.transient_encoder_products.push(product);
                         }
                     }
                 } else {
@@ -5471,10 +5809,10 @@ impl Scheduler {
                     {
                         return self.finish(id, FinishReason::Error);
                     }
-                    let mut free_handles = Vec::new();
+                    let mut free_products = Vec::new();
                     let selected_product = if let Some(cache_key) = encoder_cache_key {
                         if let Some(freed) = self.enc_cache.insert(*cache_key, feature.clone()) {
-                            free_handles.push(u64::from(freed.generation));
+                            free_products.push(freed);
                         }
                         let Some(product) = self.enc_cache.acquire(*cache_key) else {
                             return self.finish(id, FinishReason::Error);
@@ -5487,7 +5825,7 @@ impl Scheduler {
                         }
                         product
                     } else if let Some(st) = self.running.get_mut(&id) {
-                        st.ingest.transient_encoder_handles.push(result_handle);
+                        st.ingest.transient_encoder_products.push(feature.clone());
                         feature.clone()
                     } else {
                         feature.clone()
@@ -5496,8 +5834,8 @@ impl Scheduler {
                         st.ingest.encoded_product = Some(selected_product);
                         st.lifecycle.phase = Phase::IngestState;
                     }
-                    if !free_handles.is_empty() {
-                        self.gated_control(ControlOp::ReleaseProducts(free_handles));
+                    if !free_products.is_empty() {
+                        self.release_products(free_products);
                     }
                 }
                 crate::generation::TransitionDelta::EncodeFeedbackStep { .. } => {
@@ -5521,7 +5859,7 @@ impl Scheduler {
                         return self.finish(id, FinishReason::Error);
                     }
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.ingest.transient_encoder_handles.push(handle);
+                        st.ingest.transient_encoder_products.push(feature.clone());
                         st.feedback.encoded_product = Some(feature);
                         st.lifecycle.phase = Phase::FeedbackState;
                     }
@@ -5568,14 +5906,12 @@ impl Scheduler {
     }
 
     fn release_transient_products(&mut self, id: RequestId) {
-        let handles = self
+        let products = self
             .running
             .get_mut(&id)
-            .map(|state| std::mem::take(&mut state.ingest.transient_encoder_handles))
+            .map(|state| std::mem::take(&mut state.ingest.transient_encoder_products))
             .unwrap_or_default();
-        if !handles.is_empty() {
-            self.gated_control(ControlOp::ReleaseProducts(handles));
-        }
+        self.release_products(products);
     }
 
     fn record_gen_trigger_for_replay(&mut self, id: RequestId) {
@@ -5675,8 +6011,61 @@ impl Scheduler {
             }
         }
     }
-    /// Emit a text token and record it for preemption-recompute.
-    fn emit_text(&mut self, id: RequestId, tok: u32, logprob: Option<f32>) -> bool {
+
+    fn emit_visible(
+        &mut self,
+        id: RequestId,
+        mut event: GenEvent,
+        root: Option<&VersionRef>,
+        modality: PublicModality,
+    ) {
+        let root = root.cloned().or_else(|| self.fixed_version(id));
+        let Some(VersionRef {
+            producer_op_id,
+            point:
+                Point::Fixed {
+                    point_index,
+                    semantic_digest,
+                },
+            ..
+        }) = root
+        else {
+            self.finish_after_inflight(id, FinishReason::Error, None);
+            return;
+        };
+        let event_seq = self
+            .running
+            .get(&id)
+            .map_or(1, |state| state.public_event_seq.saturating_add(1));
+        let commit = PublicCommit {
+            event_seq,
+            modality,
+            committed_at: uniserve_core::now_monotonic_secs(),
+            semantic_root: SemanticRoot {
+                producer_op_id: producer_op_id.0,
+                point_index,
+                semantic_digest,
+            },
+        };
+        match &mut event {
+            GenEvent::TextToken { public_commit, .. }
+            | GenEvent::ImageDone { public_commit, .. } => *public_commit = Some(commit),
+            _ => {
+                self.finish_after_inflight(id, FinishReason::Error, None);
+                return;
+            }
+        }
+        self.emit(id, event);
+    }
+
+    /// Emit a text token and retain its semantic history.
+    fn emit_text(
+        &mut self,
+        id: RequestId,
+        tok: u32,
+        logprob: Option<f32>,
+        root: Option<&VersionRef>,
+    ) -> bool {
         let action = if let Some(st) = self.running.get_mut(&id) {
             st.replay.generated_ids.push(tok);
             st.und.text_since_image = st.und.text_since_image.saturating_add(1);
@@ -5690,7 +6079,16 @@ impl Scheduler {
                     .running
                     .get(&id)
                     .map_or(0, |state| state.public_event_seq);
-                self.emit(id, GenEvent::TextToken { id: tok, logprob });
+                self.emit_visible(
+                    id,
+                    GenEvent::TextToken {
+                        id: tok,
+                        logprob,
+                        public_commit: None,
+                    },
+                    root,
+                    PublicModality::Text,
+                );
                 if let Some(state) = self.running.get_mut(&id)
                     && state.public_event_seq > before
                 {
@@ -5712,8 +6110,9 @@ impl Scheduler {
         tok: u32,
         logprob: Option<f32>,
         top_logprobs: Option<Vec<RankedToken>>,
+        root: Option<&VersionRef>,
     ) {
-        if self.emit_text(id, tok, logprob)
+        if self.emit_text(id, tok, logprob, root)
             && let Some(top_logprobs) = top_logprobs.filter(|entries| !entries.is_empty())
         {
             self.emit(
@@ -5732,13 +6131,14 @@ impl Scheduler {
         token_id: u32,
         logprob: Option<f32>,
         top_logprobs: Option<Vec<RankedToken>>,
+        root: Option<&VersionRef>,
     ) {
         if self
             .running
             .get(&id)
             .is_some_and(|state| state.req.policy.termination.emit_stop_token)
         {
-            self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+            self.emit_sampled_text(id, token_id, logprob, top_logprobs, root);
         }
     }
 
@@ -5749,6 +6149,7 @@ impl Scheduler {
         logprob: Option<f32>,
         top_logprobs: Option<Vec<RankedToken>>,
         sampled: bool,
+        root: Option<&VersionRef>,
     ) -> bool {
         let Some(state) = self.running.get(&id) else {
             return true;
@@ -5767,16 +6168,16 @@ impl Scheduler {
         let max_hit = generated >= state.req.max_und_tokens;
 
         if stop_hit {
-            self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
+            self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs, root);
             self.finish_after_inflight(id, FinishReason::Stop, Some(format!("token:{token_id}")));
             return true;
         }
         if eos_hit || max_hit {
             if !self.ctrl.eos.contains(&token_id) {
                 if sampled {
-                    self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+                    self.emit_sampled_text(id, token_id, logprob, top_logprobs, root);
                 } else {
-                    self.emit_text(id, token_id, logprob);
+                    self.emit_text(id, token_id, logprob, root);
                 }
             }
             self.finish_after_inflight(
@@ -5791,9 +6192,9 @@ impl Scheduler {
             return true;
         }
         if sampled {
-            self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+            self.emit_sampled_text(id, token_id, logprob, top_logprobs, root);
         } else {
-            self.emit_text(id, token_id, logprob);
+            self.emit_text(id, token_id, logprob, root);
         }
         !self.running.contains_key(&id)
     }
@@ -5869,6 +6270,9 @@ impl Scheduler {
         }
         let mut awaits_close = false;
         if let Some(mut st) = self.running.remove(&id) {
+            if let Some(key) = st.cpu_pending.take() {
+                self.cpu_deadlines.remove(&key);
+            }
             if st.admission_digest.is_some() {
                 let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                 let cutoff = st.cancel_cutoff.clone().unwrap_or_else(|| VersionRef {
@@ -5898,15 +6302,14 @@ impl Scheduler {
                     .reserved_blocks
                     .saturating_sub(st.resources.worstcase_blocks);
             }
-            let mut free_encoder_handles = std::mem::take(&mut st.ingest.transient_encoder_handles);
+            let mut free_encoder_products =
+                std::mem::take(&mut st.ingest.transient_encoder_products);
             for pin in &st.ingest.acquired_encoder_pins {
                 if let Some(product) = self.enc_cache.release(pin.key, &pin.product) {
-                    free_encoder_handles.push(u64::from(product.generation));
+                    free_encoder_products.push(product);
                 }
             }
-            if !free_encoder_handles.is_empty() {
-                self.gated_control(ControlOp::ReleaseProducts(free_encoder_handles));
-            }
+            self.release_products(free_encoder_products);
             // close + archive the lifecycle trace (reconstructable post-finish).
             let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::Finished);
             ev.finish_reason = Some(finish_reason_str(&reason));
@@ -5948,6 +6351,8 @@ impl Scheduler {
         }
         if !awaits_close {
             self.bm.release(id);
+            self.product_credits
+                .retain(|product, _| product.request_key.session_id != id);
             self.ledger.release_request(id);
             self.ledger.assert_released(id);
         }
@@ -5958,12 +6363,7 @@ impl Scheduler {
     fn reset_encoder_cache(&mut self) {
         let freed = self.enc_cache.clear();
         if !freed.is_empty() {
-            self.gated_control(ControlOp::ReleaseProducts(
-                freed
-                    .into_iter()
-                    .map(|product| u64::from(product.generation))
-                    .collect(),
-            ));
+            self.release_products(freed);
         }
     }
 
@@ -6041,6 +6441,42 @@ fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
     latent_tokens
         .saturating_mul(cfg_branches)
         .saturating_mul(timesteps)
+}
+
+fn tensorized_mixed_runner_work(variant: WorkVariant) -> bool {
+    matches!(
+        variant,
+        WorkVariant::TokenExtend
+            | WorkVariant::TokenDecode
+            | WorkVariant::TokenVerify
+            | WorkVariant::Draft
+            | WorkVariant::GenFlow
+    )
+}
+
+fn partition_attention(operations: &[Operation]) -> AttentionRegime {
+    let regimes = operations
+        .iter()
+        .map(|operation| match operation.work.variant() {
+            WorkVariant::TokenExtend
+            | WorkVariant::TokenDecode
+            | WorkVariant::TokenVerify
+            | WorkVariant::Draft => AttentionRegime::Causal,
+            WorkVariant::GenFlow => AttentionRegime::Hybrid,
+            WorkVariant::GenTransition
+            | WorkVariant::EncodeVision
+            | WorkVariant::EncodeLatent
+            | WorkVariant::TransferProduct
+            | WorkVariant::TransferKvPublish
+            | WorkVariant::TransferKvInstall
+            | WorkVariant::Materialize => AttentionRegime::None,
+        })
+        .collect::<HashSet<_>>();
+    if regimes.len() == 1 {
+        *regimes.iter().next().unwrap_or(&AttentionRegime::None)
+    } else {
+        AttentionRegime::Hybrid
+    }
 }
 
 fn transition_output_bound(transition: &PlannedTransition) -> usize {
@@ -6199,6 +6635,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_gen_trigger_stops_a_registered_text_successor() {
+        let mut req = request(1, 8);
+        req.constraint = GenerationConstraint::Default;
+        req.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 4_242 };
+        req.behavior = GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
+
+        let stops = canonical_continuation_stop_token_ids(&req, &[151_643, 151_645]);
+
+        assert_eq!(stops, vec![4_242, 151_643, 151_645]);
+    }
+
     fn cursor(phase: Phase, pos: u32) -> CursorProjection {
         CursorProjection {
             phase,
@@ -6262,6 +6710,61 @@ mod tests {
             },
         );
         assert_eq!(planned_op_token_cost(&verify), 4);
+    }
+
+    #[test]
+    fn materialization_reserves_one_bounded_cpu_continuation() {
+        let req = request(1, 1);
+        let mut materialize = plan(
+            &req,
+            cursor(Phase::Prefill, 0),
+            TransitionIntent::IngestText {
+                segment_index: 0,
+                prompt_start: 0,
+                token_ids: vec![7],
+                new_blocks: Vec::new(),
+                sampling_state: SamplingState::default(),
+            },
+        );
+        materialize.work = uniserve_worker_wire::Work::Materialize;
+        materialize.operation_variant = WorkVariant::Materialize;
+
+        assert_eq!(Scheduler::operation_credits(&materialize).cpu_tasks, 1);
+    }
+
+    #[test]
+    fn latent_successor_reserves_atomic_publication_bytes() {
+        let req = request(1, 1);
+        let mut transition = plan(
+            &req,
+            cursor(Phase::Prefill, 0),
+            TransitionIntent::IngestText {
+                segment_index: 0,
+                prompt_start: 0,
+                token_ids: vec![7],
+                new_blocks: Vec::new(),
+                sampling_state: SamplingState::default(),
+            },
+        );
+        transition.resources.latent_units = 8;
+        transition.outputs = vec![ProductRef {
+            request_key: RequestKey::new(1, RequestId(1), 1),
+            producer_op_id: OpId(0),
+            output_index: 0,
+            generation: 1,
+            kind: ProductKind::Latent,
+            storage_class: StorageClass::LatentArena,
+            dtype: uniserve_worker_wire::DType::BF16,
+            shape_bound: uniserve_worker_wire::ShapeBound {
+                dims: vec![uniserve_worker_wire::DimBound::Device { max: 64 }],
+            },
+            point_range: uniserve_worker_wire::PointRange::default(),
+        }];
+
+        assert_eq!(
+            Scheduler::operation_credits(&transition).latent_artifact_bytes,
+            128
+        );
     }
 
     #[test]

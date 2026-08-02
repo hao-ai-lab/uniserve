@@ -38,6 +38,7 @@ use uniserve_core::{
 };
 use uniserve_engine_gateway::transport::{GenEvent, GenerationEventStream, GenerationFinishReason};
 use uniserve_engine_gateway::{EngineGateway, EngineGatewaySnapshot, GenerationSubmission};
+pub use uniserve_engine_gateway::{PublicCommit, PublicModality, SemanticRoot};
 use uniserve_model_profile::ModelProfile;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2674,6 +2675,7 @@ impl RuntimeRequestRegistry {
                         ((scheduled - queued).max(0.0) * 1_000_000.0) as u64
                     });
             }
+            ServeEvent::PublicCommit { .. } => {}
             ServeEvent::TextDelta { token_ids, .. } => {
                 stats.state = RequestLifecycleState::Streaming;
                 stats.visible_output_tokens = stats
@@ -3145,6 +3147,9 @@ pub enum ServeEvent {
         cache: CacheAccounting,
         resources: ResourceAccounting,
     },
+    PublicCommit {
+        commit: PublicCommit,
+    },
     TextDelta {
         candidate_id: CandidateId,
         text: String,
@@ -3380,11 +3385,16 @@ async fn text_event_stream(
                 delta,
                 token_ids,
                 logprobs,
+                public_commit,
                 finished,
-                ..
             } => {
                 if !delta.is_empty() && first_visible_output_us.is_none() {
                     first_visible_output_us = Some(started.elapsed().as_micros() as u64);
+                }
+                if !delta.is_empty()
+                    && let Some(commit) = public_commit
+                {
+                    y.yield_ok(ServeEvent::PublicCommit { commit }).await;
                 }
                 if !delta.is_empty() || !token_ids.is_empty() || finished.is_some() {
                     y.yield_ok(ServeEvent::TextDelta {
@@ -3846,6 +3856,7 @@ async fn emit_dialect_text_update(
     text: String,
     token_ids: Vec<u32>,
     logprobs: Option<DecodedLogprobs>,
+    mut public_commit: Option<PublicCommit>,
     finished: Option<crate::text::Finished>,
     started: &Instant,
     first_visible_output_us: &mut Option<u64>,
@@ -3861,6 +3872,7 @@ async fn emit_dialect_text_update(
                     delta: delta.visible,
                     token_ids,
                     logprobs,
+                    public_commit: public_commit.clone(),
                     finished,
                 },
             )
@@ -3870,14 +3882,17 @@ async fn emit_dialect_text_update(
             match map_chat_event(event) {
                 MappedChatEvent::Ignore => {}
                 MappedChatEvent::Event(event) => {
-                    if matches!(
+                    let visible = matches!(
                         &event,
                         ServeEvent::TextDelta { text, .. } if !text.is_empty()
                     ) || matches!(&event, ServeEvent::ReasoningDelta { text, .. } if !text.is_empty())
-                        || matches!(&event, ServeEvent::ToolCallStart { .. })
-                    {
+                        || matches!(&event, ServeEvent::ToolCallStart { .. });
+                    if visible {
                         first_visible_output_us
                             .get_or_insert_with(|| started.elapsed().as_micros() as u64);
+                        if let Some(commit) = public_commit.take() {
+                            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
+                        }
                     }
                     y.yield_ok(event).await;
                 }
@@ -3897,6 +3912,9 @@ async fn emit_dialect_text_update(
 
     if !delta.reasoning.is_empty() {
         first_visible_output_us.get_or_insert_with(|| started.elapsed().as_micros() as u64);
+        if let Some(commit) = public_commit.take() {
+            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
+        }
         y.yield_ok(ServeEvent::ReasoningDelta {
             candidate_id: CandidateId::PRIMARY,
             text: delta.reasoning,
@@ -3905,6 +3923,9 @@ async fn emit_dialect_text_update(
     }
     if !delta.visible.is_empty() {
         first_visible_output_us.get_or_insert_with(|| started.elapsed().as_micros() as u64);
+        if let Some(commit) = public_commit.take() {
+            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
+        }
     }
     if !delta.visible.is_empty()
         || !token_ids.is_empty()
@@ -4022,6 +4043,7 @@ async fn dialect_event_stream(
     let mut accepted = false;
     let mut pending_scheduled = None;
     let mut pending_token = None;
+    let mut last_public_commit = None;
     let mut pending_image_events = Vec::new();
     let mut chat_bridge = chat_processor
         .map(ChatOutputBridge::new)
@@ -4091,9 +4113,13 @@ async fn dialect_event_stream(
         }};
     }
     macro_rules! consume_token {
-        ($id:expr, $logprobs:expr) => {{
+        ($id:expr, $logprobs:expr, $public_commit:expr) => {{
             let id = $id;
             let logprobs: Option<DecodedLogprobs> = $logprobs;
+            let public_commit: Option<PublicCommit> = $public_commit;
+            if public_commit.is_some() {
+                last_public_commit = public_commit.clone();
+            }
             flush_pending_images!();
             emitted_output_tokens = emitted_output_tokens.saturating_add(1);
             let new_bytes =
@@ -4157,6 +4183,7 @@ async fn dialect_event_stream(
                 text,
                 vec![id],
                 logprobs,
+                public_commit,
                 finished,
                 &started,
                 &mut first_visible_output_us,
@@ -4270,7 +4297,9 @@ async fn dialect_event_stream(
                     emit_accepted!(Some(decoded));
                 }
             }
-            GenEvent::TextToken { id, .. } => {
+            GenEvent::TextToken {
+                id, public_commit, ..
+            } => {
                 if !accepted {
                     return Err(ServeError::OutputProcessing {
                         request_id: request_id.clone(),
@@ -4286,19 +4315,20 @@ async fn dialect_event_stream(
                     });
                 }
                 if generated_logprobs_requested {
-                    pending_token = Some(id);
+                    pending_token = Some((id, public_commit));
                 } else {
-                    consume_token!(id, None);
+                    consume_token!(id, None, public_commit);
                 }
             }
             GenEvent::TokenLogprobs { id, candidates } => {
-                let pending = pending_token
-                    .take()
-                    .ok_or_else(|| ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: "engine returned token logprobs without a pending token"
-                            .to_string(),
-                    })?;
+                let (pending, public_commit) =
+                    pending_token
+                        .take()
+                        .ok_or_else(|| ServeError::OutputProcessing {
+                            request_id: request_id.clone(),
+                            message: "engine returned token logprobs without a pending token"
+                                .to_string(),
+                        })?;
                 if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
                     return Err(ServeError::OutputProcessing {
                         request_id: request_id.clone(),
@@ -4318,7 +4348,7 @@ async fn dialect_event_stream(
                     request_id: request_id.clone(),
                     message: error.to_string(),
                 })?;
-                consume_token!(id, Some(logprobs));
+                consume_token!(id, Some(logprobs), public_commit);
             }
             GenEvent::ImageBegin {
                 image_id,
@@ -4364,9 +4394,13 @@ async fn dialect_event_stream(
                 bytes,
                 sha256,
                 pixels_png_b64,
+                public_commit,
             } => {
                 ensure_output_ready!("image-done event");
                 image_count = image_count.saturating_add(1);
+                if let Some(commit) = public_commit {
+                    pending_image_events.push(ServeEvent::PublicCommit { commit });
+                }
                 pending_image_events.push(ServeEvent::ImageDone {
                     candidate_id: CandidateId::PRIMARY,
                     image_id: image_id.to_string(),
@@ -4411,6 +4445,7 @@ async fn dialect_event_stream(
                     last_chunk.unwrap_or_default(),
                     Vec::new(),
                     None,
+                    last_public_commit,
                     Some(finished),
                     &started,
                     &mut first_visible_output_us,
@@ -4671,6 +4706,19 @@ mod tests {
         }
     }
 
+    fn public_commit(event_seq: u64, modality: PublicModality) -> PublicCommit {
+        PublicCommit {
+            event_seq,
+            modality,
+            committed_at: event_seq as f64,
+            semantic_root: SemanticRoot {
+                producer_op_id: event_seq,
+                point_index: event_seq as u32,
+                semantic_digest: format!("{event_seq:064x}"),
+            },
+        }
+    }
+
     fn bagel_processor(
         tokenizer: uniserve_model_profile::tokenizer::DynTokenizer,
     ) -> dialect_generation::DialectStreamProcessor {
@@ -4709,6 +4757,7 @@ mod tests {
         tx.try_send(GenEvent::TextToken {
             id: b'a' as u32,
             logprob: Some(-0.25),
+            public_commit: None,
         })
         .unwrap();
         tx.try_send(GenEvent::TokenLogprobs {
@@ -4808,9 +4857,16 @@ mod tests {
         tx.send(GenEvent::TextToken {
             id: b'a' as u32,
             logprob: None,
+            public_commit: Some(public_commit(1, PublicModality::Text)),
         })
         .await
         .unwrap();
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::PublicCommit {
+                commit: PublicCommit { event_seq: 1, .. }
+            }))
+        ));
         assert!(matches!(
             events.next().await,
             Some(Ok(ServeEvent::TextDelta { text, .. })) if text == "a"
@@ -4826,6 +4882,7 @@ mod tests {
             bytes: 3,
             sha256: "image".to_string(),
             pixels_png_b64: "cG5n".to_string(),
+            public_commit: Some(public_commit(3, PublicModality::Image)),
         })
         .await
         .unwrap();
@@ -4839,6 +4896,7 @@ mod tests {
         tx.send(GenEvent::TextToken {
             id: b'b' as u32,
             logprob: None,
+            public_commit: Some(public_commit(4, PublicModality::Text)),
         })
         .await
         .unwrap();
@@ -4848,7 +4906,19 @@ mod tests {
         ));
         assert!(matches!(
             events.next().await,
+            Some(Ok(ServeEvent::PublicCommit {
+                commit: PublicCommit { event_seq: 3, .. }
+            }))
+        ));
+        assert!(matches!(
+            events.next().await,
             Some(Ok(ServeEvent::ImageDone { .. }))
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ServeEvent::PublicCommit {
+                commit: PublicCommit { event_seq: 4, .. }
+            }))
         ));
         assert!(matches!(
             events.next().await,
@@ -4889,6 +4959,7 @@ mod tests {
         tx.try_send(GenEvent::TextToken {
             id: b'a' as u32,
             logprob: Some(-0.25),
+            public_commit: None,
         })
         .unwrap();
         tx.try_send(GenEvent::Finished {
@@ -4937,6 +5008,7 @@ mod tests {
             tx.try_send(GenEvent::TextToken {
                 id: u32::from(byte),
                 logprob: None,
+                public_commit: None,
             })
             .unwrap();
         }
@@ -5027,6 +5099,7 @@ mod tests {
             tx.try_send(GenEvent::TextToken {
                 id: u32::from(byte),
                 logprob: None,
+                public_commit: None,
             })
             .unwrap();
         }

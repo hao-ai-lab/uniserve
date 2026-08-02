@@ -72,14 +72,14 @@ def main() -> None:
     steps = sorted(s for s in submitted if submitted[s]["at_s"] >= started_at and s in resolved)
 
     def kind_of(step: int) -> str:
-        ks = set(submitted[step]["op_kinds"])
-        if ks == {"decode_und"}:
+        operation_types = set(submitted[step]["operation_types"])
+        if operation_types == {"token_decode"}:
             return "decode"
-        if ks == {"prefill_und"}:
+        if operation_types == {"token_extend"}:
             return "prefill"
-        if ks == {"decode_und", "prefill_und"}:
+        if operation_types == {"token_decode", "token_extend"}:
             return "mixed"
-        return "+".join(sorted(ks))
+        return "+".join(sorted(operation_types))
 
     kinds = {s: kind_of(s) for s in steps}
     prefills = [s for s in steps if kinds[s] == "prefill"]
@@ -105,11 +105,14 @@ def main() -> None:
         exec_ms.append(res["worker_exec_us"] / 1000)
         host_ms.append(res["host_roundtrip_us"] / 1000)
         for op in sub["ops"]:
-            start_pos.append(op["pos_range"][0])
-            token_costs.append(op["token_cost"])
-            total_cost += op["token_cost"]
+            token_cost = op["token_cost"]
+            kv_target = op["resources"]["kv_target_tokens"]
+            start = max(0, kv_target - token_cost)
+            start_pos.append(start)
+            token_costs.append(token_cost)
+            total_cost += token_cost
             total_prompt += queued.get(op["request_id"]) or 0
-            if op["pos_range"][0] == 0:
+            if start == 0:
                 n_pos0 += 1
     _dist("batch_size", batch_sizes)
     _dist("op token_cost", token_costs, " tok")
@@ -131,7 +134,10 @@ def main() -> None:
         next_k = kinds[steps[i + 1]] if i + 1 < len(steps) else "none"
         grp = "near_prefill" if "prefill" in (prev_k, next_k) else "decode_only"
         res = resolved[s]
-        comp = (res.get("forward_stats") or {}).get("component_us") or {}
+        comp: dict[str, int] = defaultdict(int)
+        for partition_stats in res["forward_stats"]:
+            for key, value in partition_stats["component_us"].items():
+                comp[key] += value
         g = groups[grp]
         g["batch_size"].append(res["batch_size"])
         g["host_ms"].append(res["host_roundtrip_us"] / 1000)
@@ -164,11 +170,11 @@ def main() -> None:
         t = res["at_s"]
         for op in res["ops"]:
             rid = op["request_id"]
-            if op["op_kind"] == "decode_und":
+            if op["operation_type"] == "token_decode":
                 if rid in last_seen:
                     gaps.append((t - last_seen[rid]) * 1000)
                 last_seen[rid] = t
-            elif op["op_kind"] == "prefill_und":
+            elif op["operation_type"] == "token_extend":
                 last_seen[rid] = t
     _dist("inter-decode gap", gaps, " ms")
 

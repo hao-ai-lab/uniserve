@@ -46,6 +46,10 @@ pub fn event_json(event: &ServeEvent) -> Value {
             "cache":cache,
             "resources":resources
         }),
+        ServeEvent::PublicCommit { commit } => json!({
+            "type":"public_commit",
+            "commit":commit
+        }),
         ServeEvent::TextDelta {
             candidate_id,
             text,

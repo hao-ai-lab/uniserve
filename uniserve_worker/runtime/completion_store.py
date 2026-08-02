@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 import torch
 
@@ -12,7 +12,12 @@ from ..foundation.errors import ErrorCode, WorkerError, resource_error
 from .device_events import DeviceEventPool
 from .host_staging import canonical_device
 
-__all__ = ["CompletionArena", "CompletionCapture", "CompletionLease"]
+__all__ = [
+    "CompletionArena",
+    "CompletionByteCapture",
+    "CompletionCapture",
+    "CompletionLease",
+]
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 
@@ -38,6 +43,8 @@ class _CompletionSlot:
     abandoned: bool = False
     sealed_ns: int = 0
     ready_ns: int = 0
+    token_offset: int = 0
+    token_capacity: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +62,25 @@ class CompletionCapture:
         return self.lease.read_tokens(self)
 
 
+@dataclass(frozen=True, slots=True)
+class CompletionByteCapture:
+    """One shaped byte range copied into a completion generation's pinned slab."""
+
+    lease: CompletionLease
+    offset: int
+    count: int
+    shape: tuple[int, ...]
+
+    def ready(self) -> bool:
+        return self.lease.ready()
+
+    def tensor(self) -> torch.Tensor:
+        return self.lease.read_bytes(self)
+
+    def numpy(self) -> Any:
+        return self.tensor().numpy()
+
+
 class CompletionLease:
     """Exclusive generation-tagged ownership of one completion arena slab."""
 
@@ -65,6 +91,7 @@ class CompletionLease:
         "_generation",
         "_rows",
         "_token_cursor",
+        "_byte_cursor",
         "_token_cache",
     )
 
@@ -82,6 +109,7 @@ class CompletionLease:
         self._generation = int(generation)
         self._rows = int(rows)
         self._token_cursor = 0
+        self._byte_cursor = 0
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
 
     @property
@@ -131,7 +159,7 @@ class CompletionLease:
         slot = self._arena._require_slot(self)
         if slot.sealed:
             raise _invariant("completion capture was registered after its slot was sealed")
-        if end > int(slot.host_tokens.numel()):
+        if end * int(slot.host_tokens.element_size()) > self._byte_floor(slot):
             raise resource_error("completion token span exceeds its reserved pinned-host capacity")
         host = slot.host_tokens[offset:end]
         if flat.device.type == "cuda":
@@ -146,6 +174,41 @@ class CompletionLease:
             host.copy_(flat.to(device="cpu"))
         self._token_cursor = end
         return CompletionCapture(self, offset, count)
+
+    def capture_bytes(self, value: torch.Tensor) -> CompletionByteCapture:
+        """Enqueue one contiguous uint8 D2H copy into this generation's byte tail."""
+
+        if value.dtype is not torch.uint8:
+            raise ValueError("completion byte capture requires uint8 storage")
+        contiguous = value.detach().contiguous()
+        count = int(contiguous.numel())
+        if count < 1:
+            raise ValueError("completion byte capture must not be empty")
+        slot = self._arena._require_slot(self)
+        if slot.sealed:
+            raise _invariant("completion byte capture was registered after its slot was sealed")
+        end = self._byte_floor(slot)
+        offset = end - count
+        token_bytes = self._token_cursor * int(slot.host_tokens.element_size())
+        if offset < token_bytes:
+            raise resource_error("completion byte span exceeds its reserved pinned-host capacity")
+        host = slot.host_tokens.view(torch.uint8)[offset:end]
+        flat = contiguous.reshape(-1)
+        if flat.device.type == "cuda":
+            if not bool(host.is_pinned()):
+                raise _invariant("CUDA completion byte copy targets pageable host storage")
+            device = canonical_device(flat.device)
+            self.register_device(device)
+            host.copy_(flat, non_blocking=True)
+        else:
+            host.copy_(flat.to(device="cpu"))
+        self._byte_cursor += count
+        return CompletionByteCapture(self, offset, count, tuple(int(v) for v in value.shape))
+
+    def _byte_floor(self, slot: _CompletionSlot) -> int:
+        return (
+            int(slot.host_tokens.numel()) * int(slot.host_tokens.element_size()) - self._byte_cursor
+        )
 
     def seal(self) -> None:
         slot = self._arena._require_slot(self)
@@ -189,6 +252,18 @@ class CompletionLease:
         self._token_cache[key] = values
         return values
 
+    def read_bytes(self, capture: CompletionByteCapture) -> torch.Tensor:
+        if capture.lease is not self:
+            raise _invariant("completion byte capture belongs to a different arena lease")
+        if not self.ready():
+            raise _invariant("completion byte storage was observed before its copy event was ready")
+        slot = self._arena._require_slot(self)
+        end = int(capture.offset) + int(capture.count)
+        total = int(slot.host_tokens.numel()) * int(slot.host_tokens.element_size())
+        if capture.offset < 0 or end > total:
+            raise _invariant("completion byte range is outside its registered extent")
+        return slot.host_tokens.view(torch.uint8)[capture.offset : end].view(capture.shape)
+
     def observe(self, row: int, generation: int) -> tuple[int, int]:
         return self._arena._observe(self, row, generation)
 
@@ -212,11 +287,19 @@ class CompletionArena:
         *,
         depth: int,
         token_capacity: int,
+        total_token_capacity: int | None = None,
         devices: tuple[torch.device | str, ...] = (),
         event_pool: DeviceEventPool | None = None,
     ) -> None:
         self.depth = max(1, int(depth))
         self.token_capacity = max(1, int(token_capacity))
+        self.total_token_capacity = (
+            self.depth * self.token_capacity
+            if total_token_capacity is None
+            else int(total_token_capacity)
+        )
+        if self.total_token_capacity < 1:
+            raise ValueError("completion arena total token capacity must be positive")
         normalized: list[torch.device] = []
         for value in devices:
             device = canonical_device(value)
@@ -225,19 +308,21 @@ class CompletionArena:
         self.devices = tuple(normalized)
         self.event_pool = DeviceEventPool() if event_pool is None else event_pool
         pin = bool(self.devices)
+        self._host_tokens = torch.empty(
+            self.total_token_capacity,
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=pin,
+        )
         self._slots = [
             _CompletionSlot(
-                host_tokens=torch.empty(
-                    self.token_capacity,
-                    dtype=torch.long,
-                    device="cpu",
-                    pin_memory=pin,
-                ),
+                host_tokens=self._host_tokens[:0],
                 events={},
                 devices=set(),
             )
             for _ in range(self.depth)
         ]
+        self._free_token_ranges = [(0, self.total_token_capacity)]
         self._cursor = 0
         self._next_owner = 1
 
@@ -245,12 +330,16 @@ class CompletionArena:
         self,
         rows: int,
         *,
+        token_capacity: int | None = None,
         devices: tuple[torch.device | str, ...] = (),
     ) -> CompletionLease:
         count = int(rows)
+        requested_tokens = self.token_capacity if token_capacity is None else int(token_capacity)
         if count < 1:
             raise ValueError("a completion lease must contain at least one operation row")
-        if count > self.token_capacity:
+        if requested_tokens < 1:
+            raise ValueError("a completion lease token capacity must be positive")
+        if count > requested_tokens or requested_tokens > self.token_capacity:
             raise resource_error("completion row count exceeds the arena capacity")
         selected_devices: set[torch.device] = set()
         for value in devices:
@@ -266,6 +355,10 @@ class CompletionArena:
             self._reclaim_if_ready(slot)
             if slot.owner != 0:
                 continue
+            allocation = self._allocate_tokens(requested_tokens)
+            if allocation is None:
+                break
+            token_offset, token_count = allocation
             generation = slot.generation + 1
             if generation > _MAX_GENERATION:
                 generation = 1
@@ -280,9 +373,36 @@ class CompletionArena:
             slot.abandoned = False
             slot.sealed_ns = 0
             slot.ready_ns = 0
+            slot.token_offset = token_offset
+            slot.token_capacity = token_count
+            slot.host_tokens = self._host_tokens[token_offset : token_offset + token_count]
             self._cursor = (index + 1) % self.depth
             return CompletionLease(self, index, owner, generation, count)
-        raise resource_error("completion arena has no query-ready free generation")
+        raise resource_error("completion arena has no query-ready slot and byte credit")
+
+    def _allocate_tokens(self, count: int) -> tuple[int, int] | None:
+        for index, (offset, available) in enumerate(self._free_token_ranges):
+            if available < count:
+                continue
+            if available == count:
+                del self._free_token_ranges[index]
+            else:
+                self._free_token_ranges[index] = (offset + count, available - count)
+            return offset, count
+        return None
+
+    def _release_tokens(self, offset: int, count: int) -> None:
+        if count < 1:
+            return
+        ranges = sorted((*self._free_token_ranges, (offset, count)))
+        merged: list[tuple[int, int]] = []
+        for current_offset, current_count in ranges:
+            if merged and merged[-1][0] + merged[-1][1] == current_offset:
+                prior_offset, prior_count = merged[-1]
+                merged[-1] = (prior_offset, prior_count + current_count)
+            else:
+                merged.append((current_offset, current_count))
+        self._free_token_ranges = merged
 
     def _require_slot(self, lease: CompletionLease) -> _CompletionSlot:
         if lease._arena is not self:
@@ -353,6 +473,10 @@ class CompletionArena:
         slot.abandoned = False
         slot.sealed_ns = 0
         slot.ready_ns = 0
+        self._release_tokens(slot.token_offset, slot.token_capacity)
+        slot.token_offset = 0
+        slot.token_capacity = 0
+        slot.host_tokens = self._host_tokens[:0]
 
     def _reclaim_if_ready(self, slot: _CompletionSlot) -> None:
         if (

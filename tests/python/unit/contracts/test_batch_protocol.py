@@ -18,7 +18,9 @@ import pytest
 from uniserve_worker.batch import (
     AdapterMode,
     Admission,
+    AttentionRegime,
     Batch,
+    BatchPartition,
     Bounds,
     Close,
     CloseReason,
@@ -32,11 +34,13 @@ from uniserve_worker.batch import (
     DrawLayout,
     DType,
     ErrorCode,
+    ExecutionCapability,
     FinishFlags,
     FixedPoint,
     LogicalLengths,
     Operation,
     OpStatus,
+    PartitionCompletion,
     PointRange,
     ProductKind,
     ProductPayload,
@@ -45,6 +49,7 @@ from uniserve_worker.batch import (
     Release,
     RequestKey,
     Rng,
+    SamplingOwnership,
     SamplingState,
     ShapeBound,
     StaticDim,
@@ -55,6 +60,7 @@ from uniserve_worker.batch import (
     UndAdmission,
     VersionRef,
     Work,
+    WorkerForwardStats,
     WorkVariant,
     control_content_digest,
     control_from_wire,
@@ -124,6 +130,21 @@ def _decode_operation(input_product: ProductRef | None = None) -> Operation:
     )
 
 
+def _partition(*operations: Operation) -> BatchPartition:
+    first = operations[0]
+    return BatchPartition(
+        partition_id=1,
+        submission_group=1,
+        collective_seq=1,
+        domain=first.domain,
+        route=first.route,
+        execution=ExecutionCapability.DOMAIN_HOMOGENEOUS,
+        attention=AttentionRegime.CAUSAL,
+        shape_class=0,
+        operations=operations,
+    )
+
+
 # --- Rust <-> Python digest parity -----------------------------------------
 
 
@@ -175,6 +196,20 @@ def test_route_capability_digest_matches_rust() -> None:
             sample["device_sequence_lengths"],
             sample["device_append_offsets"],
             sample["incremental_kv_publication"],
+            tuple(
+                (
+                    capability["route"],
+                    tuple(WorkVariant(variant) for variant in capability["supported_work"]),
+                    capability["tensorized_mixed"],
+                    SamplingOwnership(capability["sampling_ownership"]),
+                    capability["preemptible"],
+                    (
+                        tuple(capability["credits"]["per_request"]),
+                        tuple(capability["credits"]["worker"]),
+                    ),
+                )
+                for capability in sample["route_capabilities"]
+            ),
             sample["kv_dtype"],
             sample["model_dtype"],
             sample["attention_backend"],
@@ -292,7 +327,7 @@ def test_commit_requires_a_fixed_selected_version() -> None:
     device_point = VersionRef(
         request_key=_request_key(),
         producer_op_id=9,
-        point=DevicePoint(selected_point=_token_output(), producer_plan_digest="cc" * 32),
+        point=DevicePoint(point_index=1, selected_point=None, producer_plan_digest="cc" * 32),
     )
     wire = control_to_wire(
         Commit(
@@ -324,7 +359,7 @@ def test_batch_rejects_conflicting_control_identity() -> None:
         Batch(
             step_id=1,
             admissions=(admission,),
-            operations=(_decode_operation(),),
+            partitions=(_partition(_decode_operation()),),
             controls=(commit(1), commit(2)),
         )
 
@@ -342,7 +377,7 @@ def test_batch_allows_duplicate_identical_control() -> None:
     batch = Batch(
         step_id=1,
         admissions=(admission,),
-        operations=(_decode_operation(),),
+        partitions=(_partition(_decode_operation()),),
         controls=(control, control),
     )
     assert len(batch.controls) == 2
@@ -351,7 +386,7 @@ def test_batch_allows_duplicate_identical_control() -> None:
 
 def test_batch_rejects_two_operations_for_one_request() -> None:
     with pytest.raises(WorkerError):
-        Batch(step_id=1, operations=(_decode_operation(), _decode_operation()))
+        Batch(step_id=1, partitions=(_partition(_decode_operation(), _decode_operation()),))
 
 
 def test_operation_rejects_a_forged_plan_digest() -> None:
@@ -417,7 +452,7 @@ def test_batch_carries_host_supplied_input_products() -> None:
     batch = Batch(
         step_id=1,
         admissions=(admission,),
-        operations=(_decode_operation(token_input),),
+        partitions=(_partition(_decode_operation(token_input)),),
         input_products=(payload,),
     )
     restored = Batch.from_wire(batch.to_wire())
@@ -439,26 +474,41 @@ def test_completion_report_round_trips_with_product_payloads() -> None:
     )
     report = CompletionReport(
         step_id=5,
-        completions=(
-            CompletionRecord(
-                request_key=_request_key(),
-                op_id=11,
-                completion_slot_generation=2,
-                status=OpStatus.OK,
-                selected_point=1,
-                logical_lengths=LogicalLengths(token_len=1, kv_visible_len=1),
-                token_span=TokenSpan(base=0, len=1),
-                committed_tokens=(271,),
-                finish_flags=FinishFlags(),
-                product_generations=(3,),
-                semantic_digest="bb" * 32,
-                error_code=None,
-                timing_counters=TimingCounters(),
+        partitions=(
+            PartitionCompletion(
+                partition_id=1,
+                completions=(
+                    CompletionRecord(
+                        request_key=_request_key(),
+                        op_id=11,
+                        completion_slot_generation=2,
+                        status=OpStatus.OK,
+                        selected_point=1,
+                        logical_lengths=LogicalLengths(token_len=1, kv_visible_len=1),
+                        token_span=TokenSpan(base=0, len=1),
+                        committed_tokens=(271,),
+                        finish_flags=FinishFlags(),
+                        product_generations=(3,),
+                        semantic_digest="bb" * 32,
+                        error_code=None,
+                        timing_counters=TimingCounters(),
+                    ),
+                ),
+                products=(ProductPayload(product=logprob, payload=bytes([1, 2, 3, 4])),),
+                registration=RegistrationAck(visible=True),
+                worker_exec_us=10,
+                forward_stats=WorkerForwardStats(
+                    mode_counts={"text": 1},
+                    mode_tokens={"text": 1},
+                    mode_us={"text": 7},
+                    component_us={"forward": 7, "text_sample": 2},
+                    cuda_graph_replays=1,
+                    cuda_graph_unpadded_tokens=1,
+                    cuda_graph_padded_tokens=8,
+                    cuda_graph_runtime_mode_counts={"graph_replay": 1},
+                ),
             ),
         ),
-        products=(ProductPayload(product=logprob, payload=bytes([1, 2, 3, 4])),),
-        registration=RegistrationAck(visible=True),
-        worker_exec_us=10,
     )
     assert CompletionReport.from_wire(report.to_wire()) == report
 

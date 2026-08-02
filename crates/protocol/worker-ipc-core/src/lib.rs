@@ -453,7 +453,7 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
     if let Some(batch) = &req.batch {
         h.step_id = batch.step_id;
         // Hint only: first op's id. See the doc comment above.
-        if let Some(operation) = batch.operations.first() {
+        if let Some(operation) = batch.operations().next() {
             h.op_id = operation.op_id.0;
         }
     }
@@ -476,7 +476,7 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
     if let Some(report) = &resp.completion_report {
         h.step_id = report.step_id;
         // Hint only: first completion's op id. See the doc comment above.
-        if let Some(completion) = report.completions.first() {
+        if let Some(completion) = report.completions().next() {
             h.op_id = completion.op_id.0;
         }
     }
@@ -505,17 +505,18 @@ fn request_kind_code(kind: RequestKind) -> u8 {
     match kind {
         RequestKind::GetCapabilities => 1,
         RequestKind::Execute => 2,
-        RequestKind::DropSession => 3,
-        RequestKind::Shutdown => 4,
-        RequestKind::CopyKv => 5,
-        RequestKind::LoadAdapter => 6,
-        RequestKind::UnloadAdapter => 7,
-        RequestKind::ReleaseProducts => 8,
-        RequestKind::ResetPrefixCache => 9,
-        RequestKind::GetMetrics => 10,
-        RequestKind::GetPressure => 11,
-        RequestKind::SnapshotSession => 12,
-        RequestKind::RestoreSession => 13,
+        RequestKind::PollCompletions => 3,
+        RequestKind::DropSession => 4,
+        RequestKind::Shutdown => 5,
+        RequestKind::CopyKv => 6,
+        RequestKind::LoadAdapter => 7,
+        RequestKind::UnloadAdapter => 8,
+        RequestKind::ReleaseProducts => 9,
+        RequestKind::ResetPrefixCache => 10,
+        RequestKind::GetMetrics => 11,
+        RequestKind::GetPressure => 12,
+        RequestKind::SnapshotSession => 13,
+        RequestKind::RestoreSession => 14,
     }
 }
 

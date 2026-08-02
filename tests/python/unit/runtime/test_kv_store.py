@@ -24,10 +24,11 @@ from uniserve_worker.runtime.kv_store import KvExtents, KvSnapshot, KvStore
 from uniserve_worker.runtime.transfer import LocalTransport, Locator
 
 
-def _pool(*, layers: int = 2) -> PagedKVPool:
+def _pool(*, layers: int = 2, branch_blocks: int = 0) -> PagedKVPool:
     return PagedKVPool(
         num_layers=layers,
         num_blocks=8,
+        branch_blocks=branch_blocks,
         block_size=2,
         num_kv_heads=1,
         head_dim=1,
@@ -69,6 +70,57 @@ def _publication_product(request_key: RequestKey, op_id: int) -> ProductRef:
         shape_bound=ShapeBound((DeviceDim(1 << 20),)),
         point_range=PointRange(),
     )
+
+
+def _latent_product(request_key: RequestKey, op_id: int, generation: int) -> ProductRef:
+    return ProductRef(
+        request_key=request_key,
+        producer_op_id=op_id,
+        output_index=0,
+        generation=generation,
+        kind=ProductKind.LATENT,
+        storage_class=StorageClass.LATENT_ARENA,
+        dtype=DType.BF16,
+        shape_bound=ShapeBound((DeviceDim(4),)),
+        point_range=PointRange(),
+    )
+
+
+def test_scratch_branches_follow_exact_latent_product_ownership() -> None:
+    pool = _pool(layers=1, branch_blocks=4)
+    store = KvStore(pool)
+    request_key = _admit(store, 1, block_ids=(0,), prefix_len=0)
+    first = _latent_product(request_key, op_id=10, generation=7)
+    second = _latent_product(request_key, op_id=11, generation=7)
+
+    store.scratch_entry(first, "text", capacity_tokens=3, copy_conditioning=False)
+    store.scratch_entry(second, "text", capacity_tokens=3, copy_conditioning=False)
+    assert store.scratch_token_count() == 8
+    assert pool.branch_blocks_available == 0
+
+    store.release_operations(((request_key, 10),))
+    assert store.scratch_token_count() == 4
+    assert pool.branch_blocks_available == 2
+
+    store.release_operations(((request_key, 11),))
+    assert pool.branch_blocks_available == 4
+
+
+def test_committed_scratch_snapshot_restores_exact_latent_owner() -> None:
+    pool = _pool(layers=1, branch_blocks=4)
+    store = KvStore(pool)
+    request_key = _admit(store, 1, block_ids=(0,), prefix_len=0)
+    owner = _latent_product(request_key, op_id=10, generation=7)
+    store.scratch_entry(owner, "text", capacity_tokens=3, copy_conditioning=False)
+    state = store.snapshot_committed({1})
+
+    assert state[0].branches[0].owner == owner
+    store.release_operations(((request_key, 10),))
+    assert pool.branch_blocks_available == 4
+
+    store.restore_committed(state, {1})
+    assert store.snapshot_committed({1})[0].branches[0].owner == owner
+    assert pool.branch_blocks_available == 2
 
 
 def test_kv_view_uses_visible_extents_and_device_append_offsets() -> None:
@@ -132,11 +184,34 @@ def test_step_rollback_restores_every_extent_and_mapping() -> None:
     assert store.get(1).block_ids == [0, 1]
 
 
+def test_step_rollback_restores_the_exact_scratch_owner_and_capacity() -> None:
+    pool = _pool(layers=1, branch_blocks=4)
+    store = KvStore(pool)
+    request_key = _admit(store, 1, block_ids=(0,), prefix_len=0)
+    committed_owner = _latent_product(request_key, op_id=10, generation=7)
+    provisional_owner = _latent_product(request_key, op_id=11, generation=8)
+    store.scratch_entry(committed_owner, "text", capacity_tokens=3, copy_conditioning=False)
+    transaction = store.begin_step({1})
+
+    transaction.scratch_entry(
+        provisional_owner,
+        "text",
+        capacity_tokens=3,
+        copy_conditioning=False,
+    )
+    transaction.rollback()
+
+    branches = store.snapshot_committed({1})[0].branches
+    assert tuple(branch.owner for branch in branches) == (committed_owner,)
+    assert store.scratch_token_count() == 4
+    assert pool.branch_blocks_available == 2
+
+
 def test_publication_is_incremental_immutable_and_exact_base_bound() -> None:
     pool = _pool()
     store = KvStore(pool)
     request_key = _admit(store, 1, block_ids=(0, 1, 2), prefix_len=2)
-    transport = LocalTransport()
+    transport = LocalTransport(byte_capacity=1 << 20)
     for layer in range(pool.num_layers):
         prefix = torch.tensor((1.0, 2.0)).reshape(2, 1, 1) + layer * 10
         pool.write(layer, [0, 1, 2], start=0, k=prefix, v=-prefix)
@@ -198,7 +273,7 @@ def test_publication_is_incremental_immutable_and_exact_base_bound() -> None:
 def test_publication_preserves_the_committed_watermark_for_a_provisional_suffix() -> None:
     store = KvStore(_pool(layers=1))
     request_key = _admit(store, 1, block_ids=(0, 1), prefix_len=2)
-    transport = LocalTransport()
+    transport = LocalTransport(byte_capacity=1 << 20)
     committed_version = _version(request_key, 9, 1, "9")
     store.publish(
         1,
@@ -248,7 +323,7 @@ def test_publication_descriptor_requires_an_exact_fixed_digest() -> None:
 def test_drop_releases_every_immutable_transport_entry() -> None:
     class RecordingTransport(LocalTransport):
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__(byte_capacity=1 << 20)
             self.released: list[Locator] = []
 
         def release(self, locator: Locator) -> None:
