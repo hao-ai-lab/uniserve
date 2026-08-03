@@ -2462,13 +2462,12 @@ impl Scheduler {
     /// predecessor's not-yet-observed selected point.
     ///
     /// Such a successor roots on a device version reference (`Point::Device`).
-    /// A successor may depend on the predecessor's worker-local sampled-token
-    /// state for the deterministic greedy subset. Replayability is not required:
-    /// the admitted session and its exact KV state remain resident until close.
-    /// Tokens that require host control flow, including a direct Gen trigger,
-    /// clear the worker's device continuation predicate so a registered
-    /// successor becomes a semantic no-op. Every guard below matches the
-    /// depth-one serial oracle so the pipelined output stays token-identical.
+    /// It is safe only when the preceding sampled token cannot change the
+    /// scheduler-owned continuation. In particular, a Default/interleave
+    /// request may sample its direct Gen trigger: opening that branch is a
+    /// host-visible semantic decision, so it must observe the result before
+    /// registering another decode operation. A resolved, non-trigger token may
+    /// still use the normal device-product reuse path below.
     fn can_queue_decode_successor(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -2480,6 +2479,9 @@ impl Scheduler {
             || state.cancelled
             || self.pending_finishes.contains_key(&id)
             || self.custom_logits_processors > 0
+            // An image trigger changes the scheduler-owned phase, so its result
+            // must be observed before another decode is registered.
+            || state.req.behavior.gen_output
             || !matches!(state.lifecycle.phase, Phase::Prefill | Phase::DecodeUnd)
             || (state.lifecycle.phase == Phase::Prefill && state.starts_gen_after_context())
             || !Self::device_token_relay_eligible(state)

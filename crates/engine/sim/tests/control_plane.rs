@@ -2194,6 +2194,79 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
 }
 
 #[test]
+fn interleave_c4_generated_images_complete() {
+    let mut sim = SimEngine::new();
+    sim.set_pipeline_depth(2);
+    sim.set_text_len(1_000_000);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let mut events = HashMap::new();
+    let mut results = HashMap::new();
+
+    for (raw_id, trigger_offset) in [(1_u64, 0_u32), (2, 1), (3, 2), (4, 3)] {
+        let request_id = RequestId(raw_id);
+        let trigger = 1_000 + raw_id as u32 * 7 + trigger_offset;
+        let request = with_trigger(
+            generation_request(
+                request_id,
+                text_context(vec![1, 2, 3]),
+                SamplingParams::default(),
+                ImageParams {
+                    steps: 2,
+                    max_images: 1,
+                    ..Default::default()
+                },
+                GenerationConstraint::Default,
+                24,
+            ),
+            TriggerPolicyDescriptor::Token { token_id: trigger },
+        );
+        events.insert(request_id, scheduler.submit_for_test(request));
+        results.insert(
+            request_id,
+            Collected {
+                text: 0,
+                images: 0,
+                finished: false,
+                reason: None,
+            },
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while results.values().any(|result| !result.finished) && Instant::now() < deadline {
+        scheduler.step();
+        for (id, event_rx) in &mut events {
+            while let Ok(event) = event_rx.try_recv() {
+                let result = results.get_mut(id).expect("request result exists");
+                match event {
+                    GenEvent::TextToken { .. } => result.text += 1,
+                    GenEvent::ImageDone { .. } => result.images += 1,
+                    GenEvent::Finished { reason, .. } if !result.finished => {
+                        result.finished = true;
+                        result.reason = Some(reason);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(
+        results.values().all(|result| result.finished),
+        "c4 interleave requests did not all finish"
+    );
+    for (id, result) in &results {
+        assert_eq!(
+            result.reason,
+            Some(FinishReason::MaxTokens),
+            "request {id:?} failed"
+        );
+        assert_eq!(result.images, 1, "request {id:?} missed its image branch");
+    }
+}
+
+#[test]
 fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
