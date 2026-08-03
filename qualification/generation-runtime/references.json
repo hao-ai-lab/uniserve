@@ -1,36 +1,33 @@
 {
   "schema_version": 1,
   "construction_anchor": {
-    "source_commit": "14126aea91f7739c4a1660738e2feb82ad8979b6",
+    "source_commit": "05ab7a2dfe814a14eeb925323f83a47de23ae2ac",
     "source_clean": true,
-    "artifact_contract": "legacy_matrix",
+    "note": "Recovered baseline after container loss: anchor line rebuilt as 783d896 plus the ead5d77 eval fixes (blob-identical to the measurement control contract). The greedy interleave anchor artifact is pending an engine fix for the c4 decode_und batch abort and is declared absent until measured.",
+    "pending_artifacts": ["sensenova_greedy_interleave_c4"],
     "artifacts": {
       "qwen3_sharegpt_r16": {
-        "root": "artifacts/qualification/decode_runtime/anchor/qwen3_sharegpt/uniserve_r16",
-        "manifest_sha256": "c18caaadf8f5ca0e7e86d245978ea637b295f62a7dc28b57c0bf6630f7857246"
+        "root": "artifacts/qualification/generation_runtime/reference/construction/05ab7a2dfe814a14eeb925323f83a47de23ae2ac/qwen3_sharegpt/uniserve_r16",
+        "manifest_sha256": "166f3437b433eef8d14d4e73697b7ec96f1b4ac4a01b1f857450afaa22d52451"
       },
       "sensenova_t2i_c32": {
-        "root": "artifacts/qualification/decode_runtime/anchor/sensenova_mjhq_t2i/uniserve_c32",
-        "manifest_sha256": "9b32a572cc7aaf7a897ad8cb2e8325c14f219d6c61a22e94c5bfe130f2ae3f51"
+        "root": "artifacts/qualification/generation_runtime/reference/construction/05ab7a2dfe814a14eeb925323f83a47de23ae2ac/sensenova_mjhq_t2i/uniserve_c32",
+        "manifest_sha256": "9c03f86ccdab45ab6e4ba2dadc8089912ea8bb3c1c26471d0fa931066bc15871"
       },
       "sensenova_i2t_c32": {
-        "root": "artifacts/qualification/decode_runtime/anchor/sensenova_beans_i2t/uniserve_c32",
-        "manifest_sha256": "958ccbda95e87c596057453d0d3c5cff7c3ef01584ebaf58ab5a68fd7f96e564"
-      },
-      "sensenova_greedy_interleave_c4": {
-        "root": "artifacts/qualification/decode_runtime/anchor/sensenova_ueval_interleave/uniserve_c4",
-        "manifest_sha256": "223793d4a964fc584a9d9880a5f23f306d22b667094e9c4f6c242c6eb999a6c2"
+        "root": "artifacts/qualification/generation_runtime/reference/construction/05ab7a2dfe814a14eeb925323f83a47de23ae2ac/sensenova_beans_i2t/uniserve_c32",
+        "manifest_sha256": "e41980a823263cbbb5fe5560804701365e647a8cc8bad2f63f119065d2919ab5"
       }
     }
   },
   "performance_reference": {
     "source_commit": "8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5",
     "source_tree": "df134b999e6f00dbd40d6397e3da4349d3a05881",
-    "measurement_commit": "6830e6024b9c902c3231e645419cee7393f2e0e4",
-    "measurement_tree": "678e27ac5b2db01dc65eac8a46bb7696715225e3",
+    "measurement_commit": "7b0028163a1529197931d7c6d86282b736f7b3a3",
+    "measurement_tree": "6262b118199ddee119628a159317675f60df7dfb",
     "source_clean": true,
     "control_overlay": {
-      "contract_commit": "783d8966223bfb89a01749a902ab092228ec6a72",
+      "contract_commit": "ead5d774f5c52ca2f2b13938b0653d4a754d5e6e",
       "paths": [
         "scripts/run_benchmarks.py",
         "uniserve_eval/cli.py",
@@ -49,15 +46,15 @@
     "artifacts": {
       "qwen3_sharegpt_r16": {
         "root": "artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/qwen3_sharegpt/uniserve_r16",
-        "manifest_sha256": "f1dd478d0f3b1bb00e629838ac4b4dd62dfa304782652f762bf030f0ff324197"
+        "manifest_sha256": "7f588e196cac9e47637eb798e38cd7b2b2819289aefd93cdf1a28f9f48f3bfe4"
       },
       "sensenova_t2i_c32": {
         "root": "artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_mjhq_t2i/uniserve_c32",
-        "manifest_sha256": "20809411ade197e41e11b1ec207e7b82ec3e7959ee0c1aa72f0aa87a49aaec62"
+        "manifest_sha256": "3d7bf982d8757f3f82b651ec849ed4ef3db17ea1128851dad35a6b06ef26c258"
       },
       "sensenova_i2t_c32": {
         "root": "artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_beans_i2t/uniserve_c32",
-        "manifest_sha256": "89918dfeecdab4d8f4c4308c51fa788c01159c30a4279e8695952103f9610435"
+        "manifest_sha256": "362721a50ba4972605e260b73237098c69fe94934f1c0696fd14be3e97b85357"
       }
     }
   },
