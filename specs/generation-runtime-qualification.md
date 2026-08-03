@@ -67,14 +67,13 @@ The profile is distinct from greedy UEval and default travel. Its normalized req
 
 Qwen3 ShareGPT reference points use the pinned SGLang source and matched selected rows, tokenizer, request work, sampling controls, arrival semantics, cache policy, capacity, dtype, and hardware. SenseNova T2I and I2T reference points use the pinned vLLM-Omni source with declared feature and capacity mismatches preserved in the artifacts.
 
-The accepted performance-reference source is `8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5`. Its candidate artifacts are:
+The performance-reference executable source is `8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5`. P1 uses a clean measurement commit whose sole parent is that source and whose complete diff is the frozen benchmark-control overlay declared in [`qualification/generation-runtime/references.json`](../qualification/generation-runtime/references.json). Its P1 artifacts are:
 
-- [`artifacts/qualification/decode_runtime/checkpoint/qwen3_sharegpt/uniserve_r16`](../artifacts/qualification/decode_runtime/checkpoint/qwen3_sharegpt/uniserve_r16)
-- [`artifacts/qualification/decode_runtime/checkpoint/sensenova_mjhq_t2i/uniserve_c32`](../artifacts/qualification/decode_runtime/checkpoint/sensenova_mjhq_t2i/uniserve_c32)
-- [`artifacts/qualification/decode_runtime/checkpoint/sensenova_beans_i2t/uniserve_c32`](../artifacts/qualification/decode_runtime/checkpoint/sensenova_beans_i2t/uniserve_c32)
-- [`artifacts/qualification/decode_runtime/default_travel_tp1`](../artifacts/qualification/decode_runtime/default_travel_tp1)
+- [`artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/qwen3_sharegpt/uniserve_r16`](../artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/qwen3_sharegpt/uniserve_r16)
+- [`artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_mjhq_t2i/uniserve_c32`](../artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_mjhq_t2i/uniserve_c32)
+- [`artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_beans_i2t/uniserve_c32`](../artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_beans_i2t/uniserve_c32)
 
-Each artifact is admitted as a comparator only when its source, protocol, workload, environment, correctness, and manifest contracts match the active point. An incompatible artifact remains evidence for its own revision and a fresh matched reference run is required.
+The reference manifest names the exact qualified gates and pending points. P2 does not admit this reference until the matched default-travel point is complete. Every artifact is admitted as a comparator only when its executable source, measurement control, protocol, workload, environment, correctness, and manifest contracts match the active point.
 
 The construction anchor and the pre-change comparator roots for profiles introduced after that anchor are declared by [`qualification/generation-runtime/references.json`](../qualification/generation-runtime/references.json). Those declarations are immutable inputs to candidate manifests and never selected from observed candidate results.
 

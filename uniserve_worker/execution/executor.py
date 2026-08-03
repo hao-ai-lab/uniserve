@@ -150,7 +150,7 @@ from uniserve_worker.runtime.image_utils import (
     uint8_image_to_png_base64_bytes,
 )
 from uniserve_worker.runtime.kv_store import KvEntry, KvSnapshot, KvStore, KvTxn
-from uniserve_worker.runtime.latent_store import LatentRecord, LatentStore, LatentTxn, LatentTxnView
+from uniserve_worker.runtime.latent_store import LatentRecord, LatentStore, LatentTxn
 from uniserve_worker.runtime.mesh_store import MeshStore
 from uniserve_worker.runtime.product_store import (
     DeviceProductContinuationBatch,
@@ -921,10 +921,13 @@ class _CompletionImagePayload:
 class _PreparedTransferInput:
     product: ProductRef
     kind: str
-    descriptor_value: dict[str, object]
     producer_plan_digest: str
     locators: tuple[Locator, ...]
     tickets: tuple[TransferTicket, ...]
+    payload_kind: ProductKind | None
+    height: int | None
+    width: int | None
+    snapshot: KvSnapshot | None
 
     def ready(self) -> bool:
         return all(ticket.ready() for ticket in self.tickets)
@@ -1432,7 +1435,6 @@ class _ExecutionScope:
     completion: CompletionLease
     kv: KvTxn
     latents: LatentTxn
-    latent_view: LatentTxnView
     products: ProductTxn
     product_view: ProductView
     layout: _PartitionLayout | None = None
@@ -1661,6 +1663,10 @@ class ModelExecutor:
         for entry in entries:
             kind, value, producer_plan_digest = decode_transfer_descriptor(entry.payload)
             locators: tuple[Locator, ...]
+            payload_kind: ProductKind | None = None
+            height: int | None = None
+            width: int | None = None
+            snapshot: KvSnapshot | None = None
             if kind == "tensor":
                 if set(value) != {
                     "height",
@@ -1674,19 +1680,26 @@ class ModelExecutor:
                     raise invalid_descriptor("tensor transfer entry locator is invalid")
                 main = Locator.from_wire(raw_locator)
                 locators = (main,)
+                raw_payload_kind = value["payload_kind"]
+                raw_height = value["height"]
+                raw_width = value["width"]
                 if (
-                    value["payload_kind"]
+                    not isinstance(raw_payload_kind, str)
+                    or raw_payload_kind
                     not in {ProductKind.VISION_FEATURE.value, ProductKind.LATENT_FEATURE.value}
-                    or not isinstance(value["height"], int)
-                    or isinstance(value["height"], bool)
-                    or not isinstance(value["width"], int)
-                    or isinstance(value["width"], bool)
-                    or int(value["height"]) < 1
-                    or int(value["width"]) < 1
+                    or not isinstance(raw_height, int)
+                    or isinstance(raw_height, bool)
+                    or not isinstance(raw_width, int)
+                    or isinstance(raw_width, bool)
+                    or raw_height < 1
+                    or raw_width < 1
                     or main.nbytes > entry.product.max_bytes
                     or math.prod(main.shape) > entry.product.shape_bound.max_elements
                 ):
                     raise invalid_descriptor("tensor transfer metadata exceeds its product bounds")
+                payload_kind = ProductKind(raw_payload_kind)
+                height = raw_height
+                width = raw_width
             else:
                 if set(value) != {"snapshot"}:
                     raise invalid_descriptor("KV transfer entry has an invalid shape")
@@ -1698,10 +1711,13 @@ class ModelExecutor:
                 _PreparedTransferInput(
                     product=entry.product,
                     kind=kind,
-                    descriptor_value=value,
                     producer_plan_digest=producer_plan_digest,
                     locators=locators,
                     tickets=tuple(transport.fetch_async(locator) for locator in locators),
+                    payload_kind=payload_kind,
+                    height=height,
+                    width=width,
+                    snapshot=snapshot,
                 )
             )
         return PreparedExecution(batch=batch, transfers=tuple(transfers))
@@ -2013,7 +2029,6 @@ class ModelExecutor:
             completion=completion,
             kv=cast(KvTxn, transaction.store_transaction(self.kv)),
             latents=cast(LatentTxn, transaction.store_transaction(self.latents)),
-            latent_view=cast(LatentTxn, transaction.store_transaction(self.latents)).view(),
             products=cast(ProductTxn, transaction.store_transaction(self.products)),
             product_view=cast(ProductTxn, transaction.store_transaction(self.products)).view(),
             prepared_transfers={
@@ -2514,28 +2529,28 @@ class ModelExecutor:
         group_identities: list[tuple[int, str]] = []
         for submission_group, partitions in groups.items():
             collective_seq = partitions[0].collective_seq
-            identity = hashlib.sha256()
-            identity.update(int(submission_group).to_bytes(4, "little"))
-            identity.update(int(collective_seq).to_bytes(8, "little"))
+            digest = hashlib.sha256()
+            digest.update(int(submission_group).to_bytes(4, "little"))
+            digest.update(int(collective_seq).to_bytes(8, "little"))
             for partition in sorted(partitions, key=lambda value: value.partition_id):
-                identity.update(int(partition.partition_id).to_bytes(4, "little"))
-                identity.update(int(partition.route).to_bytes(4, "little"))
-                identity.update(partition.domain.value.encode("ascii"))
-                identity.update(partition.execution.value.encode("ascii"))
+                digest.update(int(partition.partition_id).to_bytes(4, "little"))
+                digest.update(int(partition.route).to_bytes(4, "little"))
+                digest.update(partition.domain.value.encode("ascii"))
+                digest.update(partition.execution.value.encode("ascii"))
                 for operation in partition.operations:
-                    identity.update(operation.plan_digest.encode("ascii"))
-            group_identities.append((int(collective_seq), identity.hexdigest()))
-        for collective_seq, identity in sorted(group_identities):
+                    digest.update(operation.plan_digest.encode("ascii"))
+            group_identities.append((int(collective_seq), digest.hexdigest()))
+        for collective_seq, collective_digest in sorted(group_identities):
             existing = self._collective_history.get(collective_seq)
             if existing is not None:
-                if existing != identity:
+                if existing != collective_digest:
                     raise invalid_descriptor("collective sequence was reused with different work")
                 continue
             if self._collective_history and collective_seq <= next(
                 reversed(self._collective_history)
             ):
                 raise invalid_descriptor("collective sequence does not advance")
-            self._collective_history[collective_seq] = identity
+            self._collective_history[collective_seq] = collective_digest
             while len(self._collective_history) > 4096:
                 self._collective_history.popitem(last=False)
 
@@ -2884,7 +2899,9 @@ class ModelExecutor:
                         "cross-stage input has no query-ready prepared transfer"
                     )
                 if transfer.kind == "kv":
-                    snapshot = KvSnapshot.from_wire(transfer.descriptor_value["snapshot"])
+                    snapshot = transfer.snapshot
+                    if snapshot is None:
+                        raise RuntimeError("prepared KV transfer has no validated snapshot")
                     if self.transport is None:
                         raise capability_mismatch(
                             "cross-stage KV input requires a configured transport"
@@ -2911,18 +2928,20 @@ class ModelExecutor:
                 )[0]
                 scope.device_writes.append(binding)
                 resident = self.products.device_products.publish_write(binding, tensors[0])
-                payload_kind = str(transfer.descriptor_value["payload_kind"])
-                height = int(transfer.descriptor_value["height"])
-                width = int(transfer.descriptor_value["width"])
-                if payload_kind == ProductKind.VISION_FEATURE.value:
-                    payload: VisionFeatureProduct | LatentFeatureProduct = VisionFeatureProduct(
+                payload_kind = transfer.payload_kind
+                height = transfer.height
+                width = transfer.width
+                if payload_kind is None or height is None or width is None:
+                    raise RuntimeError("prepared tensor transfer has no validated geometry")
+                if payload_kind is ProductKind.VISION_FEATURE:
+                    transferred_payload: VisionFeatureProduct | LatentFeatureProduct = VisionFeatureProduct(
                         features=resident,
                         height=height,
                         width=width,
                         source_base64=None,
                     )
-                elif payload_kind == ProductKind.LATENT_FEATURE.value and len(tensors) == 1:
-                    payload = LatentFeatureProduct(
+                elif payload_kind is ProductKind.LATENT_FEATURE and len(tensors) == 1:
+                    transferred_payload = LatentFeatureProduct(
                         latent=resident,
                         height=height,
                         width=width,
@@ -2935,7 +2954,7 @@ class ModelExecutor:
                     ProductRecord(
                         handle=handle,
                         session_id=product.request_key.session_id,
-                        payload=payload,
+                        payload=transferred_payload,
                     )
                 )
                 self.sessions.get(product.request_key.session_id).product_handles.add(handle)
@@ -2946,22 +2965,22 @@ class ModelExecutor:
                 )
                 continue
             handle = self._input_product_handle(product)
-            payload: LogitsProduct | EncodedImageProduct
+            inline_payload: LogitsProduct | EncodedImageProduct
             if product.kind is ProductKind.TOKEN:
-                payload = LogitsProduct(
+                inline_payload = LogitsProduct(
                     logits=torch.empty(0),
                     source_mode=TokenMode.VERIFY,
                     draft_token_ids=decode_token_product_bytes(entry.payload),
                 )
             elif entry.payload:
-                payload = EncodedImageProduct(entry.payload.decode("utf-8"))
+                inline_payload = EncodedImageProduct(entry.payload.decode("utf-8"))
             else:
                 continue
             scope.product_view.put(
                 ProductRecord(
                     handle=handle,
                     session_id=product.request_key.session_id,
-                    payload=payload,
+                    payload=inline_payload,
                 )
             )
 
@@ -3218,7 +3237,7 @@ class ModelExecutor:
         if forward:
             indexes = tuple(index for index, _task, _scope in forward)
             outputs = self._run_partitioned_wave(
-                tuple((cast(_ForwardTask, task), scope) for _index, task, scope in forward)
+                tuple((task, scope) for _index, task, scope in forward)
             )
             for index, output in zip(indexes, outputs, strict=True):
                 result[index] = output
@@ -3229,7 +3248,7 @@ class ModelExecutor:
         for candidates in sampling.values():
             scope = candidates[0][2]
             try:
-                outputs = _sample_task_batch(
+                sample_outputs = _sample_task_batch(
                     tuple(task for _index, task, _scope in candidates),
                     scope.completion,
                     device_products=self.products.device_products,
@@ -3239,8 +3258,10 @@ class ModelExecutor:
             except BaseException as error:
                 errors[scope.partition.partition_id] = error
                 continue
-            for (index, _task, _scope), output in zip(candidates, outputs, strict=True):
-                result[index] = output
+            for (index, _task, _scope), sample_output in zip(
+                candidates, sample_outputs, strict=True
+            ):
+                result[index] = sample_output
         if any(
             value is None and scope.partition.partition_id not in errors
             for value, (_task, scope) in zip(result, tasks, strict=True)
@@ -3426,9 +3447,7 @@ class ModelExecutor:
             mesh = EmptyMeshView() if self.mesh is None else self.mesh.view(route.topology_axes)
             context = ForwardContext(
                 kv=kv_view,
-                latent=scope.latent_view
-                if any(isinstance(task.row, FlowRow) for task in tasks)
-                else EmptyLatentView(),
+                latent=EmptyLatentView(),
                 attention=attention,
                 mesh=mesh,
                 output=EmptyOutputView(),
@@ -6645,6 +6664,7 @@ def _sample_device_greedy_group(
     if selection_broadcast is not None:
         selection_broadcast(device_tokens)
     active = _sample_predicates(tasks, device_tokens.device)
+    device_finish: torch.Tensor | None
     if grouped_publication:
         device_finish = _device_finish_values(tasks, device_tokens, valid & active)
         continuation_values = active & valid & ~device_finish
@@ -6675,6 +6695,8 @@ def _sample_device_greedy_group(
         if grouped_publication:
             side_batches: tuple[DeviceProductScalarBatch, ...] = ()
             if finish_batch is not None:
+                if device_finish is None:
+                    raise RuntimeError("grouped sampling has no device finish values")
                 finish_batch.tensor.copy_(
                     _select_device_values(device_finish, finish_indexes),
                 )

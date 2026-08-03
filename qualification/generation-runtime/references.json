@@ -26,26 +26,38 @@
   "performance_reference": {
     "source_commit": "8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5",
     "source_tree": "df134b999e6f00dbd40d6397e3da4349d3a05881",
-    "artifact_source_tree": "a4e8179698d2d95a13e0c16395080418c67910cf",
-    "source_clean": false,
-    "qualification_eligible": false,
+    "measurement_commit": "6830e6024b9c902c3231e645419cee7393f2e0e4",
+    "measurement_tree": "678e27ac5b2db01dc65eac8a46bb7696715225e3",
+    "source_clean": true,
+    "control_overlay": {
+      "contract_commit": "783d8966223bfb89a01749a902ab092228ec6a72",
+      "paths": [
+        "scripts/run_benchmarks.py",
+        "uniserve_eval/cli.py",
+        "uniserve_eval/harness/comparison.py",
+        "uniserve_eval/harness/core/client.py",
+        "uniserve_eval/harness/metrics/common.py",
+        "uniserve_eval/harness/metrics/stream.py",
+        "uniserve_eval/harness/report.py",
+        "uniserve_eval/profiles.json",
+        "uniserve_eval/verify.py"
+      ]
+    },
+    "qualified_gates": ["P1"],
+    "pending_points": ["sensenova_default_travel"],
     "required_action": "matched_reference_measurement",
     "artifacts": {
       "qwen3_sharegpt_r16": {
-        "root": "artifacts/qualification/decode_runtime/checkpoint/qwen3_sharegpt/uniserve_r16",
-        "manifest_sha256": "9702330bc40640e7f74653be16b5413baf21ce680c28fac1f6be0469eebe2c93"
+        "root": "artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/qwen3_sharegpt/uniserve_r16",
+        "manifest_sha256": "f1dd478d0f3b1bb00e629838ac4b4dd62dfa304782652f762bf030f0ff324197"
       },
       "sensenova_t2i_c32": {
-        "root": "artifacts/qualification/decode_runtime/checkpoint/sensenova_mjhq_t2i/uniserve_c32",
-        "manifest_sha256": "81a464078a37998fddfef10e5ccaac650e4bf37f2d0f81f6ad697021e4b97515"
+        "root": "artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_mjhq_t2i/uniserve_c32",
+        "manifest_sha256": "20809411ade197e41e11b1ec207e7b82ec3e7959ee0c1aa72f0aa87a49aaec62"
       },
       "sensenova_i2t_c32": {
-        "root": "artifacts/qualification/decode_runtime/checkpoint/sensenova_beans_i2t/uniserve_c32",
-        "manifest_sha256": "b3440ebf85249769cb6c4aeff0a2bfd9e43fd65b02923dfbd42570012812c022"
-      },
-      "sensenova_default_travel": {
-        "root": "artifacts/qualification/decode_runtime/default_travel_tp1",
-        "summary_sha256": "6dee8f9dab727c9cb5b2ae30216c0802f551bbeb96b02252c0505ded30ffecc7"
+        "root": "artifacts/qualification/generation_runtime/reference/performance/8c33a6fcc0cfc6da9e5a14a698b0efbba3e0c8f5/sensenova_beans_i2t/uniserve_c32",
+        "manifest_sha256": "89918dfeecdab4d8f4c4308c51fa788c01159c30a4279e8695952103f9610435"
       }
     }
   },

@@ -3665,7 +3665,7 @@ async fn chat_event_stream(
 }
 
 enum ChatDecodedInput {
-    Event(DecodedTextEvent),
+    Event(Box<DecodedTextEvent>),
     Barrier(Arc<AtomicBool>),
 }
 
@@ -3680,7 +3680,7 @@ impl Stream for ChatDecodedInputStream {
         loop {
             match self.receiver.poll_recv(cx) {
                 Poll::Ready(Some(ChatDecodedInput::Event(event))) => {
-                    return Poll::Ready(Some(Ok(event)));
+                    return Poll::Ready(Some(Ok(*event)));
                 }
                 Poll::Ready(Some(ChatDecodedInput::Barrier(reached))) => {
                     reached.store(true, Ordering::Release);
@@ -3711,7 +3711,7 @@ impl ChatOutputBridge {
         event: DecodedTextEvent,
     ) -> Result<Vec<ChatEvent>> {
         self.sender
-            .try_send(ChatDecodedInput::Event(event))
+            .try_send(ChatDecodedInput::Event(Box::new(event)))
             .map_err(|_| ServeError::OutputProcessing {
                 request_id: request_id.clone(),
                 message: "chat output processor closed before receiving decoded text".to_string(),

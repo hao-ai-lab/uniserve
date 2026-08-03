@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from threading import RLock
-from typing import cast
+from typing import TypeAlias, cast
 
 import torch
 
@@ -213,24 +213,24 @@ class _RetainedPage:
     value_scale_set: torch.Tensor | None
 
 
+_KvEntryState: TypeAlias = tuple[
+    bool,
+    tuple[int, ...],
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    dict[str, int],
+    int,
+    str,
+]
+
+
 @dataclass(frozen=True, slots=True)
 class _KvSnapshot:
-    entries: dict[
-        int,
-        tuple[
-            bool,
-            tuple[int, ...],
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            dict[str, int],
-            int,
-            str,
-        ],
-    ]
+    entries: dict[int, _KvEntryState]
     branches: dict[tuple[ProductRef, str], tuple[tuple[int, ...], int]]
     publications: dict[ProductRef, KvSnapshot]
     destination_bases: dict[tuple[int, str], tuple[VersionRef, int, tuple[int, ...], int, str]]
@@ -240,22 +240,7 @@ class _KvSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class _KvEntrySnapshot:
-    entries: dict[
-        int,
-        tuple[
-            bool,
-            tuple[int, ...],
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            dict[str, int],
-            int,
-            str,
-        ],
-    ]
+    entries: dict[int, _KvEntryState]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1792,8 +1777,10 @@ class KvStore:
         states: Sequence[KvCommittedState],
         session_ids: set[int],
     ) -> None:
-        for key in [key for key in self._branches if key[0] in session_ids]:
-            self._release_scratch(self._branches.pop(key).block_ids)
+        for branch_key in [
+            key for key in self._branches if key[0].request_key.session_id in session_ids
+        ]:
+            self._release_scratch(self._branches.pop(branch_key).block_ids)
         for session_id in session_ids:
             current = self._entries.pop(session_id, None)
             if current is not None:
@@ -1801,12 +1788,12 @@ class KvStore:
         for product in tuple(self._publication_products):
             if product.request_key.session_id in session_ids:
                 del self._publication_products[product]
-        for key in tuple(self._destination_bases):
-            if key[0] in session_ids:
-                del self._destination_bases[key]
-        for key in tuple(self._installed_bases):
-            if key[0] in session_ids:
-                del self._installed_bases[key]
+        for destination_key in tuple(self._destination_bases):
+            if destination_key[0] in session_ids:
+                del self._destination_bases[destination_key]
+        for installed_key in tuple(self._installed_bases):
+            if installed_key[0] in session_ids:
+                del self._installed_bases[installed_key]
 
         block_sources: dict[int, tuple[KvPageState, int]] = {}
         for state in states:
@@ -2012,23 +1999,8 @@ class KvStore:
     def _snapshot_entries_locked(
         self,
         request_ids: set[int],
-    ) -> dict[
-        int,
-        tuple[
-            bool,
-            tuple[int, ...],
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            dict[str, int],
-            int,
-            str,
-        ],
-    ]:
-        result = {}
+    ) -> dict[int, _KvEntryState]:
+        result: dict[int, _KvEntryState] = {}
         for session_id in request_ids:
             entry = self._entries.get(session_id)
             if entry is None:

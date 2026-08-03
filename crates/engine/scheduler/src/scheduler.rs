@@ -1877,28 +1877,10 @@ impl Scheduler {
     }
 
     fn request_base_credits(&self, state: &ReqState) -> CreditVector {
-        let text_event_bytes = 4096_u64
-            .saturating_add(u64::from(state.req.sampling.n_logprobs).saturating_mul(16))
-            .saturating_add(u64::from(state.req.sampling.n_prompt_logprobs).saturating_mul(16));
-        let image_event_bytes = if state.req.behavior.gen_output {
-            let raw = u64::from(state.req.image.height).saturating_mul(
-                u64::from(state.req.image.width)
-                    .saturating_mul(3)
-                    .saturating_add(1),
-            );
-            raw.saturating_mul(2)
-                .saturating_add(1 << 20)
-                .div_ceil(3)
-                .saturating_mul(4)
-        } else {
-            0
-        };
         CreditVector {
             kv_pages: state.resources.worstcase_blocks as u64,
             cpu_tasks: u64::from(self.cpu_continuation_required(state)),
-            output_journal_bytes: text_event_bytes
-                .max(image_event_bytes)
-                .saturating_mul(OUTPUT_JOURNAL_CAPACITY as u64),
+            output_journal_bytes: request_output_journal_bytes(&state.req),
             ..CreditVector::ZERO
         }
     }
@@ -6497,6 +6479,35 @@ fn transition_output_bound(transition: &PlannedTransition) -> usize {
     }
 }
 
+fn request_output_journal_bytes(request: &GenerationRequest) -> u64 {
+    let event_slots = OUTPUT_JOURNAL_CAPACITY as u64;
+    let text_event_bytes = 4096_u64
+        .saturating_add(u64::from(request.sampling.n_logprobs).saturating_mul(16))
+        .saturating_add(u64::from(request.sampling.n_prompt_logprobs).saturating_mul(16));
+    let image_slots = if request.behavior.gen_output {
+        u64::from(request.image.max_images).min(event_slots)
+    } else {
+        0
+    };
+    let image_event_bytes = if image_slots > 0 {
+        let raw = u64::from(request.image.height).saturating_mul(
+            u64::from(request.image.width)
+                .saturating_mul(3)
+                .saturating_add(1),
+        );
+        raw.saturating_mul(2)
+            .saturating_add(1 << 20)
+            .div_ceil(3)
+            .saturating_mul(4)
+            .max(text_event_bytes)
+    } else {
+        0
+    };
+    image_event_bytes
+        .saturating_mul(image_slots)
+        .saturating_add(text_event_bytes.saturating_mul(event_slots.saturating_sub(image_slots)))
+}
+
 /// Flush as many ordered journal entries as the immediate consumer can accept.
 /// Returns true when the consumer has closed.
 fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenEvent>) -> bool {
@@ -6645,6 +6656,36 @@ mod tests {
         let stops = canonical_continuation_stop_token_ids(&req, &[151_643, 151_645]);
 
         assert_eq!(stops, vec![4_242, 151_643, 151_645]);
+    }
+
+    #[test]
+    fn output_journal_credit_counts_each_bounded_image_artifact_once() {
+        let mut req = request(1, 8);
+        req.constraint = GenerationConstraint::GenOnly;
+        req.behavior = GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
+        req.behavior.gen_output = true;
+        req.image.width = 2048;
+        req.image.height = 1152;
+        req.image.max_images = 1;
+
+        let text_event_bytes = 4096_u64;
+        let raw_image_bytes = u64::from(req.image.height).saturating_mul(
+            u64::from(req.image.width)
+                .saturating_mul(3)
+                .saturating_add(1),
+        );
+        let image_event_bytes = raw_image_bytes
+            .saturating_mul(2)
+            .saturating_add(1 << 20)
+            .div_ceil(3)
+            .saturating_mul(4);
+
+        assert_eq!(
+            request_output_journal_bytes(&req),
+            image_event_bytes.saturating_add(
+                text_event_bytes.saturating_mul((OUTPUT_JOURNAL_CAPACITY - 1) as u64)
+            )
+        );
     }
 
     fn cursor(phase: Phase, pos: u32) -> CursorProjection {

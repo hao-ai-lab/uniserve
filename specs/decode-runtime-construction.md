@@ -227,7 +227,7 @@ The canonical manifest is a versioned JSON object with these required top-level 
 }
 ```
 
-The concrete schema in `schemas/generation-runtime-candidate.schema.json` is authoritative. Commands are arrays of tokens, not shell strings. Check entries declare stable IDs, gate classes, serial order, prerequisites, timeout, artifact role, and whether they mutate only the declared artifact root.
+The candidate plan schema in `schemas/generation-runtime-candidate-plan.schema.json` and immutable candidate schema in `schemas/generation-runtime-candidate.schema.json` are authoritative. Commands are arrays of tokens, not shell strings. Check entries declare stable IDs, gate classes, serial order, prerequisites, timeout, artifact role, and whether they mutate only the declared artifact root.
 
 An acceptance run with `update_ref=false` validates and emits a signed-by-digest acceptance record without changing the development ref. `update_ref=true` is permitted only after every declared check passes and the ref still names the manifest parent.
 
