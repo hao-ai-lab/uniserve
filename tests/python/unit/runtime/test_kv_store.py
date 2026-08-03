@@ -123,6 +123,25 @@ def test_committed_scratch_snapshot_restores_exact_latent_owner() -> None:
     assert pool.branch_blocks_available == 2
 
 
+def test_committed_snapshot_replaces_session_scratch_state() -> None:
+    pool = _pool(layers=1, branch_blocks=4)
+    store = KvStore(pool)
+    request_key = _admit(store, 1, block_ids=(0,), prefix_len=0)
+    committed_owner = _latent_product(request_key, op_id=10, generation=7)
+    replacement_owner = _latent_product(request_key, op_id=11, generation=8)
+    store.scratch_entry(committed_owner, "text", capacity_tokens=3, copy_conditioning=False)
+    state = store.snapshot_committed({1})
+    store.release_operations(((request_key, 10),))
+    store.scratch_entry(replacement_owner, "text", capacity_tokens=3, copy_conditioning=False)
+
+    store.restore_committed(state, {1})
+
+    branches = store.snapshot_committed({1})[0].branches
+    assert tuple(branch.owner for branch in branches) == (committed_owner,)
+    assert store.scratch_token_count() == 4
+    assert pool.branch_blocks_available == 2
+
+
 def test_kv_view_uses_visible_extents_and_device_append_offsets() -> None:
     pool = _pool(layers=1)
     store = KvStore(pool)

@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 import hashlib
 import json
 import re
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ CANONICAL_DOCUMENTS = (
 REFERENCE_PATH = Path("qualification/generation-runtime/references.json")
 REFERENCE_SCHEMA_PATH = Path("schemas/generation-runtime-references.schema.json")
 CANDIDATE_SCHEMA_PATH = Path("schemas/generation-runtime-candidate.schema.json")
+CANDIDATE_PLAN_SCHEMA_PATH = Path("schemas/generation-runtime-candidate-plan.schema.json")
 PROFILE_PATH = Path("uniserve_eval/profiles.json")
 MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\((?P<target><[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 
@@ -110,15 +111,14 @@ def validate_p0(parent: str, candidate: str) -> dict[str, Any]:
         for path in _git_text("diff", "--name-only", parent_commit, candidate_commit).splitlines()
         if path
     )
-    allowed_prefixes = ("docs/", "qualification/", "schemas/", "specs/", "tests/")
-    allowed_files = {
-        "scripts/check_generation_runtime_contract.py",
-        "uniserve_eval/profiles.json",
-    }
+    executable_prefixes = ("crates/", "uniserve_kernel/", "uniserve_worker/")
+    executable_files = {"scripts/run_benchmarks.py"}
     executable_changes = [
         path
         for path in changed_paths
-        if path not in allowed_files and not path.startswith(allowed_prefixes)
+        if path.startswith(executable_prefixes)
+        or (path.startswith("uniserve_eval/") and path != "uniserve_eval/profiles.json")
+        or path in executable_files
     ]
     if executable_changes:
         raise ContractError(
@@ -130,25 +130,26 @@ def validate_p0(parent: str, candidate: str) -> dict[str, Any]:
         candidate_config = json.loads(_git_text("show", f"{candidate_commit}:{PROFILE_PATH}"))
     except json.JSONDecodeError as error:
         raise ContractError(f"P0 profile snapshot is invalid JSON: {error}") from error
-    normalized_candidate = deepcopy(candidate_config)
-    benchmark = normalized_candidate["benchmarks"]["main"]
-    expected_load_case = benchmark["load_cases"].pop("interleave_qualification", None)
-    expected_group = benchmark["groups"].pop("sensenova-uniserve-stochastic", None)
-    expected_point = benchmark["points"].pop(
-        "sensenova_ueval_stochastic_interleave_uniserve", None
-    )
-    if not (
-        expected_load_case == [{"id": "c4", "request_rate": "inf", "max_concurrency": 4}]
-        and expected_group
-        == {
-            "server": "benchmark/server/sensenova-uniserve",
-            "points": ["sensenova_ueval_stochastic_interleave_uniserve"],
-        }
-        and isinstance(expected_point, dict)
-    ):
-        raise ContractError("P0 candidate does not contain the exact additive profile boundary")
-    if normalized_candidate != parent_config:
-        raise ContractError("P0 candidate changes an existing benchmark or serving profile")
+    if candidate_config != parent_config:
+        normalized_candidate = deepcopy(candidate_config)
+        benchmark = normalized_candidate["benchmarks"]["main"]
+        expected_load_case = benchmark["load_cases"].pop("interleave_qualification", None)
+        expected_group = benchmark["groups"].pop("sensenova-uniserve-stochastic", None)
+        expected_point = benchmark["points"].pop(
+            "sensenova_ueval_stochastic_interleave_uniserve", None
+        )
+        if not (
+            expected_load_case
+            == [{"id": "c4", "request_rate": "inf", "max_concurrency": 4}]
+            and expected_group
+            == {
+                "server": "benchmark/server/sensenova-uniserve",
+                "points": ["sensenova_ueval_stochastic_interleave_uniserve"],
+            }
+            and isinstance(expected_point, dict)
+            and normalized_candidate == parent_config
+        ):
+            raise ContractError("P0 candidate changes an existing benchmark or serving profile")
     _validate_stochastic_profile(candidate_config, _load_json(REFERENCE_PATH))
     return {
         "parent": parent_commit,
@@ -159,7 +160,80 @@ def validate_p0(parent: str, candidate: str) -> dict[str, Any]:
     }
 
 
-def _validate_reference_artifacts(references: dict[str, Any]) -> None:
+def _validate_performance_reference(
+    reference: dict[str, Any],
+    construction_anchor: dict[str, Any],
+) -> None:
+    source_commit = reference["source_commit"]
+    measurement_commit = reference["measurement_commit"]
+    if not _git_object_exists(measurement_commit):
+        raise ContractError(f"performance measurement commit is unavailable: {measurement_commit}")
+    if _git_text("rev-parse", f"{source_commit}^{{tree}}").strip() != reference["source_tree"]:
+        raise ContractError("performance reference source tree does not match its commit")
+    if (
+        _git_text("rev-parse", f"{measurement_commit}^{{tree}}").strip()
+        != reference["measurement_tree"]
+    ):
+        raise ContractError("performance reference measurement tree does not match its commit")
+    parents = _git_text("rev-list", "--parents", "-n", "1", measurement_commit).split()
+    if parents != [measurement_commit, source_commit]:
+        raise ContractError("performance measurement must have the named source as its sole parent")
+    overlay = reference["control_overlay"]
+    changed = _git_text("diff", "--name-only", source_commit, measurement_commit).splitlines()
+    if changed != overlay["paths"]:
+        raise ContractError("performance measurement control overlay paths do not match its diff")
+    for path in overlay["paths"]:
+        measured_blob = _git_text("rev-parse", f"{measurement_commit}:{path}").strip()
+        contract_blob = _git_text("rev-parse", f"{overlay['contract_commit']}:{path}").strip()
+        if measured_blob != contract_blob:
+            raise ContractError(f"performance measurement control differs from its contract: {path}")
+    if reference["qualified_gates"] != ["P1"]:
+        raise ContractError("performance reference qualification must name its exact completed gates")
+    if reference["pending_points"] != ["sensenova_default_travel"]:
+        raise ContractError("performance reference pending point set is not canonical")
+
+    point_contracts = {
+        "qwen3_sharegpt_r16": 200,
+        "sensenova_t2i_c32": 32,
+        "sensenova_i2t_c32": 32,
+    }
+    if set(reference["artifacts"]) != set(point_contracts):
+        raise ContractError("performance reference P1 artifact set is incomplete")
+    for name, request_count in point_contracts.items():
+        root = ROOT / reference["artifacts"][name]["root"]
+        summary = _load_json(root / "summary.json")
+        artifact = summary.get("artifact") if isinstance(summary, dict) else None
+        matrix = artifact.get("matrix_contract") if isinstance(artifact, dict) else None
+        policy = matrix.get("execution_policy") if isinstance(matrix, dict) else None
+        build = policy.get("build_manifest") if isinstance(policy, dict) else None
+        source = build.get("source_state") if isinstance(build, dict) else None
+        anchor_root = ROOT / construction_anchor["artifacts"][name]["root"]
+        anchor_summary = _load_json(anchor_root / "summary.json")
+        anchor_artifact = anchor_summary.get("artifact")
+        anchor_matrix = (
+            anchor_artifact.get("matrix_contract") if isinstance(anchor_artifact, dict) else None
+        )
+        expected = (
+            anchor_matrix.get("benchmark_definition") if isinstance(anchor_matrix, dict) else None
+        )
+        definition = matrix.get("benchmark_definition") if isinstance(matrix, dict) else None
+        if not (
+            artifact.get("valid") is True
+            and artifact.get("valid_marker") == "canonical-valid-v2"
+            and summary.get("request_count") == request_count
+            and summary.get("ok_count") == request_count
+            and summary.get("failed_count") == 0
+            and isinstance(source, dict)
+            and source.get("head") == measurement_commit
+            and source.get("dirty") is False
+            and definition == expected
+        ):
+            raise ContractError(f"performance reference artifact is not canonical: {name}")
+
+
+def _validate_reference_artifacts(
+    references: dict[str, Any],
+) -> None:
     for set_name in ("construction_anchor", "performance_reference"):
         reference = references[set_name]
         source_commit = reference["source_commit"]
@@ -177,6 +251,10 @@ def _validate_reference_artifacts(references: dict[str, Any]) -> None:
                 summary = root / "summary.json"
                 if not summary.is_file() or _sha256(summary) != artifact["summary_sha256"]:
                     raise ContractError(f"{set_name}.{artifact_name} summary digest mismatch")
+    _validate_performance_reference(
+        references["performance_reference"],
+        references["construction_anchor"],
+    )
     for anchor_name, anchor in references["profile_anchors"].items():
         if not _git_object_exists(anchor["source_commit"]):
             raise ContractError(f"{anchor_name} source commit is unavailable")
@@ -283,12 +361,13 @@ def _validate_stochastic_profile(config: dict[str, Any], references: dict[str, A
 
 def validate_contract() -> dict[str, Any]:
     _validate_schema(CANDIDATE_SCHEMA_PATH)
+    _validate_schema(CANDIDATE_PLAN_SCHEMA_PATH)
     _validate_schema(REFERENCE_SCHEMA_PATH, REFERENCE_PATH)
     for document in CANONICAL_DOCUMENTS:
         _validate_markdown_links(document)
+    config = load_config(ROOT / PROFILE_PATH)
     references = _load_json(REFERENCE_PATH)
     _validate_reference_artifacts(references)
-    config = load_config(ROOT / PROFILE_PATH)
     expanded = _expanded_points(config)
     if len(expanded) != 46:
         raise ContractError(f"main benchmark must expand to 46 serial points, found {len(expanded)}")

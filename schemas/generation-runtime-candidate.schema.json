@@ -88,7 +88,64 @@
           },
           "timeout_s": {"type": "integer", "minimum": 1},
           "artifact_role": {"enum": ["none", "diagnostic", "canonical"]},
-          "artifact_path": {"$ref": "#/$defs/repository_path"}
+          "artifact_path": {"$ref": "#/$defs/repository_path"},
+          "environment": {
+            "type": "object",
+            "additionalProperties": {"type": "string"}
+          },
+          "measurement": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["points"],
+            "properties": {
+              "points": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["id", "kind"],
+                  "properties": {
+                    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+                    "kind": {"enum": ["benchmark", "verification", "oracle", "stress", "reference"]},
+                    "qualification_gate": {"enum": ["P1", "P2", "P3", "P4"]},
+                    "profile": {"type": "string", "minLength": 1},
+                    "group": {"type": "string", "minLength": 1},
+                    "point": {"type": "string", "minLength": 1},
+                    "load_case_set": {"type": "string", "minLength": 1},
+                    "load_case_id": {"type": "string", "minLength": 1},
+                    "execution_depth": {"type": ["integer", "string"], "minimum": 1},
+                    "topology": {"type": "string", "minLength": 1},
+                    "role": {"enum": ["candidate", "reference", "oracle"]},
+                    "artifact_path": {"type": "string", "minLength": 1},
+                    "comparator_paths": {
+                      "type": "object",
+                      "additionalProperties": {"type": "string", "minLength": 1}
+                    },
+                    "required_success_count": {"type": "integer", "minimum": 1},
+                    "metrics": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["name", "objective", "path"],
+                        "properties": {
+                          "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+                          "objective": {"enum": ["maximize", "minimize"]},
+                          "path": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string", "minLength": 1}
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         },
         "allOf": [
           {
@@ -106,6 +163,7 @@
         "required": ["source_commit", "artifact_root"],
         "properties": {
           "source_commit": {"$ref": "#/$defs/commit"},
+          "measurement_commit": {"$ref": "#/$defs/commit"},
           "artifact_root": {"$ref": "#/$defs/repository_path"},
           "manifest_sha256": {"$ref": "#/$defs/sha256"}
         }

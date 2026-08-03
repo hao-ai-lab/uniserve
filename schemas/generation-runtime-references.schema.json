@@ -8,21 +8,7 @@
   "properties": {
     "schema_version": {"const": 1},
     "construction_anchor": {"$ref": "#/$defs/reference_set"},
-    "performance_reference": {
-      "allOf": [
-        {"$ref": "#/$defs/reference_set"},
-        {
-          "type": "object",
-          "required": ["source_tree", "artifact_source_tree", "qualification_eligible", "required_action"],
-          "properties": {
-            "source_tree": {"$ref": "#/$defs/tree"},
-            "artifact_source_tree": {"$ref": "#/$defs/tree"},
-            "qualification_eligible": {"type": "boolean"},
-            "required_action": {"enum": ["none", "matched_reference_measurement"]}
-          }
-        }
-      ]
-    },
+    "performance_reference": {"$ref": "#/$defs/performance_reference"},
     "profile_anchors": {
       "type": "object",
       "additionalProperties": {
@@ -56,6 +42,56 @@
     }
   },
   "$defs": {
+    "performance_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_commit",
+        "source_tree",
+        "measurement_commit",
+        "measurement_tree",
+        "source_clean",
+        "control_overlay",
+        "qualified_gates",
+        "pending_points",
+        "required_action",
+        "artifacts"
+      ],
+      "properties": {
+        "source_commit": {"$ref": "#/$defs/commit"},
+        "source_tree": {"$ref": "#/$defs/tree"},
+        "measurement_commit": {"$ref": "#/$defs/commit"},
+        "measurement_tree": {"$ref": "#/$defs/tree"},
+        "source_clean": {"const": true},
+        "control_overlay": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contract_commit", "paths"],
+          "properties": {
+            "contract_commit": {"$ref": "#/$defs/commit"},
+            "paths": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"$ref": "#/$defs/path"}
+            }
+          }
+        },
+        "qualified_gates": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["P1", "P2", "P3", "P4"]}
+        },
+        "pending_points": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"}
+        },
+        "required_action": {"enum": ["none", "matched_reference_measurement"]},
+        "artifacts": {"$ref": "#/$defs/artifacts"}
+      }
+    },
     "reference_set": {
       "type": "object",
       "additionalProperties": true,
@@ -63,24 +99,25 @@
       "properties": {
         "source_commit": {"$ref": "#/$defs/commit"},
         "source_clean": {"type": "boolean"},
-        "artifacts": {
-          "type": "object",
-          "minProperties": 1,
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["root"],
-            "properties": {
-              "root": {"$ref": "#/$defs/path"},
-              "manifest_sha256": {"$ref": "#/$defs/sha256"},
-              "summary_sha256": {"$ref": "#/$defs/sha256"}
-            },
-            "anyOf": [
-              {"required": ["manifest_sha256"]},
-              {"required": ["summary_sha256"]}
-            ]
-          }
-        }
+        "artifacts": {"$ref": "#/$defs/artifacts"}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["root"],
+        "properties": {
+          "root": {"$ref": "#/$defs/path"},
+          "manifest_sha256": {"$ref": "#/$defs/sha256"},
+          "summary_sha256": {"$ref": "#/$defs/sha256"}
+        },
+        "anyOf": [
+          {"required": ["manifest_sha256"]},
+          {"required": ["summary_sha256"]}
+        ]
       }
     },
     "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},

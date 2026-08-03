@@ -7,7 +7,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from ..batch import Batch, CompletionReport, SnapshotRef
+from ..batch import Batch, CompletionReport, PartitionCompletion, SnapshotRef
 from ..capabilities import RequestKind, ResponseKind, operation_type
 from ..execution.executor import finalize_completion_report, partition_completion_ready
 from ..foundation.env import env_int
@@ -224,15 +224,16 @@ def _response_ready(response: Mapping[str, Any]) -> bool:
 
     result = response.get("completion_report")
     if isinstance(result, _PendingExecution):
-        if not result.ready():
+        pending = result
+        if not pending.ready():
             return False
         if not isinstance(response, dict):
             raise RuntimeError("pending execution response is not mutable")
         try:
-            result = result.resolve()
+            result = pending.resolve()
             response["completion_report"] = result
         except BaseException as error:
-            classified = result.record_failure(error)
+            classified = pending.record_failure(error)
             fields = classified.to_wire()
             fields.pop("kind", None)
             call_id = response.get("call_id")
@@ -423,8 +424,8 @@ class WorkerServer:
             raise RuntimeError("worker server has no IPC endpoint")
         result = response.get("completion_report")
         if isinstance(result, CompletionReport):
-            ready_partitions = []
-            pending_partitions = []
+            ready_partitions: list[PartitionCompletion] = []
+            pending_partitions: list[PartitionCompletion] = []
             for partition in result.partitions:
                 target = (
                     ready_partitions

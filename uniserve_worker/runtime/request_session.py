@@ -663,7 +663,22 @@ class SessionStore:
 @dataclass(frozen=True, slots=True)
 class _SessionSnapshot:
     existed: bool
-    values: tuple[object, ...] | None
+    values: _SessionValues | None
+
+
+_SessionValues: TypeAlias = tuple[
+    int,
+    int,
+    str,
+    ProductRef | None,
+    set[int],
+    int | None,
+    int,
+    int,
+    int,
+    int | None,
+    int | None,
+]
 
 
 class StepTxn:
@@ -688,7 +703,7 @@ class StepTxn:
         self.sessions = sessions
         self.step_id = int(step_id)
         self.operations = operations
-        self.request_ids = frozenset(value.request_key.session_id for value in operations)
+        self.request_ids = {value.request_key.session_id for value in operations}
         advancing_counts: dict[int, int] = {}
         for operation in operations:
             if operation.advances_state:
@@ -893,7 +908,7 @@ class StepTxn:
                         session.last_op_id,
                         session.last_step_id,
                     ) = session_snapshot.values
-                    session.product_handles = cast(set[int], product_handles)
+                    session.product_handles = product_handles
             for store, store_snapshot in reversed(self._store_snapshots):
                 store.restore_requests(self.request_ids, store_snapshot)
         finally:
