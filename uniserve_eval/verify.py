@@ -228,6 +228,25 @@ def text_from_response(obj: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
+def has_visible_text(text: str) -> bool:
+    """Return whether a response contains user-visible, non-whitespace text."""
+    return bool(text.strip())
+
+
+def append_output_modality(output_modalities: list[str], modality: str) -> None:
+    """Record a maximal output-modality segment in arrival order."""
+    if not output_modalities or output_modalities[-1] != modality:
+        output_modalities.append(modality)
+
+
+def text_image_transition_count(output_modalities: list[str]) -> int:
+    """Count adjacent text/image modality-segment transitions."""
+    return sum(
+        {source, destination} == {"text", "image"}
+        for source, destination in zip(output_modalities, output_modalities[1:])
+    )
+
+
 def finish_count(obj: dict[str, Any]) -> int:
     choices = obj.get("choices")
     if not isinstance(choices, list):
@@ -301,10 +320,19 @@ def save_image(url: str, out_dir: Any, images: list[dict[str, Any]]) -> None:
 
 def event_manifest_entry(obj: dict[str, Any]) -> dict[str, Any]:
     text = text_from_chunk(obj)
+    image_urls = image_urls_from_chunk(obj)
     return {
         "type": str(obj.get("type", "unknown")),
         "visible_text_bytes": len(text.encode("utf-8")),
-        "image_count": len(image_urls_from_chunk(obj)),
+        "image_count": len(image_urls),
+        "modalities": [
+            modality
+            for modality, present in (
+                ("text", has_visible_text(text)),
+                ("image", bool(image_urls)),
+            )
+            if present
+        ],
         "finish_reasons": finish_reasons(obj),
         "has_usage": isinstance(obj.get("usage"), dict),
         "has_error": isinstance(obj.get("error"), dict),
@@ -318,6 +346,8 @@ def verification_checks(
     image_steps_per_image: list[int] | None,
     errors: list[dict[str, Any]],
     finished_count: int,
+    text: str = "",
+    output_modalities: list[str] | None = None,
 ) -> tuple[dict[str, bool], list[str], list[str]]:
     checks: dict[str, bool] = {}
     warnings: list[str] = []
@@ -329,6 +359,30 @@ def verification_checks(
             failures.append(failure)
 
     check("error_free", not errors, "verify returned errors")
+    if workload.get("require_visible_text", False):
+        check(
+            "visible_text",
+            has_visible_text(text),
+            "expected visible text, got none",
+        )
+    if "min_decoded_images" in workload:
+        minimum_images = int(workload["min_decoded_images"])
+        check(
+            "decoded_image_count",
+            len(images) >= minimum_images,
+            f"expected at least {minimum_images} decoded image(s), got {len(images)}",
+        )
+    if "min_text_image_transitions" in workload:
+        minimum_transitions = int(workload["min_text_image_transitions"])
+        transitions = text_image_transition_count(output_modalities or [])
+        check(
+            "text_image_transitions",
+            transitions >= minimum_transitions,
+            (
+                f"expected at least {minimum_transitions} text/image transition(s), "
+                f"got {transitions} from {output_modalities or []}"
+            ),
+        )
     expected_images = workload.get("warn_image_count")
     if expected_images is not None and len(images) != int(expected_images):
         warnings.append(f"expected {expected_images} images, got {len(images)}")
@@ -465,6 +519,7 @@ def verify(args: argparse.Namespace) -> None:
     images: list[dict[str, Any]] = []
     event_counts: dict[str, int] = {}
     text = ""
+    output_modalities: list[str] = []
     completion_tokens: int | None = None
     image_steps: int | None = None
     image_steps_per_image: list[int] | None = None
@@ -513,7 +568,11 @@ def verify(args: argparse.Namespace) -> None:
                     errors.append(obj["error"])
                     print("ERROR", obj["error"])
                     break
-                text += text_from_chunk(obj)
+                chunk_text = text_from_chunk(obj)
+                if chunk_text:
+                    text += chunk_text
+                if has_visible_text(chunk_text):
+                    append_output_modality(output_modalities, "text")
                 finished += finish_count(obj)
                 tokens = usage_completion_tokens(obj)
                 if tokens is not None:
@@ -524,8 +583,11 @@ def verify(args: argparse.Namespace) -> None:
                 per_image_steps = usage_image_steps_per_image(obj)
                 if per_image_steps is not None:
                     image_steps_per_image = per_image_steps
-                for image_url in image_urls_from_chunk(obj):
+                image_urls = image_urls_from_chunk(obj)
+                for image_url in image_urls:
                     save_image(image_url, out_dir, images)
+                if image_urls:
+                    append_output_modality(output_modalities, "image")
                 if done:
                     break
         else:
@@ -535,17 +597,23 @@ def verify(args: argparse.Namespace) -> None:
                 print("ERROR", obj["error"])
             event_counts["chat.completion"] = 1
             text = text_from_response(obj)
+            if has_visible_text(text):
+                append_output_modality(output_modalities, "text")
             finished = finish_count(obj)
             completion_tokens = usage_completion_tokens(obj)
             image_steps = usage_image_steps(obj)
             image_steps_per_image = usage_image_steps_per_image(obj)
-            for image_url in image_urls_from_response(obj):
+            image_urls = image_urls_from_response(obj)
+            for image_url in image_urls:
                 save_image(image_url, out_dir, images)
+            if image_urls:
+                append_output_modality(output_modalities, "image")
             event_manifest.append(
                 {
                     "type": "chat.completion",
                     "visible_text_bytes": len(text.encode("utf-8")),
                     "image_count": len(images),
+                    "modalities": list(output_modalities),
                     "finish_reasons": finish_reasons(obj),
                     "has_usage": isinstance(obj.get("usage"), dict),
                     "has_error": isinstance(obj.get("error"), dict),
@@ -558,6 +626,8 @@ def verify(args: argparse.Namespace) -> None:
         image_steps_per_image=image_steps_per_image,
         errors=errors,
         finished_count=finished,
+        text=text,
+        output_modalities=output_modalities,
     )
     artifact_checks = semantic_checks
     artifact_valid = all(artifact_checks.values())
@@ -570,6 +640,8 @@ def verify(args: argparse.Namespace) -> None:
         "images": images,
         "text": text,
         "visible_text_sha256": bytes_digest(text.encode("utf-8")),
+        "output_modalities": output_modalities,
+        "text_image_transition_count": text_image_transition_count(output_modalities),
         "text_unit_count": text_unit_count,
         "request_sha256": canonical_digest(payload),
         "event_manifest": event_manifest,
