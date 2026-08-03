@@ -3,8 +3,6 @@
   "construction_anchor": {
     "source_commit": "05ab7a2dfe814a14eeb925323f83a47de23ae2ac",
     "source_clean": true,
-    "note": "Recovered baseline after container loss: anchor line rebuilt as 783d896 plus the ead5d77 eval fixes (blob-identical to the measurement control contract). The greedy interleave anchor artifact is pending an engine fix for the c4 decode_und batch abort and is declared absent until measured.",
-    "pending_artifacts": ["sensenova_greedy_interleave_c4"],
     "artifacts": {
       "qwen3_sharegpt_r16": {
         "root": "artifacts/qualification/generation_runtime/reference/construction/05ab7a2dfe814a14eeb925323f83a47de23ae2ac/qwen3_sharegpt/uniserve_r16",
@@ -17,6 +15,10 @@
       "sensenova_i2t_c32": {
         "root": "artifacts/qualification/generation_runtime/reference/construction/05ab7a2dfe814a14eeb925323f83a47de23ae2ac/sensenova_beans_i2t/uniserve_c32",
         "manifest_sha256": "e41980a823263cbbb5fe5560804701365e647a8cc8bad2f63f119065d2919ab5"
+      },
+      "sensenova_greedy_interleave_c4": {
+        "root": "artifacts/qualification/generation_runtime/reference/construction/dc5e4e0146850758c2c149e2c4d14713e87e229f/sensenova_ueval_interleave/uniserve_c4",
+        "manifest_sha256": "d4592c6b782c3df81f159c897415f2639c7307c9c9409c3ae3eb3a077be114ad"
       }
     }
   },
@@ -59,6 +61,18 @@
     }
   },
   "profile_anchors": {
+    "sensenova_greedy_interleave_c4": {
+      "source_commit": "dc5e4e0146850758c2c149e2c4d14713e87e229f",
+      "source_tree": "4ca42ee94d56ee2d2415099b27c22ef90f744fd6",
+      "benchmark_profile": "main",
+      "group": "sensenova-uniserve",
+      "point": "sensenova_ueval_interleave_uniserve",
+      "load_case_set": "interleave_concurrency",
+      "load_case_id": "c4",
+      "benchmark_definition_fingerprint": "928f232225b4ff5a54476bab9946e35a6bffde132bfb34a3c5e6d4e606263e36",
+      "artifact_root": "artifacts/qualification/generation_runtime/reference/construction/dc5e4e0146850758c2c149e2c4d14713e87e229f/sensenova_ueval_interleave/uniserve_c4",
+      "status": "qualified"
+    },
     "sensenova_stochastic_interleave_c4": {
       "source_commit": "5a1538848aad017828f8995391efcff921ecce29",
       "source_tree": "34244e72b18edfb3f64f7266db643d463fce3a51",
