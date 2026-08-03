@@ -138,9 +138,9 @@
       "model": "${UNISERVE_SENSENOVA_MODEL}",
       "required_model_content": {
         "kind": "directory",
-        "file_count": 27,
-        "total_size_bytes": 35121587195,
-        "tree_sha256": "defa120b89e6ed29750cddd9f4c626566730e5eb2fa339bc6694155756e9396a"
+        "file_count": 21,
+        "total_size_bytes": 35121648810,
+        "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670"
       },
       "served_model_name": "SenseNova-U1",
       "port": 18082,
@@ -152,9 +152,9 @@
       "model": "${UNISERVE_SENSENOVA_MODEL}",
       "required_model_content": {
         "kind": "directory",
-        "file_count": 27,
-        "total_size_bytes": 35121587195,
-        "tree_sha256": "defa120b89e6ed29750cddd9f4c626566730e5eb2fa339bc6694155756e9396a"
+        "file_count": 21,
+        "total_size_bytes": 35121648810,
+        "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670"
       },
       "served_model_name": "${UNISERVE_SENSENOVA_MODEL}",
       "host": "127.0.0.1",
@@ -347,11 +347,14 @@
         }
       },
       "warn_image_count": 4,
+      "require_visible_text": true,
+      "min_decoded_images": 1,
+      "min_text_image_transitions": 1,
       "expect_image_steps_per_image": 50,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
       "timeout_s": 900,
-      "description": "SenseNova default correctness gate."
+      "description": "SenseNova default interleave correctness gate."
     },
     "gate/bagel/t2i-seed42": {
       "type": "verify",

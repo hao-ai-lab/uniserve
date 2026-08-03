@@ -398,15 +398,25 @@ def test_sensenova_default_gate_declares_complete_image_lifecycle():
         image_steps_per_image=[image_config["steps"]] * workload["warn_image_count"],
         errors=[],
         finished_count=1,
+        text="A practical travel guide with a scenic visual.",
+        output_modalities=["text", "image"],
     )
     assert all(checks.values())
     assert warnings == []
     assert failures == []
 
 
-@pytest.mark.parametrize("image_count", [0, 3])
-def test_correctness_gate_reports_variable_image_count_without_rejecting_valid_images(
+@pytest.mark.parametrize(
+    ("image_count", "output_modalities", "expected_failed_checks"),
+    [
+        (0, ["text"], {"decoded_image_count", "text_image_transitions"}),
+        (3, ["text", "image"], set()),
+    ],
+)
+def test_default_travel_gate_rejects_missing_images_but_only_warns_on_variable_count(
     image_count: int,
+    output_modalities: list[str],
+    expected_failed_checks: set[str],
 ) -> None:
     config = load_config(DEFAULT_CONFIG)
     workload = config["workloads"]["gate/sensenova/default-travel"]
@@ -419,11 +429,58 @@ def test_correctness_gate_reports_variable_image_count_without_rejecting_valid_i
         image_steps_per_image=[50] * image_count or None,
         errors=[],
         finished_count=1,
+        text="A practical travel guide with a scenic visual.",
+        output_modalities=output_modalities,
     )
 
-    assert all(checks.values())
+    assert {name for name, valid in checks.items() if not valid} == expected_failed_checks
     assert warnings == [f"expected 4 images, got {image_count}"]
-    assert failures == []
+    if image_count == 0:
+        assert "expected at least 1 decoded image(s), got 0" in failures
+    else:
+        assert failures == []
+
+
+@pytest.mark.parametrize(
+    ("text", "image_count", "output_modalities", "expected_failed_checks"),
+    [
+        (" \t\n", 1, ["image"], {"visible_text", "text_image_transitions"}),
+        (
+            "A practical travel guide.",
+            0,
+            ["text"],
+            {"decoded_image_count", "text_image_transitions"},
+        ),
+        (
+            "A practical travel guide.",
+            1,
+            ["text", "text"],
+            {"text_image_transitions"},
+        ),
+    ],
+)
+def test_default_travel_gate_requires_visible_interleaved_output(
+    text: str,
+    image_count: int,
+    output_modalities: list[str],
+    expected_failed_checks: set[str],
+) -> None:
+    config = load_config(DEFAULT_CONFIG)
+    workload = config["workloads"]["gate/sensenova/default-travel"]
+    checks, _warnings, _failures = uniserve_eval.verify.verification_checks(
+        workload,
+        images=[
+            {"size": [workload["expect_image_width"], workload["expect_image_height"]]}
+            for _ in range(image_count)
+        ],
+        image_steps_per_image=[50] * image_count or None,
+        errors=[],
+        finished_count=1,
+        text=text,
+        output_modalities=output_modalities,
+    )
+
+    assert {name for name, valid in checks.items() if not valid} == expected_failed_checks
 
 
 def test_verify_cli_accepts_an_immutable_output_directory() -> None:
@@ -472,6 +529,7 @@ def test_verify_reference_evidence_uses_exact_transport_and_rgb_bytes(tmp_path):
         "type": "chat.completion.chunk",
         "visible_text_bytes": 5,
         "image_count": 1,
+        "modalities": ["text", "image"],
         "finish_reasons": ["stop"],
         "has_usage": True,
         "has_error": False,
@@ -1610,15 +1668,15 @@ def test_multimodal_profiles_require_the_documented_model_content() -> None:
     expected = {
         "benchmark/server/sensenova-uniserve": {
             "kind": "directory",
-            "file_count": 27,
-            "total_size_bytes": 35121587195,
-            "tree_sha256": "defa120b89e6ed29750cddd9f4c626566730e5eb2fa339bc6694155756e9396a",
+            "file_count": 21,
+            "total_size_bytes": 35121648810,
+            "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670",
         },
         "benchmark/server/sensenova-omni": {
             "kind": "directory",
-            "file_count": 27,
-            "total_size_bytes": 35121587195,
-            "tree_sha256": "defa120b89e6ed29750cddd9f4c626566730e5eb2fa339bc6694155756e9396a",
+            "file_count": 21,
+            "total_size_bytes": 35121648810,
+            "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670",
         },
         "benchmark/server/bagel-uniserve": {
             "kind": "directory",
