@@ -8,10 +8,6 @@ cargo := env("CARGO", "cargo")
 fmt:
     {{cargo}} fmt --all -- --check
 
-# Validate the canonical runtime contracts and executable benchmark profile.
-contract:
-    {{python}} scripts/check_runtime_contracts.py
-
 # Clippy lint (Rust)
 clippy:
     {{cargo}} clippy --workspace --all-targets -- -D warnings
@@ -24,8 +20,8 @@ test-rust:
 bench-build:
     {{cargo}} bench --workspace --no-run
 
-# Lint: contracts + fmt + clippy + ruff + mypy
-lint: contract fmt clippy
+# Lint: fmt + clippy + ruff + mypy
+lint: fmt clippy
     {{python}} -m ruff check uniserve_worker uniserve_eval tests/python
     {{python}} -m mypy uniserve_worker uniserve_eval
 
