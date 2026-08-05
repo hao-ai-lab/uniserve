@@ -7,6 +7,7 @@ from .base import (
     TaskRequest,
     apply_chat_image_contract,
     apply_text_sampling_contract,
+    uses_reference_protocol,
 )
 
 
@@ -57,7 +58,12 @@ class InterleaveTask(BenchmarkTask):
             "top_p": self.spec.top_p,
             "ignore_eos": self.spec.ignore_eos,
         }
-        apply_chat_image_contract(payload, image_config, root_parameters=root_parameters)
+        apply_chat_image_contract(
+            payload,
+            image_config,
+            root_parameters=root_parameters,
+            include_reference_aliases=uses_reference_protocol(self.spec),
+        )
         if self.spec.extra_request_body:
             extra = dict(self.spec.extra_request_body)
             extra_image = extra.pop("image_config", None)

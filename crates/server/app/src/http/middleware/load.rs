@@ -14,31 +14,8 @@ use serde_json::json;
 
 use crate::AppState;
 
-/// Endpoints that will be tracked for server load.
-///
-/// Derived from the Python frontend's actual `@load_aware_call` coverage. This
-/// includes alias paths that delegate into decorated handlers, such as
-/// `/v1/rerank` and `/v2/rerank`.
-const TRACKED_HANDLERS: &[&str] = &[
-    "/v1/responses",
-    "/v1/responses/{response_id}",
-    "/v1/responses/{response_id}/cancel",
-    "/v1/messages",
-    "/v1/messages/count_tokens",
-    "/v1/chat/completions",
-    "/v1/completions",
-    "/v1/audio/transcriptions",
-    "/v1/audio/translations",
-    "/v1/embeddings",
-    "/pooling",
-    "/classify",
-    "/score",
-    "/v1/score",
-    "/rerank",
-    "/v1/rerank",
-    "/v2/rerank",
-    "/inference/v1/generate",
-];
+/// Generation endpoints counted as in-flight server work.
+const TRACKED_HANDLERS: &[&str] = &["/v1/chat/completions", "/v1/images/generations"];
 
 /// `Retry-After` hint (in seconds) advertised when shedding load.
 const RETRY_AFTER_SECONDS: &str = "1";
@@ -64,9 +41,8 @@ fn overloaded_response(limit: u64) -> Response {
         .into_response()
 }
 
-/// Track frontend-local in-flight inference requests for the `/load` endpoint.
-///
-/// When an admission limit is configured, tracked requests are shed with `503
+/// Track frontend-local in-flight inference requests. When an admission limit
+/// is configured, tracked requests are shed with `503
 /// Service Unavailable` (plus a `Retry-After` hint) once that many requests are
 /// already in flight, so a fixed-capacity engine browns out gracefully instead
 /// of accepting unbounded work.

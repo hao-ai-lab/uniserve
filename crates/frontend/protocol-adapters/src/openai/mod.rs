@@ -6,14 +6,10 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod chat_completions;
-pub mod completions;
 pub mod error;
 pub mod images;
 pub mod logprobs;
-pub mod lora;
-pub mod structured_outputs;
 pub mod utils;
 
 pub use error::{ApiError, Result, serve_error_to_api};
-pub use lora::LoraModelResolution;
 pub use utils::{ResolvedRequestContext, convert_logit_bias};

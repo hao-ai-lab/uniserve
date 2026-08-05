@@ -1,4 +1,3 @@
-use thiserror_ext::AsReport as _;
 use uniserve_openai_types::{ErrorDetail, ErrorResponse};
 use uniserve_serving::ServeError;
 
@@ -76,27 +75,12 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
             Some("n"),
         ),
         error @ (ServeError::UnsupportedCapability { .. }
-        | ServeError::TokenizerMismatch { .. }
         | ServeError::ContextLengthExceeded { .. }
         | ServeError::ContextCapacityExceeded { .. }
-        | ServeError::DuplicateRequestId { .. }) => {
-            ApiError::invalid_request(error.to_string(), None)
-        }
-        ServeError::ForeignExecutionPlan { .. } => {
-            ApiError::server_error("execution plan/runtime identity mismatch".to_string())
-        }
-        ServeError::Compilation { message, .. } => ApiError::invalid_request(message, None),
-        ServeError::Text(error) if text_error_is_invalid_request(&error) => {
-            ApiError::invalid_request(error.to_string(), None)
-        }
-        ServeError::Text(error) => {
-            ApiError::server_error(format!("text runtime error: {}", error.to_report_string()))
-        }
-        ServeError::Chat(error) if chat_error_is_invalid_request(&error) => {
-            ApiError::invalid_request(error.to_string(), None)
-        }
-        ServeError::Chat(error) => {
-            ApiError::server_error(format!("chat runtime error: {}", error.to_report_string()))
+        | ServeError::DuplicateRequestId { .. }
+        | ServeError::Tokenize { .. }) => ApiError::invalid_request(error.to_string(), None),
+        ServeError::ModelResolution(message) => {
+            ApiError::server_error(format!("model resolution error: {message}"))
         }
         ServeError::Engine(message) => {
             ApiError::server_error(format!("engine runtime error: {message}"))
@@ -104,47 +88,6 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
         ServeError::OutputProcessing { message, .. } => {
             ApiError::server_error(format!("output processing error: {message}"))
         }
-    }
-}
-
-fn text_error_is_invalid_request(error: &uniserve_serving::text::Error) -> bool {
-    use uniserve_serving::text::Error;
-
-    matches!(
-        error,
-        Error::StructuredOutput(_)
-            | Error::InvalidSampling(_)
-            | Error::InvalidLogprobCount { .. }
-            | Error::MinTokensExceedsMaximum { .. }
-            | Error::EmptyPromptTokenIds { .. }
-            | Error::AdapterIdOutOfRange { .. }
-            | Error::InvalidGenerationRequest(_)
-            | Error::PromptTooLong { .. }
-    )
-}
-
-fn chat_error_is_invalid_request(error: &uniserve_serving::chat::Error) -> bool {
-    use uniserve_serving::chat::Error;
-
-    match error {
-        Error::EmptyMessages
-        | Error::ContinueFinalAssistantWithoutFinalAssistant
-        | Error::UnsupportedMultimodalRenderer
-        | Error::UnsupportedMultimodalContent(_)
-        | Error::ParserUnavailableForModel { .. }
-        | Error::ParserDisabled { .. }
-        | Error::ParserUnavailableByName { .. }
-        | Error::PromptTooLong { .. } => true,
-        Error::Text(error) => text_error_is_invalid_request(error),
-        Error::MissingChatTemplate
-        | Error::ChatTemplate(_)
-        | Error::Multimodal(_)
-        | Error::ParserInitialization { .. }
-        | Error::HarmonyParserOverrideUnsupported { .. }
-        | Error::HarmonyOutputParsing { .. }
-        | Error::StreamClosedBeforeTerminalOutput { .. }
-        | Error::ToolCallStreamInvariant { .. }
-        | Error::ModelAssets(_) => false,
     }
 }
 

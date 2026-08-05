@@ -15,6 +15,39 @@ pub fn validate_request_compat(
 
     check_stream_options_requires_stream(request.stream_options.is_some(), request.stream)?;
 
+    reject_non_default(
+        request.response_format.as_ref(),
+        "response_format",
+        "structured output is not part of the configured serving surface.",
+    )?;
+    reject_non_default(
+        request.structured_outputs.as_ref(),
+        "structured_outputs",
+        "structured output is not part of the configured serving surface.",
+    )?;
+    reject_non_default(
+        request.chat_template.as_ref(),
+        "chat_template",
+        "chat templates are fixed when the model is resolved.",
+    )?;
+    reject_non_default(
+        request.chat_template_kwargs.as_ref(),
+        "chat_template_kwargs",
+        "chat-template arguments are fixed when the model is resolved.",
+    )?;
+    reject_non_default(
+        request.documents.as_ref(),
+        "documents",
+        "template documents are not part of the configured serving surface.",
+    )?;
+    if !request.other.is_empty() {
+        let fields = request.other.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(ApiError::invalid_request(
+            format!("Unsupported request field(s): {fields}."),
+            None,
+        ));
+    }
+
     if request.n.unwrap_or(1) > 1 {
         bail_invalid_request!(param = "n", "Only n=1 is supported.");
     }
@@ -285,10 +318,6 @@ mod tests {
     fn validate_request_compat_accepts_reasoning_effort() {
         let request = ChatCompletionRequest {
             reasoning_effort: Some(ReasoningEffort::Max),
-            chat_template_kwargs: Some(HashMap::from([(
-                "reasoning_effort".to_string(),
-                json!("low"),
-            )])),
             ..base_request()
         };
 
@@ -342,20 +371,51 @@ mod tests {
     }
 
     #[test]
-    fn validate_request_compat_accepts_response_format() {
+    fn validate_request_compat_rejects_response_format() {
         let request = ChatCompletionRequest {
             response_format: Some(ResponseFormat::Text),
             ..base_request()
         };
-        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
-            .expect("response_format=text should be accepted");
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
 
         let request = ChatCompletionRequest {
             response_format: Some(ResponseFormat::JsonObject),
             ..base_request()
         };
-        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
-            .expect("response_format=json_object should be accepted");
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_model_private_and_unknown_fields() {
+        for request in [
+            ChatCompletionRequest {
+                chat_template: Some("{{ messages }}".to_string()),
+                ..base_request()
+            },
+            ChatCompletionRequest {
+                chat_template_kwargs: Some(HashMap::from([("foo".to_string(), json!("bar"))])),
+                ..base_request()
+            },
+            ChatCompletionRequest {
+                documents: Some(vec![json!({"text": "private template input"})]),
+                ..base_request()
+            },
+            ChatCompletionRequest {
+                structured_outputs: Some(json!({"choice": ["yes", "no"]})),
+                ..base_request()
+            },
+            ChatCompletionRequest {
+                other: serde_json::Map::from_iter([(
+                    "grammar".to_string(),
+                    json!("root ::= 'yes'"),
+                )]),
+                ..base_request()
+            },
+        ] {
+            assert!(
+                validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err()
+            );
+        }
     }
 
     #[test]

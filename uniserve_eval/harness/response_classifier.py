@@ -28,17 +28,22 @@ def classify_json_image_response(payload: dict[str, Any]) -> tuple[bool, str]:
 
 
 def openai_message_text(message: dict[str, Any] | None) -> str:
-    """Text content of one non-streamed chat.completion message."""
-    raw = (message or {}).get("content")
+    """Concatenated text of one non-streamed message (reasoning + content)."""
+    message = message or {}
+    parts: list[str] = []
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str):
+        parts.append(reasoning)
+    raw = message.get("content")
     if isinstance(raw, str):
-        return raw
-    if isinstance(raw, list):
-        return "".join(
+        parts.append(raw)
+    elif isinstance(raw, list):
+        parts.extend(
             part.get("text", "")
             for part in raw
             if isinstance(part, dict) and part.get("type") == "text"
         )
-    return ""
+    return "".join(parts)
 
 
 def openai_message_images(message: dict[str, Any] | None) -> list[dict[str, Any]]:

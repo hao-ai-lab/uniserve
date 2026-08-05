@@ -8,6 +8,7 @@ from .base import (
     TaskRequest,
     apply_text_sampling_contract,
     input_image_data_url,
+    uses_reference_protocol,
 )
 
 
@@ -34,29 +35,28 @@ class I2TTask(BenchmarkTask):
             ],
             "modalities": ["text"],
             "max_completion_tokens": max_tokens,
-            "extra_args": {
+        }
+        apply_text_sampling_contract(payload, self.spec)
+        if uses_reference_protocol(self.spec):
+            payload["extra_args"] = {
                 "max_tokens": max_tokens,
                 "do_sample": self.spec.temperature > 0,
                 "temperature": self.spec.temperature,
                 "top_p": self.spec.top_p,
                 "ignore_eos": self.spec.ignore_eos,
-            },
-        }
-        apply_text_sampling_contract(payload, self.spec)
-        payload["extra_args"].update(
-            {
-                key: payload[key]
-                for key in (
-                    "top_k",
-                    "min_p",
-                    "repetition_penalty",
-                    "frequency_penalty",
-                    "presence_penalty",
-                    "seed",
-                )
-                if key in payload
+                **{
+                    key: payload[key]
+                    for key in (
+                        "top_k",
+                        "min_p",
+                        "repetition_penalty",
+                        "frequency_penalty",
+                        "presence_penalty",
+                        "seed",
+                    )
+                    if key in payload
+                },
             }
-        )
         if streamed:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}

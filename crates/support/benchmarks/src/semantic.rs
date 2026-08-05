@@ -1,24 +1,13 @@
-use uniserve_serving::{
-    CachePolicy, ExecutionPlan, FinishStatus, GenerationPolicy, PlanInspection, ServeEvent,
-    ServeRequest,
-};
+use uniserve_serving::{FinishStatus, GenerateReqInput, SamplingConfig, ServeEvent};
 
-pub fn text_fixture(request_id: &str, prompt: &str, max_tokens: u32) -> ServeRequest {
-    let mut request = ServeRequest::text(request_id, prompt);
-    request.generation = GenerationPolicy {
+pub fn text_fixture(request_id: &str, prompt: &str, max_tokens: u32) -> GenerateReqInput {
+    let mut request = GenerateReqInput::text(request_id, prompt);
+    request.sampling = SamplingConfig {
         max_tokens: Some(max_tokens),
         temperature: Some(0.0),
-        ..GenerationPolicy::default()
-    };
-    request.cache = CachePolicy {
-        replayable: true,
-        ..CachePolicy::default()
+        ..SamplingConfig::default()
     };
     request
-}
-
-pub fn plan_snapshot(plan: &ExecutionPlan) -> &PlanInspection {
-    plan.inspect()
 }
 
 pub fn visible_text(events: &[ServeEvent]) -> String {
@@ -63,8 +52,9 @@ mod tests {
     #[test]
     fn semantic_fixture_uses_runtime_request_shape() {
         let request = text_fixture("bench-1", "hello", 8);
-        assert_eq!(request.generation.max_tokens, Some(8));
-        assert!(request.cache.replayable);
+        assert_eq!(request.sampling.max_tokens, Some(8));
+        assert_eq!(request.sampling.temperature, Some(0.0));
+        assert_eq!(request.request_id.as_ref(), "bench-1");
     }
 
     #[test]

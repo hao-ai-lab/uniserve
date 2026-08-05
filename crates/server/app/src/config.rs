@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,7 +8,7 @@ use uniserve_engine_runtime::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy,
 };
-use uniserve_serving::chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
+use uniserve_serving::chat::ChatTemplateContentFormatOption;
 use uniserve_worker_ipc::WorkerLaunchConfig;
 
 /// How the HTTP server obtains its listening socket.
@@ -157,24 +156,11 @@ pub struct Config {
     pub engine: EngineSettings,
     /// Backend model identifier used for engine loading.
     pub model: String,
-    /// Model name(s) exposed to clients via the OpenAI API. When non-empty,
-    /// the first entry is used as the primary ID in responses and all entries
-    /// are accepted in requests. When empty, falls back to `model`.
-    pub served_model_name: Vec<String>,
+    /// Single model name exposed to clients via the OpenAI API. When absent,
+    /// the resolved model identifier is used.
+    pub served_model_name: Option<String>,
     /// HTTP listener setup.
     pub listener_mode: HttpListenerMode,
-    /// Tool-call parser selection.
-    pub tool_call_parser: ParserSelection,
-    /// Reasoning parser selection.
-    pub uniserve_reasoning_parser: ParserSelection,
-    /// Chat renderer selection.
-    pub renderer: RendererSelection,
-    /// Tokenizer implementation mode. The current frontend resolves tokenizers
-    /// automatically from model metadata.
-    pub tokenizer_mode: TokenizerMode,
-    /// Disable frontend-side multimodal preprocessing and render the model as
-    /// language-only.
-    pub language_model_only: bool,
     /// Server-default chat template override, as a file path or inline
     /// template.
     pub chat_template: Option<String>,
@@ -193,25 +179,12 @@ pub struct Config {
     /// config snapshots because it is a secret.
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
-    /// Bearer token accepted by sensitive management routes. Omitted from
-    /// serialized config snapshots because it is a secret.
-    #[serde(skip_serializing)]
-    pub admin_api_key: Option<String>,
     /// Optional per-request wall-clock timeout.
     pub request_timeout: Option<Duration>,
     /// Optional front-door HTTP admission limit for in-flight inference
     /// requests.
     pub max_concurrent_requests: Option<u64>,
-    /// Mount development-only management routes.
-    pub server_dev_mode: bool,
-    /// Mount runtime LoRA management routes.
-    pub enable_lora: bool,
-    /// Absolute path prefixes allowed for runtime LoRA adapter loading.
-    pub lora_allowed_path_prefixes: Vec<PathBuf>,
-    /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
-    /// started.
-    pub grpc_port: Option<u16>,
-    /// Maximum time to wait for active HTTP/gRPC requests to drain on shutdown.
+    /// Maximum time to wait for active HTTP requests to drain on shutdown.
     pub shutdown_timeout: Duration,
 }
 
@@ -220,16 +193,11 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
-            served_model_name: Vec::new(),
+            served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),
                 port: 8000,
             },
-            tool_call_parser: ParserSelection::default(),
-            uniserve_reasoning_parser: ParserSelection::default(),
-            renderer: RendererSelection::default(),
-            tokenizer_mode: TokenizerMode::default(),
-            language_model_only: false,
             chat_template: None,
             default_chat_template_kwargs: None,
             chat_template_content_format: ChatTemplateContentFormatOption::default(),
@@ -237,35 +205,17 @@ impl Default for Config {
             enable_request_id_headers: false,
             disable_log_stats: false,
             api_key: None,
-            admin_api_key: None,
             request_timeout: None,
             max_concurrent_requests: None,
-            server_dev_mode: false,
-            enable_lora: false,
-            lora_allowed_path_prefixes: Vec::new(),
-            grpc_port: None,
             shutdown_timeout: Duration::from_secs(0),
         }
     }
-}
-
-/// Tokenizer loading mode exposed for reference-compatible serving CLI
-/// parsing. UniServe currently supports the automatic tokenizer path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
-pub enum TokenizerMode {
-    #[default]
-    Auto,
 }
 
 impl Config {
     /// Validate frontend configuration that can be checked before engine
     /// startup.
     pub fn validate(&self) -> Result<()> {
-        uniserve_serving::chat::validate_parser_overrides(
-            &self.tool_call_parser,
-            &self.uniserve_reasoning_parser,
-        )?;
-
         self.validate_listener()?;
         self.engine.validate()?;
 

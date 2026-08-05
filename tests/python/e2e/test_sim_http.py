@@ -29,7 +29,7 @@ CONTROL_TOKENS = ("<img>", "</img>")
 def active_sensenova_model() -> Path:
     model_value = os.environ.get(MODEL_ENV)
     if not model_value:
-        pytest.skip(f"{MODEL_ENV} is required for the native sim HTTP gate")
+        pytest.skip(f"{MODEL_ENV} is required for the sim HTTP gate")
     model = Path(model_value)
     if not model.exists():
         pytest.fail(f"configured SenseNova checkpoint is missing: {model}")
@@ -193,7 +193,7 @@ def test_active_sensenova_checkpoint_image_controls_match_worker_tokenizer():
     active_sensenova_control_ids(active_sensenova_model())
 
 
-def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
+def test_sim_http_configured_routes_and_benchmark_smoke(tmp_path: Path):
     # CPU simulation emits deterministic text and image fixtures through the
     # production HTTP, scheduler, worker IPC, and geometry contracts.
     image_start_id = active_sensenova_control_ids(active_sensenova_model())["<img>"]
@@ -307,32 +307,16 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
             max_images=1,
             extra_request_body={"logit_bias": {str(image_start_id): 100.0}},
             runtime_profile_id="sensenova-u1",
-            plan_evidence_policy="runtime_inspection",
         )
         result = asyncio.run(BenchmarkRunner(base_url, spec, tmp_path / "bench").run())
         assert result.summary["harness_status"] == "completed"
         assert result.summary["failed_count"] == 0
         assert result.summary["ok_count"] == 1
-        assert result.summary["artifact"]["plan_evidence"]["source"] == "runtime_inspection"
+        assert result.summary["artifact"]["plan_evidence"]["source"] == "declared_contract"
         plan = result.summary["artifact"]["plan_summary"]
-        assert plan["dialect_id"] == "sensenova-u1"
-        assert plan["profile_id"].startswith("neo_chat:")
+        assert plan["runtime_profile_id"] == "sensenova-u1"
         assert plan["generation"]["temperature"] == 0.0
         assert plan["generation"]["top_p"] == 1.0
         assert plan["generation"]["ignore_eos"] is True
-        assert plan["generation"]["image"] == {
-            "width": 2048,
-            "height": 1152,
-            "steps": 50,
-            "cfg_text_scale": 4.0,
-            "cfg_img_scale": 1.0,
-            "cfg_renorm_type": "none",
-            "cfg_renorm_min": 0.0,
-            "cfg_interval": [0.0, 1.0],
-            "timestep_shift": 3.0,
-            "seed": 42,
-            "max_images": 1,
-            "image_prompt_count": 0,
-            "retain_images": True,
-        }
+        assert plan["image"]["max_images"] == 1
         assert (tmp_path / "bench" / "summary.json").exists()

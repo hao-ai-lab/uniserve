@@ -1,40 +1,34 @@
-//! Deployment state composition for UniServe serving.
+//! Deployment state composition for the configured UniServe serving surface.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod config;
-pub mod grpc;
 pub mod http;
-mod lora;
 mod runtime_client;
 mod scheduler_stats;
-mod server_info;
 mod state;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-pub use config::{
-    Config, EngineBackendKind, EngineConnection, EngineSettings, HttpListenerMode, TokenizerMode,
-};
+pub use config::{Config, EngineBackendKind, EngineConnection, EngineSettings, HttpListenerMode};
 use tracing::info;
 use uniserve_engine_gateway::EngineGateway;
 use uniserve_engine_gateway::transport::protocol::generation::GenerationControlTokens;
 use uniserve_engine_gateway::transport::{EngineCoreClient, TransportMode, ZmqClientConfig};
 pub use uniserve_engine_runtime::SchedulingPolicy;
 use uniserve_engine_runtime::{EngineBackend, EngineCoreConfig};
-use uniserve_model_profile::ModelProfile;
-use uniserve_serving::ServingRuntime;
-pub use uniserve_serving::chat::{
-    ChatTemplateContentFormatOption, ParserSelection, RendererSelection,
+use uniserve_model_profile::assets::{ResolvedModelFiles, TokenizerSource};
+use uniserve_model_profile::tokenizer::{
+    DynTokenizer, HuggingFaceTokenizer, TekkenTokenizer, TiktokenTokenizer,
 };
-use uniserve_serving::chat::{LoadModelBackendsOptions, load_model_backends};
+use uniserve_model_profile::{ModelProfile, ProfileDeploymentConfig};
+pub use uniserve_serving::chat::ChatTemplateContentFormatOption;
+use uniserve_serving::chat::{ChatTemplateLoadOptions, HfChatRenderer};
+use uniserve_serving::{ResolvedModel, ServingRuntime};
 use uniserve_sim::{SimEngine, SimExecutor};
 
-pub use crate::http::{ApiError, build_router, serve, serve_with_router_extension};
-pub use crate::lora::{LoadLoraError, LoraModelResolution, UnloadLoraError};
+pub use crate::http::{ApiError, build_router, serve};
 use crate::runtime_client::RuntimeEngineClient;
-pub use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 pub use crate::state::AppState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,54 +72,69 @@ fn runtime_control_tokens(
     }
 }
 
-/// Build the shared application state for one configured model and one engine
-/// client.
-pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
-    // Load both backends from the same model metadata so they stay in sync.
-    let loaded = load_model_backends(
-        &config.model,
-        LoadModelBackendsOptions {
-            renderer: config.renderer,
-            language_model_only: config.language_model_only,
-            chat_template: config.chat_template.clone(),
+fn load_tokenizer(files: &ResolvedModelFiles) -> Result<DynTokenizer> {
+    let tokenizer: DynTokenizer = match &files.tokenizer {
+        TokenizerSource::HuggingFace(path) => Arc::new(
+            HuggingFaceTokenizer::new(path)
+                .with_context(|| format!("failed to load tokenizer from {}", path.display()))?,
+        ),
+        TokenizerSource::Tiktoken(path) => Arc::new(
+            TiktokenTokenizer::new(path)
+                .with_context(|| format!("failed to load tokenizer from {}", path.display()))?,
+        ),
+        TokenizerSource::Tekken(path) => Arc::new(
+            TekkenTokenizer::new(path)
+                .with_context(|| format!("failed to load tokenizer from {}", path.display()))?,
+        ),
+    };
+    Ok(tokenizer)
+}
+
+async fn resolve_model_assets(
+    config: &Config,
+) -> Result<(ModelProfile, DynTokenizer, HfChatRenderer, u32)> {
+    let files = ResolvedModelFiles::new(&config.model)
+        .await
+        .with_context(|| format!("failed to resolve model files for `{}`", config.model))?;
+    let tokenizer = load_tokenizer(&files)?;
+    let deployment = ProfileDeploymentConfig {
+        renderer_id: Some("hf".to_string()),
+        chat_template_override: config.chat_template.clone(),
+        allow_request_chat_template_override: false,
+        max_model_tokens: config.engine.max_model_len,
+        ..ProfileDeploymentConfig::default()
+    };
+    let mut profile = ModelProfile::resolve(&config.model, &files, &deployment, tokenizer.as_ref())
+        .with_context(|| format!("failed to resolve model profile for `{}`", config.model))?;
+    let max_model_tokens = config
+        .engine
+        .max_model_len
+        .or(profile.context_limits.max_model_tokens)
+        .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
+    profile.context_limits.max_model_tokens = Some(max_model_tokens);
+    let renderer = HfChatRenderer::load(
+        &files,
+        ChatTemplateLoadOptions {
             chat_template_content_format: config.chat_template_content_format,
+            chat_template: config.chat_template.clone(),
             default_chat_template_kwargs: config
                 .default_chat_template_kwargs
                 .clone()
                 .unwrap_or_default(),
         },
+        None,
     )
-    .await
-    .context("failed to create chat/text backends")?;
-    let mut profile = loaded.profile;
-    let text_backend = loaded.text_backend;
-    let chat_backend = loaded.chat_backend;
+    .context("failed to load the configured Hugging Face chat template")?;
+    Ok((profile, tokenizer, renderer, max_model_tokens))
+}
 
-    // Resolve the effective context length: an explicit `--max-model-len`
-    // override wins; otherwise derive the model's real context length
-    // (`max_position_embeddings`) from the loaded backend so we don't silently
-    // truncate long-context models to the 8192 default.
-    let model_max_model_len = text_backend
-        .sampling_hints()
-        .ok()
-        .and_then(|hints| hints.max_model_len);
-    let effective_max_model_len = config
-        .engine
-        .max_model_len
-        .or(model_max_model_len)
-        .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
-
-    // Resolve scheduler control tokens once from the profile. Text-only models
-    // contribute their repository EOS set without requiring an image dialect.
-    profile.context_limits.max_model_tokens = Some(effective_max_model_len);
-    profile.parsers.tools = config.tool_call_parser.to_string();
-    profile.parsers.reasoning = config.uniserve_reasoning_parser.to_string();
+/// Build the shared application state for one resolved model and one engine
+/// gateway.
+pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
+    let (mut profile, tokenizer, renderer, effective_max_model_len) =
+        resolve_model_assets(config).await?;
     let control_tokens = runtime_control_tokens(&profile, config.engine.backend);
 
-    // UniServe owns the engine + scheduler in Rust; Python (or the sim) only
-    // runs the model forward pass. The engine runs either on a thread inside
-    // this process (the zero-hop default) or as one or more headless
-    // `uniserve engine` processes behind the wire protocol.
     let (backend, eos) = match config.engine.backend {
         EngineBackendKind::Sim => (EngineBackend::Sim, control_tokens.eos.clone()),
         EngineBackendKind::Worker => (EngineBackend::Worker, control_tokens.eos.clone()),
@@ -161,9 +170,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 worker_launch: config.engine.worker_launch.clone(),
                 req_slot_cap: 1 << 20,
                 resp_slot_cap: config.engine.resp_slot_cap,
-                // Text generation terminates model EOS via scheduler control
-                // tokens; explicit request stop tokens stay per request. The
-                // sim backend gets its fabricated EOS so it terminates too.
                 bos: control_tokens.bos,
                 eos,
                 end_of_image: control_tokens.end_of_image,
@@ -193,8 +199,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             EngineCoreClient::from_in_process(runtime_client)
         }
         connection => {
-            // Socket modes ship tokenizer-resolved control tokens to engines
-            // during startup; sim engines retain their configured EOS.
             let controls = GenerationControlTokens {
                 bos: control_tokens.bos,
                 eos,
@@ -255,46 +259,31 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
 
     let gateway = EngineGateway::new(client).with_log_stats(!config.disable_log_stats);
     let engine_control = gateway.app_control();
-    let runtime = ServingRuntime::new(profile, gateway, text_backend, chat_backend)
-        .with_max_model_len(effective_max_model_len)
-        .with_tool_call_parser(config.tool_call_parser.clone())
-        .with_reasoning_parser(config.uniserve_reasoning_parser.clone());
-
-    // If no served names are specified, expose a local checkpoint's directory
-    // name as the public ID while still accepting the full path.
-    let served_model_names = if config.served_model_name.is_empty() {
-        default_served_model_names(&config.model)
-    } else {
-        config.served_model_name.clone()
-    };
+    let snapshot = gateway.snapshot();
+    let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
+    profile.context_limits.max_model_tokens = Some(route_max_model_len);
+    let model = ResolvedModel::resolve(
+        profile,
+        tokenizer,
+        renderer,
+        snapshot.generation_capabilities,
+        route_max_model_len,
+    )
+    .context("failed to bind the configured model description")?;
+    let public_model_name = config
+        .served_model_name
+        .clone()
+        .unwrap_or_else(|| model.served_model_name().to_string());
+    let runtime = ServingRuntime::new(model, gateway);
 
     Ok(Arc::new(
-        AppState::new(served_model_names, runtime, engine_control)
+        AppState::new(public_model_name, runtime, engine_control)
             .with_log_requests(config.enable_log_requests)
             .with_request_id_headers(config.enable_request_id_headers)
             .with_api_key(config.api_key.clone())
-            .with_admin_api_key(config.admin_api_key.clone())
             .with_request_timeout(config.request_timeout)
-            .with_max_concurrent_requests(config.max_concurrent_requests)
-            .with_server_dev_mode(config.server_dev_mode)
-            .with_runtime_lora_updating(config.enable_lora)
-            .with_runtime_lora_allowed_path_prefixes(config.lora_allowed_path_prefixes.clone())
-            .with_server_info(ServerInfoSnapshot::from_config(config)),
+            .with_max_concurrent_requests(config.max_concurrent_requests),
     ))
-}
-
-fn default_served_model_names(model: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let path = Path::new(model);
-    if (path.is_absolute() || path.exists())
-        && let Some(name) = path.file_name().and_then(|value| value.to_str())
-        && !name.is_empty()
-        && name != model
-    {
-        names.push(name.to_string());
-    }
-    names.push(model.to_string());
-    names
 }
 
 #[cfg(test)]
@@ -303,31 +292,12 @@ mod tests {
 
     use uniserve_model_profile::ModelProfile;
 
-    use super::{default_served_model_names, runtime_control_tokens};
+    use super::runtime_control_tokens;
     use crate::EngineBackendKind;
 
     #[test]
-    fn local_model_path_defaults_to_basename_alias_then_full_path() {
-        assert_eq!(
-            default_served_model_names("/home/models/Qwen3-0.6B-Base"),
-            vec![
-                "Qwen3-0.6B-Base".to_string(),
-                "/home/models/Qwen3-0.6B-Base".to_string(),
-            ],
-        );
-    }
-
-    #[test]
-    fn remote_model_id_stays_exact() {
-        assert_eq!(
-            default_served_model_names("Qwen/Qwen3-0.6B-Base"),
-            vec!["Qwen/Qwen3-0.6B-Base".to_string()],
-        );
-    }
-
-    #[test]
-    fn text_only_profile_resolves_engine_controls_without_generation_dialect() {
-        let mut profile = ModelProfile::text_only("qwen");
+    fn text_profile_resolves_engine_control_tokens() {
+        let mut profile = ModelProfile::text_only("qwen3");
         profile.stop_tokens.primary_eos_token_id = Some(2);
         profile.stop_tokens.eos_token_ids = BTreeSet::from([2, 3]);
 

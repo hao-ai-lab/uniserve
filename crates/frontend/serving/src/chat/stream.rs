@@ -35,6 +35,10 @@ pub struct ChatEventStream {
 }
 
 impl ChatEventStream {
+    #[allow(
+        dead_code,
+        reason = "retained constructor for the chat event stream library type"
+    )]
     pub(crate) fn new(
         request_id: String,
         inner: impl crate::chat::output::processor::ChatEventStream,

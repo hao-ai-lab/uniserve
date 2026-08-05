@@ -2,7 +2,7 @@ use crate::text::tokenizer::DynTokenizer;
 use uniserve_model_profile::dialect::{DelimitedTextPolicy, OutputFilterPolicy};
 use uniserve_model_profile::reasoning::DelimitedReasoningParser;
 
-pub(super) struct DialectOutputProcessor {
+pub(crate) struct DialectOutputProcessor {
     reasoning: Option<DelimitedReasoningParser>,
     visible_wrappers: DialectVisibleWrapperFilter,
 }
@@ -14,7 +14,7 @@ pub(crate) struct DialectTextDelta {
 }
 
 impl DialectOutputProcessor {
-    pub(super) fn new(
+    pub(crate) fn new(
         mut spec: OutputFilterPolicy,
         tokenizer: DynTokenizer,
         prompt_token_ids: &[u32],
@@ -53,7 +53,7 @@ impl DialectOutputProcessor {
         })
     }
 
-    pub(super) fn push(&mut self, text: &str) -> DialectTextDelta {
+    pub(crate) fn push(&mut self, text: &str) -> DialectTextDelta {
         let (content, reasoning) = if let Some(parser) = self.reasoning.as_mut() {
             let delta = parser.push(text);
             (

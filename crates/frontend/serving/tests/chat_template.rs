@@ -25,10 +25,7 @@ use uniserve_serving::chat::template::request::{
     ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatTool, ChatToolChoice,
     GenerationPromptMode,
 };
-use uniserve_serving::chat::template::{
-    AssistantContentBlock, AssistantToolCall, ChatRenderer, DeepSeekV4ChatRenderer,
-    DeepSeekV32ChatRenderer,
-};
+use uniserve_serving::chat::template::{AssistantContentBlock, AssistantToolCall, ChatRenderer};
 
 const QWEN3_TEMPLATE: &str = include_str!("templates/qwen3.jinja");
 
@@ -311,80 +308,6 @@ fn qwen_family_preserves_historical_assistant_completion_text_byte_identically()
     );
 }
 
-fn deepseek_history() -> Vec<ChatMessage> {
-    vec![
-        ChatMessage::user("What is the capital of France?"),
-        ChatMessage::assistant_blocks(vec![
-            AssistantContentBlock::Reasoning {
-                text: "France's capital is well known.".to_string(),
-            },
-            AssistantContentBlock::Text {
-                text: "The capital of France is Paris.".to_string(),
-            },
-        ]),
-        ChatMessage::user("And of Italy?"),
-    ]
-}
-
-fn deepseek_v32_render(messages: Vec<ChatMessage>) -> String {
-    let mut request = base_request(messages);
-    request
-        .chat_options
-        .template_kwargs
-        .insert("thinking".to_string(), serde_json::Value::Bool(true));
-    text_to_prompt(DeepSeekV32ChatRenderer::new().render(&request).unwrap())
-}
-
-fn deepseek_v4_render(messages: Vec<ChatMessage>) -> String {
-    let mut request = base_request(messages);
-    request
-        .chat_options
-        .template_kwargs
-        .insert("thinking".to_string(), serde_json::Value::Bool(true));
-    text_to_prompt(DeepSeekV4ChatRenderer::new().render(&request).unwrap())
-}
-
-#[test]
-fn deepseek_v32_family_render_is_deterministic_across_repeated_renders() {
-    let first = deepseek_v32_render(deepseek_history());
-    let second = deepseek_v32_render(deepseek_history());
-    assert_eq!(
-        first, second,
-        "repeated DeepSeek V3.2 renders must be byte-identical"
-    );
-}
-
-#[test]
-fn deepseek_v32_family_preserves_historical_assistant_completion_text() {
-    let rendered = deepseek_v32_render(deepseek_history());
-    // The historical visible answer must survive verbatim; historical reasoning
-    // is dropped before the final user turn, so the visible text is framed by
-    // the thinking-close and end-of-sentence markers.
-    assert!(
-        rendered.contains("</think>The capital of France is Paris.<｜end▁of▁sentence｜>"),
-        "DeepSeek V3.2 should preserve the historical answer text, got:\n{rendered}"
-    );
-}
-
-#[test]
-fn deepseek_v4_family_render_is_deterministic_across_repeated_renders() {
-    let first = deepseek_v4_render(deepseek_history());
-    let second = deepseek_v4_render(deepseek_history());
-    assert_eq!(
-        first, second,
-        "repeated DeepSeek V4 renders must be byte-identical"
-    );
-}
-
-#[test]
-fn deepseek_v4_family_preserves_historical_assistant_completion_text() {
-    let rendered = deepseek_v4_render(deepseek_history());
-    assert!(
-        rendered.contains("The capital of France is Paris.<｜end▁of▁sentence｜>"),
-        "DeepSeek V4 should preserve the historical answer text, got:\n{rendered}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Behavior 3: tool-call argument key order and number precision survive each
 // family's JSON formatting.
@@ -407,83 +330,6 @@ fn assistant_tool_call_history(arguments: &str) -> Vec<ChatMessage> {
         })]),
         ChatMessage::tool_response("{\"ok\":true}", "call-1"),
     ]
-}
-
-#[test]
-fn deepseek_v32_tool_call_arguments_preserve_key_order_and_number_precision() {
-    let rendered = deepseek_v32_render(assistant_tool_call_history(MIXED_ARGS));
-
-    // DSML emits one `<parameter>` per argument, in original key order.
-    let zulu = rendered
-        .find("name=\"zulu\"")
-        .expect("zulu parameter present");
-    let alpha = rendered
-        .find("name=\"alpha\"")
-        .expect("alpha parameter present");
-    let mike = rendered
-        .find("name=\"mike\"")
-        .expect("mike parameter present");
-    let delta = rendered
-        .find("name=\"delta\"")
-        .expect("delta parameter present");
-    assert!(
-        zulu < alpha && alpha < mike && mike < delta,
-        "DSML parameters must follow the original key order, got:\n{rendered}"
-    );
-
-    // Integer stays integer; `1.00` normalizes to `1.0`; array preserved.
-    assert!(
-        rendered.contains("string=\"false\">2</"),
-        "integer arg should render as 2"
-    );
-    assert!(
-        rendered.contains("string=\"false\">1.0</"),
-        "1.00 should normalize to 1.0"
-    );
-    assert!(
-        rendered.contains("string=\"false\">[3, 4]</"),
-        "array arg should render with json_dumps spacing, got:\n{rendered}"
-    );
-    // String value is emitted raw under string="true".
-    assert!(
-        rendered.contains("string=\"true\">hi</"),
-        "string arg should be raw under string=true"
-    );
-}
-
-#[test]
-fn deepseek_v4_tool_call_arguments_preserve_key_order_and_number_precision() {
-    let rendered = deepseek_v4_render(assistant_tool_call_history(MIXED_ARGS));
-
-    let zulu = rendered
-        .find("name=\"zulu\"")
-        .expect("zulu parameter present");
-    let alpha = rendered
-        .find("name=\"alpha\"")
-        .expect("alpha parameter present");
-    let mike = rendered
-        .find("name=\"mike\"")
-        .expect("mike parameter present");
-    let delta = rendered
-        .find("name=\"delta\"")
-        .expect("delta parameter present");
-    assert!(
-        zulu < alpha && alpha < mike && mike < delta,
-        "DSML parameters must follow the original key order, got:\n{rendered}"
-    );
-
-    assert!(
-        rendered.contains("string=\"false\">2</"),
-        "integer arg should render as 2"
-    );
-    assert!(
-        rendered.contains("string=\"false\">1.0</"),
-        "1.00 should normalize to 1.0"
-    );
-    assert!(
-        rendered.contains("string=\"true\">hi</"),
-        "string arg should be raw under string=true"
-    );
 }
 
 #[test]
@@ -519,44 +365,6 @@ fn hf_family_tojson_preserves_key_order_and_number_precision() {
 // Behavior 3 (cont.): tool *schema* number precision is preserved per family
 // through the rendered tool preamble.
 // ---------------------------------------------------------------------------
-
-fn tool_with_numeric_schema() -> ChatTool {
-    ChatTool {
-        name: "do_thing".to_string(),
-        description: Some("does a thing".to_string()),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "ratio": {"type": "number", "default": 1.00},
-                "count": {"type": "integer", "default": 7}
-            }
-        }),
-        strict: None,
-    }
-}
-
-#[test]
-fn deepseek_v32_tool_schema_preserves_number_precision() {
-    let mut request = base_request(vec![ChatMessage::user("hi")]);
-    request.tools = vec![tool_with_numeric_schema()];
-    request.tool_choice = ChatToolChoice::Auto;
-    request
-        .chat_options
-        .template_kwargs
-        .insert("thinking".to_string(), serde_json::Value::Bool(true));
-
-    let rendered = text_to_prompt(DeepSeekV32ChatRenderer::new().render(&request).unwrap());
-
-    // `1.00` normalizes to `1.0`; integer default stays `7`.
-    assert!(
-        rendered.contains("\"default\": 1.0"),
-        "tool schema number default should normalize to 1.0, got:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("\"default\": 7"),
-        "tool schema integer default should stay 7, got:\n{rendered}"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Gated: live tokenizer / online snapshot round-trips. These require model

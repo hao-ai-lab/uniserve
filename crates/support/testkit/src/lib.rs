@@ -17,15 +17,17 @@ use uniserve_engine_api::GenEvent;
 mod stub_executor;
 pub use stub_executor::StubExecutor;
 
-pub fn text_request_fixture(
+pub fn generate_input_fixture(
     request_id: impl Into<uniserve_serving::ServeRequestId>,
     prompt: impl Into<String>,
-) -> uniserve_serving::ServeRequest {
-    uniserve_serving::ServeRequest::text(request_id, prompt)
+) -> uniserve_serving::GenerateReqInput {
+    uniserve_serving::GenerateReqInput::text(request_id, prompt)
 }
 
 pub fn mock_model_profile(profile_id: impl Into<String>) -> uniserve_model_profile::ModelProfile {
-    uniserve_model_profile::ModelProfile::text_only(profile_id)
+    let mut profile = uniserve_model_profile::ModelProfile::text_only(profile_id);
+    profile.identity.family_id = "qwen3".to_string();
+    profile
 }
 
 pub fn mock_engine_gateway(
@@ -131,10 +133,6 @@ pub fn canonical_engine_outputs(
     batch
 }
 
-pub fn plan_snapshot(plan: &uniserve_serving::ExecutionPlan) -> uniserve_serving::PlanInspection {
-    plan.inspect().clone()
-}
-
 pub async fn collect_events(
     stream: uniserve_serving::ServeEventStream,
 ) -> anyhow::Result<Vec<uniserve_serving::ServeEvent>> {
@@ -172,12 +170,85 @@ pub fn assert_terminal_success(events: &[uniserve_serving::ServeEvent]) -> anyho
     }
 }
 
-pub fn serving_runtime_from_shared_backend(
+/// A minimal ChatML template used by the fixture chat renderer. It is only rich
+/// enough to round-trip system/user/assistant turns; production templates are
+/// loaded from model files.
+const FIXTURE_CHAT_TEMPLATE: &str = concat!(
+    "{% for message in messages %}",
+    "<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n",
+    "{% endfor %}",
+    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+);
+
+/// Deterministic byte tokenizer for fixtures: it byte-encodes/decodes text and
+/// maps a small set of ChatML/vision/reasoning control tokens to fixed ids.
+#[derive(Debug)]
+struct FixtureByteTokenizer;
+
+impl uniserve_model_profile::tokenizer::Tokenizer for FixtureByteTokenizer {
+    fn encode(
+        &self,
+        text: &str,
+        _add_special_tokens: bool,
+    ) -> uniserve_model_profile::tokenizer::Result<Vec<u32>> {
+        Ok(text.bytes().map(u32::from).collect())
+    }
+
+    fn decode(
+        &self,
+        token_ids: &[u32],
+        _skip_special_tokens: bool,
+    ) -> uniserve_model_profile::tokenizer::Result<String> {
+        let bytes = token_ids
+            .iter()
+            .map(|token_id| *token_id as u8)
+            .collect::<Vec<_>>();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        match token {
+            "<|im_start|>" => Some(1),
+            "<|im_end|>" => Some(2),
+            "<|vision_start|>" => Some(3),
+            "<|vision_end|>" => Some(4),
+            "<think>" => Some(5),
+            "</think>" => Some(6),
+            _ => None,
+        }
+    }
+}
+
+/// Build a text-only [`ResolvedModel`](uniserve_serving::ResolvedModel) fixture
+/// backed by the deterministic byte tokenizer and a minimal ChatML renderer.
+#[allow(clippy::expect_used)]
+pub fn resolved_model_fixture(model_name: &str) -> uniserve_serving::ResolvedModel {
+    let profile = mock_model_profile(model_name);
+    let tokenizer: uniserve_model_profile::tokenizer::DynTokenizer =
+        std::sync::Arc::new(FixtureByteTokenizer);
+    let renderer = uniserve_serving::chat::HfChatRenderer::new(
+        Some(FIXTURE_CHAT_TEMPLATE.to_string()),
+        std::collections::HashMap::new(),
+        uniserve_serving::chat::ChatTemplateContentFormatOption::Auto,
+    )
+    .expect("build fixture chat renderer");
+    let capabilities = uniserve_core::GenerationRuntimeCapabilities {
+        supports_understanding: true,
+        ..Default::default()
+    };
+    uniserve_serving::ResolvedModel::resolve(profile, tokenizer, renderer, capabilities, 4096)
+        .expect("resolve fixture model")
+}
+
+/// Build a [`ServingRuntimeFixture`] from a resolved model and an engine
+/// gateway (typically produced by [`resolved_model_fixture`] and
+/// [`mock_engine_gateway`]).
+pub fn serving_runtime_fixture(
+    model: uniserve_serving::ResolvedModel,
     gateway: uniserve_engine_gateway::EngineGateway,
-    backend: uniserve_serving::chat::DynChatTextBackend,
 ) -> ServingRuntimeFixture {
     let engine_control = gateway.app_control();
-    let runtime = uniserve_serving::ServingRuntime::from_shared_backend(gateway, backend);
+    let runtime = uniserve_serving::ServingRuntime::new(model, gateway);
     ServingRuntimeFixture {
         runtime,
         engine_control,
@@ -190,14 +261,6 @@ pub struct ServingRuntimeFixture {
 }
 
 impl ServingRuntimeFixture {
-    pub fn with_tool_call_parser(
-        mut self,
-        selection: uniserve_serving::chat::ParserSelection,
-    ) -> Self {
-        self.runtime = self.runtime.with_tool_call_parser(selection);
-        self
-    }
-
     pub fn into_parts(
         self,
     ) -> (
@@ -424,12 +487,18 @@ mod tests {
 
     #[tokio::test]
     async fn semantic_and_mock_fixtures_have_stable_runtime_identity() {
-        let request = text_request_fixture("request-1", "hello");
+        let request = generate_input_fixture("request-1", "hello");
         assert_eq!(request.request_id.as_ref(), "request-1");
         let profile = mock_model_profile("fixture-model");
-        assert_eq!(profile.family_id(), "fixture-model");
+        assert_eq!(profile.family_id(), "qwen3");
         let (gateway, _engine) = mock_engine_gateway("fixture-model");
         assert_eq!(gateway.snapshot().model_name, "fixture-model");
+
+        let model = resolved_model_fixture("fixture-model");
+        assert_eq!(model.served_model_name(), "fixture-model");
+        let fixture = serving_runtime_fixture(model, gateway);
+        assert_eq!(fixture.served_model_name(), "fixture-model");
+        let (_runtime, _control) = fixture.into_parts();
     }
 
     #[test]

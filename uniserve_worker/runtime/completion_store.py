@@ -230,10 +230,12 @@ class CompletionLease:
             return False
         if slot.ready_ns != 0:
             return True
-        ready = all(bool(event.query()) for event in slot.events.values())
-        if ready and slot.ready_ns == 0:
+        for event in slot.events.values():
+            if not bool(event.query()):
+                return False
+        if slot.ready_ns == 0:
             slot.ready_ns = time.perf_counter_ns()
-        return ready
+        return True
 
     def read_tokens(self, capture: CompletionCapture) -> tuple[int, ...]:
         if capture.lease is not self:

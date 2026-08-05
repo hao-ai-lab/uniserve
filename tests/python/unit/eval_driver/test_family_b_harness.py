@@ -646,8 +646,8 @@ def test_interleave_task_carries_fixed_image_generation_controls() -> None:
         "steps": 50,
         "seed": 42,
     }
-    assert request.payload["think"] is False
-    assert request.payload["t_eps"] == 0.02
+    assert "think" not in request.payload
+    assert "t_eps" not in request.payload
 
 
 def test_openai_parser_captures_sglang_cached_token_breakdown_when_usage_omits_it() -> None:
@@ -765,13 +765,7 @@ def test_i2t_task_streams_openai_chat_wire() -> None:
     assert request.payload["stream_options"] == {"include_usage": True}
     assert request.payload["modalities"] == ["text"]
     assert request.payload["max_completion_tokens"] == 256
-    assert request.payload["extra_args"] == {
-        "max_tokens": 256,
-        "do_sample": False,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "ignore_eos": True,
-    }
+    assert "extra_args" not in request.payload
     parts = request.payload["messages"][0]["content"]
     assert parts[1]["image_url"]["url"] == "data:image/png;base64,QUJD"
 
@@ -790,6 +784,20 @@ def test_i2t_task_openai_chat_json_wire_is_not_streamed() -> None:
     assert request.kind == "openai_chat_json"
     assert "stream" not in request.payload
     assert request.payload["max_completion_tokens"] == 256
+    assert "extra_args" not in request.payload
+
+
+def test_i2t_reference_protocol_receives_reference_extra_args() -> None:
+    request = I2TTask(
+        BenchmarkSpec(
+            task=TaskName.I2T,
+            model="SenseNova-U1",
+            max_tokens=256,
+            wire="openai_chat_json",
+            plan_evidence_policy="reference_protocol",
+        )
+    ).build_request({"prompt": "Describe this image.", "input_image_b64": "QUJD"})
+
     assert request.payload["extra_args"]["max_tokens"] == 256
 
 
@@ -887,7 +895,20 @@ def test_chat_task_builders_preserve_declared_sampling_contract(
         assert request.payload["frequency_penalty"] == 0.0
         assert request.payload["presence_penalty"] == 0.0
         assert request.payload["seed"] == 42
-        assert request.payload["chat_template_kwargs"] == {"enable_thinking": True}
+        assert "chat_template_kwargs" not in request.payload
+
+
+def test_reference_text_protocol_receives_template_kwargs() -> None:
+    request = TextTask(
+        BenchmarkSpec(
+            task=TaskName.TEXT,
+            model="M",
+            chat_template_kwargs={"enable_thinking": True},
+            plan_evidence_policy="reference_protocol",
+        )
+    ).build_request({"prompt": "p"})
+
+    assert request.payload["chat_template_kwargs"] == {"enable_thinking": True}
 
 
 def test_interleave_task_emits_declared_sampling_seed() -> None:

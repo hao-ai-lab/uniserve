@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
     from .app import WorkerServer
 
 __all__ = ["WorkerIpcTransport", "WorkerServeLoop"]
+
 
 def _request_session_ids(request: Mapping[str, Any]) -> frozenset[int]:
     sessions: set[int] = set()
@@ -90,9 +92,26 @@ class WorkerServeLoop:
         self.worker_server = worker_server
         self.ipc_endpoint = ipc_endpoint
         self.inflight: deque[tuple[dict[str, Any], dict[str, Any]]] = deque()
+        self._inflight_sessions: dict[int, frozenset[int]] = {}
         self.shutdown: tuple[dict[str, Any], dict[str, Any]] | None = None
 
+    def _append_inflight(
+        self,
+        request: dict[str, Any],
+        response: dict[str, Any],
+    ) -> None:
+        self.inflight.append((request, response))
+        self._inflight_sessions[id(response)] = _request_session_ids(
+            request
+        ) | _response_session_ids(response)
+
     def run(self) -> None:
+        # The loaded model and executor graph live for the worker's full
+        # lifetime. Excluding that initialized graph from later cyclic scans
+        # keeps request-time full collections proportional to request state;
+        # objects allocated while serving remain in the ordinary generations.
+        gc.collect()
+        gc.freeze()
         try:
             while True:
                 self._refill()
@@ -109,8 +128,9 @@ class WorkerServeLoop:
                 if request.get("kind") == RequestKind.SHUTDOWN.value:
                     self.worker_server.respond(response)
                     return
-                self.inflight.append((request, response))
+                self._append_inflight(request, response)
         finally:
+            gc.unfreeze()
             self.worker_server.profiler.close()
             close = getattr(self.worker_server.worker, "close", None)
             if callable(close):
@@ -132,17 +152,26 @@ class WorkerServeLoop:
             if request.get("kind") == RequestKind.SHUTDOWN.value:
                 self.shutdown = (request, response)
                 return
-            self.inflight.append((request, response))
+            self._append_inflight(request, response)
 
     def _respond_ready(self) -> bool:
         from .app import _response_ready
 
         earlier_sessions: set[int] = set()
         for index, (request, response) in enumerate(self.inflight):
-            request_sessions = _request_session_ids(request) | _response_session_ids(response)
+            response_id = id(response)
+            request_sessions = self._inflight_sessions.get(response_id)
+            if request_sessions is None:
+                # Preserve direct test/debug injection into ``inflight`` while
+                # keeping the normal polling path allocation-free.
+                request_sessions = _request_session_ids(request) | _response_session_ids(
+                    response
+                )
+                self._inflight_sessions[response_id] = request_sessions
             lineage_ready = earlier_sessions.isdisjoint(request_sessions)
             if lineage_ready and _response_ready(response):
                 del self.inflight[index]
+                del self._inflight_sessions[response_id]
                 self.worker_server.respond(response)
                 return True
             earlier_sessions.update(request_sessions)

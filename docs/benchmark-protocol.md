@@ -22,12 +22,6 @@ A failed point stops the run and preserves its partial artifacts and logs. The f
 
 `--resume` continues a non-formal output root by skipping only points whose canonical artifact bundle, harness contract, matrix contract, and execution-bundle identity still match the selected profile. A missing, invalid, or stale point runs in place and the aggregate is rebuilt from the complete selected point set. Formal execution requires a fresh root and a complete matrix, so it does not permit `--resume` or point-level filters.
 
-## Generation-runtime qualification
-
-The benchmark harness executes profile-selected requests and emits measurements and integrity evidence. It does not choose construction checks, comparator roots, regression thresholds, architecture claims, or candidate acceptance. Those experiment-control decisions are defined by [`specs/generation-runtime-qualification.md`](../specs/generation-runtime-qualification.md) and materialized by the immutable candidate manifest described in [`specs/decode-runtime-construction.md`](../specs/decode-runtime-construction.md).
-
-Each formal qualification sequence uses one immutable candidate source state and one fresh artifact root, executes points serially, permits no automatic retry, and stops after the first invalid or failing point. A failed point is diagnosed before affected measurement continues. Successful evidence remains valid only while every bound source, executable, configuration, workload, model, hardware, dependency, and profile input remains unchanged.
-
 ## Workload matrix
 
 | Workload | Systems | Requests per point | Load cases | Comparison metrics |
@@ -72,7 +66,7 @@ Where a reference runtime has no equivalent knob, the mismatch is explicit rathe
 
 ## ShareGPT semantics
 
-The Qwen workload follows the pinned SGLang ShareGPT behavior implemented in [`refs/sglang/python/sglang/benchmark/datasets/sharegpt.py`](../refs/sglang/python/sglang/benchmark/datasets/sharegpt.py) and [`refs/sglang/python/sglang/benchmark/serving.py`](../refs/sglang/python/sglang/benchmark/serving.py):
+The Qwen workload follows the pinned SGLang ShareGPT behavior implemented in `refs/sglang/python/sglang/benchmark/datasets/sharegpt.py` and `refs/sglang/python/sglang/benchmark/serving.py`:
 
 1. Keep conversations with at least two turns and use the first turn as the prompt and the second turn as the trace completion.
 2. Shuffle with the configured seed and retain the first requested rows that pass the length filters.
@@ -100,7 +94,7 @@ Beans I2T fixes the selected JPEG inputs, prompt, preprocessing, and sampling co
 
 SenseNova interleaved generation uses [UEval](https://huggingface.co/datasets/zlab-princeton/UEval), whose prompts are authored to require both text and images in a single answer, so the modality alternation under measurement comes from the request rather than from a harness-side instruction. Each request uses the same seed-42 selection procedure as the other workloads, natural EOS, an 8192-token generation ceiling, 2048×1152 output, and the SenseNova 50-update image controls. The request states no image count, so a prompt produces as many images as its answer calls for and the measured image work is a model property rather than a protocol constant. A request is conformant only when it emits visible text and a decoded image with at least one transition between the two output modalities; image spans are excluded from text ITL. The matrix records UniServe characterization points because the pinned vLLM-Omni SenseNova endpoint does not expose equivalent single-request alternating text/image generation semantics, so no cross-runtime ratio is emitted for this workload.
 
-The stochastic UEval point uses the same dataset selection, output ceiling, image controls, topology, and load semantics with the fixed non-greedy processor controls in the qualification specification. It is an architecture-claim profile: the runtime trace and depth-one oracle are required evidence, and greedy UEval or default travel cannot substitute for it.
+The stochastic UEval point uses the same dataset selection, output ceiling, image controls, topology, and load semantics with the fixed non-greedy processor controls in its selected profile. It is an architecture-claim profile: the runtime trace and depth-one oracle are required evidence, and greedy UEval or default travel cannot substitute for it.
 
 ## Optional diagnostics
 

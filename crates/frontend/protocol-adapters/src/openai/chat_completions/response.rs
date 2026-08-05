@@ -8,28 +8,21 @@ use futures::{Stream, StreamExt as _, pin_mut};
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use tracing::{debug, error, info, trace};
-use uniserve_core::GenerationConstraint;
 use uniserve_openai_types::{
-    AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
-    ChatImageType, ChatLogProbs, ChatMessage, ChatMessageDelta, ChatModality, ContentPart,
-    FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent, StreamPublicCommit,
+    AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionResponse,
+    ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs, ChatMessageDelta,
+    ContentPart, FunctionCallDelta, FunctionCallResponse, ImageUrl, StreamPublicCommit,
     StreamSemanticRoot, ToolCall, ToolCallDelta, Usage,
 };
 use uniserve_serving::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt as _,
 };
 use uniserve_serving::text::DecodedLogprobs;
-use uniserve_serving::{
-    CandidateId, FinishStatus, ImageGenerationPolicy, ModalityPolicy, PublicCommit, PublicModality,
-    ServeEvent,
-};
+use uniserve_serving::{CandidateId, FinishStatus, PublicCommit, PublicModality, ServeEvent};
 
 use crate::openai::ApiError;
-use crate::openai::chat_completions::convert::{PreparedRequest, prepare_chat_request};
 use crate::openai::logprobs::{decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps};
-use crate::openai::lora::LoraModelResolution;
-use crate::openai::utils::{ResolvedRequestContext, completion_token_count};
+use crate::openai::utils::completion_token_count;
 
 fn openai_terminal_event(event: ServeEvent) -> ServeEvent {
     match event {
@@ -193,6 +186,14 @@ async fn collect_chat_events(
     let mut image_step_counts = HashMap::<String, u32>::new();
     let mut completed_image_ids = Vec::<String>::new();
     let mut finish_status = None;
+    // Structured chat processors finalize text through OutputBlockEnd. The
+    // profile-owned dialect processor emits semantic deltas directly, so keep
+    // a fallback copy for non-streaming collection without duplicating blocks
+    // from the structured path.
+    let mut loose_text = String::new();
+    let mut loose_reasoning = String::new();
+    let mut saw_text_block = false;
+    let mut saw_reasoning_block = false;
 
     while let Some(next) = stream.next().await {
         match next.map(openai_terminal_event) {
@@ -207,10 +208,12 @@ async fn collect_chat_events(
                 prompt_logprobs = accepted_prompt_logprobs;
             }
             Ok(ServeEvent::TextDelta {
+                text,
                 token_ids: delta_token_ids,
                 logprobs: delta_logprobs,
                 ..
             }) => {
+                loose_text.push_str(&text);
                 token_ids.extend(delta_token_ids);
                 if let Some(mut delta_logprobs) = delta_logprobs {
                     logprobs
@@ -221,7 +224,15 @@ async fn collect_chat_events(
                         .append(&mut delta_logprobs.positions);
                 }
             }
-            Ok(ServeEvent::OutputBlockEnd { block, .. }) => message.push_block(block),
+            Ok(ServeEvent::ReasoningDelta { text, .. }) => loose_reasoning.push_str(&text),
+            Ok(ServeEvent::OutputBlockEnd { block, .. }) => {
+                match block.kind() {
+                    AssistantBlockKind::Text => saw_text_block = true,
+                    AssistantBlockKind::Reasoning => saw_reasoning_block = true,
+                    AssistantBlockKind::ToolCall => {}
+                }
+                message.push_block(block);
+            }
             Ok(ServeEvent::ImageBegin { image_id, .. }) => {
                 image_step_counts.entry(image_id).or_default();
             }
@@ -297,6 +308,15 @@ async fn collect_chat_events(
             "chat completion stream closed before terminal finish event"
         ));
     };
+
+    if !saw_reasoning_block && !loose_reasoning.is_empty() {
+        message.push_block(AssistantContentBlock::Reasoning {
+            text: loose_reasoning,
+        });
+    }
+    if !saw_text_block && !loose_text.is_empty() {
+        message.push_block(AssistantContentBlock::Text { text: loose_text });
+    }
 
     Ok(CollectedChatOutput {
         message,
@@ -645,114 +665,6 @@ fn usage_chunk(
     let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
     chunk.usage = Some(usage);
     chunk
-}
-
-pub fn native_chat_constraint(
-    supports_und_only: bool,
-    request: &ChatCompletionRequest,
-) -> Option<GenerationConstraint> {
-    let has_image = request.modalities.contains(&ChatModality::Image);
-    let has_text = request.modalities.contains(&ChatModality::Text);
-    match (has_text, has_image) {
-        (true, true) => Some(GenerationConstraint::Default),
-        (false, true) => Some(GenerationConstraint::GenOnly),
-        (true, false) => {
-            let has_image_input = request.messages.iter().any(chat_message_has_image_parts);
-            (has_image_input && supports_und_only).then_some(GenerationConstraint::UndOnly)
-        }
-        (false, false) => None,
-    }
-}
-
-fn chat_message_has_image_parts(message: &ChatMessage) -> bool {
-    match message {
-        ChatMessage::System { content, .. }
-        | ChatMessage::User { content, .. }
-        | ChatMessage::Tool { content, .. }
-        | ChatMessage::Developer { content, .. } => content_has_image_parts(content),
-        ChatMessage::Assistant { content, .. } => {
-            content.as_ref().is_some_and(content_has_image_parts)
-        }
-        ChatMessage::Function { .. } => false,
-    }
-}
-
-fn content_has_image_parts(content: &MessageContent) -> bool {
-    matches!(
-        content,
-        MessageContent::Parts(parts)
-            if parts.iter().any(|part| matches!(part, ContentPart::ImageUrl { .. }))
-    )
-}
-
-pub fn validate_native_chat_request(
-    request: &ChatCompletionRequest,
-    _native_constraint: GenerationConstraint,
-) -> Result<(), ApiError> {
-    if let Some(seed) = request.seed
-        && seed < 0
-    {
-        return Err(ApiError::invalid_request(
-            "seed must be non-negative for native chat completions".to_string(),
-            Some("seed"),
-        ));
-    }
-    if let Some(config) = &request.image_config
-        && let Some(image_type) = config.image_type
-        && image_type != ChatImageType::Png
-    {
-        return Err(ApiError::invalid_request(
-            "image_type must be png for image chat completions".to_string(),
-            Some("image_config"),
-        ));
-    }
-    Ok(())
-}
-
-pub fn prepare_native_chat_request(
-    request: ChatCompletionRequest,
-    lora_resolution: &LoraModelResolution,
-    request_context: ResolvedRequestContext,
-    native_constraint: GenerationConstraint,
-) -> Result<PreparedRequest, ApiError> {
-    validate_native_chat_request(&request, native_constraint)?;
-    let input_image = request.messages.iter().any(chat_message_has_image_parts);
-    let image = native_image_policy(request.image_config.as_ref());
-    let mut prepared = prepare_chat_request(request, lora_resolution, request_context)?;
-    prepared.serve_request.generation.constraint = native_constraint;
-    prepared.serve_request.generation.image = image;
-    prepared.serve_request.modalities = ModalityPolicy {
-        input_text: true,
-        input_image,
-        output_text: native_constraint != GenerationConstraint::GenOnly,
-        output_image: native_constraint != GenerationConstraint::UndOnly,
-    };
-    Ok(prepared)
-}
-
-fn native_image_policy(
-    config: Option<&uniserve_openai_types::ChatImageConfig>,
-) -> ImageGenerationPolicy {
-    let mut image = ImageGenerationPolicy::default();
-    if let Some(config) = config {
-        image.resolution = config.resolution.clone();
-        image.width = positive_dimension(config.width);
-        image.height = positive_dimension(config.height);
-        image.steps = config.steps;
-        image.cfg_text_scale = config.guidance_scale;
-        image.cfg_img_scale = config.image_guidance_scale;
-        image.cfg_renorm_type = config.cfg_norm.clone();
-        image.cfg_interval = config.cfg_interval;
-        image.cfg_renorm_min = None;
-        image.timestep_shift = config.timestep_shift;
-        image.seed = config.seed;
-        image.max_images = config.num_images;
-    }
-    image
-}
-
-fn positive_dimension(value: Option<i32>) -> Option<u32> {
-    value.and_then(|value| (value > 0).then_some(value as u32))
 }
 
 fn image_delta_chunk(
@@ -1178,16 +1090,13 @@ mod tests {
     };
     use uniserve_serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
     use uniserve_serving::{
-        AdapterSelection, CandidateId, FinishStatus, ModelContext, PublicCommit, PublicModality,
-        SemanticRoot, ServeError, ServeEvent,
+        CandidateId, FinishStatus, PublicCommit, PublicModality, SemanticRoot, ServeError,
+        ServeEvent,
     };
 
     use super::{
         block_delta_chunk, chat_completion_chunk_stream, collect_chat_completion, final_chunk,
-        prepare_native_chat_request,
     };
-    use crate::openai::lora::LoraModelResolution;
-    use crate::openai::utils::ResolvedRequestContext;
 
     fn public_commit(event_seq: u64, modality: PublicModality) -> PublicCommit {
         PublicCommit {
@@ -1200,120 +1109,6 @@ mod tests {
                 semantic_digest: format!("{event_seq:064x}"),
             },
         }
-    }
-
-    #[test]
-    fn native_chat_request_preserves_sampling_controls() {
-        let request = serde_json::from_value(json!({
-            "model": "model",
-            "stream": true,
-            "messages": [{"role": "user", "content": "draw"}],
-            "min_tokens": 5,
-            "min_p": 0.12,
-            "frequency_penalty": 0.25,
-            "presence_penalty": -0.5,
-            "repetition_penalty": 1.1,
-            "ignore_eos": true,
-            "logit_bias": {"151670": 80.0},
-            "allowed_token_ids": [7, 11],
-            "bad_words": ["blocked"]
-        }))
-        .unwrap();
-
-        let prepared = prepare_native_chat_request(
-            request,
-            &LoraModelResolution {
-                model_names: vec!["model".to_string()],
-                adapter: AdapterSelection::Base,
-            },
-            ResolvedRequestContext {
-                request_id: "req".to_string(),
-                ..ResolvedRequestContext::default()
-            },
-            uniserve_core::GenerationConstraint::Default,
-        )
-        .expect("sampling controls are valid");
-        let generation = prepared.serve_request.generation;
-
-        assert_eq!(generation.min_tokens, Some(5));
-        assert_eq!(generation.min_p, Some(0.12));
-        assert_eq!(generation.frequency_penalty, Some(0.25));
-        assert_eq!(generation.presence_penalty, Some(-0.5));
-        assert_eq!(generation.repetition_penalty, Some(1.1));
-        assert!(generation.ignore_eos);
-        assert_eq!(
-            generation.logit_bias,
-            Some(std::collections::HashMap::from([(151670, 80.0)]))
-        );
-        assert_eq!(generation.allowed_token_ids, Some(vec![7, 11]));
-        assert_eq!(generation.bad_words, vec!["blocked"]);
-        assert!(matches!(
-            prepared.serve_request.model_context,
-            ModelContext::Chat { .. }
-        ));
-    }
-
-    #[test]
-    fn native_chat_request_preserves_history_tools_and_image_order() {
-        let request = serde_json::from_value(json!({
-            "model": "model",
-            "stream": true,
-            "modalities": ["text", "image"],
-            "messages": [
-                {"role":"system","content":"policy"},
-                {"role":"user","content":[
-                    {"type":"text","text":"inspect"},
-                    {"type":"image_url","image_url":{"url":"data:image/png;base64,aQ=="}}
-                ]},
-                {"role":"assistant","content":"checking","tool_calls":[{
-                    "id":"call-1","type":"function",
-                    "function":{"name":"lookup","arguments":"{\"id\":1}"}
-                }]},
-                {"role":"tool","tool_call_id":"call-1","content":"result"},
-                {"role":"user","content":"continue"}
-            ],
-            "tools":[{"type":"function","function":{
-                "name":"lookup","description":"Lookup",
-                "parameters":{"type":"object","properties":{"id":{"type":"integer"}}}
-            }}],
-            "tool_choice":"auto"
-        }))
-        .expect("OpenAI chat request");
-
-        let prepared = prepare_native_chat_request(
-            request,
-            &LoraModelResolution {
-                model_names: vec!["model".to_string()],
-                adapter: AdapterSelection::Base,
-            },
-            ResolvedRequestContext {
-                request_id: "history".to_string(),
-                ..ResolvedRequestContext::default()
-            },
-            uniserve_core::GenerationConstraint::Default,
-        )
-        .expect("multimodal history");
-
-        let ModelContext::Chat {
-            messages,
-            tools,
-            tool_choice,
-            ..
-        } = prepared.serve_request.model_context
-        else {
-            panic!("chat context");
-        };
-        assert_eq!(messages.len(), 5);
-        assert!(matches!(
-            messages[2],
-            uniserve_serving::chat::ChatMessage::Assistant { .. }
-        ));
-        assert!(matches!(
-            messages[3],
-            uniserve_serving::chat::ChatMessage::ToolResponse { .. }
-        ));
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tool_choice, uniserve_serving::chat::ChatToolChoice::Auto);
     }
 
     #[tokio::test]
@@ -1682,7 +1477,7 @@ mod tests {
                     .into_iter()
                     .map(Ok)
                     .collect(),
-                Err(error) => vec![Err(ServeError::Chat(error))],
+                Err(error) => vec![Err(ServeError::Engine(error.to_string()))],
             }
         }))
     }

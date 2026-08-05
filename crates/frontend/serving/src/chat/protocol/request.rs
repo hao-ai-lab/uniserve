@@ -415,9 +415,6 @@ pub struct ChatRequest {
     /// Protocol-neutral trace context propagated to scheduler transport.
     #[serde(default)]
     pub trace_context: HashMap<String, String>,
-    /// Resolved adapter selected for this request.
-    #[serde(default)]
-    pub adapter: crate::AdapterSelection,
 }
 
 impl ChatRequest {
@@ -438,7 +435,6 @@ impl ChatRequest {
             add_special_tokens: false,
             data_parallel_rank: None,
             trace_context: HashMap::new(),
-            adapter: crate::AdapterSelection::Base,
         }
     }
 

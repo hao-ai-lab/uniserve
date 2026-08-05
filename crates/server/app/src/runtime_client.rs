@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sim_engine_generates_image_through_native_adapter() {
+    async fn sim_engine_generates_image_through_generation_gateway() {
         let client = EngineCoreClient::from_in_process(
             RuntimeEngineClient::connect_with_executor(
                 EngineCoreConfig::sim("sim-model"),

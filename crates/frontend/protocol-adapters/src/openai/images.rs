@@ -1,28 +1,33 @@
 use futures::{Stream, StreamExt as _};
-use uniserve_core::GenerationConstraint;
 use uniserve_openai_types::{
     GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ImageOutputFormat,
     ImageResponseFormat,
 };
 use uniserve_serving::{
-    ImageGenerationPolicy, ModalityPolicy, RequestMetadata, SchedulingPolicy, ServeEvent,
-    ServeRequest,
+    GenerateReqInput, ImageGenControls, ModalitySelection, OutputContract, PromptInput,
+    SchedulingBounds, ServeEvent, ServeRequestId,
 };
 
 use crate::openai::error::{ApiError, serve_error_to_api};
-use crate::openai::lora::LoraModelResolution;
 use crate::openai::utils::{ResolvedRequestContext, check_model_served};
 
+/// One lowered image-generation request: the sole [`GenerateReqInput`] plus the
+/// public response metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedImageGeneration {
     pub request_id: String,
     pub response_model: String,
-    pub serve_request: ServeRequest,
+    pub input: GenerateReqInput,
 }
 
+/// Validate and lower one OpenAI image-generation request into exactly one
+/// [`GenerateReqInput`].
+///
+/// `served_model_names` must be non-empty; the first entry is echoed back as the
+/// response model.
 pub fn prepare_image_generation_request(
     request: ImageGenerationRequest,
-    lora_resolution: &LoraModelResolution,
+    served_model_names: &[String],
     context: ResolvedRequestContext,
 ) -> Result<PreparedImageGeneration, ApiError> {
     if request.prompt.trim().is_empty() {
@@ -38,7 +43,7 @@ pub fn prepare_image_generation_request(
         ));
     }
     if let Some(model) = request.model.as_deref() {
-        check_model_served(model, &lora_resolution.model_names)?;
+        check_model_served(model, served_model_names)?;
     }
     reject_unsupported_option(request.quality.as_ref(), "quality")?;
     reject_unsupported_option(request.style.as_ref(), "style")?;
@@ -83,15 +88,11 @@ pub fn prepare_image_generation_request(
         .map_or((None, None), |(width, height)| (Some(width), Some(height)));
 
     let request_id = format!("img-{}", context.request_id);
-    let response_model = lora_resolution.response_model();
-    if response_model.is_empty() {
-        return Err(ApiError::server_error(
-            "image generation has no resolved response model".to_string(),
-        ));
-    }
-    let mut serve_request = ServeRequest::text(request_id.clone(), request.prompt);
-    serve_request.generation.constraint = GenerationConstraint::GenOnly;
-    serve_request.generation.image = ImageGenerationPolicy {
+    let response_model = served_model_names.first().cloned().ok_or_else(|| {
+        ApiError::server_error("image generation has no served model configured".to_string())
+    })?;
+
+    let image_gen = ImageGenControls {
         width,
         height,
         steps,
@@ -101,32 +102,32 @@ pub fn prepare_image_generation_request(
         cfg_renorm_type: request.cfg_norm,
         timestep_shift: request.timestep_shift,
         seed: request.seed,
-        negative_prompt: request.negative_prompt,
         max_images: Some(1),
-        ..ImageGenerationPolicy::default()
+        ..ImageGenControls::default()
     };
-    serve_request.modalities = ModalityPolicy {
-        input_text: true,
-        input_image: false,
-        output_text: false,
-        output_image: true,
-    };
-    serve_request.adapter = lora_resolution.adapter.clone();
-    serve_request.scheduling = SchedulingPolicy {
-        data_parallel_rank: context.data_parallel_rank,
-        trace_context: context.trace_context,
-        ..SchedulingPolicy::default()
-    };
-    serve_request.metadata = RequestMetadata {
-        tenant: request.user,
-        route: Some("/v1/images/generations".to_string()),
-        protocol_adapter: Some("openai_images".to_string()),
+
+    let input = GenerateReqInput {
+        stream: false,
+        prompt: PromptInput::Text(request.prompt),
+        modalities: ModalitySelection {
+            output_text: false,
+            output_image: true,
+        },
+        negative_text: request.negative_prompt,
+        image_gen: Some(image_gen),
+        output: OutputContract::VisibleText,
+        scheduling: SchedulingBounds {
+            data_parallel_rank: context.data_parallel_rank,
+            trace_context: context.trace_context.into_iter().collect(),
+            ..SchedulingBounds::default()
+        },
+        ..GenerateReqInput::text(ServeRequestId::from(request_id.clone()), String::new())
     };
 
     Ok(PreparedImageGeneration {
         request_id,
         response_model,
-        serve_request,
+        input,
     })
 }
 
@@ -250,11 +251,8 @@ mod tests {
 
     use super::*;
 
-    fn resolution() -> LoraModelResolution {
-        LoraModelResolution {
-            model_names: vec!["image-model".to_string()],
-            adapter: uniserve_serving::AdapterSelection::Base,
-        }
+    fn served() -> Vec<String> {
+        vec!["image-model".to_string()]
     }
 
     #[test]
@@ -266,11 +264,7 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            prepare_image_generation_request(
-                request,
-                &resolution(),
-                ResolvedRequestContext::default(),
-            ),
+            prepare_image_generation_request(request, &served(), ResolvedRequestContext::default()),
             Err(ApiError::ModelNotFound { .. })
         ));
 
@@ -283,7 +277,7 @@ mod tests {
         assert!(matches!(
             prepare_image_generation_request(
                 unsupported,
-                &resolution(),
+                &served(),
                 ResolvedRequestContext::default(),
             ),
             Err(ApiError::InvalidRequest {
@@ -312,7 +306,7 @@ mod tests {
         .unwrap();
         let prepared = prepare_image_generation_request(
             request,
-            &resolution(),
+            &served(),
             ResolvedRequestContext {
                 request_id: "abc".to_string(),
                 ..ResolvedRequestContext::default()
@@ -322,41 +316,21 @@ mod tests {
 
         assert_eq!(prepared.request_id, "img-abc");
         assert_eq!(prepared.response_model, "image-model");
-        assert_eq!(
-            prepared.serve_request.generation.constraint,
-            GenerationConstraint::GenOnly
-        );
-        assert_eq!(prepared.serve_request.generation.image.width, Some(640));
-        assert_eq!(prepared.serve_request.generation.image.height, Some(480));
-        assert_eq!(prepared.serve_request.generation.image.steps, Some(12));
-        assert_eq!(
-            prepared.serve_request.generation.image.cfg_text_scale,
-            Some(4.0)
-        );
-        assert_eq!(
-            prepared.serve_request.generation.image.cfg_img_scale,
-            Some(1.25)
-        );
-        assert_eq!(
-            prepared
-                .serve_request
-                .generation
-                .image
-                .cfg_renorm_type
-                .as_deref(),
-            Some("none")
-        );
-        assert_eq!(
-            prepared.serve_request.generation.image.cfg_interval,
-            Some([0.1, 0.9])
-        );
-        assert_eq!(
-            prepared.serve_request.generation.image.timestep_shift,
-            Some(3.0)
-        );
-        assert_eq!(prepared.serve_request.generation.image.seed, Some(7));
-        assert!(prepared.serve_request.modalities.output_image);
-        assert!(!prepared.serve_request.modalities.output_text);
+        assert_eq!(prepared.input.prompt, PromptInput::Text("draw".to_string()));
+        let image_gen = prepared.input.image_gen.expect("image controls");
+        assert_eq!(image_gen.width, Some(640));
+        assert_eq!(image_gen.height, Some(480));
+        assert_eq!(image_gen.steps, Some(12));
+        assert_eq!(image_gen.cfg_text_scale, Some(4.0));
+        assert_eq!(image_gen.cfg_img_scale, Some(1.25));
+        assert_eq!(image_gen.cfg_renorm_type.as_deref(), Some("none"));
+        assert_eq!(image_gen.cfg_interval, Some([0.1, 0.9]));
+        assert_eq!(image_gen.timestep_shift, Some(3.0));
+        assert_eq!(image_gen.seed, Some(7));
+        assert_eq!(image_gen.max_images, Some(1));
+        assert_eq!(prepared.input.negative_text.as_deref(), Some("blur"));
+        assert!(prepared.input.modalities.output_image);
+        assert!(!prepared.input.modalities.output_text);
     }
 
     #[test]
@@ -369,11 +343,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            prepare_image_generation_request(
-                request,
-                &resolution(),
-                ResolvedRequestContext::default(),
-            ),
+            prepare_image_generation_request(request, &served(), ResolvedRequestContext::default()),
             Err(ApiError::InvalidRequest {
                 param: Some("num_inference_steps"),
                 ..

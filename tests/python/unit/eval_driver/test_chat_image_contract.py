@@ -1,10 +1,7 @@
-"""One declared image operating point, expressed for every chat implementation.
+"""One declared image operating point over canonical and reference wires.
 
-Chat diffusion implementations resolve generation parameters from the request
-root under their own field names while ``image_config`` carries the canonical
-representation. A benchmark point is only comparable when both sides resolve
-the same declared values, so the request must state them everywhere they are
-read.
+UniServe receives only ``image_config``. Explicit reference protocols may also
+receive the request-root aliases their implementations require.
 """
 
 from __future__ import annotations
@@ -93,12 +90,12 @@ def test_root_only_parameters_stay_out_of_the_canonical_image_config():
 
     assert "think" not in payload["image_config"]
     assert "t_eps" not in payload["image_config"]
-    assert payload["think"] is False
-    assert payload["t_eps"] == 0.02
+    assert "think" not in payload
+    assert "t_eps" not in payload
 
 
-def test_declared_parameters_reach_every_root_name_servers_read():
-    payload = _payload()
+def test_reference_protocol_receives_every_required_root_alias():
+    payload = _payload(plan_evidence_policy="reference_protocol")
     declared = {**payload["image_config"], "think": False, "t_eps": 0.02}
 
     for name, root_names in ROOT_NAMES.items():
@@ -106,12 +103,14 @@ def test_declared_parameters_reach_every_root_name_servers_read():
             assert payload[root_name] == declared[name], root_name
 
 
-def test_output_size_is_stated_as_dimensions_and_as_a_size_string():
+def test_canonical_output_size_stays_in_image_config():
     payload = _payload()
 
-    assert payload["width"] == 2048
-    assert payload["height"] == 1152
-    assert payload["size"] == "2048x1152"
+    assert payload["image_config"]["width"] == 2048
+    assert payload["image_config"]["height"] == 1152
+    assert "width" not in payload
+    assert "height" not in payload
+    assert "size" not in payload
 
 
 def test_undeclared_parameters_stay_absent_from_the_request():

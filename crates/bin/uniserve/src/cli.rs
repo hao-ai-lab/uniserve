@@ -4,8 +4,6 @@
 //! forward pass. There is a single `serve` command.
 
 use std::collections::HashMap;
-use std::fmt;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -19,7 +17,7 @@ use uniserve_engine_runtime::{
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
-    ParserSelection, RendererSelection, SchedulingPolicy, TokenizerMode,
+    SchedulingPolicy,
 };
 use uniserve_worker_ipc::WorkerLaunchConfig;
 
@@ -64,28 +62,6 @@ pub(crate) enum Command {
 pub(crate) enum SchedulerPolicyArg {
     Fcfs,
     Priority,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-pub(crate) enum TokenizerModeArg {
-    #[default]
-    Auto,
-}
-
-impl From<TokenizerModeArg> for TokenizerMode {
-    fn from(value: TokenizerModeArg) -> Self {
-        match value {
-            TokenizerModeArg::Auto => TokenizerMode::Auto,
-        }
-    }
-}
-
-impl fmt::Display for TokenizerModeArg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TokenizerModeArg::Auto => f.write_str("auto"),
-        }
-    }
 }
 
 impl From<SchedulerPolicyArg> for SchedulingPolicy {
@@ -287,23 +263,6 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
-    /// Select the tool call parser depending on the model that you're using.
-    /// Use `auto` to infer from the model or `none` to disable parsing.
-    #[arg(long, default_value_t)]
-    pub tool_call_parser: ParserSelection,
-    /// Select the reasoning parser depending on the model that you're using.
-    /// Use `auto` to infer from the model or `none` to disable parsing.
-    #[arg(long = "reasoning-parser", default_value_t)]
-    pub uniserve_reasoning_parser: ParserSelection,
-    /// Select the chat renderer implementation.
-    #[arg(long = "chat-renderer", default_value_t)]
-    pub renderer: RendererSelection,
-    /// Select tokenizer loading behavior.
-    #[arg(long = "tokenizer-mode", default_value_t)]
-    pub tokenizer_mode: TokenizerModeArg,
-    /// Disable multimodal inputs and treat the model as language-only.
-    #[arg(long = "language-only")]
-    pub language_model_only: bool,
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
@@ -368,10 +327,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// Waiting queue policy used by the scheduler.
     #[arg(long = "schedule-policy", value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
     pub scheduler_policy: SchedulerPolicyArg,
-    /// TCP port for the gRPC Generate service. When not set, no gRPC server is
-    /// started.
-    #[arg(long, hide = true)]
-    pub grpc_port: Option<u16>,
     /// Maximum seconds to wait for active requests to drain during shutdown.
     /// `0` disables graceful drain (terminate immediately).
     #[arg(long, default_value_t = 30)]
@@ -404,8 +359,7 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long)]
     pub chat_template: Option<String>,
 
-    /// Default keyword arguments to pass to the chat template renderer, merged
-    /// with request-level `chat_template_kwargs` (request values take precedence).
+    /// Default keyword arguments bound into the configured chat template.
     #[arg(long, value_parser = parse_json::<HashMap<String, Value>>, value_name = "JSON")]
     pub default_chat_template_kwargs: Option<HashMap<String, Value>>,
 
@@ -425,25 +379,12 @@ pub(crate) struct SharedRuntimeArgs {
     /// Bearer token accepted by public serving API routes.
     #[arg(long = "api-key")]
     pub api_key: Option<String>,
-    /// Bearer token accepted by sensitive management routes.
-    #[arg(long = "admin-api-key")]
-    pub admin_api_key: Option<String>,
     /// Per-request wall-clock timeout, in seconds.
     #[arg(long = "request-timeout", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub request_timeout: Option<u64>,
     /// Front-door HTTP admission limit for in-flight inference requests.
     #[arg(long = "max-concurrent-requests", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub max_concurrent_requests: Option<u64>,
-    /// Mount development-only management routes.
-    #[arg(long = "server-dev-mode", hide = true)]
-    pub server_dev_mode: bool,
-    /// Mount runtime LoRA management routes.
-    #[arg(long = "enable-lora")]
-    pub enable_lora: bool,
-    /// Absolute path prefixes allowed for runtime LoRA adapter loading.
-    #[arg(long = "lora-allowed-path-prefixes", value_delimiter = ',')]
-    pub lora_allowed_path_prefixes: Vec<PathBuf>,
-
     /// Disable periodic logging of engine statistics.
     #[arg(long)]
     pub disable_log_stats: bool,
@@ -451,20 +392,14 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "log-stats", action = ArgAction::Set)]
     pub log_stats: Option<bool>,
 
-    /// The model name(s) used in the API. The first is the primary ID returned
-    /// in responses; all are accepted in requests. Defaults to the selected
-    /// model path.
-    #[arg(long, num_args = 0..)]
-    pub served_model_name: Vec<String>,
+    /// The single model name used in the API. Defaults to the resolved model ID.
+    #[arg(long)]
+    pub served_model_name: Option<String>,
 }
 
 impl SharedRuntimeArgs {
     pub(crate) fn resolved_model(&self) -> String {
         self.model.clone()
-    }
-
-    fn grpc_port(&self) -> Option<u16> {
-        self.grpc_port.or_else(grpc_port_from_sglang_env)
     }
 
     fn disable_log_stats(&self) -> bool {
@@ -479,10 +414,6 @@ impl SharedRuntimeArgs {
                 .ok()
                 .and_then(|value| non_empty_secret(Some(&value)))
         })
-    }
-
-    fn configured_admin_api_key(&self) -> Option<String> {
-        non_empty_secret(self.admin_api_key.as_deref())
     }
 
     /// Build the UniServe Rust-engine settings from these CLI arguments.
@@ -575,19 +506,12 @@ impl SharedRuntimeArgs {
         let model = self.resolved_model();
         let disable_log_stats = self.disable_log_stats();
         let api_key = self.configured_api_key();
-        let admin_api_key = self.configured_admin_api_key();
-        let grpc_port = self.grpc_port();
         let request_timeout = self.request_timeout.map(Duration::from_secs);
         Config {
             engine,
             model,
             served_model_name: self.served_model_name,
             listener_mode,
-            tool_call_parser: self.tool_call_parser,
-            uniserve_reasoning_parser: self.uniserve_reasoning_parser,
-            renderer: self.renderer,
-            tokenizer_mode: self.tokenizer_mode.into(),
-            language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             chat_template_content_format: self.chat_template_content_format,
@@ -595,13 +519,8 @@ impl SharedRuntimeArgs {
             enable_request_id_headers: self.enable_request_id_headers,
             disable_log_stats,
             api_key,
-            admin_api_key,
             request_timeout,
             max_concurrent_requests: self.max_concurrent_requests,
-            server_dev_mode: self.server_dev_mode,
-            enable_lora: self.enable_lora,
-            lora_allowed_path_prefixes: self.lora_allowed_path_prefixes,
-            grpc_port,
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout),
         }
     }
@@ -911,19 +830,6 @@ fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
 fn non_empty_secret(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-fn grpc_port_from_sglang_env() -> Option<u16> {
-    let enabled = std::env::var("SGLANG_ENABLE_GRPC").ok()?;
-    if matches!(
-        enabled.trim().to_ascii_lowercase().as_str(),
-        "" | "0" | "false" | "no" | "off"
-    ) {
-        return None;
-    }
-    std::env::var("SGLANG_GRPC_PORT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
 }
 
 /// Default worker interpreter: a `python3`/`python` next to the running binary
@@ -1349,9 +1255,6 @@ mod tests {
             "2048",
             "--schedule-policy",
             "priority",
-            "--language-only",
-            "--reasoning-parser",
-            "none",
             "--dtype",
             "float16",
             "--mem-fraction-static",
@@ -1368,8 +1271,6 @@ mod tests {
             runtime.scheduler_policy,
             SchedulerPolicyArg::Priority
         ));
-        assert!(runtime.language_model_only);
-        assert_eq!(runtime.uniserve_reasoning_parser, ParserSelection::None);
         assert_eq!(runtime.worker_launch.model_dtype, "float16");
         assert_eq!(runtime.worker_launch.kv_memory_fraction, "0.5");
         assert!(runtime.worker_launch.transformers_trust_remote_code);
@@ -1387,16 +1288,10 @@ mod tests {
         let runtime = parse_serve(&[
             "--api-key",
             "public-key",
-            "--admin-api-key",
-            "admin-key",
             "--request-timeout",
             "9",
             "--max-concurrent-requests",
             "11",
-            "--server-dev-mode",
-            "--enable-lora",
-            "--lora-allowed-path-prefixes",
-            "/srv/lora,/opt/lora",
         ]);
         let config = runtime.into_config(HttpListenerMode::BindTcp {
             host: "127.0.0.1".to_string(),
@@ -1404,30 +1299,8 @@ mod tests {
         });
 
         assert_eq!(config.api_key.as_deref(), Some("public-key"));
-        assert_eq!(config.admin_api_key.as_deref(), Some("admin-key"));
         assert_eq!(config.request_timeout, Some(Duration::from_secs(9)));
         assert_eq!(config.max_concurrent_requests, Some(11));
-        assert!(config.server_dev_mode);
-        assert!(config.enable_lora);
-        assert_eq!(
-            config.lora_allowed_path_prefixes,
-            vec![PathBuf::from("/srv/lora"), PathBuf::from("/opt/lora")]
-        );
-    }
-
-    #[test]
-    fn tokenizer_mode_accepts_only_supported_reference_value() {
-        let runtime = parse_serve(&["--tokenizer-mode", "auto"]);
-        assert!(matches!(runtime.tokenizer_mode, TokenizerModeArg::Auto));
-
-        let parsed = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "model",
-            "--tokenizer-mode",
-            "native",
-        ]);
-        assert!(parsed.is_err());
     }
 
     #[test]

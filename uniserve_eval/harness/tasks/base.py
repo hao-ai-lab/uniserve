@@ -25,6 +25,10 @@ class BenchmarkTask:
         raise NotImplementedError
 
 
+def uses_reference_protocol(spec: BenchmarkSpec) -> bool:
+    return spec.plan_evidence_policy == "reference_protocol"
+
+
 def apply_text_sampling_contract(payload: dict[str, Any], spec: BenchmarkSpec) -> None:
     payload["temperature"] = spec.temperature
     payload["top_p"] = spec.top_p
@@ -41,7 +45,7 @@ def apply_text_sampling_contract(payload: dict[str, Any], spec: BenchmarkSpec) -
             payload[key] = value
     if spec.sampling_seed is not None:
         payload["seed"] = spec.sampling_seed
-    if spec.chat_template_kwargs:
+    if spec.chat_template_kwargs and uses_reference_protocol(spec):
         payload["chat_template_kwargs"] = dict(spec.chat_template_kwargs)
 
 
@@ -67,18 +71,17 @@ def apply_chat_image_contract(
     image_config: dict[str, Any],
     *,
     root_parameters: dict[str, Any] | None = None,
+    include_reference_aliases: bool = False,
 ) -> None:
-    """Carry one declared image parameter set under every spelling a server reads.
+    """Carry one declared image parameter set through the canonical chat field.
 
-    ``image_config`` is the canonical chat representation and holds the
-    parameters that shape belongs to. ``root_parameters`` holds declared knobs
-    that chat implementations only accept at the request root. Chat
-    implementations also resolve the canonical parameters from the root under
-    their own field names, so every declared value is emitted under all of them
-    and each server runs the same declared operating point.
+    Reference runtimes that lack the canonical object may additionally receive
+    their request-root aliases. UniServe requests never carry those aliases.
     """
 
     payload["image_config"] = image_config
+    if not include_reference_aliases:
+        return
     declared = {**image_config, **(root_parameters or {})}
     width = declared.get("width")
     height = declared.get("height")

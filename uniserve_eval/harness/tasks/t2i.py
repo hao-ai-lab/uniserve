@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest, apply_chat_image_contract
+from .base import BenchmarkTask, TaskRequest, apply_chat_image_contract, uses_reference_protocol
 
 
 class T2ITask(BenchmarkTask):
@@ -48,7 +48,12 @@ class T2ITask(BenchmarkTask):
                 "top_p": self.spec.top_p,
                 "ignore_eos": self.spec.ignore_eos,
             }
-            apply_chat_image_contract(payload, image_config, root_parameters=root_parameters)
+            apply_chat_image_contract(
+                payload,
+                image_config,
+                root_parameters=root_parameters,
+                include_reference_aliases=uses_reference_protocol(self.spec),
+            )
             if self.spec.extra_request_body:
                 payload.update(self.spec.extra_request_body)
             return TaskRequest(

@@ -1,0 +1,648 @@
+//! Closed, load-bound model resolution and the sole model-owned `tokenize`
+//! arrow.
+//!
+//! [`ResolvedModel`] is the closed value the server resolves at load time. It
+//! owns the only transition from [`GenerateReqInput`] to
+//! [`TokenizedGenerateReqInput`] via the inherent [`ResolvedModel::tokenize`]
+//! method. There is no name registry, family router, plugin factory, or
+//! trait-object tower in front of it.
+
+use std::collections::BTreeSet;
+
+use uniserve_core::{
+    ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
+    GenerationCachePolicyDescriptor, GenerationCapabilityNeeds, GenerationConstraint,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
+    GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams as EngineSamplingParams,
+    UndVisibility,
+};
+use uniserve_model_profile::dialect::GenerationDialectProfile;
+use uniserve_model_profile::tokenizer::DynTokenizer;
+use uniserve_model_profile::{ModelIdentity, ModelProfile};
+
+use crate::chat::{
+    ChatRenderer, ChatRequest, DefaultChatOutputProcessor, HfChatRenderer, ParserSelection,
+};
+use crate::input::{
+    ChatOutputProcessorConfig, GenerateReqInput, ModelEventIdentity, OutputContract,
+    OutputProcessorPolicy, PromptInput, SubmissionMetadata, TokenizedGenerateReqInput,
+};
+use crate::text::{SamplingHints, TextDecodeOptions, resolve_max_tokens};
+use crate::{CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key};
+
+/// Fixed Qwen3 reasoning parser identifier.
+const QWEN3_REASONING_PARSER: &str = "qwen3";
+/// Fixed Qwen3 tool parser identifier.
+const QWEN3_TOOL_PARSER: &str = "qwen3_xml";
+
+/// The closed load-bound model owner.
+pub enum ResolvedModel {
+    Qwen3(Qwen3Desc),
+    SenseNova(SenseNovaDesc),
+    Bagel(BagelDesc),
+}
+
+/// Text chat description: HF tokenization + chat template + fixed Qwen3 parser
+/// policy.
+pub struct Qwen3Desc {
+    identity: ModelIdentity,
+    tokenizer: DynTokenizer,
+    renderer: HfChatRenderer,
+    hints: SamplingHints,
+    capabilities: GenerationRuntimeCapabilities,
+    logprobs_supported: bool,
+}
+
+/// SenseNova omni description: image input, text output, image output, and
+/// repeated interleave through description-owned framing/ingest/output filter.
+pub struct SenseNovaDesc {
+    identity: ModelIdentity,
+    tokenizer: DynTokenizer,
+    renderer: HfChatRenderer,
+    dialect: GenerationDialectProfile,
+    capabilities: GenerationRuntimeCapabilities,
+    default_max_output_tokens: Option<u32>,
+    max_model_tokens: u32,
+}
+
+/// BAGEL omni description: image input, text output, and image output.
+pub struct BagelDesc {
+    identity: ModelIdentity,
+    tokenizer: DynTokenizer,
+    renderer: HfChatRenderer,
+    dialect: GenerationDialectProfile,
+    capabilities: GenerationRuntimeCapabilities,
+    default_max_output_tokens: Option<u32>,
+    max_model_tokens: u32,
+}
+
+impl ResolvedModel {
+    /// Fallible, exhaustive resolution over the closed configured set.
+    ///
+    /// A text profile (no generation dialect) resolves to [`Qwen3Desc`]; the
+    /// `sensenova-u1` dialect resolves to [`SenseNovaDesc`]; the `bagel` dialect
+    /// resolves to [`BagelDesc`]. Any other dialect is a resolution error.
+    pub fn resolve(
+        profile: ModelProfile,
+        tokenizer: DynTokenizer,
+        renderer: HfChatRenderer,
+        capabilities: GenerationRuntimeCapabilities,
+        max_model_tokens: u32,
+    ) -> Result<Self> {
+        let default_max_output_tokens = profile
+            .context_limits
+            .max_output_tokens
+            .or(profile.generation_defaults.max_output_tokens);
+        let hints = sampling_hints(&profile, max_model_tokens);
+        let identity = profile.identity.clone();
+
+        match profile.generation_dialect {
+            None if identity.family_id.to_ascii_lowercase().contains("qwen3") => {
+                Ok(Self::Qwen3(Qwen3Desc {
+                    identity,
+                    tokenizer,
+                    renderer,
+                    hints,
+                    capabilities,
+                    logprobs_supported: profile.features.logprobs,
+                }))
+            }
+            None => Err(ServeError::ModelResolution(format!(
+                "model family `{}` has no configured model description",
+                identity.family_id
+            ))),
+            Some(dialect) => match dialect.id.as_str() {
+                "sensenova-u1" => Ok(Self::SenseNova(SenseNovaDesc {
+                    identity,
+                    tokenizer,
+                    renderer,
+                    dialect,
+                    capabilities,
+                    default_max_output_tokens,
+                    max_model_tokens,
+                })),
+                "bagel" => Ok(Self::Bagel(BagelDesc {
+                    identity,
+                    tokenizer,
+                    renderer,
+                    dialect,
+                    capabilities,
+                    default_max_output_tokens,
+                    max_model_tokens,
+                })),
+                other => Err(ServeError::ModelResolution(format!(
+                    "generation dialect `{other}` has no configured model description"
+                ))),
+            },
+        }
+    }
+
+    /// Served-model identity used by `/v1/models` and event provenance.
+    pub fn served_identity(&self) -> &ModelIdentity {
+        match self {
+            Self::Qwen3(d) => &d.identity,
+            Self::SenseNova(d) => &d.identity,
+            Self::Bagel(d) => &d.identity,
+        }
+    }
+
+    /// Friendly served-model name.
+    pub fn served_model_name(&self) -> &str {
+        &self.served_identity().model_id
+    }
+
+    /// Event identity (`profile_id` + `dialect_id`) stamped onto `Accepted`.
+    pub fn event_identity(&self) -> ModelEventIdentity {
+        let identity = self.served_identity();
+        ModelEventIdentity {
+            profile_id: identity.profile_id.clone(),
+            dialect_id: identity.dialect_id.clone(),
+        }
+    }
+
+    /// Tokenizer bound into the resolved description.
+    pub fn tokenizer(&self) -> DynTokenizer {
+        match self {
+            Self::Qwen3(d) => std::sync::Arc::clone(&d.tokenizer),
+            Self::SenseNova(d) => std::sync::Arc::clone(&d.tokenizer),
+            Self::Bagel(d) => std::sync::Arc::clone(&d.tokenizer),
+        }
+    }
+
+    /// True when the description supports image output.
+    pub fn supports_image_output(&self) -> bool {
+        match self {
+            Self::Qwen3(_) => false,
+            Self::SenseNova(d) => d.dialect.supports_constraint(GenerationConstraint::GenOnly),
+            Self::Bagel(d) => d.dialect.supports_constraint(GenerationConstraint::GenOnly),
+        }
+    }
+
+    /// True when the description supports image input.
+    pub fn supports_image_input(&self) -> bool {
+        !matches!(self, Self::Qwen3(_))
+    }
+
+    /// Deterministic capability admission or rejection from the resolved route.
+    pub fn validate_request(&self, request: &GenerateReqInput) -> Result<()> {
+        let reject = |capability: &'static str| ServeError::UnsupportedCapability {
+            request_id: request.request_id.clone(),
+            capability,
+        };
+        let has_input_image = request.has_input_image();
+        if has_input_image && !self.supports_image_input() {
+            return Err(reject("image_input"));
+        }
+        if request.modalities.output_image && !self.supports_image_output() {
+            return Err(reject("image_output"));
+        }
+        if !request.modalities.output_text && !request.modalities.output_image {
+            return Err(reject("no_output_modality"));
+        }
+        let (capabilities, needs) = match self {
+            Self::Qwen3(d) => (
+                &d.capabilities,
+                GenerationCapabilityNeeds {
+                    understanding: true,
+                    ..Default::default()
+                },
+            ),
+            Self::SenseNova(d) => (&d.capabilities, omni_capability_needs(&d.dialect, request)),
+            Self::Bagel(d) => (&d.capabilities, omni_capability_needs(&d.dialect, request)),
+        };
+        if let Err(capability) = capabilities.covers(&needs) {
+            return Err(reject(capability));
+        }
+        Ok(())
+    }
+
+    /// The sole model-owned arrow from [`GenerateReqInput`] to
+    /// [`TokenizedGenerateReqInput`]. Inherent (not `From`/`TryFrom`/`Into`).
+    pub fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
+        match self {
+            Self::Qwen3(d) => d.tokenize(request),
+            Self::SenseNova(d) => crate::omni::tokenize_omni(
+                &crate::omni::OmniContext {
+                    dialect: &d.dialect,
+                    tokenizer: std::sync::Arc::clone(&d.tokenizer),
+                    renderer: &d.renderer,
+                    capabilities: &d.capabilities,
+                    default_max_output_tokens: d.default_max_output_tokens,
+                    max_model_tokens: d.max_model_tokens,
+                    identity: self.event_identity(),
+                },
+                request,
+            ),
+            Self::Bagel(d) => crate::omni::tokenize_omni(
+                &crate::omni::OmniContext {
+                    dialect: &d.dialect,
+                    tokenizer: std::sync::Arc::clone(&d.tokenizer),
+                    renderer: &d.renderer,
+                    capabilities: &d.capabilities,
+                    default_max_output_tokens: d.default_max_output_tokens,
+                    max_model_tokens: d.max_model_tokens,
+                    identity: self.event_identity(),
+                },
+                request,
+            ),
+        }
+    }
+}
+
+fn omni_capability_needs(
+    dialect: &GenerationDialectProfile,
+    request: &GenerateReqInput,
+) -> GenerationCapabilityNeeds {
+    let has_input_image = request.has_input_image();
+    let constraint = if request.modalities.output_image && !request.modalities.output_text {
+        GenerationConstraint::GenOnly
+    } else if has_input_image && !request.modalities.output_image {
+        GenerationConstraint::UndOnly
+    } else {
+        GenerationConstraint::Default
+    };
+    let behavior = GenerationBehaviorDescriptor::resolve(constraint, &dialect.generation_policy);
+    let context_steps = if has_input_image {
+        dialect.image_ingest.steps.clone()
+    } else {
+        Vec::new()
+    };
+    behavior.capability_needs(&dialect.generation_policy, context_steps)
+}
+
+fn sampling_hints(profile: &ModelProfile, max_model_tokens: u32) -> SamplingHints {
+    let primary = profile.stop_tokens.primary_eos_token_id;
+    let mut extra: BTreeSet<u32> = profile.stop_tokens.eos_token_ids.clone();
+    if let Some(primary) = primary {
+        extra.remove(&primary);
+    }
+    SamplingHints {
+        primary_eos_token_id: primary,
+        extra_eos_token_ids: extra,
+        default_temperature: profile.generation_defaults.temperature,
+        default_top_p: profile.generation_defaults.top_p,
+        default_top_k: profile.generation_defaults.top_k,
+        default_min_p: profile.generation_defaults.min_p,
+        default_repetition_penalty: profile.generation_defaults.repetition_penalty,
+        default_max_tokens: profile.generation_defaults.max_output_tokens,
+        max_model_len: Some(max_model_tokens),
+    }
+}
+
+impl Qwen3Desc {
+    fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
+        let request_id = request.request_id.clone();
+        self.tokenize_inner(request)
+            .map_err(|message| ServeError::Tokenize {
+                request_id,
+                message,
+            })
+    }
+
+    fn tokenize_inner(
+        &self,
+        request: GenerateReqInput,
+    ) -> std::result::Result<TokenizedGenerateReqInput, String> {
+        let (prompt_token_ids, output_processor, skip_special_tokens) = match &request.prompt {
+            PromptInput::Text(text) => {
+                let ids = self
+                    .tokenizer
+                    .encode(text, request.decode.add_special_tokens)
+                    .map_err(|error| error.to_string())?;
+                (
+                    ids,
+                    OutputProcessorPolicy::None,
+                    request.decode.skip_special_tokens,
+                )
+            }
+            PromptInput::Chat {
+                messages,
+                tools,
+                tool_choice,
+                generation_prompt_mode,
+                reasoning_effort,
+            } => {
+                let mut chat_request = ChatRequest {
+                    request_id: request.request_id.to_string(),
+                    messages: messages.clone(),
+                    sampling_params: crate::chat::SamplingParams::default(),
+                    chat_options: crate::chat::ChatOptions {
+                        generation_prompt_mode: *generation_prompt_mode,
+                        chat_template: None,
+                        reasoning_effort: *reasoning_effort,
+                        template_kwargs: std::collections::HashMap::new(),
+                    },
+                    tools: tools.clone(),
+                    tool_choice: *tool_choice,
+                    decode_options: TextDecodeOptions {
+                        skip_special_tokens: request.decode.skip_special_tokens,
+                        include_stop_str_in_output: request.decode.include_stop_string_in_output,
+                        stop_strings: (!request.stop.stop_strings.is_empty())
+                            .then(|| request.stop.stop_strings.clone()),
+                        min_tokens: request.sampling.min_tokens.unwrap_or(0),
+                    },
+                    intermediate: request.stream,
+                    priority: request.scheduling.priority,
+                    documents: None,
+                    cache_salt: request.cache.salt.clone(),
+                    add_special_tokens: request.decode.add_special_tokens,
+                    data_parallel_rank: request.scheduling.data_parallel_rank,
+                    trace_context: request
+                        .scheduling
+                        .trace_context
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                };
+                chat_request.validate().map_err(|error| error.to_string())?;
+                // Build the processor once to apply parser-driven request
+                // adjustments (e.g. disabling special-token skipping).
+                let tool_parser = ParserSelection::Explicit(QWEN3_TOOL_PARSER.to_string());
+                let reasoning_parser =
+                    ParserSelection::Explicit(QWEN3_REASONING_PARSER.to_string());
+                let _processor = DefaultChatOutputProcessor::new(
+                    &mut chat_request,
+                    &self.identity.model_id,
+                    std::sync::Arc::clone(&self.tokenizer),
+                    &tool_parser,
+                    &reasoning_parser,
+                )
+                .map_err(|error| error.to_string())?;
+                let rendered = self
+                    .renderer
+                    .render(&chat_request)
+                    .map_err(|error| error.to_string())?;
+                let rendered_text = match rendered.prompt {
+                    crate::text::Prompt::Text(text) => text,
+                    crate::text::Prompt::TokenIds(_) => {
+                        return Err("chat rendering must produce text".to_string());
+                    }
+                };
+                let ids = self
+                    .tokenizer
+                    .encode(&rendered_text, chat_request.add_special_tokens)
+                    .map_err(|error| error.to_string())?;
+                let skip = chat_request.decode_options.skip_special_tokens;
+                (
+                    ids,
+                    OutputProcessorPolicy::Chat(Box::new(ChatOutputProcessorConfig {
+                        request: chat_request,
+                        model_id: self.identity.model_id.clone(),
+                        tool_parser,
+                        reasoning_parser,
+                    })),
+                    skip,
+                )
+            }
+        };
+
+        let prompt_len = prompt_token_ids.len() as u32;
+        let lowered = self.lower_sampling(&request, prompt_len)?;
+
+        let constraint = GenerationConstraint::UndOnly;
+        let mut policy = GenerationPolicyDescriptor::default();
+        policy.termination.emit_stop_token = request.decode.include_stop_string_in_output;
+        let isolation_key = cache_isolation_key(
+            request.cache.namespace.as_deref(),
+            request.cache.salt.as_deref(),
+        );
+        let cache = GenerationCachePolicyDescriptor {
+            read: !request.cache.bypass_read && !lowered.sampling.prompt_logprobs_requested(),
+            write: !request.cache.no_store,
+            isolation_key,
+        };
+        let prompt_logprobs_requested = lowered.sampling.prompt_logprobs_requested();
+        let generated_logprobs_requested = lowered.sampling.generated_logprobs_requested();
+        let max_und_tokens = lowered.max_tokens as usize;
+        let resources = GenerationResourceBounds {
+            context_tokens: prompt_len as usize,
+            max_kv_tokens: (prompt_len as usize).saturating_add(max_und_tokens),
+            ..GenerationResourceBounds::default()
+        };
+        let generation = GenerationRequest {
+            request_id: RequestId(stable_hash(request.request_id.as_ref())),
+            context: vec![CoreContextSegment::UndTokens {
+                token_ids: prompt_token_ids.clone(),
+                visibility: UndVisibility::Internal,
+            }],
+            negative_context: Vec::new(),
+            constraint,
+            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: lowered.sampling,
+            image: ImageParams::default(),
+            max_und_tokens,
+            stop_strings: request.stop.stop_strings.clone(),
+            stop_token_ids: lowered.stop_token_ids,
+            priority: request.scheduling.priority,
+            lora_id: None,
+            grammar: None,
+            cache: cache.clone(),
+            policy,
+            resources: resources.clone(),
+        };
+        generation.validate().map_err(|error| error.to_string())?;
+
+        let cache_accounting = CacheAccounting {
+            read_enabled: cache.read,
+            write_enabled: cache.write,
+            encoder_pin_count: 0,
+            transfer: None,
+        };
+        let resource_accounting = ResourceAccounting {
+            expected_kv_tokens: resources.max_kv_tokens as u64,
+            image_latent_units: 0,
+            scratch_units: 0,
+            host_scratch_tokens: 0,
+            encoder_cache_pins: 0,
+            grammar_states: 0,
+            adapter_slots: 0,
+            replayable: true,
+        };
+
+        let decode = TextDecodeOptions {
+            skip_special_tokens,
+            include_stop_str_in_output: request.decode.include_stop_string_in_output,
+            stop_strings: (!request.stop.stop_strings.is_empty())
+                .then(|| request.stop.stop_strings.clone()),
+            min_tokens: request.sampling.min_tokens.unwrap_or(0),
+        };
+
+        Ok(TokenizedGenerateReqInput {
+            request_id: request.request_id,
+            request: generation,
+            prompt_token_ids,
+            decode,
+            emit_token_ids: matches!(
+                request.output,
+                OutputContract::Tokens | OutputContract::Logprobs
+            ),
+            prompt_logprobs_requested,
+            generated_logprobs_requested,
+            skip_special_tokens,
+            output_processor,
+            submission: SubmissionMetadata {
+                data_parallel_rank: request.scheduling.data_parallel_rank,
+                trace_headers: (!request.scheduling.trace_context.is_empty())
+                    .then(|| request.scheduling.trace_context.clone()),
+            },
+            identity: ModelEventIdentity {
+                profile_id: self.identity.profile_id.clone(),
+                dialect_id: self.identity.dialect_id.clone(),
+            },
+            cache: cache_accounting,
+            resources: resource_accounting,
+        })
+    }
+
+    fn lower_sampling(
+        &self,
+        request: &GenerateReqInput,
+        prompt_len: u32,
+    ) -> std::result::Result<LoweredSampling, String> {
+        let sampling = &request.sampling;
+        let stop = &request.stop;
+        let hints = &self.hints;
+
+        let temperature = sampling
+            .temperature
+            .or(hints.default_temperature)
+            .unwrap_or(1.0);
+        let top_p = sampling.top_p.or(hints.default_top_p).unwrap_or(1.0);
+        let top_k = sampling.top_k.or(hints.default_top_k).unwrap_or(0);
+        let min_p = sampling.min_p.or(hints.default_min_p).unwrap_or(0.0);
+        let repetition_penalty = sampling
+            .repetition_penalty
+            .or(hints.default_repetition_penalty)
+            .unwrap_or(1.0);
+        let max_tokens = resolve_max_tokens(
+            sampling.max_tokens,
+            hints.default_max_tokens,
+            hints.max_model_len,
+            prompt_len,
+        )
+        .map_err(|error| error.to_string())?;
+        let min_tokens = sampling.min_tokens.unwrap_or(0);
+        let frequency_penalty = sampling.frequency_penalty.unwrap_or(0.0);
+        let presence_penalty = sampling.presence_penalty.unwrap_or(0.0);
+
+        let mut stop_token_ids = stop.stop_token_ids.clone();
+        if !sampling.ignore_eos {
+            for token_id in &hints.extra_eos_token_ids {
+                if !stop_token_ids.contains(token_id) {
+                    stop_token_ids.push(*token_id);
+                }
+            }
+        }
+
+        for (field, value) in [
+            ("logprobs", stop.logprobs),
+            ("prompt_logprobs", stop.prompt_logprobs),
+        ] {
+            if let Some(value) = value
+                && value < -1
+            {
+                return Err(format!("{field} must be non-negative or -1, got {value}"));
+            }
+        }
+        if min_tokens > max_tokens {
+            return Err(format!(
+                "min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})"
+            ));
+        }
+
+        let bad_words_ids = tokenize_bad_words(&stop.bad_words, self.tokenizer.as_ref())?;
+
+        let mut canonical_logit_bias: Vec<(u32, f32)> = stop
+            .logit_bias
+            .as_ref()
+            .map(|biases| biases.iter().map(|(&token, &bias)| (token, bias)).collect())
+            .unwrap_or_default();
+        canonical_logit_bias.sort_by_key(|(token, _)| *token);
+
+        let core = EngineSamplingParams {
+            temperature,
+            top_k,
+            top_p,
+            ignore_eos: sampling.ignore_eos,
+            seed: sampling.seed.map(|value| value as u64),
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            logit_bias: canonical_logit_bias,
+            min_tokens: min_tokens as usize,
+            return_logprobs: stop.logprobs.is_some() || stop.logprob_token_ids.is_some(),
+            n_logprobs: match stop.logprobs {
+                Some(-1) => u32::MAX,
+                Some(value) => value as u32,
+                None => 0,
+            },
+            return_prompt_logprobs: stop.prompt_logprobs.is_some(),
+            n_prompt_logprobs: match stop.prompt_logprobs {
+                Some(-1) => u32::MAX,
+                Some(value) => value as u32,
+                None => 0,
+            },
+            logprob_token_ids: stop.logprob_token_ids.clone().unwrap_or_default(),
+            bad_words_ids: bad_words_ids.unwrap_or_default(),
+            allowed_token_ids: stop.allowed_token_ids.clone(),
+        };
+        core.validate().map_err(|error| error.to_string())?;
+
+        // Logprob feature gate.
+        if (stop.logprobs.is_some() || stop.prompt_logprobs.is_some()) && !self.logprobs_supported {
+            return Err("this model does not support logprobs".to_string());
+        }
+
+        Ok(LoweredSampling {
+            sampling: core,
+            max_tokens,
+            stop_token_ids,
+        })
+    }
+}
+
+struct LoweredSampling {
+    sampling: EngineSamplingParams,
+    max_tokens: u32,
+    stop_token_ids: Vec<u32>,
+}
+
+/// Convert bad-word strings into token-ID sequences, encoding each word both
+/// with and without a leading space (prefix-space convention) and deduping.
+fn tokenize_bad_words(
+    bad_words: &[String],
+    tokenizer: &dyn uniserve_model_profile::tokenizer::Tokenizer,
+) -> std::result::Result<Option<Vec<Vec<u32>>>, String> {
+    if bad_words.is_empty() {
+        return Ok(None);
+    }
+    let mut all_token_ids = Vec::new();
+    for bad_word in bad_words {
+        let without_space = tokenizer
+            .encode(bad_word, false)
+            .map_err(|e| e.to_string())?;
+        let with_space = tokenizer
+            .encode(&format!(" {}", bad_word.trim_start()), false)
+            .map_err(|e| e.to_string())?;
+        let keep_with_space = !with_space.is_empty()
+            && (without_space.is_empty()
+                || (with_space[0] != without_space[0] && with_space.len() == without_space.len()));
+        if !without_space.is_empty() {
+            all_token_ids.push(without_space);
+        }
+        if keep_with_space {
+            all_token_ids.push(with_space);
+        }
+    }
+    Ok((!all_token_ids.is_empty()).then_some(all_token_ids))
+}
+
+fn stable_hash(value: &str) -> u64 {
+    value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}

@@ -11,22 +11,7 @@ use uniserve_observability::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 
 /// Endpoints that will be excluded from HTTP metrics tracking.
 ///
-const EXCLUDED_HANDLERS: &[&str] = &[
-    "/metrics",
-    "/health",
-    "/load",
-    "/ping",
-    "/version",
-    "/server_info",
-    // Rust frontend extra:
-    "/reset_prefix_cache",
-    "/reset_mm_cache",
-    "/reset_encoder_cache",
-    "/collective_rpc",
-    "/sleep",
-    "/wake_up",
-    "/is_sleeping",
-];
+const EXCLUDED_HANDLERS: &[&str] = &["/metrics", "/health", "/version"];
 
 /// Record API-server HTTP metrics with Python-compatible
 /// (`PrometheusFastApiInstrumentator` style) family names and labels.

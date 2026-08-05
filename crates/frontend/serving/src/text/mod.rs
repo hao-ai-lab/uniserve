@@ -1,143 +1,191 @@
-//! Shared text-generation support used by chat and future raw completions.
+//! Shared text-generation support: incremental detokenization, decode helpers,
+//! tokenizer/model-derived sampling hints, and max-token resolution.
 //!
-//! This crate intentionally stays below chat semantics:
-//! prompt text handling, tokenizer/model loading, incremental detokenization,
-//! and the thin generate-facing backend interface live here.
+//! Under the S02 funnel this module is a decode + lowering-helper library. Model
+//! tokenization is owned by [`crate::model::ResolvedModel`]; there is no separate
+//! text backend tower, request class, or structured-output surface here.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-use std::mem::take;
 
-pub use backend::{DynTextBackend, SamplingHints, TextBackend};
+use std::collections::{BTreeSet, HashMap};
+
+use enum_as_inner::EnumAsInner;
+use serde::{Deserialize, Serialize};
+
 pub use error::{Error, Result};
-use futures::Stream;
-pub use lower::resolve_max_tokens;
-pub(crate) use lower::{PreparedTextRequest, lower_text_request};
 pub use output::{
     CollectedTextOutput, DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs,
     DecodedTextEvent, DecodedTokenLogprob, FinishReason, Finished, StopReason, TextDecodeOptions,
     TextOutputStreamExt,
 };
-pub use request::{Prompt, SamplingParams, TextRequest};
-use trait_set::trait_set;
-use uniserve_engine_gateway::EngineGateway;
-use uniserve_engine_gateway::generation::GenerationEventStream;
-use uniserve_model_profile::tokenizer::DynTokenizer;
 
-pub mod backend;
 mod error;
-mod lower;
 pub mod output;
-mod request;
-pub(crate) mod structured_output;
 pub use uniserve_model_profile::tokenizer;
 
+use futures::Stream;
+use trait_set::trait_set;
+
 trait_set! {
- /// Shared streamed text output type used by raw completions and other text-only northbound paths.
+    /// Shared streamed decoded-text output type.
     pub trait TextOutputStream = Stream<Item = Result<DecodedTextEvent>> + Send + 'static;
 }
 
-/// Text compilation and decoding implementation used by [`crate::ServingRuntime`].
+/// One rendered chat prompt, kept as an enum for renderer compatibility.
 ///
-/// This layer stays below chat semantics: prompt text or prompt token IDs flow
-/// in, decoded text deltas and terminal metadata flow out.
-#[derive(Clone)]
-pub(crate) struct TextRuntime {
-    /// Tokenizer/model metadata backend responsible for prompt encode/decode
-    /// and sampling hints.
-    backend: DynTextBackend,
-    /// Context window size reported by the engine startup handshake, with
-    /// optional override from config.
-    max_model_len: u32,
+/// The configured funnel only ever produces [`Prompt::Text`]; the pre-tokenized
+/// escape hatch is retained solely so the shared renderer contract stays stable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumAsInner)]
+#[serde(untagged)]
+pub enum Prompt {
+    /// Untokenized prompt text that still needs tokenizer work.
+    Text(String),
+    /// Pre-tokenized prompt IDs.
+    TokenIds(Vec<u32>),
 }
 
-impl TextRuntime {
-    /// Create text runtime state from the resolved backend and gateway limits.
-    pub(crate) fn new(gateway: &EngineGateway, backend: DynTextBackend) -> Self {
-        // Prefer the engine-reported max_model_len because it reflects the
-        // post-profiling, auto-fitted KV cache limit rather than static
-        // frontend metadata.
-        let max_model_len = gateway.snapshot().max_model_len;
+impl Default for Prompt {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
 
+/// User-facing sampling parameters accepted by the internal chat render input.
+///
+/// Every field is optional so that model and generation-config defaults apply
+/// when the caller omits a value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SamplingParams {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub seed: Option<i64>,
+    pub max_tokens: Option<u32>,
+    pub min_tokens: Option<u32>,
+    pub logprobs: Option<i32>,
+    pub prompt_logprobs: Option<i32>,
+    pub min_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub stop_token_ids: Option<Vec<u32>>,
+    pub ignore_eos: bool,
+    pub logit_bias: Option<HashMap<u32, f32>>,
+    pub allowed_token_ids: Option<Vec<u32>>,
+    pub bad_words: Option<Vec<String>>,
+    pub logprob_token_ids: Option<Vec<u32>>,
+    pub skip_reading_prefix_cache: Option<bool>,
+    pub write_prefix_cache: Option<bool>,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for SamplingParams {
+    fn default() -> Self {
         Self {
-            backend,
-            max_model_len,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            max_tokens: None,
+            min_tokens: None,
+            logprobs: None,
+            prompt_logprobs: None,
+            min_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            stop_token_ids: None,
+            ignore_eos: false,
+            logit_bias: None,
+            allowed_token_ids: None,
+            bad_words: None,
+            logprob_token_ids: None,
+            skip_reading_prefix_cache: None,
+            write_prefix_cache: None,
         }
     }
+}
 
-    /// Override the maximum model context length explicitly.
-    ///
-    /// This takes priority over both the engine-reported default and any
-    /// tokenizer/model metadata exposed by the backend.
-    pub(crate) fn with_max_model_len(mut self, max_model_len: u32) -> Self {
-        self.max_model_len = max_model_len;
-        self
-    }
+/// Tokenizer/model-derived hints used to enrich sampling parameters before they
+/// are lowered into an engine request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingHints {
+    pub primary_eos_token_id: Option<u32>,
+    pub extra_eos_token_ids: BTreeSet<u32>,
+    pub default_temperature: Option<f32>,
+    pub default_top_p: Option<f32>,
+    pub default_top_k: Option<u32>,
+    pub default_min_p: Option<f32>,
+    pub default_repetition_penalty: Option<f32>,
+    pub default_max_tokens: Option<u32>,
+    /// Model context window size (`max_position_embeddings`).
+    pub max_model_len: Option<u32>,
+}
 
-    /// Return the tokenizer used by this text backend.
-    pub(crate) fn tokenizer(&self) -> DynTokenizer {
-        self.backend.tokenizer()
-    }
+/// Resolve the effective `max_tokens` for generation.
+///
+/// Takes the minimum of all available limits (user, generation-config default,
+/// and `max_model_len - prompt_len`), falling back to `u32::MAX` when nothing is
+/// known so the engine can apply its own context-window limit.
+pub fn resolve_max_tokens(
+    user_max_tokens: Option<u32>,
+    default_max_tokens: Option<u32>,
+    max_model_len: Option<u32>,
+    prompt_len: u32,
+) -> Result<u32> {
+    let model_max_tokens = match max_model_len {
+        Some(max_model_len) if prompt_len >= max_model_len => {
+            return Err(Error::PromptTooLong {
+                max_model_len,
+                prompt_len,
+            });
+        }
+        Some(max_model_len) => Some(max_model_len - prompt_len),
+        None => None,
+    };
 
-    /// Compile one text request into a tokenized, engine-ready request without
-    /// submitting it.
-    pub(crate) fn compile(&self, mut request: TextRequest) -> Result<PreparedTextRequest> {
-        request.validate()?;
+    let fallback_max_tokens = user_max_tokens.or(default_max_tokens);
+    Ok([fallback_max_tokens, model_max_tokens]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(u32::MAX))
+}
 
-        let tokenizer = self.backend.tokenizer();
-        let prompt_token_ids = match take(&mut request.prompt) {
-            Prompt::Text(text) => tokenizer.encode(&text, request.add_special_tokens)?,
-            // Pre-tokenized prompts are the main completions-side escape hatch that lets benchmark
-            // and infra workloads bypass chat rendering and tokenizer overhead entirely.
-            Prompt::TokenIds(token_ids) => token_ids,
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let mut sampling_hints = self.backend.sampling_hints()?;
-        sampling_hints.max_model_len = Some(self.max_model_len);
-        lower_text_request(request, prompt_token_ids, sampling_hints, &*tokenizer)
-    }
-
-    /// Submit a previously compiled request and return the raw token stream.
-    pub(crate) async fn generate_raw_prepared(
-        &self,
-        gateway: &EngineGateway,
-        prepared: PreparedTextRequest,
-    ) -> Result<GenerationEventStream> {
-        let raw_stream = gateway.submit_generation(prepared.submission).await?;
-        Ok(raw_stream)
-    }
-
-    /// Submit a previously compiled request and stream incrementally decoded
-    /// text.
-    pub(crate) async fn generate_prepared(
-        &self,
-        gateway: &EngineGateway,
-        prepared: PreparedTextRequest,
-    ) -> Result<impl TextOutputStream> {
-        let text_request = prepared.text_request.clone();
-        let prompt_token_ids = prepared.submission.request.prompt_token_ids();
-        let prompt_logprobs_requested = prepared
-            .submission
-            .request
-            .sampling
-            .prompt_logprobs_requested();
-        let generated_logprobs_requested = prepared
-            .submission
-            .request
-            .sampling
-            .generated_logprobs_requested();
-        let raw_stream = self.generate_raw_prepared(gateway, prepared).await?;
-        let tokenizer = self.backend.tokenizer();
-        let decoded_stream = output::decoded_text_event_stream(
-            text_request.request_id,
-            tokenizer,
-            prompt_token_ids,
-            prompt_logprobs_requested,
-            generated_logprobs_requested,
-            raw_stream,
-            text_request.decode_options,
-            text_request.intermediate,
+    #[test]
+    fn resolve_max_tokens_caps_by_model_len() {
+        assert_eq!(
+            resolve_max_tokens(Some(150), None, Some(200), 100).unwrap(),
+            100
         );
+    }
 
-        Ok(decoded_stream)
+    #[test]
+    fn resolve_max_tokens_uses_default_when_user_omits() {
+        assert_eq!(
+            resolve_max_tokens(None, Some(64), Some(200), 100).unwrap(),
+            64
+        );
+    }
+
+    #[test]
+    fn resolve_max_tokens_no_limits_known_falls_back_to_u32_max() {
+        assert_eq!(resolve_max_tokens(None, None, None, 100).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn resolve_max_tokens_prompt_too_long() {
+        assert!(matches!(
+            resolve_max_tokens(Some(10), None, Some(100), 100),
+            Err(Error::PromptTooLong {
+                max_model_len: 100,
+                prompt_len: 100,
+            })
+        ));
     }
 }

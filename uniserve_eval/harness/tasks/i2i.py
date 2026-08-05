@@ -7,6 +7,7 @@ from .base import (
     TaskRequest,
     apply_chat_image_contract,
     input_image_data_url,
+    uses_reference_protocol,
 )
 
 
@@ -55,7 +56,11 @@ class I2ITask(BenchmarkTask):
             "top_p": self.spec.top_p,
             "ignore_eos": self.spec.ignore_eos,
         }
-        apply_chat_image_contract(payload, image_config)
+        apply_chat_image_contract(
+            payload,
+            image_config,
+            include_reference_aliases=uses_reference_protocol(self.spec),
+        )
         if self.spec.extra_request_body:
             payload.update(self.spec.extra_request_body)
         return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="openai_chat_json")

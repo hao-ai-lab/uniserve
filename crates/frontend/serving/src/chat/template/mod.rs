@@ -5,11 +5,8 @@ pub mod error;
 pub mod renderer;
 
 pub use error::{Error, Result};
-pub use renderer::hf::ChatTemplateContentFormatOption;
-pub use renderer::{
-    ChatRenderer, DeepSeekV4ChatRenderer, DeepSeekV32ChatRenderer, DynChatRenderer, RenderedPrompt,
-    RendererSelection,
-};
+pub use renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
+pub use renderer::{ChatRenderer, DynChatRenderer, RenderedPrompt};
 
 pub use crate::chat::protocol::{
     AssistantContentBlock, AssistantMessageExt, AssistantToolCall, ChatContent, ChatContentPart,

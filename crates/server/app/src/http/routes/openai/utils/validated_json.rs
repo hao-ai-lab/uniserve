@@ -16,14 +16,10 @@ use crate::http::error::{ApiError, invalid_request};
 /// After deserialization the extractor first calls
 /// [`Normalizable::normalize`] and then `Validate::validate`. The amount of
 /// checking performed by the latter is entirely determined by `T`'s `Validate`
-/// impl: request types such as `ChatCompletionRequest`/`CompletionRequest`
-/// declare real `#[validate(...)]` constraints (ranges, custom and
-/// cross-parameter checks), whereas types that derive `Validate` without any
-/// field constraints (e.g. the LoRA admin and token-in/token-out generate
-/// requests) get a derived no-op `validate` and rely solely on
-/// deserialization and downstream lowering for their invariants. When
-/// `validate` does report errors, this returns [`ApiError::InvalidRequest`]
-/// with the validation details.
+/// impl. Request types declare `#[validate(...)]` constraints for ranges and
+/// cross-parameter checks, while fallible protocol lowering enforces the
+/// configured serving-surface capability. When validation reports errors,
+/// this returns [`ApiError::InvalidRequest`] with the details.
 pub(crate) struct ValidatedJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for ValidatedJson<T>

@@ -7,11 +7,10 @@ use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use tracing::info;
 use tracing_futures::Instrument as _;
-use uniserve_engine_gateway::transport::GenerationConstraint;
 use uniserve_openai_types::ChatCompletionRequest;
 use uniserve_protocol_adapters::openai::chat_completions::{
     chat_completion_chunk_stream, chat_completion_sse_stream, collect_chat_completion,
-    native_chat_constraint, prepare_chat_request, prepare_native_chat_request,
+    prepare_chat_request,
 };
 use uniserve_protocol_adapters::openai::serve_error_to_api;
 
@@ -28,21 +27,7 @@ pub(crate) async fn chat_completions(
 ) -> Response {
     let stream = body.stream;
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
-
-    let supports_und_only = state
-        .runtime()
-        .profile()
-        .generation_dialect
-        .as_ref()
-        .is_some_and(|profile| profile.supports_constraint(GenerationConstraint::UndOnly));
-    let prepared = match native_chat_constraint(supports_und_only, &body) {
-        Some(constraint) => {
-            prepare_native_chat_request(body, &lora_resolution, request_context, constraint)
-        }
-        None => prepare_chat_request(body, &lora_resolution, request_context),
-    };
-    let prepared = match prepared {
+    let prepared = match prepare_chat_request(body, state.served_model_names(), request_context) {
         Ok(prepared) => prepared,
         Err(error) => return ApiError::from(error).into_response(),
     };
@@ -55,11 +40,9 @@ pub(crate) async fn chat_completions(
     let created = unix_timestamp();
     let log_request = state.enable_log_requests();
 
-    let serve_request = prepared.serve_request;
-
     let serve_stream = match state
         .runtime()
-        .serve(serve_request)
+        .generate(prepared.input)
         .instrument(request_span.clone())
         .await
     {
@@ -121,45 +104,5 @@ pub(crate) async fn chat_completions(
         }
 
         Json(response).into_response()
-    }
-}
-
-/// Compile the exact OpenAI chat payload into its sanitized runtime plan
-/// without submitting work to the engine.
-pub(crate) async fn chat_completion_plan(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
-) -> Response {
-    let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
-    let supports_und_only = state
-        .runtime()
-        .profile()
-        .generation_dialect
-        .as_ref()
-        .is_some_and(|profile| profile.supports_constraint(GenerationConstraint::UndOnly));
-
-    let serve_request =
-        if let Some(native_constraint) = native_chat_constraint(supports_und_only, &body) {
-            match prepare_native_chat_request(
-                body,
-                &lora_resolution,
-                request_context,
-                native_constraint,
-            ) {
-                Ok(prepared) => prepared.serve_request,
-                Err(error) => return ApiError::from(error).into_response(),
-            }
-        } else {
-            match prepare_chat_request(body, &lora_resolution, request_context) {
-                Ok(prepared) => prepared.serve_request,
-                Err(error) => return ApiError::from(error).into_response(),
-            }
-        };
-
-    match state.runtime().compile_async(serve_request).await {
-        Ok(plan) => Json(plan.inspect().clone()).into_response(),
-        Err(error) => ApiError::invalid_request(error.to_string(), None).into_response(),
     }
 }

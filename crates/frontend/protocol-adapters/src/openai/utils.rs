@@ -10,15 +10,6 @@ pub(crate) fn completion_token_count(visible: u32, internal: u32) -> u32 {
 
 // ---- Transport-agnostic compatibility predicates ----
 
-// These encode the shared OpenAI compatibility rules that apply identically to
-// every request surface (chat/completions, text/completions, and the native
-// /generate route). They are written against scalar inputs rather than a
-// concrete request struct so that callers with different request shapes
-// (`model: String` vs `Option<String>`, `prompt_logprobs` nested under
-// `sampling_params`, etc.) can route through one definition. They return the
-// canonical [`ApiError`]; the native HTTP layer converts via its existing
-// `From<uniserve_protocol_adapters::openai::ApiError>` impl.
-
 /// Reject a request whose model name is not among the served model names.
 ///
 /// `model` is the resolved model name the caller extracted from its own

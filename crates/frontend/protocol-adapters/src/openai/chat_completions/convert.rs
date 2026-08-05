@@ -1,25 +1,27 @@
 use itertools::Itertools as _;
 use uniserve_openai_types::{
-    ChatCompletionRequest, ChatMessage, ContentPart, MessageContent,
-    ReasoningEffort as OpenAiReasoningEffort, Tool, ToolCall, ToolChoice, ToolChoiceValue,
+    ChatCompletionRequest, ChatImageConfig, ChatImageType, ChatMessage, ChatModality, ContentPart,
+    MessageContent, ReasoningEffort as OpenAiReasoningEffort, Tool, ToolCall, ToolChoice,
+    ToolChoiceValue,
 };
 use uniserve_serving::chat::{
     AssistantContentBlock, AssistantToolCall, ChatContent, ChatContentPart,
-    ChatMessage as UniserveChatMessage, ChatOptions, ChatRequest, ChatTool, ChatToolChoice,
-    GenerationPromptMode, ReasoningEffort, SamplingParams,
+    ChatMessage as UniserveChatMessage, ChatRole, ChatTool, ChatToolChoice, GenerationPromptMode,
+    ReasoningEffort,
 };
-use uniserve_serving::{RequestMetadata, ServeRequest};
+use uniserve_serving::{
+    CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ModalitySelection,
+    OutputContract, PromptInput, SamplingConfig, SchedulingBounds, ServeRequestId, StopConfig,
+};
 
 use super::validate;
 use crate::openai::error::{ApiError, bail_invalid_request};
-use crate::openai::lora::LoraModelResolution;
-use crate::openai::structured_outputs::convert_from_response_format;
 use crate::openai::utils::{ResolvedRequestContext, convert_logit_bias};
 
-/// Lowered chat request plus the public response metadata carried by every SSE
-/// chunk.
+/// One lowered chat request: the sole [`GenerateReqInput`] plus the public
+/// response metadata carried by response assembly and every SSE chunk.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PreparedRequest {
+pub struct PreparedChatRequest {
     /// Stable OpenAI-style request ID, reused as the external chat request ID.
     pub request_id: String,
     /// Public model ID echoed back to the client.
@@ -32,8 +34,8 @@ pub struct PreparedRequest {
     pub include_prompt_logprobs: bool,
     /// Whether to include reasoning content in OpenAI responses.
     pub include_reasoning: bool,
-    /// Canonical semantic request submitted to the serving runtime.
-    pub serve_request: ServeRequest,
+    /// The single canonical admission value submitted to the serving runtime.
+    pub input: GenerateReqInput,
     /// Last assistant-role message content to echo back when `echo=true`.
     pub echo: Option<String>,
     /// Whether to include token IDs alongside generated text.
@@ -42,17 +44,18 @@ pub struct PreparedRequest {
     pub return_tokens_as_token_ids: bool,
 }
 
-/// Validate and lower one OpenAI chat completion request into the internal chat
-/// format.
+/// Validate and lower one OpenAI chat completion request into exactly one
+/// [`GenerateReqInput`] plus the response metadata needed to assemble the
+/// OpenAI response.
 ///
-/// `lora_resolution.model_names` must be non-empty; the first entry is used as
-/// the base `model` field in responses when no LoRA adapter is selected.
+/// `served_model_names` must be non-empty; the first entry is used as the
+/// `model` field echoed back in responses.
 pub fn prepare_chat_request(
     request: ChatCompletionRequest,
-    lora_resolution: &LoraModelResolution,
+    served_model_names: &[String],
     ctx: ResolvedRequestContext,
-) -> Result<PreparedRequest, ApiError> {
-    validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+) -> Result<PreparedChatRequest, ApiError> {
+    validate::validate_request_compat(&request, served_model_names)?;
     if request
         .kv_transfer_params
         .as_ref()
@@ -75,12 +78,22 @@ pub fn prepare_chat_request(
     }
 
     let request_id = format!("chatcmpl-{}", ctx.request_id);
-    let response_model = lora_resolution.response_model();
+    let response_model = served_model_names.first().cloned().ok_or_else(|| {
+        ApiError::server_error("chat completion has no served model configured".to_string())
+    })?;
     let include_reasoning = request.include_reasoning;
     let echo = request
         .echo
         .then(|| extract_last_assistant_content(&request.messages))
         .flatten();
+
+    let modalities = convert_modalities(&request.modalities)?;
+    let image_gen = request
+        .image_config
+        .as_ref()
+        .map(convert_image_config)
+        .transpose()?;
+
     let messages: Vec<_> = request
         .messages
         .into_iter()
@@ -91,8 +104,6 @@ pub fn prepare_chat_request(
         request.continue_final_message,
         &messages,
     )?;
-
-    let template_kwargs = request.chat_template_kwargs.unwrap_or_default();
 
     let include_usage = (request.stream_options.as_ref())
         .and_then(|options| options.include_usage)
@@ -106,84 +117,146 @@ pub fn prepare_chat_request(
         .prompt_logprobs
         .or((request.echo && !request.stream).then_some(top_logprobs));
     let include_prompt_logprobs = prompt_logprobs.is_some();
+    let logprobs = request.logprobs.then_some(top_logprobs);
 
-    let structured_outputs = convert_from_response_format(
-        request.response_format.as_ref(),
-        &request.structured_outputs,
-    )?;
-
-    let chat_request = ChatRequest {
-        request_id: request_id.clone(),
-        messages,
-        sampling_params: SamplingParams {
-            temperature: request.temperature,
-            top_p: request.top_p,
-            top_k: request.top_k,
-            seed: request.seed,
-            max_tokens: request.max_completion_tokens,
-            min_tokens: request.min_tokens,
-            logprobs: request.logprobs.then_some(top_logprobs),
-            prompt_logprobs,
-            min_p: request.min_p,
-            frequency_penalty: request.frequency_penalty,
-            presence_penalty: request.presence_penalty,
-            repetition_penalty: request.repetition_penalty,
-            stop_token_ids: request.stop_token_ids,
-            ignore_eos: request.ignore_eos,
-            logit_bias: convert_logit_bias(request.logit_bias)?,
-            allowed_token_ids: request.allowed_token_ids,
-            bad_words: request.bad_words,
-            logprob_token_ids: None,
-            structured_outputs,
-            skip_reading_prefix_cache: None,
-            write_prefix_cache: None,
-        },
-        chat_options: ChatOptions {
-            generation_prompt_mode,
-            chat_template: request.chat_template,
-            reasoning_effort: request.reasoning_effort.map(convert_reasoning_effort),
-            template_kwargs,
-        },
-        tools: convert_tools(request.tools)?,
-        tool_choice: convert_tool_choice(request.tool_choice.as_ref())?,
-        decode_options: uniserve_serving::text::output::TextDecodeOptions {
-            skip_special_tokens: request.skip_special_tokens,
-            include_stop_str_in_output: request.include_stop_str_in_output,
-            stop_strings: request.stop.map(|stop| stop.into_vec()),
-            min_tokens: request.min_tokens.unwrap_or(0),
-        },
-        intermediate: request.stream,
-        priority: request.priority.unwrap_or(0),
-        documents: request.documents,
-        cache_salt: request.cache_salt,
-        add_special_tokens: request.add_special_tokens,
-        data_parallel_rank: ctx.data_parallel_rank,
-        trace_context: ctx.trace_context,
-        adapter: lora_resolution.adapter.clone(),
+    let return_token_ids = request.return_token_ids.unwrap_or(false);
+    let output = if requested_logprobs || include_prompt_logprobs {
+        OutputContract::Logprobs
+    } else if return_token_ids {
+        OutputContract::Tokens
+    } else {
+        OutputContract::VisibleText
     };
 
-    let serve_request = ServeRequest::from_chat_request(
-        chat_request,
-        RequestMetadata {
-            protocol_adapter: Some("openai_chat_completions".to_string()),
-            route: Some("/v1/chat/completions".to_string()),
-            ..RequestMetadata::default()
-        },
-    )
-    .map_err(|error| ApiError::invalid_request(error.to_string(), None))?;
+    let prompt = PromptInput::Chat {
+        messages,
+        tools: convert_tools(request.tools)?,
+        tool_choice: convert_tool_choice(request.tool_choice.as_ref())?,
+        generation_prompt_mode,
+        reasoning_effort: request.reasoning_effort.map(convert_reasoning_effort),
+    };
 
-    Ok(PreparedRequest {
+    let sampling = SamplingConfig {
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        seed: request.seed,
+        max_tokens: request.max_completion_tokens,
+        min_tokens: request.min_tokens,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
+        repetition_penalty: request.repetition_penalty,
+        ignore_eos: request.ignore_eos,
+    };
+    let stop = StopConfig {
+        stop_token_ids: request.stop_token_ids.unwrap_or_default(),
+        stop_strings: request.stop.map(|stop| stop.into_vec()).unwrap_or_default(),
+        bad_words: request.bad_words.unwrap_or_default(),
+        allowed_token_ids: request.allowed_token_ids,
+        logit_bias: convert_logit_bias(request.logit_bias)?,
+        logprobs,
+        prompt_logprobs,
+        logprob_token_ids: None,
+    };
+
+    let input = GenerateReqInput {
+        request_id: ServeRequestId::from(request_id.clone()),
+        stream: request.stream,
+        prompt,
+        images: Vec::new(),
+        modalities,
+        sampling,
+        stop,
+        negative_text: None,
+        image_gen,
+        cache: CacheBounds {
+            namespace: None,
+            salt: request.cache_salt,
+            bypass_read: false,
+            no_store: false,
+        },
+        scheduling: SchedulingBounds {
+            priority: request.priority.unwrap_or(0),
+            data_parallel_rank: ctx.data_parallel_rank,
+            trace_context: ctx.trace_context.into_iter().collect(),
+        },
+        output,
+        decode: DecodeControls {
+            skip_special_tokens: request.skip_special_tokens,
+            include_stop_string_in_output: request.include_stop_str_in_output,
+            add_special_tokens: request.add_special_tokens,
+        },
+    };
+
+    Ok(PreparedChatRequest {
         request_id,
         response_model,
         include_usage,
         requested_logprobs,
         include_prompt_logprobs,
         include_reasoning,
-        serve_request,
+        input,
         echo,
-        return_token_ids: request.return_token_ids.unwrap_or(false),
+        return_token_ids,
         return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
     })
+}
+
+/// Lower requested output modalities into the canonical [`ModalitySelection`].
+fn convert_modalities(modalities: &[ChatModality]) -> Result<ModalitySelection, ApiError> {
+    let mut output_text = false;
+    let mut output_image = false;
+    for modality in modalities {
+        match modality {
+            ChatModality::Text => output_text = true,
+            ChatModality::Image => output_image = true,
+            ChatModality::Audio => {
+                bail_invalid_request!(param = "modalities", "audio output is not supported.")
+            }
+        }
+    }
+    // An empty modality list falls back to text output, matching the OpenAI
+    // default of `modalities = ["text"]`.
+    if !output_text && !output_image {
+        return Ok(ModalitySelection::default());
+    }
+    Ok(ModalitySelection {
+        output_text,
+        output_image,
+    })
+}
+
+/// Lower OpenAI chat image controls into the canonical [`ImageGenControls`].
+fn convert_image_config(config: &ChatImageConfig) -> Result<ImageGenControls, ApiError> {
+    if let Some(image_type) = config.image_type
+        && image_type != ChatImageType::Png
+    {
+        bail_invalid_request!(
+            param = "image_config",
+            "image_type must be png for image chat completions."
+        );
+    }
+    Ok(ImageGenControls {
+        resolution: config.resolution.clone(),
+        width: positive_dimension(config.width),
+        height: positive_dimension(config.height),
+        steps: config.steps,
+        cfg_text_scale: config.guidance_scale,
+        cfg_img_scale: config.image_guidance_scale,
+        cfg_interval: config.cfg_interval,
+        cfg_renorm_type: config.cfg_norm.clone(),
+        cfg_renorm_min: None,
+        timestep_shift: config.timestep_shift,
+        seed: config.seed,
+        max_images: config.num_images,
+        prompts: Vec::new(),
+        retain_images: None,
+    })
+}
+
+fn positive_dimension(value: Option<i32>) -> Option<u32> {
+    value.and_then(|value| (value > 0).then_some(value as u32))
 }
 
 fn convert_reasoning_effort(value: OpenAiReasoningEffort) -> ReasoningEffort {
@@ -212,9 +285,7 @@ fn normalize_generation_prompt_mode(
     let last_role = messages.last().map(UniserveChatMessage::role);
     match (add_generation_prompt, continue_final_message, last_role) {
         (Some(true), true, _) => unreachable!("rejected above"),
-        (_, true, Some(uniserve_serving::chat::ChatRole::Assistant)) => {
-            Ok(GenerationPromptMode::ContinueFinalAssistant)
-        }
+        (_, true, Some(ChatRole::Assistant)) => Ok(GenerationPromptMode::ContinueFinalAssistant),
         (_, true, _) => {
             bail_invalid_request!(
                 "Cannot set `continue_final_message` to True when the last message is not from the assistant."
@@ -407,20 +478,15 @@ mod tests {
     use uniserve_serving::chat::{
         AssistantContentBlock, AssistantToolCall, ChatContentPart,
         ChatMessage as UniserveChatMessage, ChatTool as UniserveChatTool, ChatToolChoice,
-        GenerationPromptMode, SamplingParams as UniserveSamplingParams,
+        GenerationPromptMode,
     };
-    use uniserve_serving::text::output::TextDecodeOptions;
-    use uniserve_serving::{GenerationPolicy, ModelContext, ServeRequest};
+    use uniserve_serving::{GenerateReqInput, PromptInput, SamplingConfig, StopConfig};
 
-    use super::prepare_chat_request;
-    use crate::openai::lora::LoraModelResolution;
+    use super::{PreparedChatRequest, prepare_chat_request};
     use crate::openai::utils::ResolvedRequestContext;
 
-    fn served(names: &[&str]) -> LoraModelResolution {
-        LoraModelResolution {
-            model_names: names.iter().map(|s| s.to_string()).collect(),
-            adapter: uniserve_serving::AdapterSelection::Base,
-        }
+    fn served(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
     }
 
     fn base_request() -> ChatCompletionRequest {
@@ -435,55 +501,38 @@ mod tests {
         }
     }
 
+    fn prepared(request: ChatCompletionRequest) -> PreparedChatRequest {
+        prepare_chat_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+        )
+        .expect("request is valid")
+    }
+
     fn chat_context(
-        request: &ServeRequest,
+        input: &GenerateReqInput,
     ) -> (
         &[UniserveChatMessage],
-        &uniserve_serving::chat::ChatOptions,
+        GenerationPromptMode,
         &[UniserveChatTool],
         &ChatToolChoice,
     ) {
-        let ModelContext::Chat {
+        let PromptInput::Chat {
             messages,
-            chat_options,
+            generation_prompt_mode,
             tools,
             tool_choice,
             ..
-        } = &request.model_context
+        } = &input.prompt
         else {
-            panic!("OpenAI chat adapter must produce semantic chat context");
+            panic!("OpenAI chat adapter must produce a chat prompt");
         };
-        (messages, chat_options, tools, tool_choice)
+        (messages, *generation_prompt_mode, tools, tool_choice)
     }
 
-    fn assert_sampling_matches(policy: &GenerationPolicy, expected: &UniserveSamplingParams) {
-        assert_eq!(policy.temperature, expected.temperature);
-        assert_eq!(policy.top_p, expected.top_p);
-        assert_eq!(policy.top_k, expected.top_k);
-        assert_eq!(policy.seed, expected.seed);
-        assert_eq!(policy.max_tokens, expected.max_tokens);
-        assert_eq!(policy.min_tokens, expected.min_tokens);
-        assert_eq!(policy.logprobs, expected.logprobs);
-        assert_eq!(policy.prompt_logprobs, expected.prompt_logprobs);
-        assert_eq!(policy.min_p, expected.min_p);
-        assert_eq!(policy.frequency_penalty, expected.frequency_penalty);
-        assert_eq!(policy.presence_penalty, expected.presence_penalty);
-        assert_eq!(policy.repetition_penalty, expected.repetition_penalty);
-        assert_eq!(
-            policy.stop_token_ids,
-            expected.stop_token_ids.clone().unwrap_or_default()
-        );
-        assert_eq!(policy.ignore_eos, expected.ignore_eos);
-    }
-
-    fn decode_options(request: &ServeRequest) -> TextDecodeOptions {
-        TextDecodeOptions {
-            skip_special_tokens: request.generation.skip_special_tokens,
-            include_stop_str_in_output: request.generation.include_stop_string_in_output,
-            stop_strings: (!request.generation.stop_strings.is_empty())
-                .then(|| request.generation.stop_strings.clone()),
-            min_tokens: request.generation.min_tokens.unwrap_or(0),
-        }
+    fn assert_sampling_matches(sampling: &SamplingConfig, expected: &SamplingConfig) {
+        assert_eq!(sampling, expected);
     }
 
     #[test]
@@ -500,88 +549,47 @@ mod tests {
         request.add_generation_prompt = Some(false);
         request.continue_final_message = true;
         request.skip_special_tokens = false;
-        request.chat_template_kwargs = Some(HashMap::from([("foo".to_string(), json!("bar"))]));
-
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert!(prepared.request_id.starts_with("chatcmpl-"));
         assert_eq!(
-            chat_context(&prepared.serve_request).0,
+            chat_context(&prepared.input).0,
             vec![UniserveChatMessage::assistant_text("hello")]
         );
-        assert_sampling_matches(
-            &prepared.serve_request.generation,
-            &UniserveSamplingParams::default(),
-        );
+        assert_sampling_matches(&prepared.input.sampling, &SamplingConfig::default());
         assert_eq!(
-            chat_context(&prepared.serve_request)
-                .1
-                .generation_prompt_mode,
+            chat_context(&prepared.input).1,
             GenerationPromptMode::ContinueFinalAssistant
         );
-        assert_eq!(
-            chat_context(&prepared.serve_request).1.template_kwargs,
-            HashMap::from([("foo".to_string(), json!("bar"))])
-        );
-        assert_eq!(
-            decode_options(&prepared.serve_request),
-            TextDecodeOptions {
-                skip_special_tokens: false,
-                include_stop_str_in_output: false,
-                stop_strings: None,
-                min_tokens: 0,
-            }
-        );
-        assert!(chat_context(&prepared.serve_request).2.is_empty());
-        assert_eq!(
-            *chat_context(&prepared.serve_request).3,
-            ChatToolChoice::Auto
-        );
+        assert!(!prepared.input.decode.skip_special_tokens);
+        assert_eq!(prepared.input.stop, StopConfig::default());
+        assert!(chat_context(&prepared.input).2.is_empty());
+        assert_eq!(*chat_context(&prepared.input).3, ChatToolChoice::Auto);
     }
 
     #[test]
     fn prepare_chat_request_keeps_optional_sampling_fields_unset() {
-        let prepared = prepare_chat_request(
-            base_request(),
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(base_request());
 
         assert!(prepared.request_id.starts_with("chatcmpl-"));
         assert_eq!(
-            chat_context(&prepared.serve_request).0,
+            chat_context(&prepared.input).0,
             vec![UniserveChatMessage::user("hello")]
         );
-        assert_sampling_matches(
-            &prepared.serve_request.generation,
-            &UniserveSamplingParams::default(),
-        );
+        assert_sampling_matches(&prepared.input.sampling, &SamplingConfig::default());
         assert_eq!(
-            chat_context(&prepared.serve_request)
-                .1
-                .generation_prompt_mode,
+            chat_context(&prepared.input).1,
             GenerationPromptMode::StartNewAssistant
         );
-        assert_eq!(
-            decode_options(&prepared.serve_request),
-            TextDecodeOptions {
-                skip_special_tokens: true,
-                include_stop_str_in_output: false,
-                stop_strings: None,
-                min_tokens: 0,
-            }
-        );
-        assert!(chat_context(&prepared.serve_request).2.is_empty());
-        assert_eq!(
-            *chat_context(&prepared.serve_request).3,
-            ChatToolChoice::Auto
-        );
+        assert!(prepared.input.decode.skip_special_tokens);
+        assert!(chat_context(&prepared.input).2.is_empty());
+        assert_eq!(*chat_context(&prepared.input).3, ChatToolChoice::Auto);
+    }
+
+    #[test]
+    fn prepare_chat_request_echoes_first_served_model_name() {
+        let prepared = prepared(base_request());
+        assert_eq!(prepared.response_model, "Qwen/Qwen1.5-0.5B-Chat");
     }
 
     #[test]
@@ -591,12 +599,7 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert!(!prepared.include_reasoning);
     }
@@ -612,21 +615,95 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
-        let expected = UniserveSamplingParams {
+        let prepared = prepared(request);
+        let expected = SamplingConfig {
             seed: Some(42),
             min_p: Some(0.2),
             frequency_penalty: Some(0.3),
             presence_penalty: Some(0.4),
             repetition_penalty: Some(1.1),
-            ..UniserveSamplingParams::default()
+            ..SamplingConfig::default()
         };
-        assert_sampling_matches(&prepared.serve_request.generation, &expected);
+        assert_sampling_matches(&prepared.input.sampling, &expected);
+    }
+
+    #[test]
+    fn prepare_chat_request_maps_stop_and_sampling_controls() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 5,
+            "ignore_eos": true,
+            "logit_bias": {"151670": 80.0},
+            "allowed_token_ids": [7, 11],
+            "bad_words": ["blocked"],
+            "stop": ["END"],
+            "stop_token_ids": [3, 4]
+        }))
+        .unwrap();
+
+        let prepared = prepared(request);
+
+        assert_eq!(prepared.input.sampling.min_tokens, Some(5));
+        assert!(prepared.input.sampling.ignore_eos);
+        assert_eq!(
+            prepared.input.stop.logit_bias,
+            Some(HashMap::from([(151670, 80.0)]))
+        );
+        assert_eq!(prepared.input.stop.allowed_token_ids, Some(vec![7, 11]));
+        assert_eq!(prepared.input.stop.bad_words, vec!["blocked".to_string()]);
+        assert_eq!(prepared.input.stop.stop_strings, vec!["END".to_string()]);
+        assert_eq!(prepared.input.stop.stop_token_ids, vec![3, 4]);
+    }
+
+    #[test]
+    fn prepare_chat_request_maps_image_output_modality_and_controls() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "stream": true,
+            "modalities": ["text", "image"],
+            "messages": [{"role": "user", "content": "draw a cat"}],
+            "image_config": {
+                "width": 640,
+                "height": 480,
+                "steps": 12,
+                "guidance_scale": 4.0,
+                "seed": 7
+            }
+        }))
+        .unwrap();
+
+        let prepared = prepared(request);
+
+        assert!(prepared.input.modalities.output_text);
+        assert!(prepared.input.modalities.output_image);
+        let image_gen = prepared.input.image_gen.expect("image controls");
+        assert_eq!(image_gen.width, Some(640));
+        assert_eq!(image_gen.height, Some(480));
+        assert_eq!(image_gen.steps, Some(12));
+        assert_eq!(image_gen.cfg_text_scale, Some(4.0));
+        assert_eq!(image_gen.seed, Some(7));
+    }
+
+    #[test]
+    fn prepare_chat_request_rejects_audio_modality() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "stream": true,
+            "modalities": ["audio"],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let error = prepare_chat_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+        )
+        .unwrap_err();
+        expect!["audio output is not supported."]
+            .assert_eq(&error.to_error_response().error.message);
     }
 
     #[test]
@@ -651,15 +728,10 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert_eq!(
-            chat_context(&prepared.serve_request).0,
+            chat_context(&prepared.input).0,
             vec![UniserveChatMessage::developer(
                 "hello",
                 Some(vec![UniserveChatTool {
@@ -699,15 +771,10 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert_eq!(
-            chat_context(&prepared.serve_request).0,
+            chat_context(&prepared.input).0,
             vec![UniserveChatMessage::user(vec![
                 ChatContentPart::text("describe "),
                 ChatContentPart::ImageUrl {
@@ -737,15 +804,10 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert_eq!(
-            chat_context(&prepared.serve_request).0,
+            chat_context(&prepared.input).0,
             vec![UniserveChatMessage::developer(
                 vec![ChatContentPart::image_url("https://example.com/image.png")],
                 None,
@@ -820,14 +882,9 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
         assert_eq!(
-            chat_context(&prepared.serve_request).0,
+            chat_context(&prepared.input).0,
             vec![UniserveChatMessage::assistant_blocks(vec![
                 AssistantContentBlock::Reasoning {
                     text: "inner".to_string(),
@@ -837,11 +894,8 @@ mod tests {
                 },
             ])]
         );
-        assert!(chat_context(&prepared.serve_request).2.is_empty());
-        assert_eq!(
-            *chat_context(&prepared.serve_request).3,
-            ChatToolChoice::Auto
-        );
+        assert!(chat_context(&prepared.input).2.is_empty());
+        assert_eq!(*chat_context(&prepared.input).3, ChatToolChoice::Auto);
     }
 
     #[test]
@@ -882,14 +936,9 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
         assert_eq!(
-            chat_context(&prepared.serve_request).0,
+            chat_context(&prepared.input).0,
             vec![
                 UniserveChatMessage::assistant_blocks(vec![AssistantContentBlock::ToolCall(
                     AssistantToolCall {
@@ -902,7 +951,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            chat_context(&prepared.serve_request).2,
+            chat_context(&prepared.input).2,
             vec![UniserveChatTool {
                 name: "get_weather".to_string(),
                 description: Some("Get weather".to_string()),
@@ -913,10 +962,7 @@ mod tests {
                 strict: None,
             }]
         );
-        assert_eq!(
-            *chat_context(&prepared.serve_request).3,
-            ChatToolChoice::None
-        );
+        assert_eq!(*chat_context(&prepared.input).3, ChatToolChoice::None);
     }
 
     #[test]
@@ -928,17 +974,12 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert!(prepared.requested_logprobs);
         assert!(prepared.include_prompt_logprobs);
-        assert_eq!(prepared.serve_request.generation.logprobs, Some(0));
-        assert_eq!(prepared.serve_request.generation.prompt_logprobs, Some(2));
+        assert_eq!(prepared.input.stop.logprobs, Some(0));
+        assert_eq!(prepared.input.stop.prompt_logprobs, Some(2));
     }
 
     #[test]
@@ -950,15 +991,10 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
-        assert_eq!(prepared.serve_request.generation.logprobs, Some(3));
-        assert_eq!(prepared.serve_request.generation.prompt_logprobs, None);
+        assert_eq!(prepared.input.stop.logprobs, Some(3));
+        assert_eq!(prepared.input.stop.prompt_logprobs, None);
         assert!(!prepared.include_prompt_logprobs);
     }
 
@@ -974,21 +1010,13 @@ mod tests {
             },
         )
         .expect("request is valid");
-        assert_eq!(
-            prepared.serve_request.scheduling.data_parallel_rank,
-            Some(7)
-        );
+        assert_eq!(prepared.input.scheduling.data_parallel_rank, Some(7));
     }
 
     #[test]
     fn prepare_chat_request_leaves_data_parallel_rank_none_when_absent() {
-        let prepared = prepare_chat_request(
-            base_request(),
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
-        assert_eq!(prepared.serve_request.scheduling.data_parallel_rank, None);
+        let prepared = prepared(base_request());
+        assert_eq!(prepared.input.scheduling.data_parallel_rank, None);
     }
 
     #[test]
@@ -996,17 +1024,10 @@ mod tests {
         let mut request = base_request();
         request.add_generation_prompt = Some(false);
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert_eq!(
-            chat_context(&prepared.serve_request)
-                .1
-                .generation_prompt_mode,
+            chat_context(&prepared.input).1,
             GenerationPromptMode::NoGenerationPrompt
         );
     }
@@ -1039,17 +1060,10 @@ mod tests {
         }];
         request.continue_final_message = true;
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert_eq!(
-            chat_context(&prepared.serve_request)
-                .1
-                .generation_prompt_mode,
+            chat_context(&prepared.input).1,
             GenerationPromptMode::ContinueFinalAssistant
         );
     }
@@ -1082,17 +1096,10 @@ mod tests {
             ..base_request()
         };
 
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
+        let prepared = prepared(request);
 
         assert_eq!(
-            chat_context(&prepared.serve_request)
-                .1
-                .generation_prompt_mode,
+            chat_context(&prepared.input).1,
             GenerationPromptMode::StartNewAssistant
         );
     }

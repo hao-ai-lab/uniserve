@@ -8,11 +8,11 @@ version = "0.1.0"
 description = "UniServe Python worker runtime with internal BAGEL and SenseNova backends. The Rust host/server is built with cargo."
 readme = "README.md"
 requires-python = ">=3.11"
-# torch/torchvision are pinned for source installs; in a container that already
-# provides them, use a `--system-site-packages` venv so they stay satisfied.
+# Keep the CUDA-13 PyTorch and torchvision release lines aligned. The locked
+# Linux wheels bring their matching NCCL and NVSHMEM runtime dependencies.
 dependencies = [
-    "torch>=2.8.0a0,<2.12",
-    "torchvision>=0.23.0a0,<0.27",
+    "torch>=2.13,<2.14",
+    "torchvision>=0.28,<0.29",
     "transformers>=4.57.1",
     "safetensors",
     "einops",

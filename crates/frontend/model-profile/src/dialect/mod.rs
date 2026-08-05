@@ -17,7 +17,6 @@ pub mod resolution;
 
 const BAGEL_PROFILE_JSON: &str = include_str!("../../profiles/bagel.json");
 const SENSENOVA_PROFILE_JSON: &str = include_str!("../../profiles/sensenova-u1.json");
-const THINKMORPH_PROFILE_JSON: &str = include_str!("../../profiles/thinkmorph.json");
 
 /// Protocol-neutral prompt inputs consumed by a generation dialect renderer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,7 +289,6 @@ fn profile_from_key(
 ) -> assets::Result<GenerationDialectProfile> {
     let json = match key {
         "sensenova-u1" => SENSENOVA_PROFILE_JSON,
-        "thinkmorph" => THINKMORPH_PROFILE_JSON,
         "bagel" => BAGEL_PROFILE_JSON,
         other => {
             return Err(AssetError::message(format!(
@@ -534,8 +532,6 @@ fn profile_key_from_model(model_ref: &str) -> assets::Result<Option<&'static str
     let lower = model_ref.to_ascii_lowercase();
     if lower.contains("sensenova") || lower.contains("neo_chat") || lower.contains("neo-unify") {
         Ok(Some("sensenova-u1"))
-    } else if lower.contains("thinkmorph") || lower.contains("think-morph") {
-        Ok(Some("thinkmorph"))
     } else if lower.contains("bagel") {
         Ok(Some("bagel"))
     } else {
@@ -567,13 +563,6 @@ fn profile_key_from_config(config: &Value) -> Option<&'static str> {
         })
     {
         return Some("sensenova-u1");
-    }
-    if model_type.contains("thinkmorph")
-        || architectures
-            .iter()
-            .any(|arch| arch.contains("thinkmorph") || arch.contains("think_morph"))
-    {
-        return Some("thinkmorph");
     }
     if model_type.contains("bagel") || architectures.iter().any(|arch| arch.contains("bagel")) {
         return Some("bagel");
@@ -1334,36 +1323,6 @@ mod tests {
         );
         assert_eq!(
             sensenova
-                .generation_policy
-                .feedback
-                .as_ref()
-                .map(|feedback| feedback.source.clone()),
-            Some(uniserve_core::FeedbackSource::DeviceProduct)
-        );
-
-        let thinkmorph = profile_from_key("thinkmorph", &tok).expect("ThinkMorph profile");
-        assert_eq!(
-            thinkmorph.image_ingest.steps,
-            vec![ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode]
-        );
-        assert!(matches!(
-            thinkmorph.generation_policy.trigger,
-            TriggerPolicyDescriptor::RoundCloseThenSuffix { .. }
-        ));
-        assert_eq!(
-            thinkmorph.generation_policy.gen_only_start,
-            GenOnlyStartPolicyDescriptor::Immediate
-        );
-        assert_eq!(
-            thinkmorph
-                .generation_policy
-                .feedback
-                .as_ref()
-                .map(|feedback| feedback.next_und_token),
-            Some(uniserve_core::FeedbackNextToken::Bos)
-        );
-        assert_eq!(
-            thinkmorph
                 .generation_policy
                 .feedback
                 .as_ref()

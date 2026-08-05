@@ -242,9 +242,10 @@ def _response_ready(response: Mapping[str, Any]) -> bool:
             response["call_id"] = call_id
             return True
     if isinstance(result, CompletionReport):
-        return not result.partitions or any(
-            partition_completion_ready(partition) for partition in result.partitions
-        )
+        for partition in result.partitions:
+            if partition_completion_ready(partition):
+                return True
+        return not result.partitions
     return True
 
 
