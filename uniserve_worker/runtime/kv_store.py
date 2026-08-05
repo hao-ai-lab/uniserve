@@ -994,6 +994,46 @@ class KvStore:
             self._branches[key] = entry
             return entry, True
 
+    def rebind_scratch_owner(self, source: ProductRef, target: ProductRef) -> None:
+        """Move branch KV ownership to a successor latent product."""
+
+        for owner in (source, target):
+            if (
+                owner.kind is not ProductKind.LATENT
+                or owner.storage_class is not StorageClass.LATENT_ARENA
+                or int(owner.generation) < 1
+            ):
+                raise invalid_descriptor("branch KV owner is not an exact latent product")
+        if source.request_key != target.request_key:
+            raise invalid_descriptor("branch KV ownership cannot cross request keys")
+        if source == target:
+            return
+        with self._lock:
+            moves = tuple(
+                (key, (target, key[1]), entry)
+                for key, entry in self._branches.items()
+                if key[0] == source
+            )
+            if any(target_key in self._branches for _source_key, target_key, _entry in moves):
+                raise invalid_descriptor("successor latent already owns branch KV state")
+            for source_key, target_key, entry in moves:
+                del self._branches[source_key]
+                self._branches[target_key] = entry
+
+    def release_scratch_owner(self, owner: ProductRef) -> None:
+        """Release every branch prefix owned by one exact latent product."""
+
+        if (
+            owner.kind is not ProductKind.LATENT
+            or owner.storage_class is not StorageClass.LATENT_ARENA
+            or int(owner.generation) < 1
+        ):
+            raise invalid_descriptor("branch KV owner is not an exact latent product")
+        with self._lock:
+            keys = tuple(key for key in self._branches if key[0] == owner)
+            for key in keys:
+                self._release_scratch(self._branches.pop(key).block_ids)
+
     def advance_entry(self, entry: KvEntry, tokens: int) -> None:
         pool = self.pool
         if pool is None:
@@ -2314,6 +2354,22 @@ class KvTxn:
             capacity_tokens=capacity_tokens,
             copy_conditioning=copy_conditioning,
         )
+
+    def rebind_scratch_owner(self, source: ProductRef, target: ProductRef) -> None:
+        self._require_open()
+        if int(source.request_key.session_id) not in self._session_ids:
+            raise RuntimeError("scratch KV source targets a session outside this step")
+        if int(target.request_key.session_id) not in self._session_ids:
+            raise RuntimeError("scratch KV target targets a session outside this step")
+        self._capture_auxiliary()
+        self._store.rebind_scratch_owner(source, target)
+
+    def release_scratch_owner(self, owner: ProductRef) -> None:
+        self._require_open()
+        if int(owner.request_key.session_id) not in self._session_ids:
+            raise RuntimeError("scratch KV owner targets a session outside this step")
+        self._capture_auxiliary()
+        self._store.release_scratch_owner(owner)
 
     def advance_entry(self, entry: KvEntry, tokens: int) -> None:
         self._require_open()

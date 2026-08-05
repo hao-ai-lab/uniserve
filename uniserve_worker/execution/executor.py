@@ -1047,8 +1047,10 @@ class _PendingDigest:
             return False
         if self._lease is None or not self._lease.ready():
             return False
-        task_readiness = tuple(task.ready() for task in self._completion_tasks)
-        return all(task_readiness)
+        for task in self._completion_tasks:
+            if not task.ready():
+                return False
+        return True
 
     def resolve(self) -> str:
         if self._value is None:
@@ -1166,11 +1168,10 @@ def _record_ready(record: CompletionRecord) -> bool:
     digest = record.semantic_digest
     if isinstance(digest, _PendingDigest):
         return digest.ready()
-    return all(
-        value.ready()
-        for value in cast(tuple[object, ...], record.committed_tokens)
-        if isinstance(value, _CompletionToken)
-    )
+    for value in cast(tuple[object, ...], record.committed_tokens):
+        if isinstance(value, _CompletionToken) and not value.ready():
+            return False
+    return True
 
 
 def _finalized_record(record: CompletionRecord) -> CompletionRecord:
@@ -1277,19 +1278,23 @@ def completion_report_ready(report: CompletionReport) -> bool:
     """True once every completion's deferred token/digest/artifact can be read
     without a stall."""
 
-    record_readiness = tuple(_record_ready(record) for record in report.completions)
-    payload_readiness = tuple(
-        _completion_payload_ready(product.payload) for product in report.products
-    )
-    return all(record_readiness) and all(payload_readiness)
+    for record in report.completions:
+        if not _record_ready(record):
+            return False
+    for product in report.products:
+        if not _completion_payload_ready(product.payload):
+            return False
+    return True
 
 
 def partition_completion_ready(partition: PartitionCompletion) -> bool:
-    record_readiness = tuple(_record_ready(record) for record in partition.completions)
-    payload_readiness = tuple(
-        _completion_payload_ready(product.payload) for product in partition.products
-    )
-    return all(record_readiness) and all(payload_readiness)
+    for record in partition.completions:
+        if not _record_ready(record):
+            return False
+    for product in partition.products:
+        if not _completion_payload_ready(product.payload):
+            return False
+    return True
 
 
 def _completion_payload_ready(payload: object) -> bool:
@@ -4772,6 +4777,11 @@ class ModelExecutor:
         if record.step != start_step or session.flow_step != start_step:
             raise invalid_descriptor("flow operation start step does not match committed state")
 
+        # A flow quantum publishes a new immutable latent generation. Carry the
+        # already-computed CFG branch prefixes forward under that exact successor
+        # owner instead of rebuilding them for every denoise step.
+        scope.kv.rebind_scratch_owner(latent_input, latent_output)
+
         schedule = FlowMatchSchedule(
             num_steps=int(image.steps),
             shift=float(
@@ -4811,7 +4821,7 @@ class ModelExecutor:
                 )
                 query = self._flow_physical_tokens(record.height, record.width)
                 entry, created = scope.kv.scratch_entry(
-                    latent_input,
+                    latent_output,
                     branch.value,
                     capacity_tokens=(
                         self.kv.get(session_id).length if copy_conditioning else len(prefix)
@@ -4878,6 +4888,8 @@ class ModelExecutor:
             )
         )
         session.latent_product = latent_output
+        if record.step == int(image.steps):
+            scope.kv.release_scratch_owner(latent_output)
         length = self.kv.get(session_id).length
         extents = self.kv.get(session_id).extents()
         return _Outcome(
@@ -6665,9 +6677,16 @@ def _sample_device_greedy_group(
         selection_broadcast(device_tokens)
     active = _sample_predicates(tasks, device_tokens.device)
     device_finish: torch.Tensor | None
+    empty_finish = grouped_publication and all(
+        not task.rows[0].force_finish and not task.rows[0].finish_token_ids for task in tasks
+    )
     if grouped_publication:
-        device_finish = _device_finish_values(tasks, device_tokens, valid & active)
-        continuation_values = active & valid & ~device_finish
+        if empty_finish:
+            device_finish = torch.zeros_like(valid, dtype=torch.bool)
+            continuation_values = active & valid
+        else:
+            device_finish = _device_finish_values(tasks, device_tokens, valid & active)
+            continuation_values = active & valid & ~device_finish
     else:
         device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
             tasks,
@@ -6682,7 +6701,7 @@ def _sample_device_greedy_group(
         valid,
         active,
         device_tokens,
-        torch.zeros_like(device_tokens),
+        device_finish if empty_finish else torch.zeros_like(device_tokens),
         completion,
     )
     tagged_tokens = _tagged_token_values(
@@ -7009,10 +7028,10 @@ def _capture_sample_span(
         raise RuntimeError("sampling completion vectors do not align")
     metadata = torch.cat(
         (
-            valid.reshape(-1).to(dtype=torch.long),
-            active.reshape(-1).to(dtype=torch.long),
-            tokens.reshape(-1).to(dtype=torch.long),
-            accepted.reshape(-1).to(dtype=torch.long),
+            valid.reshape(-1),
+            active.reshape(-1),
+            tokens.reshape(-1),
+            accepted.reshape(-1),
         )
     )
     if int(metadata.numel()) != SAMPLING_COMPLETION_FIELDS * count:
@@ -7106,13 +7125,13 @@ def _sample_predicates(
         packed = packed_tensor_views(predicates)
         if packed is None:
             packed = torch.cat(predicates, dim=0)
-        return packed.reshape(-1).bitwise_and(TOKEN_CONTINUATION_BIT).ne(0)
+        return packed.reshape(-1).ge(TOKEN_CONTINUATION_BIT)
     values = tuple(
         (
             torch.ones((1,), dtype=torch.bool, device=device)
             if task.predicate is None
             else (
-                task.predicate.reshape(-1)[:1].bitwise_and(TOKEN_CONTINUATION_BIT).ne(0)
+                task.predicate.reshape(-1)[:1].ge(TOKEN_CONTINUATION_BIT)
                 if task.tagged_predicate
                 else task.predicate.reshape(-1)[:1].to(device=device, dtype=torch.bool)
             )

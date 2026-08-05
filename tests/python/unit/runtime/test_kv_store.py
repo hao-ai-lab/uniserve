@@ -106,6 +106,35 @@ def test_scratch_branches_follow_exact_latent_product_ownership() -> None:
     assert pool.branch_blocks_available == 4
 
 
+def test_scratch_branches_rebind_to_a_successor_and_release_at_flow_end() -> None:
+    pool = _pool(layers=1, branch_blocks=4)
+    store = KvStore(pool)
+    request_key = _admit(store, 1, block_ids=(0,), prefix_len=0)
+    source = _latent_product(request_key, op_id=10, generation=7)
+    successor = _latent_product(request_key, op_id=11, generation=8)
+
+    entry, created = store.scratch_entry(
+        source,
+        "text",
+        capacity_tokens=3,
+        copy_conditioning=False,
+    )
+    store.rebind_scratch_owner(source, successor)
+    rebound, rebound_created = store.scratch_entry(
+        successor,
+        "text",
+        capacity_tokens=3,
+        copy_conditioning=False,
+    )
+
+    assert created
+    assert not rebound_created
+    assert rebound is entry
+    assert pool.branch_blocks_available == 2
+    store.release_scratch_owner(successor)
+    assert pool.branch_blocks_available == 4
+
+
 def test_committed_scratch_snapshot_restores_exact_latent_owner() -> None:
     pool = _pool(layers=1, branch_blocks=4)
     store = KvStore(pool)
