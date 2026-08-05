@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 from collections import OrderedDict
+from importlib import import_module
 from typing import Any, Protocol
 
 import torch
@@ -65,7 +66,7 @@ class _ComputePrefixBoundsVarlen(Protocol):
 _compute_prefix_bounds: _ComputePrefixBounds | None
 _compute_prefix_bounds_varlen: _ComputePrefixBoundsVarlen | None
 try:  # pragma: no cover - optional CUDA package.
-    from uniserve_kernel import mm_attn_varlen
+    mm_attn_varlen = import_module("uniserve_kernel.mm_attn_varlen")
 
     _fa4_flash_attn_fwd = mm_attn_varlen.flash_attn_fwd
     _compute_prefix_bounds = mm_attn_varlen.compute_prefix_bounds

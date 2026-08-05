@@ -6701,7 +6701,9 @@ def _sample_device_greedy_group(
         valid,
         active,
         device_tokens,
-        device_finish if empty_finish else torch.zeros_like(device_tokens),
+        cast(torch.Tensor, device_finish)
+        if empty_finish
+        else torch.zeros_like(device_tokens),
         completion,
     )
     tagged_tokens = _tagged_token_values(
