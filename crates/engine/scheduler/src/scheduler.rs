@@ -2462,12 +2462,11 @@ impl Scheduler {
     /// predecessor's not-yet-observed selected point.
     ///
     /// Such a successor roots on a device version reference (`Point::Device`).
-    /// It is safe only when the preceding sampled token cannot change the
-    /// scheduler-owned continuation. In particular, a Default/interleave
-    /// request may sample its direct Gen trigger: opening that branch is a
-    /// host-visible semantic decision, so it must observe the result before
-    /// registering another decode operation. A resolved, non-trigger token may
-    /// still use the normal device-product reuse path below.
+    /// The predecessor's tagged token product is the successor predicate.
+    /// Terminal tokens and direct image triggers clear its continuation bit, so
+    /// the worker resolves an already registered successor as a semantic no-op.
+    /// The host can then apply the sampled token's terminal or branch transition
+    /// without admitting an extra text token into that lineage.
     fn can_queue_decode_successor(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -2479,9 +2478,6 @@ impl Scheduler {
             || state.cancelled
             || self.pending_finishes.contains_key(&id)
             || self.custom_logits_processors > 0
-            // An image trigger changes the scheduler-owned phase, so its result
-            // must be observed before another decode is registered.
-            || state.req.behavior.gen_output
             || !matches!(state.lifecycle.phase, Phase::Prefill | Phase::DecodeUnd)
             || (state.lifecycle.phase == Phase::Prefill && state.starts_gen_after_context())
             || !Self::device_token_relay_eligible(state)
