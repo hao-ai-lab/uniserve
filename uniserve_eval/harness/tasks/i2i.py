@@ -1,42 +1,30 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
+from ..metrics.common import RequestRecord
+from ..validation import ValidationResult
 from .base import (
     BenchmarkTask,
     TaskRequest,
-    apply_chat_image_contract,
+    apply_chat_image_parameters,
+    image_integrity_checks,
     input_image_data_url,
-    uses_external_request_schema,
 )
 
 
 class I2ITask(BenchmarkTask):
-    """Image-to-image editing through non-streamed chat completions."""
-
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
-        image_config: dict[str, Any] = {}
-        max_images = item.get("max_images", self.spec.max_images)
-        if max_images is not None:
-            image_config["num_images"] = int(max_images)
         width = item.get("width", self.spec.width)
         height = item.get("height", self.spec.height)
+        image_config: dict[str, Any] = {"seed": int(item.get("seed", self.spec.seed))}
+        if self.spec.image_count is not None:
+            image_config["num_images"] = self.spec.image_count
         if width is not None and height is not None:
-            image_config["width"] = int(width)
-            image_config["height"] = int(height)
+            image_config.update(width=int(width), height=int(height))
         if self.spec.steps is not None:
-            image_config["steps"] = int(self.spec.steps)
-        image_config["seed"] = int(item.get("seed", self.spec.seed))
-        if self.spec.guidance_scale is not None:
-            image_config["guidance_scale"] = self.spec.guidance_scale
-        if self.spec.image_guidance_scale is not None:
-            image_config["image_guidance_scale"] = self.spec.image_guidance_scale
-        if self.spec.cfg_norm is not None:
-            image_config["cfg_norm"] = self.spec.cfg_norm
-        if self.spec.cfg_interval is not None:
-            image_config["cfg_interval"] = list(self.spec.cfg_interval)
-        if self.spec.timestep_shift is not None:
-            image_config["timestep_shift"] = self.spec.timestep_shift
+            image_config["steps"] = self.spec.steps
         payload: dict[str, Any] = {
             "model": self.spec.model,
             "modalities": ["image"],
@@ -45,10 +33,7 @@ class I2ITask(BenchmarkTask):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": item["prompt"]},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": input_image_data_url(item)},
-                        },
+                        {"type": "image_url", "image_url": {"url": input_image_data_url(item)}},
                     ],
                 }
             ],
@@ -56,11 +41,15 @@ class I2ITask(BenchmarkTask):
             "top_p": self.spec.top_p,
             "ignore_eos": self.spec.ignore_eos,
         }
-        apply_chat_image_contract(
-            payload,
-            image_config,
-            include_reference_aliases=uses_external_request_schema(self.spec),
-        )
-        if self.spec.extra_request_body:
-            payload.update(self.spec.extra_request_body)
-        return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="openai_chat_json")
+        apply_chat_image_parameters(payload, image_config)
+        payload.update(self.spec.extra_request_body)
+        return TaskRequest(self.spec.endpoint, payload, "openai_chat_json")
+
+    def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+        checks = image_integrity_checks(records, width=self.spec.width, height=self.spec.height)
+        checks["image_output"] = bool(records) and all(record.images > 0 for record in records)
+        if self.spec.image_count is not None:
+            checks["exact_image_count"] = all(
+                record.images == self.spec.image_count for record in records
+            )
+        return ValidationResult(checks=checks)

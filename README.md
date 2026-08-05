@@ -157,7 +157,7 @@ UNISERVE_RUN_GPU_E2E=1 \
 just test-python-gpu
 ```
 
-The serving benchmark protocol is documented in [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md), and the executable profile matrix is defined in [`uniserve_eval/profiles.json`](uniserve_eval/profiles.json).
+The serving benchmark protocol is documented in [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md), and the explicit evaluator points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
 ## Repository layout
 

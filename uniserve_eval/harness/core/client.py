@@ -18,11 +18,8 @@ from typing import Any, TypeGuard
 import httpx
 
 from ..image_outputs import (
-    ImageOutputContract,
     ImageOutputError,
     decode_openai_image_parts,
-    image_output_contract,
-    image_output_mismatch,
 )
 from ..metrics.common import RequestRecord
 from ..response_classifier import (
@@ -52,12 +49,6 @@ async def send_request(
     url = base_url.rstrip("/") + request.endpoint
     record = RequestRecord(request_id=request_id, task=task)
     record.requested_output_len = int(output_len_fallback)
-    image_contract = image_output_contract(payload, request_kind=request.kind, task=task)
-    record.image_output_mode = image_contract.mode
-    record.requested_image_count = image_contract.count
-    record.requested_image_count_is_cap = image_contract.count_is_cap
-    record.requested_image_width = image_contract.width
-    record.requested_image_height = image_contract.height
     record.scheduled_time = scheduled_time
     record.endpoint = request.endpoint
     record.start_time = time.perf_counter()
@@ -90,8 +81,6 @@ async def send_request(
         record.success = False
         record.classifier = "harness_or_transport_failure"
         record.error = f"{type(error).__name__}: {error}"
-    if record.success and record.image_output_mode == "optional" and record.images == 0:
-        record.warnings.append("no_generated_image")
     return record
 
 
@@ -347,7 +336,6 @@ def _parse_openai(
                     ),
                     "text_bytes": len(content.encode("utf-8")),
                     "image_count": len(images),
-                    "public_commit": event.get("public_commit"),
                 }
             )
         if content:
@@ -398,14 +386,7 @@ def _decode_record_images(parts: list[dict[str, Any]], record: RequestRecord) ->
         return error.classifier
     record.decoded_images = decoded
     record.images = len(decoded)
-    contract = ImageOutputContract(
-        mode=record.image_output_mode,
-        count=record.requested_image_count,
-        count_is_cap=record.requested_image_count_is_cap,
-        width=record.requested_image_width,
-        height=record.requested_image_height,
-    )
-    return image_output_mismatch(decoded, contract)
+    return None
 
 
 def _capture_cached_prompt_tokens(record: RequestRecord, payload: dict[str, Any]) -> None:

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..spec import BenchmarkSpec, TaskName
+from .beans import load_beans
 from .mjhq import load_mjhq
 from .pie_bench import load_pie_bench
 from .sharegpt import load_sharegpt
@@ -25,6 +26,7 @@ from .ueval import load_ueval
 __all__ = [
     "BenchmarkInputs",
     "load_benchmark_inputs",
+    "load_beans",
     "load_dataset_rows",
     "load_image_dir",
     "load_mjhq",
@@ -99,6 +101,14 @@ def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> l
 
     if dataset in _SYNTHETIC_IMAGE_ALIASES or (not dataset and spec.task == TaskName.I2T):
         return load_synthetic_images(spec.num_prompts, seed=spec.seed, question=spec.i2t_question)
+
+    if dataset == "beans":
+        return load_beans(
+            spec.num_prompts,
+            seed=spec.seed,
+            revision=spec.dataset_revision,
+            question=spec.i2t_question,
+        )
 
     if dataset == "image-dir":
         if not path:

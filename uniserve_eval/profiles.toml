@@ -1,0 +1,140 @@
+artifact_root = "artifacts/benchmark"
+
+[servers.qwen]
+host = "127.0.0.1"
+port = 18081
+command = ["target/release/uniserve", "serve", "${UNISERVE_QWEN3_MODEL}", "--model-description", "qwen3", "--served-model-name", "Qwen3-32B", "--host", "127.0.0.1", "--port", "18081", "--worker-python", ".venv/bin/python", "--max-total-tokens", "131072", "--max-running-requests", "128", "--max-num-batched-tokens", "16384", "--chunked-prefill-size", "16384", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--prefill-cuda-graph-warmup", "true"]
+
+[servers.qwen.environment]
+CUDA_VISIBLE_DEVICES = "0"
+
+[servers.sensenova]
+host = "127.0.0.1"
+port = 18082
+command = ["target/release/uniserve", "serve", "${UNISERVE_SENSENOVA_MODEL}", "--model-description", "sensenova", "--served-model-name", "SenseNova-U1", "--host", "127.0.0.1", "--port", "18082", "--worker-python", ".venv/bin/python", "--max-running-requests", "32", "--max-num-batched-tokens", "8192", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--prefill-cuda-graph-warmup", "true"]
+
+[servers.sensenova.environment]
+CUDA_VISIBLE_DEVICES = "0"
+
+[benchmarks.qwen-uniserve-sharegpt-r16]
+server = "qwen"
+task = "text"
+model = "Qwen3-32B"
+dataset = "sharegpt"
+dataset_revision = "192ab2185289094fc556ec8ce1e8e587154ca"
+tokenizer = "${UNISERVE_QWEN3_MODEL}"
+num_prompts = 200
+request_rate = 16.0
+warmup_requests = 1
+seed = 42
+temperature = 0.0
+top_p = 1.0
+top_k = 20
+min_p = 0.0
+repetition_penalty = 1.0
+frequency_penalty = 0.0
+presence_penalty = 0.0
+sampling_seed = 42
+ignore_eos = true
+
+[benchmarks.qwen-uniserve-sharegpt-r16.metrics]
+output_throughput = "higher"
+mean_ttft_ms = "lower"
+mean_tpot_ms = "lower"
+
+[benchmarks.sensenova-uniserve-i2t-c32]
+server = "sensenova"
+task = "i2t"
+model = "SenseNova-U1"
+dataset = "beans"
+dataset_revision = "27aa014ce09b193e1a6f58112d4a66e0eddb69c5"
+num_prompts = 32
+request_rate = inf
+max_concurrency = 32
+warmup_requests = 1
+seed = 42
+temperature = 0.0
+top_p = 1.0
+top_k = 1
+min_p = 0.0
+repetition_penalty = 1.0
+frequency_penalty = 0.0
+presence_penalty = 0.0
+sampling_seed = 42
+ignore_eos = false
+max_tokens = 8192
+wire = "openai_chat_json"
+
+[benchmarks.sensenova-uniserve-i2t-c32.metrics]
+output_throughput = "higher"
+
+[benchmarks.sensenova-uniserve-t2i-c32]
+server = "sensenova"
+task = "t2i"
+model = "SenseNova-U1"
+dataset = "mjhq"
+dataset_revision = "15b0a659e066e763d0e9a6cd8f00e25f8af5e084"
+num_prompts = 32
+request_rate = inf
+max_concurrency = 32
+warmup_requests = 1
+seed = 42
+temperature = 0.0
+top_p = 1.0
+width = 2048
+height = 1152
+steps = 50
+image_count = 1
+guidance_scale = 4.0
+image_guidance_scale = 1.0
+cfg_norm = "none"
+cfg_interval = [0.0, 1.0]
+timestep_shift = 3.0
+wire = "openai_chat_json"
+
+[benchmarks.sensenova-uniserve-t2i-c32.metrics]
+images_per_second = "higher"
+
+[benchmarks.sensenova-uniserve-interleave-c4]
+server = "sensenova"
+task = "interleave"
+model = "SenseNova-U1"
+dataset = "ueval"
+dataset_revision = "fdeac6654b113d20e7e89d496167a4a5bb55bc66"
+num_prompts = 32
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 1
+seed = 42
+temperature = 0.0
+top_p = 1.0
+top_k = 1
+min_p = 0.0
+repetition_penalty = 1.0
+frequency_penalty = 0.0
+presence_penalty = 0.0
+sampling_seed = 42
+ignore_eos = false
+max_tokens = 8192
+width = 2048
+height = 1152
+steps = 50
+minimum_average_images = 1.0
+guidance_scale = 4.0
+image_guidance_scale = 1.0
+cfg_norm = "none"
+cfg_interval = [0.0, 1.0]
+timestep_shift = 3.0
+wire = "openai_chat"
+
+[benchmarks.sensenova-uniserve-interleave-c4.metrics]
+mean_ttft_ms = "lower"
+mean_tpot_ms = "lower"
+"images.image_latency_ms.mean" = "lower"
+"modality_interleave.transition_latency_ms.mean" = "lower"
+"modality_interleave.text_to_image_latency_ms.mean" = "lower"
+"modality_interleave.image_to_text_latency_ms.mean" = "lower"
+
+[suites.decode-runtime]
+points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-c32", "sensenova-uniserve-t2i-c32", "sensenova-uniserve-interleave-c4"]
+max_regression = 0.05

@@ -1,12 +1,4 @@
-"""Single-operating-point benchmark runner.
-
-Loads the dataset, drives the warmup + timed region via the sglang-mirrored
-arrival engine, summarizes with the task's metric family, and writes
-``run.json`` / ``requests.jsonl`` / ``summary.json`` / ``summary.md``.
-
-One ``run()`` is exactly one operating point (one rate, one concurrency); sweeps
-are the CLI's job.
-"""
+"""Execute one benchmark point and write its raw result bundle."""
 
 from __future__ import annotations
 
@@ -24,21 +16,12 @@ from .core.client import send_request
 from .core.gpu_sampler import GpuMemorySampler
 from .datasets import load_benchmark_inputs
 from .metrics.common import RequestRecord
-from .report import (
-    attach_execution_contract,
-    benchmark_contract,
-    build_summary,
-    image_sample_collection_contract,
-    record_collection_contract,
-    render_markdown,
-    spec_to_dict,
-    write_summary_artifacts,
-)
+from .report import build_summary, render_markdown, selected_rows_identity
 from .spec import BenchmarkSpec
 from .tasks import TASKS
 
 
-@dataclass
+@dataclass(frozen=True)
 class RunResult:
     summary: dict[str, Any]
     output_dir: Path
@@ -50,68 +33,56 @@ class BenchmarkRunner:
         base_url: str,
         spec: BenchmarkSpec,
         output_dir: str | Path,
+        *,
+        provenance: dict[str, Any] | None = None,
         timeout_s: float = 6 * 60 * 60.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.spec = spec
-        self.writer = ArtifactWriter(output_dir)
+        self.output_dir = Path(output_dir)
+        self.provenance = provenance or {}
         self.timeout_s = timeout_s
         self.task = TASKS[spec.task.value](spec)
 
     async def run(self) -> RunResult:
-        for commit_marker in ("summary.json", "artifact_manifest.json", "summary.md"):
-            (self.writer.output_dir / commit_marker).unlink(missing_ok=True)
-        self.writer.clear_samples()
+        if self.output_dir.exists() and any(self.output_dir.iterdir()):
+            raise FileExistsError(f"result directory is not empty: {self.output_dir}")
         inputs = load_benchmark_inputs(self.spec)
         rows = inputs.measured
-        tokenizer = inputs.tokenizer
-        contract = benchmark_contract(self.spec, rows)
-
+        selection = selected_rows_identity(rows)
+        writer = ArtifactWriter(self.output_dir)
         started_at = time.time()
-        self.writer.write_json(
+        writer.write_json(
             "run.json",
             {
-                "harness_status": "running",
-                "spec": spec_to_dict(self.spec),
-                "base_url": self.base_url,
-                "items": len(rows),
+                "status": "running",
+                "benchmark": self.spec.name,
+                "workload": self.spec.workload_dict(),
+                "selected_rows": selection,
                 "started_at": started_at,
+                "provenance": self.provenance,
             },
         )
-        self.writer.write_jsonl("requests.jsonl", [])
-        self.writer.write_jsonl("gpu_samples.jsonl", [])
+        writer.write_jsonl("requests.jsonl", [])
+        writer.write_jsonl("gpu_samples.jsonl", [])
 
-        # Deterministic Poisson arrivals (matches sglang's np.random.seed(seed)).
         np.random.seed(self.spec.seed)
-
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
         async with httpx.AsyncClient(timeout=self.timeout_s, limits=limits) as client:
+
             async def submit(row: dict[str, Any]) -> RequestRecord:
                 return await self._submit(client, row)
-
-            async def warmup_submit(row: dict[str, Any]) -> RequestRecord:
-                record = await self._submit(client, row)
-                # A warmup that reached the server and terminated cleanly did
-                # its job even when a reasoning model produced no visible output.
-                if (
-                    not record.success
-                    and record.status_code == 200
-                    and record.classifier == "protocol_empty_output"
-                ):
-                    record.success = True
-                    record.classifier = "warmup_empty_output_ok"
-                return record
 
             sampler = GpuMemorySampler() if self.spec.sample_gpu_memory else None
             if sampler is not None:
                 sampler.start()
             try:
-                records, dur_s = await run_load(
+                records, duration = await run_load(
                     rows,
                     request_rate=self.spec.request_rate,
                     max_concurrency=self.spec.max_concurrency,
                     submit=submit,
-                    warmup_submit=warmup_submit,
+                    warmup_submit=submit,
                     warmup_requests=self.spec.warmup_requests,
                     warmup_rows=inputs.warmup,
                 )
@@ -124,54 +95,37 @@ class BenchmarkRunner:
             self.spec,
             self.base_url,
             records,
-            dur_s,
-            tokenizer=tokenizer,
+            duration,
+            task=self.task,
+            selected_rows=selection,
+            tokenizer=inputs.tokenizer,
             server_info=server_info,
-            contract=contract,
+            provenance=self.provenance,
         )
-        gpu_samples: list[dict[str, Any]] = []
+        gpu_samples = list(sampler.sample_records) if sampler is not None else []
         if sampler is not None:
             summary["gpu_memory"] = sampler.summary()
-            gpu_samples = list(sampler.sample_records)
-
         for record in records:
             for image in record.decoded_images:
-                self.writer.write_image_sample(image)
-        request_records = [record.record_dict() for record in records]
-        attach_execution_contract(
-            summary,
-            "request_records",
-            record_collection_contract(request_records),
-        )
-        attach_execution_contract(
-            summary,
-            "gpu_samples",
-            record_collection_contract(gpu_samples),
-        )
-        attach_execution_contract(
-            summary,
-            "image_samples",
-            image_sample_collection_contract(request_records),
-        )
-        self.writer.write_jsonl("requests.jsonl", request_records)
-        self.writer.write_jsonl("gpu_samples.jsonl", gpu_samples)
-        self.writer.write_json(
+                writer.write_image_sample(image)
+        writer.write_jsonl("requests.jsonl", [record.record_dict() for record in records])
+        writer.write_jsonl("gpu_samples.jsonl", gpu_samples)
+        writer.write_json("summary.json", summary)
+        (self.output_dir / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
+        writer.write_json(
             "run.json",
             {
-                "harness_status": "completed",
-                "artifact_valid": summary["artifact"]["valid"],
-                "spec": spec_to_dict(self.spec),
-                "base_url": self.base_url,
-                "items": len(rows),
+                "status": "completed",
+                "benchmark": self.spec.name,
+                "workload": self.spec.workload_dict(),
+                "selected_rows": selection,
                 "started_at": started_at,
                 "completed_at": time.time(),
+                "valid": summary["validation"]["valid"],
+                "provenance": self.provenance,
             },
         )
-        (self.writer.output_dir / "summary.md").write_text(
-            render_markdown(summary), encoding="utf-8"
-        )
-        write_summary_artifacts(self.writer.output_dir, summary)
-        return RunResult(summary=summary, output_dir=self.writer.output_dir)
+        return RunResult(summary, self.output_dir)
 
     async def _submit(self, client: httpx.AsyncClient, row: dict[str, Any]) -> RequestRecord:
         request = self.task.build_request(row)
@@ -195,11 +149,8 @@ class BenchmarkRunner:
         for endpoint in ("/server_info", "/get_server_info", "/model_info", "/version"):
             try:
                 response = await client.get(self.base_url + endpoint, timeout=15.0)
-                if response.status_code != 200:
-                    continue
-                payload = response.json()
-                if isinstance(payload, dict):
-                    return {"source_endpoint": endpoint, "payload": payload}
-            except Exception:  # noqa: BLE001 - try the next standard inspection endpoint.
+                if response.status_code == 200 and isinstance(payload := response.json(), dict):
+                    return {"endpoint": endpoint, "payload": payload}
+            except Exception:
                 continue
         return None

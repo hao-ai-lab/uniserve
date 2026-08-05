@@ -1,14 +1,11 @@
-"""Benchmark operating-point configuration.
-
-One :class:`BenchmarkSpec` describes exactly one operating point: task, dataset,
-request-arrival behavior, concurrency bound, and generation controls. The matrix
-runner creates one spec for each named load case.
-"""
+"""One explicit benchmark operating point."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+from typing import Any, Literal
 
 
 class TaskName(StrEnum):
@@ -19,20 +16,25 @@ class TaskName(StrEnum):
     INTERLEAVE = "interleave"
 
 
-# Streaming token metrics (Family A) vs image-speed metrics (Family B).
+MetricDirection = Literal["higher", "lower"]
+
+
+@dataclass(frozen=True)
+class MetricDefinition:
+    path: tuple[str, ...]
+    direction: MetricDirection
+
+    @property
+    def name(self) -> str:
+        return ".".join(self.path)
+
+    def as_dict(self) -> dict[str, str]:
+        return {"path": self.name, "direction": self.direction}
+
+
 STREAM_TASKS = frozenset({TaskName.TEXT, TaskName.I2T, TaskName.INTERLEAVE})
 IMAGE_TASKS = frozenset({TaskName.T2I, TaskName.I2I})
 
-# Wire = request/response shape used to exercise one task over one endpoint.
-#
-# * "openai_chat"       -> OpenAI chat completions SSE, streamed; per-chunk
-#                          timing (TTFT/ITL) and delta.images image counting
-# * "openai_chat_json"  -> OpenAI chat completions, one non-streamed JSON
-#                          response; E2E + counts only (diffusion-pipeline
-#                          backends such as vLLM-Omni, and image-only chat)
-# * "images_generations"-> OpenAI-style /v1/images/generations JSON
-#
-# Endpoint is derived from (task, wire) unless --endpoint overrides it.
 TASK_WIRES = {
     TaskName.TEXT: ("openai_chat",),
     TaskName.T2I: ("images_generations", "openai_chat_json"),
@@ -47,9 +49,6 @@ WIRE_ENDPOINTS = {
     "images_generations": "/v1/images/generations",
 }
 
-# Default real dataset backing each task. i2t defaults to deterministic
-# synthetic images so the comparison runs from a clean checkout with no
-# downloads; pass --dataset image-dir --dataset-path <dir> for real photos.
 DEFAULT_DATASETS = {
     TaskName.TEXT: "sharegpt",
     TaskName.T2I: "mjhq",
@@ -63,18 +62,18 @@ DEFAULT_DATASETS = {
 class BenchmarkSpec:
     task: TaskName
     model: str
+    name: str
+    metrics: tuple[MetricDefinition, ...]
+    server: str
     endpoint: str = ""
     dataset: str = ""
-    name: str = ""
 
-    # Load / arrival.
     num_prompts: int = 1000
     request_rate: float = float("inf")
     max_concurrency: int | None = None
     warmup_requests: int = 1
     seed: int = 42
 
-    # Text generation.
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
@@ -83,100 +82,75 @@ class BenchmarkSpec:
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
     sampling_seed: int | None = None
-    chat_template_kwargs: dict[str, object] = field(default_factory=dict)
     ignore_eos: bool = True
-    max_tokens: int | None = None  # output cap; ShareGPT uses per-row output_len when None.
+    max_tokens: int | None = None
 
-    # Image generation.
     width: int | None = None
     height: int | None = None
     steps: int | None = None
-    denoise_updates: int | None = None
-    max_images: int | None = None
+    image_count: int | None = None
+    minimum_average_images: float | None = None
     guidance_scale: float | None = None
     image_guidance_scale: float | None = None
     cfg_norm: str | None = None
     cfg_interval: tuple[float, float] | None = None
     timestep_shift: float | None = None
-    image_think: bool | None = None
-    image_t_eps: float | None = None
 
-    # Request/response shape for this task; see TASK_WIRES. Empty selects the
-    # task's first (default) wire.
     wire: str = ""
     i2t_question: str = "Describe this image in detail."
-
-    # Harness-side GPU memory sampling (nvidia-smi poll) during the timed
-    # region; backend-agnostic so both servers are measured identically.
     sample_gpu_memory: bool = True
-
-    # Tokenizer (ShareGPT length shaping + retokenized cross-check).
     tokenizer: str | None = None
-
-    # ShareGPT shaping.
     sharegpt_context_len: int | None = None
     sharegpt_output_len: int | None = None
-
-    # Dataset access: local file/dir override (else HF auto-download).
     dataset_path: str | None = None
     dataset_revision: str | None = None
-
-    # Per-request body extras (rarely needed).
-    extra_request_body: dict = field(default_factory=dict)
-
-    # Formal measurement contract and artifact provenance.
-    runtime_profile_id: str = "unspecified"
-    measurement_interface: str = "public_protocol_adapter"
-    cache_read_policy: str = "enabled"
-    cache_write_policy: str = "enabled"
-    adapter_selection: str = "base"
-    structured_output_policy: str = "none"
-    output_constraint: str = "default"
-    preprocessing: str = "dataset_default"
-    measured_runs: int = 1
-    server_topology: str = "single_server"
-    request_schema: str = "uniserve"
-    acceptance_min_success: int = 1
-    acceptance_max_failed: int = 0
-    acceptance_min_images_per_success: float = 0.0
+    extra_request_body: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task", TaskName(self.task))
         if self.num_prompts < 1:
             raise ValueError("num_prompts must be positive")
+        if self.request_rate <= 0 or math.isnan(self.request_rate):
+            raise ValueError("request_rate must be positive")
+        if self.max_concurrency is not None and self.max_concurrency < 1:
+            raise ValueError("max_concurrency must be positive")
+        if self.warmup_requests < 0:
+            raise ValueError("warmup_requests must be non-negative")
         if not self.wire:
             object.__setattr__(self, "wire", TASK_WIRES[self.task][0])
         if self.wire not in TASK_WIRES[self.task]:
             supported = ", ".join(TASK_WIRES[self.task])
             raise ValueError(
-                f"task {self.task.value} does not support wire {self.wire!r}; expected one of: {supported}"
+                f"task {self.task.value} does not support wire {self.wire!r}; expected: {supported}"
             )
         if not self.endpoint:
             object.__setattr__(self, "endpoint", WIRE_ENDPOINTS[self.wire])
         if not self.dataset:
             object.__setattr__(self, "dataset", DEFAULT_DATASETS[self.task])
-        if not self.name:
-            object.__setattr__(self, "name", f"{self.model}_{self.task.value}_{self.dataset}")
+        if not self.metrics:
+            raise ValueError("a benchmark point must protect at least one metric")
         if self.cfg_interval is not None and len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain exactly two values")
-        if self.denoise_updates is not None:
-            if self.denoise_updates < 1:
-                raise ValueError("denoise_updates must be positive")
-            if self.steps is None:
-                raise ValueError("denoise_updates requires a backend steps value")
-        if self.measured_runs != 1:
-            raise ValueError("one harness invocation is exactly one measured run")
-        if self.request_schema not in {"uniserve", "sglang", "vllm_omni"}:
-            raise ValueError("unsupported request schema")
-        if (
-            self.acceptance_min_success < 1
-            or self.acceptance_max_failed < 0
-            or self.acceptance_min_images_per_success < 0
-        ):
-            raise ValueError(
-                "acceptance criteria must require success and a non-negative failure bound"
-            )
+        if self.steps is not None and self.steps < 1:
+            raise ValueError("steps must be positive")
+        if self.image_count is not None and self.image_count < 1:
+            raise ValueError("image_count must be positive")
+        if self.minimum_average_images is not None and self.minimum_average_images < 0:
+            raise ValueError("minimum_average_images must be non-negative")
+        if self.task == TaskName.T2I and self.image_count is None:
+            raise ValueError("t2i requires image_count")
+        if self.task == TaskName.INTERLEAVE and self.image_count is not None:
+            raise ValueError("interleave does not declare a per-request image count")
+        if self.task != TaskName.INTERLEAVE and self.minimum_average_images is not None:
+            raise ValueError("minimum_average_images is only valid for interleave")
 
     @property
     def is_stream_task(self) -> bool:
         return self.task in STREAM_TASKS
+
+    def workload_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["task"] = self.task.value
+        value["metrics"] = [metric.as_dict() for metric in self.metrics]
+        value["request_rate"] = "inf" if math.isinf(self.request_rate) else self.request_rate
+        return value

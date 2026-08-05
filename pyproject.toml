@@ -75,7 +75,7 @@ uniserve-eval = "uniserve_eval.cli:main"
 include = ["uniserve_worker*", "uniserve_eval*"]
 
 [tool.setuptools.package-data]
-uniserve_eval = ["profiles.json", "data/*.jsonl", "harness/schemas/*.json"]
+uniserve_eval = ["profiles.toml", "data/*.jsonl"]
 
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]

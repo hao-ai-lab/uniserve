@@ -1,184 +1,201 @@
-"""Profile-driven serving evaluation: launch servers and run correctness gates.
-
-Concepts:
-  server   = how to launch one serving backend topology
-  workload = what to run against a compatible launched server
-             (verify = correctness gates over public chat completions,
-              script = a generic repo-script escape hatch)
-  suite    = ordered workload names for a broader pass
-
-Examples:
-  uniserve-eval list
-  uniserve-eval launch gate/server/sensenova
-  uniserve-eval verify gate/sensenova/default-travel
-  uniserve-eval run gate/all --manage-servers
-
-Benchmark measurement points are a separate path: see
-``scripts/run_benchmarks.py`` and ``docs/benchmark-protocol.md``.
-"""
+"""Run and compare explicit public-protocol serving benchmarks."""
 
 from __future__ import annotations
 
 import argparse
-import subprocess
+import asyncio
+import fcntl
+import json
+import os
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
-from . import backends, verify
+from .backends import ManagedServer
+from .harness.comparison import (
+    compare_suite,
+)
+from .harness.comparison import (
+    render_markdown as render_comparison,
+)
+from .harness.provenance import collect_provenance
+from .harness.runner import BenchmarkRunner
 from .profiles import (
     DEFAULT_CONFIG,
-    ROOT,
     load_config,
-    merged_env,
-    resolve_server_for_workload,
-    server_spec,
-    suite_spec,
-    workload_spec,
+    require_resolved,
+    server_command,
 )
-
-
-def run_script_workload(args: argparse.Namespace) -> None:
-    """Generic escape hatch: run ``python <script> <args>`` from the repo root."""
-    config = load_config(args.config)
-    workload = workload_spec(config, args.workload)
-    if workload.get("type") != "script":
-        raise SystemExit(f"workload {args.workload!r} is not type=script")
-    script = workload.get("script")
-    if not script:
-        raise SystemExit(f"script workload {args.workload!r} has no script")
-    cmd = [str(ROOT / config.get("python", ".venv/bin/python")), str(ROOT / script)]
-    cmd.extend(str(part) for part in workload.get("args", []))
-    print("script:", " ".join(cmd))
-    subprocess.check_call(cmd, cwd=ROOT, env=merged_env(workload))
-    expected = workload.get("expect_file")
-    if expected and not (ROOT / str(expected)).exists():
-        raise SystemExit(f"expected script artifact does not exist: {expected}")
-
-
-def _clean_server_for_suite(config_path: Path, server: str, grace_s: float) -> None:
-    backends.clean(argparse.Namespace(config=config_path, server=server, all=False, grace_s=grace_s))
-
-
-def _launch_server_for_suite(config_path: Path, server: str, timeout_s: float) -> None:
-    backends.launch(
-        argparse.Namespace(
-            config=config_path,
-            server=server,
-            foreground=False,
-            wait=True,
-            timeout_s=timeout_s,
-        )
-    )
-
-
-def _run_workload(args: argparse.Namespace, workload_name: str) -> None:
-    workload = workload_spec(load_config(args.config), workload_name)
-    sub = argparse.Namespace(config=args.config, workload=workload_name, server=args.server)
-    sub.output_dir = None
-    kind = workload.get("type")
-    if kind == "verify":
-        verify.verify(sub)
-    elif kind == "script":
-        run_script_workload(sub)
-    else:
-        raise SystemExit(f"unsupported workload type for {workload_name!r}: {kind}")
-
-
-def run_suite(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
-    suite = suite_spec(config, args.suite)
-    for workload_name in suite["workloads"]:
-        workload = workload_spec(config, workload_name)
-        manage_server = bool(args.manage_servers or workload.get("manage_server"))
-        server_name = None
-        if workload.get("type") == "verify":
-            server_name, _ = resolve_server_for_workload(config, workload, args.server)
-        if manage_server and server_name:
-            _clean_server_for_suite(args.config, server_name, args.clean_grace_s)
-            _launch_server_for_suite(args.config, server_name, args.launch_timeout_s)
-            try:
-                _run_workload(args, workload_name)
-            finally:
-                _clean_server_for_suite(args.config, server_name, args.clean_grace_s)
-        else:
-            _run_workload(args, workload_name)
 
 
 def list_items(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    sections = [args.section] if args.section != "all" else ["servers", "workloads", "suites"]
-    for section in sections:
-        print(f"[{section}]")
-        if section == "servers":
-            for name, spec in sorted(config.get("servers", {}).items()):
-                resolved = server_spec(config, name)
-                if resolved.get("abstract"):
-                    continue
-                line = f"{name}\t{resolved.get('served_model_name', '')}\t{resolved.get('host', '')}:{resolved.get('port', '')}"
-                if resolved.get("description"):
-                    line += f"\n\t{resolved['description']}"
-                print(line)
-        elif section == "workloads":
-            for name, spec in sorted(config.get("workloads", {}).items()):
-                line = f"{name}\t{spec.get('type', '')}\tserver={spec.get('server', '-')}"
-                if spec.get("description"):
-                    line += f"\n\t{spec['description']}"
-                print(line)
-        elif section == "suites":
-            for name in sorted(config.get("suites", {})):
-                suite = suite_spec(config, name)
-                print(f"{name}\t{','.join(suite['workloads'])}")
-        else:
-            raise SystemExit(f"unknown list section {section!r}")
+    if args.section in {"all", "servers"}:
+        print("[servers]")
+        for name, server in config.servers.items():
+            print(f"{name}\t{server.base_url}")
+    if args.section in {"all", "benchmarks"}:
+        print("[benchmarks]")
+        for name, point in config.benchmarks.items():
+            print(f"{name}\t{point.task.value}\tserver={point.server}")
+    if args.section in {"all", "suites"}:
+        print("[suites]")
+        for name, suite in config.suites.items():
+            print(f"{name}\t{','.join(suite.points)}")
+
+
+def plan(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    points = config.selected_points(args.selection)
+    rendered = []
+    for point in points:
+        server = config.servers[point.server]
+        command = server_command(server, args.executable)
+        rendered.append(
+            {
+                "benchmark": point.name,
+                "task": point.task.value,
+                "server_command": list(command),
+                "base_url": server.base_url,
+                "dataset": point.dataset,
+                "num_prompts": point.num_prompts,
+                "request_rate": "inf" if point.request_rate == float("inf") else point.request_rate,
+                "max_concurrency": point.max_concurrency,
+                "metrics": [metric.as_dict() for metric in point.metrics],
+            }
+        )
+    print(json.dumps(rendered, indent=2))
+
+
+def run(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    output_root = args.output_root or config.artifact_root
+    points = config.selected_points(args.selection)
+    failures = 0
+    with _host_lock():
+        for point in points:
+            server = config.servers[point.server]
+            command = server_command(server, args.executable)
+            require_resolved(command, context=f"server {server.name}")
+            require_resolved(point.workload_dict(), context=f"benchmark {point.name}")
+            point_dir = output_root / point.name
+            log_path = output_root / "server-logs" / f"{point.name}.log"
+            provenance = collect_provenance(command, server.environment)
+            with _environment(server.environment):
+                with ManagedServer(server, command, log_path, timeout_s=args.launch_timeout_s):
+                    result = asyncio.run(
+                        BenchmarkRunner(
+                            server.base_url,
+                            point,
+                            point_dir,
+                            provenance=provenance,
+                            timeout_s=args.request_timeout_s,
+                        ).run()
+                    )
+            print(
+                f"{point.name}: {'pass' if result.summary['validation']['valid'] else 'fail'} "
+                f"({result.summary['ok_count']}/{result.summary['request_count']} requests)"
+            )
+            if result.summary["validation"]["valid"] is not True:
+                failures += 1
+                break
+    if failures:
+        raise SystemExit(2)
+
+
+def compare(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    points = config.selected_points(args.selection)
+    suite = config.suites.get(args.selection)
+    max_regression = args.max_regression
+    if max_regression is None:
+        max_regression = suite.max_regression if suite is not None else None
+    if max_regression is None:
+        raise ValueError("comparison requires --max-regression or a suite threshold")
+    report = compare_suite(
+        args.reference_root,
+        args.candidate_root,
+        [point.name for point in points],
+        max_regression=max_regression,
+    )
+    markdown = render_comparison(report)
+    print(markdown, end="")
+    if args.output_dir is not None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "comparison.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (args.output_dir / "comparison.md").write_text(markdown, encoding="utf-8")
+    if report["passed"] is not True:
+        raise SystemExit(2)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uniserve-eval", description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("list")
-    p.add_argument("section", nargs="?", choices=["all", "servers", "workloads", "suites"], default="all")
-    p.set_defaults(func=list_items)
+    command = subparsers.add_parser("list")
+    command.add_argument(
+        "section",
+        nargs="?",
+        choices=("all", "servers", "benchmarks", "suites"),
+        default="all",
+    )
+    command.set_defaults(function=list_items)
 
-    p = sub.add_parser("launch")
-    p.add_argument("server")
-    p.add_argument("--foreground", action="store_true")
-    p.add_argument("--wait", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--timeout-s", type=float, default=1800)
-    p.set_defaults(func=backends.launch)
+    command = subparsers.add_parser("plan")
+    command.add_argument("selection")
+    command.add_argument("--executable", type=Path)
+    command.set_defaults(function=plan)
 
-    p = sub.add_parser("verify")
-    p.add_argument("workload")
-    p.add_argument("--server", help="override workload server")
-    p.add_argument("--output-dir", type=Path, help="immutable output directory for this invocation")
-    p.set_defaults(func=verify.verify)
+    command = subparsers.add_parser("run")
+    command.add_argument("selection")
+    command.add_argument("--executable", type=Path)
+    command.add_argument("--output-root", type=Path)
+    command.add_argument("--launch-timeout-s", type=float, default=1800)
+    command.add_argument("--request-timeout-s", type=float, default=6 * 60 * 60)
+    command.set_defaults(function=run)
 
-    p = sub.add_parser("script")
-    p.add_argument("workload")
-    p.add_argument("--server", help="accepted for CLI symmetry; script workloads own their target")
-    p.set_defaults(func=run_script_workload)
-
-    p = sub.add_parser("run")
-    p.add_argument("suite")
-    p.add_argument("--server", help="override every workload server")
-    p.add_argument("--manage-servers", action="store_true", help="launch/clean each workload server")
-    p.add_argument("--launch-timeout-s", type=float, default=1800)
-    p.add_argument("--clean-grace-s", type=float, default=3)
-    p.set_defaults(func=run_suite)
-
-    p = sub.add_parser("clean")
-    p.add_argument("server", nargs="?")
-    p.add_argument("--all", action="store_true")
-    p.add_argument("--grace-s", type=float, default=3)
-    p.set_defaults(func=backends.clean)
+    command = subparsers.add_parser("compare")
+    command.add_argument("selection")
+    command.add_argument("--reference-root", type=Path, required=True)
+    command.add_argument("--candidate-root", type=Path, required=True)
+    command.add_argument("--max-regression", type=float)
+    command.add_argument("--output-dir", type=Path)
+    command.set_defaults(function=compare)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if getattr(args, "cmd", None) == "clean" and not args.all and not args.server:
-        raise SystemExit("clean requires a server or --all")
-    args.func(args)
+    args.function(args)
+
+
+@contextmanager
+def _host_lock() -> Iterator[None]:
+    path = Path("/tmp/uniserve-eval.lock")
+    with path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("another uniserve-eval process holds the host lock") from error
+        yield
+
+
+@contextmanager
+def _environment(values: dict[str, str]) -> Iterator[None]:
+    previous: dict[str, str | None] = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 if __name__ == "__main__":

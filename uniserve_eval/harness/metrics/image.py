@@ -25,10 +25,9 @@ def summarize_image(records: list[RequestRecord], dur_s: float) -> dict[str, Any
         if r.image_latencies:
             image_latencies.extend(r.image_latencies)
             total_images += len(r.image_latencies)
-        else:
-            # Non-streaming t2i: the request E2E is the image latency.
-            image_latencies.append(r.latency)
-            total_images += max(1, r.images)
+        elif r.images:
+            image_latencies.extend([r.latency] * r.images)
+            total_images += r.images
 
     dur_s = dur_s if dur_s > 0 else 1e-9
 

@@ -2,8 +2,8 @@
 
 The timed region matches SGLang's ``benchmark()``:
 
-1. ``warmup_requests`` warmup requests are sent first (output capped) and their
-   results discarded. If every warmup fails we raise -- the run is misconfigured.
+1. ``warmup_requests`` warmup requests are sent first with the configured workload and
+   their results discarded. If every warmup fails we raise -- the run is misconfigured.
 2. ``await asyncio.sleep(1.0)`` -- the same fixed settle before timing starts.
 3. ``benchmark_start_time = perf_counter()``.
 4. Requests arrive via ``get_request`` (Poisson when ``request_rate`` is finite,

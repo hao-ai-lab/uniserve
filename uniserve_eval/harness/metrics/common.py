@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from ..image_outputs import DecodedImage, ImageOutputMode
+from ..image_outputs import DecodedImage
 
 
 @dataclass
@@ -76,11 +76,6 @@ class RequestRecord:
     image_gen_seconds: list[float] = field(default_factory=list)
     image_steps: list[int] = field(default_factory=list)
     image_spans: list[dict[str, Any]] = field(default_factory=list)
-    image_output_mode: ImageOutputMode = "none"
-    requested_image_count: int | None = None
-    requested_image_count_is_cap: bool = False
-    requested_image_width: int | None = None
-    requested_image_height: int | None = None
     # Exact response bytes live only for the duration of the harness process.
     # ``record_dict`` emits compact metadata and the runner writes the bytes to
     # content-addressed files under ``samples/``.
@@ -176,7 +171,6 @@ class RequestRecord:
                     "modalities": list(event.get("modalities", [])),
                     "text_bytes": int(event.get("text_bytes", 0)),
                     "image_count": int(event.get("image_count", 0)),
-                    "public_commit": event.get("public_commit"),
                     "client_offset_ms": (
                         (float(event["client_time"]) - self.start_time) * 1000.0
                         if isinstance(event.get("client_time"), (int, float))
@@ -187,11 +181,6 @@ class RequestRecord:
                 for event in self.modality_events
             ],
             "images": self.images,
-            "image_output_mode": self.image_output_mode,
-            "requested_image_count": self.requested_image_count,
-            "requested_image_count_is_cap": self.requested_image_count_is_cap,
-            "requested_image_width": self.requested_image_width,
-            "requested_image_height": self.requested_image_height,
             "image_outputs": [image.metadata_dict() for image in self.decoded_images],
             "first_image_latency_ms": (
                 self.first_image_latency * 1000.0 if self.first_image_latency is not None else None

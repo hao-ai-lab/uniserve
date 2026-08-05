@@ -11,6 +11,7 @@ with a ``prompt``/``question`` field); otherwise the HF dataset is loaded via
 """
 from __future__ import annotations
 
+import importlib
 import json
 import random
 from pathlib import Path
@@ -70,7 +71,7 @@ def _load_hf(
     hf_repo: str, split: str | None, revision: str | None
 ) -> list[dict[str, Any]]:
     try:
-        from datasets import load_dataset
+        load_dataset = getattr(importlib.import_module("datasets"), "load_dataset")
     except ImportError as error:  # pragma: no cover - environment dependent
         raise ImportError(
             "loading UEval from the Hugging Face hub requires the 'datasets' "

@@ -1,65 +1,28 @@
 # Serving evaluation
 
-`uniserve_eval` provides profile-driven correctness checks, serving workloads, and cross-runtime benchmark comparisons. [`uniserve_eval/profiles.json`](../uniserve_eval/profiles.json) is the executable configuration, and [`benchmark-protocol.md`](benchmark-protocol.md) defines the benchmark semantics.
+`uniserve-eval` provides a small workflow for public-protocol performance evaluation: plan explicit TOML points, run them serially, and compare matched result bundles offline. The detailed command and measurement semantics are documented in [`benchmark-protocol.md`](benchmark-protocol.md).
 
-## Benchmark entry
-
-Run the configured 46-point matrix through one command:
-
-```bash
-.venv/bin/python scripts/run_benchmarks.py \
-  --benchmark main \
-  --output-root artifacts/benchmark
-```
-
-Select complete backend groups with `--only`, inspect generated commands with `--dry-run --no-build`, or continue a partially completed root with `--resume`. `--repeat N` wraps the selected matrix in serial child runs. `--text-canary` and `--image-smoke` add optional numerical diagnostics.
-
-`--formal` enables the repository, hardware, revision, process, GPU, build, and execution-identity checks defined by the canonical profile. It requires an explicit empty output root and complete comparison pairs.
-
-## Execution model
-
-The runner holds a host-wide lock. Each matrix point starts a fresh server, launches one harness against it, stops the server, validates the resulting artifact, and only then advances to the next point. Backend groups, workload points, load cases, and repeated matrices are never run concurrently.
-
-The runner writes `COMMANDS.md`, point-local artifacts, server logs and snapshots, `results.json`, and `results.md` beneath the selected root. Candidate/reference ratios are reported only when both point artifacts exist and their parity and task work checks pass.
-
-## Configuration
-
-| Section | Contents |
-| --- | --- |
-| `shared` | Environment-variable descriptions |
-| `servers` | UniServe and reference launch specifications |
-| `workloads` | Correctness gates |
-| `suites` | Ordered workload collections |
-| `benchmarks` | Workload points, backend roles, named load cases, datasets, and hardware requirements |
-
-Server profiles either declare a UniServe model plus `serve_args` or an explicit reference command. Environment variables expand at launch, unresolved required values fail before execution, and inherited server lists represent complete effective values.
-
-The main matrix uses these environment variables where applicable:
-
-- `UNISERVE_QWEN3_MODEL`
-- `UNISERVE_SENSENOVA_MODEL`
-- `UNISERVE_BAGEL_MODEL`
-- `UNISERVE_SGLANG_PYTHON`
-- `UNISERVE_OMNI_VLLM`
-- `UNISERVE_BENCH_CUDA_VISIBLE_DEVICES`
-
-## Artifact integrity
-
-Each harness point retains normalized request records, GPU samples, summary, manifest, command, log, and process snapshots. Generated images use content-addressed files bound to request metadata. Matrix artifacts also bind the active profile definition, named load case, selected rows, normalized request semantics, server and harness execution identity, model content, source revision where declared, selected accelerator, and support files.
-
-Only complete canonical artifacts are included in `results.json`. Interrupted, failed, or structurally inconsistent points remain in their point directories for diagnosis and are not incorporated into comparisons.
-
-## Focused checks
-
-The `uniserve-eval` command runs focused correctness gates:
+## Inspect available work
 
 ```bash
 uniserve-eval list
-uniserve-eval launch gate/server/sensenova
-uniserve-eval verify gate/sensenova/default-travel --output-dir artifacts/eval/sensenova/default-travel
-uniserve-eval run gate/all --manage-servers
+uniserve-eval plan decode-runtime
 ```
 
-An explicit verification output directory is immutable: the command refuses to replace an existing directory. These checks provide implementation feedback and are separate from the benchmark matrix.
+The plan is the complete execution set. Selecting one point runs only that point; selecting a suite runs its listed points in order.
 
-Correctness gates require an error-free terminal response, validate every decoded image and its declared dimensions, and verify the observed denoising-step count for each completed image. The configured image count is reported as an expectation warning because the generated answer may choose a different number of images. OpenAI's `[DONE]` SSE sentinel is retained as transport metadata but is not a model-result acceptance condition.
+## Measure and compare
+
+```bash
+uniserve-eval run decode-runtime --executable /path/to/reference/uniserve --output-root /results/reference
+uniserve-eval run decode-runtime --executable /path/to/candidate/uniserve --output-root /results/candidate
+uniserve-eval compare decode-runtime --reference-root /results/reference --candidate-root /results/candidate --output-dir /results/comparison
+```
+
+The evaluator refuses to overwrite a non-empty point directory. Validation and comparison read completed bundles and require no running server or GPU.
+
+## Extending evaluation
+
+Add a server command and one explicit benchmark table to [`uniserve_eval/profiles.toml`](../uniserve_eval/profiles.toml). A benchmark selects an existing task implementation, whose public request construction and observable output validation form one polymorphic boundary. Shared transport and metric code do not contain model-specific output rules.
+
+Protected metrics are a TOML mapping from summary paths to `higher` or `lower`. A suite is an ordered list of benchmark names with an optional maximum regression.

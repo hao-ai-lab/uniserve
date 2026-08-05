@@ -18,7 +18,7 @@ from tests.python.e2e.http_helpers import (
     tiny_input_png_b64,
 )
 from uniserve_eval.harness.runner import BenchmarkRunner
-from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
+from uniserve_eval.harness.spec import BenchmarkSpec, MetricDefinition, TaskName
 
 pytestmark = [pytest.mark.e2e]
 
@@ -433,18 +433,19 @@ def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
             name="sensenova_interleave_contract",
             task=TaskName.INTERLEAVE,
             model="SenseNova-U1",
+            server="test",
+            metrics=(MetricDefinition(("mean_ttft_ms",), "lower"),),
             dataset="trace",
             dataset_path=str(trace_path),
             num_prompts=1,
             warmup_requests=0,
             max_tokens=8,
-            max_images=1,
+            minimum_average_images=1.0,
             extra_request_body={"logit_bias": {str(image_start_id): 100.0}},
-            runtime_profile_id="sensenova-u1",
         )
         result = asyncio.run(BenchmarkRunner(base_url, spec, tmp_path / "bench").run())
-        assert result.summary["harness_status"] == "completed"
+        assert result.summary["status"] == "completed"
         assert result.summary["failed_count"] == 0
         assert result.summary["ok_count"] == 1
-        assert result.summary["artifact"]["valid"] is True
+        assert result.summary["validation"]["valid"] is True
         assert (tmp_path / "bench" / "summary.json").exists()
