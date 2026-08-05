@@ -11,13 +11,10 @@ use crate::chat::output::FinishReason;
 use crate::chat::output::error::Result;
 use crate::chat::output::event::{AssistantBlockKind, ChatEvent};
 
-mod default;
-mod harmony;
+mod qwen3;
 mod structured;
 
-pub use default::DefaultChatOutputProcessor;
-pub use harmony::HarmonyChatOutputProcessor;
-pub use harmony::validate_harmony_parser_overrides;
+pub use qwen3::Qwen3ChatOutputProcessor;
 
 /// Internal assistant event before final assembly.
 ///
@@ -60,71 +57,10 @@ pub(crate) enum AssistantEvent {
     },
 }
 
-impl ContentEvent {
-    /// Convert a [`DecodedTextEvent`] into one or more [`ContentEvent`] values
-    /// by treating all text as plain (non-reasoning) content.
-    fn from_decoded_plain_text(event: DecodedTextEvent) -> Vec<Self> {
-        match event {
-            DecodedTextEvent::Start {
-                prompt_token_ids,
-                prompt_logprobs,
-                queued_at,
-                scheduled_at,
-            } => vec![Self::Start {
-                prompt_token_ids,
-                prompt_logprobs,
-                queued_at,
-                scheduled_at,
-            }],
-            DecodedTextEvent::TextDelta {
-                delta,
-                token_ids,
-                logprobs,
-                finished,
-                ..
-            } => {
-                let mut events = Vec::new();
-                if !delta.is_empty() {
-                    events.push(Self::TextDelta {
-                        kind: AssistantBlockKind::Text,
-                        delta,
-                    });
-                }
-                if logprobs.is_some() || !token_ids.is_empty() {
-                    events.push(Self::LogprobsDelta {
-                        logprobs,
-                        token_ids,
-                    });
-                }
-                if let Some(finished) = finished {
-                    events.push(Self::Done {
-                        prompt_token_count: finished.prompt_token_count,
-                        output_token_count: finished.output_token_count,
-                        internal_token_count: finished.internal_token_count,
-                        finish_reason: finished.finish_reason,
-                        kv_transfer_params: finished.kv_transfer_params,
-                    });
-                }
-                events
-            }
-        }
-    }
-}
-
 /// Boxed stream of decoded text events coming from [`text`].
 pub type DynDecodedTextEventStream = Pin<Box<dyn Stream<Item = Result<DecodedTextEvent>> + Send>>;
-/// Boxed stream of structured chat events exposed by [`crate::chat::output::ChatRuntime`].
+/// Boxed stream of structured chat events exposed by the chat runtime.
 pub type DynChatEventStream = Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>;
-
-/// Request-scoped output processor from decoded text events into structured
-/// chat events.
-pub trait ChatOutputProcessor: Send {
-    /// Consume decoded text stream and return the structured chat-event stream.
-    fn process(self: Box<Self>, decoded: DynDecodedTextEventStream) -> Result<DynChatEventStream>;
-}
-
-/// Trait-object form of [`ChatOutputProcessor`].
-pub type DynChatOutputProcessor = Box<dyn ChatOutputProcessor>;
 
 trait_set! {
  /// Boxed-stream constraint for decoded text updates.
@@ -137,8 +73,6 @@ trait_set! {
 
 /// Generate the northbound tool-call ID using the OpenAI-style `call_<id>`
 /// format.
-// Other ID schemes such as Kimi-K2 can be added here when needed.
-// `functions.{name}:{global_index}`.
 pub(crate) fn generate_tool_call_id() -> String {
     format!("call_{}", &Uuid::new_v4().simple().to_string()[..24])
 }

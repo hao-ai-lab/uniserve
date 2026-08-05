@@ -6,7 +6,6 @@ pub mod renderer;
 
 pub use error::{Error, Result};
 pub use renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
-pub use renderer::{ChatRenderer, DynChatRenderer, RenderedPrompt};
 
 pub use crate::chat::protocol::{
     AssistantContentBlock, AssistantMessageExt, AssistantToolCall, ChatContent, ChatContentPart,
@@ -24,7 +23,7 @@ pub mod event {
 pub mod request {
     pub use crate::chat::protocol::{
         ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatTool,
-        ChatToolChoice, GenerationPromptMode, ReasoningEffort, SamplingParams,
+        ChatToolChoice, GenerationPromptMode, ReasoningEffort,
     };
 }
 

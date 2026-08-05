@@ -1,5 +1,5 @@
 # Shortcuts for local checks and tests. Build is `pip install` / `cargo`;
-# serving is `uniserve serve <model>`.
+# serving is `uniserve serve <model> --model-description <description>`.
 
 python := env("PYTHON", ".venv/bin/python")
 cargo := env("CARGO", "cargo")
@@ -7,6 +7,10 @@ cargo := env("CARGO", "cargo")
 # Format check (Rust)
 fmt:
     {{cargo}} fmt --all -- --check
+
+# Validate the canonical runtime contracts and executable benchmark profile.
+contract:
+    {{python}} scripts/check_runtime_contracts.py
 
 # Clippy lint (Rust)
 clippy:
@@ -20,8 +24,8 @@ test-rust:
 bench-build:
     {{cargo}} bench --workspace --no-run
 
-# Lint: fmt + clippy + ruff + mypy
-lint: fmt clippy
+# Lint: contracts + fmt + clippy + ruff + mypy
+lint: contract fmt clippy
     {{python}} -m ruff check uniserve_worker uniserve_eval tests/python
     {{python}} -m mypy uniserve_worker uniserve_eval
 

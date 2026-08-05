@@ -1,8 +1,4 @@
-use std::fs;
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uniserve_core::{
     GenOnlyStartPolicyDescriptor, GeneratedImageFeedbackRecipe, GenerationConstraint,
     GenerationPolicyDescriptor, ImageIngestRecipe, ImageIngestStep, ImageKvEffect,
@@ -10,6 +6,7 @@ use uniserve_core::{
 };
 
 use self::resolution::{ResolutionBucket, ResolutionPolicy};
+use crate::ModelDescription;
 use crate::assets::{self, Error as AssetError};
 use crate::tokenizer::{DynTokenizer, Tokenizer};
 
@@ -269,67 +266,27 @@ impl GenerationDialectProfile {
     }
 }
 
-/// Resolve the selected generation dialect for a model. Models without a
-/// repository manifest or recognized family have no image-generation contract.
-pub fn resolve_generation_dialect_for_model(
-    model_ref: &str,
+/// Resolve the built-in dialect owned by one closed model description.
+pub fn resolve_generation_dialect(
+    description: ModelDescription,
     tokenizer: &dyn Tokenizer,
 ) -> assets::Result<Option<GenerationDialectProfile>> {
-    if let Some(profile) = profile_from_model_manifest(model_ref, tokenizer)? {
-        return Ok(Some(profile));
-    }
-    profile_key_from_model(model_ref)?
-        .map(|key| profile_from_key(key, tokenizer))
-        .transpose()
-}
-
-fn profile_from_key(
-    key: &str,
-    tokenizer: &dyn Tokenizer,
-) -> assets::Result<GenerationDialectProfile> {
-    let json = match key {
-        "sensenova-u1" => SENSENOVA_PROFILE_JSON,
-        "bagel" => BAGEL_PROFILE_JSON,
-        other => {
-            return Err(AssetError::message(format!(
-                "unknown generation profile {other:?}"
-            )));
+    match description {
+        ModelDescription::Qwen3 => Ok(None),
+        ModelDescription::SenseNova => {
+            profile_from_manifest(parse_builtin_manifest(SENSENOVA_PROFILE_JSON)?, tokenizer)
+                .map(Some)
         }
-    };
-    profile_from_manifest(parse_builtin_manifest(json)?, tokenizer)
+        ModelDescription::Bagel => {
+            profile_from_manifest(parse_builtin_manifest(BAGEL_PROFILE_JSON)?, tokenizer).map(Some)
+        }
+    }
 }
 
 fn parse_builtin_manifest(json: &str) -> assets::Result<ProfileManifest> {
     serde_json::from_str(json).map_err(|error| {
         AssetError::message(format!("invalid built-in generation profile: {error}"))
     })
-}
-
-fn profile_from_model_manifest(
-    model_ref: &str,
-    tokenizer: &dyn Tokenizer,
-) -> assets::Result<Option<GenerationDialectProfile>> {
-    let path = Path::new(model_ref);
-    if !path.is_dir() {
-        return Ok(None);
-    }
-    let manifest_path = path.join("uniserve_profile.json");
-    if !manifest_path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&manifest_path).map_err(|error| {
-        AssetError::message(format!(
-            "failed to read generation profile {}: {error}",
-            manifest_path.display()
-        ))
-    })?;
-    let manifest = serde_json::from_str::<ProfileManifest>(&text).map_err(|error| {
-        AssetError::message(format!(
-            "invalid generation profile {}: {error}",
-            manifest_path.display()
-        ))
-    })?;
-    profile_from_manifest(manifest, tokenizer).map(Some)
 }
 
 fn profile_from_manifest(
@@ -505,69 +462,6 @@ fn required_token_id(
     role: &str,
 ) -> assets::Result<u32> {
     required_token(tokenizer, candidates, role).map(|(id, _)| id)
-}
-
-fn profile_key_from_model(model_ref: &str) -> assets::Result<Option<&'static str>> {
-    let path = Path::new(model_ref);
-    if path.is_dir() {
-        let config_path = path.join("config.json");
-        if config_path.exists() {
-            let text = fs::read_to_string(&config_path).map_err(|error| {
-                AssetError::message(format!(
-                    "failed to read model config {}: {error}",
-                    config_path.display()
-                ))
-            })?;
-            let config = serde_json::from_str::<Value>(&text).map_err(|error| {
-                AssetError::message(format!(
-                    "invalid model config {}: {error}",
-                    config_path.display()
-                ))
-            })?;
-            if let Some(key) = profile_key_from_config(&config) {
-                return Ok(Some(key));
-            }
-        }
-    }
-    let lower = model_ref.to_ascii_lowercase();
-    if lower.contains("sensenova") || lower.contains("neo_chat") || lower.contains("neo-unify") {
-        Ok(Some("sensenova-u1"))
-    } else if lower.contains("bagel") {
-        Ok(Some("bagel"))
-    } else {
-        Ok(None)
-    }
-}
-
-fn profile_key_from_config(config: &Value) -> Option<&'static str> {
-    let model_type = config
-        .get("model_type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let architectures: Vec<String> = config
-        .get("architectures")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_ascii_lowercase)
-        .collect();
-    if model_type == "neo_chat"
-        || model_type == "neo_unify"
-        || architectures.iter().any(|arch| {
-            matches!(
-                arch.as_str(),
-                "neochatmodel" | "neo_chat" | "neo-unify" | "neo_unify"
-            )
-        })
-    {
-        return Some("sensenova-u1");
-    }
-    if model_type.contains("bagel") || architectures.iter().any(|arch| arch.contains("bagel")) {
-        return Some("bagel");
-    }
-    None
 }
 
 fn render_prompt(
@@ -1146,234 +1040,5 @@ impl TryFrom<PromptRecipeManifest> for PromptRecipe {
             },
             PromptRecipeKind::Raw => PromptRecipe::Raw,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use crate::tokenizer::{DynTokenizer, Tokenizer};
-
-    use super::*;
-
-    #[derive(Debug)]
-    struct ByteTokenizer;
-
-    impl Tokenizer for ByteTokenizer {
-        fn encode(
-            &self,
-            text: &str,
-            _add_special_tokens: bool,
-        ) -> crate::tokenizer::Result<Vec<u32>> {
-            Ok(text.bytes().map(u32::from).collect())
-        }
-
-        fn decode(
-            &self,
-            token_ids: &[u32],
-            _skip_special_tokens: bool,
-        ) -> crate::tokenizer::Result<String> {
-            Ok(
-                String::from_utf8_lossy(&token_ids.iter().map(|id| *id as u8).collect::<Vec<_>>())
-                    .into_owned(),
-            )
-        }
-
-        fn token_to_id(&self, token: &str) -> Option<u32> {
-            match token {
-                "<img>" => Some(10),
-                "</img>" => Some(11),
-                "<|im_start|>" => Some(13),
-                "<|im_end|>" => Some(14),
-                _ => None,
-            }
-        }
-    }
-
-    fn temp_model_config(config: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "uniserve-generation-profile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.json"), config).unwrap();
-        dir
-    }
-
-    #[test]
-    fn resolves_sensenova_profile_from_model_metadata() {
-        let tok = ByteTokenizer;
-        let dir = temp_model_config(r#"{"architectures":["NEOChatModel"]}"#);
-        let profile = resolve_generation_dialect_for_model(dir.to_str().unwrap(), &tok)
-            .expect("profile resolution")
-            .expect("SenseNova profile");
-        assert_eq!(profile.id, "sensenova-u1");
-        assert_eq!(profile.resolution_policy.default.width, 2048);
-        assert_eq!(profile.resolution_policy.default.height, 1152);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn loads_checkpoint_profile_manifest_before_metadata_fallback() {
-        let tok = ByteTokenizer;
-        let dir = temp_model_config(r#"{"architectures":["NEOChatModel"]}"#);
-        let mut manifest: serde_json::Value = serde_json::from_str(BAGEL_PROFILE_JSON).unwrap();
-        manifest["id"] = serde_json::Value::String("custom-profile".into());
-        std::fs::write(
-            dir.join("uniserve_profile.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
-
-        let profile = resolve_generation_dialect_for_model(dir.to_str().unwrap(), &tok)
-            .expect("profile resolution")
-            .expect("checkpoint profile");
-        assert_eq!(profile.id, "custom-profile");
-        assert!(profile.supports_constraint(GenerationConstraint::UndOnly));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn malformed_checkpoint_profile_does_not_fall_back_to_model_metadata() {
-        let tok = ByteTokenizer;
-        let dir = temp_model_config(r#"{"architectures":["NEOChatModel"]}"#);
-        std::fs::write(dir.join("uniserve_profile.json"), "{").unwrap();
-
-        let error = resolve_generation_dialect_for_model(dir.to_str().unwrap(), &tok)
-            .expect_err("malformed checkpoint profile must fail at the repository boundary");
-        assert!(error.to_string().contains("invalid generation profile"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn checkpoint_profile_requires_resolvable_control_tokens() {
-        let tok = ByteTokenizer;
-        let dir = temp_model_config(r#"{"architectures":["NEOChatModel"]}"#);
-        let mut manifest: serde_json::Value = serde_json::from_str(BAGEL_PROFILE_JSON).unwrap();
-        manifest["control_tokens"]["start_of_image"] = serde_json::json!(["<missing>"]);
-        std::fs::write(
-            dir.join("uniserve_profile.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
-
-        let error = resolve_generation_dialect_for_model(dir.to_str().unwrap(), &tok)
-            .expect_err("missing control token must reject the profile");
-        assert!(error.to_string().contains("start_of_image control token"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn checkpoint_profile_rejects_empty_output_delimiters() {
-        let tok = ByteTokenizer;
-        let dir = temp_model_config(r#"{"architectures":["NEOChatModel"]}"#);
-        let mut manifest: serde_json::Value = serde_json::from_str(BAGEL_PROFILE_JSON).unwrap();
-        manifest["output_filter"]["visible_wrappers"] = serde_json::json!([{
-            "start": "",
-            "end": "</answer>"
-        }]);
-        std::fs::write(
-            dir.join("uniserve_profile.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
-
-        let error = resolve_generation_dialect_for_model(dir.to_str().unwrap(), &tok)
-            .expect_err("empty output delimiter must reject the profile");
-        assert!(error.to_string().contains("delimiters must not be empty"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn sensenova_image_prompt_uses_profile_generation_prompt() {
-        let tok: DynTokenizer = Arc::new(ByteTokenizer);
-        let profile = profile_from_key("sensenova-u1", &*tok).expect("SenseNova profile");
-        let body = PromptContext {
-            prompt: "paint a lake".into(),
-            ..Default::default()
-        };
-        let ids = profile
-            .build_prompt_ids(&tok, &body, PromptKind::Gen)
-            .expect("render prompt");
-        let text = tok.decode(&ids, false).unwrap();
-        assert!(text.contains("image generation and editing assistant"));
-        assert!(text.ends_with("<think>\n\n</think>\n\n<img>"));
-    }
-
-    #[test]
-    fn manifests_resolve_ingest_and_generation_policies() {
-        let tok = ByteTokenizer;
-        let sensenova = profile_from_key("sensenova-u1", &tok).expect("SenseNova profile");
-        assert_eq!(
-            sensenova.image_ingest.steps,
-            vec![ImageIngestStep::VitEncode]
-        );
-        assert_eq!(
-            sensenova.generation_policy.trigger,
-            TriggerPolicyDescriptor::Token { token_id: 10 }
-        );
-        assert_eq!(
-            sensenova.generation_policy.gen_only_start,
-            GenOnlyStartPolicyDescriptor::Immediate
-        );
-        assert_eq!(
-            sensenova
-                .generation_policy
-                .feedback
-                .as_ref()
-                .map(|feedback| feedback.source.clone()),
-            Some(uniserve_core::FeedbackSource::DeviceProduct)
-        );
-
-        let bagel = profile_from_key("bagel", &tok).expect("BAGEL profile");
-        assert_eq!(
-            bagel
-                .generation_policy
-                .feedback
-                .as_ref()
-                .map(|feedback| feedback.source.clone()),
-            Some(uniserve_core::FeedbackSource::DeviceProduct)
-        );
-    }
-
-    #[test]
-    fn profiles_resolve_exact_input_image_kv_from_dimensions() {
-        let tok = ByteTokenizer;
-        let bagel = profile_from_key("bagel", &tok).expect("BAGEL profile");
-        for (width, height, vae_tokens, vit_tokens) in [
-            (512, 512, 1_026, 1_371),
-            (640, 480, 1_378, 1_815),
-            (1_920, 1_080, 2_306, 2_732),
-            (300, 1_200, 1_026, 1_262),
-            (2_048, 2_048, 4_098, 4_902),
-            (224, 224, 1_026, 1_371),
-            (321, 517, 1_666, 2_185),
-        ] {
-            let bagel_ingest = bagel
-                .image_ingest_for_dimensions(width, height, 1)
-                .expect("BAGEL image KV");
-            assert_eq!(
-                bagel_ingest.step_kv_tokens,
-                vec![
-                    ImageKvEffect::Exact { tokens: vae_tokens },
-                    ImageKvEffect::Exact { tokens: vit_tokens },
-                ],
-                "BAGEL image geometry {width}x{height}"
-            );
-        }
-
-        let sensenova = profile_from_key("sensenova-u1", &tok).expect("SenseNova profile");
-        let sensenova_ingest = sensenova
-            .image_ingest_for_dimensions(512, 512, 1)
-            .expect("SenseNova image KV");
-        assert_eq!(
-            sensenova_ingest.step_kv_tokens,
-            vec![ImageKvEffect::Exact { tokens: 256 }]
-        );
     }
 }

@@ -17,10 +17,9 @@ use uniserve_engine_gateway::transport::protocol::generation::GenerationControlT
 use uniserve_engine_gateway::transport::{EngineCoreClient, TransportMode, ZmqClientConfig};
 pub use uniserve_engine_runtime::SchedulingPolicy;
 use uniserve_engine_runtime::{EngineBackend, EngineCoreConfig};
-use uniserve_model_profile::assets::{ResolvedModelFiles, TokenizerSource};
-use uniserve_model_profile::tokenizer::{
-    DynTokenizer, HuggingFaceTokenizer, TekkenTokenizer, TiktokenTokenizer,
-};
+pub use uniserve_model_profile::ModelDescription;
+use uniserve_model_profile::assets::ResolvedModelFiles;
+use uniserve_model_profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_model_profile::{ModelProfile, ProfileDeploymentConfig};
 pub use uniserve_serving::chat::ChatTemplateContentFormatOption;
 use uniserve_serving::chat::{ChatTemplateLoadOptions, HfChatRenderer};
@@ -73,21 +72,14 @@ fn runtime_control_tokens(
 }
 
 fn load_tokenizer(files: &ResolvedModelFiles) -> Result<DynTokenizer> {
-    let tokenizer: DynTokenizer = match &files.tokenizer {
-        TokenizerSource::HuggingFace(path) => Arc::new(
-            HuggingFaceTokenizer::new(path)
-                .with_context(|| format!("failed to load tokenizer from {}", path.display()))?,
-        ),
-        TokenizerSource::Tiktoken(path) => Arc::new(
-            TiktokenTokenizer::new(path)
-                .with_context(|| format!("failed to load tokenizer from {}", path.display()))?,
-        ),
-        TokenizerSource::Tekken(path) => Arc::new(
-            TekkenTokenizer::new(path)
-                .with_context(|| format!("failed to load tokenizer from {}", path.display()))?,
-        ),
-    };
-    Ok(tokenizer)
+    Ok(Arc::new(
+        HuggingFaceTokenizer::new(&files.tokenizer_path).with_context(|| {
+            format!(
+                "failed to load tokenizer from {}",
+                files.tokenizer_path.display()
+            )
+        })?,
+    ))
 }
 
 async fn resolve_model_assets(
@@ -98,14 +90,17 @@ async fn resolve_model_assets(
         .with_context(|| format!("failed to resolve model files for `{}`", config.model))?;
     let tokenizer = load_tokenizer(&files)?;
     let deployment = ProfileDeploymentConfig {
-        renderer_id: Some("hf".to_string()),
         chat_template_override: config.chat_template.clone(),
-        allow_request_chat_template_override: false,
         max_model_tokens: config.engine.max_model_len,
-        ..ProfileDeploymentConfig::default()
     };
-    let mut profile = ModelProfile::resolve(&config.model, &files, &deployment, tokenizer.as_ref())
-        .with_context(|| format!("failed to resolve model profile for `{}`", config.model))?;
+    let mut profile = ModelProfile::resolve(
+        config.model_description,
+        &config.model,
+        &files,
+        &deployment,
+        tokenizer.as_ref(),
+    )
+    .with_context(|| format!("failed to resolve model profile for `{}`", config.model))?;
     let max_model_tokens = config
         .engine
         .max_model_len
@@ -284,28 +279,4 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_request_timeout(config.request_timeout)
             .with_max_concurrent_requests(config.max_concurrent_requests),
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use uniserve_model_profile::ModelProfile;
-
-    use super::runtime_control_tokens;
-    use crate::EngineBackendKind;
-
-    #[test]
-    fn text_profile_resolves_engine_control_tokens() {
-        let mut profile = ModelProfile::text_only("qwen3");
-        profile.stop_tokens.primary_eos_token_id = Some(2);
-        profile.stop_tokens.eos_token_ids = BTreeSet::from([2, 3]);
-
-        let controls = runtime_control_tokens(&profile, EngineBackendKind::Worker);
-
-        assert_eq!(controls.bos, 0);
-        assert_eq!(controls.eos, vec![2, 3]);
-        assert_eq!(controls.start_of_image, 0);
-        assert_eq!(controls.end_of_image, 0);
-    }
 }

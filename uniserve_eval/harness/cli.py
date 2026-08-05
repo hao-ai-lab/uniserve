@@ -148,9 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measured-runs", type=int, default=1)
     parser.add_argument("--server-topology", default="single_server")
     parser.add_argument(
-        "--plan-evidence-policy",
-        default="declared_contract",
-        choices=["declared_contract", "runtime_inspection", "reference_protocol"],
+        "--request-schema",
+        default="uniserve",
+        choices=["uniserve", "sglang", "vllm_omni"],
     )
     parser.add_argument("--acceptance-min-success", type=int, default=1)
     parser.add_argument("--acceptance-max-failed", type=int, default=0)
@@ -235,7 +235,7 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         preprocessing=args.preprocessing,
         measured_runs=args.measured_runs,
         server_topology=args.server_topology,
-        plan_evidence_policy=args.plan_evidence_policy,
+        request_schema=args.request_schema,
         acceptance_min_success=args.acceptance_min_success,
         acceptance_max_failed=args.acceptance_max_failed,
         acceptance_min_images_per_success=args.acceptance_min_images_per_success,
@@ -289,9 +289,9 @@ def main(argv: list[str] | None = None) -> int:
         artifact = result.summary.get("artifact", {})
         checks = artifact.get("checks", {})
         ok = bool(
-            artifact.get("schema_version") == 2
+            artifact.get("schema_version") == 4
             and artifact.get("valid") is True
-            and artifact.get("valid_marker") in {"artifact-valid-v2", "canonical-valid-v2"}
+            and artifact.get("valid_marker") in {"artifact-valid-v4", "canonical-valid-v4"}
             and isinstance(checks, dict)
             and checks
             and all(value is True for value in checks.values())

@@ -28,7 +28,6 @@ uniserve-engine-runtime.workspace = true
 uniserve-engine-wire.workspace = true
 uniserve-model-profile.workspace = true
 uniserve-observability.workspace = true
-uniserve-openai-types.workspace = true
 uniserve-protocol-adapters.workspace = true
 uniserve-scheduler.workspace = true
 uniserve-serving.workspace = true

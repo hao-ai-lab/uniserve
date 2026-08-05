@@ -5,11 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 asynk-strim-attr.workspace = true
 base64.workspace = true
 easy-ext.workspace = true
-enum-as-inner.workspace = true
 futures.workspace = true
 image.workspace = true
 indexmap.workspace = true
@@ -17,7 +15,6 @@ itertools.workspace = true
 llm-multimodal.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
-openai-harmony.workspace = true
 serde.workspace = true
 serde-json-fmt.workspace = true
 serde_json.workspace = true
@@ -33,17 +30,11 @@ uuid.workspace = true
 uniserve-engine-gateway.workspace = true
 uniserve-core.workspace = true
 uniserve-model-profile.workspace = true
-xgrammar-rs.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
-clap.workspace = true
 expect-test.workspace = true
-paste.workspace = true
-png.workspace = true
-serial_test.workspace = true
 tempfile.workspace = true
-tracing-subscriber.workspace = true
+tokenizers.workspace = true
 uniserve-engine-gateway = { workspace = true, features = ["test-util"] }
 
 [lints]

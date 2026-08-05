@@ -1,72 +1,47 @@
 use std::sync::Arc;
 
-use crate::tokenizer::Tokenizer;
+use tempfile::tempdir;
+use tokenizers::models::bpe::BPE;
+use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-use super::{
-    DeepSeekR1ReasoningParser, DelimitedReasoningParser, Qwen3ReasoningParser, ReasoningParser,
-};
+use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
-struct FakeTokenizer;
+use super::{DelimitedReasoningParser, Qwen3ReasoningParser};
 
-impl Tokenizer for FakeTokenizer {
-    fn encode(&self, text: &str, _add_special_tokens: bool) -> crate::tokenizer::Result<Vec<u32>> {
-        Ok(text.chars().map(u32::from).collect())
-    }
+fn reasoning_tokenizer() -> DynTokenizer {
+    let model = BPE::builder()
+        .vocab_and_merges(
+            [
+                ("<unk>".to_string(), 0),
+                ("a".to_string(), 1),
+                ("b".to_string(), 2),
+            ],
+            Vec::new(),
+        )
+        .unk_token("<unk>".to_string())
+        .build()
+        .expect("build tokenizer model");
+    let mut tokenizer = TokenizerBuilder::new(model);
+    tokenizer.add_special_tokens(&[
+        AddedToken::from("<think>", true),
+        AddedToken::from("</think>", true),
+        AddedToken::from("<|im_end|>", true),
+    ]);
+    let directory = tempdir().expect("create tokenizer directory");
+    let path = directory.path().join("tokenizer.json");
+    tokenizer.save(&path, false).expect("save tokenizer");
+    Arc::new(HuggingFaceTokenizer::new(&path).expect("load configured tokenizer"))
+}
 
-    fn decode(
-        &self,
-        token_ids: &[u32],
-        _skip_special_tokens: bool,
-    ) -> crate::tokenizer::Result<String> {
-        Ok(token_ids
-            .iter()
-            .map(|token_id| char::from_u32(*token_id).unwrap_or('\u{FFFD}'))
-            .collect())
-    }
-
-    fn token_to_id(&self, token: &str) -> Option<u32> {
-        match token {
-            "<think>" => Some(1),
-            "</think>" => Some(2),
-            "<|START_THINKING|>" => Some(3),
-            "<|END_THINKING|>" => Some(4),
-            "◁think▷" => Some(5),
-            "◁/think▷" => Some(6),
-            _ => None,
-        }
-    }
-
-    fn is_special_id(&self, token_id: u32) -> bool {
-        token_id == 7
-    }
+fn token_id(tokenizer: &DynTokenizer, token: &str) -> u32 {
+    tokenizer
+        .token_to_id(token)
+        .unwrap_or_else(|| panic!("tokenizer must contain {token}"))
 }
 
 #[test]
-fn delimited_content_only_stream() {
-    let tokenizer = Arc::new(FakeTokenizer);
-    let mut parser =
-        DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false).unwrap();
-
-    assert_eq!(
-        parser.push("plain content").content.as_deref(),
-        Some("plain content")
-    );
-}
-
-#[test]
-fn delimited_single_chunk_with_reasoning_and_content() {
-    let tokenizer = Arc::new(FakeTokenizer);
-    let mut parser =
-        DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false).unwrap();
-
-    let delta = parser.push("<think>reason</think>answer");
-    assert_eq!(delta.reasoning.as_deref(), Some("reason"));
-    assert_eq!(delta.content.as_deref(), Some("answer"));
-}
-
-#[test]
-fn delimited_partial_tokens_across_chunks() {
-    let tokenizer = Arc::new(FakeTokenizer);
+fn delimited_parser_splits_reasoning_across_chunk_boundaries() {
+    let tokenizer = reasoning_tokenizer();
     let mut parser =
         DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false).unwrap();
 
@@ -77,21 +52,21 @@ fn delimited_partial_tokens_across_chunks() {
 }
 
 #[test]
-fn delimited_finish_flushes_buffer() {
-    let tokenizer = Arc::new(FakeTokenizer);
+fn delimited_parser_flushes_partial_end_marker() {
+    let tokenizer = reasoning_tokenizer();
+    let start = token_id(&tokenizer, "<think>");
     let mut parser =
         DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false).unwrap();
-    parser.initialize(&[1]);
+    parser.initialize(&[start]);
 
     let delta = parser.push("unfinished</thi");
     assert_eq!(delta.reasoning.as_deref(), Some("unfinished"));
-    let final_delta = parser.finish();
-    assert_eq!(final_delta.reasoning.as_deref(), Some("</thi"));
+    assert_eq!(parser.finish().reasoning.as_deref(), Some("</thi"));
 }
 
 #[test]
-fn qwen3_without_prompt_markers_expects_start_token() {
-    let tokenizer = Arc::new(FakeTokenizer);
+fn qwen3_without_prompt_boundary_waits_for_reasoning_start() {
+    let tokenizer = reasoning_tokenizer();
     let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
 
     let delta = parser.push("reason</think>answer").unwrap();
@@ -100,62 +75,34 @@ fn qwen3_without_prompt_markers_expects_start_token() {
 }
 
 #[test]
-fn qwen3_prompt_end_marker_starts_in_content() {
-    let tokenizer = Arc::new(FakeTokenizer);
-    let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
-    parser.initialize(&[2]).unwrap();
+fn qwen3_prompt_boundaries_select_the_initial_output_region() {
+    let tokenizer = reasoning_tokenizer();
+    let start = token_id(&tokenizer, "<think>");
+    let end = token_id(&tokenizer, "</think>");
 
-    let delta = parser.push("answer").unwrap();
-    assert_eq!(delta.reasoning, None);
-    assert_eq!(delta.content.as_deref(), Some("answer"));
-}
+    let mut content = Qwen3ReasoningParser::new(Arc::clone(&tokenizer)).unwrap();
+    content.initialize(&[end]).unwrap();
+    assert_eq!(
+        content.push("answer").unwrap().content.as_deref(),
+        Some("answer")
+    );
 
-#[test]
-fn qwen3_tolerates_compat_and_current_formats() {
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(FakeTokenizer);
-
-    let mut compat_parser = Qwen3ReasoningParser::new(Arc::clone(&tokenizer)).unwrap();
-    let compat = compat_parser.push("<think>reason</think>answer").unwrap();
-    assert_eq!(compat.reasoning.as_deref(), Some("reason"));
-    assert_eq!(compat.content.as_deref(), Some("answer"));
-
-    let mut current_parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
-    current_parser.initialize(&[1]).unwrap();
-    let current = current_parser.push("reason</think>answer").unwrap();
-    assert_eq!(current.reasoning.as_deref(), Some("reason"));
-    assert_eq!(current.content.as_deref(), Some("answer"));
-}
-
-#[test]
-fn qwen3_stops_scanning_at_last_special_token() {
-    let tokenizer = Arc::new(FakeTokenizer);
-    let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
-
-    parser.initialize(&[1, 7]).unwrap();
-
-    let delta = parser.push("answer").unwrap();
-    assert_eq!(delta.reasoning, None);
-    assert_eq!(delta.content.as_deref(), Some("answer"));
-}
-
-#[test]
-fn deepseek_r1_defaults_to_reasoning_without_prompt_boundary() {
-    let tokenizer = Arc::new(FakeTokenizer);
-    let mut parser = DeepSeekR1ReasoningParser::new(tokenizer).unwrap();
-
-    let delta = parser.push("reason</think>answer").unwrap();
+    let mut reasoning = Qwen3ReasoningParser::new(tokenizer).unwrap();
+    reasoning.initialize(&[start]).unwrap();
+    let delta = reasoning.push("reason</think>answer").unwrap();
     assert_eq!(delta.reasoning.as_deref(), Some("reason"));
     assert_eq!(delta.content.as_deref(), Some("answer"));
 }
 
 #[test]
-fn deepseek_r1_stops_scanning_at_last_special_token() {
-    let tokenizer = Arc::new(FakeTokenizer);
-    let mut parser = DeepSeekR1ReasoningParser::new(tokenizer).unwrap();
+fn qwen3_prompt_scan_stops_at_the_last_special_token() {
+    let tokenizer = reasoning_tokenizer();
+    let start = token_id(&tokenizer, "<think>");
+    let prompt_end = token_id(&tokenizer, "<|im_end|>");
+    let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
 
-    parser.initialize(&[2, 7]).unwrap();
-
-    let delta = parser.push("reason</think>answer").unwrap();
-    assert_eq!(delta.reasoning.as_deref(), Some("reason"));
+    parser.initialize(&[start, prompt_end]).unwrap();
+    let delta = parser.push("answer").unwrap();
+    assert_eq!(delta.reasoning, None);
     assert_eq!(delta.content.as_deref(), Some("answer"));
 }

@@ -1,10 +1,6 @@
-use std::collections::HashMap;
-
-pub use crate::text::SamplingParams;
 use crate::text::TextDecodeOptions;
 use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 pub use uniserve_model_profile::tools::Tool as ChatTool;
 
 use crate::chat::protocol::error::{Error, Result};
@@ -324,24 +320,15 @@ pub struct ChatOptions {
     /// all.
     pub generation_prompt_mode: GenerationPromptMode,
 
-    /// Per-request Jinja chat template override. When set, this template is
-    /// used instead of the model's default chat template.
-    pub chat_template: Option<String>,
-
     /// Effort level exposed to chat templates for reasoning models.
     pub reasoning_effort: Option<ReasoningEffort>,
-
-    /// Additional keyword arguments exposed to the chat template.
-    pub template_kwargs: HashMap<String, Value>,
 }
 
 impl Default for ChatOptions {
     fn default() -> Self {
         Self {
             generation_prompt_mode: GenerationPromptMode::StartNewAssistant,
-            chat_template: None,
             reasoning_effort: None,
-            template_kwargs: HashMap::new(),
         }
     }
 }
@@ -379,12 +366,8 @@ pub enum ChatToolChoice {
 /// generate request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
-    /// Stable caller-supplied request ID.
-    pub request_id: String,
     /// Ordered chat history to render.
     pub messages: Vec<ChatMessage>,
-    /// User-facing sampling parameters accepted by `chat`.
-    pub sampling_params: SamplingParams,
     /// Chat-specific rendering options.
     pub chat_options: ChatOptions,
     /// Function tools made available to the model for this request.
@@ -393,48 +376,17 @@ pub struct ChatRequest {
     pub tool_choice: ChatToolChoice,
     /// Text decode options for incremental detokenization.
     pub decode_options: TextDecodeOptions,
-    /// Whether to emit intermediate northbound content deltas before the
-    /// terminal result.
-    ///
-    /// If `false`, callers only observe the terminal accumulated assistant
-    /// output. If `true`, callers may receive zero or more incremental
-    /// content events before the final terminal one.
-    pub intermediate: bool,
-    /// Request scheduling priority (lower means earlier handling; default 0).
-    pub priority: i32,
-    /// Documents for RAG (retrieval-augmented generation), passed to the chat
-    /// template.
-    pub documents: Option<Vec<Value>>,
-    /// Salt for prefix cache isolation in multi-user environments.
-    pub cache_salt: Option<String>,
-    /// Whether to add special tokens (e.g. BOS) during prompt tokenization.
-    pub add_special_tokens: bool,
-    /// Override data parallel rank.
-    #[serde(default)]
-    pub data_parallel_rank: Option<u32>,
-    /// Protocol-neutral trace context propagated to scheduler transport.
-    #[serde(default)]
-    pub trace_context: HashMap<String, String>,
 }
 
 impl ChatRequest {
     /// Return one minimal valid request fixture for tests.
     pub fn for_test() -> Self {
         Self {
-            request_id: "test-request".to_string(),
             messages: vec![ChatMessage::text(ChatRole::User, "test")],
-            sampling_params: SamplingParams::default(),
             chat_options: ChatOptions::default(),
             tools: Vec::new(),
             tool_choice: ChatToolChoice::None,
             decode_options: TextDecodeOptions::default(),
-            intermediate: true,
-            priority: 0,
-            documents: None,
-            cache_salt: None,
-            add_special_tokens: false,
-            data_parallel_rank: None,
-            trace_context: HashMap::new(),
         }
     }
 
@@ -468,39 +420,6 @@ impl ChatRequest {
     pub fn tool_parsing_enabled(&self) -> bool {
         matches!(self.tool_choice, ChatToolChoice::Auto) && !self.tools.is_empty()
     }
-
-    /// Return the request-level thinking toggle when explicitly requested.
-    ///
-    /// We currently accept the two request kwargs `thinking` and
-    /// `enable_thinking`. Both must be booleans when present. If both are
-    /// present, they must have the same value. If neither key is provided,
-    /// return `None`.
-    pub fn enable_thinking(&self) -> Result<Option<bool>> {
-        let thinking = self.parse_template_bool("thinking")?;
-        let enable_thinking = self.parse_template_bool("enable_thinking")?;
-
-        match (thinking, enable_thinking) {
-            (None, None) => Ok(None),
-            (Some(thinking), Some(enable_thinking)) if thinking != enable_thinking => {
-                Err(Error::ChatTemplate(
-                    "template kwargs `thinking` and `enable_thinking` must match when both are set"
-                        .to_string(),
-                ))
-            }
-            (Some(thinking), _) => Ok(Some(thinking)),
-            (None, Some(enable_thinking)) => Ok(Some(enable_thinking)),
-        }
-    }
-
-    pub fn parse_template_bool(&self, key: &str) -> Result<Option<bool>> {
-        match self.chat_options.template_kwargs.get(key) {
-            None => Ok(None),
-            Some(Value::Bool(value)) => Ok(Some(*value)),
-            Some(other) => Err(Error::ChatTemplate(format!(
-                "template kwarg `{key}` must be a boolean, got {other}"
-            ))),
-        }
-    }
 }
 
 impl ChatRole {
@@ -521,8 +440,7 @@ impl ChatRole {
 mod tests {
     use serde_json::{json, to_value};
 
-    use super::{ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatTool};
-    use crate::chat::protocol::Error;
+    use super::{ChatContent, ChatContentPart, ChatMessage, ChatRole, ChatTool};
     use crate::chat::protocol::event::AssistantContentBlock;
 
     #[test]
@@ -596,60 +514,5 @@ mod tests {
         let value = to_value(&message).unwrap();
         let decoded: ChatMessage = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, message);
-    }
-
-    #[test]
-    fn enable_thinking_is_none_when_no_kwargs_are_present() {
-        let request = ChatRequest::for_test();
-        assert_eq!(request.enable_thinking().unwrap(), None);
-    }
-
-    #[test]
-    fn enable_thinking_accepts_matching_duplicate_kwargs() {
-        let mut request = ChatRequest::for_test();
-        request
-            .chat_options
-            .template_kwargs
-            .insert("thinking".to_string(), json!(true));
-        request
-            .chat_options
-            .template_kwargs
-            .insert("enable_thinking".to_string(), json!(true));
-
-        assert_eq!(request.enable_thinking().unwrap(), Some(true));
-    }
-
-    #[test]
-    fn enable_thinking_rejects_non_boolean_kwargs() {
-        let mut request = ChatRequest::for_test();
-        request
-            .chat_options
-            .template_kwargs
-            .insert("thinking".to_string(), json!("yes"));
-
-        assert!(matches!(
-            request.enable_thinking(),
-            Err(Error::ChatTemplate(message))
-                if message.contains("`thinking` must be a boolean")
-        ));
-    }
-
-    #[test]
-    fn enable_thinking_rejects_conflicting_duplicate_kwargs() {
-        let mut request = ChatRequest::for_test();
-        request
-            .chat_options
-            .template_kwargs
-            .insert("thinking".to_string(), json!(false));
-        request
-            .chat_options
-            .template_kwargs
-            .insert("enable_thinking".to_string(), json!(true));
-
-        assert!(matches!(
-            request.enable_thinking(),
-            Err(Error::ChatTemplate(message))
-                if message.contains("`thinking` and `enable_thinking` must match")
-        ));
     }
 }

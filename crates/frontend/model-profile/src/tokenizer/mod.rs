@@ -6,17 +6,12 @@ use crate::tokenizer::incremental::DecodeStream;
 mod byte_level_decode;
 #[macro_use]
 mod error;
-mod grammar_vocab;
 mod hf;
 mod incremental;
-mod tekken;
-mod tiktoken;
 
 pub use error::{Result, TokenizerError};
 pub use hf::HuggingFaceTokenizer;
 pub use incremental::IncrementalDecoder;
-pub use tekken::TekkenTokenizer;
-pub use tiktoken::TiktokenTokenizer;
 
 pub trait Tokenizer: Send + Sync {
     /// Encode one prompt string into token IDs.
@@ -29,35 +24,15 @@ pub trait Tokenizer: Send + Sync {
     /// is not in the tokenizer vocabulary.
     fn token_to_id(&self, token: &str) -> Option<u32>;
 
-    /// Convert one token ID into the tokenizer's raw token string, returning
-    /// `None` when the backend cannot resolve the ID.
+    /// Convert one token ID into its raw token string when available.
     fn id_to_token(&self, _id: u32) -> Option<String> {
-        // The default keeps existing tokenizer backends source-compatible; new
-        // backends should override this when exact token strings are available.
-        // Callers cannot distinguish "unknown ID" from "backend has no mapping",
-        // so any backend with real token strings must override this.
         None
     }
 
     /// Return whether the given token ID is special.
     ///
-    /// The default returns `false` to keep existing tokenizer backends
-    /// source-compatible; any backend that knows its special-token set must
-    /// override this, since callers treat the default as "not special" rather
-    /// than "unknown" (e.g. reasoning-boundary detection and special-token
-    /// skipping silently no-op on the default).
     fn is_special_id(&self, _token_id: u32) -> bool {
         false
-    }
-
-    /// Raw decoded bytes for each token ID, used to compile tokenizer-specific
-    /// structured-output grammars. Special tokens begin with a byte that cannot
-    /// occur in UTF-8 grammar text, so only declared stop tokens can terminate a
-    /// completed grammar.
-    fn grammar_token_bytes(&self) -> Result<Arc<[Vec<u8>]>> {
-        Err(tokenizer_error!(
-            "structured-output vocabulary is unavailable for this tokenizer"
-        ))
     }
 
     /// Create a stateful incremental decoder primed with the given prompt

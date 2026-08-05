@@ -1,11 +1,7 @@
 //! Chat rendering and output-processing library.
 //!
-//! Under the S02 funnel this module is a description-owned library: it provides
-//! the fixed Hugging Face chat renderer, the chat protocol request/event types,
-//! and the request-scoped chat output processor. There is no chat backend tower,
-//! no runtime facade, and no string-keyed renderer/parser selection on the
-//! configured request path — [`crate::model::Qwen3Desc`] binds the concrete
-//! renderer and parser policy directly.
+//! This description-owned library provides the fixed Hugging Face chat renderer,
+//! chat protocol values, and the request-scoped Qwen3 output processor.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -15,21 +11,16 @@ pub use event::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt,
     AssistantToolCall, ChatEvent,
 };
-pub use output::{
-    ChatOutputProcessor, DefaultChatOutputProcessor, DynChatOutputProcessor,
-    HarmonyChatOutputProcessor,
-};
-pub use parser::ParserSelection;
+pub use output::Qwen3ChatOutputProcessor;
 pub use renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
-pub use renderer::{ChatRenderer, DynChatRenderer, RenderedPrompt};
 pub use request::{
     ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatTool,
-    ChatToolChoice, GenerationPromptMode, ReasoningEffort, SamplingParams,
+    ChatToolChoice, GenerationPromptMode, ReasoningEffort,
 };
 pub use stream::{ChatEventStream, ChatEventStreamTrait, CollectedAssistantMessage};
 pub use template::ChatTemplateLoadOptions;
-pub use uniserve_model_profile::reasoning::{ReasoningDelta, ReasoningError, ReasoningParser};
-pub use uniserve_model_profile::tools::{ToolParser, ToolParserError};
+pub use uniserve_model_profile::reasoning::{ReasoningDelta, ReasoningError};
+pub use uniserve_model_profile::tools::ToolParserError;
 
 mod error;
 pub mod output;
@@ -50,7 +41,7 @@ pub mod event {
 pub mod request {
     pub use crate::chat::protocol::{
         ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatTool,
-        ChatToolChoice, GenerationPromptMode, ReasoningEffort, SamplingParams,
+        ChatToolChoice, GenerationPromptMode, ReasoningEffort,
     };
 }
-mod stream;
+pub mod stream;

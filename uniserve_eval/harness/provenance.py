@@ -320,11 +320,71 @@ def _hash_directory_contract(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _looks_like_model_directory(path: Path) -> bool:
+    return (path / "config.json").is_file() and any(
+        entry.is_file()
+        and (
+            entry.name.endswith(".safetensors")
+            or entry.name.endswith(".bin")
+            or entry.name == "model.safetensors.index.json"
+        )
+        for entry in path.iterdir()
+    )
+
+
+def _hash_model_directory_contract(path: Path) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    total_size = 0
+    for entry in sorted(path.iterdir(), key=lambda item: item.name):
+        metadata = entry.lstat()
+        if entry.name.startswith(".") or stat.S_ISDIR(metadata.st_mode):
+            continue
+        if entry.is_symlink():
+            target = os.readlink(entry)
+            resolved = entry.resolve(strict=True)
+            if resolved.is_dir():
+                raise RuntimeError(f"model input contains a directory symlink: {entry}")
+            target_contract = _hash_file_contract(resolved)
+            total_size += int(target_contract["size_bytes"])
+            entries.append(
+                {
+                    "path": entry.name,
+                    "kind": "symlink",
+                    "target": target if not Path(target).is_absolute() else Path(target).name,
+                    "target_size_bytes": target_contract["size_bytes"],
+                    "target_sha256": target_contract["sha256"],
+                }
+            )
+        elif stat.S_ISREG(metadata.st_mode):
+            contract = _hash_file_contract(entry)
+            total_size += int(contract["size_bytes"])
+            entries.append(
+                {
+                    "path": entry.name,
+                    "kind": "file",
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                    "size_bytes": contract["size_bytes"],
+                    "sha256": contract["sha256"],
+                }
+            )
+        else:
+            raise RuntimeError(f"unsupported model input entry: {entry}")
+    return {
+        "kind": "model_directory",
+        "resolved_name": path.name,
+        "file_count": len(entries),
+        "total_size_bytes": total_size,
+        "tree_sha256": _canonical_digest(entries),
+    }
+
+
 def _path_contract(path: Path) -> dict[str, Any]:
     resolved = path.resolve(strict=True)
     if resolved.is_file():
         return _hash_file_contract(resolved)
     if resolved.is_dir():
+        if _looks_like_model_directory(resolved):
+            return _hash_model_directory_contract(resolved)
         return _hash_directory_contract(resolved)
     raise RuntimeError(f"command input is not a file or directory: {path}")
 

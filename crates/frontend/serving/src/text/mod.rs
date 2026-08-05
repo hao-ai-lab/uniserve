@@ -1,16 +1,12 @@
 //! Shared text-generation support: incremental detokenization, decode helpers,
 //! tokenizer/model-derived sampling hints, and max-token resolution.
 //!
-//! Under the S02 funnel this module is a decode + lowering-helper library. Model
-//! tokenization is owned by [`crate::model::ResolvedModel`]; there is no separate
-//! text backend tower, request class, or structured-output surface here.
+//! Model tokenization is owned by [`crate::model::ResolvedModel`]; this module
+//! provides decode and sampling-lowering helpers.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::{BTreeSet, HashMap};
-
-use enum_as_inner::EnumAsInner;
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub use error::{Error, Result};
 pub use output::{
@@ -29,82 +25,6 @@ use trait_set::trait_set;
 trait_set! {
     /// Shared streamed decoded-text output type.
     pub trait TextOutputStream = Stream<Item = Result<DecodedTextEvent>> + Send + 'static;
-}
-
-/// One rendered chat prompt, kept as an enum for renderer compatibility.
-///
-/// The configured funnel only ever produces [`Prompt::Text`]; the pre-tokenized
-/// escape hatch is retained solely so the shared renderer contract stays stable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumAsInner)]
-#[serde(untagged)]
-pub enum Prompt {
-    /// Untokenized prompt text that still needs tokenizer work.
-    Text(String),
-    /// Pre-tokenized prompt IDs.
-    TokenIds(Vec<u32>),
-}
-
-impl Default for Prompt {
-    fn default() -> Self {
-        Self::Text(String::new())
-    }
-}
-
-/// User-facing sampling parameters accepted by the internal chat render input.
-///
-/// Every field is optional so that model and generation-config defaults apply
-/// when the caller omits a value.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SamplingParams {
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub top_k: Option<u32>,
-    pub seed: Option<i64>,
-    pub max_tokens: Option<u32>,
-    pub min_tokens: Option<u32>,
-    pub logprobs: Option<i32>,
-    pub prompt_logprobs: Option<i32>,
-    pub min_p: Option<f32>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
-    pub repetition_penalty: Option<f32>,
-    pub stop_token_ids: Option<Vec<u32>>,
-    pub ignore_eos: bool,
-    pub logit_bias: Option<HashMap<u32, f32>>,
-    pub allowed_token_ids: Option<Vec<u32>>,
-    pub bad_words: Option<Vec<String>>,
-    pub logprob_token_ids: Option<Vec<u32>>,
-    pub skip_reading_prefix_cache: Option<bool>,
-    pub write_prefix_cache: Option<bool>,
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self {
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            seed: None,
-            max_tokens: None,
-            min_tokens: None,
-            logprobs: None,
-            prompt_logprobs: None,
-            min_p: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            repetition_penalty: None,
-            stop_token_ids: None,
-            ignore_eos: false,
-            logit_bias: None,
-            allowed_token_ids: None,
-            bad_words: None,
-            logprob_token_ids: None,
-            skip_reading_prefix_cache: None,
-            write_prefix_cache: None,
-        }
-    }
 }
 
 /// Tokenizer/model-derived hints used to enrich sampling parameters before they

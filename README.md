@@ -1,150 +1,177 @@
 # UniServe
 
-UniServe is an OpenAI-compatible inference engine for omni models, built around a strict **control-plane / data-plane split**:
+UniServe is an OpenAI-compatible inference server for configured text and omni models. Rust owns HTTP admission, tokenization, scheduling, generation state, cache accounting, and response assembly; Python workers own model forward execution and device tensors.
 
-- **Control plane (Rust).** The OpenAI/gRPC API, tokenization, request scheduling, continuous batching, and KV-cache bookkeeping run in a single Rust process. The control plane owns every decision about *what* runs and *when*.
-- **Data plane (Python + GPU).** Model weights, KV-cache pages, activations, and image latents live entirely inside a thin, forward-only Python worker on the GPU. They are never serialized out.
-
-The two halves communicate over a zero-copy shared-memory transport (iceoryx2) that carries **only small control-plane descriptors and scalar results** — block tables, token ids, sampled outputs. Tensors and KV pages stay GPU-resident and never cross the boundary.
+The configured model descriptions are `qwen3`, `sensenova`, and `bagel`. A server process loads exactly one description and exposes one served-model identity.
 
 ## Requirements
 
+| Component | Requirement |
+| --- | --- |
+| OS / architecture | Linux on x86-64 or aarch64 |
+| GPU | NVIDIA GPU with a CUDA-compatible driver for production model execution |
+| Python | Python 3.11+ with a compatible PyTorch installation |
+| Rust | Stable Rust toolchain with edition 2024 support |
 
-| Component | Requirement                                                                   |
-| --------- | ----------------------------------------------------------------------------- |
-| OS / arch | Linux, x86-64 or aarch64                                                      |
-| GPU       | NVIDIA GPU + recent driver (CUDA). `--device cpu` is available for CPU-compatible paths |
-| Python    | 3.11+ with **PyTorch 2.8+** built for your CUDA/arch                          |
-| Rust      | stable toolchain (`rustup`), edition 2024 — needed at install time            |
+The NVIDIA NGC PyTorch container is the recommended environment because it supplies an accelerator-matched PyTorch and CUDA toolchain.
 
-
-The tested baseline is the **NVIDIA NGC PyTorch container** (`nvcr.io/nvidia/pytorch`), which ships a CUDA/arch-matched PyTorch plus `flash-attn` and `triton`. A bare machine works too, as long as a working PyTorch is installed first.
-
-## Install
+## Installation
 
 ```bash
-# 1. Rust toolchain (skip if `cargo` is already on PATH).
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && . "$HOME/.cargo/env"
-
-# 2. A virtualenv that inherits the system PyTorch.
-uv venv --system-site-packages .venv && source .venv/bin/activate
-
-# 3. Install (builds the `uniserve` binary and the IPC extension via setuptools-rust).
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+. "$HOME/.cargo/env"
+uv venv --system-site-packages .venv
+source .venv/bin/activate
 uv pip install -e .
 ```
 
-## Quick start
+The installation builds the `uniserve` binary and the native worker IPC extension.
 
-With the venv active, serving is a single command:
+## Start a server
+
+Every server invocation supplies the model path or Hugging Face repository and its closed description:
 
 ```bash
-uniserve serve --model-path Qwen/Qwen3-32B          # downloads from the Hub on first run
-uniserve serve --model-path /path/to/Qwen3-32B      # …or serve a local model directory
+uniserve serve Qwen/Qwen3-32B \
+  --model-description qwen3 \
+  --served-model-name Qwen3-32B
 ```
 
-Then:
+Local model directories use the same command shape:
 
 ```bash
-# List models
-curl -s http://127.0.0.1:8000/v1/models
+uniserve serve /models/SenseNova-U1 \
+  --model-description sensenova \
+  --served-model-name SenseNova-U1
+```
 
-# Chat completion (Qwen3 is a reasoning model; disable thinking for a direct answer)
+Run `uniserve serve --help` for the complete option set.
+
+## Public HTTP API
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /health` | Process and route readiness |
+| `GET /metrics` | Runtime metrics |
+| `GET /version` | Build and protocol provenance |
+| `GET /v1/models` | Configured served-model identity and capabilities |
+| `POST /v1/chat/completions` | Streaming and non-streaming text, image-input, image-output, and interleaved generation |
+| `POST /v1/images/generations` | Single-image generation adapter for configured omni descriptions |
+
+List the configured model:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models
+```
+
+Submit a chat completion:
+
+```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "Qwen3-32B",
-    "messages": [{"role": "user", "content": "Give me one concise fact about matrix multiplication."}],
-    "max_tokens": 128,
-    "chat_template_kwargs": {"enable_thinking": false}
+    "messages": [{"role": "user", "content": "Give one concise fact about matrix multiplication."}],
+    "max_completion_tokens": 128
   }'
+```
 
-# Streaming
+Stream a chat completion:
+
+```bash
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen3-32B","messages":[{"role":"user","content":"Count to five."}],"stream":true}'
+  -d '{
+    "model": "Qwen3-32B",
+    "messages": [{"role": "user", "content": "Count to five."}],
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'
 ```
 
-Any OpenAI client works — point its `base_url` at `http://<host>:<port>/v1`.
-
-## Configuration
-
-Run `uniserve serve --help` for the full list. The most useful flags:
-
-
-| Flag                       | Default                           | Description                                                                               |
-| -------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------- |
-| `--model-path`             | —                                 | Local model directory or Hugging Face repo id                                             |
-| `--host` / `--port`        | `127.0.0.1` / `8000`              | HTTP bind address                                                                         |
-| `--uds <path>`             | —                                 | Bind a Unix domain socket instead of host/port                                            |
-| `--device`                 | `cuda`                            | `cuda`, `cpu`                                                                             |
-| `--tp-size`                | `1`                               | Tensor-parallel worker processes (set >1 for models that exceed one GPU)                  |
-| `--max-model-len`          | model's `max_position_embeddings` | Context-length cap                                                                        |
-| `--max-running-requests`   | engine default                    | Scheduler active-request limit                                                            |
-| `--max-concurrent-requests` | —                                | Front-door HTTP admission limit for in-flight inference requests                          |
-| `--max-num-batched-tokens` | engine default                    | Per-step token budget (chunked prefill)                                                   |
-| `--max-total-tokens`       | auto-fit                          | KV token capacity override                                                                |
-| `--attention-backend`      | `auto`                            | `auto` picks flashinfer/flash-attn/sgl-kernel if present, else a correct PyTorch fallback |
-| `--api-key`                | —                                 | Bearer token for public API routes                                                        |
-| `--admin-api-key`          | —                                 | Bearer token for sensitive management routes                                              |
-| `--request-timeout`        | —                                 | Per-request wall-clock timeout in seconds                                                 |
-| `--log-level` / `--log-level-http` | `INFO` / inherited        | Default and HTTP-target log levels                                                        |
-| `--log-stats`              | enabled                           | Set `false` to disable periodic engine statistics logging                                 |
-| `--enable-lora`            | off                               | Mount runtime LoRA management routes                                                      |
-| `--lora-allowed-path-prefixes` | —                              | Comma-separated absolute prefixes for local runtime LoRA adapter paths                    |
-| `SGLANG_GRPC_PORT`         | —                                 | gRPC Generate service port when `SGLANG_ENABLE_GRPC` is enabled                           |
-| `--served-model-name`      | `--model-path`                    | Public model id(s) returned by the API                                                    |
-
-
-KV-cache size is auto-fitted to free GPU memory; override with `--max-total-tokens`. Context length, when not pinned with `--max-model-len`, is read from the model config (e.g. 40960 for Qwen3-32B).
-
-### Multiple GPUs
-
-For a model that does not fit on one GPU, run it tensor-parallel with one worker rank per GPU:
+Generate one image from a SenseNova server:
 
 ```bash
-uniserve serve --model-path /path/to/big-model --tp-size 4
+curl -s http://127.0.0.1:8000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "SenseNova-U1",
+    "prompt": "A red bicycle against a brick wall in golden-hour light",
+    "n": 1,
+    "size": "2048x1152",
+    "steps": 50,
+    "seed": 42
+  }'
 ```
 
-## Dependencies
+## Serving configuration
 
-- **Runtime** (`uv pip install -e .`): PyTorch, transformers, safetensors, einops, accelerate, numpy, pillow, sentencepiece, huggingface_hub.
-- **gpu** (`uv pip install -e ".[gpu]"`): optional accelerator kernels (`flashinfer-python`); worker imports are guarded and fall back to a pure-PyTorch attention path when absent.
-- **dev** / **test** / **bench**: linting, type-checking, testing, and the serving benchmark harness.
+| Option | Default | Purpose |
+| --- | --- | --- |
+| Positional `MODEL` | Required | Local model directory or Hugging Face repository |
+| `--model-description` | Required | `qwen3`, `sensenova`, or `bagel` preprocessing and output contract |
+| `--served-model-name` | Resolved model ID | Single public model ID |
+| `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
+| `--uds` | Unset | Unix-domain listener instead of TCP |
+| `--device` | `cuda` | Worker device |
+| `--tp-size` | `1` | Tensor-parallel worker ranks |
+| `--max-model-len` | Model configuration | Context-length ceiling |
+| `--max-total-tokens` | Runtime sizing | KV token-capacity override |
+| `--max-running-requests` | `128` | Scheduler active-request bound |
+| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
+| `--chunked-prefill-size` | `8192` | Per-request prefill bound |
+| `--attention-backend` | `auto` | Worker attention provider selection |
+| `--api-key` | Unset | Bearer token for public routes |
+| `--request-timeout` | Unset | Request wall-clock timeout in seconds |
+| `--max-concurrent-requests` | Unset | HTTP in-flight admission bound |
+| `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
 
-## Development
-
-The `justfile` wraps the common local checks (install [just](https://github.com/casey/just) if not already available):
+For tensor-parallel execution, select one rank per participating GPU:
 
 ```bash
-just fmt                       # cargo fmt --check
-just clippy                    # cargo clippy -D warnings
-just test-rust                 # cargo test --workspace
-just lint                      # fmt + clippy + ruff + mypy
-just test-python-fast          # unit / contract / architecture tests
-just test-python-integration   # fake/simulated-backend tests
-just test-python-e2e           # black-box server tests
-just test-all                  # all of the above in one shot
+uniserve serve /models/Qwen3-32B \
+  --model-description qwen3 \
+  --served-model-name Qwen3-32B \
+  --tp-size 4
 ```
 
-GPU/model end-to-end validation is opt-in because it loads real checkpoints:
+## Development and verification
+
+The `justfile` exposes the canonical repository checks:
 
 ```bash
-UNISERVE_RUN_GPU_E2E=1 just test-python-gpu
+just lint
+just test-rust
+just test-python-fast
+just test-python-integration
+just test-python-e2e
 ```
 
-## Project layout
+Real-device end-to-end validation uses the configured model environment variables:
 
+```bash
+UNISERVE_QWEN3_MODEL=/models/Qwen3-32B \
+UNISERVE_SENSENOVA_MODEL=/models/SenseNova-U1 \
+UNISERVE_BAGEL_MODEL=/models/BAGEL-7B-MoT \
+UNISERVE_RUN_GPU_E2E=1 \
+just test-python-gpu
 ```
-crates/                        Rust workspace (see Cargo.toml for the full crate list)
-  foundation/                  core types, config, observability
-  protocol/                    wire formats, gRPC/OpenAI types, worker IPC (incl. the PyO3 extension)
-  engine/                      scheduler, KV, executor, worker-IPC host, process supervisor
-  frontend/                    tokenizer, chat templates, OpenAI/native APIs, parsers
-  server/                      HTTP + gRPC server apps
-  bin/                         the `uniserve` CLI binary
-uniserve_worker/               forward-only Python worker: models, layers, model loaders, runtime
-uniserve_eval/                  serving evaluation driver + measurement harness (`uniserve-eval`)
-justfile                       development & release recipes (replaces Makefile)
+
+The serving benchmark protocol is documented in [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md), and the executable profile matrix is defined in [`uniserve_eval/profiles.json`](uniserve_eval/profiles.json).
+
+## Repository layout
+
+```text
+crates/foundation/       Shared runtime types, configuration, and observability
+crates/protocol/         Engine and worker wire contracts
+crates/engine/           Scheduler, executor, worker transport, and engine process
+crates/frontend/         Model profiles, serving request funnel, and OpenAI adapters
+crates/server/           Configured HTTP application
+crates/bin/uniserve/     `uniserve` CLI
+uniserve_worker/         Forward-only Python model workers
+uniserve_eval/           Evaluation driver and benchmark harness
+specs/                   Builder-facing runtime and serving contracts
+docs/                    User-facing protocols and evaluation documentation
 ```
 
 ## License

@@ -135,7 +135,7 @@ class BenchmarkSpec:
     preprocessing: str = "dataset_default"
     measured_runs: int = 1
     server_topology: str = "single_server"
-    plan_evidence_policy: str = "declared_contract"
+    request_schema: str = "uniserve"
     acceptance_min_success: int = 1
     acceptance_max_failed: int = 0
     acceptance_min_images_per_success: float = 0.0
@@ -166,12 +166,8 @@ class BenchmarkSpec:
                 raise ValueError("denoise_updates requires a backend steps value")
         if self.measured_runs != 1:
             raise ValueError("one harness invocation is exactly one measured run")
-        if self.plan_evidence_policy not in {
-            "declared_contract",
-            "runtime_inspection",
-            "reference_protocol",
-        }:
-            raise ValueError("unsupported plan evidence policy")
+        if self.request_schema not in {"uniserve", "sglang", "vllm_omni"}:
+            raise ValueError("unsupported request schema")
         if (
             self.acceptance_min_success < 1
             or self.acceptance_max_failed < 0

@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request};
 use serde::de::DeserializeOwned;
-use uniserve_openai_types::Normalizable;
+use uniserve_protocol_adapters::openai::Normalizable;
 use validator::Validate;
 
 use crate::http::error::{ApiError, invalid_request};

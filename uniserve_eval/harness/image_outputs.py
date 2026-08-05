@@ -13,7 +13,7 @@ import binascii
 import hashlib
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from PIL import Image, UnidentifiedImageError
 
@@ -49,11 +49,14 @@ class DecodedImage:
         }
 
 
-@dataclass(frozen=True)
-class ImageOutputRequirements:
-    """Image-output work declared by one emitted request."""
+ImageOutputMode = Literal["none", "optional", "required"]
 
-    expected: bool
+
+@dataclass(frozen=True)
+class ImageOutputContract:
+    """Image-output obligations declared by one emitted request."""
+
+    mode: ImageOutputMode
     count: int | None
     count_is_cap: bool
     width: int | None
@@ -137,16 +140,17 @@ def inspect_image_bytes(data: bytes, *, declared_mime: str | None = None) -> Dec
     )
 
 
-def image_output_requirements(
-    payload: dict[str, Any], *, request_kind: str
-) -> ImageOutputRequirements:
-    """Extract only generated-image requirements, never input-image properties."""
+def image_output_contract(
+    payload: dict[str, Any], *, request_kind: str, task: str
+) -> ImageOutputContract:
+    """Extract generated-image obligations without inspecting input-image properties."""
     modalities = payload.get("modalities")
-    expected = request_kind == "images_generations" or (
+    image_enabled = request_kind == "images_generations" or (
         isinstance(modalities, list) and "image" in modalities
     )
-    if not expected:
-        return ImageOutputRequirements(False, None, False, None, None)
+    if not image_enabled:
+        return ImageOutputContract("none", None, False, None, None)
+    mode: ImageOutputMode = "optional" if task == "interleave" else "required"
     image_config = payload.get("image_config")
     image = image_config if isinstance(image_config, dict) else {}
     count = _positive_int(
@@ -163,8 +167,8 @@ def image_output_requirements(
         if parsed is not None:
             width = width or parsed[0]
             height = height or parsed[1]
-    return ImageOutputRequirements(
-        True,
+    return ImageOutputContract(
+        mode,
         count,
         request_kind == "openai_chat",
         width,
@@ -173,29 +177,29 @@ def image_output_requirements(
 
 
 def image_output_mismatch(
-    images: Sequence[DecodedImage], requirements: ImageOutputRequirements
+    images: Sequence[DecodedImage], contract: ImageOutputContract
 ) -> str | None:
     """Return the first declared-work mismatch, if any."""
-    if requirements.expected and not images:
+    if contract.mode == "required" and not images:
         return "protocol_missing_decoded_image"
     if (
-        requirements.count is not None
-        and requirements.count_is_cap
-        and len(images) > requirements.count
+        contract.count is not None
+        and contract.count_is_cap
+        and len(images) > contract.count
     ):
         return "protocol_image_count_mismatch"
     if (
-        requirements.count is not None
-        and not requirements.count_is_cap
-        and len(images) != requirements.count
+        contract.count is not None
+        and not contract.count_is_cap
+        and len(images) != contract.count
     ):
         return "protocol_image_count_mismatch"
-    if requirements.width is not None and any(
-        image.width != requirements.width for image in images
+    if contract.width is not None and any(
+        image.width != contract.width for image in images
     ):
         return "protocol_image_dimensions_mismatch"
-    if requirements.height is not None and any(
-        image.height != requirements.height for image in images
+    if contract.height is not None and any(
+        image.height != contract.height for image in images
     ):
         return "protocol_image_dimensions_mismatch"
     return None

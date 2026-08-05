@@ -52,6 +52,7 @@
     },
     "benchmark/server/qwen-uniserve": {
       "model": "${UNISERVE_QWEN3_MODEL}",
+      "model_description": "qwen3",
       "required_model_revision": {
         "repository": "Qwen/Qwen3-32B",
         "revision": "9216db5781bf21249d130ec9da846c4624c16137"
@@ -136,11 +137,12 @@
     },
     "benchmark/server/sensenova-uniserve": {
       "model": "${UNISERVE_SENSENOVA_MODEL}",
+      "model_description": "sensenova",
       "required_model_content": {
-        "kind": "directory",
-        "file_count": 21,
-        "total_size_bytes": 35121648810,
-        "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670"
+        "kind": "model_directory",
+        "file_count": 20,
+        "total_size_bytes": 35121626550,
+        "tree_sha256": "17e3f80729ff5ec69207494387cc8d6e259073c45840f82adfb7172c9be168c0"
       },
       "served_model_name": "SenseNova-U1",
       "port": 18082,
@@ -151,10 +153,10 @@
     "benchmark/server/sensenova-omni": {
       "model": "${UNISERVE_SENSENOVA_MODEL}",
       "required_model_content": {
-        "kind": "directory",
-        "file_count": 21,
-        "total_size_bytes": 35121648810,
-        "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670"
+        "kind": "model_directory",
+        "file_count": 20,
+        "total_size_bytes": 35121626550,
+        "tree_sha256": "17e3f80729ff5ec69207494387cc8d6e259073c45840f82adfb7172c9be168c0"
       },
       "served_model_name": "${UNISERVE_SENSENOVA_MODEL}",
       "host": "127.0.0.1",
@@ -183,11 +185,12 @@
     },
     "benchmark/server/bagel-uniserve": {
       "model": "${UNISERVE_BAGEL_MODEL}",
+      "model_description": "bagel",
       "required_model_content": {
-        "kind": "directory",
-        "file_count": 29,
-        "total_size_bytes": 29561613162,
-        "tree_sha256": "0ecdb77f50b149122bb28a709dbe66cfc9a226edc99e6bd1404227233b19857c"
+        "kind": "model_directory",
+        "file_count": 13,
+        "total_size_bytes": 29561610186,
+        "tree_sha256": "f1d61076bb5ce7f70d4b93b003576fabbb3f52681364c2de3848e9d531639c4f"
       },
       "served_model_name": "BAGEL",
       "port": 18083,
@@ -198,10 +201,10 @@
     "benchmark/server/bagel-omni": {
       "model": "${UNISERVE_BAGEL_MODEL}",
       "required_model_content": {
-        "kind": "directory",
-        "file_count": 29,
-        "total_size_bytes": 29561613162,
-        "tree_sha256": "0ecdb77f50b149122bb28a709dbe66cfc9a226edc99e6bd1404227233b19857c"
+        "kind": "model_directory",
+        "file_count": 13,
+        "total_size_bytes": 29561610186,
+        "tree_sha256": "f1d61076bb5ce7f70d4b93b003576fabbb3f52681364c2de3848e9d531639c4f"
       },
       "served_model_name": "${UNISERVE_BAGEL_MODEL}",
       "host": "127.0.0.1",
@@ -233,6 +236,7 @@
     },
     "gate/server/sensenova": {
       "model": "${UNISERVE_SENSENOVA_MODEL}",
+      "model_description": "sensenova",
       "served_model_name": "SenseNova-U1",
       "port": 18082,
       "cuda_visible_devices": "0,1",
@@ -254,6 +258,7 @@
     },
     "gate/server/bagel": {
       "model": "${UNISERVE_BAGEL_MODEL}",
+      "model_description": "bagel",
       "served_model_name": "BAGEL",
       "port": 18083,
       "description": "UniServe BAGEL correctness-gate server.",
@@ -568,7 +573,6 @@
           "sampling_seed": 42,
           "chat_template_kwargs": {"enable_thinking": true},
           "runtime_profile_id": "qwen3",
-          "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "und_only",
             "preprocessing": "sharegpt_token_length_shaping_v1"
           }
@@ -596,7 +600,7 @@
           "sampling_seed": 42,
           "chat_template_kwargs": {"enable_thinking": true},
           "runtime_profile_id": "qwen3-reference",
-          "plan_evidence_policy": "reference_protocol",
+          "request_schema": "sglang",
             "output_constraint": "und_only",
             "preprocessing": "sharegpt_token_length_shaping_v1"
           }
@@ -627,7 +631,6 @@
             "image_think": false,
             "image_t_eps": 0.02,
           "runtime_profile_id": "sensenova-u1",
-          "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "gen_only",
             "preprocessing": "mjhq_prompt_text_v1",
             "acceptance_min_images_per_success": 1.0
@@ -659,7 +662,7 @@
             "image_think": false,
             "image_t_eps": 0.02,
           "runtime_profile_id": "sensenova-u1-reference",
-          "plan_evidence_policy": "reference_protocol",
+          "request_schema": "vllm_omni",
             "output_constraint": "gen_only",
             "preprocessing": "mjhq_prompt_text_v1",
             "acceptance_min_images_per_success": 1.0
@@ -698,11 +701,9 @@
             "image_think": false,
             "image_t_eps": 0.02,
             "runtime_profile_id": "sensenova-u1",
-            "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "default",
             "preprocessing": "ueval_prompt_text_v1",
-            "acceptance_min_success": 32,
-            "acceptance_min_images_per_success": 1.0
+            "acceptance_min_success": 32
           }
         },
         "sensenova_ueval_stochastic_interleave_uniserve": {
@@ -738,11 +739,9 @@
             "image_think": false,
             "image_t_eps": 0.02,
             "runtime_profile_id": "sensenova-u1",
-            "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "default",
             "preprocessing": "ueval_prompt_text_v1",
-            "acceptance_min_success": 32,
-            "acceptance_min_images_per_success": 1.0
+            "acceptance_min_success": 32
           }
         },
         "sensenova_beans_i2t_uniserve": {
@@ -770,7 +769,6 @@
             "disable_ignore_eos": true,
             "wire": "openai_chat_json",
           "runtime_profile_id": "sensenova-u1",
-          "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "und_only",
             "preprocessing": "beans_jpeg95_seed42_v1"
           }
@@ -800,7 +798,7 @@
             "disable_ignore_eos": true,
             "wire": "openai_chat_json",
           "runtime_profile_id": "sensenova-u1-reference",
-          "plan_evidence_policy": "reference_protocol",
+          "request_schema": "vllm_omni",
             "output_constraint": "und_only",
             "preprocessing": "beans_jpeg95_seed42_v1"
           }
@@ -830,7 +828,6 @@
             "timestep_shift": 3.0,
             "image_think": false,
           "runtime_profile_id": "bagel",
-          "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "gen_only",
             "preprocessing": "mjhq_prompt_text_v1",
             "acceptance_min_images_per_success": 1.0
@@ -861,7 +858,7 @@
             "timestep_shift": 3.0,
             "image_think": false,
           "runtime_profile_id": "bagel-reference",
-          "plan_evidence_policy": "reference_protocol",
+          "request_schema": "vllm_omni",
             "output_constraint": "gen_only",
             "preprocessing": "mjhq_prompt_text_v1",
             "acceptance_min_images_per_success": 1.0
@@ -892,7 +889,6 @@
             "disable_ignore_eos": true,
             "wire": "openai_chat",
           "runtime_profile_id": "bagel",
-          "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "und_only",
             "preprocessing": "beans_jpeg95_seed42_v1"
           }
@@ -922,7 +918,7 @@
             "disable_ignore_eos": true,
             "wire": "openai_chat",
           "runtime_profile_id": "bagel-reference",
-          "plan_evidence_policy": "reference_protocol",
+          "request_schema": "vllm_omni",
             "output_constraint": "und_only",
             "preprocessing": "beans_jpeg95_seed42_v1"
           }

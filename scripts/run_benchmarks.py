@@ -133,7 +133,7 @@ HARNESS_FLAGS = {
     "preprocessing": "--preprocessing",
     "measured_runs": "--measured-runs",
     "server_topology": "--server-topology",
-    "plan_evidence_policy": "--plan-evidence-policy",
+    "request_schema": "--request-schema",
     "acceptance_min_success": "--acceptance-min-success",
     "acceptance_max_failed": "--acceptance-max-failed",
     "acceptance_min_images_per_success": "--acceptance-min-images-per-success",
@@ -1809,7 +1809,7 @@ def write_comparisons(
                     ),
                     "valid": bool(
                         artifact.get("valid") is True
-                        and artifact.get("valid_marker") == "canonical-valid-v2"
+                        and artifact.get("valid_marker") == "canonical-valid-v3"
                     ),
                     "request_count": summary.get("request_count"),
                     "ok_count": summary.get("ok_count"),

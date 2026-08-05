@@ -17,7 +17,7 @@ use uniserve_engine_runtime::{
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
-    SchedulingPolicy,
+    ModelDescription, SchedulingPolicy,
 };
 use uniserve_worker_ipc::WorkerLaunchConfig;
 
@@ -69,6 +69,24 @@ impl From<SchedulerPolicyArg> for SchedulingPolicy {
         match value {
             SchedulerPolicyArg::Fcfs => SchedulingPolicy::Fcfs,
             SchedulerPolicyArg::Priority => SchedulingPolicy::Priority,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ModelDescriptionArg {
+    Qwen3,
+    #[value(name = "sensenova")]
+    SenseNova,
+    Bagel,
+}
+
+impl From<ModelDescriptionArg> for ModelDescription {
+    fn from(value: ModelDescriptionArg) -> Self {
+        match value {
+            ModelDescriptionArg::Qwen3 => ModelDescription::Qwen3,
+            ModelDescriptionArg::SenseNova => ModelDescription::SenseNova,
+            ModelDescriptionArg::Bagel => ModelDescription::Bagel,
         }
     }
 }
@@ -262,6 +280,10 @@ pub(crate) struct SharedRuntimeArgs {
     /// public model ID.
     #[arg(value_name = "MODEL")]
     pub model: String,
+
+    /// Closed model description that owns configured preprocessing and output behavior.
+    #[arg(long, value_enum)]
+    pub model_description: ModelDescriptionArg,
 
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
@@ -510,6 +532,7 @@ impl SharedRuntimeArgs {
         Config {
             engine,
             model,
+            model_description: self.model_description.into(),
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -860,11 +883,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serve_requires_model_description() {
+        let result = <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "model"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn serve_rejects_zero_block_size() {
         let res = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
             "model",
+            "--model-description",
+            "qwen3",
             "--page-size",
             "0",
         ]);
@@ -872,9 +903,15 @@ mod tests {
     }
 
     #[test]
-    fn serve_accepts_valid_args_and_keeps_drain_default() {
-        let cli = <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "model"])
-            .expect("default serve invocation must parse");
+    fn serve_accepts_configured_model_description() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--model-description",
+            "qwen3",
+        ])
+        .expect("configured serve invocation must parse");
         let Command::Serve(args) = cli.command else {
             panic!("expected serve command");
         };
@@ -889,6 +926,8 @@ mod tests {
             "uniserve",
             "serve",
             "model",
+            "--model-description",
+            "qwen3",
             "--resp-slot-cap",
             "1048576",
         ])
@@ -910,6 +949,8 @@ mod tests {
             "uniserve",
             "serve",
             "model",
+            "--model-description",
+            "qwen3",
             "--resp-slot-cap",
             "1048576",
         ])
@@ -931,6 +972,8 @@ mod tests {
             "uniserve",
             "serve",
             "model",
+            "--model-description",
+            "qwen3",
             "--cuda-graph",
             "false",
             "--prefill-cuda-graph",
@@ -990,7 +1033,7 @@ mod tests {
 
     /// Parse a `serve` invocation and return its `SharedRuntimeArgs`.
     fn parse_serve(extra: &[&str]) -> SharedRuntimeArgs {
-        let mut argv = vec!["uniserve", "serve", "model"];
+        let mut argv = vec!["uniserve", "serve", "model", "--model-description", "qwen3"];
         argv.extend_from_slice(extra);
         let cli = <Cli as clap::Parser>::try_parse_from(argv)
             .expect("serve invocation under test must parse");

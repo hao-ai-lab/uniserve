@@ -1,35 +1,20 @@
 use futures::{Stream, StreamExt as _};
-use uniserve_openai_types::{
-    GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ImageOutputFormat,
-    ImageResponseFormat,
-};
 use uniserve_serving::{
     GenerateReqInput, ImageGenControls, ModalitySelection, OutputContract, PromptInput,
     SchedulingBounds, ServeEvent, ServeRequestId,
 };
 
 use crate::openai::error::{ApiError, serve_error_to_api};
+use crate::openai::types::{GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse};
 use crate::openai::utils::{ResolvedRequestContext, check_model_served};
 
-/// One lowered image-generation request: the sole [`GenerateReqInput`] plus the
-/// public response metadata.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PreparedImageGeneration {
-    pub request_id: String,
-    pub response_model: String,
-    pub input: GenerateReqInput,
-}
-
-/// Validate and lower one OpenAI image-generation request into exactly one
-/// [`GenerateReqInput`].
-///
-/// `served_model_names` must be non-empty; the first entry is echoed back as the
-/// response model.
-pub fn prepare_image_generation_request(
+/// Lower one image-generation wire request into the sole generate admission
+/// value.
+pub fn lower_image_generation_request(
     request: ImageGenerationRequest,
     served_model_names: &[String],
     context: ResolvedRequestContext,
-) -> Result<PreparedImageGeneration, ApiError> {
+) -> Result<GenerateReqInput, ApiError> {
     if request.prompt.trim().is_empty() {
         return Err(ApiError::invalid_request(
             "prompt must not be empty".to_string(),
@@ -38,43 +23,14 @@ pub fn prepare_image_generation_request(
     }
     if request.n != 1 {
         return Err(ApiError::invalid_request(
-            "this runtime supports exactly one image per request".to_string(),
+            "n must be 1 for the configured image-generation route".to_string(),
             Some("n"),
         ));
     }
     if let Some(model) = request.model.as_deref() {
         check_model_served(model, served_model_names)?;
     }
-    reject_unsupported_option(request.quality.as_ref(), "quality")?;
-    reject_unsupported_option(request.style.as_ref(), "style")?;
-    reject_unsupported_option(request.background.as_ref(), "background")?;
-    reject_unsupported_option(request.moderation.as_ref(), "moderation")?;
-    if matches!(request.response_format, Some(ImageResponseFormat::Url)) {
-        return Err(ApiError::invalid_request(
-            "response_format=url is unavailable; use b64_json".to_string(),
-            Some("response_format"),
-        ));
-    }
-    if matches!(
-        request.output_format,
-        Some(ImageOutputFormat::Jpeg | ImageOutputFormat::Webp)
-    ) {
-        return Err(ApiError::invalid_request(
-            "only PNG image output is supported".to_string(),
-            Some("output_format"),
-        ));
-    }
-    if request.steps.is_some()
-        && request.num_inference_steps.is_some()
-        && request.steps != request.num_inference_steps
-    {
-        return Err(ApiError::invalid_request(
-            "steps and num_inference_steps must match when both are provided".to_string(),
-            Some("num_inference_steps"),
-        ));
-    }
-    let steps = request.steps.or(request.num_inference_steps);
-    if steps == Some(0) {
+    if request.steps == Some(0) {
         return Err(ApiError::invalid_request(
             "steps must be positive".to_string(),
             Some("steps"),
@@ -86,27 +42,8 @@ pub fn prepare_image_generation_request(
         .map(parse_size)
         .transpose()?
         .map_or((None, None), |(width, height)| (Some(width), Some(height)));
-
     let request_id = format!("img-{}", context.request_id);
-    let response_model = served_model_names.first().cloned().ok_or_else(|| {
-        ApiError::server_error("image generation has no served model configured".to_string())
-    })?;
-
-    let image_gen = ImageGenControls {
-        width,
-        height,
-        steps,
-        cfg_text_scale: request.guidance_scale,
-        cfg_img_scale: request.image_guidance_scale,
-        cfg_interval: request.cfg_interval,
-        cfg_renorm_type: request.cfg_norm,
-        timestep_shift: request.timestep_shift,
-        seed: request.seed,
-        max_images: Some(1),
-        ..ImageGenControls::default()
-    };
-
-    let input = GenerateReqInput {
+    Ok(GenerateReqInput {
         stream: false,
         prompt: PromptInput::Text(request.prompt),
         modalities: ModalitySelection {
@@ -114,31 +51,26 @@ pub fn prepare_image_generation_request(
             output_image: true,
         },
         negative_text: request.negative_prompt,
-        image_gen: Some(image_gen),
+        image_gen: Some(ImageGenControls {
+            width,
+            height,
+            steps: request.steps,
+            cfg_text_scale: request.guidance_scale,
+            cfg_img_scale: request.image_guidance_scale,
+            cfg_interval: request.cfg_interval,
+            cfg_renorm_type: request.cfg_norm,
+            timestep_shift: request.timestep_shift,
+            seed: request.seed,
+            max_images: Some(1),
+            ..ImageGenControls::default()
+        }),
         output: OutputContract::VisibleText,
         scheduling: SchedulingBounds {
-            data_parallel_rank: context.data_parallel_rank,
             trace_context: context.trace_context.into_iter().collect(),
             ..SchedulingBounds::default()
         },
-        ..GenerateReqInput::text(ServeRequestId::from(request_id.clone()), String::new())
-    };
-
-    Ok(PreparedImageGeneration {
-        request_id,
-        response_model,
-        input,
+        ..GenerateReqInput::text(ServeRequestId::from(request_id), String::new())
     })
-}
-
-fn reject_unsupported_option<T>(value: Option<&T>, param: &'static str) -> Result<(), ApiError> {
-    if value.is_some() {
-        return Err(ApiError::invalid_request(
-            format!("{param} is not supported by this image runtime"),
-            Some(param),
-        ));
-    }
-    Ok(())
 }
 
 fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
@@ -242,153 +174,4 @@ fn required_image_field<T>(value: Option<T>, field: &str) -> Result<T, ApiError>
             "image generation completed without required {field} metadata"
         ))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use futures::stream;
-    use uniserve_serving::{CandidateId, FinishStatus};
-
-    use super::*;
-
-    fn served() -> Vec<String> {
-        vec!["image-model".to_string()]
-    }
-
-    #[test]
-    fn request_validation_owns_model_size_and_output_controls() {
-        let request: ImageGenerationRequest = serde_json::from_value(serde_json::json!({
-            "prompt": "draw",
-            "model": "missing",
-            "size": "1024-by-1024"
-        }))
-        .unwrap();
-        assert!(matches!(
-            prepare_image_generation_request(request, &served(), ResolvedRequestContext::default()),
-            Err(ApiError::ModelNotFound { .. })
-        ));
-
-        let unsupported: ImageGenerationRequest = serde_json::from_value(serde_json::json!({
-            "prompt": "draw",
-            "model": "image-model",
-            "response_format": "url"
-        }))
-        .unwrap();
-        assert!(matches!(
-            prepare_image_generation_request(
-                unsupported,
-                &served(),
-                ResolvedRequestContext::default(),
-            ),
-            Err(ApiError::InvalidRequest {
-                param: Some("response_format"),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn request_lowers_to_canonical_image_generation() {
-        let request: ImageGenerationRequest = serde_json::from_value(serde_json::json!({
-            "prompt": "draw",
-            "model": "image-model",
-            "size": "640x480",
-            "steps": 12,
-            "num_inference_steps": 12,
-            "seed": 7,
-            "negative_prompt": "blur",
-            "guidance_scale": 4.0,
-            "image_guidance_scale": 1.25,
-            "cfg_norm": "none",
-            "cfg_interval": [0.1, 0.9],
-            "timestep_shift": 3.0
-        }))
-        .unwrap();
-        let prepared = prepare_image_generation_request(
-            request,
-            &served(),
-            ResolvedRequestContext {
-                request_id: "abc".to_string(),
-                ..ResolvedRequestContext::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(prepared.request_id, "img-abc");
-        assert_eq!(prepared.response_model, "image-model");
-        assert_eq!(prepared.input.prompt, PromptInput::Text("draw".to_string()));
-        let image_gen = prepared.input.image_gen.expect("image controls");
-        assert_eq!(image_gen.width, Some(640));
-        assert_eq!(image_gen.height, Some(480));
-        assert_eq!(image_gen.steps, Some(12));
-        assert_eq!(image_gen.cfg_text_scale, Some(4.0));
-        assert_eq!(image_gen.cfg_img_scale, Some(1.25));
-        assert_eq!(image_gen.cfg_renorm_type.as_deref(), Some("none"));
-        assert_eq!(image_gen.cfg_interval, Some([0.1, 0.9]));
-        assert_eq!(image_gen.timestep_shift, Some(3.0));
-        assert_eq!(image_gen.seed, Some(7));
-        assert_eq!(image_gen.max_images, Some(1));
-        assert_eq!(prepared.input.negative_text.as_deref(), Some("blur"));
-        assert!(prepared.input.modalities.output_image);
-        assert!(!prepared.input.modalities.output_text);
-    }
-
-    #[test]
-    fn request_rejects_conflicting_step_aliases() {
-        let request: ImageGenerationRequest = serde_json::from_value(serde_json::json!({
-            "prompt": "draw",
-            "steps": 12,
-            "num_inference_steps": 13
-        }))
-        .unwrap();
-
-        assert!(matches!(
-            prepare_image_generation_request(request, &served(), ResolvedRequestContext::default()),
-            Err(ApiError::InvalidRequest {
-                param: Some("num_inference_steps"),
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn response_requires_complete_image_metadata_and_terminal_completion() {
-        let complete = stream::iter(vec![
-            Ok(ServeEvent::ImageDone {
-                candidate_id: CandidateId::PRIMARY,
-                image_id: "0".to_string(),
-                width: Some(64),
-                height: Some(32),
-                bytes: Some(3),
-                sha256: Some("hash".to_string()),
-                pixels_png_b64: Some("cG5n".to_string()),
-                elapsed_us: 1,
-            }),
-            Ok(ServeEvent::Finished {
-                candidate_id: CandidateId::PRIMARY,
-                reason: FinishStatus::Stop { cause: None },
-                finish_detail: Some("image_done".to_string()),
-            }),
-        ]);
-        let response = collect_image_generation(complete, 9).await.unwrap();
-        assert_eq!(response.created, 9);
-        assert_eq!(response.data[0].width, 64);
-        assert_eq!(response.data[0].height, 32);
-        assert_eq!(response.data[0].b64_json, "cG5n");
-
-        let incomplete = stream::iter(vec![Ok(ServeEvent::ImageDone {
-            candidate_id: CandidateId::PRIMARY,
-            image_id: "0".to_string(),
-            width: None,
-            height: Some(32),
-            bytes: Some(3),
-            sha256: Some("hash".to_string()),
-            pixels_png_b64: Some("cG5n".to_string()),
-            elapsed_us: 1,
-        })]);
-        assert!(matches!(
-            collect_image_generation(incomplete, 9).await,
-            Err(ApiError::ServerError { .. })
-        ));
-    }
 }

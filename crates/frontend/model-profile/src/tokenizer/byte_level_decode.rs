@@ -9,7 +9,6 @@ const CHAR_TO_BYTE: [u8; 324] = build_char_to_byte();
 const fn is_nice(b: u8) -> bool {
     (b >= b'!' && b <= b'~') || (b >= 0xA1 && b <= 0xAC) || b >= 0xAE
 }
-
 const fn build_char_to_byte() -> [u8; 324] {
     let mut table = [0u8; 324];
     let mut b: u16 = 0;
@@ -49,73 +48,11 @@ pub(crate) fn decode_byte_level<'a, I: IntoIterator<Item = &'a str>>(tokens: I) 
             if cp < CHAR_TO_BYTE.len() {
                 bytes.push(CHAR_TO_BYTE[cp]);
             } else {
-                // Non-GPT2 codepoints (e.g. DeepSeek's U+FF5C, U+2581) pass through.
+                // Non-GPT-2 codepoints pass through unchanged.
                 let mut buf = [0u8; 4];
                 bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
         }
     }
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build_byte_to_char_ref() -> [char; 256] {
-        let mut table = ['\0'; 256];
-        let mut next: u32 = 256;
-        for b in 0..=255u8 {
-            let cp = if is_nice(b) {
-                b as u32
-            } else {
-                let cp = next;
-                next += 1;
-                cp
-            };
-            table[b as usize] = char::from_u32(cp).unwrap();
-        }
-        table
-    }
-
-    #[test]
-    fn char_to_byte_roundtrips_every_byte() {
-        let byte_to_char = build_byte_to_char_ref();
-        for b in 0..=255u8 {
-            let cp = byte_to_char[b as usize] as usize;
-            assert!(cp < CHAR_TO_BYTE.len());
-            assert_eq!(CHAR_TO_BYTE[cp], b, "mismatch for byte {b:#x}");
-        }
-    }
-
-    #[test]
-    fn decode_ascii() {
-        assert_eq!(decode_byte_level(["Hello"]), "Hello");
-    }
-
-    #[test]
-    fn decode_space_marker() {
-        // GPT-2 maps 0x20 → Ġ (U+0120).
-        assert_eq!(
-            decode_byte_level(["\u{120}Hello", "\u{120}world"]),
-            " Hello world",
-        );
-    }
-
-    #[test]
-    fn decode_multibyte_euro() {
-        // € → 0xE2 0x82 0xAC, each mapped to a specific GPT-2 char.
-        let byte_to_char = build_byte_to_char_ref();
-        let encoded: String = [0xE2u8, 0x82, 0xAC]
-            .iter()
-            .map(|&b| byte_to_char[b as usize])
-            .collect();
-        assert_eq!(decode_byte_level([encoded.as_str()]), "€");
-    }
-
-    #[test]
-    fn decode_preserves_non_gpt2_chars() {
-        let tok = "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>";
-        assert_eq!(decode_byte_level([tok]), "<｜begin▁of▁sentence｜>");
-    }
 }

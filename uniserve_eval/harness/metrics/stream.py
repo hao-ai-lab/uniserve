@@ -32,8 +32,6 @@ from .common import RequestRecord, _max, _mean, _std, distribution, percentile
 UEVAL_LATENCY_DEFINITION = {
     "clock": "time.perf_counter",
     "event_timestamp": "client_sse_receive_before_parse",
-    "server_public_commit_clock": "server_process_monotonic",
-    "public_commit_correlation": "scheduler_event_sequence_and_fixed_semantic_root",
     "visible_text": "nonempty_content_or_reasoning",
     "visible_image": "received_image_part_that_decodes_and_conforms",
     "segment": "maximal_consecutive_visible_events_of_one_modality",
@@ -43,7 +41,13 @@ UEVAL_LATENCY_DEFINITION = {
     "tpot": "request_e2e_minus_ttft_divided_by_server_completion_tokens_minus_one",
     "image_latency": "decoded_image_event_minus_request_send",
     "aggregation": "arithmetic_mean_with_complete_distributions",
-    "missing_sample": "invalidate_point",
+    "missing_client_sample": "invalidate_point",
+    "server_attribution": {
+        "availability": "optional",
+        "clock": "server_process_monotonic",
+        "correlation": "scheduler_event_sequence_and_fixed_semantic_root",
+        "missing_or_partial": "warn",
+    },
 }
 UEVAL_LATENCY_DEFINITION_DIGEST = hashlib.sha256(
     json.dumps(
@@ -250,13 +254,12 @@ def _default_image_block(successful: list[RequestRecord], dur_s: float) -> dict[
 
 
 def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
-    multimodal = [record for record in successful if record.images > 0]
-    if not multimodal:
+    if not successful or any(record.task != "interleave" for record in successful):
         return None
-    timings = [_request_transition_timing(record) for record in multimodal]
+    timings = [_request_transition_timing(record) for record in successful]
     transitions = [float(timing["expected_transition_count"]) for timing in timings]
     patterns: dict[str, int] = {}
-    for record, timing in zip(multimodal, timings, strict=True):
+    for record, timing in zip(successful, timings, strict=True):
         pattern = str(timing["signature"] or "->".join(record.output_modalities))
         patterns[pattern] = patterns.get(pattern, 0) + 1
     complete_timings = [timing for timing in timings if timing["valid"] is True]
@@ -297,10 +300,25 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
     timestamped_event_count = sum(int(timing["timestamped_event_count"]) for timing in timings)
     expected_transition_count = sum(int(timing["expected_transition_count"]) for timing in timings)
     measured_transition_count = len(transition_latencies)
+    server_attribution_statuses = {
+        record.request_id: str(timing["server_attribution_status"])
+        for record, timing in zip(successful, timings, strict=True)
+    }
+    server_attribution_counts = {
+        status: sum(value == status for value in server_attribution_statuses.values())
+        for status in ("complete", "partial", "unavailable")
+    }
+    server_attribution_status = (
+        "complete"
+        if server_attribution_counts["complete"] == len(timings)
+        else "unavailable"
+        if server_attribution_counts["unavailable"] == len(timings)
+        else "partial"
+    )
     return {
         "requests_with_text_and_image": sum(
             "text" in record.output_modalities and "image" in record.output_modalities
-            for record in multimodal
+            for record in successful
         ),
         "modality_transitions": distribution(transitions),
         "patterns": patterns,
@@ -339,6 +357,11 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
             "public_commit_non_monotonic_count": sum(
                 int(timing["public_commit_non_monotonic_count"]) for timing in timings
             ),
+            "server_attribution": {
+                "status": server_attribution_status,
+                "request_counts": server_attribution_counts,
+                "request_statuses": server_attribution_statuses,
+            },
             "expected_transition_count": expected_transition_count,
             "measured_transition_count": measured_transition_count,
             "transition_sample_coverage": (
@@ -348,7 +371,7 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
             ),
             "request_signatures": {
                 record.request_id: timing["signature"]
-                for record, timing in zip(multimodal, timings, strict=True)
+                for record, timing in zip(successful, timings, strict=True)
             },
             "transition_latency_ms": distribution(transition_latencies, scale=1000),
             "text_to_image_transition_latency_ms": distribution(text_to_image, scale=1000),
@@ -371,7 +394,7 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
             ),
             "boundary_correlations": {
                 record.request_id: timing["boundary_correlations"]
-                for record, timing in zip(multimodal, timings, strict=True)
+                for record, timing in zip(successful, timings, strict=True)
             },
         },
     }
@@ -422,10 +445,7 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
             committed_at = float(public_commit["committed_at"])
             if previous_public_seq is not None and event_seq <= previous_public_seq:
                 public_commit_non_monotonic_count += 1
-            if (
-                previous_public_timestamp is not None
-                and committed_at < previous_public_timestamp
-            ):
+            if previous_public_timestamp is not None and committed_at < previous_public_timestamp:
                 public_commit_non_monotonic_count += 1
             previous_public_seq = event_seq
             previous_public_timestamp = committed_at
@@ -497,13 +517,26 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
     valid = valid and timestamped_event_count == visible_event_count
     valid = valid and ambiguous_event_count == 0
     valid = valid and non_monotonic_event_count == 0
-    valid = valid and len(segments) >= 2
+    valid = valid and len(segments) >= 1
     valid = valid and signature == "->".join(record.output_modalities)
     valid = valid and len(transition_latencies) == expected_transition_count
-    valid = valid and public_commit_event_count == visible_event_count
-    valid = valid and public_commit_invalid_count == 0
-    valid = valid and public_commit_non_monotonic_count == 0
-    valid = valid and len(server_transition_latencies) == expected_transition_count
+    if record.images > 0:
+        valid = valid and len(segments) >= 2 and expected_transition_count > 0
+    else:
+        valid = valid and signature == "text" and expected_transition_count == 0
+    server_attribution_complete = (
+        public_commit_event_count == visible_event_count
+        and public_commit_invalid_count == 0
+        and public_commit_non_monotonic_count == 0
+        and len(server_transition_latencies) == expected_transition_count
+    )
+    server_attribution_status = (
+        "complete"
+        if server_attribution_complete
+        else "unavailable"
+        if public_commit_event_count == 0 and public_commit_invalid_count == 0
+        else "partial"
+    )
     return {
         "valid": valid,
         "signature": signature,
@@ -514,6 +547,7 @@ def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
         "public_commit_event_count": public_commit_event_count,
         "public_commit_invalid_count": public_commit_invalid_count,
         "public_commit_non_monotonic_count": public_commit_non_monotonic_count,
+        "server_attribution_status": server_attribution_status,
         "expected_transition_count": expected_transition_count,
         "transition_latencies": transition_latencies if valid else [],
         "server_transition_latencies": server_transition_latencies if valid else [],

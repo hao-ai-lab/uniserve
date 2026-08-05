@@ -342,7 +342,7 @@ def _load_point(directory: Path, *, expected_role: str) -> dict[str, Any]:
     return {
         "valid": bool(
             artifact.get("valid") is True
-            and artifact.get("valid_marker") == "canonical-valid-v2"
+            and artifact.get("valid_marker") == "canonical-valid-v4"
             and role == expected_role
         ),
         "role": role,

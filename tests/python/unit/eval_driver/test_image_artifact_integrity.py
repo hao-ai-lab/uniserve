@@ -127,6 +127,45 @@ def test_openai_chat_accepts_non_streaming_json_response() -> None:
     assert record.token_timing_available is False
 
 
+def test_interleave_text_response_succeeds_with_image_warning() -> None:
+    request = TaskRequest(
+        endpoint="/v1/chat/completions",
+        kind="openai_chat",
+        payload={
+            "messages": [{"role": "user", "content": "explain and illustrate"}],
+            "modalities": ["text", "image"],
+            "image_config": {"num_images": 4, "width": 2, "height": 3},
+            "stream": True,
+        },
+    )
+    response = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "Follow these steps."},
+            }
+        ],
+        "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+    }
+
+    record = asyncio.run(
+        send_request(
+            _StreamingJsonClient(response),
+            "http://server",
+            request,
+            "interleave-1",
+            task="interleave",
+        )
+    )
+
+    assert record.success is True
+    assert record.classifier == "ok"
+    assert record.image_output_mode == "optional"
+    assert record.images == 0
+    assert record.warnings == ["no_generated_image"]
+    assert record.record_dict()["warnings"] == ["no_generated_image"]
+
+
 def test_images_generations_decodes_exact_bytes_and_records_only_metadata() -> None:
     image_bytes = _image_bytes()
     request = TaskRequest(
@@ -153,6 +192,28 @@ def test_images_generations_decodes_exact_bytes_and_records_only_metadata() -> N
     persisted = record.record_dict()
     assert persisted["image_outputs"] == [record.decoded_images[0].metadata_dict()]
     assert _encoded(image_bytes) not in json.dumps(persisted)
+
+
+def test_images_generations_requires_a_decoded_image() -> None:
+    request = TaskRequest(
+        endpoint="/v1/images/generations",
+        kind="images_generations",
+        payload={"prompt": "x", "size": "2x3", "n": 1},
+    )
+
+    record = asyncio.run(
+        send_request(
+            _JsonClient({"data": []}),
+            "http://server",
+            request,
+            "image-1",
+            task="t2i",
+        )
+    )
+
+    assert record.success is False
+    assert record.classifier == "protocol_empty_image_data"
+    assert record.warnings == []
 
 
 def test_chat_json_image_part_must_match_declared_count_and_dimensions() -> None:
@@ -201,7 +262,7 @@ def test_streaming_image_delta_uses_the_same_decoder_and_rejects_mime_mismatch()
     record = RequestRecord(
         request_id="image-1",
         task="default",
-        generated_images_expected=True,
+        image_output_mode="required",
         requested_image_count=1,
         requested_image_width=2,
         requested_image_height=3,
@@ -289,7 +350,7 @@ def test_runner_commits_exact_samples_and_bundle_rejects_file_drift(tmp_path, mo
             classifier="ok",
             latency=1.0,
             images=1,
-            generated_images_expected=True,
+            image_output_mode="required",
             requested_image_count=1,
             requested_image_width=2,
             requested_image_height=3,
@@ -299,15 +360,11 @@ def test_runner_commits_exact_samples_and_bundle_rejects_file_drift(tmp_path, mo
     async def fake_run_load(items, **kwargs):
         return [await kwargs["submit"](items[0])], 1.0
 
-    async def fake_plan(self, _client, _rows):
-        return {"source": "declared_contract", "plan": harness_runner.plan_summary(self.spec)}
-
     async def fake_server_info(self, _client):
         del self
         return None
 
     monkeypatch.setattr(BenchmarkRunner, "_submit", fake_submit)
-    monkeypatch.setattr(BenchmarkRunner, "_collect_plan_evidence", fake_plan)
     monkeypatch.setattr(BenchmarkRunner, "_fetch_server_info", fake_server_info)
     monkeypatch.setattr(harness_runner, "run_load", fake_run_load)
 

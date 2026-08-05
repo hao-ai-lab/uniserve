@@ -45,23 +45,21 @@ from uniserve_eval.harness.datasets import (
     trace_items,
 )
 from uniserve_eval.harness.image_outputs import (
+    image_output_contract,
     image_output_mismatch,
-    image_output_requirements,
     inspect_image_bytes,
 )
 from uniserve_eval.harness.metrics import summarize_image
 from uniserve_eval.harness.metrics.common import RequestRecord
 from uniserve_eval.harness.report import (
     benchmark_contract,
-    benchmark_contract_is_valid,
     build_summary,
-    plan_summary,
 )
 from uniserve_eval.harness.response_classifier import (
     classify_json_image_response,
     classify_openai_events,
 )
-from uniserve_eval.harness.runner import RunResult, reference_request_summary
+from uniserve_eval.harness.runner import RunResult
 from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
 from uniserve_eval.harness.sse import (
     aiter_sse_events,
@@ -120,7 +118,7 @@ def _successful_image_record(
         latency=1.0,
         images=1,
         classifier="ok",
-        generated_images_expected=True,
+        image_output_mode="required",
         requested_image_count=1,
         requested_image_width=width,
         requested_image_height=height,
@@ -129,29 +127,35 @@ def _successful_image_record(
 
 
 def test_streamed_multimodal_image_count_is_an_upper_bound() -> None:
-    requirements = image_output_requirements(
+    contract = image_output_contract(
         {
             "modalities": ["text", "image"],
             "image_config": {"num_images": 4},
         },
         request_kind="openai_chat",
+        task="interleave",
     )
     images = [inspect_image_bytes(_png_bytes()) for _ in range(2)]
 
-    assert requirements.count_is_cap is True
-    assert image_output_mismatch(images, requirements) is None
-    assert image_output_mismatch(images * 3, requirements) == "protocol_image_count_mismatch"
+    assert contract.mode == "optional"
+    assert contract.count_is_cap is True
+    assert image_output_mismatch([], contract) is None
+    assert image_output_mismatch(images, contract) is None
+    assert image_output_mismatch(images * 3, contract) == "protocol_image_count_mismatch"
 
 
 def test_image_generation_count_is_exact() -> None:
-    requirements = image_output_requirements(
+    contract = image_output_contract(
         {"n": 4},
         request_kind="images_generations",
+        task="t2i",
     )
     images = [inspect_image_bytes(_png_bytes()) for _ in range(2)]
 
-    assert requirements.count_is_cap is False
-    assert image_output_mismatch(images, requirements) == "protocol_image_count_mismatch"
+    assert contract.mode == "required"
+    assert contract.count_is_cap is False
+    assert image_output_mismatch([], contract) == "protocol_missing_decoded_image"
+    assert image_output_mismatch(images, contract) == "protocol_image_count_mismatch"
 
 
 # --- summarize_image (Family B aggregate fields) ------------------------------
@@ -408,6 +412,7 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
         prompt_len_source="server_usage",
         output_len_source="server_usage",
         generated_text="intro caption",
+        image_output_mode="optional",
         images=1,
         image_latencies=[3.0],
         output_modalities=["text", "image", "text"],
@@ -507,6 +512,121 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
     assert conformance["mismatched_request_ids"] == ["interleave-1"]
 
 
+def test_interleave_summary_counts_text_only_response_as_warned_success() -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.INTERLEAVE,
+        model="SenseNova-U1",
+        num_prompts=2,
+        max_tokens=256,
+        max_images=1,
+        width=2,
+        height=3,
+        steps=50,
+        denoise_updates=50,
+        ignore_eos=False,
+        acceptance_min_success=2,
+    )
+    image = inspect_image_bytes(_png_bytes())
+    multimodal = RequestRecord(
+        request_id="interleave-1",
+        task="interleave",
+        success=True,
+        classifier="ok",
+        latency=3.0,
+        ttft=0.5,
+        token_timing_available=True,
+        prompt_len=16,
+        output_len=3,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="intro caption",
+        image_output_mode="optional",
+        requested_image_count=1,
+        requested_image_count_is_cap=True,
+        requested_image_width=2,
+        requested_image_height=3,
+        images=1,
+        image_latencies=[2.0],
+        output_modalities=["text", "image"],
+        modality_events=[
+            {
+                "modalities": ["text"],
+                "client_time": 0.5,
+                "text_bytes": 5,
+                "image_count": 0,
+                "public_commit": _public_commit(1, "text", 10.0),
+            },
+            {
+                "modalities": ["image"],
+                "client_time": 2.0,
+                "text_bytes": 0,
+                "image_count": 1,
+                "public_commit": _public_commit(2, "image", 11.0),
+            },
+        ],
+        decoded_images=[image],
+    )
+    text_only = RequestRecord(
+        request_id="interleave-2",
+        task="interleave",
+        success=True,
+        classifier="ok",
+        warnings=["no_generated_image"],
+        latency=2.0,
+        ttft=0.25,
+        token_timing_available=True,
+        prompt_len=12,
+        output_len=3,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="textual steps",
+        image_output_mode="optional",
+        requested_image_count=1,
+        requested_image_count_is_cap=True,
+        requested_image_width=2,
+        requested_image_height=3,
+        output_modalities=["text"],
+        modality_events=[
+            {
+                "modalities": ["text"],
+                "client_time": 0.25,
+                "text_bytes": 13,
+                "image_count": 0,
+                "public_commit": _public_commit(3, "text", 12.0),
+            }
+        ],
+    )
+    contract = benchmark_contract(spec, [{"id": "interleave-1"}, {"id": "interleave-2"}])
+
+    summary = build_summary(
+        spec,
+        "http://x",
+        [multimodal, text_only],
+        dur_s=3.0,
+        contract=contract,
+    )
+
+    assert summary["ok_count"] == 2
+    assert summary["failed_count"] == 0
+    assert summary["warnings"] == {
+        "request_count": 1,
+        "total_count": 1,
+        "counts": {"no_generated_image": 1},
+    }
+    assert summary["artifact"]["warnings"] == summary["warnings"]
+    assert summary["artifact"]["valid"] is True
+    assert summary["metrics"]["ttft_ms"]["count"] == 2
+    assert summary["metrics"]["tpot_ms"]["count"] == 2
+    timing = summary["metrics"]["modality_interleave"]["transition_timing"]
+    assert timing["request_count"] == 2
+    assert timing["complete_request_count"] == 2
+    assert timing["request_signatures"] == {
+        "interleave-1": "text->image",
+        "interleave-2": "text",
+    }
+    assert timing["transition_latency_ms"]["count"] == 1
+
+
 @pytest.mark.parametrize(
     "events",
     [
@@ -532,21 +652,6 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
                 "image_count": 1,
             },
         ],
-        [
-            {
-                "modalities": ["text"],
-                "client_time": 1.0,
-                "text_bytes": 5,
-                "image_count": 0,
-                "public_commit": _public_commit(1, "text", 1.0),
-            },
-            {
-                "modalities": ["image"],
-                "client_time": 2.0,
-                "text_bytes": 0,
-                "image_count": 1,
-            },
-        ],
     ],
 )
 def test_interleave_timing_requires_unambiguous_complete_event_timestamps(
@@ -563,7 +668,6 @@ def test_interleave_timing_requires_unambiguous_complete_event_timestamps(
         steps=50,
         denoise_updates=50,
         ignore_eos=False,
-        acceptance_min_images_per_success=1.0,
     )
     record = RequestRecord(
         request_id="interleave-1",
@@ -578,6 +682,7 @@ def test_interleave_timing_requires_unambiguous_complete_event_timestamps(
         prompt_len_source="server_usage",
         output_len_source="server_usage",
         generated_text="intro",
+        image_output_mode="optional",
         images=1,
         image_latencies=[2.0],
         output_modalities=["text", "image"],
@@ -591,6 +696,99 @@ def test_interleave_timing_requires_unambiguous_complete_event_timestamps(
     assert summary["artifact"]["generation_conformance"]["valid"] is True
     assert summary["artifact"]["checks"]["interleave_latency_conformance"] is False
     assert summary["artifact"]["valid"] is False
+
+
+@pytest.mark.parametrize(
+    ("events", "attribution_status", "warning"),
+    [
+        (
+            [
+                {
+                    "modalities": ["text"],
+                    "client_time": 1.0,
+                    "text_bytes": 5,
+                    "image_count": 0,
+                },
+                {
+                    "modalities": ["image"],
+                    "client_time": 2.0,
+                    "text_bytes": 0,
+                    "image_count": 1,
+                },
+            ],
+            "unavailable",
+            "server_public_commit_unavailable",
+        ),
+        (
+            [
+                {
+                    "modalities": ["text"],
+                    "client_time": 1.0,
+                    "text_bytes": 5,
+                    "image_count": 0,
+                    "public_commit": _public_commit(1, "text", 1.0),
+                },
+                {
+                    "modalities": ["image"],
+                    "client_time": 2.0,
+                    "text_bytes": 0,
+                    "image_count": 1,
+                },
+            ],
+            "partial",
+            "server_public_commit_partial",
+        ),
+    ],
+)
+def test_interleave_timing_uses_complete_client_boundaries(
+    events: list[dict[str, object]], attribution_status: str, warning: str
+) -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.INTERLEAVE,
+        model="SenseNova-U1",
+        num_prompts=1,
+        max_tokens=256,
+        max_images=1,
+        width=2,
+        height=3,
+        steps=50,
+        denoise_updates=50,
+        ignore_eos=False,
+    )
+    record = RequestRecord(
+        request_id="interleave-1",
+        task="interleave",
+        success=True,
+        classifier="ok",
+        latency=3.0,
+        ttft=0.5,
+        token_timing_available=True,
+        prompt_len=16,
+        output_len=3,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="intro",
+        image_output_mode="optional",
+        images=1,
+        image_latencies=[2.0],
+        output_modalities=["text", "image"],
+        modality_events=events,
+        decoded_images=[inspect_image_bytes(_png_bytes())],
+    )
+    contract = benchmark_contract(spec, [{"id": "interleave-1"}])
+
+    summary = build_summary(spec, "http://x", [record], dur_s=3.0, contract=contract)
+
+    assert summary["artifact"]["checks"]["interleave_latency_conformance"] is True
+    assert summary["artifact"]["valid"] is True
+    assert summary["warnings"] == {
+        "request_count": 1,
+        "total_count": 1,
+        "counts": {warning: 1},
+    }
+    timing = summary["metrics"]["modality_interleave"]["transition_timing"]
+    assert timing["server_attribution"]["status"] == attribution_status
+    assert timing["transition_latency_ms"]["mean"] == pytest.approx(1000.0)
 
 
 def test_interleave_dataset_serves_ueval_prompts_verbatim(
@@ -787,14 +985,14 @@ def test_i2t_task_openai_chat_json_wire_is_not_streamed() -> None:
     assert "extra_args" not in request.payload
 
 
-def test_i2t_reference_protocol_receives_reference_extra_args() -> None:
+def test_i2t_vllm_omni_request_schema_receives_extra_args() -> None:
     request = I2TTask(
         BenchmarkSpec(
             task=TaskName.I2T,
             model="SenseNova-U1",
             max_tokens=256,
             wire="openai_chat_json",
-            plan_evidence_policy="reference_protocol",
+            request_schema="vllm_omni",
         )
     ).build_request({"prompt": "Describe this image.", "input_image_b64": "QUJD"})
 
@@ -898,13 +1096,13 @@ def test_chat_task_builders_preserve_declared_sampling_contract(
         assert "chat_template_kwargs" not in request.payload
 
 
-def test_reference_text_protocol_receives_template_kwargs() -> None:
+def test_sglang_request_schema_receives_template_kwargs() -> None:
     request = TextTask(
         BenchmarkSpec(
             task=TaskName.TEXT,
             model="M",
             chat_template_kwargs={"enable_thinking": True},
-            plan_evidence_policy="reference_protocol",
+            request_schema="sglang",
         )
     ).build_request({"prompt": "p"})
 
@@ -1337,6 +1535,7 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
         "ok_count",
         "failed_count",
         "classifiers",
+        "warnings",
         "metric_family",
         "metrics",
         "artifact",
@@ -1350,13 +1549,13 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
     assert summary["ok_count"] == 1
     assert summary["failed_count"] == 1
     assert summary["classifiers"] == {"ok": 1, "model_error": 1}
+    assert summary["warnings"] == {"request_count": 0, "total_count": 0, "counts": {}}
     assert summary["elapsed_s"] == pytest.approx(10.0)
     assert summary["load"]["mode"] == "saturation"
     assert summary["load"]["request_rate"] == "inf"
     assert summary["metrics"]["completed_images"] == 1
     assert summary["artifact"]["valid"] is False
     assert summary["artifact"]["valid_marker"] is None
-    assert summary["artifact"]["plan_summary"]["runtime_profile_id"] == "unspecified"
 
 
 def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
@@ -1376,99 +1575,6 @@ def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
 
     assert summary["endpoint"] == "/v1/chat/completions"
     assert summary["spec"]["endpoint"] == "/v1/chat/completions"
-
-
-def test_runtime_plan_evidence_is_required_and_preserved() -> None:
-    spec = BenchmarkSpec(
-        task=TaskName.T2I,
-        model="M",
-        num_prompts=1,
-        wire="openai_chat_json",
-        runtime_profile_id="dialect",
-        output_constraint="gen_only",
-        plan_evidence_policy="runtime_inspection",
-        acceptance_min_images_per_success=1.0,
-    )
-    records = [_successful_image_record()]
-
-    missing = build_summary(spec, "http://x", records, dur_s=1.0)
-    assert missing["artifact"]["checks"]["plan_evidence"] is False
-    assert missing["artifact"]["valid"] is False
-
-    actual_plan = {
-        "profile_id": "profile",
-        "dialect_id": "dialect",
-        "generation": {
-            "constraint": "gen_only",
-            "max_tokens": None,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "ignore_eos": True,
-            "image": {"seed": 42},
-        },
-        "cache": {"read_enabled": True, "write_enabled": True},
-        "adapter": "Base",
-    }
-    summary = build_summary(
-        spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence={
-            "source": "runtime_inspection",
-            "endpoint": "/v1/chat/completions/plan",
-            "plan": actual_plan,
-            "request": reference_request_summary(
-                T2ITask(spec).build_request({"prompt": "image prompt"})
-            ),
-        },
-        contract=benchmark_contract(spec, [{"id": "a"}]),
-        server_info={"source_endpoint": "/server_info", "payload": {"profile": "test"}},
-    )
-    assert summary["artifact"]["checks"]["plan_evidence"] is True
-    assert summary["artifact"]["plan_summary"] == actual_plan
-    assert summary["artifact"]["valid"] is True
-
-    mismatched = build_summary(
-        spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence={
-            "source": "runtime_inspection",
-            "endpoint": "/v1/chat/completions/plan",
-            "plan": {**actual_plan, "dialect_id": "other"},
-            "request": reference_request_summary(
-                T2ITask(spec).build_request({"prompt": "image prompt"})
-            ),
-        },
-        contract=benchmark_contract(spec, [{"id": "a"}]),
-        server_info={"source_endpoint": "/server_info", "payload": {"profile": "test"}},
-    )
-    assert mismatched["artifact"]["checks"]["plan_evidence"] is False
-    assert mismatched["artifact"]["valid"] is False
-
-    wrong_policy = build_summary(
-        spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence={
-            "source": "runtime_inspection",
-            "endpoint": "/v1/chat/completions/plan",
-            "plan": {
-                **actual_plan,
-                "generation": {**actual_plan["generation"], "temperature": 0.7},
-            },
-            "request": reference_request_summary(
-                T2ITask(spec).build_request({"prompt": "image prompt"})
-            ),
-        },
-        contract=benchmark_contract(spec, [{"id": "a"}]),
-        server_info={"source_endpoint": "/server_info", "payload": {"profile": "test"}},
-    )
-    assert wrong_policy["artifact"]["checks"]["plan_evidence"] is False
-    assert wrong_policy["artifact"]["valid"] is False
 
 
 def test_text_artifact_requires_server_reported_exact_generation_work() -> None:
@@ -1566,65 +1672,6 @@ def test_natural_eos_i2t_does_not_require_fixed_output_length() -> None:
     )
     assert summary["artifact"]["generation_conformance"]["valid"] is True
     assert summary["artifact"]["generation_conformance"]["policy"] == "successful_response"
-
-
-def test_reference_protocol_evidence_is_derived_from_the_emitted_request() -> None:
-    spec = BenchmarkSpec(
-        task=TaskName.T2I,
-        model="M",
-        num_prompts=1,
-        width=1024,
-        height=768,
-        steps=30,
-        max_images=1,
-        guidance_scale=4.0,
-        image_guidance_scale=1.0,
-        cfg_norm="global",
-        cfg_interval=(0.0, 1.0),
-        timestep_shift=1.0,
-        runtime_profile_id="reference",
-        output_constraint="gen_only",
-        plan_evidence_policy="reference_protocol",
-        acceptance_min_images_per_success=1.0,
-    )
-    request = T2ITask(spec).build_request({"prompt": "private prompt"})
-    evidence = {
-        "source": "reference_protocol",
-        "plan": plan_summary(spec),
-        "request": reference_request_summary(request),
-    }
-    records = [_successful_image_record(width=1024, height=768)]
-
-    contract = benchmark_contract(spec, [{"id": "a"}])
-    persisted_contract = json.loads(json.dumps(contract))
-    assert persisted_contract == contract
-    assert benchmark_contract_is_valid(persisted_contract, spec, request_count=1)
-    summary = build_summary(
-        spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence=evidence,
-        contract=contract,
-        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
-    )
-
-    assert summary["artifact"]["checks"]["plan_evidence"] is True
-    assert summary["artifact"]["valid"] is True
-    assert "private prompt" not in json.dumps(evidence)
-
-    evidence["request"]["image"]["steps"] = 29
-    mismatched = build_summary(
-        spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence=evidence,
-        contract=contract,
-        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
-    )
-    assert mismatched["artifact"]["checks"]["plan_evidence"] is False
-    assert mismatched["artifact"]["valid"] is False
 
 
 def test_build_summary_selects_stream_family_for_text_task() -> None:

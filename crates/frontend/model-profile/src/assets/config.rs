@@ -13,11 +13,6 @@ pub struct HfTokenizerConfig {
     #[serde(flatten)]
     pub special_tokens: HfSpecialTokens,
     pub chat_template: Option<String>,
-    /// The `tokenizer_class` field from HuggingFace tokenizer configs. Some
-    /// tiktoken-based models (e.g. DeepSeek, Kimi K2) set this to a value
-    /// containing "Tiktoken" which can be used as a hint for backend
-    /// selection.
-    pub tokenizer_class: Option<String>,
 }
 
 /// Hugging Face named special tokens may be serialized as a string or an

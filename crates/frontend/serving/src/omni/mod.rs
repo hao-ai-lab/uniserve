@@ -5,8 +5,7 @@
 //! omni description and the single [`TokenizedGenerateReqInput`] submitted to
 //! the engine: prompt framing, image placement/ingest, negative-prompt
 //! encoding, image-control normalization, resource declaration, and the
-//! description-owned output filter. It is the S02 home of the logic previously
-//! in `dialect_generation`.
+//! description-owned output filter.
 
 use std::io::Cursor;
 
@@ -23,12 +22,11 @@ use uniserve_model_profile::dialect::{
 };
 
 use crate::chat::{
-    ChatContent, ChatContentPart, ChatMessage, ChatRenderer, ChatRequest, GenerationPromptMode,
-    HfChatRenderer,
+    ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode, HfChatRenderer,
 };
 use crate::input::{
-    DialectOutputConfig, GenerateReqInput, ImageGenControls, ImageInput, ModelEventIdentity,
-    OutputProcessorPolicy, PromptInput, SubmissionMetadata, TokenizedGenerateReqInput,
+    GenerateReqInput, ImageGenControls, ModelEventIdentity, OutputProcessorPolicy, PromptInput,
+    SubmissionMetadata, TokenizedGenerateReqInput,
 };
 use crate::text::TextDecodeOptions;
 use crate::text::tokenizer::DynTokenizer;
@@ -273,12 +271,8 @@ fn build_tokenized(
         prompt_logprobs_requested,
         generated_logprobs_requested,
         skip_special_tokens: request.decode.skip_special_tokens,
-        output_processor: OutputProcessorPolicy::DialectFilter(DialectOutputConfig {
-            output_filter: ctx.dialect.output_filter.clone(),
-            profile_reasoning: true,
-        }),
+        output_processor: OutputProcessorPolicy::Dialect(ctx.dialect.output_filter.clone()),
         submission: SubmissionMetadata {
-            data_parallel_rank: request.scheduling.data_parallel_rank,
             trace_headers: (!request.scheduling.trace_context.is_empty())
                 .then(|| request.scheduling.trace_context.clone()),
         },
@@ -325,7 +319,13 @@ struct CompileInput {
     seed: Option<u64>,
     stop_token_ids: Vec<u32>,
     image: Option<ImageGenControls>,
-    input_images: Vec<ImageInput>,
+    input_images: Vec<PositionedImageInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PositionedImageInput {
+    b64: String,
+    placement: Option<u32>,
 }
 
 impl CompileInput {
@@ -358,7 +358,14 @@ impl CompileInput {
         match &request.prompt {
             PromptInput::Text(text) => {
                 input.prompt = text.clone();
-                input.input_images = request.images.clone();
+                input.input_images = request
+                    .images
+                    .iter()
+                    .map(|image| PositionedImageInput {
+                        b64: image.b64.clone(),
+                        placement: None,
+                    })
+                    .collect();
             }
             PromptInput::Chat { .. } => {
                 let (prompt_ids, images) = render_chat_to_tokens(ctx, request, constraint)?;
@@ -377,7 +384,7 @@ impl CompileInput {
         self.negative_prompt.clone().unwrap_or_default()
     }
 
-    fn input_images(&self) -> Vec<ImageInput> {
+    fn input_images(&self) -> Vec<PositionedImageInput> {
         self.input_images.clone()
     }
 
@@ -396,12 +403,11 @@ fn render_chat_to_tokens(
     ctx: &OmniContext<'_>,
     request: &GenerateReqInput,
     constraint: GenerationConstraint,
-) -> std::result::Result<(Vec<u32>, Vec<ImageInput>), String> {
+) -> std::result::Result<(Vec<u32>, Vec<PositionedImageInput>), String> {
     let PromptInput::Chat {
         messages,
         tools,
         tool_choice,
-        generation_prompt_mode,
         reasoning_effort,
     } = &request.prompt
     else {
@@ -409,10 +415,8 @@ fn render_chat_to_tokens(
     };
     let mut messages = messages.clone();
     let mut chat_options = crate::chat::ChatOptions {
-        generation_prompt_mode: *generation_prompt_mode,
-        chat_template: None,
+        generation_prompt_mode: GenerationPromptMode::StartNewAssistant,
         reasoning_effort: *reasoning_effort,
-        template_kwargs: std::collections::HashMap::new(),
     };
 
     let image_count = semantic_image_count(&messages);
@@ -448,40 +452,19 @@ fn render_chat_to_tokens(
     )?;
 
     let chat_request = ChatRequest {
-        request_id: request.request_id.to_string(),
         messages,
-        sampling_params: crate::chat::SamplingParams::default(),
         chat_options,
         tools: tools.clone(),
         tool_choice: *tool_choice,
         decode_options: TextDecodeOptions::default(),
-        intermediate: request.stream,
-        priority: request.scheduling.priority,
-        documents: None,
-        cache_salt: request.cache.salt.clone(),
-        add_special_tokens: request.decode.add_special_tokens,
-        data_parallel_rank: request.scheduling.data_parallel_rank,
-        trace_context: request
-            .scheduling
-            .trace_context
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
     };
-    let rendered = ctx
+    let rendered_text = ctx
         .renderer
         .render(&chat_request)
         .map_err(|error| error.to_string())?;
-    let rendered_text = match rendered.prompt {
-        crate::text::Prompt::Text(text) => text,
-        crate::text::Prompt::TokenIds(_) => {
-            return Err("image placement requires a text-rendering chat profile".to_string());
-        }
-    };
     tokenize_rendered_chat_with_images(
         &ctx.tokenizer,
         &rendered_text,
-        request.decode.add_special_tokens,
         ctx.dialect.context_markers_in_prompt(),
         &placeholders,
         images,
@@ -511,7 +494,7 @@ fn replace_chat_images(
     request_id: &str,
     messages: &mut [ChatMessage],
     marker_text: Option<&str>,
-) -> std::result::Result<(Vec<ImageInput>, Vec<String>), String> {
+) -> std::result::Result<(Vec<PositionedImageInput>, Vec<String>), String> {
     let request_fingerprint = format!("{:016x}", fnv1a(request_id.as_bytes()));
     let mut images = Vec::new();
     let mut placeholders = Vec::new();
@@ -537,7 +520,7 @@ fn replace_chat_images(
                     images.len()
                 )
             });
-            images.push(ImageInput {
+            images.push(PositionedImageInput {
                 b64: data_image_payload(image_url)?,
                 placement: None,
             });
@@ -565,14 +548,13 @@ fn data_image_payload(url: &str) -> std::result::Result<String, String> {
 fn tokenize_rendered_chat_with_images(
     tokenizer: &DynTokenizer,
     rendered: &str,
-    add_special_tokens: bool,
     markers_in_prompt: bool,
     placeholders: &[String],
-    mut images: Vec<ImageInput>,
-) -> std::result::Result<(Vec<u32>, Vec<ImageInput>), String> {
+    mut images: Vec<PositionedImageInput>,
+) -> std::result::Result<(Vec<u32>, Vec<PositionedImageInput>), String> {
     if markers_in_prompt {
         let token_ids = tokenizer
-            .encode(rendered, add_special_tokens)
+            .encode(rendered, false)
             .map_err(|error| format!("image chat tokenization failed: {error}"))?;
         return Ok((token_ids, images));
     }
@@ -595,11 +577,11 @@ fn tokenize_rendered_chat_with_images(
     }
     clean.push_str(&rendered[cursor..]);
     let token_ids = tokenizer
-        .encode(&clean, add_special_tokens)
+        .encode(&clean, false)
         .map_err(|error| format!("image chat tokenization failed: {error}"))?;
     for (image, byte_offset) in images.iter_mut().zip(image_offsets) {
         let prefix_tokens = tokenizer
-            .encode(&clean[..byte_offset], add_special_tokens)
+            .encode(&clean[..byte_offset], false)
             .map_err(|error| format!("image placement tokenization failed: {error}"))?;
         image.placement = Some(
             prefix_tokens
@@ -678,7 +660,7 @@ impl<'a> GenerationRequestCompiler<'a> {
         &self,
         body: &CompileInput,
         constraint: GenerationConstraint,
-        input_images: &[ImageInput],
+        input_images: &[PositionedImageInput],
     ) -> std::result::Result<LoweredGenerationInput, String> {
         if self.profile.context_markers_in_prompt() || body.prompt_ids.is_some() {
             return self.build_und_with_marked_images(body, constraint, input_images);
@@ -749,7 +731,7 @@ impl<'a> GenerationRequestCompiler<'a> {
         &self,
         body: &CompileInput,
         constraint: GenerationConstraint,
-        input_images: &[ImageInput],
+        input_images: &[PositionedImageInput],
     ) -> std::result::Result<LoweredGenerationInput, String> {
         if input_images.is_empty() {
             return Err("und_only requests with context images require image data".to_string());
@@ -775,7 +757,7 @@ impl<'a> GenerationRequestCompiler<'a> {
         &self,
         body: &CompileInput,
         kind: PromptKind,
-        input_images: &[ImageInput],
+        input_images: &[PositionedImageInput],
     ) -> std::result::Result<(Vec<u32>, Vec<RenderedImage>), String> {
         if let Some(prompt_ids) = &body.prompt_ids {
             if input_images.is_empty() {
@@ -1116,7 +1098,7 @@ fn prompt_with_image_markers(
     user_text
 }
 
-fn mm_item(image: &ImageInput, position: u32) -> RenderedImage {
+fn mm_item(image: &PositionedImageInput, position: u32) -> RenderedImage {
     RenderedImage {
         hash: fnv1a(image.b64.as_bytes()),
         position,

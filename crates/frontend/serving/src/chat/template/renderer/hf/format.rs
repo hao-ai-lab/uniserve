@@ -333,41 +333,10 @@ pub(super) fn detect_chat_template_content_format(template: &str) -> ChatTemplat
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    use expect_test::expect;
-
     use super::{ChatTemplateContentFormat, detect_chat_template_content_format};
 
     fn detect(template: &str) -> ChatTemplateContentFormat {
         detect_chat_template_content_format(template)
-    }
-
-    fn uniserve_examples_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/templates/uniserve_examples")
-            .canonicalize()
-            .expect("example template directory should exist locally")
-    }
-
-    fn read_uniserve_example(relative_path: &str) -> String {
-        fs::read_to_string(uniserve_examples_dir().join(relative_path))
-            .unwrap_or_else(|_| panic!("failed to read example template: {relative_path}"))
-    }
-
-    fn iter_uniserve_example_template_paths() -> impl Iterator<Item = PathBuf> {
-        let mut paths = fs::read_dir(uniserve_examples_dir())
-            .expect("failed to read example template directory")
-            .map(|entry| {
-                entry
-                    .expect("failed to read example template dir entry")
-                    .path()
-            })
-            .filter(|path| path.extension().is_some_and(|ext| ext == "jinja"))
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths.into_iter()
     }
 
     #[test]
@@ -428,59 +397,5 @@ mod tests {
             detect("{% for message in messages %}{{ message.content[0] }}{% endfor %}"),
             ChatTemplateContentFormat::String
         );
-    }
-
-    #[test]
-    fn matches_uniserve_example_template_formats() {
-        let snapshot = iter_uniserve_example_template_paths()
-            .map(|path| {
-                let file_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("template file name should be valid UTF-8");
-                let template = read_uniserve_example(file_name);
-                let format = detect(&template);
-                format!("{file_name:50} => {format:?}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        expect![[r#"
-            template_alpaca.jinja                              => String
-            template_baichuan.jinja                            => String
-            template_chatglm.jinja                             => String
-            template_chatglm2.jinja                            => String
-            template_chatml.jinja                              => String
-            template_falcon.jinja                              => String
-            template_falcon_180b.jinja                         => String
-            template_inkbot.jinja                              => String
-            template_teleflm.jinja                             => String
-            tool_chat_template_deepseekr1.jinja                => String
-            tool_chat_template_deepseekv3.jinja                => String
-            tool_chat_template_deepseekv31.jinja               => String
-            tool_chat_template_functiongemma.jinja             => String
-            tool_chat_template_gemma3_pythonic.jinja           => Preserve
-            tool_chat_template_gemma4.jinja                    => Preserve
-            tool_chat_template_glm4.jinja                      => String
-            tool_chat_template_granite.jinja                   => String
-            tool_chat_template_granite_20b_fc.jinja            => String
-            tool_chat_template_hermes.jinja                    => String
-            tool_chat_template_hunyuan_a13b.jinja              => String
-            tool_chat_template_internlm2_tool.jinja            => String
-            tool_chat_template_llama3.1_json.jinja             => Preserve
-            tool_chat_template_llama3.2_json.jinja             => Preserve
-            tool_chat_template_llama3.2_pythonic.jinja         => String
-            tool_chat_template_llama4_json.jinja               => Preserve
-            tool_chat_template_llama4_pythonic.jinja           => Preserve
-            tool_chat_template_minimax_m1.jinja                => Preserve
-            tool_chat_template_mistral.jinja                   => String
-            tool_chat_template_mistral3.jinja                  => Preserve
-            tool_chat_template_mistral_parallel.jinja          => String
-            tool_chat_template_phi4_mini.jinja                 => String
-            tool_chat_template_qwen3coder.jinja                => String
-            tool_chat_template_toolace.jinja                   => String
-            tool_chat_template_xlam_llama.jinja                => String
-            tool_chat_template_xlam_qwen.jinja                 => String"#]]
-        .assert_eq(&snapshot);
     }
 }

@@ -8,6 +8,7 @@ use uniserve_engine_runtime::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy,
 };
+use uniserve_model_profile::ModelDescription;
 use uniserve_serving::chat::ChatTemplateContentFormatOption;
 use uniserve_worker_ipc::WorkerLaunchConfig;
 
@@ -66,9 +67,8 @@ pub enum EngineConnection {
     },
 }
 
-/// Configuration of the in-process UniServe Rust engine (scheduler +
-/// forward-only worker). This is the southbound boundary in the merged design:
-/// Rust owns the engine and scheduler, Python only runs the model forward pass.
+/// Configuration of the in-process UniServe engine. Rust owns scheduling and
+/// engine execution; Python owns model forward execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EngineSettings {
     /// How the server reaches its engine core(s): in-process (default) or
@@ -156,6 +156,8 @@ pub struct Config {
     pub engine: EngineSettings,
     /// Backend model identifier used for engine loading.
     pub model: String,
+    /// Closed description that owns model-specific serving behavior.
+    pub model_description: ModelDescription,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -193,6 +195,7 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
+            model_description: ModelDescription::Qwen3,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),

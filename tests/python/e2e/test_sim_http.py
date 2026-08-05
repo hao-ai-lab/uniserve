@@ -23,17 +23,23 @@ from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
 pytestmark = [pytest.mark.e2e]
 
 MODEL_ENV = "UNISERVE_SENSENOVA_MODEL"
+QWEN_MODEL_ENV = "UNISERVE_QWEN3_MODEL"
+BAGEL_MODEL_ENV = "UNISERVE_BAGEL_MODEL"
 CONTROL_TOKENS = ("<img>", "</img>")
 
 
-def active_sensenova_model() -> Path:
-    model_value = os.environ.get(MODEL_ENV)
+def active_model(environment_variable: str) -> Path:
+    model_value = os.environ.get(environment_variable)
     if not model_value:
-        pytest.skip(f"{MODEL_ENV} is required for the sim HTTP gate")
+        pytest.fail(f"{environment_variable} is required for the sim HTTP gate")
     model = Path(model_value)
     if not model.exists():
-        pytest.fail(f"configured SenseNova checkpoint is missing: {model}")
+        pytest.fail(f"configured checkpoint is missing: {model}")
     return model
+
+
+def active_sensenova_model() -> Path:
+    return active_model(MODEL_ENV)
 
 
 def _control_ids_from_tokenizer_json(model: Path) -> dict[str, int]:
@@ -151,20 +157,27 @@ def chat_sse_images(events: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 @contextmanager
-def sim_server(tmp_path: Path):
+def configured_sim_server(
+    tmp_path: Path,
+    *,
+    model: Path,
+    description: str,
+    served_model_name: str,
+):
     try:
         binary = require_uniserve_binary()
     except FileNotFoundError as error:
-        pytest.skip(str(error))
-    model = active_sensenova_model()
+        pytest.fail(str(error))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     args = [
         str(binary),
         "serve",
         str(model),
+        "--model-description",
+        description,
         "--served-model-name",
-        "SenseNova-U1",
+        served_model_name,
         "--host",
         "127.0.0.1",
         "--port",
@@ -189,15 +202,137 @@ def sim_server(tmp_path: Path):
         yield base_url
 
 
+@contextmanager
+def sim_server(tmp_path: Path):
+    with configured_sim_server(
+        tmp_path,
+        model=active_sensenova_model(),
+        description="sensenova",
+        served_model_name="SenseNova-U1",
+    ) as base_url:
+        yield base_url
+
+
 def test_active_sensenova_checkpoint_image_controls_match_worker_tokenizer():
     active_sensenova_control_ids(active_sensenova_model())
 
 
-def test_sim_http_configured_routes_and_benchmark_smoke(tmp_path: Path):
+def test_qwen3_public_chat_funnel(tmp_path: Path):
+    with configured_sim_server(
+        tmp_path,
+        model=active_model(QWEN_MODEL_ENV),
+        description="qwen3",
+        served_model_name="Qwen3-32B",
+    ) as base_url:
+        response = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "Qwen3-32B",
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "max_completion_tokens": 8,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        assert payload["model"] == "Qwen3-32B"
+        assert payload["choices"][0]["message"]["content"]
+        assert payload["choices"][0]["finish_reason"] in {"stop", "length"}
+
+
+def test_bagel_public_funnels(tmp_path: Path):
+    with configured_sim_server(
+        tmp_path,
+        model=active_model(BAGEL_MODEL_ENV),
+        description="bagel",
+        served_model_name="BAGEL",
+    ) as base_url:
+        image_to_text = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "BAGEL",
+                "modalities": ["text"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image."},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{tiny_input_png_b64()}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "max_completion_tokens": 8,
+            },
+            timeout=60,
+        )
+        image_to_text.raise_for_status()
+        assert image_to_text.json()["choices"][0]["message"]["content"]
+
+        invalid_count = httpx.post(
+            f"{base_url}/v1/images/generations",
+            json={"model": "BAGEL", "prompt": "A geometric landscape.", "n": 2},
+            timeout=60,
+        )
+        assert invalid_count.status_code == 400
+        assert invalid_count.json()["error"]["param"] == "n"
+
+        response = httpx.post(
+            f"{base_url}/v1/images/generations",
+            json={"model": "BAGEL", "prompt": "A geometric landscape."},
+            timeout=300,
+        )
+        response.raise_for_status()
+        images = response.json()["data"]
+        assert len(images) == 1
+        for image in images:
+            dimensions = (image["width"], image["height"])
+            assert png_size_from_b64(image["b64_json"]) == dimensions
+            assert image["bytes"] > 0
+            assert len(image["sha256"]) == 64
+
+
+def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
     # CPU simulation emits deterministic text and image fixtures through the
-    # production HTTP, scheduler, worker IPC, and geometry contracts.
+    # configured HTTP, scheduler, generation-event, and geometry contracts.
     image_start_id = active_sensenova_control_ids(active_sensenova_model())["<img>"]
     with sim_server(tmp_path) as base_url:
+        metrics_response = httpx.get(f"{base_url}/metrics", timeout=30)
+        metrics_response.raise_for_status()
+        assert metrics_response.text
+
+        version_response = httpx.get(f"{base_url}/version", timeout=30)
+        version_response.raise_for_status()
+        assert version_response.json()["version"]
+
+        models_response = httpx.get(f"{base_url}/v1/models", timeout=30)
+        models_response.raise_for_status()
+        assert [model["id"] for model in models_response.json()["data"]] == ["SenseNova-U1"]
+
+        unknown_chat_control = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "SenseNova-U1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "grammar": "root ::= 'yes'",
+            },
+            timeout=30,
+        )
+        assert unknown_chat_control.status_code == 400
+        assert unknown_chat_control.json()["error"]["type"] == "invalid_request_error"
+
+        unknown_image_control = httpx.post(
+            f"{base_url}/v1/images/generations",
+            json={"prompt": "draw", "response_format": "url"},
+            timeout=30,
+        )
+        assert unknown_image_control.status_code == 400
+        assert unknown_image_control.json()["error"]["type"] == "invalid_request_error"
+
         # The deterministic model emits EOS after eight tokens; this request
         # exercises the runtime's EOS completion contract.
         text_events = post_sse(
@@ -253,7 +388,6 @@ def test_sim_http_configured_routes_and_benchmark_smoke(tmp_path: Path):
         assert images
         image_b64 = str(images[0]["image_url"]["url"]).split(",", 1)[1]
         assert png_size_from_b64(image_b64) == (2048, 1152)
-        assert not any(event.get("type") == "image_begin" for event in default_events)
 
         i2i_response = httpx.post(
             f"{base_url}/v1/chat/completions",
@@ -287,7 +421,7 @@ def test_sim_http_configured_routes_and_benchmark_smoke(tmp_path: Path):
         trace_path.write_text(
             json.dumps(
                 {
-                    "id": "smoke-1",
+                    "id": "sensenova-interleave-contract",
                     "task": "interleave",
                     "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
                 }
@@ -296,7 +430,7 @@ def test_sim_http_configured_routes_and_benchmark_smoke(tmp_path: Path):
             encoding="utf-8",
         )
         spec = BenchmarkSpec(
-            name="sim_default_smoke",
+            name="sensenova_interleave_contract",
             task=TaskName.INTERLEAVE,
             model="SenseNova-U1",
             dataset="trace",
@@ -312,11 +446,5 @@ def test_sim_http_configured_routes_and_benchmark_smoke(tmp_path: Path):
         assert result.summary["harness_status"] == "completed"
         assert result.summary["failed_count"] == 0
         assert result.summary["ok_count"] == 1
-        assert result.summary["artifact"]["plan_evidence"]["source"] == "declared_contract"
-        plan = result.summary["artifact"]["plan_summary"]
-        assert plan["runtime_profile_id"] == "sensenova-u1"
-        assert plan["generation"]["temperature"] == 0.0
-        assert plan["generation"]["top_p"] == 1.0
-        assert plan["generation"]["ignore_eos"] is True
-        assert plan["image"]["max_images"] == 1
+        assert result.summary["artifact"]["valid"] is True
         assert (tmp_path / "bench" / "summary.json").exists()

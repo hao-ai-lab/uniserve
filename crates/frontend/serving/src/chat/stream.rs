@@ -35,11 +35,7 @@ pub struct ChatEventStream {
 }
 
 impl ChatEventStream {
-    #[allow(
-        dead_code,
-        reason = "retained constructor for the chat event stream library type"
-    )]
-    pub(crate) fn new(
+    pub fn new(
         request_id: String,
         inner: impl crate::chat::output::processor::ChatEventStream,
     ) -> Self {
@@ -119,11 +115,6 @@ impl ChatEventStream {
             }
         }
 
-        // The stream ended without a terminal `ChatEvent::Done`. In normal operation the
-        // underlying stream surfaces its own error on unexpected close, so reaching here
-        // means the terminal event was dropped (or the stream was constructed without one,
-        // as the unit tests exercise). Rather than silently succeeding with a partial
-        // message, report it explicitly so the dropped terminal output is not masked.
         Err(Error::StreamClosedBeforeTerminalOutput {
             request_id: self.request_id,
         })

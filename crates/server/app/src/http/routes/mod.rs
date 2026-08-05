@@ -125,6 +125,3 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     }
     router
 }
-
-#[cfg(test)]
-mod tests;

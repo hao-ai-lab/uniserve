@@ -12,6 +12,8 @@ pub mod chat;
 mod input;
 mod model;
 mod omni;
+#[cfg(test)]
+mod test_support;
 pub mod text;
 
 use std::borrow::Borrow;
@@ -36,16 +38,13 @@ use uniserve_engine_gateway::{EngineGateway, GenerationSubmission};
 pub use uniserve_engine_gateway::{PublicCommit, PublicModality, SemanticRoot};
 
 pub use input::{
-    CacheBounds, ChatOutputProcessorConfig, DecodeControls, DialectOutputConfig, GenerateReqInput,
-    ImageGenControls, ImageInput, ModalitySelection, ModelEventIdentity, OutputContract,
-    OutputProcessorPolicy, PromptInput, SamplingConfig, SchedulingBounds, StopConfig,
-    SubmissionMetadata, TokenizedGenerateReqInput,
+    CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection,
+    ModelEventIdentity, OutputContract, OutputProcessorPolicy, PromptInput, SamplingConfig,
+    SchedulingBounds, StopConfig, SubmissionMetadata, TokenizedGenerateReqInput,
 };
 pub use model::{BagelDesc, Qwen3Desc, ResolvedModel, SenseNovaDesc};
 
-use crate::chat::{
-    AssistantBlockKind, AssistantContentBlock, ChatEvent, DefaultChatOutputProcessor,
-};
+use crate::chat::{AssistantBlockKind, AssistantContentBlock, ChatEvent, Qwen3ChatOutputProcessor};
 use crate::omni::output::{DialectOutputProcessor, DialectTextDelta};
 use crate::text::output::stop_string_holdback_bytes;
 use crate::text::{
@@ -351,7 +350,6 @@ impl ServingRuntime {
         };
 
         let mut gateway_submission = GenerationSubmission::new(request_id.to_string(), request);
-        gateway_submission.data_parallel_rank = submission.data_parallel_rank;
         gateway_submission.trace_headers = submission.trace_headers;
 
         let stream_result: Result<ServeEventStream> =
@@ -1379,34 +1377,26 @@ fn build_output_sink(
 ) -> Result<OutputSink> {
     match policy {
         OutputProcessorPolicy::None => Ok(OutputSink::Raw),
-        OutputProcessorPolicy::Chat(config) => {
-            let config = *config;
-            let mut request = config.request;
-            let processor = DefaultChatOutputProcessor::new(
-                &mut request,
-                &config.model_id,
-                std::sync::Arc::clone(tokenizer),
-                &config.tool_parser,
-                &config.reasoning_parser,
-            )
-            .map_err(|error| ServeError::OutputProcessing {
-                request_id: request_id.clone(),
-                message: error.to_string(),
-            })?;
-            let bridge = ChatOutputBridge::new(Box::new(processor)).map_err(|error| {
-                ServeError::OutputProcessing {
+        OutputProcessorPolicy::Qwen3(request) => {
+            let mut request = *request;
+            let processor =
+                Qwen3ChatOutputProcessor::new(&mut request, std::sync::Arc::clone(tokenizer))
+                    .map_err(|error| ServeError::OutputProcessing {
+                        request_id: request_id.clone(),
+                        message: error.to_string(),
+                    })?;
+            let bridge =
+                ChatOutputBridge::new(processor).map_err(|error| ServeError::OutputProcessing {
                     request_id: request_id.clone(),
                     message: error.to_string(),
-                }
-            })?;
+                })?;
             Ok(OutputSink::Chat(bridge))
         }
-        OutputProcessorPolicy::DialectFilter(config) => {
+        OutputProcessorPolicy::Dialect(output_filter) => {
             let processor = DialectOutputProcessor::new(
-                config.output_filter,
+                output_filter,
                 std::sync::Arc::clone(tokenizer),
                 prompt_token_ids,
-                config.profile_reasoning,
             )
             .map_err(|error| ServeError::OutputProcessing {
                 request_id: request_id.clone(),
@@ -1451,7 +1441,7 @@ struct ChatOutputBridge {
 }
 
 impl ChatOutputBridge {
-    fn new(processor: crate::chat::DynChatOutputProcessor) -> crate::chat::output::Result<Self> {
+    fn new(processor: Qwen3ChatOutputProcessor) -> crate::chat::output::Result<Self> {
         let (sender, receiver) = mpsc::channel(2);
         let decoded = Box::pin(ChatDecodedInputStream { receiver });
         let output = processor.process(decoded)?;
@@ -2290,45 +2280,6 @@ mod tests {
     use uniserve_engine_gateway::GenerationTokenLogprob;
     use uniserve_engine_gateway::transport::GenerationEventStream;
 
-    #[derive(Debug)]
-    struct ByteTokenizer;
-
-    impl uniserve_model_profile::tokenizer::Tokenizer for ByteTokenizer {
-        fn encode(
-            &self,
-            text: &str,
-            _add_special_tokens: bool,
-        ) -> uniserve_model_profile::tokenizer::Result<Vec<u32>> {
-            Ok(text.bytes().map(u32::from).collect())
-        }
-
-        fn decode(
-            &self,
-            token_ids: &[u32],
-            _skip_special_tokens: bool,
-        ) -> uniserve_model_profile::tokenizer::Result<String> {
-            Ok(String::from_utf8_lossy(
-                &token_ids
-                    .iter()
-                    .map(|token_id| *token_id as u8)
-                    .collect::<Vec<_>>(),
-            )
-            .into_owned())
-        }
-
-        fn token_to_id(&self, token: &str) -> Option<u32> {
-            match token {
-                "<|im_start|>" => Some(1),
-                "<|im_end|>" => Some(2),
-                "<|vision_start|>" => Some(3),
-                "<|vision_end|>" => Some(4),
-                "<think>" => Some(5),
-                "</think>" => Some(6),
-                _ => None,
-            }
-        }
-    }
-
     fn event_context() -> EventContext {
         EventContext {
             profile_id: "profile".to_string(),
@@ -2364,22 +2315,19 @@ mod tests {
     }
 
     fn bagel_filter() -> OutputProcessorPolicy {
-        let tokenizer: crate::text::tokenizer::DynTokenizer = Arc::new(ByteTokenizer);
-        let dialect = uniserve_model_profile::dialect::resolve_generation_dialect_for_model(
-            "bagel",
+        let tokenizer = crate::test_support::configured_tokenizer();
+        let dialect = uniserve_model_profile::dialect::resolve_generation_dialect(
+            uniserve_model_profile::ModelDescription::Bagel,
             tokenizer.as_ref(),
         )
         .expect("resolve dialect")
         .expect("BAGEL dialect");
-        OutputProcessorPolicy::DialectFilter(DialectOutputConfig {
-            output_filter: dialect.output_filter.clone(),
-            profile_reasoning: true,
-        })
+        OutputProcessorPolicy::Dialect(dialect.output_filter.clone())
     }
 
     #[tokio::test]
     async fn assembler_attaches_ranked_logprobs_to_text_delta() {
-        let tokenizer: crate::text::tokenizer::DynTokenizer = Arc::new(ByteTokenizer);
+        let tokenizer = crate::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tx.try_send(GenEvent::Scheduled {
             queued_at: 1.0,
@@ -2455,7 +2403,7 @@ mod tests {
 
     #[tokio::test]
     async fn assembler_publishes_an_image_with_its_next_text_token() {
-        let tokenizer: crate::text::tokenizer::DynTokenizer = Arc::new(ByteTokenizer);
+        let tokenizer = crate::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tx.try_send(GenEvent::Scheduled {
             queued_at: 1.0,

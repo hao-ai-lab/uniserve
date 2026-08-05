@@ -25,9 +25,22 @@ pub fn generate_input_fixture(
 }
 
 pub fn mock_model_profile(profile_id: impl Into<String>) -> uniserve_model_profile::ModelProfile {
-    let mut profile = uniserve_model_profile::ModelProfile::text_only(profile_id);
-    profile.identity.family_id = "qwen3".to_string();
-    profile
+    let model_id = profile_id.into();
+    let fingerprint = format!("fixture:{model_id}");
+    uniserve_model_profile::ModelProfile {
+        description: uniserve_model_profile::ModelDescription::Qwen3,
+        identity: uniserve_model_profile::ModelIdentity {
+            model_id,
+            profile_id: fingerprint.clone(),
+            family_id: "qwen3".to_string(),
+            dialect_id: "qwen3".to_string(),
+            config_fingerprint: fingerprint,
+        },
+        generation_defaults: uniserve_model_profile::GenerationDefaultsDescriptor::default(),
+        context_limits: uniserve_model_profile::ContextLimits::default(),
+        stop_tokens: uniserve_model_profile::StopTokenPolicy::default(),
+        generation_dialect: None,
+    }
 }
 
 pub fn mock_engine_gateway(
@@ -170,9 +183,7 @@ pub fn assert_terminal_success(events: &[uniserve_serving::ServeEvent]) -> anyho
     }
 }
 
-/// A minimal ChatML template used by the fixture chat renderer. It is only rich
-/// enough to round-trip system/user/assistant turns; production templates are
-/// loaded from model files.
+/// ChatML template used by the configured serving fixture.
 const FIXTURE_CHAT_TEMPLATE: &str = concat!(
     "{% for message in messages %}",
     "<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n",
@@ -180,52 +191,62 @@ const FIXTURE_CHAT_TEMPLATE: &str = concat!(
     "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
 );
 
-/// Deterministic byte tokenizer for fixtures: it byte-encodes/decodes text and
-/// maps a small set of ChatML/vision/reasoning control tokens to fixed ids.
-#[derive(Debug)]
-struct FixtureByteTokenizer;
+#[allow(clippy::expect_used)]
+fn configured_tokenizer() -> uniserve_model_profile::tokenizer::DynTokenizer {
+    use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-impl uniserve_model_profile::tokenizer::Tokenizer for FixtureByteTokenizer {
-    fn encode(
-        &self,
-        text: &str,
-        _add_special_tokens: bool,
-    ) -> uniserve_model_profile::tokenizer::Result<Vec<u32>> {
-        Ok(text.bytes().map(u32::from).collect())
+    let mut vocab = (0_u32..=127)
+        .map(|id| {
+            let token = if id == 0 {
+                "<unk>".to_string()
+            } else {
+                char::from_u32(id).expect("ASCII code point").to_string()
+            };
+            (token, id)
+        })
+        .collect::<Vocab>();
+    for (id, token) in [
+        (1, "<|im_start|>"),
+        (2, "<|im_end|>"),
+        (3, "<|vision_start|>"),
+        (4, "<|vision_end|>"),
+        (5, "<think>"),
+        (6, "</think>"),
+        (97, "a"),
+        (98, "b"),
+    ] {
+        vocab.retain(|_, existing_id| *existing_id != id);
+        vocab.insert(token.to_string(), id);
     }
-
-    fn decode(
-        &self,
-        token_ids: &[u32],
-        _skip_special_tokens: bool,
-    ) -> uniserve_model_profile::tokenizer::Result<String> {
-        let bytes = token_ids
-            .iter()
-            .map(|token_id| *token_id as u8)
-            .collect::<Vec<_>>();
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    fn token_to_id(&self, token: &str) -> Option<u32> {
-        match token {
-            "<|im_start|>" => Some(1),
-            "<|im_end|>" => Some(2),
-            "<|vision_start|>" => Some(3),
-            "<|vision_end|>" => Some(4),
-            "<think>" => Some(5),
-            "</think>" => Some(6),
-            _ => None,
-        }
-    }
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, Vec::new())
+        .unk_token("<unk>".to_string())
+        .build()
+        .expect("build configured tokenizer model");
+    let mut tokenizer = TokenizerBuilder::new(model);
+    tokenizer.add_special_tokens(&[
+        AddedToken::from("<|im_start|>", true),
+        AddedToken::from("<|im_end|>", true),
+        AddedToken::from("<|vision_start|>", true),
+        AddedToken::from("<|vision_end|>", true),
+        AddedToken::from("<think>", true),
+        AddedToken::from("</think>", true),
+    ]);
+    let directory = tempfile::tempdir().expect("create tokenizer directory");
+    let path = directory.path().join("tokenizer.json");
+    tokenizer.save(&path, false).expect("save tokenizer");
+    std::sync::Arc::new(
+        uniserve_model_profile::tokenizer::HuggingFaceTokenizer::new(&path)
+            .expect("load configured tokenizer"),
+    )
 }
 
-/// Build a text-only [`ResolvedModel`](uniserve_serving::ResolvedModel) fixture
-/// backed by the deterministic byte tokenizer and a minimal ChatML renderer.
+/// Build a text-only [`ResolvedModel`](uniserve_serving::ResolvedModel) fixture.
 #[allow(clippy::expect_used)]
 pub fn resolved_model_fixture(model_name: &str) -> uniserve_serving::ResolvedModel {
     let profile = mock_model_profile(model_name);
-    let tokenizer: uniserve_model_profile::tokenizer::DynTokenizer =
-        std::sync::Arc::new(FixtureByteTokenizer);
+    let tokenizer = configured_tokenizer();
     let renderer = uniserve_serving::chat::HfChatRenderer::new(
         Some(FIXTURE_CHAT_TEMPLATE.to_string()),
         std::collections::HashMap::new(),
@@ -490,7 +511,7 @@ mod tests {
         let request = generate_input_fixture("request-1", "hello");
         assert_eq!(request.request_id.as_ref(), "request-1");
         let profile = mock_model_profile("fixture-model");
-        assert_eq!(profile.family_id(), "qwen3");
+        assert_eq!(profile.identity.family_id, "qwen3");
         let (gateway, _engine) = mock_engine_gateway("fixture-model");
         assert_eq!(gateway.snapshot().model_name, "fixture-model");
 

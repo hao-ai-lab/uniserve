@@ -8,7 +8,6 @@ from .base import (
     TaskRequest,
     apply_text_sampling_contract,
     input_image_data_url,
-    uses_reference_protocol,
 )
 
 
@@ -37,7 +36,7 @@ class I2TTask(BenchmarkTask):
             "max_completion_tokens": max_tokens,
         }
         apply_text_sampling_contract(payload, self.spec)
-        if uses_reference_protocol(self.spec):
+        if self.spec.request_schema == "vllm_omni":
             payload["extra_args"] = {
                 "max_tokens": max_tokens,
                 "do_sample": self.spec.temperature > 0,

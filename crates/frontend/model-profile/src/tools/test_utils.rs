@@ -1,7 +1,7 @@
 use serde_json::json;
 
-use super::{ToolParser, ToolParserOutput};
-use crate::tools::{Tool, ToolParserTestExt as _};
+use super::{Qwen3XmlToolParser, ToolParserOutput};
+use crate::tools::Tool;
 
 /// Build a reusable set of function tools for parser unit tests.
 pub fn test_tools() -> Vec<Tool> {
@@ -88,7 +88,7 @@ pub fn test_tools() -> Vec<Tool> {
     clippy::unwrap_used,
     reason = "this assertion helper intentionally panics on parser failures"
 )]
-pub fn collect_stream<T: ToolParser + ?Sized>(parser: &mut T, chunks: &[&str]) -> ToolParserOutput {
+pub fn collect_stream(parser: &mut Qwen3XmlToolParser, chunks: &[&str]) -> ToolParserOutput {
     let mut output = ToolParserOutput::default();
     for chunk in chunks {
         output.append(parser.parse_chunk(chunk).unwrap());

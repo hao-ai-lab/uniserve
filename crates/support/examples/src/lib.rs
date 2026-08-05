@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use futures::TryStreamExt as _;
+use uniserve_server::ModelDescription;
 use uniserve_server::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 use uniserve_serving::{
     GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection, OutputContract,
@@ -16,6 +17,7 @@ use uniserve_serving::{
 pub fn sim_http_config(model: impl Into<String>) -> Config {
     Config {
         model: model.into(),
+        model_description: ModelDescription::SenseNova,
         served_model_name: None,
         listener_mode: HttpListenerMode::BindTcp {
             host: "127.0.0.1".to_string(),
@@ -63,7 +65,6 @@ pub fn semantic_text_image_request(
     let mut request = GenerateReqInput::text(request_id, prompt);
     request.images.push(ImageInput {
         b64: input_image_b64.into(),
-        placement: None,
     });
     request.sampling.max_tokens = Some(128);
     request.sampling.temperature = Some(0.0);

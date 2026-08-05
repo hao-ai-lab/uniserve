@@ -95,7 +95,6 @@ _PROFILE_CONFIG_TEMPLATE = {
                         "height": 16,
                         "max_images": 1,
                         "runtime_profile_id": "fixture-image-candidate",
-                        "plan_evidence_policy": "runtime_inspection",
                     },
                 },
                 "reference_point": {
@@ -112,7 +111,7 @@ _PROFILE_CONFIG_TEMPLATE = {
                         "height": 16,
                         "max_images": 1,
                         "runtime_profile_id": "fixture-image-reference",
-                        "plan_evidence_policy": "reference_protocol",
+                        "request_schema": "vllm_omni",
                     },
                 },
             },
@@ -168,7 +167,7 @@ def _record(
         "success": True,
         "classifier": "ok",
         "images": len(images),
-        "generated_images_expected": True,
+        "image_output_mode": "required",
         "requested_image_count": len(images),
         "requested_image_width": width,
         "requested_image_height": height,
@@ -306,9 +305,9 @@ def _write_canonical_artifact(
         "base_url": "http://127.0.0.1:8000",
         "metrics": {"images_per_second": images_per_second},
         "artifact": {
-            "schema_version": 2,
+            "schema_version": 4,
             "valid": True,
-            "valid_marker": "artifact-valid-v2",
+            "valid_marker": "artifact-valid-v4",
             "checks": {"contract": True},
             "contract": contract,
             "request_records": record_collection_contract(records),
@@ -341,7 +340,7 @@ def _write_canonical_artifact(
         required_source_role = active_server.get("required_source_role")
         model_revision_contract = None
         model_contract = {
-            "kind": "directory",
+            "kind": "model_directory",
             "resolved_name": "fixture-model",
             "file_count": 1,
             "total_size_bytes": 1,

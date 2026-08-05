@@ -1,37 +1,17 @@
-//! Streaming tool parsers for chat completions.
+//! Qwen3 XML tool-call parsing.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #[macro_use]
 mod error;
-mod deepseek_dsml;
-mod deepseek_json;
-mod gemma4;
-mod glm_xml;
-mod hy_v3;
 mod json;
-mod kimi_k2;
-mod minimax_m2;
-mod parameters;
-mod qwen_coder;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_utils;
 mod utils;
 
 use std::collections::{BTreeMap, btree_map};
 
-pub use deepseek_dsml::{DeepSeekV4ToolParser, DeepSeekV32ToolParser};
-pub use deepseek_json::{DeepSeekV3ToolParser, DeepSeekV31ToolParser};
 pub use error::{Result, ToolParserError};
-pub use gemma4::Gemma4ToolParser;
-pub use glm_xml::{Glm45MoeToolParser, Glm47MoeToolParser};
-pub use hy_v3::HyV3ToolParser;
-pub use json::{
-    HermesToolParser, Internlm2ToolParser, Llama3JsonToolParser, MistralToolParser,
-    Phi4MiniJsonToolParser, Qwen3XmlToolParser,
-};
-pub use kimi_k2::KimiK2ToolParser;
-pub use minimax_m2::MinimaxM2ToolParser;
-pub use qwen_coder::Qwen3CoderToolParser;
+pub use json::Qwen3XmlToolParser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -108,73 +88,3 @@ impl ToolParserOutput {
         self
     }
 }
-
-/// Incremental parser that extracts tool calls from assistant output.
-pub trait ToolParser: Send {
-    /// Construct a boxed parser instance for one request stream.
-    fn create(tools: &[Tool]) -> Result<Box<dyn ToolParser>>
-    where
-        Self: Sized + 'static;
-
-    /// Return whether decoded output must preserve tokenizer special tokens.
-    ///
-    /// Some model families emit tool-call sentinels as special tokens. Those
-    /// parsers need `skip_special_tokens = false` while parsing is enabled.
-    fn preserve_special_tokens(&self) -> bool {
-        false
-    }
-
-    /// Feed one decoded text delta into the parser, appending committed output
-    /// into `output`.
-    ///
-    /// If this returns an error, any output already appended to `output`
-    /// remains committed parser output. The parser must keep its uncommitted
-    /// buffer intact so callers may recover it with `reset`.
-    fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()>;
-
-    /// Flush any buffered partial state at end of stream.
-    ///
-    /// This operation is atomic: on error no partial output is returned and the
-    /// parser's buffered state is left intact.
-    fn finish(&mut self) -> Result<ToolParserOutput>;
-
-    /// Clear parser state and return currently uncommitted buffered text.
-    ///
-    /// Callers may use this to recover any text that failed to parse after an error
-    /// and output it as normal text.
-    fn reset(&mut self) -> String;
-}
-
-/// Extension methods for easily testing `ToolParser` implementations.
-///
-/// These helpers do not handle partial parsing or error recovery, so they are
-/// not intended for use in production code paths.
-#[cfg(any(test, feature = "test-util"))]
-#[easy_ext::ext(ToolParserTestExt)]
-impl<T: ToolParser + ?Sized> T {
-    /// Feed one decoded text delta and return only if the whole chunk parses.
-    ///
-    /// If parsing fails, partial committed output is discarded by this helper.
-    /// Prefer `parse_into` for more fine-grained control in error recovery.
-    pub fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
-        let mut output = ToolParserOutput::default();
-        self.parse_into(chunk, &mut output)?;
-        Ok(output)
-    }
-
-    /// Parse complete tool calls from final output.
-    ///
-    /// This default implementation reuses the incremental parser lifecycle by
-    /// feeding the full output through `parse_chunk` and then calling `finish`.
-    ///
-    /// If parsing fails, partial committed output is discarded by this helper.
-    /// Prefer `parse_into` for more fine-grained control in error recovery.
-    pub fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
-        let mut output = self.parse_chunk(text)?;
-        output.append(self.finish()?);
-        Ok(output.coalesce_calls())
-    }
-}
-
-#[cfg(test)]
-mod tests;

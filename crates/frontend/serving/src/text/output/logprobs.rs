@@ -132,40 +132,9 @@ mod tests {
 
     use super::*;
 
-    #[derive(Debug)]
-    struct ByteTokenizer;
-
-    impl uniserve_model_profile::tokenizer::Tokenizer for ByteTokenizer {
-        fn encode(
-            &self,
-            _text: &str,
-            _add_special_tokens: bool,
-        ) -> uniserve_model_profile::tokenizer::Result<Vec<u32>> {
-            unreachable!()
-        }
-
-        fn decode(
-            &self,
-            token_ids: &[u32],
-            _skip_special_tokens: bool,
-        ) -> uniserve_model_profile::tokenizer::Result<String> {
-            Ok(String::from_utf8_lossy(
-                &token_ids
-                    .iter()
-                    .map(|token_id| *token_id as u8)
-                    .collect::<Vec<_>>(),
-            )
-            .into_owned())
-        }
-
-        fn token_to_id(&self, _token: &str) -> Option<u32> {
-            unreachable!()
-        }
-    }
-
     #[test]
     fn decode_logprobs_decodes_every_candidate_token() {
-        let tokenizer = ByteTokenizer;
+        let tokenizer = crate::test_support::configured_tokenizer();
         let logprobs = vec![GenerationPositionLogprobs {
             entries: vec![
                 GenerationTokenLogprob {
@@ -182,7 +151,7 @@ mod tests {
         }];
 
         assert_eq!(
-            decode_logprobs(&tokenizer, &logprobs, false).unwrap(),
+            decode_logprobs(tokenizer.as_ref(), &logprobs, false).unwrap(),
             DecodedLogprobs {
                 positions: vec![DecodedPositionLogprobs {
                     entries: vec![
@@ -206,7 +175,7 @@ mod tests {
 
     #[test]
     fn decode_prompt_logprobs_separates_first_prompt_token() {
-        let tokenizer = ByteTokenizer;
+        let tokenizer = crate::test_support::configured_tokenizer();
         let logprobs = vec![GenerationPositionLogprobs {
             entries: vec![GenerationTokenLogprob {
                 token_id: b'x' as u32,
@@ -218,7 +187,7 @@ mod tests {
         assert_eq!(
             decode_prompt_logprobs(
                 "test",
-                &tokenizer,
+                tokenizer.as_ref(),
                 &[b'p' as u32, b'x' as u32],
                 &logprobs,
                 false,

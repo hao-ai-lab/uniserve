@@ -29,7 +29,6 @@ from .report import (
     benchmark_contract,
     build_summary,
     image_sample_collection_contract,
-    plan_summary,
     record_collection_contract,
     render_markdown,
     spec_to_dict,
@@ -37,7 +36,6 @@ from .report import (
 )
 from .spec import BenchmarkSpec
 from .tasks import TASKS
-from .tasks.base import TaskRequest
 
 
 @dataclass
@@ -88,8 +86,6 @@ class BenchmarkRunner:
 
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
         async with httpx.AsyncClient(timeout=self.timeout_s, limits=limits) as client:
-            plan_evidence = await self._collect_plan_evidence(client, rows)
-
             async def submit(row: dict[str, Any]) -> RequestRecord:
                 return await self._submit(client, row)
 
@@ -131,7 +127,6 @@ class BenchmarkRunner:
             dur_s,
             tokenizer=tokenizer,
             server_info=server_info,
-            plan_evidence=plan_evidence,
             contract=contract,
         )
         gpu_samples: list[dict[str, Any]] = []
@@ -208,143 +203,3 @@ class BenchmarkRunner:
             except Exception:  # noqa: BLE001 - try the next standard inspection endpoint.
                 continue
         return None
-
-    async def _collect_plan_evidence(
-        self,
-        client: httpx.AsyncClient,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        policy = self.spec.plan_evidence_policy
-        if policy == "declared_contract":
-            return {"source": policy, "plan": plan_summary(self.spec)}
-        if not rows:
-            return {
-                "source": policy,
-                "plan": None,
-                "error": "the dataset produced no request for plan inspection",
-            }
-        request = self.task.build_request(rows[0])
-        if policy == "reference_protocol":
-            return {
-                "source": policy,
-                "plan": plan_summary(self.spec),
-                "request": reference_request_summary(request),
-            }
-        evidence = await self._inspect_runtime_plan(client, request)
-        return {"source": "runtime_inspection", **evidence}
-
-    async def _inspect_runtime_plan(
-        self,
-        client: httpx.AsyncClient,
-        request: TaskRequest,
-    ) -> dict[str, Any]:
-        plan_endpoints = {
-            "/v1/chat/completions": "/v1/chat/completions/plan",
-            "/v1/images/generations": "/v1/images/generations/plan",
-        }
-        endpoint = plan_endpoints.get(request.endpoint)
-        if endpoint is None:
-            return {
-                "plan": None,
-                "error": f"no runtime plan endpoint is defined for {request.endpoint}",
-            }
-        try:
-            response = await client.post(
-                self.base_url + endpoint,
-                json=request.payload,
-                headers={"x-request-id": "plan-inspection"},
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            plan = response.json()
-            if not isinstance(plan, dict) or not isinstance(plan.get("profile_id"), str):
-                raise ValueError("runtime plan response is not a PlanInspection object")
-            return {
-                "endpoint": endpoint,
-                "plan": plan,
-                "request": reference_request_summary(request),
-            }
-        except Exception as error:  # noqa: BLE001 - the artifact records inspection failure.
-            return {
-                "endpoint": endpoint,
-                "plan": None,
-                "error": str(error),
-            }
-
-
-def reference_request_summary(request: TaskRequest) -> dict[str, Any]:
-    """Return a prompt-free semantic summary derived from one emitted request."""
-    payload = request.payload
-    image = payload.get("image_config")
-    image_config = image if isinstance(image, dict) else {}
-    width = image_config.get("width")
-    height = image_config.get("height")
-    size = payload.get("size")
-    if (width is None or height is None) and isinstance(size, str) and "x" in size:
-        width_text, height_text = size.lower().split("x", maxsplit=1)
-        if width_text.isdigit() and height_text.isdigit():
-            width, height = int(width_text), int(height_text)
-    steps = image_config.get("steps", payload.get("steps"))
-    alternate_steps = payload.get("num_inference_steps")
-    steps_consistent = alternate_steps is None or steps is None or alternate_steps == steps
-    messages = payload.get("messages")
-    return {
-        "endpoint": request.endpoint,
-        "kind": request.kind,
-        "model": payload.get("model"),
-        "stream": payload.get("stream", False),
-        "modalities": payload.get("modalities"),
-        "message_count": len(messages) if isinstance(messages, list) else 0,
-        "input_image_count": _count_input_images(messages),
-        "generation": {
-            "max_tokens": payload.get("max_completion_tokens", payload.get("max_tokens")),
-            "temperature": payload.get("temperature"),
-            "top_p": payload.get("top_p"),
-            "top_k": payload.get("top_k"),
-            "min_p": payload.get("min_p"),
-            "repetition_penalty": payload.get("repetition_penalty"),
-            "frequency_penalty": payload.get("frequency_penalty"),
-            "presence_penalty": payload.get("presence_penalty"),
-            "seed": payload.get("seed"),
-            "chat_template_kwargs": payload.get("chat_template_kwargs") or {},
-            "ignore_eos": payload.get("ignore_eos"),
-            "structured_outputs": payload.get("structured_outputs"),
-            "response_format": payload.get("response_format"),
-        },
-        "image": {
-            "width": width,
-            "height": height,
-            "steps": steps,
-            "steps_consistent": steps_consistent,
-            "max_images": image_config.get("num_images", payload.get("n")),
-            "seed": image_config.get("seed", payload.get("seed")),
-            "guidance_scale": image_config.get("guidance_scale", payload.get("guidance_scale")),
-            "image_guidance_scale": image_config.get(
-                "image_guidance_scale", payload.get("image_guidance_scale")
-            ),
-            "cfg_norm": image_config.get("cfg_norm", payload.get("cfg_norm")),
-            "cfg_interval": image_config.get("cfg_interval", payload.get("cfg_interval")),
-            "timestep_shift": image_config.get("timestep_shift", payload.get("timestep_shift")),
-            "think": image_config.get("think", payload.get("think")),
-            "t_eps": image_config.get("t_eps", payload.get("t_eps")),
-        },
-        "adapter": "base" if payload.get("lora_request") is None else "lora",
-    }
-
-
-def _count_input_images(messages: Any) -> int:
-    if not isinstance(messages, list):
-        return 0
-    count = 0
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        count += sum(
-            1
-            for part in content
-            if isinstance(part, dict) and part.get("type") in {"image", "image_url"}
-        )
-    return count

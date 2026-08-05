@@ -10,18 +10,15 @@ use std::collections::{BTreeMap, HashMap};
 
 use uniserve_core::GenerationRequest;
 
-use crate::chat::{
-    ChatMessage, ChatRequest, ChatTool, ChatToolChoice, GenerationPromptMode, ParserSelection,
-    ReasoningEffort,
-};
+use crate::chat::{ChatMessage, ChatRequest, ChatTool, ChatToolChoice, ReasoningEffort};
 use crate::text::TextDecodeOptions;
 use crate::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
-/// One supported input image (data payload plus optional token placement).
+/// One supported public input image. Model-specific placement is resolved by
+/// [`crate::model::ResolvedModel::tokenize`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInput {
     pub b64: String,
-    pub placement: Option<u32>,
 }
 
 /// The public prompt: raw text or a chat conversation. Input images live in
@@ -33,7 +30,6 @@ pub enum PromptInput {
         messages: Vec<ChatMessage>,
         tools: Vec<ChatTool>,
         tool_choice: ChatToolChoice,
-        generation_prompt_mode: GenerationPromptMode,
         reasoning_effort: Option<ReasoningEffort>,
     },
 }
@@ -119,7 +115,6 @@ pub struct CacheBounds {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SchedulingBounds {
     pub priority: i32,
-    pub data_parallel_rank: Option<u32>,
     pub trace_context: BTreeMap<String, String>,
 }
 
@@ -137,7 +132,6 @@ pub enum OutputContract {
 pub struct DecodeControls {
     pub skip_special_tokens: bool,
     pub include_stop_string_in_output: bool,
-    pub add_special_tokens: bool,
 }
 
 impl Default for DecodeControls {
@@ -145,7 +139,6 @@ impl Default for DecodeControls {
         Self {
             skip_special_tokens: true,
             include_stop_string_in_output: false,
-            add_special_tokens: false,
         }
     }
 }
@@ -182,7 +175,6 @@ impl GenerateReqInput {
                 messages,
                 tools: Vec::new(),
                 tool_choice: ChatToolChoice::None,
-                generation_prompt_mode: GenerationPromptMode::default(),
                 reasoning_effort: None,
             },
         )
@@ -220,33 +212,14 @@ pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
     /// Qwen3 chat reasoning + tool parsing over decoded text.
-    Chat(Box<ChatOutputProcessorConfig>),
+    Qwen3(Box<ChatRequest>),
     /// SenseNova/Bagel output filter over committed text.
-    DialectFilter(DialectOutputConfig),
-}
-
-/// Cloneable configuration used to rebuild the Qwen3 chat output processor
-/// inside the stream assembler.
-#[derive(Debug, Clone)]
-pub struct ChatOutputProcessorConfig {
-    pub request: ChatRequest,
-    pub model_id: String,
-    pub tool_parser: ParserSelection,
-    pub reasoning_parser: ParserSelection,
-}
-
-/// Cloneable configuration used to rebuild the dialect output filter inside the
-/// stream assembler.
-#[derive(Debug, Clone)]
-pub struct DialectOutputConfig {
-    pub output_filter: uniserve_model_profile::dialect::OutputFilterPolicy,
-    pub profile_reasoning: bool,
+    Dialect(uniserve_model_profile::dialect::OutputFilterPolicy),
 }
 
 /// Submission-envelope inputs carried alongside the engine request.
 #[derive(Debug, Clone)]
 pub struct SubmissionMetadata {
-    pub data_parallel_rank: Option<u32>,
     pub trace_headers: Option<BTreeMap<String, String>>,
 }
 

@@ -1,4 +1,3 @@
-use crate::chat::output::error::available_parser_hint;
 use thiserror::Error;
 use thiserror_ext::Macro;
 
@@ -21,38 +20,10 @@ pub enum Error {
     UnsupportedMultimodalContent(&'static str),
     #[error("multimodal preprocessing error: {0}")]
     Multimodal(#[message] String),
-    #[error("{kind} parsing is not available for model `{model_id}`")]
-    ParserUnavailableForModel {
-        kind: &'static str,
-        model_id: String,
-    },
-    #[error("{kind} parsing is disabled by frontend configuration")]
-    ParserDisabled { kind: &'static str },
-    #[error(
-        "{kind} parser `{name}` is not registered{}",
-        available_parser_hint(.available_names)
-    )]
-    ParserUnavailableByName {
-        kind: &'static str,
-        name: String,
-        available_names: Vec<String>,
-    },
     #[error("failed to initialize {kind} parser `{name}`")]
     ParserInitialization {
         kind: &'static str,
         name: String,
-        #[source]
-        error: BoxedError,
-    },
-    #[error(
-        "gpt_oss uses native Harmony output parsing; generic {kind} parser override `{selection}` is not supported"
-    )]
-    HarmonyParserOverrideUnsupported {
-        kind: &'static str,
-        selection: String,
-    },
-    #[error("harmony output parsing failed")]
-    HarmonyOutputParsing {
         #[source]
         error: BoxedError,
     },
@@ -112,27 +83,8 @@ impl From<crate::chat::template::Error> for Error {
 impl From<crate::chat::output::Error> for Error {
     fn from(error: crate::chat::output::Error) -> Self {
         match error {
-            crate::chat::output::Error::ParserUnavailableForModel { kind, model_id } => {
-                Self::ParserUnavailableForModel { kind, model_id }
-            }
-            crate::chat::output::Error::ParserDisabled { kind } => Self::ParserDisabled { kind },
-            crate::chat::output::Error::ParserUnavailableByName {
-                kind,
-                name,
-                available_names,
-            } => Self::ParserUnavailableByName {
-                kind,
-                name,
-                available_names,
-            },
             crate::chat::output::Error::ParserInitialization { kind, name, error } => {
                 Self::ParserInitialization { kind, name, error }
-            }
-            crate::chat::output::Error::HarmonyParserOverrideUnsupported { kind, selection } => {
-                Self::HarmonyParserOverrideUnsupported { kind, selection }
-            }
-            crate::chat::output::Error::HarmonyOutputParsing { error } => {
-                Self::HarmonyOutputParsing { error }
             }
             crate::chat::output::Error::ToolCallStreamInvariant { message } => {
                 Self::ToolCallStreamInvariant { message }

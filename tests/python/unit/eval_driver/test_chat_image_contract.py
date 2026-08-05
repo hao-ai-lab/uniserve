@@ -1,7 +1,7 @@
-"""One declared image operating point over canonical and reference wires.
+"""One declared image operating point over canonical and external request schemas.
 
-UniServe receives only ``image_config``. Explicit reference protocols may also
-receive the request-root aliases their implementations require.
+UniServe receives only ``image_config``. External backends may also receive the
+request-root aliases their implementations require.
 """
 
 from __future__ import annotations
@@ -94,8 +94,8 @@ def test_root_only_parameters_stay_out_of_the_canonical_image_config():
     assert "t_eps" not in payload
 
 
-def test_reference_protocol_receives_every_required_root_alias():
-    payload = _payload(plan_evidence_policy="reference_protocol")
+def test_vllm_omni_request_schema_receives_every_required_root_alias():
+    payload = _payload(request_schema="vllm_omni")
     declared = {**payload["image_config"], "think": False, "t_eps": 0.02}
 
     for name, root_names in ROOT_NAMES.items():

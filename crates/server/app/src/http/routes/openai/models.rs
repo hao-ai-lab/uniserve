@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use uniserve_openai_types::{ListModelsResponse, ModelObject};
+use uniserve_protocol_adapters::openai::{ListModelsResponse, ModelObject};
 
 use crate::AppState;
 

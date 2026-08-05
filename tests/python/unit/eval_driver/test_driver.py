@@ -66,14 +66,13 @@ def test_benchmark_parity_excludes_backend_identity_but_pins_protocol_and_rows()
         task=TaskName.TEXT,
         model="candidate",
         runtime_profile_id="candidate-profile",
-        plan_evidence_policy="runtime_inspection",
         num_prompts=1,
     )
     reference = BenchmarkSpec(
         task=TaskName.TEXT,
         model="reference",
         runtime_profile_id="reference-profile",
-        plan_evidence_policy="reference_protocol",
+        request_schema="sglang",
         num_prompts=1,
     )
 
@@ -108,7 +107,6 @@ def test_benchmark_parity_normalizes_backend_schedule_points_to_denoise_updates(
         task=TaskName.T2I,
         model="candidate",
         runtime_profile_id="candidate-profile",
-        plan_evidence_policy="runtime_inspection",
         num_prompts=1,
         steps=50,
         denoise_updates=50,
@@ -117,7 +115,7 @@ def test_benchmark_parity_normalizes_backend_schedule_points_to_denoise_updates(
         task=TaskName.T2I,
         model="reference",
         runtime_profile_id="reference-profile",
-        plan_evidence_policy="reference_protocol",
+        request_schema="vllm_omni",
         num_prompts=1,
         steps=51,
         denoise_updates=50,
@@ -184,9 +182,9 @@ def _write_harness_bundle(output_dir: Path, contract: dict) -> None:
         "spec": {"task": "text"},
         "base_url": "http://127.0.0.1:8000",
         "artifact": {
-            "schema_version": 2,
+            "schema_version": 4,
             "valid": True,
-            "valid_marker": "artifact-valid-v2",
+            "valid_marker": "artifact-valid-v4",
             "checks": {"contract": True},
             "contract": contract,
             "request_records": record_collection_contract(request_records),
@@ -1167,6 +1165,7 @@ def test_server_execution_must_derive_from_profile_and_link_model_input(tmp_path
     executable.chmod(0o755)
     model = tmp_path / "model"
     model.mkdir()
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
     (model / "weights.bin").write_bytes(b"weights")
     config = {
         "servers": {
@@ -1241,6 +1240,7 @@ def test_server_execution_must_derive_from_profile_and_link_model_input(tmp_path
 
     other_model = tmp_path / "other-model"
     other_model.mkdir()
+    (other_model / "config.json").write_text("{}\n", encoding="utf-8")
     (other_model / "weights.bin").write_bytes(b"other")
     assert not server_execution_matches_profile(
         config,
@@ -1329,7 +1329,7 @@ def test_matrix_definition_binds_active_point_semantics_load_case_dataset_and_ha
     parity_payload = {
         "schema_version": 2,
         "harness": harness,
-        "model": {"kind": "directory"},
+        "model": {"kind": "model_directory"},
     }
     selected = _fingerprinted(
         {
@@ -1667,28 +1667,28 @@ def test_multimodal_profiles_require_the_documented_model_content() -> None:
     config = load_config(DEFAULT_CONFIG)
     expected = {
         "benchmark/server/sensenova-uniserve": {
-            "kind": "directory",
-            "file_count": 21,
-            "total_size_bytes": 35121648810,
-            "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670",
+            "kind": "model_directory",
+            "file_count": 20,
+            "total_size_bytes": 35121626550,
+            "tree_sha256": "17e3f80729ff5ec69207494387cc8d6e259073c45840f82adfb7172c9be168c0",
         },
         "benchmark/server/sensenova-omni": {
-            "kind": "directory",
-            "file_count": 21,
-            "total_size_bytes": 35121648810,
-            "tree_sha256": "e1c384ec879ffb0c98ef8f57d3181e68208ab03bdd156b058b806bc74cc52670",
+            "kind": "model_directory",
+            "file_count": 20,
+            "total_size_bytes": 35121626550,
+            "tree_sha256": "17e3f80729ff5ec69207494387cc8d6e259073c45840f82adfb7172c9be168c0",
         },
         "benchmark/server/bagel-uniserve": {
-            "kind": "directory",
-            "file_count": 29,
-            "total_size_bytes": 29561613162,
-            "tree_sha256": "0ecdb77f50b149122bb28a709dbe66cfc9a226edc99e6bd1404227233b19857c",
+            "kind": "model_directory",
+            "file_count": 13,
+            "total_size_bytes": 29561610186,
+            "tree_sha256": "f1d61076bb5ce7f70d4b93b003576fabbb3f52681364c2de3848e9d531639c4f",
         },
         "benchmark/server/bagel-omni": {
-            "kind": "directory",
-            "file_count": 29,
-            "total_size_bytes": 29561613162,
-            "tree_sha256": "0ecdb77f50b149122bb28a709dbe66cfc9a226edc99e6bd1404227233b19857c",
+            "kind": "model_directory",
+            "file_count": 13,
+            "total_size_bytes": 29561610186,
+            "tree_sha256": "f1d61076bb5ce7f70d4b93b003576fabbb3f52681364c2de3848e9d531639c4f",
         },
     }
 
@@ -1981,9 +1981,9 @@ def test_performance_environment_does_not_persist_asset_paths() -> None:
 def test_execution_contract_attachment_writes_synchronized_artifacts(tmp_path):
     summary = {
         "artifact": {
-            "schema_version": 2,
+            "schema_version": 4,
             "valid": True,
-            "valid_marker": "canonical-valid-v2",
+            "valid_marker": "canonical-valid-v4",
             "checks": {"harness_contract": True},
         }
     }
@@ -1999,7 +1999,7 @@ def test_execution_contract_attachment_writes_synchronized_artifacts(tmp_path):
     assert persisted_summary == summary
     assert persisted_manifest == summary["artifact"]
     assert persisted_summary["artifact"]["checks"]["matrix_contract"] is True
-    assert persisted_summary["artifact"]["valid_marker"] == "canonical-valid-v2"
+    assert persisted_summary["artifact"]["valid_marker"] == "canonical-valid-v4"
 
     attach_execution_contract(summary, "quality_contract", {"schema_version": 1}, valid=False)
     assert summary["artifact"]["valid"] is False
@@ -2015,9 +2015,9 @@ def test_canonical_artifact_bundle_binds_every_durable_record(tmp_path):
         "spec": {"task": "text"},
         "base_url": "http://127.0.0.1:8000",
         "artifact": {
-            "schema_version": 2,
+            "schema_version": 4,
             "valid": True,
-            "valid_marker": "canonical-valid-v2",
+            "valid_marker": "canonical-valid-v4",
             "checks": {"contract": True},
             "contract": expected_contract,
         },
@@ -2063,9 +2063,9 @@ def test_canonical_artifact_bundle_binds_reported_metrics(tmp_path):
         "base_url": "http://127.0.0.1:8000",
         "metrics": {"output_throughput": 10.0},
         "artifact": {
-            "schema_version": 2,
+            "schema_version": 4,
             "valid": True,
-            "valid_marker": "canonical-valid-v2",
+            "valid_marker": "canonical-valid-v4",
             "checks": {"contract": True},
             "contract": expected_contract,
             "request_records": record_collection_contract(request_records),
@@ -2105,9 +2105,9 @@ def test_direct_harness_bundle_is_not_a_matrix_canonical_point(tmp_path):
         "spec": {"task": "text"},
         "base_url": "http://127.0.0.1:8000",
         "artifact": {
-            "schema_version": 2,
+            "schema_version": 4,
             "valid": True,
-            "valid_marker": "artifact-valid-v2",
+            "valid_marker": "artifact-valid-v4",
             "checks": {"contract": True},
             "contract": expected_contract,
             "request_records": record_collection_contract(request_records),
@@ -2211,15 +2211,11 @@ def test_benchmark_runner_warmup_uses_the_measured_request_shape(tmp_path, monke
         measured = await kwargs["submit"](rows[0])
         return [measured], 1.0
 
-    async def fake_plan(self, _client, _rows):
-        return {"source": "declared_contract", "plan": harness_runner.plan_summary(self.spec)}
-
     async def fake_server_info(self, _client):
         del self
         return None
 
     monkeypatch.setattr(BenchmarkRunner, "_submit", fake_submit)
-    monkeypatch.setattr(BenchmarkRunner, "_collect_plan_evidence", fake_plan)
     monkeypatch.setattr(BenchmarkRunner, "_fetch_server_info", fake_server_info)
     monkeypatch.setattr(harness_runner, "run_load", fake_run_load)
 

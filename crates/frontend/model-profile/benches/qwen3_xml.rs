@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use uniserve_model_profile::tools::test_utils::{split_by_chars, test_tools};
-use uniserve_model_profile::tools::{Qwen3XmlToolParser, Tool, ToolParser};
+use uniserve_model_profile::tools::{Qwen3XmlToolParser, Tool};
 
 mod utils;
 use utils::feed_parser;
@@ -29,8 +29,8 @@ fn long_normal_text_fixture() -> String {
     line.repeat(LONG_NORMAL_TEXT_REPEATS)
 }
 
-fn native_parser(tools: &[Tool]) -> Box<dyn ToolParser> {
-    Qwen3XmlToolParser::create(tools).expect("Qwen XML parser should initialize")
+fn native_parser(tools: &[Tool]) -> Qwen3XmlToolParser {
+    Qwen3XmlToolParser::new(tools)
 }
 
 fn run_stream_group(
@@ -53,7 +53,7 @@ fn run_stream_group(
     group.bench_function("native_reuse_parser", |b| {
         let mut parser = native_parser(tools);
         b.iter(|| {
-            let result = feed_parser(&mut *parser, black_box(&chunks));
+            let result = feed_parser(&mut parser, black_box(&chunks));
             debug_assert_eq!(result.0, expected_normal_text);
             debug_assert_eq!(result.1, expected_native_calls_len);
             black_box(result);
@@ -64,7 +64,7 @@ fn run_stream_group(
         b.iter_batched(
             || native_parser(tools),
             |mut parser| {
-                let result = feed_parser(&mut *parser, black_box(&chunks));
+                let result = feed_parser(&mut parser, black_box(&chunks));
                 debug_assert_eq!(result.0, expected_normal_text);
                 debug_assert_eq!(result.1, expected_native_calls_len);
                 black_box(result);

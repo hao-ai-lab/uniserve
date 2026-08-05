@@ -12,7 +12,8 @@ from typing import Any, cast
 
 from .artifacts import ArtifactWriter
 from .image_outputs import (
-    ImageOutputRequirements,
+    ImageOutputContract,
+    ImageOutputMode,
     image_output_mismatch,
     inspect_image_bytes,
 )
@@ -68,7 +69,7 @@ def benchmark_contract(
 
 
 _PARITY_IDENTITY_FIELDS = frozenset(
-    {"dataset_path", "model", "name", "runtime_profile_id", "plan_evidence_policy"}
+    {"dataset_path", "model", "name", "runtime_profile_id", "request_schema"}
 )
 
 
@@ -133,9 +134,9 @@ def artifact_summary_matches(
         return False
     checks = artifact.get("checks")
     if not (
-        artifact.get("schema_version") == 2
+        artifact.get("schema_version") == 4
         and artifact.get("valid") is True
-        and artifact.get("valid_marker") in {"artifact-valid-v2", "canonical-valid-v2"}
+        and artifact.get("valid_marker") in {"artifact-valid-v4", "canonical-valid-v4"}
         and isinstance(checks, dict)
         and bool(checks)
         and all(value is True for value in checks.values())
@@ -165,7 +166,7 @@ def canonical_summary_matches(
     ):
         return False
     assert isinstance(summary, dict)
-    return summary["artifact"].get("valid_marker") == "canonical-valid-v2"
+    return summary["artifact"].get("valid_marker") == "canonical-valid-v4"
 
 
 def record_collection_contract(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -395,13 +396,13 @@ def attach_execution_contract(
     checks = artifact.get("checks")
     if not isinstance(checks, dict):
         raise ValueError("benchmark artifact has no validity checks")
-    was_canonical = artifact.get("valid_marker") == "canonical-valid-v2"
+    was_canonical = artifact.get("valid_marker") == "canonical-valid-v4"
     artifact[name] = contract
     checks[name] = valid
     artifact["valid"] = all(value is True for value in checks.values())
     canonical = was_canonical or name in {"matrix_contract", "profile_contract"}
     artifact["valid_marker"] = (
-        ("canonical-valid-v2" if canonical else "artifact-valid-v2") if artifact["valid"] else None
+        ("canonical-valid-v4" if canonical else "artifact-valid-v4") if artifact["valid"] else None
     )
 
 
@@ -437,55 +438,6 @@ def load_mode(spec: BenchmarkSpec) -> str:
     return "saturation"
 
 
-def plan_summary(spec: BenchmarkSpec) -> dict[str, Any]:
-    """Sanitized semantic plan declared for one formal measurement point."""
-    return {
-        "runtime_profile_id": spec.runtime_profile_id,
-        "protocol_adapter": spec.wire,
-        "measurement_interface": spec.measurement_interface,
-        "context": {
-            "dataset": spec.dataset,
-            "preprocessing": spec.preprocessing,
-            "prompt_source": spec.dataset_path or spec.dataset,
-        },
-        "generation": {
-            "output_constraint": spec.output_constraint,
-            "max_tokens": spec.max_tokens,
-            "temperature": spec.temperature,
-            "top_p": spec.top_p,
-            "top_k": spec.top_k,
-            "min_p": spec.min_p,
-            "repetition_penalty": spec.repetition_penalty,
-            "frequency_penalty": spec.frequency_penalty,
-            "presence_penalty": spec.presence_penalty,
-            "seed": spec.sampling_seed,
-            "chat_template_kwargs": spec.chat_template_kwargs,
-            "ignore_eos": spec.ignore_eos,
-            "structured_output": spec.structured_output_policy,
-        },
-        "image": {
-            "width": spec.width,
-            "height": spec.height,
-            "steps": spec.steps,
-            "denoise_updates": spec.denoise_updates,
-            "max_images": spec.max_images,
-            "seed": spec.seed,
-            "guidance_scale": spec.guidance_scale,
-            "image_guidance_scale": spec.image_guidance_scale,
-            "cfg_norm": spec.cfg_norm,
-            "cfg_interval": list(spec.cfg_interval) if spec.cfg_interval is not None else None,
-            "timestep_shift": spec.timestep_shift,
-            "think": spec.image_think,
-            "t_eps": spec.image_t_eps,
-        },
-        "cache": {
-            "read": spec.cache_read_policy,
-            "write": spec.cache_write_policy,
-        },
-        "adapter": spec.adapter_selection,
-    }
-
-
 def artifact_contract(
     spec: BenchmarkSpec,
     *,
@@ -493,36 +445,11 @@ def artifact_contract(
     ok_count: int,
     failed_count: int,
     total_images: int,
-    plan_evidence: dict[str, Any] | None,
     contract: dict[str, Any] | None,
     generation_conformance: dict[str, Any],
     interleave_latency_conformance: dict[str, Any] | None,
+    warnings: dict[str, Any],
 ) -> dict[str, Any]:
-    expected_plan_source = spec.plan_evidence_policy
-    if plan_evidence is None:
-        plan_evidence = {
-            "source": "declared_contract",
-            "plan": plan_summary(spec),
-        }
-    plan = plan_evidence.get("plan")
-    plan_evidence_valid = plan_evidence.get("source") == expected_plan_source
-    if plan_evidence_valid and expected_plan_source == "declared_contract":
-        plan_evidence_valid = isinstance(plan, dict)
-    elif plan_evidence_valid and expected_plan_source == "runtime_inspection":
-        request = plan_evidence.get("request")
-        plan_evidence_valid = (
-            isinstance(plan, dict)
-            and isinstance(request, dict)
-            and _reference_request_matches_contract(request, spec)
-            and _runtime_plan_matches_declared_contract(plan, spec, request=request)
-        )
-    elif plan_evidence_valid and expected_plan_source == "reference_protocol":
-        request = plan_evidence.get("request")
-        plan_evidence_valid = (
-            isinstance(request, dict)
-            and plan == plan_summary(spec)
-            and _reference_request_matches_contract(request, spec)
-        )
     checks = {
         "declared_request_count": request_count == spec.num_prompts,
         "minimum_successful_requests": ok_count >= spec.acceptance_min_success,
@@ -530,7 +457,6 @@ def artifact_contract(
         "single_measured_run": spec.measured_runs == 1,
         "minimum_images": total_images
         >= math.ceil(ok_count * spec.acceptance_min_images_per_success),
-        "plan_evidence": plan_evidence_valid,
         "contract_fingerprint": benchmark_contract_is_valid(contract, spec, request_count),
         "generation_conformance": generation_conformance.get("valid") is True,
     }
@@ -540,9 +466,9 @@ def artifact_contract(
         )
     valid = all(checks.values())
     artifact: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 4,
         "valid": valid,
-        "valid_marker": "artifact-valid-v2" if valid else None,
+        "valid_marker": "artifact-valid-v4" if valid else None,
         "checks": checks,
         "acceptance": {
             "minimum_successful_requests": spec.acceptance_min_success,
@@ -551,219 +477,13 @@ def artifact_contract(
         },
         "measured_runs": spec.measured_runs,
         "server_topology": spec.server_topology,
-        "declared_contract": plan_summary(spec),
-        "plan_summary": plan_evidence.get("plan", plan_evidence.get("request")),
-        "plan_evidence": plan_evidence,
         "contract": contract,
         "generation_conformance": generation_conformance,
+        "warnings": warnings,
     }
     if interleave_latency_conformance is not None:
         artifact["interleave_latency_conformance"] = interleave_latency_conformance
     return artifact
-
-
-def _runtime_plan_matches_declared_contract(
-    plan: dict[str, Any], spec: BenchmarkSpec, *, request: dict[str, Any] | None = None
-) -> bool:
-    expected_profile = spec.runtime_profile_id
-    if expected_profile == "unspecified":
-        return False
-    profile_id = plan.get("profile_id")
-    dialect_id = plan.get("dialect_id")
-    identity_matches = (
-        isinstance(profile_id, str)
-        and isinstance(dialect_id, str)
-        and (
-            profile_id == expected_profile
-            or profile_id.startswith(f"{expected_profile}:")
-            or dialect_id == expected_profile
-        )
-    )
-    generation = plan.get("generation")
-    cache = plan.get("cache")
-    if not identity_matches or not isinstance(generation, dict) or not isinstance(cache, dict):
-        return False
-    if generation.get("constraint") != spec.output_constraint:
-        return False
-    if spec.max_tokens is not None and generation.get("max_tokens") != spec.max_tokens:
-        return False
-    if request is not None:
-        request_generation = request.get("generation")
-        if not isinstance(request_generation, dict):
-            return False
-        requested_max = request_generation.get("max_tokens")
-        if requested_max is not None and generation.get("max_tokens") != requested_max:
-            return False
-    if not _same_float(generation.get("temperature"), spec.temperature):
-        return False
-    if not _same_float(generation.get("top_p"), spec.top_p):
-        return False
-    optional_generation_fields: dict[str, float | int | None] = {
-        "top_k": spec.top_k,
-        "min_p": spec.min_p,
-        "repetition_penalty": spec.repetition_penalty,
-        "frequency_penalty": spec.frequency_penalty,
-        "presence_penalty": spec.presence_penalty,
-        "seed": spec.sampling_seed,
-    }
-    for key, optional_expected in optional_generation_fields.items():
-        if optional_expected is None:
-            continue
-        actual = generation.get(key)
-        if isinstance(optional_expected, float):
-            if not _same_float(actual, optional_expected):
-                return False
-        elif actual != optional_expected:
-            return False
-    if generation.get("ignore_eos") is not spec.ignore_eos:
-        return False
-    if cache.get("read_enabled") is not (spec.cache_read_policy == "enabled"):
-        return False
-    if cache.get("write_enabled") is not (spec.cache_write_policy == "enabled"):
-        return False
-    if _adapter_name(plan.get("adapter")) != spec.adapter_selection:
-        return False
-    if spec.output_constraint not in {"default", "gen_only"}:
-        return True
-    image = generation.get("image")
-    if not isinstance(image, dict):
-        return False
-    exact_image_fields: dict[str, int | str | None] = {
-        "width": spec.width,
-        "height": spec.height,
-        "steps": spec.steps,
-        "max_images": spec.max_images,
-        "seed": spec.seed,
-        "cfg_renorm_type": spec.cfg_norm,
-    }
-    for key, expected_exact in exact_image_fields.items():
-        if expected_exact is not None and image.get(key) != expected_exact:
-            return False
-    float_image_fields: dict[str, float | None] = {
-        "cfg_text_scale": spec.guidance_scale,
-        "cfg_img_scale": spec.image_guidance_scale,
-        "timestep_shift": spec.timestep_shift,
-    }
-    for key, expected_float in float_image_fields.items():
-        if expected_float is not None and not _same_float(image.get(key), expected_float):
-            return False
-    if spec.cfg_interval is not None:
-        actual_interval = image.get("cfg_interval")
-        if not isinstance(actual_interval, (list, tuple)) or len(actual_interval) != 2:
-            return False
-        if not all(
-            _same_float(actual, expected)
-            for actual, expected in zip(actual_interval, spec.cfg_interval, strict=True)
-        ):
-            return False
-    return True
-
-
-def _reference_request_matches_contract(request: dict[str, Any], spec: BenchmarkSpec) -> bool:
-    if request.get("endpoint") != spec.endpoint or request.get("kind") != spec.wire:
-        return False
-    if request.get("model") != spec.model or request.get("adapter") != spec.adapter_selection:
-        return False
-    modalities = request.get("modalities")
-    if spec.output_constraint == "gen_only":
-        if request.get("kind") != "images_generations" and modalities != ["image"]:
-            return False
-    elif spec.output_constraint == "default":
-        if modalities != ["text", "image"]:
-            return False
-    elif spec.output_constraint == "und_only" and modalities is not None and modalities != ["text"]:
-        return False
-    generation = request.get("generation")
-    if not isinstance(generation, dict):
-        return False
-    if spec.max_tokens is not None and generation.get("max_tokens") != spec.max_tokens:
-        return False
-    for key, expected in (("temperature", spec.temperature), ("top_p", spec.top_p)):
-        actual = generation.get(key)
-        if actual is not None and not _same_float(actual, expected):
-            return False
-    optional_generation_fields = {
-        "top_k": spec.top_k,
-        "min_p": spec.min_p,
-        "repetition_penalty": spec.repetition_penalty,
-        "frequency_penalty": spec.frequency_penalty,
-        "presence_penalty": spec.presence_penalty,
-        "seed": spec.sampling_seed,
-    }
-    for key, expected_value in optional_generation_fields.items():
-        if expected_value is None:
-            continue
-        actual = generation.get(key)
-        if isinstance(expected_value, float):
-            if not _same_float(actual, expected_value):
-                return False
-        elif actual != expected_value:
-            return False
-    if generation.get("chat_template_kwargs") != spec.chat_template_kwargs:
-        return False
-    actual_ignore_eos = generation.get("ignore_eos")
-    if actual_ignore_eos is not None and actual_ignore_eos is not spec.ignore_eos:
-        return False
-    if spec.structured_output_policy == "none" and (
-        generation.get("structured_outputs") is not None
-        or generation.get("response_format") is not None
-    ):
-        return False
-    if spec.task.value in {"i2i", "i2t"} and request.get("input_image_count", 0) < 1:
-        return False
-    if spec.output_constraint not in {"default", "gen_only"}:
-        return True
-    image = request.get("image")
-    if not isinstance(image, dict) or image.get("steps_consistent") is not True:
-        return False
-    exact_fields = {
-        "width": spec.width,
-        "height": spec.height,
-        "steps": spec.steps,
-        "max_images": spec.max_images,
-        "seed": spec.seed,
-        "cfg_norm": spec.cfg_norm,
-    }
-    for key, expected_exact in exact_fields.items():
-        if expected_exact is not None and image.get(key) != expected_exact:
-            return False
-    float_fields = {
-        "guidance_scale": spec.guidance_scale,
-        "image_guidance_scale": spec.image_guidance_scale,
-        "timestep_shift": spec.timestep_shift,
-        "t_eps": spec.image_t_eps,
-    }
-    for key, expected_float in float_fields.items():
-        if expected_float is not None and not _same_float(image.get(key), expected_float):
-            return False
-    if spec.image_think is not None and image.get("think") is not spec.image_think:
-        return False
-    if spec.cfg_interval is not None:
-        actual_interval = image.get("cfg_interval")
-        if not isinstance(actual_interval, (list, tuple)) or len(actual_interval) != 2:
-            return False
-        if not all(
-            _same_float(actual, expected)
-            for actual, expected in zip(actual_interval, spec.cfg_interval, strict=True)
-        ):
-            return False
-    return True
-
-
-def _same_float(actual: Any, expected: float) -> bool:
-    return (
-        not isinstance(actual, bool)
-        and isinstance(actual, (int, float))
-        and math.isclose(float(actual), float(expected), rel_tol=1e-6, abs_tol=1e-6)
-    )
-
-
-def _adapter_name(adapter: Any) -> str | None:
-    if isinstance(adapter, str):
-        return adapter.lower()
-    if isinstance(adapter, dict) and len(adapter) == 1:
-        return next(iter(adapter)).lower()
-    return None
 
 
 def build_summary(
@@ -774,7 +494,6 @@ def build_summary(
     *,
     tokenizer: Any | None = None,
     server_info: dict[str, Any] | None = None,
-    plan_evidence: dict[str, Any] | None = None,
     contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ok = [r for r in records if r.success]
@@ -788,6 +507,7 @@ def build_summary(
     else:
         family = "image"
         metrics = summarize_image(records, dur_s)
+    warnings = _warning_summary(records, metrics)
     endpoint = _observed_endpoint(records) or spec.endpoint
 
     summary: dict[str, Any] = {
@@ -813,6 +533,7 @@ def build_summary(
         "ok_count": len(ok),
         "failed_count": len(records) - len(ok),
         "classifiers": classifiers,
+        "warnings": warnings,
         "metric_family": family,
         "metrics": metrics,
     }
@@ -823,10 +544,10 @@ def build_summary(
         ok_count=summary["ok_count"],
         failed_count=summary["failed_count"],
         total_images=_completed_images(family, metrics),
-        plan_evidence=plan_evidence,
         contract=contract,
         generation_conformance=generation_conformance,
         interleave_latency_conformance=_interleave_latency_conformance(spec, metrics),
+        warnings=warnings,
     )
     if spec.runtime_profile_id != "unspecified":
         server_info_valid = bool(
@@ -841,12 +562,40 @@ def build_summary(
             value is True for value in summary["artifact"]["checks"].values()
         )
         summary["artifact"]["valid_marker"] = (
-            "artifact-valid-v2" if summary["artifact"]["valid"] else None
+            "artifact-valid-v4" if summary["artifact"]["valid"] else None
         )
     summary["artifact"]["image_samples"] = image_sample_collection_contract(
         [record.record_dict() for record in records]
     )
     return summary
+
+
+def _warning_summary(records: Sequence[RequestRecord], metrics: dict[str, Any]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    warned_request_ids: set[str] = set()
+    for record in records:
+        if record.warnings:
+            warned_request_ids.add(record.request_id)
+        for warning in record.warnings:
+            counts[warning] = counts.get(warning, 0) + 1
+    interleave = metrics.get("modality_interleave")
+    timing = interleave.get("transition_timing") if isinstance(interleave, dict) else None
+    server_attribution = timing.get("server_attribution") if isinstance(timing, dict) else None
+    request_statuses = (
+        server_attribution.get("request_statuses") if isinstance(server_attribution, dict) else None
+    )
+    if isinstance(request_statuses, dict):
+        for request_id, status in request_statuses.items():
+            if not isinstance(request_id, str) or status not in {"partial", "unavailable"}:
+                continue
+            warning = f"server_public_commit_{status}"
+            warned_request_ids.add(request_id)
+            counts[warning] = counts.get(warning, 0) + 1
+    return {
+        "request_count": len(warned_request_ids),
+        "total_count": sum(counts.values()),
+        "counts": counts,
+    }
 
 
 def _completed_images(family: str, metrics: dict[str, Any]) -> int:
@@ -976,7 +725,7 @@ def _image_generation_conformance(
     return {
         "schema_version": 1,
         "policy": (
-            "decoded_image_within_declared_cap"
+            "optional_decoded_images_within_declared_cap"
             if spec.task == TaskName.INTERLEAVE
             else "decoded_image_exact_declared_work"
         ),
@@ -993,20 +742,12 @@ def _interleave_generation_conformance(
 ) -> dict[str, Any]:
     image = _image_generation_conformance(spec, records)
     modality_mismatches = [
-        record.request_id
-        for record in records
-        if not (
-            record.success
-            and record.generated_text
-            and "text" in record.output_modalities
-            and "image" in record.output_modalities
-            and len(record.output_modalities) >= 2
-        )
+        record.request_id for record in records if not _interleave_record_conforms(record)
     ]
     mismatches = list(dict.fromkeys(image["mismatched_request_ids"] + modality_mismatches))
     return {
         "schema_version": 1,
-        "policy": "decoded_image_and_visible_modality_transition",
+        "policy": "visible_text_with_optional_decoded_image_transitions",
         "successful_requests": sum(record.success for record in records),
         "checked_requests": len(records),
         "mismatch_count": len(mismatches),
@@ -1050,9 +791,22 @@ def _text_generation_conformance(
     }
 
 
+def _interleave_record_conforms(record: RequestRecord) -> bool:
+    if not record.success or not record.generated_text or "text" not in record.output_modalities:
+        return False
+    if record.images == 0:
+        return record.image_output_mode == "optional"
+    return bool(
+        record.image_output_mode == "optional"
+        and "image" in record.output_modalities
+        and len(record.output_modalities) >= 2
+    )
+
+
 def _image_record_conforms(record: RequestRecord, spec: BenchmarkSpec) -> bool:
-    requirements = ImageOutputRequirements(
-        expected=True,
+    expected_mode: ImageOutputMode = "optional" if spec.task == TaskName.INTERLEAVE else "required"
+    contract = ImageOutputContract(
+        mode=expected_mode,
         count=(
             record.requested_image_count
             if record.requested_image_count is not None
@@ -1074,8 +828,9 @@ def _image_record_conforms(record: RequestRecord, spec: BenchmarkSpec) -> bool:
     )
     return bool(
         record.success
+        and record.image_output_mode == expected_mode
         and record.images == len(record.decoded_images)
-        and image_output_mismatch(record.decoded_images, requirements) is None
+        and image_output_mismatch(record.decoded_images, contract) is None
     )
 
 
@@ -1180,10 +935,17 @@ def _stream_markdown(metrics: dict[str, Any]) -> list[str]:
         overall = timing["transition_latency_ms"]
         text_to_image = timing["text_to_image_transition_latency_ms"]
         image_to_text = timing["image_to_text_transition_latency_ms"]
+        server_attribution = timing.get("server_attribution")
+        server_attribution_status = (
+            server_attribution.get("status")
+            if isinstance(server_attribution, dict)
+            else "unavailable"
+        )
         lines += [
             "",
             f"- transition timing: {'valid' if timing.get('valid') else 'invalid'}, "
             f"coverage={_fmt(timing.get('transition_sample_coverage'))}",
+            f"- server transition attribution: {server_attribution_status}",
             f"- transition latency mean/p95 = {_fmt(overall['mean'])}/{_fmt(overall['p95'])} ms",
             f"- text-to-image mean/p95 = "
             f"{_fmt(text_to_image['mean'])}/{_fmt(text_to_image['p95'])} ms",

@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from ..image_outputs import DecodedImage
+from ..image_outputs import DecodedImage, ImageOutputMode
 
 
 @dataclass
@@ -32,6 +32,7 @@ class RequestRecord:
     success: bool = False
     classifier: str = ""
     error: str | None = None
+    warnings: list[str] = field(default_factory=list)
     endpoint: str = ""
 
     # Timing (seconds). ``start_time`` is a ``perf_counter()`` taken right before
@@ -75,7 +76,7 @@ class RequestRecord:
     image_gen_seconds: list[float] = field(default_factory=list)
     image_steps: list[int] = field(default_factory=list)
     image_spans: list[dict[str, Any]] = field(default_factory=list)
-    generated_images_expected: bool = False
+    image_output_mode: ImageOutputMode = "none"
     requested_image_count: int | None = None
     requested_image_count_is_cap: bool = False
     requested_image_width: int | None = None
@@ -121,6 +122,7 @@ class RequestRecord:
             "success": self.success,
             "classifier": self.classifier,
             "error": self.error,
+            "warnings": list(self.warnings),
             "endpoint": self.endpoint,
             "scheduled_time": self.scheduled_time,
             "client_send_time": self.start_time,
@@ -185,7 +187,7 @@ class RequestRecord:
                 for event in self.modality_events
             ],
             "images": self.images,
-            "generated_images_expected": self.generated_images_expected,
+            "image_output_mode": self.image_output_mode,
             "requested_image_count": self.requested_image_count,
             "requested_image_count_is_cap": self.requested_image_count_is_cap,
             "requested_image_width": self.requested_image_width,

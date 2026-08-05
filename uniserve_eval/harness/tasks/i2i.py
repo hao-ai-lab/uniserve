@@ -7,7 +7,7 @@ from .base import (
     TaskRequest,
     apply_chat_image_contract,
     input_image_data_url,
-    uses_reference_protocol,
+    uses_external_request_schema,
 )
 
 
@@ -59,7 +59,7 @@ class I2ITask(BenchmarkTask):
         apply_chat_image_contract(
             payload,
             image_config,
-            include_reference_aliases=uses_reference_protocol(self.spec),
+            include_reference_aliases=uses_external_request_schema(self.spec),
         )
         if self.spec.extra_request_body:
             payload.update(self.spec.extra_request_body)

@@ -25,8 +25,8 @@ class BenchmarkTask:
         raise NotImplementedError
 
 
-def uses_reference_protocol(spec: BenchmarkSpec) -> bool:
-    return spec.plan_evidence_policy == "reference_protocol"
+def uses_external_request_schema(spec: BenchmarkSpec) -> bool:
+    return spec.request_schema != "uniserve"
 
 
 def apply_text_sampling_contract(payload: dict[str, Any], spec: BenchmarkSpec) -> None:
@@ -45,7 +45,7 @@ def apply_text_sampling_contract(payload: dict[str, Any], spec: BenchmarkSpec) -
             payload[key] = value
     if spec.sampling_seed is not None:
         payload["seed"] = spec.sampling_seed
-    if spec.chat_template_kwargs and uses_reference_protocol(spec):
+    if spec.chat_template_kwargs and spec.request_schema == "sglang":
         payload["chat_template_kwargs"] = dict(spec.chat_template_kwargs)
 
 

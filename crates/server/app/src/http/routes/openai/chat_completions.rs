@@ -7,10 +7,10 @@ use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use tracing::info;
 use tracing_futures::Instrument as _;
-use uniserve_openai_types::ChatCompletionRequest;
+use uniserve_protocol_adapters::openai::ChatCompletionRequest;
 use uniserve_protocol_adapters::openai::chat_completions::{
     chat_completion_chunk_stream, chat_completion_sse_stream, collect_chat_completion,
-    prepare_chat_request,
+    lower_chat_request,
 };
 use uniserve_protocol_adapters::openai::serve_error_to_api;
 
@@ -26,14 +26,15 @@ pub(crate) async fn chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let stream = body.stream;
-    let request_context = resolve_request_context(&headers, body.request_id.as_deref());
-    let prepared = match prepare_chat_request(body, state.served_model_names(), request_context) {
-        Ok(prepared) => prepared,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
+    let request_context = resolve_request_context(&headers);
+    let (input, response) =
+        match lower_chat_request(body, state.served_model_names(), request_context) {
+            Ok(lowered) => lowered,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
     let request_span = tracing::info_span!(
         "chat_completions",
-        request_id = %prepared.request_id,
+        request_id = %response.request_id,
         engine_request_id = tracing::field::Empty,
     );
 
@@ -42,7 +43,7 @@ pub(crate) async fn chat_completions(
 
     let serve_stream = match state
         .runtime()
-        .generate(prepared.input)
+        .generate(input)
         .instrument(request_span.clone())
         .await
     {
@@ -53,16 +54,15 @@ pub(crate) async fn chat_completions(
     if stream {
         let chunk_stream = chat_completion_chunk_stream(
             serve_stream,
-            prepared.request_id,
-            prepared.response_model,
+            response.request_id,
+            response.response_model,
             created,
             log_request,
-            prepared.include_usage,
-            prepared.requested_logprobs,
-            prepared.include_reasoning,
-            prepared.echo,
-            prepared.return_token_ids,
-            prepared.return_tokens_as_token_ids,
+            response.include_usage,
+            response.requested_logprobs,
+            response.include_reasoning,
+            response.return_token_ids,
+            response.return_tokens_as_token_ids,
         );
         let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
 
@@ -74,15 +74,14 @@ pub(crate) async fn chat_completions(
     } else {
         let response = match collect_chat_completion(
             serve_stream,
-            prepared.request_id,
-            prepared.response_model,
+            response.request_id,
+            response.response_model,
             created,
-            prepared.requested_logprobs,
-            prepared.include_prompt_logprobs,
-            prepared.include_reasoning,
-            prepared.echo,
-            prepared.return_token_ids,
-            prepared.return_tokens_as_token_ids,
+            response.requested_logprobs,
+            response.include_prompt_logprobs,
+            response.include_reasoning,
+            response.return_token_ids,
+            response.return_tokens_as_token_ids,
         )
         .instrument(request_span.clone())
         .await

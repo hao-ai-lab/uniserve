@@ -9,6 +9,7 @@
     "request_count",
     "ok_count",
     "failed_count",
+    "warnings",
     "metric_family",
     "metrics",
     "load",
@@ -40,13 +41,14 @@
     "ok_count": {"type": "integer", "minimum": 0},
     "failed_count": {"type": "integer", "minimum": 0},
     "classifiers": {"type": "object"},
+    "warnings": {"$ref": "#/$defs/warningSummary"},
     "metric_family": {"type": "string", "enum": ["stream", "image"]},
     "metrics": {"type": "object"},
     "artifact": {
       "type": "object",
-      "required": ["schema_version", "valid", "valid_marker", "checks", "contract", "declared_contract", "plan_summary", "plan_evidence", "image_samples"],
+      "required": ["schema_version", "valid", "valid_marker", "checks", "contract", "warnings", "image_samples"],
       "properties": {
-        "schema_version": {"type": "integer", "const": 2},
+        "schema_version": {"type": "integer", "const": 4},
         "valid": {"type": "boolean"},
         "valid_marker": {"type": ["string", "null"]},
         "checks": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "boolean"}},
@@ -67,39 +69,25 @@
             "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
           }
         },
-        "declared_contract": {"type": "object"},
-        "plan_summary": {"type": ["object", "null"]},
-        "plan_evidence": {
-          "type": "object",
-          "required": ["source"],
-          "properties": {
-            "source": {"type": "string", "enum": ["declared_contract", "runtime_inspection", "reference_protocol"]},
-            "plan": {"type": ["object", "null"]},
-            "request": {"type": "object"},
-            "endpoint": {"type": "string"},
-            "error": {"type": "string"}
-          },
-          "allOf": [
-            {
-              "if": {"properties": {"source": {"const": "reference_protocol"}}},
-              "then": {
-                "anyOf": [
-                  {"required": ["request"]},
-                  {"required": ["plan", "error"]}
-                ]
-              },
-              "else": {"required": ["plan"]}
-            }
-          ]
-        },
         "profile_contract": {"$ref": "#/$defs/executionContract"},
         "matrix_contract": {"$ref": "#/$defs/executionContract"},
         "execution_bundle_contract": {"$ref": "#/$defs/executionBundleContract"},
+        "warnings": {"$ref": "#/$defs/warningSummary"},
         "image_samples": {"$ref": "#/$defs/imageSampleCollectionContract"}
       }
     }
   },
   "$defs": {
+    "warningSummary": {
+      "type": "object",
+      "required": ["request_count", "total_count", "counts"],
+      "properties": {
+        "request_count": {"type": "integer", "minimum": 0},
+        "total_count": {"type": "integer", "minimum": 0},
+        "counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}}
+      },
+      "additionalProperties": false
+    },
     "executionContract": {
       "type": "object",
       "required": ["schema_version", "fingerprint"],

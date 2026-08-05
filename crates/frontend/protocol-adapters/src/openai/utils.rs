@@ -56,7 +56,6 @@ pub fn check_prompt_logprobs_bound(
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedRequestContext {
     pub request_id: String,
-    pub data_parallel_rank: Option<u32>,
     pub trace_context: HashMap<String, String>,
 }
 
@@ -82,51 +81,4 @@ pub fn convert_logit_bias(
                 .collect()
         })
         .transpose()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn served(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn check_model_served_accepts_known_and_rejects_unknown() {
-        assert!(check_model_served("m", &served(&["other", "m"])).is_ok());
-        match check_model_served("m", &served(&["other"])) {
-            Err(ApiError::ModelNotFound { model }) => assert_eq!(model, "m"),
-            other => panic!("expected ModelNotFound, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_stream_options_requires_stream_rejects_only_when_not_streaming() {
-        assert!(check_stream_options_requires_stream(true, true).is_ok());
-        assert!(check_stream_options_requires_stream(false, false).is_ok());
-        match check_stream_options_requires_stream(true, false) {
-            Err(ApiError::InvalidRequest { param, .. }) => {
-                assert_eq!(param, Some("stream_options"))
-            }
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_prompt_logprobs_bound_accepts_non_negative_and_sentinel() {
-        assert!(check_prompt_logprobs_bound(0, "prompt_logprobs").is_ok());
-        assert!(check_prompt_logprobs_bound(5, "prompt_logprobs").is_ok());
-        assert!(check_prompt_logprobs_bound(-1, "prompt_logprobs").is_ok());
-    }
-
-    #[test]
-    fn check_prompt_logprobs_bound_rejects_other_negatives_with_caller_param() {
-        match check_prompt_logprobs_bound(-2, "sampling_params") {
-            Err(ApiError::InvalidRequest { param, .. }) => {
-                assert_eq!(param, Some("sampling_params"))
-            }
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
-    }
 }

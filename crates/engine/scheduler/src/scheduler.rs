@@ -588,6 +588,11 @@ pub struct Scheduler {
     /// owns the committed lease; later entries are bounded projected successors
     /// whose versions and cursor deltas are resolved strictly in order.
     inflight_ops: HashMap<RequestId, VecDeque<InflightOp>>,
+    /// Worker-ready completions waiting for their request-local predecessors.
+    /// Independent batch partitions may publish a successor before the host
+    /// observes its predecessor, while semantic cursor application remains
+    /// strictly request-ordered.
+    pending_completions: HashMap<RequestId, BTreeMap<u64, PendingCompletion>>,
     /// Terminal outcomes whose projected successors still own worker-visible
     /// request state. The scheduler retains all leases until those successors
     /// drain, then publishes the terminal event exactly once.
@@ -629,6 +634,7 @@ pub struct Scheduler {
     authority_id: u64,
     /// Monotonic op ids and archived lifecycle traces.
     next_op_id: u64,
+    next_completion_seq: u64,
     next_product_generation: u64,
     next_collective_seq: u64,
     next_epoch: u64,
@@ -845,6 +851,13 @@ fn assembly_lane(operation_variant: WorkVariant) -> AssemblyLane {
     }
 }
 
+fn completion_priority(operation_variant: WorkVariant) -> u8 {
+    match operation_variant {
+        WorkVariant::GenFlow | WorkVariant::Materialize | WorkVariant::TransferKvInstall => 0,
+        _ => 1,
+    }
+}
+
 fn policy_str(policy: SchedulingPolicy) -> &'static str {
     match policy {
         SchedulingPolicy::Fcfs => "fcfs",
@@ -864,6 +877,13 @@ struct InflightOp {
     /// Worst-case public events reserved before this operation was registered.
     output_credit_bound: usize,
     credits: CreditVector,
+}
+
+struct PendingCompletion {
+    record: CompletionRecord,
+    products: Arc<[ProductPayload]>,
+    worker_us: u64,
+    arrival_seq: u64,
 }
 
 struct PendingFinish {
@@ -1020,6 +1040,7 @@ impl Scheduler {
             reserved_blocks: 0,
             step_id: 0,
             inflight_ops: HashMap::new(),
+            pending_completions: HashMap::new(),
             pending_finishes: HashMap::new(),
             prompt_cohort: None,
             denoise_step_burst,
@@ -1037,6 +1058,7 @@ impl Scheduler {
             control_batches: HashMap::new(),
             authority_id: 1,
             next_op_id: 1,
+            next_completion_seq: 1,
             next_product_generation: 1,
             next_collective_seq: 1,
             next_epoch: 1,
@@ -2779,6 +2801,78 @@ impl Scheduler {
             });
     }
 
+    fn stage_completion(
+        &mut self,
+        record: CompletionRecord,
+        products: Arc<[ProductPayload]>,
+        worker_us: u64,
+    ) {
+        let id = record.request_key.session_id;
+        let op_id = record.op_id.0;
+        let known = self
+            .inflight_ops
+            .get(&id)
+            .is_some_and(|queue| queue.iter().any(|inflight| inflight.op_id == op_id));
+        let duplicate = self
+            .pending_completions
+            .get(&id)
+            .is_some_and(|pending| pending.contains_key(&op_id));
+        if !known || duplicate {
+            self.trace_record(json!({
+                "event": "unknown_result_op_id",
+                "at_s": now(),
+                "request_id": id.0,
+                "op_id": op_id,
+            }));
+            if self.running.contains_key(&id) {
+                self.finish(id, FinishReason::Error);
+            }
+            return;
+        }
+        let arrival_seq = self.next_completion_seq;
+        self.next_completion_seq = self.next_completion_seq.saturating_add(1);
+        self.pending_completions.entry(id).or_default().insert(
+            op_id,
+            PendingCompletion {
+                record,
+                products,
+                worker_us,
+                arrival_seq,
+            },
+        );
+    }
+
+    fn take_ready_completions(&mut self) -> Vec<PendingCompletion> {
+        let mut ready = self
+            .pending_completions
+            .iter()
+            .filter_map(|(id, pending)| {
+                let inflight = self.inflight_ops.get(id)?.front()?;
+                let completion = pending.get(&inflight.op_id)?;
+                Some((
+                    completion_priority(inflight.transition.operation_variant),
+                    completion.arrival_seq,
+                    *id,
+                    inflight.op_id,
+                ))
+            })
+            .collect::<Vec<_>>();
+        ready.sort_unstable_by_key(|(priority, arrival_seq, ..)| (*priority, *arrival_seq));
+        let mut completions = Vec::with_capacity(ready.len());
+        for (_, _, id, op_id) in ready {
+            let Some(pending) = self.pending_completions.get_mut(&id) else {
+                continue;
+            };
+            if let Some(completion) = pending.remove(&op_id) {
+                completions.push(completion);
+            }
+            if pending.is_empty() {
+                self.pending_completions.remove(&id);
+            }
+        }
+        completions
+    }
+
     /// Resolve the front in-flight op for `id` by the worker's echoed `op_id`.
     fn pop_inflight(
         &mut self,
@@ -2975,16 +3069,11 @@ impl Scheduler {
             .iter()
             .filter_map(|partition| partition.forward_stats.clone())
             .collect::<Vec<_>>();
-        let products = report
+        let completion_count = report
             .partitions
             .iter()
-            .flat_map(|partition| partition.products.iter().cloned())
-            .collect::<Vec<_>>();
-        let completions = report
-            .partitions
-            .into_iter()
-            .flat_map(|partition| partition.completions)
-            .collect::<Vec<_>>();
+            .map(|partition| partition.completions.len())
+            .sum();
         if batch_complete {
             self.batch_partitions.remove(&result_step_id);
             if let Some(controls) = self.control_batches.remove(&result_step_id) {
@@ -3031,50 +3120,69 @@ impl Scheduler {
         for stats in &forward_stats {
             self.record_worker_forward_stats(Some(stats));
         }
-        let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completions.len()));
-        let mut progress_ops = trace_enabled.then(|| Vec::with_capacity(completions.len()));
-        let mut to_resolve = Vec::with_capacity(completions.len());
-        for (operation_index, record) in completions.into_iter().enumerate() {
-            let id = record.request_key.session_id;
-            let op_id = record.op_id.0;
-            // Worker response publication is globally readiness-ordered while
-            // preserving lineage order, so the echoed op id must name this
-            // request's oldest unresolved operation.
-            let (transition, draft_token_ids, started) = self.pop_inflight(id, op_id);
-            let Some(transition) = transition else {
-                self.trace_record(json!({
-                    "event": "unknown_result_op_id",
-                    "at_s": now(),
-                    "request_id": id.0,
-                    "op_id": op_id,
-                }));
-                if self.running.contains_key(&id) {
-                    self.finish(id, FinishReason::Error);
-                }
-                continue;
-            };
-            let operation_variant = transition.operation_variant;
-            let view =
-                SequenceView::from_report(operation_variant, &record, &products, &draft_token_ids);
-            let draft_tokens = draft_token_ids.len();
-            // fold this op's host-side round-trip latency into the history.
-            let roundtrip_us = started
-                .map(|start| start.elapsed().as_micros() as u64)
-                .unwrap_or(0);
-            self.latency
-                .observe(operation_variant.as_wire_str(), roundtrip_us);
-            // record the op-resolved lifecycle event (op_id echoed by the
-            // worker, host round-trip + worker compute time).
-            let sampled_token_ids_len = view.committed_tokens.len();
-            let sampled_token_ids_last = view.committed_tokens.last().copied();
-            let accepted_draft_tokens = view.accepted_draft_tokens;
-            if let Some(resolved_ops) = resolved_ops.as_mut() {
-                let image_hw = view
-                    .image_png
-                    .as_deref()
-                    .and_then(|png| validate_png_artifact(png, None))
-                    .map(|metadata| (metadata.height, metadata.width));
-                resolved_ops.push(json!({
+        for partition in report.partitions {
+            let products = Arc::<[ProductPayload]>::from(partition.products);
+            let partition_worker_us = partition.worker_exec_us.unwrap_or(0);
+            for record in partition.completions {
+                self.stage_completion(record, Arc::clone(&products), partition_worker_us);
+            }
+        }
+        let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
+        let mut progress_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
+        loop {
+            let completions = self.take_ready_completions();
+            if completions.is_empty() {
+                break;
+            }
+            let mut to_resolve = Vec::with_capacity(completions.len());
+            for completion in completions {
+                let PendingCompletion {
+                    record,
+                    products,
+                    worker_us: completion_worker_us,
+                    arrival_seq,
+                } = completion;
+                let id = record.request_key.session_id;
+                let op_id = record.op_id.0;
+                let (transition, draft_token_ids, started) = self.pop_inflight(id, op_id);
+                let Some(transition) = transition else {
+                    self.trace_record(json!({
+                        "event": "unknown_result_op_id",
+                        "at_s": now(),
+                        "request_id": id.0,
+                        "op_id": op_id,
+                    }));
+                    if self.running.contains_key(&id) {
+                        self.finish(id, FinishReason::Error);
+                    }
+                    continue;
+                };
+                let operation_variant = transition.operation_variant;
+                let view = SequenceView::from_report(
+                    operation_variant,
+                    &record,
+                    products.as_ref(),
+                    &draft_token_ids,
+                );
+                let draft_tokens = draft_token_ids.len();
+                // fold this op's host-side round-trip latency into the history.
+                let roundtrip_us = started
+                    .map(|start| start.elapsed().as_micros() as u64)
+                    .unwrap_or(0);
+                self.latency
+                    .observe(operation_variant.as_wire_str(), roundtrip_us);
+                // record the op-resolved lifecycle event (op_id echoed by the
+                // worker, host round-trip + worker compute time).
+                let sampled_token_ids_len = view.committed_tokens.len();
+                let sampled_token_ids_last = view.committed_tokens.last().copied();
+                let accepted_draft_tokens = view.accepted_draft_tokens;
+                if let Some(resolved_ops) = resolved_ops.as_mut() {
+                    let image_hw = view
+                        .image_png
+                        .as_deref()
+                        .and_then(|png| validate_png_artifact(png, None))
+                        .map(|metadata| (metadata.height, metadata.width));
+                    resolved_ops.push(json!({
                     "request_id": id.0,
                     "op_id": op_id,
                     "operation_type": operation_variant.as_wire_str(),
@@ -3100,281 +3208,282 @@ impl Scheduler {
                     "num_accepted_tokens": accepted_draft_tokens,
                     "product_handle": view.encode_generation,
                 }));
-            }
-            if draft_tokens > 0 {
-                self.spec_decode
-                    .record_acceptance(draft_tokens, accepted_draft_tokens);
-            }
-            if let Some(st) = self.running.get_mut(&id) {
-                let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpResolved);
-                ev.op_id = Some(op_id);
-                ev.op_kind = Some(operation_variant.as_wire_str());
-                ev.roundtrip_us = roundtrip_us;
-                ev.worker_us = worker_us;
-                ev.completion_copy_us = record.timing_counters.copy_us;
-                ev.completion_ready_to_observed_us = record.timing_counters.host_us;
-                st.trace.push(ev);
-            }
-            let predicated_parent_point = (record.status == OpStatus::Predicated).then(|| {
-                self.running
-                    .get(&id)
-                    .map_or(0, |state| state.version.min(u64::from(u32::MAX)) as u32)
-            });
-            if let Err(error) =
-                transition.validate_result(&record, &products, predicated_parent_point)
-            {
-                self.trace_record(json!({
-                    "event": "transition_validation_failed",
-                    "at_s": now(),
-                    "request_id": id.0,
-                    "op_id": op_id,
-                    "operation_type": operation_variant.as_wire_str(),
-                    "error": transition_validation_error_str(&error),
-                }));
-                if self.running.contains_key(&id) {
-                    self.finish_after_inflight(id, FinishReason::Error, None);
                 }
-                continue;
-            }
-            let semantic_blocked = self.running.get(&id).is_some_and(|state| state.cancelled)
-                || self.pending_finishes.contains_key(&id);
-            if semantic_blocked {
-                self.release_transition_resources(id, &transition);
-                self.finish_pending_if_idle(id);
-                continue;
-            }
-            let expected_parent = self.fixed_version(id);
-            let prefix_versions = token_prefix_versions(
-                transition.operation.as_ref(),
-                &record,
-                expected_parent.as_ref(),
-            );
-            let cursor_result = self.running.get_mut(&id).map(|state| {
-                state
-                    .cursor
-                    .apply_transition(&transition, &record, &products)
-            });
-            if let Some(Err(error)) = cursor_result {
-                self.trace_record(json!({
-                    "event": "cursor_transition_failed",
-                    "at_s": now(),
-                    "request_id": id.0,
-                    "op_id": op_id,
-                    "operation_type": operation_variant.as_wire_str(),
-                    "error": cursor_apply_error_str(&error),
-                }));
-                if self.running.contains_key(&id) {
-                    self.finish_after_inflight(id, FinishReason::Error, None);
+                if draft_tokens > 0 {
+                    self.spec_decode
+                        .record_acceptance(draft_tokens, accepted_draft_tokens);
                 }
-                continue;
-            }
-            // A state-advancing completion resolves a new point. Ordered commit
-            // control emission below decides when that point becomes semantic.
-            let advanced = record.status == OpStatus::Ok
-                && record.selected_point > 0
-                && transition
-                    .operation
-                    .as_ref()
-                    .is_some_and(|operation| operation.advances_state);
-            let latest_device_version = if advanced {
-                transition.operation.as_ref().and_then(|operation| {
-                    let token = operation
-                        .outputs
-                        .iter()
-                        .find(|output| {
-                            output.kind == ProductKind::Token
-                                && output.storage_class
-                                    == uniserve_worker_wire::StorageClass::DeviceTensor
-                        })
-                        .cloned();
-                    token.map(|token| ResidentDeviceVersion {
-                        producer: operation.work.variant(),
-                        token,
-                        version: VersionRef {
-                            request_key: operation.request_key,
-                            producer_op_id: operation.op_id,
-                            point: Point::Device {
-                                point_index: record.selected_point,
-                                selected_point: None,
-                                producer_plan_digest: operation.plan_digest.clone(),
+                if let Some(st) = self.running.get_mut(&id) {
+                    let mut ev =
+                        crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpResolved);
+                    ev.op_id = Some(op_id);
+                    ev.op_kind = Some(operation_variant.as_wire_str());
+                    ev.roundtrip_us = roundtrip_us;
+                    ev.worker_us = completion_worker_us;
+                    ev.completion_copy_us = record.timing_counters.copy_us;
+                    ev.completion_ready_to_observed_us = record.timing_counters.host_us;
+                    st.trace.push(ev);
+                }
+                let predicated_parent_point = (record.status == OpStatus::Predicated).then(|| {
+                    self.running
+                        .get(&id)
+                        .map_or(0, |state| state.version.min(u64::from(u32::MAX)) as u32)
+                });
+                if let Err(error) =
+                    transition.validate_result(&record, products.as_ref(), predicated_parent_point)
+                {
+                    self.trace_record(json!({
+                        "event": "transition_validation_failed",
+                        "at_s": now(),
+                        "request_id": id.0,
+                        "op_id": op_id,
+                        "operation_type": operation_variant.as_wire_str(),
+                        "error": transition_validation_error_str(&error),
+                    }));
+                    if self.running.contains_key(&id) {
+                        self.finish_after_inflight(id, FinishReason::Error, None);
+                    }
+                    continue;
+                }
+                let semantic_blocked = self.running.get(&id).is_some_and(|state| state.cancelled)
+                    || self.pending_finishes.contains_key(&id);
+                if semantic_blocked {
+                    self.release_transition_resources(id, &transition);
+                    self.finish_pending_if_idle(id);
+                    continue;
+                }
+                let expected_parent = self.fixed_version(id);
+                let prefix_versions = token_prefix_versions(
+                    transition.operation.as_ref(),
+                    &record,
+                    expected_parent.as_ref(),
+                );
+                let cursor_result = self.running.get_mut(&id).map(|state| {
+                    state
+                        .cursor
+                        .apply_transition(&transition, &record, products.as_ref())
+                });
+                if let Some(Err(error)) = cursor_result {
+                    self.trace_record(json!({
+                        "event": "cursor_transition_failed",
+                        "at_s": now(),
+                        "request_id": id.0,
+                        "op_id": op_id,
+                        "operation_type": operation_variant.as_wire_str(),
+                        "error": cursor_apply_error_str(&error),
+                    }));
+                    if self.running.contains_key(&id) {
+                        self.finish_after_inflight(id, FinishReason::Error, None);
+                    }
+                    continue;
+                }
+                // A state-advancing completion resolves a new point. Ordered commit
+                // control emission below decides when that point becomes semantic.
+                let advanced = record.status == OpStatus::Ok
+                    && record.selected_point > 0
+                    && transition
+                        .operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.advances_state);
+                let latest_device_version = if advanced {
+                    transition.operation.as_ref().and_then(|operation| {
+                        let token = operation
+                            .outputs
+                            .iter()
+                            .find(|output| {
+                                output.kind == ProductKind::Token
+                                    && output.storage_class
+                                        == uniserve_worker_wire::StorageClass::DeviceTensor
+                            })
+                            .cloned();
+                        token.map(|token| ResidentDeviceVersion {
+                            producer: operation.work.variant(),
+                            token,
+                            version: VersionRef {
+                                request_key: operation.request_key,
+                                producer_op_id: operation.op_id,
+                                point: Point::Device {
+                                    point_index: record.selected_point,
+                                    selected_point: None,
+                                    producer_plan_digest: operation.plan_digest.clone(),
+                                },
                             },
-                        },
+                        })
                     })
-                })
-            } else {
-                None
-            };
-            let retain_device_version = !self.has_inflight(id);
-            if let Some(state) = self.running.get_mut(&id)
-                && advanced
-            {
-                state.version = u64::from(record.selected_point);
-                state.resolved_semantic = record.semantic_digest.clone();
-                state.resolved_producer_op_id = record.op_id.0;
-                state.latest_device_version = if retain_device_version {
-                    latest_device_version
                 } else {
                     None
                 };
-            }
-            let selected_fixed = self.fixed_version(id);
-            if advanced
-                && let (Some(expected_parent), Some(selected)) =
-                    (expected_parent, selected_fixed.clone())
-            {
-                let public_event_limit = self.public_limit_for(id, &transition);
-                let decoder_decision_required = matches!(
+                let retain_device_version = !self.has_inflight(id);
+                if let Some(state) = self.running.get_mut(&id)
+                    && advanced
+                {
+                    state.version = u64::from(record.selected_point);
+                    state.resolved_semantic = record.semantic_digest.clone();
+                    state.resolved_producer_op_id = record.op_id.0;
+                    state.latest_device_version = if retain_device_version {
+                        latest_device_version
+                    } else {
+                        None
+                    };
+                }
+                let selected_fixed = self.fixed_version(id);
+                if advanced
+                    && let (Some(expected_parent), Some(selected)) =
+                        (expected_parent, selected_fixed.clone())
+                {
+                    let public_event_limit = self.public_limit_for(id, &transition);
+                    let decoder_decision_required = matches!(
+                        operation_variant,
+                        WorkVariant::TokenExtend
+                            | WorkVariant::TokenDecode
+                            | WorkVariant::TokenVerify
+                    ) && self
+                        .running
+                        .get(&id)
+                        .is_some_and(|state| !state.req.stop_strings.is_empty());
+                    if decoder_decision_required {
+                        let pending = PendingSemanticCommit {
+                            token_count: None,
+                            expected_parent,
+                            selected,
+                            public_event_limit,
+                        };
+                        if let Some(state) = self.running.get_mut(&id)
+                            && state.semantic_commit.replace(pending).is_some()
+                        {
+                            self.finish_after_inflight(id, FinishReason::Error, None);
+                            continue;
+                        }
+                    } else {
+                        self.queue_commit(id, expected_parent, selected, public_event_limit);
+                    }
+                }
+                self.release_transition_resources(id, &transition);
+                if matches!(
                     operation_variant,
-                    WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
-                ) && self
+                    WorkVariant::GenFlow | WorkVariant::Materialize
+                ) {
+                    let consumed_latents = transition
+                        .operation
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|operation| operation.inputs.iter())
+                        .filter(|product| product.kind == ProductKind::Latent)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !consumed_latents.is_empty() {
+                        self.release_products(consumed_latents);
+                    }
+                }
+                let priority = completion_priority(operation_variant);
+                let public_tokens_before = self
                     .running
                     .get(&id)
-                    .is_some_and(|state| !state.req.stop_strings.is_empty());
-                if decoder_decision_required {
-                    let pending = PendingSemanticCommit {
-                        token_count: None,
-                        expected_parent,
-                        selected,
-                        public_event_limit,
-                    };
-                    if let Some(state) = self.running.get_mut(&id)
-                        && state.semantic_commit.replace(pending).is_some()
-                    {
-                        self.finish_after_inflight(id, FinishReason::Error, None);
-                        continue;
-                    }
+                    .map_or(0, |state| state.public_token_seq);
+                if record.status == OpStatus::Predicated {
+                    let unused_products = transition
+                        .operation
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|operation| operation.outputs.iter().cloned())
+                        .collect();
+                    self.release_products(unused_products);
+                    self.finish_pending_if_idle(id);
                 } else {
-                    self.queue_commit(id, expected_parent, selected, public_event_limit);
-                }
-            }
-            self.release_transition_resources(id, &transition);
-            if matches!(
-                operation_variant,
-                WorkVariant::GenFlow | WorkVariant::Materialize
-            ) {
-                let consumed_latents = transition
-                    .operation
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|operation| operation.inputs.iter())
-                    .filter(|product| product.kind == ProductKind::Latent)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !consumed_latents.is_empty() {
-                    self.release_products(consumed_latents);
-                }
-            }
-            let priority = match operation_variant {
-                WorkVariant::GenFlow
-                | WorkVariant::Materialize
-                | WorkVariant::TransferKvInstall => 0,
-                _ => 1,
-            };
-            let public_tokens_before = self
-                .running
-                .get(&id)
-                .map_or(0, |state| state.public_token_seq);
-            if record.status == OpStatus::Predicated {
-                let unused_products = transition
-                    .operation
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|operation| operation.outputs.iter().cloned())
-                    .collect();
-                self.release_products(unused_products);
-                self.finish_pending_if_idle(id);
-            } else {
-                to_resolve.push((
-                    priority,
-                    operation_index,
-                    id,
-                    transition,
-                    view,
-                    draft_token_ids,
-                    selected_fixed,
-                    public_tokens_before,
-                    prefix_versions,
-                ));
-            }
-        }
-        to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
-        for (
-            _priority,
-            _seq_index,
-            id,
-            transition,
-            view,
-            draft_token_ids,
-            selected_fixed,
-            public_tokens_before,
-            prefix_versions,
-        ) in to_resolve
-        {
-            let token_operation = matches!(
-                transition.operation_variant,
-                WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
-            );
-            if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
-                self.resolve(
-                    id,
-                    transition,
-                    view,
-                    draft_token_ids,
-                    prefix_versions.clone(),
-                );
-            }
-            if token_operation {
-                let mut commit_without_decoder_event = None;
-                if let Some(state) = self.running.get_mut(&id) {
-                    if state.public_token_seq > public_tokens_before {
-                        let emitted = state.public_token_seq - public_tokens_before;
-                        for (offset, selected) in
-                            prefix_versions.into_iter().take(emitted).enumerate()
-                        {
-                            state
-                                .token_cutoffs
-                                .insert(public_tokens_before + offset + 1, selected);
-                        }
-                        if emitted > 0
-                            && !state.token_cutoffs.contains_key(&state.public_token_seq)
-                            && let Some(selected) = selected_fixed
-                        {
-                            state.token_cutoffs.insert(state.public_token_seq, selected);
-                        }
-                        if !state.req.stop_strings.is_empty()
-                            && let Some(pending) = state.semantic_commit.as_mut()
-                        {
-                            pending.token_count = Some(state.public_token_seq);
-                        }
-                    } else if !state.req.stop_strings.is_empty() {
-                        commit_without_decoder_event = state.semantic_commit.take();
-                    }
-                }
-                if let Some(pending) = commit_without_decoder_event {
-                    self.queue_commit(
+                    to_resolve.push((
+                        priority,
+                        arrival_seq,
                         id,
-                        pending.expected_parent,
-                        pending.selected,
-                        pending.public_event_limit,
+                        transition,
+                        view,
+                        draft_token_ids,
+                        selected_fixed,
+                        public_tokens_before,
+                        prefix_versions,
+                    ));
+                }
+            }
+            to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
+            for (
+                _priority,
+                _seq_index,
+                id,
+                transition,
+                view,
+                draft_token_ids,
+                selected_fixed,
+                public_tokens_before,
+                prefix_versions,
+            ) in to_resolve
+            {
+                let token_operation = matches!(
+                    transition.operation_variant,
+                    WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
+                );
+                if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
+                    self.resolve(
+                        id,
+                        transition,
+                        view,
+                        draft_token_ids,
+                        prefix_versions.clone(),
                     );
                 }
-            }
-            self.finish_pending_if_idle(id);
-            if let (Some(st), Some(progress_ops)) = (self.running.get(&id), progress_ops.as_mut()) {
-                progress_ops.push(json!({
-                    "request_id": id.0,
-                    "phase": phase_str(st.lifecycle.phase),
-                    "generated_tokens": st.und.tokens_emitted,
-                    "images_done": st.image_gen.images_done,
-                    "image_id": st.image_gen.image_id,
-                    "steps_done": st.image_gen.steps_done,
-                    "pos": st.und.logical_pos,
-                    "kvlen": st.und.physical_kv_len,
-                    "next_token": st.und.next_token,
-                    "text_since_image": st.und.text_since_image,
-                    "gen_branch_pending": st.image_gen.branch_pending,
-                    "context_round_closing": st.ingest.round_closing,
-                }));
+                if token_operation {
+                    let mut commit_without_decoder_event = None;
+                    if let Some(state) = self.running.get_mut(&id) {
+                        if state.public_token_seq > public_tokens_before {
+                            let emitted = state.public_token_seq - public_tokens_before;
+                            for (offset, selected) in
+                                prefix_versions.into_iter().take(emitted).enumerate()
+                            {
+                                state
+                                    .token_cutoffs
+                                    .insert(public_tokens_before + offset + 1, selected);
+                            }
+                            if emitted > 0
+                                && !state.token_cutoffs.contains_key(&state.public_token_seq)
+                                && let Some(selected) = selected_fixed
+                            {
+                                state.token_cutoffs.insert(state.public_token_seq, selected);
+                            }
+                            if !state.req.stop_strings.is_empty()
+                                && let Some(pending) = state.semantic_commit.as_mut()
+                            {
+                                pending.token_count = Some(state.public_token_seq);
+                            }
+                        } else if !state.req.stop_strings.is_empty() {
+                            commit_without_decoder_event = state.semantic_commit.take();
+                        }
+                    }
+                    if let Some(pending) = commit_without_decoder_event {
+                        self.queue_commit(
+                            id,
+                            pending.expected_parent,
+                            pending.selected,
+                            pending.public_event_limit,
+                        );
+                    }
+                }
+                self.finish_pending_if_idle(id);
+                if let (Some(st), Some(progress_ops)) =
+                    (self.running.get(&id), progress_ops.as_mut())
+                {
+                    progress_ops.push(json!({
+                        "request_id": id.0,
+                        "phase": phase_str(st.lifecycle.phase),
+                        "generated_tokens": st.und.tokens_emitted,
+                        "images_done": st.image_gen.images_done,
+                        "image_id": st.image_gen.image_id,
+                        "steps_done": st.image_gen.steps_done,
+                        "pos": st.und.logical_pos,
+                        "kvlen": st.und.physical_kv_len,
+                        "next_token": st.und.next_token,
+                        "text_since_image": st.und.text_since_image,
+                        "gen_branch_pending": st.image_gen.branch_pending,
+                        "context_round_closing": st.ingest.round_closing,
+                    }));
+                }
             }
         }
         if let (Some(resolved_ops), Some(progress_ops)) = (resolved_ops, progress_ops) {
@@ -3520,6 +3629,7 @@ impl Scheduler {
     fn fail_all_inflight(&mut self, msg: &str) {
         let ids: Vec<RequestId> = self.inflight_ops.keys().copied().collect();
         self.inflight_ops.clear();
+        self.pending_completions.clear();
         // the submitted batches whose results will now never return are
         // failed here, so drop their pending submit-timestamps too — otherwise
         // `batch_started` accumulates orphaned entries for every failed batch.
@@ -3540,6 +3650,7 @@ impl Scheduler {
 
     fn fail_all_running(&mut self, message: &str) {
         self.inflight_ops.clear();
+        self.pending_completions.clear();
         self.batch_started.clear();
         self.batch_partitions.clear();
         let ids = self.running.keys().copied().collect::<Vec<_>>();

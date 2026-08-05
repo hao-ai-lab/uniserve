@@ -200,6 +200,8 @@ def server_command_template(config: dict[str, Any], name: str) -> list[str]:
             launcher_path(config.get("server_bin", "target/debug/uniserve")),
             "serve",
             str(definition["model"]),
+            "--model-description",
+            str(definition["model_description"]),
             "--served-model-name",
             str(definition["served_model_name"]),
             "--host",
@@ -288,7 +290,7 @@ def _required_model_content(definition: dict[str, Any]) -> dict[str, Any] | None
     if not (
         isinstance(value, dict)
         and set(value) == {"kind", "file_count", "total_size_bytes", "tree_sha256"}
-        and value.get("kind") == "directory"
+        and value.get("kind") == "model_directory"
         and isinstance(value.get("file_count"), int)
         and not isinstance(value.get("file_count"), bool)
         and value.get("file_count", 0) > 0
@@ -499,7 +501,7 @@ def benchmark_comparison_profiles(
 
 
 _BENCHMARK_PARITY_IDENTITY_FIELDS = frozenset(
-    {"dataset_path", "model", "name", "runtime_profile_id", "plan_evidence_policy"}
+    {"dataset_path", "model", "name", "runtime_profile_id", "request_schema"}
 )
 
 

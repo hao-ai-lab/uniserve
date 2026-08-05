@@ -43,6 +43,10 @@ artifacts/
 
 target/
 refs/
-specs/
+specs/*
+!specs/decode-runtime.md
+!specs/decode-runtime-construction.md
+!specs/generation-runtime-qualification.md
+!specs/serving-surface.md
 
 AGENTS.md

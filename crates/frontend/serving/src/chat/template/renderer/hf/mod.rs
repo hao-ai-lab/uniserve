@@ -1,8 +1,5 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use crate::text::Prompt;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use thiserror_ext::AsReport as _;
@@ -16,11 +13,8 @@ use self::format::{
 };
 use self::template::{CompiledChatTemplate, TemplateContext};
 use self::value::{TemplateValue, to_template_value};
-use super::{ChatRenderer, RenderedPrompt};
 use crate::chat::template::error::Result;
-use crate::chat::template::request::{
-    ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode,
-};
+use crate::chat::template::request::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 use crate::chat::template::{
     AssistantContentBlock, AssistantMessageExt, ChatTemplateLoadOptions, ChatTool, Error,
 };
@@ -45,22 +39,9 @@ pub struct MultimodalRenderInfo {
 pub struct HfChatRenderer {
     default_template: Option<CompiledChatTemplate>,
     default_template_kwargs: HashMap<String, JsonValue>,
-    content_format: ContentFormatOption,
-    fast_template: Option<FastChatTemplate>,
     special_tokens: Option<HfSpecialTokens>,
     multimodal: Option<MultimodalRenderInfo>,
-    /// Cache of compiled per-request `chat_template` overrides, keyed by the
-    /// raw override string, so repeated requests carrying the same override do
-    /// not re-parse the Jinja template on every call.
-    override_cache: Mutex<HashMap<String, Arc<CompiledChatTemplate>>>,
 }
-
-/// Upper bound on cached per-request override templates. Overrides are
-/// arbitrary client-supplied strings, so the cache is bounded to avoid
-/// unbounded growth; when the bound is reached the cache is cleared wholesale
-/// (a deliberately simple eviction strategy that keeps memory bounded without
-/// pulling in an LRU dependency).
-const OVERRIDE_CACHE_CAPACITY: usize = 32;
 
 impl HfChatRenderer {
     /// Create a renderer from the given template string.
@@ -69,7 +50,6 @@ impl HfChatRenderer {
         default_template_kwargs: HashMap<String, JsonValue>,
         content_format: ContentFormatOption,
     ) -> Result<Self> {
-        let fast_template = template.as_deref().and_then(FastChatTemplate::detect);
         Ok(Self {
             default_template: template
                 .map(|template| {
@@ -78,11 +58,8 @@ impl HfChatRenderer {
                 })
                 .transpose()?,
             default_template_kwargs,
-            content_format,
-            fast_template,
             special_tokens: None,
             multimodal: None,
-            override_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -145,105 +122,22 @@ impl HfChatRenderer {
         .with_multimodal(multimodal))
     }
 
-    /// Apply the chat template to one chat request, rendering the prompt string
-    /// to be tokenized and submitted to the model.
-    ///
-    /// If the request carries a per-request `chat_template` override, a
-    /// temporary template is compiled from that string and used instead of
-    /// the model's default.
-    fn apply_chat_template(&self, request: &ChatRequest) -> Result<RenderedPrompt> {
-        let override_template = request
-            .chat_options
-            .chat_template
-            .as_deref()
-            .map(|template| self.compiled_override(template))
-            .transpose()?;
-        let template = override_template
-            .as_deref()
-            .or(self.default_template.as_ref())
+    /// Render one chat request into the text prompt submitted to the configured
+    /// model description.
+    pub fn render(&self, request: &ChatRequest) -> Result<String> {
+        let template = self
+            .default_template
+            .as_ref()
             .ok_or(Error::MissingChatTemplate)?;
 
-        if template.content_format() == ChatTemplateContentFormat::String
-            && override_template.is_none()
-            && let Some(fast_template) = self.fast_template
-            && let Some(prompt) = self.try_apply_fast_template(fast_template, request)
-        {
-            return Ok(RenderedPrompt {
-                prompt: Prompt::Text(prompt),
-            });
-        }
-
         self.apply_chat_template_inner(template, request)
-    }
-
-    /// Compile a per-request `chat_template` override, reusing a cached compiled
-    /// template when the same override string has been seen before. Compiling a
-    /// Jinja template is a full parse, so without this cache a client repeatedly
-    /// sending the same override would re-parse it on every request.
-    fn compiled_override(&self, template: &str) -> Result<Arc<CompiledChatTemplate>> {
-        let mut cache = self
-            .override_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(compiled) = cache.get(template) {
-            return Ok(Arc::clone(compiled));
-        }
-        let compiled = Arc::new(
-            CompiledChatTemplate::new(template.to_owned(), self.content_format)
-                .map_err(|error| Error::ChatTemplate(error.to_report_string()))?,
-        );
-        // Keep memory bounded: drop the whole cache once it is full rather than
-        // tracking per-entry recency.
-        if cache.len() >= OVERRIDE_CACHE_CAPACITY {
-            cache.clear();
-        }
-        cache.insert(template.to_owned(), Arc::clone(&compiled));
-        Ok(compiled)
-    }
-
-    fn try_apply_fast_template(
-        &self,
-        fast_template: FastChatTemplate,
-        request: &ChatRequest,
-    ) -> Option<String> {
-        if !self.default_template_kwargs.is_empty()
-            || !request.chat_options.template_kwargs.is_empty()
-            || request.chat_options.reasoning_effort.is_some()
-            || request.documents.is_some()
-            || !request.tools.is_empty()
-            || request.has_multimodal()
-        {
-            return None;
-        }
-        let (system, user) = simple_system_user_messages(request)?;
-        let mut prompt =
-            String::with_capacity(user.len() + system.as_ref().map_or(0, |value| value.len()) + 96);
-        if let Some(system) = system {
-            prompt.push_str("<|im_start|>system\n");
-            prompt.push_str(fast_template.normalize_content(system).as_ref());
-            prompt.push_str("<|im_end|>\n");
-        }
-        prompt.push_str("<|im_start|>user\n");
-        prompt.push_str(fast_template.normalize_content(user).as_ref());
-        prompt.push_str("<|im_end|>\n");
-        match request.chat_options.generation_prompt_mode {
-            GenerationPromptMode::StartNewAssistant => {
-                prompt.push_str("<|im_start|>assistant\n");
-                if fast_template == FastChatTemplate::Qwen35 {
-                    prompt.push_str("<think>\n\n</think>\n\n");
-                }
-            }
-            GenerationPromptMode::NoGenerationPrompt => {}
-            GenerationPromptMode::ContinueFinalAssistant => return None,
-        }
-        Some(prompt)
     }
 
     fn apply_chat_template_inner(
         &self,
         effective_template: &CompiledChatTemplate,
         request: &ChatRequest,
-    ) -> Result<RenderedPrompt> {
+    ) -> Result<String> {
         let messages = to_template_messages(
             &request.messages,
             effective_template.content_format(),
@@ -260,16 +154,14 @@ impl HfChatRenderer {
             "applying chat template"
         );
 
-        let mut merged_template_kwargs = self.default_template_kwargs.clone();
-        merged_template_kwargs.extend(request.chat_options.template_kwargs.clone());
         let prompt = effective_template
             .apply(TemplateContext {
                 messages: &messages,
                 add_generation_prompt: request.chat_options.add_generation_prompt(),
                 continue_final_message: request.chat_options.continue_final_message(),
                 tools: tools.as_deref(),
-                documents: request.documents.as_deref(),
-                template_kwargs: Some(&merged_template_kwargs),
+                documents: None,
+                template_kwargs: Some(&self.default_template_kwargs),
                 special_tokens: self.special_tokens.as_ref(),
                 reasoning_effort: request.chat_options.reasoning_effort,
             })
@@ -280,68 +172,7 @@ impl HfChatRenderer {
             prompt, "rendered chat template prompt"
         );
 
-        Ok(RenderedPrompt {
-            prompt: Prompt::Text(prompt),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FastChatTemplate {
-    Qwen3,
-    Qwen35,
-}
-
-impl FastChatTemplate {
-    fn detect(template: &str) -> Option<Self> {
-        let qwen_shape = template.contains("<|im_start|>user")
-            && template.contains("<|im_start|>assistant\\n")
-            && template.contains("messages[::-1]")
-            && template.contains("message.role == \"user\"");
-        if !qwen_shape {
-            return None;
-        }
-        if template.contains("enable_thinking is defined and enable_thinking is true") {
-            return Some(Self::Qwen35);
-        }
-        if template.contains("enable_thinking is defined and enable_thinking is false") {
-            return Some(Self::Qwen3);
-        }
-        None
-    }
-
-    fn normalize_content<'a>(self, content: &'a str) -> Cow<'a, str> {
-        match self {
-            Self::Qwen3 => Cow::Borrowed(content),
-            Self::Qwen35 => Cow::Borrowed(content.trim()),
-        }
-    }
-}
-
-fn simple_system_user_messages(request: &ChatRequest) -> Option<(Option<&str>, &str)> {
-    match request.messages.as_slice() {
-        [ChatMessage::User { content }] => Some((None, simple_text_content(content)?)),
-        [
-            ChatMessage::System { content: system },
-            ChatMessage::User { content: user },
-        ] => Some((
-            Some(simple_text_content(system)?),
-            simple_text_content(user)?,
-        )),
-        _ => None,
-    }
-}
-
-fn simple_text_content(content: &ChatContent) -> Option<&str> {
-    match content {
-        ChatContent::Text(text) => Some(text.as_str()),
-        ChatContent::Parts(_) => None,
-    }
-}
-
-impl ChatRenderer for HfChatRenderer {
-    fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt> {
-        self.apply_chat_template(request)
+        Ok(prompt)
     }
 }
 
@@ -590,7 +421,6 @@ fn to_template_tools(tools: &[ChatTool]) -> Vec<TemplateTool> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::text::Prompt;
     use expect_test::expect;
     use serde_json::Value;
     use uniserve_model_profile::assets::{HfSpecialTokens, NamedSpecialToken};
@@ -600,15 +430,12 @@ mod tests {
         ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatTool, ChatToolChoice,
         GenerationPromptMode, ReasoningEffort,
     };
-    use crate::chat::template::{AssistantContentBlock, ChatRenderer, Error, Result};
+    use crate::chat::template::{AssistantContentBlock, Error, Result};
 
     const QWEN3_0_6B_TEMPLATE: &str = include_str!("../../../../../tests/templates/qwen3.jinja");
-    const QWEN3_5_0_8B_TEMPLATE: &str = include_str!("../../../../../tests/templates/qwen35.jinja");
-
     fn sample_request(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
             messages,
-            request_id: "render-test".to_string(),
             ..ChatRequest::for_test()
         }
     }
@@ -619,17 +446,14 @@ mod tests {
             HashMap::new(),
             ChatTemplateContentFormatOption::Auto,
         )?
-        .render(request)?
-        .prompt
-        .into_text()
-        .map_err(|_| unreachable!("HF renderer should return text prompt"))
+        .render(request)
     }
 
     fn render_mm(
         template: &str,
         request: &ChatRequest,
         content_format: ChatTemplateContentFormatOption,
-    ) -> Result<crate::chat::template::RenderedPrompt> {
+    ) -> Result<String> {
         HfChatRenderer::new(Some(template.to_string()), HashMap::new(), content_format)?
             .with_multimodal(Some(MultimodalRenderInfo {
                 placeholder_token: "<image>".to_string(),
@@ -654,7 +478,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rendered.prompt, Prompt::Text("a<image>b".to_string()));
+        assert_eq!(rendered, "a<image>b");
     }
 
     #[test]
@@ -666,7 +490,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rendered.prompt, Prompt::Text("a<|image_pad|>b".to_string()));
+        assert_eq!(rendered, "a<|image_pad|>b");
     }
 
     #[test]
@@ -686,10 +510,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            rendered.prompt,
-            Prompt::Text("S:policy|a<image>b".to_string())
-        );
+        assert_eq!(rendered, "S:policy|a<image>b");
     }
 
     #[test]
@@ -806,76 +627,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_template_per_request_override() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-
-        // Default template renders one way.
-        let default_rendered = render(Some("{{ messages[0].content }}"), &request).unwrap();
-        assert_eq!(default_rendered, "hello");
-
-        // Per-request override replaces the default template entirely.
-        request.chat_options.chat_template = Some("override:{{ messages[0].content }}".to_string());
-        let overridden = render(Some("{{ messages[0].content }}"), &request).unwrap();
-        assert_eq!(overridden, "override:hello");
-    }
-
-    #[test]
-    fn chat_template_caches_repeated_per_request_overrides() {
-        let renderer = HfChatRenderer::new(
-            Some("{{ messages[0].content }}".to_string()),
-            HashMap::new(),
-            ChatTemplateContentFormatOption::Auto,
-        )
-        .unwrap();
-
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-        request.chat_options.chat_template = Some("override:{{ messages[0].content }}".to_string());
-
-        // The same override string is compiled once and reused across renders.
-        for _ in 0..3 {
-            let rendered = renderer.render(&request).unwrap().prompt;
-            assert_eq!(rendered, Prompt::Text("override:hello".to_string()));
-        }
-        assert_eq!(renderer.override_cache.lock().unwrap().len(), 1);
-
-        // A distinct override string adds a separate cache entry.
-        request.chat_options.chat_template = Some("other:{{ messages[0].content }}".to_string());
-        let rendered = renderer.render(&request).unwrap().prompt;
-        assert_eq!(rendered, Prompt::Text("other:hello".to_string()));
-        assert_eq!(renderer.override_cache.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn chat_template_override_cache_is_bounded() {
-        let renderer = HfChatRenderer::new(
-            Some("{{ messages[0].content }}".to_string()),
-            HashMap::new(),
-            ChatTemplateContentFormatOption::Auto,
-        )
-        .unwrap();
-
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-        for i in 0..(super::OVERRIDE_CACHE_CAPACITY + 1) {
-            request.chat_options.chat_template =
-                Some(format!("o{i}:{{{{ messages[0].content }}}}"));
-            renderer.render(&request).unwrap();
-        }
-
-        // The cache never exceeds its capacity bound.
-        assert!(renderer.override_cache.lock().unwrap().len() <= super::OVERRIDE_CACHE_CAPACITY);
-    }
-
-    #[test]
-    fn chat_template_per_request_override_without_default_template() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-        request.chat_options.chat_template = Some("override:{{ messages[0].content }}".to_string());
-
-        let rendered = render(None, &request).unwrap();
-
-        assert_eq!(rendered, "override:hello");
-    }
-
-    #[test]
     fn chat_template_requires_a_template() {
         let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
         let error = render(None, &request).unwrap_err();
@@ -898,10 +649,10 @@ mod tests {
         )
         .unwrap()
         .with_special_tokens(Some(special_tokens))
-        .apply_chat_template(&request)
+        .render(&request)
         .unwrap();
 
-        assert_eq!(rendered.prompt, Prompt::Text("<bos>|true".to_string()));
+        assert_eq!(rendered, "<bos>|true");
     }
 
     #[test]
@@ -940,10 +691,9 @@ mod tests {
         )
         .unwrap()
         .render(&request)
-        .unwrap()
-        .prompt;
+        .unwrap();
 
-        assert_eq!(rendered, Prompt::Text("hello world".to_string()));
+        assert_eq!(rendered, "hello world");
     }
 
     #[test]
@@ -960,43 +710,33 @@ mod tests {
         )
         .unwrap()
         .render(&request)
-        .unwrap()
-        .prompt;
+        .unwrap();
 
-        assert_eq!(rendered, Prompt::Text("hello world".to_string()));
+        assert_eq!(rendered, "hello world");
     }
 
     #[test]
-    fn chat_template_merges_default_template_kwargs_before_request_kwargs() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-        request
-            .chat_options
-            .template_kwargs
-            .insert("enable_thinking".to_string(), Value::Bool(true));
-
+    fn chat_template_exposes_default_template_kwargs() {
+        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
         let renderer = HfChatRenderer::new(
             Some("{{ enable_thinking }}|{{ default_only }}".to_string()),
             HashMap::from([
-                ("enable_thinking".to_string(), Value::Bool(false)),
+                ("enable_thinking".to_string(), Value::Bool(true)),
                 ("default_only".to_string(), Value::String("x".to_string())),
             ]),
             ChatTemplateContentFormatOption::Auto,
         )
         .unwrap();
 
-        let rendered = renderer.render(&request).unwrap().prompt;
+        let rendered = renderer.render(&request).unwrap();
 
-        assert_eq!(rendered, Prompt::Text("true|x".to_string()));
+        assert_eq!(rendered, "true|x");
     }
 
     #[test]
-    fn chat_template_reasoning_effort_overrides_template_kwargs() {
+    fn chat_template_reasoning_effort_overrides_default_template_kwargs() {
         let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
         request.chat_options.reasoning_effort = Some(ReasoningEffort::Max);
-        request.chat_options.template_kwargs.insert(
-            "reasoning_effort".to_string(),
-            Value::String("low".to_string()),
-        );
 
         let renderer = HfChatRenderer::new(
             Some("{{ reasoning_effort }}".to_string()),
@@ -1008,13 +748,13 @@ mod tests {
         )
         .unwrap();
 
-        let rendered = renderer.render(&request).unwrap().prompt;
+        let rendered = renderer.render(&request).unwrap();
 
-        assert_eq!(rendered, Prompt::Text("max".to_string()));
+        assert_eq!(rendered, "max");
     }
 
     #[test]
-    fn qwen3_template_omits_reasoning_for_historical_assistant_messages() {
+    fn qwen3_template_omits_reasoning_for_prior_assistant_messages() {
         let request = sample_request(vec![
             ChatMessage::text(
                 ChatRole::User,
@@ -1046,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_template_fast_renders_single_user_prompt() {
+    fn qwen3_template_renders_single_user_prompt() {
         let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
 
         let rendered = render(Some(QWEN3_0_6B_TEMPLATE), &request).unwrap();
@@ -1060,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_template_fast_renders_system_user_prompt() {
+    fn qwen3_template_renders_system_user_prompt() {
         let request = sample_request(vec![
             ChatMessage::text(ChatRole::System, "be brief"),
             ChatMessage::text(ChatRole::User, "hello"),
@@ -1079,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_template_fast_respects_forced_openai_content_format() {
+    fn qwen3_template_respects_forced_openai_content_format() {
         let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
 
         let rendered = HfChatRenderer::new(
@@ -1089,10 +829,6 @@ mod tests {
         )
         .unwrap()
         .render(&request)
-        .unwrap()
-        .prompt
-        .into_text()
-        .map_err(|_| unreachable!("HF renderer should return text prompt"))
         .unwrap();
 
         expect![[r#"
@@ -1202,82 +938,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(rendered, "items=operands;x=2;y=1.0;|operands");
-    }
-
-    #[test]
-    fn qwen35_template_fast_renders_default_thinking_suffix() {
-        let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-
-        let rendered = render(Some(QWEN3_5_0_8B_TEMPLATE), &request).unwrap();
-
-        expect![[r#"
-            <|im_start|>user
-            hello<|im_end|>
-            <|im_start|>assistant
-            <think>
-
-            </think>
-
-        "#]]
-        .assert_eq(&rendered);
-    }
-
-    #[test]
-    fn qwen35_template_renders_prefilled_reasoning_start_when_thinking_enabled() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-        request
-            .chat_options
-            .template_kwargs
-            .insert("enable_thinking".to_string(), Value::Bool(true));
-
-        let rendered = render(Some(QWEN3_5_0_8B_TEMPLATE), &request).unwrap();
-
-        expect![[r#"
-            <|im_start|>user
-            hello<|im_end|>
-            <|im_start|>assistant
-            <think>
-        "#]]
-        .assert_eq(&rendered);
-    }
-
-    #[test]
-    fn qwen35_template_renders_closed_empty_reasoning_span_when_thinking_disabled() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-        request
-            .chat_options
-            .template_kwargs
-            .insert("enable_thinking".to_string(), Value::Bool(false));
-
-        let rendered = render(Some(QWEN3_5_0_8B_TEMPLATE), &request).unwrap();
-
-        expect![[r#"
-            <|im_start|>user
-            hello<|im_end|>
-            <|im_start|>assistant
-            <think>
-
-            </think>
-
-        "#]]
-        .assert_eq(&rendered);
-    }
-
-    #[test]
-    fn qwen35_template_omits_assistant_reasoning_prefill_without_generation_prompt() {
-        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
-        request.chat_options.generation_prompt_mode = GenerationPromptMode::NoGenerationPrompt;
-        request
-            .chat_options
-            .template_kwargs
-            .insert("enable_thinking".to_string(), Value::Bool(true));
-
-        let rendered = render(Some(QWEN3_5_0_8B_TEMPLATE), &request).unwrap();
-
-        expect![[r#"
-            <|im_start|>user
-            hello<|im_end|>
-        "#]]
-        .assert_eq(&rendered);
     }
 }

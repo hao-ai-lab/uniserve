@@ -1,4 +1,4 @@
-use uniserve_openai_types::{ErrorDetail, ErrorResponse};
+use crate::openai::types::{ErrorDetail, ErrorResponse};
 use uniserve_serving::ServeError;
 
 /// Error categories raised while validating or lowering OpenAI-compatible

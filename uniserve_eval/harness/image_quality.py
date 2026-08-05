@@ -670,11 +670,11 @@ def _inspect_artifact(
                 side=side,
                 request_id_sha256=redacted_id,
             )
-        if record.get("generated_images_expected") is not True:
+        if record.get("image_output_mode") != "required":
             image_counts_valid = False
             _add_failure(
                 failures,
-                "generated_image_not_declared",
+                "required_image_output_not_declared",
                 side=side,
                 request_id_sha256=redacted_id,
             )

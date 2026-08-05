@@ -18,22 +18,15 @@ use uniserve_core::{
 };
 use uniserve_model_profile::dialect::GenerationDialectProfile;
 use uniserve_model_profile::tokenizer::DynTokenizer;
-use uniserve_model_profile::{ModelIdentity, ModelProfile};
+use uniserve_model_profile::{ModelDescription, ModelIdentity, ModelProfile};
 
-use crate::chat::{
-    ChatRenderer, ChatRequest, DefaultChatOutputProcessor, HfChatRenderer, ParserSelection,
-};
+use crate::chat::{ChatRequest, HfChatRenderer, Qwen3ChatOutputProcessor};
 use crate::input::{
-    ChatOutputProcessorConfig, GenerateReqInput, ModelEventIdentity, OutputContract,
-    OutputProcessorPolicy, PromptInput, SubmissionMetadata, TokenizedGenerateReqInput,
+    GenerateReqInput, ModelEventIdentity, OutputContract, OutputProcessorPolicy, PromptInput,
+    SubmissionMetadata, TokenizedGenerateReqInput,
 };
 use crate::text::{SamplingHints, TextDecodeOptions, resolve_max_tokens};
 use crate::{CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key};
-
-/// Fixed Qwen3 reasoning parser identifier.
-const QWEN3_REASONING_PARSER: &str = "qwen3";
-/// Fixed Qwen3 tool parser identifier.
-const QWEN3_TOOL_PARSER: &str = "qwen3_xml";
 
 /// The closed load-bound model owner.
 pub enum ResolvedModel {
@@ -79,9 +72,8 @@ pub struct BagelDesc {
 impl ResolvedModel {
     /// Fallible, exhaustive resolution over the closed configured set.
     ///
-    /// A text profile (no generation dialect) resolves to [`Qwen3Desc`]; the
-    /// `sensenova-u1` dialect resolves to [`SenseNovaDesc`]; the `bagel` dialect
-    /// resolves to [`BagelDesc`]. Any other dialect is a resolution error.
+    /// The typed description selects the variant; required description-owned
+    /// assets are checked before construction.
     pub fn resolve(
         profile: ModelProfile,
         tokenizer: DynTokenizer,
@@ -96,23 +88,30 @@ impl ResolvedModel {
         let hints = sampling_hints(&profile, max_model_tokens);
         let identity = profile.identity.clone();
 
-        match profile.generation_dialect {
-            None if identity.family_id.to_ascii_lowercase().contains("qwen3") => {
+        match profile.description {
+            ModelDescription::Qwen3 => {
+                if profile.generation_dialect.is_some() {
+                    return Err(ServeError::ModelResolution(
+                        "Qwen3 description cannot own an omni generation dialect".to_string(),
+                    ));
+                }
                 Ok(Self::Qwen3(Qwen3Desc {
                     identity,
                     tokenizer,
                     renderer,
                     hints,
                     capabilities,
-                    logprobs_supported: profile.features.logprobs,
+                    logprobs_supported: true,
                 }))
             }
-            None => Err(ServeError::ModelResolution(format!(
-                "model family `{}` has no configured model description",
-                identity.family_id
-            ))),
-            Some(dialect) => match dialect.id.as_str() {
-                "sensenova-u1" => Ok(Self::SenseNova(SenseNovaDesc {
+            ModelDescription::SenseNova => {
+                let dialect = profile.generation_dialect.ok_or_else(|| {
+                    ServeError::ModelResolution(
+                        "SenseNova description requires its built-in generation dialect"
+                            .to_string(),
+                    )
+                })?;
+                Ok(Self::SenseNova(SenseNovaDesc {
                     identity,
                     tokenizer,
                     renderer,
@@ -120,8 +119,15 @@ impl ResolvedModel {
                     capabilities,
                     default_max_output_tokens,
                     max_model_tokens,
-                })),
-                "bagel" => Ok(Self::Bagel(BagelDesc {
+                }))
+            }
+            ModelDescription::Bagel => {
+                let dialect = profile.generation_dialect.ok_or_else(|| {
+                    ServeError::ModelResolution(
+                        "Bagel description requires its built-in generation dialect".to_string(),
+                    )
+                })?;
+                Ok(Self::Bagel(BagelDesc {
                     identity,
                     tokenizer,
                     renderer,
@@ -129,11 +135,8 @@ impl ResolvedModel {
                     capabilities,
                     default_max_output_tokens,
                     max_model_tokens,
-                })),
-                other => Err(ServeError::ModelResolution(format!(
-                    "generation dialect `{other}` has no configured model description"
-                ))),
-            },
+                }))
+            }
         }
     }
 
@@ -307,7 +310,7 @@ impl Qwen3Desc {
             PromptInput::Text(text) => {
                 let ids = self
                     .tokenizer
-                    .encode(text, request.decode.add_special_tokens)
+                    .encode(text, false)
                     .map_err(|error| error.to_string())?;
                 (
                     ids,
@@ -319,18 +322,14 @@ impl Qwen3Desc {
                 messages,
                 tools,
                 tool_choice,
-                generation_prompt_mode,
                 reasoning_effort,
             } => {
                 let mut chat_request = ChatRequest {
-                    request_id: request.request_id.to_string(),
                     messages: messages.clone(),
-                    sampling_params: crate::chat::SamplingParams::default(),
                     chat_options: crate::chat::ChatOptions {
-                        generation_prompt_mode: *generation_prompt_mode,
-                        chat_template: None,
+                        generation_prompt_mode:
+                            crate::chat::GenerationPromptMode::StartNewAssistant,
                         reasoning_effort: *reasoning_effort,
-                        template_kwargs: std::collections::HashMap::new(),
                     },
                     tools: tools.clone(),
                     tool_choice: *tool_choice,
@@ -341,56 +340,27 @@ impl Qwen3Desc {
                             .then(|| request.stop.stop_strings.clone()),
                         min_tokens: request.sampling.min_tokens.unwrap_or(0),
                     },
-                    intermediate: request.stream,
-                    priority: request.scheduling.priority,
-                    documents: None,
-                    cache_salt: request.cache.salt.clone(),
-                    add_special_tokens: request.decode.add_special_tokens,
-                    data_parallel_rank: request.scheduling.data_parallel_rank,
-                    trace_context: request
-                        .scheduling
-                        .trace_context
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
                 };
                 chat_request.validate().map_err(|error| error.to_string())?;
                 // Build the processor once to apply parser-driven request
                 // adjustments (e.g. disabling special-token skipping).
-                let tool_parser = ParserSelection::Explicit(QWEN3_TOOL_PARSER.to_string());
-                let reasoning_parser =
-                    ParserSelection::Explicit(QWEN3_REASONING_PARSER.to_string());
-                let _processor = DefaultChatOutputProcessor::new(
+                let _processor = Qwen3ChatOutputProcessor::new(
                     &mut chat_request,
-                    &self.identity.model_id,
                     std::sync::Arc::clone(&self.tokenizer),
-                    &tool_parser,
-                    &reasoning_parser,
                 )
                 .map_err(|error| error.to_string())?;
-                let rendered = self
+                let rendered_text = self
                     .renderer
                     .render(&chat_request)
                     .map_err(|error| error.to_string())?;
-                let rendered_text = match rendered.prompt {
-                    crate::text::Prompt::Text(text) => text,
-                    crate::text::Prompt::TokenIds(_) => {
-                        return Err("chat rendering must produce text".to_string());
-                    }
-                };
                 let ids = self
                     .tokenizer
-                    .encode(&rendered_text, chat_request.add_special_tokens)
+                    .encode(&rendered_text, false)
                     .map_err(|error| error.to_string())?;
                 let skip = chat_request.decode_options.skip_special_tokens;
                 (
                     ids,
-                    OutputProcessorPolicy::Chat(Box::new(ChatOutputProcessorConfig {
-                        request: chat_request,
-                        model_id: self.identity.model_id.clone(),
-                        tool_parser,
-                        reasoning_parser,
-                    })),
+                    OutputProcessorPolicy::Qwen3(Box::new(chat_request)),
                     skip,
                 )
             }
@@ -481,7 +451,6 @@ impl Qwen3Desc {
             skip_special_tokens,
             output_processor,
             submission: SubmissionMetadata {
-                data_parallel_rank: request.scheduling.data_parallel_rank,
                 trace_headers: (!request.scheduling.trace_context.is_empty())
                     .then(|| request.scheduling.trace_context.clone()),
             },

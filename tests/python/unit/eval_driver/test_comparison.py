@@ -46,7 +46,7 @@ def _point(directory: Path, *, role: str, throughput: float, text: str) -> None:
         },
         "artifact": {
             "valid": True,
-            "valid_marker": "canonical-valid-v2",
+            "valid_marker": "canonical-valid-v4",
             "matrix_contract": {
                 "comparison_role": role,
                 "parity_group": "qwen3_sharegpt",
@@ -116,7 +116,7 @@ def _i2t_point(
         "metrics": {"output_throughput": float(output_len)},
         "artifact": {
             "valid": True,
-            "valid_marker": "canonical-valid-v2",
+            "valid_marker": "canonical-valid-v4",
             "matrix_contract": {
                 "comparison_role": role,
                 "parity_group": "image_to_text",
@@ -298,7 +298,7 @@ def _image_point(
         },
         "artifact": {
             "valid": True,
-            "valid_marker": "canonical-valid-v2",
+            "valid_marker": "canonical-valid-v4",
             "generation_conformance": {"valid": True},
             "matrix_contract": {
                 "comparison_role": role,

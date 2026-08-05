@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest, apply_chat_image_contract, uses_reference_protocol
+from .base import (
+    BenchmarkTask,
+    TaskRequest,
+    apply_chat_image_contract,
+    uses_external_request_schema,
+)
 
 
 class T2ITask(BenchmarkTask):
@@ -52,7 +57,7 @@ class T2ITask(BenchmarkTask):
                 payload,
                 image_config,
                 root_parameters=root_parameters,
-                include_reference_aliases=uses_reference_protocol(self.spec),
+                include_reference_aliases=uses_external_request_schema(self.spec),
             )
             if self.spec.extra_request_body:
                 payload.update(self.spec.extra_request_body)

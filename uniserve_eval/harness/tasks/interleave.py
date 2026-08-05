@@ -7,7 +7,7 @@ from .base import (
     TaskRequest,
     apply_chat_image_contract,
     apply_text_sampling_contract,
-    uses_reference_protocol,
+    uses_external_request_schema,
 )
 
 
@@ -62,7 +62,7 @@ class InterleaveTask(BenchmarkTask):
             payload,
             image_config,
             root_parameters=root_parameters,
-            include_reference_aliases=uses_reference_protocol(self.spec),
+            include_reference_aliases=uses_external_request_schema(self.spec),
         )
         if self.spec.extra_request_body:
             extra = dict(self.spec.extra_request_body)

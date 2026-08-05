@@ -1,6 +1,6 @@
 use crate::tokenizer::DynTokenizer;
 
-use super::{DelimitedReasoningParser, ReasoningDelta, ReasoningParser, Result};
+use super::{DelimitedReasoningParser, ReasoningDelta, Result};
 
 /// Reasoning parser for the Qwen3/Qwen3.5 family.
 ///
@@ -18,26 +18,20 @@ impl Qwen3ReasoningParser {
             inner: DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false)?,
         })
     }
-}
-
-impl ReasoningParser for Qwen3ReasoningParser {
-    fn create(tokenizer: DynTokenizer) -> Result<Box<dyn ReasoningParser>>
-    where
-        Self: Sized + 'static,
-    {
-        Ok(Box::new(Self::new(tokenizer)?))
-    }
-
-    fn initialize(&mut self, prompt_token_ids: &[u32]) -> Result<()> {
+    pub fn initialize(&mut self, prompt_token_ids: &[u32]) -> Result<()> {
         self.inner.initialize(prompt_token_ids);
         Ok(())
     }
 
-    fn push(&mut self, delta: &str) -> Result<ReasoningDelta> {
+    pub const fn preserve_special_tokens(&self) -> bool {
+        false
+    }
+
+    pub fn push(&mut self, delta: &str) -> Result<ReasoningDelta> {
         Ok(self.inner.push(delta))
     }
 
-    fn finish(&mut self) -> Result<ReasoningDelta> {
+    pub fn finish(&mut self) -> Result<ReasoningDelta> {
         Ok(self.inner.finish())
     }
 }

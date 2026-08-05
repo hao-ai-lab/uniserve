@@ -10,4 +10,4 @@ pub use config::{
     OneOrManyTokenIds, load_generation_config, load_model_config, load_tokenizer_config,
 };
 pub use error::{Error, Result};
-pub use model_files::{ResolvedModelFiles, TokenizerSource};
+pub use model_files::ResolvedModelFiles;
