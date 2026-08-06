@@ -1,6 +1,4 @@
-//! Tests derived from the Checkpoint 1 protocol specification: round-trip
-//! encoding for every record and `Work`/`Control` variant, identity validation,
-//! and digest determinism.
+//! Protocol round trips, canonical identity, and descriptor validation.
 
 use uniserve_core::{BlockId, KvGroupKind, RequestId};
 
@@ -119,7 +117,7 @@ fn token_decode_operation() -> Operation {
             accepted_span_product(OpId(11)),
             continuation_product(OpId(11)),
         ],
-        vec![BlockId(7)],
+        1,
         None,
         Some(Rng {
             seed: 99,
@@ -144,7 +142,7 @@ fn operation_for(work: Work, op_id: OpId, advances: bool) -> Operation {
         },
         Vec::new(),
         Vec::new(),
-        Vec::new(),
+        0,
         None,
         None,
         0,
@@ -185,7 +183,7 @@ fn admission() -> Admission {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
-            kv: KvAllocation::default(),
+            kv: KvAdmission::default(),
         }),
         None,
     )
@@ -213,16 +211,28 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
     groups
         .into_iter()
         .enumerate()
-        .map(|(index, (domain, route, operations))| BatchPartition {
-            partition_id: index as u32 + 1,
-            submission_group: index as u32 + 1,
-            collective_seq: index as u64 + 1,
-            domain,
-            route,
-            execution: ExecutionCapability::DomainHomogeneous,
-            attention: AttentionRegime::Hybrid,
-            shape_class: 0,
-            operations,
+        .map(|(index, (domain, route, operations))| {
+            let kv_reservations = operations
+                .iter()
+                .filter(|operation| operation.kv_capacity_pages > 0)
+                .map(|operation| KvReservation {
+                    request_key: operation.request_key,
+                    op_id: operation.op_id,
+                    logical_page_delta: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+                })
+                .collect();
+            BatchPartition {
+                partition_id: index as u32 + 1,
+                submission_group: index as u32 + 1,
+                collective_seq: index as u64 + 1,
+                domain,
+                route,
+                execution: ExecutionCapability::DomainHomogeneous,
+                attention: AttentionRegime::Hybrid,
+                shape_class: 0,
+                operations,
+                kv_reservations,
+            }
         })
         .collect()
 }
@@ -313,7 +323,7 @@ fn version_ref_device_point_round_trips() {
         },
         Vec::new(),
         vec![output_product(OpId(12))],
-        Vec::new(),
+        0,
         None,
         None,
         0,
@@ -323,19 +333,23 @@ fn version_ref_device_point_round_trips() {
 }
 
 #[test]
-fn operation_carries_new_kv_blocks_across_the_wire() {
+fn logical_capacity_and_reservation_round_trip_independently() {
     let base = token_decode_operation();
-    assert_eq!(base.new_kv_blocks, vec![BlockId(7)]);
+    assert_eq!(base.kv_capacity_pages, 1);
     let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
-    assert_eq!(
-        batch.operations().next().unwrap().new_kv_blocks,
-        vec![BlockId(7)]
-    );
     assert_eq!(batch.operations().next().unwrap(), &base);
-    // The appended KV blocks are a registration field: changing them changes the
-    // plan digest.
+    assert_eq!(
+        batch.partitions[0].kv_reservations[0].logical_page_delta,
+        vec![BlockId(0)]
+    );
+    let mut relocated = batch.clone();
+    relocated.partitions[0].kv_reservations[0].logical_page_delta = vec![BlockId(17)];
+    assert_eq!(
+        relocated.operations().next().unwrap().plan_digest,
+        base.plan_digest
+    );
     let mut more = token_decode_operation();
-    more.new_kv_blocks = vec![BlockId(7), BlockId(8)];
+    more.kv_capacity_pages = 2;
     assert_ne!(more.compute_plan_digest(), base.plan_digest);
 }
 
@@ -442,14 +456,13 @@ fn admission_round_trips_and_binds_its_operation() {
 }
 
 #[test]
-fn plan_digest_is_deterministic_and_excludes_control_seq() {
+fn plan_digest_is_deterministic_and_binds_control_seq() {
     let mut a = token_decode_operation();
     let b = token_decode_operation();
     assert_eq!(a.plan_digest, b.plan_digest);
     assert_eq!(a.plan_digest, a.compute_plan_digest());
-    // control_seq is an ordering field, not registration identity.
     a.control_seq = 999;
-    assert_eq!(a.compute_plan_digest(), b.plan_digest);
+    assert_ne!(a.compute_plan_digest(), b.plan_digest);
 }
 
 #[test]
@@ -504,6 +517,22 @@ fn validation_rejects_inconsistent_advances_state() {
 fn validation_rejects_an_output_owned_by_another_operation() {
     let mut operation = token_decode_operation();
     operation.outputs[0].producer_op_id = OpId(999);
+    operation.plan_digest = operation.compute_plan_digest();
+    assert!(operation.validate().is_err());
+}
+
+#[test]
+fn validation_allows_shared_encoder_features_and_rejects_foreign_lineage_state() {
+    let foreign_key = RequestKey::new(4, RequestId(8), 2);
+    let mut feature = output_product(OpId(3));
+    feature.request_key = foreign_key;
+    feature.kind = ProductKind::VisionFeature;
+    let mut operation = token_decode_operation();
+    operation.inputs = vec![feature];
+    operation.plan_digest = operation.compute_plan_digest();
+    operation.validate().unwrap();
+
+    operation.inputs[0].kind = ProductKind::Token;
     operation.plan_digest = operation.compute_plan_digest();
     assert!(operation.validate().is_err());
 }
@@ -836,23 +865,13 @@ fn comprehensive_batch() -> Batch {
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
             },
-            vec![product_for(
-                session_key(50),
-                OpId(2),
-                0,
-                ProductKind::VisionFeature,
-            )],
+            vec![product_for(key, OpId(2), 0, ProductKind::VisionFeature)],
             vec![
                 product_for(key, op_id, 0, ProductKind::Token),
                 product_for(key, op_id, 1, ProductKind::Kv),
             ],
-            vec![BlockId(70 + index as u32), BlockId(90 + index as u32)],
-            Some(product_for(
-                session_key(51),
-                OpId(3),
-                0,
-                ProductKind::Completion,
-            )),
+            3,
+            Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
             Some(Rng {
                 seed: 99 + index as u64,
                 semantic_index_base: 4,
@@ -871,8 +890,7 @@ fn comprehensive_batch() -> Batch {
             sampling: full_sampling(),
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
-            kv: KvAllocation {
-                block_ids: vec![BlockId(3), BlockId(4), BlockId(5)],
+            kv: KvAdmission {
                 prefix_len: 128,
                 group_id: 1,
             },
@@ -1342,7 +1360,7 @@ fn decode_step_batch(operations: usize) -> Batch {
                     product_for(key, op_id, 0, ProductKind::Token),
                     product_for(key, op_id, 1, ProductKind::Kv),
                 ],
-                vec![BlockId(7 + index as u32)],
+                1,
                 None,
                 Some(Rng {
                     seed: 99 + index as u64,

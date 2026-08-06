@@ -999,7 +999,7 @@ mod tests {
 
     use uniserve_core::{RequestId, SamplingParams};
     use uniserve_worker_wire::{
-        AttentionRegime, Bounds, DType, DimBound, Domain, ExecutionCapability, KvAllocation, OpId,
+        AttentionRegime, Bounds, DType, DimBound, Domain, ExecutionCapability, KvAdmission, OpId,
         OpStatus, PointRange, ProductKind, ProductRef, RegistrationAck, RouteId, ShapeBound,
         StorageClass, TokenMode, UndAdmission, VersionRef, Work, encode_token_product_bytes,
     };
@@ -1133,7 +1133,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
-                kv: KvAllocation::default(),
+                kv: KvAdmission::default(),
             }),
             None,
         )
@@ -1276,7 +1276,7 @@ mod tests {
             Bounds::default(),
             vec![image.clone()],
             Vec::new(),
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1306,7 +1306,7 @@ mod tests {
             },
             vec![tokens.clone()],
             Vec::new(),
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1328,6 +1328,7 @@ mod tests {
                             attention: AttentionRegime::None,
                             shape_class: 0,
                             operations: vec![encode],
+                            kv_reservations: Vec::new(),
                         },
                         BatchPartition {
                             partition_id: 2,
@@ -1339,6 +1340,7 @@ mod tests {
                             attention: AttentionRegime::Causal,
                             shape_class: 0,
                             operations: vec![prefill],
+                            kv_reservations: Vec::new(),
                         },
                     ],
                 )
@@ -1436,7 +1438,7 @@ mod tests {
             },
             vec![image.clone()],
             vec![feature.clone()],
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1461,6 +1463,7 @@ mod tests {
                         attention: AttentionRegime::None,
                         shape_class: 0,
                         operations: vec![encode],
+                        kv_reservations: Vec::new(),
                     }],
                 )
                 .with_input_products(vec![ProductPayload {
@@ -1483,7 +1486,7 @@ mod tests {
             },
             vec![feature.clone()],
             Vec::new(),
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1501,6 +1504,7 @@ mod tests {
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![consume],
+                kv_reservations: Vec::new(),
             }],
         );
         let pending_error = router
@@ -1551,7 +1555,7 @@ mod tests {
             },
             vec![image.clone()],
             vec![feature.clone()],
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1580,6 +1584,7 @@ mod tests {
                         attention: AttentionRegime::None,
                         shape_class: 0,
                         operations: vec![encode],
+                        kv_reservations: Vec::new(),
                     }],
                 )
                 .with_input_products(vec![ProductPayload {

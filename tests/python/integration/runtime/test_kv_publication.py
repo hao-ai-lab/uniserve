@@ -102,6 +102,7 @@ def _installation_operation(
             bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
             inputs=(source,),
             outputs=(product,),
+            kv_capacity_pages=1,
         ),
         product,
     )
@@ -235,9 +236,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         )
     )
     incremental_payload = incremental_result.products[0]
-    kind, descriptor, producer_plan_digest = decode_transfer_descriptor(
-        incremental_payload.payload
-    )
+    kind, descriptor, producer_plan_digest = decode_transfer_descriptor(incremental_payload.payload)
     assert kind == "kv"
     assert producer_plan_digest == incremental.plan_digest
     incremental_snapshot = KvSnapshot.from_wire(descriptor["snapshot"])
@@ -394,6 +393,8 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
         assert producer.kv.validate_conditioning(43, source).source_version == commit.selected
         assert consumer.sessions.peek(43) is None
         assert consumer.kv.resident_block_count() == 0
+        assert consumer.kv.pool is not None
+        assert consumer.kv.pool.session_blocks_available == consumer.kv.pool.leasable_num_blocks
     finally:
         producer.close()
         consumer.close()

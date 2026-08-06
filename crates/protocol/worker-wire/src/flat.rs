@@ -11,8 +11,8 @@ use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
     CompletionReport, Control, CreditVector, DType, DimBound, Disposition, Domain, DrawLayout,
     EngineCaps, ErrorCode, ErrorOperationIdentity, ExecutionCapability, ExecutionConstraints,
-    FinishFlags, GenAdmission, KvAllocation, LogicalLengths, OpId, OpStatus, Operation,
-    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    FinishFlags, GenAdmission, KvAdmission, KvReservation, LogicalLengths, OpId, OpStatus,
+    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
     RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng,
     RouteCreditLimits, RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound,
     SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, Work,
@@ -200,6 +200,16 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<Ba
             })
             .transpose()?
             .unwrap_or_default(),
+        kv_reservations: partition
+            .kv_reservations()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(kv_reservation_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
     };
     partition.validate()?;
     Ok(partition)
@@ -234,11 +244,7 @@ fn und_admission_from_table(admission: fbs::UndAdmission<'_>) -> anyhow::Result<
             .finish_token_ids()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
-        kv: kv_allocation_from_table(
-            admission
-                .kv()
-                .context("und admission has no KV allocation")?,
-        ),
+        kv: kv_admission_from_table(admission.kv().context("und admission has no KV metadata")?),
     })
 }
 
@@ -252,15 +258,25 @@ fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> anyhow::Result<
     })
 }
 
-fn kv_allocation_from_table(allocation: fbs::KvAllocation<'_>) -> KvAllocation {
-    KvAllocation {
-        block_ids: allocation
-            .block_ids()
+fn kv_admission_from_table(admission: fbs::KvAdmission<'_>) -> KvAdmission {
+    KvAdmission {
+        prefix_len: admission.prefix_len(),
+        group_id: admission.group_id(),
+    }
+}
+
+fn kv_reservation_from_table(reservation: fbs::KvReservation<'_>) -> anyhow::Result<KvReservation> {
+    Ok(KvReservation {
+        request_key: request_key_from_table(
+            reservation.request_key(),
+            "KV reservation.request_key",
+        )?,
+        op_id: OpId(reservation.op_id()),
+        logical_page_delta: reservation
+            .logical_page_delta()
             .map(|items| items.iter().map(BlockId).collect())
             .unwrap_or_default(),
-        prefix_len: allocation.prefix_len(),
-        group_id: allocation.group_id(),
-    }
+    })
 }
 
 fn operation_from_table(operation: fbs::Operation<'_>) -> anyhow::Result<Operation> {
@@ -293,10 +309,7 @@ fn operation_from_table(operation: fbs::Operation<'_>) -> anyhow::Result<Operati
             })
             .transpose()?
             .unwrap_or_default(),
-        new_kv_blocks: operation
-            .new_kv_blocks()
-            .map(|items| items.iter().map(BlockId).collect())
-            .unwrap_or_default(),
+        kv_capacity_pages: operation.kv_capacity_pages(),
         predicate: operation
             .predicate()
             .map(product_ref_from_table)
@@ -1296,6 +1309,13 @@ fn partition_to_fb(partition: &BatchPartition) -> anyhow::Result<fbs::BatchParti
                 .map(operation_to_fb)
                 .collect::<anyhow::Result<_>>()?,
         ),
+        kv_reservations: Some(
+            partition
+                .kv_reservations
+                .iter()
+                .map(kv_reservation_to_fb)
+                .collect(),
+        ),
     })
 }
 
@@ -1349,6 +1369,12 @@ fn partition_from_fb(partition: fbs::BatchPartitionT) -> anyhow::Result<BatchPar
             .into_iter()
             .map(operation_from_fb)
             .collect::<anyhow::Result<_>>()?,
+        kv_reservations: partition
+            .kv_reservations
+            .unwrap_or_default()
+            .into_iter()
+            .map(kv_reservation_from_fb)
+            .collect::<anyhow::Result<_>>()?,
     };
     partition.validate()?;
     Ok(partition)
@@ -1396,7 +1422,7 @@ fn und_admission_to_fb(admission: &UndAdmission) -> anyhow::Result<fbs::UndAdmis
         sampling: Some(Box::new(sampling_to_fb(&admission.sampling)?)),
         negative_token_ids: Some(admission.negative_token_ids.clone()),
         finish_token_ids: Some(admission.finish_token_ids.clone()),
-        kv: Some(Box::new(kv_allocation_to_fb(&admission.kv))),
+        kv: Some(Box::new(kv_admission_to_fb(&admission.kv))),
     })
 }
 
@@ -1410,7 +1436,7 @@ fn und_admission_from_fb(admission: fbs::UndAdmissionT) -> anyhow::Result<UndAdm
         )?,
         negative_token_ids: admission.negative_token_ids.unwrap_or_default(),
         finish_token_ids: admission.finish_token_ids.unwrap_or_default(),
-        kv: kv_allocation_from_fb(*admission.kv.context("und admission has no KV allocation")?),
+        kv: kv_admission_from_fb(*admission.kv.context("und admission has no KV metadata")?),
     })
 }
 
@@ -1427,26 +1453,47 @@ fn gen_admission_from_fb(admission: fbs::GenAdmissionT) -> anyhow::Result<GenAdm
     })
 }
 
-fn kv_allocation_to_fb(allocation: &KvAllocation) -> fbs::KvAllocationT {
-    fbs::KvAllocationT {
-        block_ids: Some(allocation.block_ids.iter().map(|block| block.0).collect()),
-        prefix_len: allocation.prefix_len,
-        group_id: allocation.group_id,
+fn kv_admission_to_fb(admission: &KvAdmission) -> fbs::KvAdmissionT {
+    fbs::KvAdmissionT {
+        prefix_len: admission.prefix_len,
+        group_id: admission.group_id,
     }
 }
 
 #[cfg(test)]
-fn kv_allocation_from_fb(allocation: fbs::KvAllocationT) -> KvAllocation {
-    KvAllocation {
-        block_ids: allocation
-            .block_ids
+fn kv_admission_from_fb(admission: fbs::KvAdmissionT) -> KvAdmission {
+    KvAdmission {
+        prefix_len: admission.prefix_len,
+        group_id: admission.group_id,
+    }
+}
+
+fn kv_reservation_to_fb(reservation: &KvReservation) -> fbs::KvReservationT {
+    fbs::KvReservationT {
+        request_key: Some(Box::new(request_key_to_fb(reservation.request_key))),
+        op_id: reservation.op_id.0,
+        logical_page_delta: Some(
+            reservation
+                .logical_page_delta
+                .iter()
+                .map(|block| block.0)
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn kv_reservation_from_fb(reservation: fbs::KvReservationT) -> anyhow::Result<KvReservation> {
+    Ok(KvReservation {
+        request_key: request_key_from_fb(reservation.request_key, "KV reservation.request_key")?,
+        op_id: OpId(reservation.op_id),
+        logical_page_delta: reservation
+            .logical_page_delta
             .unwrap_or_default()
             .into_iter()
             .map(BlockId)
             .collect(),
-        prefix_len: allocation.prefix_len,
-        group_id: allocation.group_id,
-    }
+    })
 }
 
 fn operation_to_fb(operation: &Operation) -> anyhow::Result<fbs::OperationT> {
@@ -1462,13 +1509,7 @@ fn operation_to_fb(operation: &Operation) -> anyhow::Result<fbs::OperationT> {
         bounds: Some(Box::new(bounds_to_fb(&operation.bounds))),
         inputs: Some(operation.inputs.iter().map(product_ref_to_fb).collect()),
         outputs: Some(operation.outputs.iter().map(product_ref_to_fb).collect()),
-        new_kv_blocks: Some(
-            operation
-                .new_kv_blocks
-                .iter()
-                .map(|block| block.0)
-                .collect(),
-        ),
+        kv_capacity_pages: operation.kv_capacity_pages,
         predicate: operation
             .predicate
             .as_ref()
@@ -1503,12 +1544,7 @@ fn operation_from_fb(operation: fbs::OperationT) -> anyhow::Result<Operation> {
             .into_iter()
             .map(product_ref_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        new_kv_blocks: operation
-            .new_kv_blocks
-            .unwrap_or_default()
-            .into_iter()
-            .map(BlockId)
-            .collect(),
+        kv_capacity_pages: operation.kv_capacity_pages,
         predicate: operation
             .predicate
             .map(|predicate| product_ref_from_fb(*predicate))

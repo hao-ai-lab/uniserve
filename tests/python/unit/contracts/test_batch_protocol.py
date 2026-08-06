@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from itertools import permutations
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ from uniserve_worker.batch import (
     ExecutionCapability,
     FinishFlags,
     FixedPoint,
+    KvReservation,
     LogicalLengths,
     Operation,
     OpStatus,
@@ -124,7 +126,7 @@ def _decode_operation(input_product: ProductRef | None = None) -> Operation:
         bounds=Bounds(max_points=1, max_tokens=1, max_kv_pages=1),
         inputs=(() if input_product is None else (input_product,)),
         outputs=(_token_output(),),
-        new_kv_blocks=(7,),
+        kv_capacity_pages=1,
         rng=Rng(seed=99, semantic_index_base=4, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
 
@@ -141,6 +143,14 @@ def _partition(*operations: Operation) -> BatchPartition:
         attention=AttentionRegime.CAUSAL,
         shape_class=0,
         operations=operations,
+        kv_reservations=tuple(
+            KvReservation(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                logical_page_delta=(7,),
+            )
+            for operation in operations
+        ),
     )
 
 
@@ -170,6 +180,86 @@ def test_semantic_digest_matches_rust() -> None:
         shifted.compute_semantic_digest(fixture["parent_semantic_digest"], fixture["plan_digest"])
         != fixture["semantic_digest"]
     )
+
+
+def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order() -> None:
+    operation = _decode_operation()
+    other_key = RequestKey(0, 12, 1)
+    other_outputs = tuple(
+        replace(product, request_key=other_key, producer_op_id=12) for product in operation.outputs
+    )
+    other = replace(
+        operation,
+        request_key=other_key,
+        op_id=12,
+        parent=VersionRef(other_key, 1, operation.parent.point),
+        outputs=other_outputs,
+    )
+    other = replace(other, plan_digest=other.compute_plan_digest())
+    expected_plan = operation.plan_digest
+    assert replace(operation, control_seq=1).compute_plan_digest() != expected_plan
+
+    for index, (ordered, placements) in enumerate(
+        (
+            ((operation, other), (7, 8)),
+            ((other, operation), (80, 70)),
+        ),
+        start=1,
+    ):
+        reservations = tuple(
+            KvReservation(
+                request_key=item.request_key,
+                op_id=item.op_id,
+                logical_page_delta=(placements[position],),
+            )
+            for position, item in enumerate(ordered)
+        )
+        batch = Batch(
+            step_id=100 + index,
+            partitions=(
+                BatchPartition(
+                    partition_id=10 + index,
+                    submission_group=20 + index,
+                    collective_seq=30 + index,
+                    domain=Domain.UND,
+                    route=operation.route,
+                    execution=ExecutionCapability.DOMAIN_HOMOGENEOUS,
+                    attention=AttentionRegime.CAUSAL,
+                    shape_class=index,
+                    operations=ordered,
+                    kv_reservations=reservations,
+                ),
+            ),
+        )
+        restored = Batch.from_wire(batch.to_wire())
+        target = next(
+            item for item in restored.operations if item.request_key == operation.request_key
+        )
+        assert target.plan_digest == expected_plan
+
+    fixture = _fixture()
+    completion = CompletionRecord.from_wire(fixture["completion"])
+    other_completion = replace(completion, request_key=other_key, op_id=12)
+    plans = {
+        operation.request_key: operation.plan_digest,
+        other.request_key: other.plan_digest,
+    }
+    expected = {
+        (record.request_key, record.op_id): record.compute_semantic_digest(
+            fixture["parent_semantic_digest"],
+            plans[record.request_key],
+        )
+        for record in (completion, other_completion)
+    }
+    for ordering in permutations((completion, other_completion)):
+        observed = {
+            (record.request_key, record.op_id): record.compute_semantic_digest(
+                fixture["parent_semantic_digest"],
+                plans[record.request_key],
+            )
+            for record in ordering
+        }
+        assert observed == expected
 
 
 def test_protocol_layout_digest_matches_rust() -> None:
@@ -392,6 +482,24 @@ def test_operation_rejects_a_forged_plan_digest() -> None:
     wire["plan_digest"] = "00" * 32
     with pytest.raises(WorkerError):
         Operation.from_wire(wire)
+
+
+def test_operation_accepts_shared_encoder_features_but_not_foreign_lineage_state() -> None:
+    feature = replace(
+        _token_output(),
+        request_key=RequestKey(0, 99, 1),
+        producer_op_id=3,
+        kind=ProductKind.VISION_FEATURE,
+    )
+    operation = replace(_decode_operation(), inputs=(feature,))
+    operation = replace(operation, plan_digest=operation.compute_plan_digest())
+    assert Operation.from_wire(operation.to_wire()) == operation
+
+    foreign_token = replace(feature, kind=ProductKind.TOKEN)
+    invalid = replace(operation, inputs=(foreign_token,))
+    invalid = replace(invalid, plan_digest=invalid.compute_plan_digest())
+    with pytest.raises(WorkerError, match="request-local input"):
+        Operation.from_wire(invalid.to_wire())
 
 
 def test_admission_round_trips_and_binds_digest() -> None:

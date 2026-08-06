@@ -1,4 +1,5 @@
 """Physical paged KV storage owned and bounded by ``KvStore``."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
@@ -16,18 +17,18 @@ from ..nn.quant.kv_cache import (
 from .block_allocator import BlockFreeList
 
 __all__ = [
-    'PagedKVPool',
+    "PagedKVPool",
 ]
 
 
 class PagedKVPool:
-    """Layer-major paged KV storage indexed by host-issued block ids.
+    """Layer-major paged KV storage with worker-owned physical page allocation.
 
     One pool holds every span attention can address in a single forward. Its
-    block ids partition into three ranges: the host leases ``[0,
-    leasable_num_blocks)`` to sessions, the worker allocates branch blocks for
-    transaction-scoped spans immediately above that, and the tail is reserved
-    headroom for padded graph rows. A batch that mixes a session's committed
+    block ids partition into three ranges: the worker allocates ``[0,
+    leasable_num_blocks)`` to registered session leases, allocates branch blocks
+    for transaction-scoped spans immediately above that, and reserves the tail
+    for padded graph rows. A batch that mixes a session's committed
     span with a branch span therefore builds one page table over one storage
     tensor, so no span has to be relocated to be attended to alongside another.
     """
@@ -80,6 +81,7 @@ class PagedKVPool:
         if self.leasable_num_blocks < 1:
             raise invalid_descriptor("PagedKVPool must leave at least one leasable block")
         self._branch_free = BlockFreeList(self.branch_num_blocks)
+        self._session_free = BlockFreeList(self.leasable_num_blocks)
         # Layer-major storage makes a single layer's page table contiguous for
         # flash-attn's paged-kv kernel: [num_blocks, page, kv_heads, head_dim].
         shape = (self.num_layers, self.num_blocks, self.block_size, self.n_kv, self.head_dim)
@@ -87,31 +89,31 @@ class PagedKVPool:
         self.v = torch.zeros(shape, device=device, dtype=self.store_dtype)
         scale_shape = (self.num_layers, self.num_blocks, 1, 1, 1)
         self.k_scale = (
-            torch.ones(scale_shape, device=device, dtype=torch.float32) if self.is_quantized else None
+            torch.ones(scale_shape, device=device, dtype=torch.float32)
+            if self.is_quantized
+            else None
         )
         self.v_scale = (
-            torch.ones(scale_shape, device=device, dtype=torch.float32) if self.is_quantized else None
+            torch.ones(scale_shape, device=device, dtype=torch.float32)
+            if self.is_quantized
+            else None
         )
         # Tracks whether each (layer, block) scale has been established by a
         # first write; once set, the scale is frozen and reused for appends.
         self.k_scale_set = (
-            torch.zeros(
-                (self.num_layers, self.num_blocks), device=device, dtype=torch.bool
-            )
+            torch.zeros((self.num_layers, self.num_blocks), device=device, dtype=torch.bool)
             if self.is_quantized
             else None
         )
         self.v_scale_set = (
-            torch.zeros(
-                (self.num_layers, self.num_blocks), device=device, dtype=torch.bool
-            )
+            torch.zeros((self.num_layers, self.num_blocks), device=device, dtype=torch.bool)
             if self.is_quantized
             else None
         )
 
     @property
     def leasable_num_blocks(self) -> int:
-        """Block ids the host may lease to a session."""
+        """Physical pages available for worker session mappings."""
 
         return self.num_blocks - self.reserved_tail_blocks - self.branch_num_blocks
 
@@ -125,6 +127,21 @@ class PagedKVPool:
     @property
     def branch_blocks_available(self) -> int:
         return self._branch_free.available
+
+    @property
+    def session_blocks_available(self) -> int:
+        return self._session_free.available
+
+    def allocate_session_blocks(self, count: int) -> list[int]:
+        """Select physical pages for newly observed logical session blocks."""
+
+        return self._session_free.allocate(int(count), label="session KV pages")
+
+    def release_session_blocks(self, block_ids: Iterable[int]) -> None:
+        values = [int(value) for value in block_ids]
+        if any(value < 0 or value >= self.leasable_num_blocks for value in values):
+            raise invalid_descriptor("session KV page is outside this pool's session range")
+        self._session_free.release(values)
 
     def allocate_branch_blocks(self, count: int) -> list[int]:
         """Take ``count`` transaction-branch blocks from this pool's own range."""
@@ -165,7 +182,14 @@ class PagedKVPool:
         target = torch.tensor(
             self.validate_block_ids(target_blocks), dtype=torch.long, device=device
         )
-        for store in (self.k, self.v, self.k_scale, self.v_scale, self.k_scale_set, self.v_scale_set):
+        for store in (
+            self.k,
+            self.v,
+            self.k_scale,
+            self.v_scale,
+            self.k_scale_set,
+            self.v_scale_set,
+        ):
             if store is not None:
                 store.index_copy_(1, target, store.index_select(1, source))
 
@@ -195,8 +219,7 @@ class PagedKVPool:
         end = int(start) + int(n)
         if end > len(block_ids) * self.block_size:
             raise invalid_descriptor(
-                "paged KV view does not contain enough logical blocks "
-                f"for range [{start}, {end})"
+                f"paged KV view does not contain enough logical blocks for range [{start}, {end})"
             )
         bs = self.block_size
         out: list[tuple[int, int, int]] = []
@@ -268,8 +291,12 @@ class PagedKVPool:
         n = int(k.shape[0])
         written = 0
         for blk, off, cnt in self.spans(block_ids, int(start), n):
-            self._write_span(self.k, self.k_scale, self.k_scale_set, layer, blk, off, k[written:written + cnt])
-            self._write_span(self.v, self.v_scale, self.v_scale_set, layer, blk, off, v[written:written + cnt])
+            self._write_span(
+                self.k, self.k_scale, self.k_scale_set, layer, blk, off, k[written : written + cnt]
+            )
+            self._write_span(
+                self.v, self.v_scale, self.v_scale_set, layer, blk, off, v[written : written + cnt]
+            )
             written += cnt
 
     def layer_cache(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -293,7 +320,7 @@ class PagedKVPool:
         offset: int,
         count: int,
     ) -> torch.Tensor:
-        span = store[layer, block_id, offset:offset + count]
+        span = store[layer, block_id, offset : offset + count]
         if not self.is_quantized:
             return span
         if scale_table is None:
@@ -315,7 +342,7 @@ class PagedKVPool:
         values: torch.Tensor,
     ) -> None:
         if not self.is_quantized:
-            store[layer, block_id, offset:offset + int(values.shape[0])] = values.to(
+            store[layer, block_id, offset : offset + int(values.shape[0])] = values.to(
                 device=store.device,
                 dtype=store.dtype,
             )
@@ -338,4 +365,4 @@ class PagedKVPool:
             scale_set[layer, block_id] = True
         else:
             scale = scale_table[layer, block_id].to(device=store.device)
-        store[layer, block_id, offset:offset + count] = fp8_quantize(values_f32, scale)
+        store[layer, block_id, offset : offset + count] = fp8_quantize(values_f32, scale)

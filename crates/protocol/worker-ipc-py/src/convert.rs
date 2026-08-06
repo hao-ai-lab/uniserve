@@ -27,11 +27,11 @@ use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
     CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, EncodeMode,
     ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, GenMode,
-    KvAllocation, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point,
-    PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
-    ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenMode, TokenSpan,
-    TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats, WorkerRequest,
-    WorkerResponse,
+    KvAdmission, KvReservation, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion,
+    Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
+    RequestKind, ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
+    TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats,
+    WorkerRequest, WorkerResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,33 @@ fn batch_partition_to_py<'py>(
         dict_list(py, &partition.operations, |operation| {
             operation_to_py(py, operation, context)
         })?,
+    )?;
+    dict.set_item(
+        intern!(py, "kv_reservations"),
+        dict_list(py, &partition.kv_reservations, |reservation| {
+            kv_reservation_to_py(py, reservation, context)
+        })?,
+    )?;
+    Ok(dict)
+}
+
+fn kv_reservation_to_py<'py>(
+    py: Python<'py>,
+    reservation: &KvReservation,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        intern!(py, "request_key"),
+        context.request_key(reservation.request_key)?,
+    )?;
+    dict.set_item(intern!(py, "op_id"), reservation.op_id.0)?;
+    dict.set_item(
+        intern!(py, "logical_page_delta"),
+        PyList::new(
+            py,
+            reservation.logical_page_delta.iter().map(|block| block.0),
+        )?,
     )?;
     Ok(dict)
 }
@@ -251,7 +278,7 @@ fn und_admission_to_py<'py>(py: Python<'py>, und: &UndAdmission) -> PyResult<Bou
         intern!(py, "finish_token_ids"),
         u32_list(py, &und.finish_token_ids)?,
     )?;
-    dict.set_item(intern!(py, "kv"), kv_allocation_to_py(py, &und.kv)?)?;
+    dict.set_item(intern!(py, "kv"), kv_admission_to_py(py, &und.kv)?)?;
     Ok(dict)
 }
 
@@ -264,12 +291,8 @@ fn gen_admission_to_py<'py>(
     Ok(dict)
 }
 
-fn kv_allocation_to_py<'py>(py: Python<'py>, kv: &KvAllocation) -> PyResult<Bound<'py, PyDict>> {
+fn kv_admission_to_py<'py>(py: Python<'py>, kv: &KvAdmission) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "block_ids"),
-        PyList::new(py, kv.block_ids.iter().map(|block| block.0))?,
-    )?;
     dict.set_item(intern!(py, "prefix_len"), kv.prefix_len)?;
     dict.set_item(intern!(py, "group_id"), kv.group_id)?;
     Ok(dict)
@@ -391,8 +414,8 @@ fn operation_to_py<'py>(
         })?,
     )?;
     dict.set_item(
-        intern!(py, "new_kv_blocks"),
-        PyList::new(py, operation.new_kv_blocks.iter().map(|block| block.0))?,
+        intern!(py, "kv_capacity_pages"),
+        operation.kv_capacity_pages,
     )?;
     dict.set_item(
         intern!(py, "predicate"),
@@ -1420,8 +1443,8 @@ mod tests {
             _ => Vec::new(),
         };
         for input in &mut inputs {
+            input.request_key = key;
             if input.storage_class == StorageClass::HostStaging {
-                input.request_key = key;
                 input.producer_op_id = op_id;
             }
         }
@@ -1439,13 +1462,9 @@ mod tests {
             let mut predicate = product_ref(seed + 20);
             predicate.kind = ProductKind::Completion;
             predicate.storage_class = StorageClass::DeviceTensor;
+            predicate.request_key = key;
             predicate
         });
-        let new_kv_blocks = if seed.is_multiple_of(2) {
-            vec![BlockId(seed as u32), BlockId(seed as u32 + 1)]
-        } else {
-            Vec::new()
-        };
         let mut outputs = vec![product_ref(seed + 30), product_ref(seed + 31)];
         for output in &mut outputs {
             output.request_key = key;
@@ -1473,7 +1492,7 @@ mod tests {
             },
             inputs,
             outputs,
-            new_kv_blocks,
+            2,
             predicate,
             rng,
             seed,
@@ -1482,6 +1501,14 @@ mod tests {
 
     fn partition(operations: Vec<Operation>) -> BatchPartition {
         let first = operations.first().expect("partition needs operations");
+        let kv_reservations = operations
+            .iter()
+            .map(|operation| uniserve_worker_wire::KvReservation {
+                request_key: operation.request_key,
+                op_id: operation.op_id,
+                logical_page_delta: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+            })
+            .collect();
         BatchPartition {
             partition_id: 1,
             submission_group: 1,
@@ -1492,6 +1519,7 @@ mod tests {
             attention: AttentionRegime::Hybrid,
             shape_class: 0,
             operations,
+            kv_reservations,
         }
     }
 
@@ -1507,8 +1535,7 @@ mod tests {
                     sampling: full_sampling(),
                     negative_token_ids: vec![100, 200],
                     finish_token_ids: vec![2, 7],
-                    kv: KvAllocation {
-                        block_ids: vec![BlockId(1), BlockId(9)],
+                    kv: KvAdmission {
                         prefix_len: 64,
                         group_id: 1,
                     },
@@ -1530,7 +1557,7 @@ mod tests {
                     sampling: SamplingParams::default(),
                     negative_token_ids: Vec::new(),
                     finish_token_ids: vec![3],
-                    kv: KvAllocation::default(),
+                    kv: KvAdmission::default(),
                 }),
                 Some(GenAdmission {
                     image: full_image(),
@@ -1998,11 +2025,7 @@ mod tests {
                     },
                     Vec::new(),
                     outputs,
-                    if seed.is_multiple_of(4) {
-                        vec![BlockId(seed as u32)]
-                    } else {
-                        Vec::new()
-                    },
+                    1,
                     None,
                     Some(Rng {
                         seed,

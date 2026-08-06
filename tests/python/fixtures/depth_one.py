@@ -27,7 +27,8 @@ from uniserve_worker.batch import (
     FixedPoint,
     GenAdmission,
     ImageParams,
-    KvAllocation,
+    KvAdmission,
+    KvReservation,
     Operation,
     PointRange,
     ProductKind,
@@ -48,6 +49,9 @@ from uniserve_worker.batch import (
 )
 
 AUTHORITY = 0
+_LOGICAL_LEASES: dict[RequestKey, list[int]] = {}
+_LOGICAL_PAGE_DELTAS: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
+_UNBOUND_LOGICAL_PAGES: dict[RequestKey, list[int]] = {}
 
 
 def execution_batch(
@@ -60,6 +64,7 @@ def execution_batch(
 ) -> Batch:
     """Build the explicit physical partitions used by executor behavior tests."""
 
+    admitted = {admission.request_key for admission in admissions}
     by_route: dict[int, list[Operation]] = {}
     for operation in operations:
         by_route.setdefault(int(operation.route), []).append(operation)
@@ -102,6 +107,25 @@ def execution_batch(
                     attention=attention,
                     shape_class=0,
                     operations=domain_operations,
+                    kv_reservations=tuple(
+                        KvReservation(
+                            request_key=operation.request_key,
+                            op_id=operation.op_id,
+                            logical_page_delta=(
+                                tuple(
+                                    _LOGICAL_LEASES.get(operation.request_key, ())[
+                                        : operation.kv_capacity_pages
+                                    ]
+                                )
+                                if operation.request_key in admitted
+                                else _LOGICAL_PAGE_DELTAS.get(
+                                    (operation.request_key, operation.op_id), ()
+                                )
+                            ),
+                        )
+                        for operation in domain_operations
+                        if operation.kv_capacity_pages > 0
+                    ),
                 )
             )
             partition_id += 1
@@ -126,18 +150,18 @@ def und_admission(
     epoch: int = 1,
     sampling: SamplingParams | None = None,
 ) -> Admission:
+    rk = request_key(session_id, epoch)
+    _LOGICAL_LEASES[rk] = [int(value) for value in block_ids]
+    _UNBOUND_LOGICAL_PAGES[rk] = [int(value) for value in block_ids]
     return Admission.create(
-        request_key(session_id, epoch),
+        rk,
         und=UndAdmission(
             sampling=(
                 sampling
                 if sampling is not None
                 else SamplingParams(temperature=0.0, ignore_eos=True)
             ),
-            kv=KvAllocation(
-                block_ids=tuple(int(value) for value in block_ids),
-                prefix_len=int(prefix_len),
-            ),
+            kv=KvAdmission(prefix_len=int(prefix_len)),
         ),
     )
 
@@ -186,19 +210,25 @@ def token_operation(
     parent: VersionRef,
     mode: TokenMode,
     tokens: Sequence[int],
-    new_kv_blocks: Sequence[int] = (),
+    logical_block_delta: Sequence[int] = (),
     predicate: ProductRef | None = None,
     produces_finish_candidate: bool = True,
     logprobs: bool = False,
     rng: Rng | None = None,
     control_seq: int = 0,
 ) -> tuple[Operation, ProductPayload]:
-    """A token operation plus the input token product the worker decodes for it.
+    """A token operation plus the input token product the worker decodes for it."""
 
-    ``new_kv_blocks`` are the KV blocks this step appends to the session's lease,
-    exactly as the scheduler supplies them when a sequence crosses a page
-    boundary.
-    """
+    lease = _LOGICAL_LEASES.setdefault(rk, [])
+    added = [int(value) for value in logical_block_delta]
+    if set(added) & set(lease):
+        raise ValueError("logical KV lease delta repeats an existing block")
+    lease.extend(added)
+    pending = _UNBOUND_LOGICAL_PAGES.setdefault(rk, [])
+    pending.extend(added)
+    registration_delta = tuple(pending)
+    _LOGICAL_PAGE_DELTAS[(rk, op_id)] = registration_delta
+    pending.clear()
 
     reference = _token_input_ref(rk, op_id, len(tokens))
     token_output = ProductRef(
@@ -289,11 +319,12 @@ def token_operation(
         bounds=Bounds(
             max_points=max_points,
             max_tokens=max(1, len(tokens)),
+            max_kv_pages=len(added),
             max_completion_bytes=((1 << 16) - 1 if logprobs else 0),
         ),
         inputs=(reference,),
         outputs=tuple(outputs),
-        new_kv_blocks=tuple(int(value) for value in new_kv_blocks),
+        kv_capacity_pages=len(lease),
         predicate=predicate,
         rng=rng,
         control_seq=control_seq,

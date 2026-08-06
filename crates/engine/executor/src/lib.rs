@@ -531,7 +531,7 @@ mod tests {
             Bounds::default(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            0,
             None,
             None,
             0,

@@ -172,9 +172,9 @@ use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
     CompletionReport, Control, CreditVector, Disposition, EngineCaps, ExecutionCapability,
-    GenAdmission, KvAllocation, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload,
-    ProductRef, RequestKey, ResourceClass, RouteCreditLimits, SamplingState, StorageClass,
-    UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
+    GenAdmission, KvAdmission, KvReservation, OpId, OpStatus, Operation, Point, ProductKind,
+    ProductPayload, ProductRef, RequestKey, ResourceClass, RouteCreditLimits, SamplingState,
+    StorageClass, UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
 };
 
 use crate::image_artifact::validate_png_artifact;
@@ -524,7 +524,7 @@ pub struct Scheduler {
     /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
     /// Worker-visible sessions whose close transaction has been submitted but
-    /// not yet acknowledged. Their host KV pages and logical leases remain
+    /// not yet acknowledged. Their worker page holdings and logical leases remain
     /// owned until the close report establishes the worker-side retirement
     /// ordering point.
     retiring_sessions: HashMap<RequestId, RequestKey>,
@@ -3813,9 +3813,14 @@ impl Scheduler {
                     mixed_left = mixed_left.saturating_sub(planned_op_token_cost(&op));
                 }
                 budget = budget.saturating_sub(planned_op_token_cost(&op));
-                // Stateful-diff contract: a request's static state and
-                // initial block allocation cross once, ahead of its
-                // first op; the op then carries only deltas.
+                if !self.reserve_transition_resources(&mut op) {
+                    self.return_unsent_blocks(id, &op);
+                    tracing::debug!(
+                        request_id = id.0,
+                        "operation registration is paused by finite-credit pressure"
+                    );
+                    continue;
+                }
                 let finish_token_ids = self
                     .running
                     .get(&id)
@@ -3825,7 +3830,6 @@ impl Scheduler {
                     && !st.resources.worker_registered
                 {
                     st.resources.worker_registered = true;
-                    let initial_blocks = std::mem::take(&mut op.new_blocks);
                     let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                     let admission = Admission::new(
                         request_key,
@@ -3833,8 +3837,7 @@ impl Scheduler {
                             sampling: st.req.sampling.clone(),
                             negative_token_ids: st.context.negative_prompt_ids.clone(),
                             finish_token_ids,
-                            kv: KvAllocation {
-                                block_ids: initial_blocks,
+                            kv: KvAdmission {
                                 prefix_len: st.ingest.prompt_cursor,
                                 group_id: 0,
                             },
@@ -3867,14 +3870,6 @@ impl Scheduler {
                         },
                     );
                     admissions.push(admission);
-                }
-                if !self.reserve_transition_resources(&mut op) {
-                    self.return_unsent_blocks(id, &op);
-                    tracing::debug!(
-                        request_id = id.0,
-                        "operation registration is paused by finite-credit pressure"
-                    );
-                    continue;
                 }
                 selected.insert(id);
                 let placed_flow = op.operation_variant == WorkVariant::GenFlow;
@@ -4134,6 +4129,8 @@ impl Scheduler {
                 .running
                 .get(&request_id)
                 .map_or(0, |state| state.control_seq);
+            transition.kv_capacity_pages =
+                self.bm.blocks_for(request_id).len().min(u32::MAX as usize) as u32;
             if let Err(error) = transition.assign_operation(
                 request_key,
                 OpId(oid),
@@ -4268,6 +4265,28 @@ impl Scheduler {
                 "submitting mixed forward batch"
             );
         }
+        let admitted_request_keys = admissions
+            .iter()
+            .map(|admission| admission.request_key)
+            .collect::<HashSet<_>>();
+        let logical_page_deltas = transitions
+            .iter()
+            .filter_map(|transition| {
+                transition.operation.as_ref().map(|operation| {
+                    let pages = if admitted_request_keys.contains(&operation.request_key) {
+                        self.bm
+                            .blocks_for(operation.request_key.session_id)
+                            .iter()
+                            .take(operation.kv_capacity_pages as usize)
+                            .copied()
+                            .collect()
+                    } else {
+                        transition.new_blocks.clone()
+                    };
+                    ((operation.request_key, operation.op_id), pages)
+                })
+            })
+            .collect::<HashMap<_, _>>();
         let wire_ops: Vec<uniserve_worker_wire::Operation> = transitions
             .iter()
             .filter_map(|transition| transition.operation.clone())
@@ -4287,7 +4306,7 @@ impl Scheduler {
             })
             .collect::<Vec<_>>();
         controls.extend(releases);
-        let partitions = self.partition_batch(wire_ops);
+        let partitions = self.partition_batch(wire_ops, &logical_page_deltas);
         let partition_ids = partitions
             .iter()
             .map(|partition| partition.partition_id)
@@ -4315,7 +4334,11 @@ impl Scheduler {
         }
     }
 
-    fn partition_batch(&mut self, operations: Vec<Operation>) -> Vec<BatchPartition> {
+    fn partition_batch(
+        &mut self,
+        operations: Vec<Operation>,
+        logical_page_deltas: &HashMap<(RequestKey, OpId), Vec<BlockId>>,
+    ) -> Vec<BatchPartition> {
         let mut routes: RouteDomainOperations = Vec::new();
         for operation in operations {
             let route = operation.route;
@@ -4397,6 +4420,7 @@ impl Scheduler {
                         .collect::<Vec<_>>(),
                 );
                 for (domain, operations) in mixed_candidates {
+                    let kv_reservations = self.kv_reservations(&operations, logical_page_deltas);
                     partitions.push(BatchPartition {
                         partition_id: next_partition_id,
                         submission_group: next_submission_group,
@@ -4407,6 +4431,7 @@ impl Scheduler {
                         attention,
                         shape_class: 0,
                         operations,
+                        kv_reservations,
                     });
                     next_partition_id = next_partition_id.saturating_add(1);
                 }
@@ -4418,6 +4443,7 @@ impl Scheduler {
                     self.next_collective_seq = value.saturating_add(1);
                     value
                 };
+                let kv_reservations = self.kv_reservations(&operations, logical_page_deltas);
                 partitions.push(BatchPartition {
                     partition_id: next_partition_id,
                     submission_group: next_submission_group,
@@ -4428,12 +4454,32 @@ impl Scheduler {
                     attention: partition_attention(&operations),
                     shape_class: 0,
                     operations,
+                    kv_reservations,
                 });
                 next_partition_id = next_partition_id.saturating_add(1);
                 next_submission_group = next_submission_group.saturating_add(1);
             }
         }
         partitions
+    }
+
+    fn kv_reservations(
+        &self,
+        operations: &[Operation],
+        logical_page_deltas: &HashMap<(RequestKey, OpId), Vec<BlockId>>,
+    ) -> Vec<KvReservation> {
+        operations
+            .iter()
+            .filter(|operation| operation.kv_capacity_pages > 0)
+            .map(|operation| KvReservation {
+                request_key: operation.request_key,
+                op_id: operation.op_id,
+                logical_page_delta: logical_page_deltas
+                    .get(&(operation.request_key, operation.op_id))
+                    .cloned()
+                    .expect("registered operation has a logical-page delta"),
+            })
+            .collect()
     }
 
     fn generated_trigger_matches(st: &ReqState) -> bool {
@@ -6498,26 +6544,5 @@ mod tests {
             Scheduler::operation_credits(&transition).latent_artifact_bytes,
             128
         );
-    }
-
-    #[test]
-    fn operation_block_lease_is_consumed_once() {
-        let req = request(1, 2);
-        let mut extend = plan(
-            &req,
-            cursor(Phase::Prefill, 0),
-            TransitionIntent::IngestText {
-                segment_index: 0,
-                prompt_start: 0,
-                token_ids: vec![7],
-                new_blocks: vec![BlockId(4), BlockId(5)],
-                sampling_state: SamplingState::default(),
-            },
-        );
-        assert_eq!(
-            std::mem::take(&mut extend.new_blocks),
-            vec![BlockId(4), BlockId(5)]
-        );
-        assert!(std::mem::take(&mut extend.new_blocks).is_empty());
     }
 }

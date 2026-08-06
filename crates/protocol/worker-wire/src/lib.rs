@@ -11,7 +11,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -557,11 +557,9 @@ pub struct Operation {
     pub bounds: Bounds,
     pub inputs: Vec<ProductRef>,
     pub outputs: Vec<ProductRef>,
-    /// The KV blocks this operation appends to its session's KV view as the
-    /// sequence grows (empty when this step adds no block). The scheduler's block
-    /// manager allocates them; the worker grows its KV entry by exactly these
-    /// blocks during registration.
-    pub new_kv_blocks: Vec<BlockId>,
+    /// Exact logical KV capacity visible after registration. Physical pages are
+    /// selected by the worker from the partition's logical lease reservation.
+    pub kv_capacity_pages: u32,
     pub predicate: Option<ProductRef>,
     pub rng: Option<Rng>,
     pub control_seq: u64,
@@ -581,7 +579,7 @@ impl Operation {
         bounds: Bounds,
         inputs: Vec<ProductRef>,
         outputs: Vec<ProductRef>,
-        new_kv_blocks: Vec<BlockId>,
+        kv_capacity_pages: u32,
         predicate: Option<ProductRef>,
         rng: Option<Rng>,
         control_seq: u64,
@@ -597,7 +595,7 @@ impl Operation {
             bounds,
             inputs,
             outputs,
-            new_kv_blocks,
+            kv_capacity_pages,
             predicate,
             rng,
             control_seq,
@@ -626,9 +624,10 @@ impl Operation {
         for output in &self.outputs {
             digest.product_ref(output);
         }
+        digest.u32(self.kv_capacity_pages);
         digest.option(self.predicate.as_ref(), CanonicalDigest::product_ref);
         digest.option(self.rng.as_ref(), CanonicalDigest::rng);
-        digest.u32s(self.new_kv_blocks.iter().map(|block| block.0));
+        digest.u64(self.control_seq);
         digest.finish()
     }
 
@@ -639,7 +638,15 @@ impl Operation {
             "operation declares an advances_state inconsistent with its work variant"
         );
         self.parent.validate()?;
+        anyhow::ensure!(
+            self.parent.request_key == self.request_key,
+            "operation parent belongs to another request lineage"
+        );
         self.bounds_are_finite()?;
+        anyhow::ensure!(
+            self.bounds.max_kv_pages <= self.kv_capacity_pages,
+            "operation KV growth bound exceeds its logical capacity"
+        );
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         for output in &self.outputs {
             output.validate()?;
@@ -677,9 +684,21 @@ impl Operation {
         }
         for input in &self.inputs {
             input.validate()?;
+            anyhow::ensure!(
+                input.request_key == self.request_key
+                    || matches!(
+                        input.kind,
+                        ProductKind::VisionFeature | ProductKind::LatentFeature
+                    ),
+                "a request-local input product belongs to another request lineage"
+            );
         }
         if let Some(predicate) = &self.predicate {
             predicate.validate()?;
+            anyhow::ensure!(
+                predicate.request_key == self.request_key,
+                "operation predicate belongs to another request lineage"
+            );
             let continuation_token = predicate.kind == ProductKind::Token
                 && predicate.dtype == DType::U32
                 && predicate.shape_bound.max_elements() == 1;
@@ -1011,22 +1030,21 @@ impl Control {
 // Admission framing (session establishment)
 // ---------------------------------------------------------------------------
 
-/// A logical KV allocation established at admission for a token lineage.
+/// KV lineage metadata established at admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct KvAllocation {
-    pub block_ids: Vec<BlockId>,
+pub struct KvAdmission {
     pub prefix_len: u32,
     pub group_id: u32,
 }
 
 /// Understanding-branch admission: invariant sampling policy, negative tokens,
-/// terminal token ids, and KV allocation.
+/// terminal token ids, and KV lineage metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UndAdmission {
     pub sampling: SamplingParams,
     pub negative_token_ids: Vec<u32>,
     pub finish_token_ids: Vec<u32>,
-    pub kv: KvAllocation,
+    pub kv: KvAdmission,
 }
 
 /// Generation-branch admission: image parameters.
@@ -1072,7 +1090,6 @@ impl Admission {
             digest.sampling(&und.sampling);
             digest.u32s(und.negative_token_ids.iter().copied());
             digest.u32s(und.finish_token_ids.iter().copied());
-            digest.u32s(und.kv.block_ids.iter().map(|block| block.0));
             digest.u32(und.kv.prefix_len);
             digest.u32(und.kv.group_id);
         });
@@ -1103,14 +1120,6 @@ impl Admission {
                     .all(|pair| pair[0] < pair[1]),
                 "und admission finish token ids are not canonical"
             );
-            anyhow::ensure!(
-                und.kv.prefix_len == 0 || !und.kv.block_ids.is_empty(),
-                "a non-empty KV prefix requires allocated blocks"
-            );
-            anyhow::ensure!(
-                und.kv.block_ids.iter().collect::<HashSet<_>>().len() == und.kv.block_ids.len(),
-                "KV allocation repeats a logical block"
-            );
         }
         if let Some(branch) = &self.gen_admission {
             branch.image.validate()?;
@@ -1139,6 +1148,33 @@ pub struct BatchPartition {
     pub attention: AttentionRegime,
     pub shape_class: u64,
     pub operations: Vec<Operation>,
+    /// Logical page deltas bound atomically while this partition is registered.
+    /// Logical identity preserves prefix sharing; worker-local mappings determine
+    /// every physical page address.
+    pub kv_reservations: Vec<KvReservation>,
+}
+
+/// One operation's logical KV page growth at registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvReservation {
+    pub request_key: RequestKey,
+    pub op_id: OpId,
+    pub logical_page_delta: Vec<BlockId>,
+}
+
+impl KvReservation {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.op_id.0 > 0,
+            "KV reservation operation id must be positive"
+        );
+        anyhow::ensure!(
+            self.logical_page_delta.iter().collect::<HashSet<_>>().len()
+                == self.logical_page_delta.len(),
+            "KV reservation repeats a logical page"
+        );
+        Ok(())
+    }
 }
 
 impl BatchPartition {
@@ -1161,6 +1197,34 @@ impl BatchPartition {
             anyhow::ensure!(
                 operation.domain == self.domain && operation.route == self.route,
                 "batch partition operation disagrees with its domain or route"
+            );
+        }
+        let operations = self
+            .operations
+            .iter()
+            .map(|operation| ((operation.request_key, operation.op_id), operation))
+            .collect::<HashMap<_, _>>();
+        let mut reservation_ids = HashSet::with_capacity(self.kv_reservations.len());
+        for reservation in &self.kv_reservations {
+            reservation.validate()?;
+            let identity = (reservation.request_key, reservation.op_id);
+            anyhow::ensure!(
+                reservation_ids.insert(identity),
+                "batch partition repeats a KV reservation identity"
+            );
+            let operation = operations.get(&identity).ok_or_else(|| {
+                anyhow::anyhow!("KV reservation does not name a partition operation")
+            })?;
+            anyhow::ensure!(
+                reservation.logical_page_delta.len() <= operation.kv_capacity_pages as usize,
+                "KV reservation exceeds operation logical capacity"
+            );
+        }
+        for operation in &self.operations {
+            anyhow::ensure!(
+                operation.kv_capacity_pages == 0
+                    || reservation_ids.contains(&(operation.request_key, operation.op_id)),
+                "operation with logical KV capacity has no reservation"
             );
         }
         Ok(())
@@ -2081,7 +2145,7 @@ pub fn protocol_layout_digest() -> Digest {
         digest.string(control);
     }
     // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 5] = [
+    let record_layouts: [&[&str]; 10] = [
         &[
             "request_key",
             "op_id",
@@ -2093,7 +2157,7 @@ pub fn protocol_layout_digest() -> Digest {
             "bounds",
             "inputs",
             "outputs",
-            "new_kv_blocks",
+            "kv_capacity_pages",
             "predicate",
             "rng",
             "control_seq",
@@ -2119,6 +2183,7 @@ pub fn protocol_layout_digest() -> Digest {
             "selected_point",
             "logical_lengths",
             "token_span",
+            "committed_tokens",
             "finish_flags",
             "product_generations",
             "semantic_digest",
@@ -2126,6 +2191,22 @@ pub fn protocol_layout_digest() -> Digest {
             "timing_counters",
         ],
         &["version", "digest", "locator"],
+        &["prefix_len", "group_id"],
+        &["sampling", "negative_token_ids", "finish_token_ids", "kv"],
+        &["request_key", "digest", "und", "gen_admission"],
+        &["request_key", "op_id", "logical_page_delta"],
+        &[
+            "partition_id",
+            "submission_group",
+            "collective_seq",
+            "domain",
+            "route",
+            "execution",
+            "attention",
+            "shape_class",
+            "operations",
+            "kv_reservations",
+        ],
     ];
     for record in record_layouts {
         digest.u64(record.len() as u64);

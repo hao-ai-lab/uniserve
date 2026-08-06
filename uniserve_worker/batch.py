@@ -289,7 +289,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "bounds",
         "inputs",
         "outputs",
-        "new_kv_blocks",
+        "kv_capacity_pages",
         "predicate",
         "rng",
         "control_seq",
@@ -315,6 +315,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "selected_point",
         "logical_lengths",
         "token_span",
+        "committed_tokens",
         "finish_flags",
         "product_generations",
         "semantic_digest",
@@ -322,6 +323,22 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "timing_counters",
     ),
     ("version", "digest", "locator"),
+    ("prefix_len", "group_id"),
+    ("sampling", "negative_token_ids", "finish_token_ids", "kv"),
+    ("request_key", "digest", "und", "gen_admission"),
+    ("request_key", "op_id", "logical_page_delta"),
+    (
+        "partition_id",
+        "submission_group",
+        "collective_seq",
+        "domain",
+        "route",
+        "execution",
+        "attention",
+        "shape_class",
+        "operations",
+        "kv_reservations",
+    ),
 )
 
 
@@ -662,31 +679,24 @@ class ImageParams:
 
 
 @dataclass(frozen=True, slots=True)
-class KvAllocation:
-    block_ids: tuple[int, ...] = ()
+class KvAdmission:
     prefix_len: int = 0
     group_id: int = 0
 
     def __post_init__(self) -> None:
-        if self.prefix_len and not self.block_ids:
-            raise invalid_descriptor("a non-empty KV prefix requires allocated blocks")
-        if len(set(self.block_ids)) != len(self.block_ids):
-            raise invalid_descriptor("KV allocation repeats a logical block")
         _nonnegative(self.prefix_len, "kv.prefix_len")
         _nonnegative(self.group_id, "kv.group_id")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "kv") -> KvAllocation:
+    def from_wire(cls, value: object, where: str = "kv") -> KvAdmission:
         data = _map(value, where)
         return cls(
-            block_ids=_uints(data.get("block_ids", ()), f"{where}.block_ids"),
             prefix_len=_uint(data.get("prefix_len", 0), f"{where}.prefix_len"),
             group_id=_uint(data.get("group_id", 0), f"{where}.group_id"),
         )
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "block_ids": list(self.block_ids),
             "prefix_len": self.prefix_len,
             "group_id": self.group_id,
         }
@@ -905,9 +915,7 @@ class VersionRef:
         elif kind == "device":
             inner = _map(payload, f"{where}.point.value")
             point = DevicePoint(
-                point_index=_uint(
-                    inner.get("point_index"), f"{where}.point.value.point_index"
-                ),
+                point_index=_uint(inner.get("point_index"), f"{where}.point.value.point_index"),
                 selected_point=(
                     None
                     if inner.get("selected_point") is None
@@ -1105,7 +1113,7 @@ class Operation:
     bounds: Bounds
     inputs: tuple[ProductRef, ...]
     outputs: tuple[ProductRef, ...]
-    new_kv_blocks: tuple[int, ...]
+    kv_capacity_pages: int
     predicate: ProductRef | None
     rng: Rng | None
     control_seq: int
@@ -1124,7 +1132,7 @@ class Operation:
         bounds: Bounds,
         inputs: tuple[ProductRef, ...] = (),
         outputs: tuple[ProductRef, ...] = (),
-        new_kv_blocks: tuple[int, ...] = (),
+        kv_capacity_pages: int = 0,
         predicate: ProductRef | None = None,
         rng: Rng | None = None,
         control_seq: int = 0,
@@ -1140,7 +1148,7 @@ class Operation:
             bounds=bounds,
             inputs=inputs,
             outputs=outputs,
-            new_kv_blocks=new_kv_blocks,
+            kv_capacity_pages=kv_capacity_pages,
             predicate=predicate,
             rng=rng,
             control_seq=control_seq,
@@ -1168,6 +1176,7 @@ class Operation:
         buf += _PACK_Q(len(self.outputs))
         for product in self.outputs:
             _digest_product_ref(digest, product)
+        digest.u32(self.kv_capacity_pages)
         if self.predicate is None:
             buf += b"\x00"
         else:
@@ -1178,7 +1187,7 @@ class Operation:
         else:
             buf += b"\x01"
             _digest_rng(digest, self.rng)
-        digest.u32s(self.new_kv_blocks)
+        digest.u64(self.control_seq)
         return digest.finish()
 
     def validate(self) -> None:
@@ -1188,6 +1197,10 @@ class Operation:
             raise invalid_descriptor(
                 "operation declares an advances_state inconsistent with its work variant"
             )
+        if self.parent.request_key != self.request_key:
+            raise invalid_descriptor("operation parent belongs to another request lineage")
+        if self.bounds.max_kv_pages > self.kv_capacity_pages:
+            raise invalid_descriptor("operation KV growth bound exceeds its logical capacity")
         output_indices: set[int] = set()
         for product in self.outputs:
             if product.request_key != self.request_key or product.producer_op_id != self.op_id:
@@ -1222,6 +1235,14 @@ class Operation:
             if product.output_index in output_indices:
                 raise invalid_descriptor("operation repeats an output index")
             output_indices.add(product.output_index)
+        if any(
+            product.request_key != self.request_key
+            and product.kind not in (ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE)
+            for product in self.inputs
+        ):
+            raise invalid_descriptor(
+                "a request-local input product belongs to another request lineage"
+            )
         if isinstance(self.parent.point, DevicePoint):
             selected = self.parent.point.selected_point
             if selected is None:
@@ -1231,9 +1252,7 @@ class Operation:
                     )
             else:
                 if self.parent.point.point_index != 0:
-                    raise invalid_descriptor(
-                        "a dynamic device version also declares a fixed point"
-                    )
+                    raise invalid_descriptor("a dynamic device version also declares a fixed point")
                 if (
                     selected.request_key != self.parent.request_key
                     or selected.producer_op_id != self.parent.producer_op_id
@@ -1255,6 +1274,8 @@ class Operation:
                         "device version does not name a scalar selected-point product"
                     )
         if self.predicate is not None:
+            if self.predicate.request_key != self.request_key:
+                raise invalid_descriptor("operation predicate belongs to another request lineage")
             continuation_token = (
                 self.predicate.kind is ProductKind.TOKEN
                 and self.predicate.dtype is DType.U32
@@ -1323,9 +1344,9 @@ class Operation:
                 ProductRef.from_wire(item, f"{where}.outputs[{index}]")
                 for index, item in enumerate(_seq(data.get("outputs", ()), f"{where}.outputs"))
             )
-        new_kv_blocks = _fast_uints(get("new_kv_blocks", ()))
-        if new_kv_blocks is None:
-            new_kv_blocks = _uints(data.get("new_kv_blocks", ()), f"{where}.new_kv_blocks")
+        kv_capacity_pages = get("kv_capacity_pages", 0)
+        if not (type(kv_capacity_pages) is int and kv_capacity_pages >= 0):
+            kv_capacity_pages = _uint(kv_capacity_pages, f"{where}.kv_capacity_pages")
         predicate_raw = get("predicate")
         if predicate_raw is None:
             predicate = None
@@ -1359,7 +1380,7 @@ class Operation:
             set_field(operation, "bounds", bounds)
             set_field(operation, "inputs", inputs)
             set_field(operation, "outputs", outputs)
-            set_field(operation, "new_kv_blocks", new_kv_blocks)
+            set_field(operation, "kv_capacity_pages", kv_capacity_pages)
             set_field(operation, "predicate", predicate)
             set_field(operation, "rng", rng)
             set_field(operation, "control_seq", control_seq)
@@ -1376,7 +1397,7 @@ class Operation:
             bounds=bounds,
             inputs=inputs,
             outputs=outputs,
-            new_kv_blocks=new_kv_blocks,
+            kv_capacity_pages=kv_capacity_pages,
             predicate=predicate,
             rng=rng,
             control_seq=control_seq,
@@ -1397,7 +1418,7 @@ class Operation:
             "bounds": self.bounds.to_wire(),
             "inputs": [product.to_wire() for product in self.inputs],
             "outputs": [product.to_wire() for product in self.outputs],
-            "new_kv_blocks": list(self.new_kv_blocks),
+            "kv_capacity_pages": self.kv_capacity_pages,
             "predicate": None if self.predicate is None else self.predicate.to_wire(),
             "rng": None if self.rng is None else self.rng.to_wire(),
             "control_seq": self.control_seq,
@@ -1766,7 +1787,7 @@ class UndAdmission:
     sampling: SamplingParams = field(default_factory=SamplingParams)
     negative_token_ids: tuple[int, ...] = ()
     finish_token_ids: tuple[int, ...] = ()
-    kv: KvAllocation = field(default_factory=KvAllocation)
+    kv: KvAdmission = field(default_factory=KvAdmission)
 
     def __post_init__(self) -> None:
         if any(
@@ -1788,7 +1809,7 @@ class UndAdmission:
                 data.get("negative_token_ids", ()), f"{where}.negative_token_ids"
             ),
             finish_token_ids=_uints(data.get("finish_token_ids", ()), f"{where}.finish_token_ids"),
-            kv=KvAllocation.from_wire(data.get("kv", {}), f"{where}.kv"),
+            kv=KvAdmission.from_wire(data.get("kv", {}), f"{where}.kv"),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1880,6 +1901,39 @@ class Admission:
 
 
 @dataclass(frozen=True, slots=True)
+class KvReservation:
+    request_key: RequestKey
+    op_id: int
+    logical_page_delta: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.op_id < 1:
+            raise invalid_descriptor("KV reservation operation id must be positive")
+        if any(value < 0 for value in self.logical_page_delta):
+            raise invalid_descriptor("KV reservation contains a negative logical page")
+        if len(set(self.logical_page_delta)) != len(self.logical_page_delta):
+            raise invalid_descriptor("KV reservation repeats a logical page")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "KV reservation") -> KvReservation:
+        data = _map(value, where)
+        return cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
+            logical_page_delta=_uints(
+                data.get("logical_page_delta", ()), f"{where}.logical_page_delta"
+            ),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_key": self.request_key.to_wire(),
+            "op_id": self.op_id,
+            "logical_page_delta": list(self.logical_page_delta),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class BatchPartition:
     partition_id: int
     submission_group: int
@@ -1890,6 +1944,7 @@ class BatchPartition:
     attention: AttentionRegime
     shape_class: int
     operations: tuple[Operation, ...]
+    kv_reservations: tuple[KvReservation, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -1910,6 +1965,26 @@ class BatchPartition:
             for operation in self.operations
         ):
             raise invalid_descriptor("batch partition operation disagrees with its domain or route")
+        operations = {
+            (operation.request_key, operation.op_id): operation for operation in self.operations
+        }
+        reservations: set[tuple[RequestKey, int]] = set()
+        for reservation in self.kv_reservations:
+            identity = (reservation.request_key, reservation.op_id)
+            if identity in reservations:
+                raise invalid_descriptor("batch partition repeats a KV reservation identity")
+            reservations.add(identity)
+            operation = operations.get(identity)
+            if operation is None:
+                raise invalid_descriptor("KV reservation does not name a partition operation")
+            if len(reservation.logical_page_delta) > operation.kv_capacity_pages:
+                raise invalid_descriptor("KV reservation exceeds operation logical capacity")
+        if any(
+            operation.kv_capacity_pages > 0
+            and (operation.request_key, operation.op_id) not in reservations
+            for operation in self.operations
+        ):
+            raise invalid_descriptor("operation with logical KV capacity has no reservation")
 
     @classmethod
     def from_wire(
@@ -1939,6 +2014,12 @@ class BatchPartition:
                     _seq(data.get("operations", ()), f"{where}.operations")
                 )
             ),
+            kv_reservations=tuple(
+                KvReservation.from_wire(item, f"{where}.kv_reservations[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("kv_reservations", ()), f"{where}.kv_reservations")
+                )
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1952,6 +2033,7 @@ class BatchPartition:
             "attention": self.attention.value,
             "shape_class": self.shape_class,
             "operations": [operation.to_wire() for operation in self.operations],
+            "kv_reservations": [reservation.to_wire() for reservation in self.kv_reservations],
         }
 
 
@@ -2402,9 +2484,7 @@ class WorkerForwardStats:
             flashinfer_decode_plan_reuses=scalar_fields["flashinfer_decode_plan_reuses"],
             flashinfer_decode_plan_rows=scalar_fields["flashinfer_decode_plan_rows"],
             flashinfer_decode_plan_indices=scalar_fields["flashinfer_decode_plan_indices"],
-            flashinfer_decode_graph_plan_calls=scalar_fields[
-                "flashinfer_decode_graph_plan_calls"
-            ],
+            flashinfer_decode_graph_plan_calls=scalar_fields["flashinfer_decode_graph_plan_calls"],
             flashinfer_decode_graph_plan_reuses=scalar_fields[
                 "flashinfer_decode_graph_plan_reuses"
             ],
@@ -2648,7 +2728,6 @@ def _digest_und_admission(digest: _Digest, value: UndAdmission) -> None:
     _digest_sampling(digest, value.sampling)
     digest.u32s(value.negative_token_ids)
     digest.u32s(value.finish_token_ids)
-    digest.u32s(value.kv.block_ids)
     digest.u32(value.kv.prefix_len)
     digest.u32(value.kv.group_id)
 

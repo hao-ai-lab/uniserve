@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use uniserve_core::{BlockId, RequestId};
+use uniserve_core::RequestId;
 use uniserve_worker_wire::{
     Bounds, CompletionRecord, CreditDimension, CreditVector, DType, DimBound, Domain, DrawLayout,
     EngineCaps, ExecutionConstraints, FinishFlags, LogicalLengths, OpId, OpStatus, Operation,
@@ -130,7 +130,7 @@ fn canonical_operation() -> Operation {
             accepted_span_output,
             continuation_output,
         ],
-        vec![BlockId(64)],
+        3,
         None,
         Some(Rng {
             seed: 0x0123_4567_89ab_cdef,

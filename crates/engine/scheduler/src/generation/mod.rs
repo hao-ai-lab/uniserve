@@ -1795,6 +1795,7 @@ impl GenerationPlanner {
             request_id: request.request_id,
             draft_token_ids: wire.draft_token_ids,
             new_blocks: wire.new_blocks,
+            kv_capacity_pages: 0,
             token_cost: wire.token_cost,
             input_tokens: wire.input_tokens,
             input_image_bytes: wire.input_image_bytes,
@@ -1961,7 +1962,7 @@ pub(crate) enum PlanningError {
 /// `inputs`, `outputs`, `rng`, `control_seq`) are lowered by the planner; the
 /// flat [`Operation`] is stamped with request and lineage identity at submit
 /// time by [`PlannedTransition::assign_operation`]. The host-side
-/// `draft_token_ids`, `new_blocks`, and `token_cost` carry scheduler-owned
+/// `draft_token_ids`, logical KV accounting, and `token_cost` carry scheduler-owned
 /// accounting outside the wire operation.
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedTransition {
@@ -1981,6 +1982,7 @@ pub(crate) struct PlannedTransition {
     pub(crate) request_id: RequestId,
     pub(crate) draft_token_ids: Vec<u32>,
     pub(crate) new_blocks: Vec<BlockId>,
+    pub(crate) kv_capacity_pages: u32,
     pub(crate) token_cost: usize,
     /// Host-known input token values the operation's forward consumes.
     pub(crate) input_tokens: Vec<u32>,
@@ -2112,9 +2114,7 @@ impl PlannedTransition {
             self.bounds,
             inputs,
             outputs,
-            // The KV blocks this step appends travel on the wire so the worker's
-            // forward addresses the newly allocated pages at a block boundary.
-            self.new_blocks.clone(),
+            self.kv_capacity_pages,
             self.predicate.clone(),
             self.rng,
             self.control_seq,

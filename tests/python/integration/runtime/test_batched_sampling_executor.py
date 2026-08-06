@@ -101,7 +101,7 @@ def _with_sampling_state(
         bounds=operation.bounds,
         inputs=(*operation.inputs, reference),
         outputs=operation.outputs,
-        new_kv_blocks=operation.new_kv_blocks,
+        kv_capacity_pages=operation.kv_capacity_pages,
         predicate=operation.predicate,
         rng=operation.rng,
         control_seq=operation.control_seq,

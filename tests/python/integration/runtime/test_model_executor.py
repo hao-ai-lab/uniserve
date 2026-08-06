@@ -541,6 +541,8 @@ def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
     worker.execute(execution_batch(step_id=12, admissions=(), operations=(), controls=(commit,)))
     committed = deepcopy(worker.sessions.get(4))
     committed_length = worker.kv.get(4).length
+    committed_blocks = tuple(worker.kv.get(4).block_ids)
+    committed_resident_blocks = worker.kv.resident_block_count()
 
     retry, retry_input = token_operation(
         admission.request_key,
@@ -560,6 +562,8 @@ def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
     assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
     assert worker.sessions.get(4) == committed
     assert worker.kv.get(4).length == committed_length
+    assert tuple(worker.kv.get(4).block_ids) == committed_blocks
+    assert worker.kv.resident_block_count() == committed_resident_blocks
 
     model.fault = None
     replayed = worker.execute(retry_batch)
@@ -794,11 +798,8 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
     torch.testing.assert_close(observed[1], observed[0], rtol=0, atol=0)
 
 
-def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
-    # A small page (4 tokens/block) forces the decode chain to cross a block
-    # boundary. Each step's `new_kv_blocks` grows the session lease before the
-    # forward computes its page index; without that growth the attention plan
-    # indexes past block_ids and IndexErrors at the boundary.
+def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
+    # A small page forces the decode chain to cross a registration boundary.
     block_size = 4
     worker = execution_worker(_ObservedModel(), block_size=block_size)
     admission = und_admission(1, block_ids=(0,))
@@ -815,16 +816,16 @@ def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
         )
     )
     committed = list(extended.completions[0].committed_tokens)
-    assert worker.kv.get(1).block_ids == [0]
+    assert len(worker.kv.get(1).block_ids) == 1
 
     next_block = 1
     crossed = False
     for step in range(4):
         length = worker.kv.get(1).length
         blocks = tuple(worker.kv.get(1).block_ids)
-        new_kv_blocks: tuple[int, ...] = ()
+        logical_delta: tuple[int, ...] = ()
         if length // block_size >= len(blocks):
-            new_kv_blocks = (next_block,)
+            logical_delta = (next_block,)
             next_block += 1
             crossed = True
         commit = commit_resolved(worker.sessions.get(1))
@@ -834,7 +835,7 @@ def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
             parent=commit.selected,
             mode=TokenMode.DECODE,
             tokens=(committed[-1],),
-            new_kv_blocks=new_kv_blocks,
+            logical_block_delta=logical_delta,
             control_seq=commit.control_seq,
         )
         report = worker.execute(
@@ -846,14 +847,14 @@ def test_decode_grows_the_block_lease_across_a_kv_page_boundary():
                 input_products=(decode_input,),
             )
         )
-        if new_kv_blocks:
-            assert tuple(worker.kv.get(1).block_ids) == blocks + new_kv_blocks
+        if logical_delta:
+            assert len(worker.kv.get(1).block_ids) == len(blocks) + 1
         else:
-            assert tuple(worker.kv.get(1).block_ids) == blocks
+            assert len(worker.kv.get(1).block_ids) == len(blocks)
         committed.extend(report.completions[0].committed_tokens)
 
     assert crossed  # the chain actually crossed a page boundary
-    assert worker.kv.get(1).block_ids == [0, 1]
+    assert len(worker.kv.get(1).block_ids) == 2
     assert worker.kv.get(1).length == 6
     # Committed tokens follow the stub oracle unbroken across the boundary.
     chain = [_next_token(4)]

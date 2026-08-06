@@ -3,20 +3,15 @@
 //! LRU free/eviction queue, one-or-more KV-cache groups (hybrid attention),
 //! sliding-window/sink trimming, the per-request segment table, the scratch
 //! budget, the prefix-cache hash→block map, and a cache-event stream.
-//! Holds NO GPU memory and speaks only integer block ids — the worker's physical
-//! pool turns ids into tensors.
+//! Holds no GPU memory. Its integer block ids are logical cache identities;
+//! each worker independently maps them into its physical page pool.
 //!
 //! **substrate.** Blocks are reference-counted; a block becomes eligible
 //! for reuse only at `ref_cnt == 0`, when it is appended to its group's free
 //! queue (most-recently-used end). Allocation pops the queue's LRU end; if the
 //! popped block was *cached* (retains a prefix hash) its hash is dropped from the
-//! map and a `BlockRemoved` event is emitted. This is exactly the reference's
-//! `FreeKVCacheBlockQueue` + `BlockPool` mechanism (`block_pool.py`), and it is
-//! the substrate prefix caching and preemption-recompute need.
-//!
-//! The single-group, no-prefix-cache path (BAGEL today) is byte-for-byte the
-//! previous all-or-nothing allocator: every released block has no hash, so it
-//! returns straight to the free queue as `Free`.
+//! map and a `BlockRemoved` event is emitted. This state machine supports prefix
+//! caching and preemption-recompute without acquiring physical page authority.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::collections::{HashMap, VecDeque};
@@ -100,8 +95,6 @@ pub enum BlockState {
     /// Reference count reached 0 but the block retains a prefix hash and is
     /// reusable until evicted. Lives in the free queue, LRU-ordered.
     Cached,
-    /// Block 0: the CUDA-graph padding slot — never handed to a request.
-    Padding,
 }
 
 /// One contiguous single-modality span of a request.
@@ -151,9 +144,8 @@ struct Group {
 #[derive(Debug, Default)]
 struct RequestKvState {
     blocks: Vec<BlockId>,
-    // `None` => no segment table has been materialized for this request (the
-    // previous "absent from the `segments` map" state); `Some` => present, even
-    // when empty.
+    // `None` means no segment table is materialized; `Some` retains an explicit
+    // table even when it is empty.
     segments: Option<SegmentTable>,
     scratch_res: u64,
     // true token-start offset of each *currently-retained* block, parallel
@@ -194,38 +186,33 @@ pub struct BlockManager {
 }
 
 impl BlockManager {
-    /// Single full-attention group spanning `[1, num_blocks)` (BAGEL default).
+    /// Single full-attention group spanning the complete logical capacity.
     pub fn new(num_blocks: usize, block_size: usize, scratch_capacity: u64) -> Self {
-        // group spans [1, num_blocks): block 0 is the padding slot.
         Self::with_groups(
             num_blocks,
             block_size,
             scratch_capacity,
-            &[(KvGroupKind::Full, 1, num_blocks.saturating_sub(1) as u32)],
+            &[(
+                KvGroupKind::Full,
+                0,
+                u32::try_from(num_blocks).expect("logical KV capacity exceeds u32"),
+            )],
         )
     }
 
-    /// Validate that `(kind, first_block, count)` groups partition `[1, num_blocks)`
-    /// without gaps, overlaps, or out-of-range/overflowing ranges. Returns
-    /// the offending group on failure so a malformed worker handshake can be
-    /// rejected with a clear message instead of an opaque out-of-bounds panic or
-    /// silent free-queue corruption. `block 0` is always reserved as padding, so
-    /// every group must start at `>= 1`.
+    /// Validate that `(kind, first_block, count)` groups partition the complete
+    /// logical block range without gaps, overlaps, empty groups, or overflow.
     pub fn validate_group_specs(
         num_blocks: usize,
         group_specs: &[(KvGroupKind, u32, u32)],
     ) -> Result<(), String> {
         if num_blocks == 0 {
-            return Err("num_blocks must be >= 1 (block 0 is padding)".to_string());
+            return Err("num_blocks must be positive".to_string());
         }
-        // covered[b] tracks which group (if any) claims block b; index 0 is padding.
         let mut covered = vec![false; num_blocks];
-        covered[0] = true; // padding slot, never claimable by a group
         for (gid, (_, first, count)) in group_specs.iter().enumerate() {
-            if *first < 1 {
-                return Err(format!(
-                    "group {gid}: first_block {first} must be >= 1 (block 0 is padding)"
-                ));
+            if *count == 0 {
+                return Err(format!("group {gid}: count must be positive"));
             }
             let end = (*first as u64)
                 .checked_add(*count as u64)
@@ -235,8 +222,12 @@ impl BlockManager {
                     "group {gid}: range [{first}, {end}) exceeds num_blocks {num_blocks}"
                 ));
             }
-            for b in *first..(*first + *count) {
-                let slot = &mut covered[b as usize];
+            for (b, slot) in covered
+                .iter_mut()
+                .enumerate()
+                .take(end as usize)
+                .skip(*first as usize)
+            {
                 if *slot {
                     return Err(format!("group {gid}: block {b} overlaps another group"));
                 }
@@ -245,14 +236,14 @@ impl BlockManager {
         }
         if let Some(b) = covered.iter().position(|c| !c) {
             return Err(format!(
-                "block {b} is not covered by any group ([1, num_blocks) must be fully partitioned)"
+                "block {b} is not covered by any group (logical capacity must be fully partitioned)"
             ));
         }
         Ok(())
     }
 
-    /// Build with explicit `(kind, first_block, count)` groups. `first_block`
-    /// must be >= 1 (block 0 is padding) and groups must partition `[1, num_blocks)`.
+    /// Build with explicit `(kind, first_block, count)` groups that partition the
+    /// complete logical capacity.
     ///
     /// Panics with a descriptive message (via [`Self::validate_group_specs`]) if
     /// the specs are malformed — a buggy/version-skewed worker handshake that
@@ -269,10 +260,9 @@ impl BlockManager {
         if let Err(e) = Self::validate_group_specs(num_blocks, group_specs) {
             panic!("BlockManager::with_groups: invalid KV-cache group specs: {e}");
         }
-        let mut meta: Vec<BlockMeta> = (0..num_blocks)
+        let meta: Vec<BlockMeta> = (0..num_blocks)
             .map(|_| BlockMeta::new(BlockState::Free))
             .collect();
-        meta[0].state = BlockState::Padding;
         let mut block_group = vec![0u32; num_blocks];
         let mut groups = Vec::new();
         for (gid, (kind, first, count)) in group_specs.iter().enumerate() {
@@ -307,9 +297,7 @@ impl BlockManager {
                 blocks_stored: 0,
             },
         };
-        // Seed each group's free queue with its blocks, ascending id (so block 1
-        // is reclaimed first — matches the previous `(1..n).rev` pop order via
-        // pop_front of an ascending push).
+        // Seed each group's free queue in ascending logical-id order.
         for (gid, (_, first, count)) in group_specs.iter().enumerate() {
             for b in *first..(*first + *count) {
                 mgr.fq_push_back(gid, BlockId(b));
@@ -402,11 +390,7 @@ impl BlockManager {
     pub fn blocks_needed(&self, num_tokens: usize) -> usize {
         num_tokens.div_ceil(self.block_size)
     }
-    pub fn padding_block(&self) -> BlockId {
-        BlockId(0)
-    }
-
-    /// All-or-nothing allocation from group 0 (the BAGEL default).
+    /// All-or-nothing allocation from group 0.
     pub fn allocate(&mut self, req: RequestId, n: usize) -> Option<Vec<BlockId>> {
         self.allocate_in(req, 0, n)
     }
@@ -420,11 +404,6 @@ impl BlockManager {
         let mut got = Vec::with_capacity(n);
         for _ in 0..n {
             let b = self.fq_pop_front(gid).expect("free_count invariant");
-            // Block 0 is the padding slot and is never seeded into any group's
-            // free queue, so it can never be popped here; assert the invariant so
-            // a future group-seeding bug surfaces loudly instead of corrupting the
-            // worker's padding row (host usable capacity == num_blocks-1).
-            debug_assert!(b.0 != 0, "padding block 0 must never be allocated");
             // evict a cached block: drop its hash from the map.
             if let Some(h) = self.meta[b.0 as usize].hash.take() {
                 // drop the stored tokens too so a re-cached block can't
@@ -511,7 +490,7 @@ impl BlockManager {
         if m.ref_cnt > 0 {
             m.ref_cnt -= 1;
         }
-        if m.ref_cnt == 0 && !m.in_fq && m.state != BlockState::Padding {
+        if m.ref_cnt == 0 && !m.in_fq {
             let gid = self.block_group[b.0 as usize] as usize;
             self.meta[b.0 as usize].state = if self.meta[b.0 as usize].hash.is_some() {
                 BlockState::Cached
@@ -618,9 +597,8 @@ impl BlockManager {
 
     // ---- sliding window / sink trimming ----
 
-    /// For each sliding-window group a request uses, release blocks that fall
-    /// outside `[0, sink) ∪ [pos-window, pos)` (analogous to the reference's
-    /// `remove_skipped_blocks`). No-op for full-attention groups (BAGEL).
+    /// For each sliding-window group a request uses, release blocks outside
+    /// `[0, sink) ∪ [pos-window, pos)`. Full-attention groups retain every block.
     ///
     /// each block's token range is resolved from its *true* start offset,
     /// not its positional index. For a request that is still token-contiguous
@@ -733,13 +711,7 @@ impl BlockManager {
         self.hash_to_block.len()
     }
 
-    /// Total physical rows the worker declared (`EngineCaps.num_blocks`). NOTE
-    /// the host reserves block id 0 as the CUDA-graph padding slot and only ever
-    /// hands out ids in `[1, num_blocks)`, so the host-*usable* capacity is
-    /// `num_blocks - 1`. The worker's `PagedKVPool` treats all
-    /// `num_blocks` rows as usable storage and simply leaves row 0 unwritten; the
-    /// two sides therefore agree on the wire scalar but differ on its meaning, so
-    /// do not assume this many blocks are allocatable — see `free_blocks`.
+    /// Total logical blocks negotiated with the worker.
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
     }
@@ -760,22 +732,22 @@ mod tests {
     #[test]
     fn single_group_allocate_release_roundtrip() {
         let mut bm = BlockManager::new(8, 4, 0);
-        assert_eq!(bm.free_blocks(), 7); // block 0 is padding
+        assert_eq!(bm.free_blocks(), 8);
         let blocks = bm.allocate(rid(1), 3).unwrap();
         assert_eq!(blocks.len(), 3);
-        assert_eq!(bm.free_blocks(), 4);
+        assert_eq!(bm.free_blocks(), 5);
         for b in &blocks {
             assert_eq!(bm.ref_count(*b), 1);
         }
         bm.release(rid(1));
-        assert_eq!(bm.free_blocks(), 7);
+        assert_eq!(bm.free_blocks(), 8);
     }
 
     #[test]
     fn lru_reclaim_order() {
         // Freed blocks return to the MRU end; allocation pops the LRU end, so the
         // earliest-freed block is reclaimed first.
-        let mut bm = BlockManager::new(5, 4, 0); // blocks 1..5 free
+        let mut bm = BlockManager::new(5, 4, 0);
         let a = bm.allocate(rid(1), 1).unwrap()[0];
         let b = bm.allocate(rid(2), 1).unwrap()[0];
         let c = bm.allocate(rid(3), 1).unwrap()[0];
@@ -796,13 +768,13 @@ mod tests {
 
     #[test]
     fn ref_counted_block_not_evicted_until_zero() {
-        let mut bm = BlockManager::new(4, 4, 0); // blocks 1,2,3
+        let mut bm = BlockManager::new(4, 4, 0);
         let blk = bm.allocate(rid(1), 1).unwrap()[0];
         let toks = &[1u32, 2, 3, 4];
         bm.cache_block(blk, 0xABCD, toks);
         // request still holds it (ref_cnt=1): cannot be reused even under pressure.
         // Exhaust the other free blocks.
-        let _ = bm.allocate(rid(2), 2).unwrap();
+        let _ = bm.allocate(rid(2), 3).unwrap();
         assert_eq!(bm.free_blocks(), 0);
         assert!(
             bm.allocate(rid(3), 1).is_none(),
@@ -883,7 +855,7 @@ mod tests {
             16,
             4,
             0,
-            &[(KvGroupKind::SlidingWindow { window: 8, sink: 4 }, 1, 15)],
+            &[(KvGroupKind::SlidingWindow { window: 8, sink: 4 }, 0, 16)],
         );
         // allocate 5 blocks covering tokens [0,20)
         let _ = bm.allocate(rid(1), 5).unwrap();
@@ -894,7 +866,7 @@ mod tests {
         let after = bm.blocks_for(rid(1)).len();
         assert!(after < before, "expected trimming, {after} !< {before}");
         // sink block (idx 0) retained; some middle blocks freed back.
-        assert!(bm.free_blocks() > 15 - 5);
+        assert!(bm.free_blocks() > 16 - 5);
     }
 
     #[test]
@@ -957,43 +929,28 @@ mod tests {
     #[test]
     fn validate_group_specs_accepts_full_partition_and_rejects_malformed() {
         use uniserve_core::KvGroupKind::Full;
-        // BAGEL default: one full group covering [1, num_blocks).
-        assert!(BlockManager::validate_group_specs(8, &[(Full, 1, 7)]).is_ok());
-        // two disjoint groups exactly partitioning [1, 8).
-        assert!(BlockManager::validate_group_specs(8, &[(Full, 1, 3), (Full, 4, 4)]).is_ok());
-        // first_block 0 collides with the padding slot.
+        assert!(BlockManager::validate_group_specs(8, &[(Full, 0, 8)]).is_ok());
+        assert!(BlockManager::validate_group_specs(8, &[(Full, 0, 3), (Full, 3, 5)]).is_ok());
+        assert!(BlockManager::validate_group_specs(8, &[(Full, 0, 0), (Full, 0, 8)]).is_err());
+        assert!(BlockManager::validate_group_specs(8, &[(Full, 0, 20)]).is_err());
+        assert!(BlockManager::validate_group_specs(8, &[(Full, 0, 4), (Full, 3, 5)]).is_err());
         assert!(BlockManager::validate_group_specs(8, &[(Full, 0, 7)]).is_err());
-        // range runs past num_blocks (the OOB-panic case, now rejected).
-        assert!(BlockManager::validate_group_specs(8, &[(Full, 1, 20)]).is_err());
-        // overlapping ranges (would double-list / corrupt free_count).
-        assert!(BlockManager::validate_group_specs(8, &[(Full, 1, 4), (Full, 3, 4)]).is_err());
-        // a gap leaves block 7 orphaned.
-        assert!(BlockManager::validate_group_specs(8, &[(Full, 1, 6)]).is_err());
-        // first+count overflow is caught instead of wrapping.
         assert!(BlockManager::validate_group_specs(8, &[(Full, u32::MAX, 2)]).is_err());
     }
 
     #[test]
     #[should_panic(expected = "invalid KV-cache group specs")]
     fn with_groups_panics_on_out_of_range_spec() {
-        let _ = BlockManager::with_groups(
-            8,
-            4,
-            0,
-            &[(KvGroupKind::Full, 1, 20)], // exceeds num_blocks
-        );
+        let _ = BlockManager::with_groups(8, 4, 0, &[(KvGroupKind::Full, 0, 20)]);
     }
 
     #[test]
-    fn padding_block_zero_never_allocated() {
-        // block 0 is the padding slot; usable capacity is num_blocks-1 and
-        // allocation never returns id 0 even when the pool is fully drained.
-        let mut bm = BlockManager::new(4, 4, 0); // ids 1,2,3 usable
-        assert_eq!(bm.free_blocks(), 3);
-        let all = bm.allocate(rid(1), 3).unwrap();
-        assert!(all.iter().all(|b| b.0 != 0));
+    fn logical_capacity_includes_block_zero() {
+        let mut bm = BlockManager::new(4, 4, 0);
+        assert_eq!(bm.free_blocks(), 4);
+        let all = bm.allocate(rid(1), 4).unwrap();
+        assert_eq!(all, vec![BlockId(0), BlockId(1), BlockId(2), BlockId(3)]);
         assert_eq!(bm.free_blocks(), 0);
-        assert_eq!(bm.padding_block(), BlockId(0));
     }
 
     #[test]
@@ -1006,7 +963,7 @@ mod tests {
             16,
             4,
             0,
-            &[(KvGroupKind::SlidingWindow { window: 8, sink: 4 }, 1, 15)],
+            &[(KvGroupKind::SlidingWindow { window: 8, sink: 4 }, 0, 16)],
         );
         // 5 blocks covering tokens [0,4),[4,8),[8,12),[12,16),[16,20).
         let blks = bm.allocate(rid(1), 5).unwrap();

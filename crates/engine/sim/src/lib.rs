@@ -1026,7 +1026,7 @@ impl ModelEngine for SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_wire::{
-        AttentionRegime, BatchPartition, Bounds, DType, Domain, ExecutionCapability, KvAllocation,
+        AttentionRegime, BatchPartition, Bounds, DType, Domain, ExecutionCapability, KvAdmission,
         OpId, PointRange, ProductRef, RequestKey, RouteId, ShapeBound, StorageClass, UndAdmission,
         VersionRef,
     };
@@ -1042,7 +1042,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
-                kv: KvAllocation::default(),
+                kv: KvAdmission::default(),
             }),
             None,
         )
@@ -1091,7 +1091,7 @@ mod tests {
             },
             Vec::new(),
             token_outputs(OpId(op_id)),
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1109,6 +1109,7 @@ mod tests {
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![operation],
+                kv_reservations: Vec::new(),
             }],
         )
     }

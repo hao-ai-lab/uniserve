@@ -1534,7 +1534,7 @@ mod tests {
             },
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1552,6 +1552,7 @@ mod tests {
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![operation],
+                kv_reservations: Vec::new(),
             }],
         )
     }
@@ -1573,7 +1574,7 @@ mod tests {
             },
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            0,
             None,
             None,
             0,
@@ -1588,6 +1589,7 @@ mod tests {
             attention: AttentionRegime::Causal,
             shape_class: 0,
             operations: vec![operation],
+            kv_reservations: Vec::new(),
         });
         batch
     }

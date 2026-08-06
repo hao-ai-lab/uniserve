@@ -44,6 +44,7 @@ class KvSnapshot:
     base_extent: int
     published_extent: int
     block_ids: tuple[int, ...]
+    logical_blocks: tuple[int, ...]
     group_id: int
     mapping_generation: int
     scale_identity: str
@@ -73,6 +74,12 @@ class KvSnapshot:
             self.block_ids
         ):
             raise invalid_descriptor("KV publication block mapping is invalid")
+        if (
+            len(self.logical_blocks) != len(self.block_ids)
+            or any(block_id < 0 for block_id in self.logical_blocks)
+            or len(set(self.logical_blocks)) != len(self.logical_blocks)
+        ):
+            raise invalid_descriptor("KV publication logical lease is invalid")
         if self.group_id < 0 or self.mapping_generation < 1 or not self.scale_identity:
             raise invalid_descriptor("KV publication mapping metadata is invalid")
         if self.published_extent == self.base_extent and self.locators:
@@ -88,6 +95,7 @@ class KvSnapshot:
             "base_extent": self.base_extent,
             "published_extent": self.published_extent,
             "block_ids": list(self.block_ids),
+            "logical_blocks": list(self.logical_blocks),
             "group_id": self.group_id,
             "mapping_generation": self.mapping_generation,
             "scale_identity": self.scale_identity,
@@ -99,6 +107,7 @@ class KvSnapshot:
             raise invalid_descriptor("KV publication descriptor is not a mapping")
         base = value.get("base_version")
         raw_block_ids = value.get("block_ids", ())
+        raw_logical_blocks = value.get("logical_blocks", ())
         if not isinstance(raw_block_ids, Sequence) or isinstance(
             raw_block_ids, (str, bytes, bytearray)
         ):
@@ -108,6 +117,15 @@ class KvSnapshot:
             if not isinstance(item, int) or isinstance(item, bool):
                 raise invalid_descriptor("KV publication block mapping contains a non-integer")
             block_ids.append(item)
+        if not isinstance(raw_logical_blocks, Sequence) or isinstance(
+            raw_logical_blocks, (str, bytes, bytearray)
+        ):
+            raise invalid_descriptor("KV publication logical lease is not a sequence")
+        logical_blocks: list[int] = []
+        for item in raw_logical_blocks:
+            if not isinstance(item, int) or isinstance(item, bool):
+                raise invalid_descriptor("KV publication logical lease contains a non-integer")
+            logical_blocks.append(item)
         return cls(
             locators=tuple(str(item) for item in cast(Sequence[object], value.get("locators", ()))),
             source_version=VersionRef.from_wire(
@@ -121,6 +139,7 @@ class KvSnapshot:
             base_extent=int(value.get("base_extent", 0)),
             published_extent=int(value.get("published_extent", 0)),
             block_ids=tuple(block_ids),
+            logical_blocks=tuple(logical_blocks),
             group_id=int(value.get("group_id", 0)),
             mapping_generation=int(value.get("mapping_generation", 0)),
             scale_identity=str(value.get("scale_identity", "")),
@@ -147,6 +166,7 @@ class KvSnapshot:
 @dataclass(slots=True)
 class KvEntry:
     block_ids: list[int] = field(default_factory=list)
+    logical_blocks: list[int] = field(default_factory=list)
     prefix_len: int = 0
     group_id: int = 0
     reserved_len: int = 0
@@ -216,6 +236,7 @@ class _RetainedPage:
 _KvEntryState: TypeAlias = tuple[
     bool,
     tuple[int, ...],
+    tuple[int, ...],
     int,
     int,
     int,
@@ -226,6 +247,15 @@ _KvEntryState: TypeAlias = tuple[
     int,
     str,
 ]
+
+
+_LogicalPageKey: TypeAlias = int
+
+
+@dataclass(frozen=True, slots=True)
+class _LogicalPageUndo:
+    key: _LogicalPageKey
+    page: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +305,7 @@ class KvBranchState:
 class KvCommittedState:
     session_id: int
     block_ids: tuple[int, ...]
+    logical_blocks: tuple[int, ...]
     prefix_len: int
     length: int
     group_id: int
@@ -745,6 +776,9 @@ class KvStore:
     def __init__(self, pool: PagedKVPool | None = None) -> None:
         self.pool = pool
         self._entries: dict[int, KvEntry] = {}
+        self._logical_pages: dict[_LogicalPageKey, int] = {}
+        self._logical_groups: dict[_LogicalPageKey, int] = {}
+        self._page_logical: dict[int, _LogicalPageKey] = {}
         self._branches: dict[tuple[ProductRef, str], KvEntry] = {}
         self._holders: dict[int, set[int]] = {}
         self._published: dict[
@@ -765,7 +799,7 @@ class KvStore:
             self.pool = pool
 
     def resident_block_count(self) -> int:
-        """Return the number of distinct host-leased blocks with live holders."""
+        """Return the number of worker pages with live session holders."""
 
         with self._lock:
             return sum(bool(holders) for holders in self._holders.values())
@@ -799,24 +833,98 @@ class KvStore:
                 return
             if session_id in self._entries:
                 return
-            allocation = und.kv
+            metadata = und.kv
             entry = KvEntry(
-                block_ids=list(allocation.block_ids),
-                prefix_len=allocation.prefix_len,
-                group_id=allocation.group_id,
-                reserved_len=(
-                    len(allocation.block_ids) * self.pool.block_size
-                    if self.pool is not None
-                    else allocation.prefix_len
-                ),
-                initialized_len=allocation.prefix_len,
-                visible_len=allocation.prefix_len,
-                committed_len=allocation.prefix_len,
+                prefix_len=metadata.prefix_len,
+                group_id=metadata.group_id,
+                reserved_len=metadata.prefix_len,
+                initialized_len=metadata.prefix_len,
+                visible_len=metadata.prefix_len,
+                committed_len=metadata.prefix_len,
                 scale_identity=self._scale_identity(),
             )
-            self._validate_blocks(session_id, entry.block_ids, entry.prefix_len)
             self._entries[session_id] = entry
-            self._register(session_id, entry.block_ids)
+
+    def reserve_logical_page_delta(
+        self,
+        request_key: RequestKey,
+        logical_page_delta: Sequence[int],
+        *,
+        expected_capacity_pages: int,
+    ) -> tuple[_LogicalPageUndo, ...]:
+        """Extend one logical lease with worker-selected physical pages."""
+
+        pool = self.pool
+        if pool is None:
+            raise RuntimeError("KV registration requires a physical pool")
+        session_id = int(request_key.session_id)
+        delta = [int(value) for value in logical_page_delta]
+        expected_capacity = int(expected_capacity_pages)
+        if expected_capacity < 0 or expected_capacity > pool.leasable_num_blocks:
+            raise invalid_descriptor("KV reservation declares an invalid logical capacity")
+        if len(set(delta)) != len(delta):
+            raise invalid_descriptor("KV reservation repeats a logical page")
+        if any(value < 0 or value >= pool.leasable_num_blocks for value in delta):
+            raise invalid_descriptor("KV reservation exceeds negotiated logical capacity")
+        with self._lock:
+            entry = self.get(session_id)
+            if len(entry.logical_blocks) + len(delta) != expected_capacity:
+                raise invalid_descriptor("KV reservation does not establish operation capacity")
+            if set(delta).intersection(entry.logical_blocks):
+                raise invalid_descriptor("KV reservation repeats a committed logical page")
+            pages = list(entry.block_ids)
+            undo: list[_LogicalPageUndo] = []
+            try:
+                for logical_block in delta:
+                    key = logical_block
+                    group = self._logical_groups.get(key)
+                    if group is not None and group != int(entry.group_id):
+                        raise invalid_descriptor("KV logical block belongs to another cache group")
+                    page = self._logical_pages.get(key)
+                    if page is None:
+                        page = self._allocate_logical_page(key, int(entry.group_id))
+                        undo.append(_LogicalPageUndo(key=key, page=page))
+                    pages.append(page)
+                if entry.prefix_len > len(pages) * pool.block_size:
+                    raise invalid_descriptor("KV prefix exceeds its logical lease capacity")
+                self._validate_blocks(session_id, pages, entry.prefix_len)
+            except BaseException:
+                self._undo_logical_pages(tuple(reversed(undo)))
+                raise
+            added = pages[len(entry.block_ids) :]
+            entry.logical_blocks.extend(delta)
+            entry.block_ids.extend(added)
+            self._register(session_id, added)
+            entry.reserved_len = len(pages) * pool.block_size
+            if added:
+                entry.mapping_generation += 1
+            return tuple(undo)
+
+    def _allocate_logical_page(
+        self,
+        key: _LogicalPageKey,
+        group_id: int,
+    ) -> int:
+        pool = self.pool
+        if pool is None:
+            raise RuntimeError("KV registration requires a physical pool")
+        page = pool.allocate_session_blocks(1)[0]
+        self._logical_pages[key] = page
+        self._logical_groups[key] = int(group_id)
+        self._page_logical[page] = key
+        return page
+
+    def _undo_logical_pages(self, undo: Sequence[_LogicalPageUndo]) -> None:
+        pool = self.pool
+        if pool is None:
+            raise RuntimeError("KV registration lost its physical pool")
+        for change in undo:
+            if self._logical_pages.get(change.key) != change.page:
+                raise RuntimeError("KV logical-page mapping changed during registration")
+            del self._logical_pages[change.key]
+            del self._logical_groups[change.key]
+            del self._page_logical[change.page]
+            pool.release_session_blocks((change.page,))
 
     def get(self, session_id: int) -> KvEntry:
         with self._lock:
@@ -885,34 +993,6 @@ class KvStore:
                 raise invalid_descriptor("KV rewind selects an uninitialized prefix")
             entry.visible_len = selected
             entry.committed_len = min(entry.committed_len, selected)
-
-    def append_kv_blocks(self, session_id: int, new_blocks: Sequence[int]) -> None:
-        """Grow a session's block lease by the blocks an operation appends this step.
-
-        The session entry starts from the admission's :class:`KvAllocation` blocks
-        and grows by exactly each operation's declared ``new_kv_blocks`` before its
-        forward writes, so the block table covers the write position as the
-        sequence crosses a page boundary. Re-applying the same tail is a no-op.
-        """
-
-        with self._lock:
-            entry = self.get(session_id)
-            new = [int(value) for value in new_blocks]
-            if not new:
-                return
-            if entry.block_ids[-len(new) :] == new:
-                return
-            duplicate = set(entry.block_ids) & set(new)
-            if duplicate:
-                raise invalid_descriptor(
-                    f"session {session_id} KV append repeats blocks {sorted(duplicate)}"
-                )
-            self._validate_blocks(session_id, new, entry.length)
-            entry.block_ids.extend(new)
-            self._register(session_id, new)
-            if self.pool is not None:
-                entry.reserved_len = len(entry.block_ids) * self.pool.block_size
-            entry.mapping_generation += 1
 
     def view(
         self,
@@ -1128,6 +1208,7 @@ class KvStore:
             base_extent=base_extent,
             published_extent=entry.committed_len,
             block_ids=tuple(entry.block_ids),
+            logical_blocks=tuple(entry.logical_blocks),
             group_id=entry.group_id,
             mapping_generation=entry.mapping_generation,
             scale_identity=entry.scale_identity,
@@ -1226,6 +1307,7 @@ class KvStore:
             entry.visible_len == snapshot.published_extent
             and entry.committed_len == snapshot.published_extent
             and tuple(entry.block_ids) == snapshot.block_ids
+            and tuple(entry.logical_blocks) == snapshot.logical_blocks
             and entry.mapping_generation == snapshot.mapping_generation
             and entry.scale_identity == snapshot.scale_identity
         )
@@ -1242,8 +1324,18 @@ class KvStore:
                 transferred_tensors=transferred_tensors,
             )
         with self._lock:
-            self._publication_products[installed_product] = snapshot
-        return snapshot
+            entry = self.get(session_id)
+            lease_pages = len(snapshot.logical_blocks)
+            local_snapshot = replace(
+                snapshot,
+                block_ids=tuple(entry.block_ids[:lease_pages]),
+                logical_blocks=tuple(entry.logical_blocks[:lease_pages]),
+                mapping_generation=entry.mapping_generation,
+                scale_identity=entry.scale_identity,
+            )
+            self._publication_products[source] = local_snapshot
+            self._publication_products[installed_product] = local_snapshot
+        return local_snapshot
 
     def validate_installed(self, session_id: int, product: ProductRef) -> KvSnapshot:
         snapshot = self.publication(product)
@@ -1356,7 +1448,9 @@ class KvStore:
 
         def rewrite(snapshot: KvSnapshot) -> KvSnapshot:
             locators = tuple(replacements.get(raw, raw) for raw in snapshot.locators)
-            return snapshot if locators == snapshot.locators else replace(snapshot, locators=locators)
+            return (
+                snapshot if locators == snapshot.locators else replace(snapshot, locators=locators)
+            )
 
         with self._lock:
             for product, snapshot in tuple(self._publication_products.items()):
@@ -1440,8 +1534,8 @@ class KvStore:
             if resident.group_id != snapshot.group_id:
                 raise invalid_descriptor("published KV group does not match the local session")
             base_pages = ceil_div(snapshot.base_extent, self.pool.block_size)
-            if tuple(resident.block_ids[:base_pages]) != snapshot.block_ids[:base_pages]:
-                raise invalid_descriptor("KV installation block mapping does not match base")
+            if tuple(resident.logical_blocks[:base_pages]) != snapshot.logical_blocks[:base_pages]:
+                raise invalid_descriptor("KV installation logical base does not match")
             if resident.scale_identity != snapshot.scale_identity:
                 raise invalid_descriptor("KV installation scale identity does not match base")
 
@@ -1477,7 +1571,12 @@ class KvStore:
             entry = self.get(session_id)
             if entry.group_id != snapshot.group_id:
                 raise invalid_descriptor("published KV group does not match the local session")
-            blocks = list(snapshot.block_ids)
+            if (
+                tuple(entry.logical_blocks[: len(snapshot.logical_blocks)])
+                != snapshot.logical_blocks
+            ):
+                raise invalid_descriptor("KV installation logical lease does not match reservation")
+            blocks = entry.block_ids[: len(snapshot.logical_blocks)]
             self._validate_blocks(session_id, blocks, snapshot.published_extent)
             write_page = snapshot.base_extent // self.pool.block_size
             transaction._retain_pages(blocks[write_page:])
@@ -1489,17 +1588,13 @@ class KvStore:
                     k=key.to(self.pool.k.device),
                     v=value.to(self.pool.v.device),
                 )
-            self._unregister(session_id, entry.block_ids)
-            entry.block_ids = blocks
-            entry.reserved_len = len(blocks) * self.pool.block_size
+            entry.reserved_len = len(entry.block_ids) * self.pool.block_size
             entry.initialized_len = snapshot.published_extent
             entry.visible_len = snapshot.published_extent
             entry.committed_len = snapshot.published_extent
             entry.published_by_destination[snapshot.destination] = snapshot.published_extent
-            entry.mapping_generation = snapshot.mapping_generation
             entry.scale_identity = snapshot.scale_identity
             entry.prefix_len = min(entry.prefix_len, entry.visible_len)
-            self._register(session_id, blocks)
             self._installed_bases[(int(session_id), snapshot.destination)] = (
                 snapshot.source_version,
                 snapshot.published_extent,
@@ -1584,6 +1679,7 @@ class KvStore:
                     KvCommittedState(
                         session_id=session_id,
                         block_ids=tuple(entry.block_ids),
+                        logical_blocks=tuple(entry.logical_blocks),
                         prefix_len=entry.prefix_len,
                         length=length,
                         group_id=entry.group_id,
@@ -1699,6 +1795,12 @@ class KvStore:
                 <= state.reserved_len
             ):
                 raise invalid_descriptor("KV snapshot extents are not monotonically contained")
+            if len(state.logical_blocks) != len(state.block_ids) or len(
+                set(state.logical_blocks)
+            ) != len(state.logical_blocks):
+                raise invalid_descriptor("KV snapshot logical lease is invalid")
+            if any(logical_block < 0 for logical_block in state.logical_blocks):
+                raise invalid_descriptor("KV snapshot logical lease is invalid")
             if state.prefix_len > state.committed_len:
                 raise invalid_descriptor("KV snapshot prefix exceeds its committed length")
             if not state.scale_identity or state.mapping_generation < 1:
@@ -1727,6 +1829,8 @@ class KvStore:
                     or publication.source_version.request_key != product.request_key
                     or publication.published_extent > state.committed_len
                     or not publication_pages_match
+                    or tuple(state.logical_blocks[: len(publication.logical_blocks)])
+                    != publication.logical_blocks
                 ):
                     raise invalid_descriptor("KV snapshot publication identity is invalid")
                 publication_refs.add(product)
@@ -1738,15 +1842,18 @@ class KvStore:
                 or len(set(installed_base_names)) != len(installed_base_names)
             ):
                 raise invalid_descriptor("KV snapshot exact destination bases are invalid")
-            for _destination, version, extent, blocks, group_id, scale_identity in (
-                state.destination_bases
-            ):
+            for (
+                _destination,
+                version,
+                extent,
+                blocks,
+                group_id,
+                scale_identity,
+            ) in state.destination_bases:
                 base_pages_match = not blocks
                 if self.pool is not None:
                     base_pages = ceil_div(extent, self.pool.block_size)
-                    base_pages_match = (
-                        tuple(state.block_ids[:base_pages]) == blocks[:base_pages]
-                    )
+                    base_pages_match = tuple(state.block_ids[:base_pages]) == blocks[:base_pages]
                 if (
                     version.request_key.session_id != state.session_id
                     or not isinstance(version.point, FixedPoint)
@@ -1773,6 +1880,11 @@ class KvStore:
                     raise invalid_descriptor(
                         "KV snapshot reservation does not match block capacity"
                     )
+                if any(
+                    logical_block >= self.pool.leasable_num_blocks
+                    for logical_block in state.logical_blocks
+                ):
+                    raise invalid_descriptor("KV snapshot logical lease exceeds capacity")
                 self.pool.validate_block_ids(state.block_ids)
                 if any(value >= self.pool.leasable_num_blocks for value in state.block_ids):
                     raise invalid_descriptor("KV snapshot uses a block outside the leased range")
@@ -1837,8 +1949,19 @@ class KvStore:
 
         block_sources: dict[int, tuple[KvPageState, int]] = {}
         for state in states:
+            physical_blocks = []
+            for logical_block in state.logical_blocks:
+                key = int(logical_block)
+                group = self._logical_groups.get(key)
+                if group is not None and group != int(state.group_id):
+                    raise invalid_descriptor("KV logical block belongs to another cache group")
+                page = self._logical_pages.get(key)
+                if page is None:
+                    page = self._allocate_logical_page(key, int(state.group_id))
+                physical_blocks.append(page)
             entry = KvEntry(
-                block_ids=list(state.block_ids),
+                block_ids=physical_blocks,
+                logical_blocks=list(state.logical_blocks),
                 prefix_len=state.prefix_len,
                 group_id=state.group_id,
                 reserved_len=state.reserved_len,
@@ -1846,7 +1969,8 @@ class KvStore:
                 visible_len=state.length,
                 committed_len=state.committed_len,
                 published_by_destination=dict(state.published_by_destination),
-                mapping_generation=state.mapping_generation,
+                mapping_generation=state.mapping_generation
+                + int(tuple(physical_blocks) != state.block_ids),
                 scale_identity=state.scale_identity,
             )
             block_size = 0 if self.pool is None else self.pool.block_size
@@ -1860,19 +1984,32 @@ class KvStore:
             self._entries[state.session_id] = entry
             self._register(state.session_id, entry.block_ids)
             if state.pages is not None:
-                for index, block_id in enumerate(state.block_ids):
+                for index, block_id in enumerate(entry.block_ids):
                     block_sources.setdefault(block_id, (state.pages, index))
-            self._publication_products.update(dict(state.publications))
+            self._publication_products.update(
+                {
+                    product: replace(
+                        publication,
+                        block_ids=tuple(entry.block_ids[: len(publication.logical_blocks)]),
+                        logical_blocks=tuple(
+                            entry.logical_blocks[: len(publication.logical_blocks)]
+                        ),
+                        mapping_generation=entry.mapping_generation,
+                        scale_identity=entry.scale_identity,
+                    )
+                    for product, publication in state.publications
+                }
+            )
             self._destination_bases.update(
                 {
                     (state.session_id, destination): (
                         version,
                         extent,
-                        blocks,
+                        tuple(entry.block_ids[: ceil_div(extent, block_size) if block_size else 0]),
                         group_id,
                         scale_identity,
                     )
-                    for destination, version, extent, blocks, group_id, scale_identity in (
+                    for destination, version, extent, _blocks, group_id, scale_identity in (
                         state.destination_bases
                     )
                 }
@@ -2044,11 +2181,12 @@ class KvStore:
         for session_id in request_ids:
             entry = self._entries.get(session_id)
             if entry is None:
-                result[session_id] = (False, (), 0, 0, 0, 0, 0, 0, {}, 0, "none")
+                result[session_id] = (False, (), (), 0, 0, 0, 0, 0, 0, {}, 0, "none")
             else:
                 result[session_id] = (
                     True,
                     tuple(entry.block_ids),
+                    tuple(entry.logical_blocks),
                     entry.prefix_len,
                     entry.group_id,
                     entry.reserved_len,
@@ -2074,14 +2212,15 @@ class KvStore:
                 if product.request_key.session_id in request_ids
             },
             destination_bases={
-                key: value for key, value in self._destination_bases.items() if key[0] in request_ids
+                key: value
+                for key, value in self._destination_bases.items()
+                if key[0] in request_ids
             },
             installed_bases={
                 key: value for key, value in self._installed_bases.items() if key[0] in request_ids
             },
             retained_counts={
-                session_id: len(self._published.get(session_id, ()))
-                for session_id in request_ids
+                session_id: len(self._published.get(session_id, ())) for session_id in request_ids
             },
         )
 
@@ -2128,6 +2267,7 @@ class KvStore:
             tuple[
                 bool,
                 tuple[int, ...],
+                tuple[int, ...],
                 int,
                 int,
                 int,
@@ -2147,6 +2287,7 @@ class KvStore:
             (
                 existed,
                 blocks,
+                logical_blocks,
                 prefix_len,
                 group_id,
                 reserved_len,
@@ -2158,11 +2299,12 @@ class KvStore:
                 scale_identity,
             ) = entries.get(
                 session_id,
-                (False, (), 0, 0, 0, 0, 0, 0, {}, 0, "none"),
+                (False, (), (), 0, 0, 0, 0, 0, 0, {}, 0, "none"),
             )
             if existed:
                 entry = KvEntry(
                     block_ids=list(blocks),
+                    logical_blocks=list(logical_blocks),
                     prefix_len=prefix_len,
                     group_id=group_id,
                     reserved_len=reserved_len,
@@ -2182,9 +2324,7 @@ class KvStore:
         snapshot: _KvAuxiliarySnapshot,
     ) -> None:
         current_keys = [
-            key
-            for key in self._branches
-            if int(key[0].request_key.session_id) in request_ids
+            key for key in self._branches if int(key[0].request_key.session_id) in request_ids
         ]
         for key in current_keys:
             current = self._branches.pop(key)
@@ -2196,8 +2336,7 @@ class KvStore:
             if int(key[0].request_key.session_id) in request_ids:
                 self._branches[key] = KvEntry(
                     block_ids=list(blocks),
-                    reserved_len=len(blocks)
-                    * (0 if self.pool is None else self.pool.block_size),
+                    reserved_len=len(blocks) * (0 if self.pool is None else self.pool.block_size),
                     initialized_len=length,
                     visible_len=length,
                     committed_len=length,
@@ -2210,9 +2349,7 @@ class KvStore:
         ]:
             del self._publication_products[product]
         self._publication_products.update(snapshot.publications)
-        for destination_key in [
-            key for key in self._destination_bases if key[0] in request_ids
-        ]:
+        for destination_key in [key for key in self._destination_bases if key[0] in request_ids]:
             del self._destination_bases[destination_key]
         self._destination_bases.update(snapshot.destination_bases)
         for installed_key in [key for key in self._installed_bases if key[0] in request_ids]:
@@ -2299,6 +2436,7 @@ class KvTxn:
         self._entry_snapshot = store.snapshot_entries(set(session_ids))
         self._auxiliary_snapshot: _KvAuxiliarySnapshot | None = None
         self._retained: dict[int, _RetainedPage] = {}
+        self._logical_page_undo: list[_LogicalPageUndo] = []
         self._closed = False
 
     def view(
@@ -2406,11 +2544,23 @@ class KvTxn:
             raise RuntimeError("KV extent query targets a session outside this step")
         return self._store.get(int(session_id)).extents()
 
-    def append_kv_blocks(self, session_id: int, new_blocks: Sequence[int]) -> None:
+    def reserve_logical_page_delta(
+        self,
+        request_key: RequestKey,
+        logical_page_delta: Sequence[int],
+        *,
+        expected_capacity_pages: int,
+    ) -> None:
         self._require_open()
-        if int(session_id) not in self._session_ids:
-            raise RuntimeError("KV append targets a session outside this step")
-        self._store.append_kv_blocks(int(session_id), new_blocks)
+        if int(request_key.session_id) not in self._session_ids:
+            raise RuntimeError("KV reservation targets a session outside this step")
+        self._logical_page_undo.extend(
+            self._store.reserve_logical_page_delta(
+                request_key,
+                logical_page_delta,
+                expected_capacity_pages=expected_capacity_pages,
+            )
+        )
 
     def import_snapshot(
         self,
@@ -2520,6 +2670,7 @@ class KvTxn:
                     set(self._session_ids),
                     self._auxiliary_snapshot,
                 )
+            self._store._undo_logical_pages(tuple(reversed(self._logical_page_undo)))
         self._closed = True
         self._clear_retained()
 

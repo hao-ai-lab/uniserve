@@ -16,6 +16,7 @@ from ..batch import (
     CompletionReport,
     Domain,
     ExecutionCapability,
+    KvReservation,
     Operation,
     OpStatus,
     ProductPayload,
@@ -61,6 +62,19 @@ def _warmup_batch(
     operations: tuple[Operation, ...],
     input_products: tuple[ProductPayload, ...] = (),
 ) -> Batch:
+    logical_leases: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
+    admitted_request_keys = {admission.request_key for admission in admissions}
+    next_logical_block = 0
+    for operation in operations:
+        capacity = (
+            int(operation.kv_capacity_pages)
+            if operation.request_key in admitted_request_keys
+            else 0
+        )
+        logical_leases[(operation.request_key, operation.op_id)] = tuple(
+            range(next_logical_block, next_logical_block + capacity)
+        )
+        next_logical_block += capacity
     groups: list[tuple[Domain, int, list[Operation]]] = []
     for operation in operations:
         existing = next(
@@ -86,6 +100,15 @@ def _warmup_batch(
             attention=AttentionRegime.HYBRID,
             shape_class=0,
             operations=tuple(members),
+            kv_reservations=tuple(
+                KvReservation(
+                    request_key=operation.request_key,
+                    op_id=operation.op_id,
+                    logical_page_delta=logical_leases[(operation.request_key, operation.op_id)],
+                )
+                for operation in members
+                if operation.kv_capacity_pages > 0
+            ),
         )
         for index, (domain, route, members) in enumerate(groups, start=1)
     )
@@ -447,7 +470,7 @@ class ModelWorker:
             Domain,
             DType,
             FixedPoint,
-            KvAllocation,
+            KvAdmission,
             Operation,
             PointRange,
             ProductKind,
@@ -505,10 +528,10 @@ class ModelWorker:
                 keys[sid],
                 und=UndAdmission(
                     sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                    kv=KvAllocation(block_ids=(block_id,)),
+                    kv=KvAdmission(),
                 ),
             )
-            for block_id, sid in enumerate(session_ids)
+            for sid in session_ids
         }
 
         next_product_generation = 1
@@ -543,6 +566,7 @@ class ModelWorker:
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
                 inputs=(token_ref,),
                 outputs=outputs,
+                kv_capacity_pages=1,
             )
             return operation, ProductPayload(
                 product=token_ref, payload=encode_token_product_bytes(tokens)
@@ -568,6 +592,7 @@ class ModelWorker:
                 domain=Domain.UND,
                 bounds=Bounds(max_points=1, max_tokens=1),
                 outputs=outputs,
+                kv_capacity_pages=1,
                 predicate=token_output,
             )
 
@@ -633,7 +658,7 @@ class ModelWorker:
             Domain,
             DType,
             FixedPoint,
-            KvAllocation,
+            KvAdmission,
             Operation,
             PointRange,
             ProductKind,
@@ -693,7 +718,7 @@ class ModelWorker:
                     rk,
                     und=UndAdmission(
                         sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                        kv=KvAllocation(block_ids=tuple(range(block_count))),
+                        kv=KvAdmission(),
                     ),
                 )
                 token_ref = ProductRef(
@@ -717,6 +742,7 @@ class ModelWorker:
                     bounds=Bounds(max_points=1, max_tokens=token_count),
                     inputs=(token_ref,),
                     outputs=_warmup_token_outputs(rk, 1, 2),
+                    kv_capacity_pages=block_count,
                 )
                 try:
                     self._execute_warmup(

@@ -312,11 +312,17 @@ table Operation {
   bounds:Bounds;
   inputs:[ProductRef];
   outputs:[ProductRef];
-  new_kv_blocks:[uint];
+  kv_capacity_pages:uint;
   predicate:ProductRef;
   rng:Rng;
   control_seq:ulong;
   plan_digest:string;
+}
+
+table KvReservation {
+  request_key:RequestKey;
+  op_id:ulong;
+  logical_page_delta:[uint];
 }
 
 table LogicalLengths {
@@ -390,8 +396,7 @@ table ControlEnvelope { control:Control; }
 
 // ---- Admission framing (session establishment) ----------------------------
 
-table KvAllocation {
-  block_ids:[uint];
+table KvAdmission {
   prefix_len:uint;
   group_id:uint;
 }
@@ -400,7 +405,7 @@ table UndAdmission {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
-  kv:KvAllocation;
+  kv:KvAdmission;
 }
 
 table GenAdmission { image:ImageParams; }
@@ -422,6 +427,7 @@ table BatchPartition {
   attention:AttentionRegime;
   shape_class:ulong;
   operations:[Operation];
+  kv_reservations:[KvReservation];
 }
 
 table Batch {

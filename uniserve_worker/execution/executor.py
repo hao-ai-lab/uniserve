@@ -2063,7 +2063,7 @@ class ModelExecutor:
             self._reserve_cpu_tasks(operations, scope)
             for admission in admissions:
                 self.kv.admit(admission)
-            self._apply_new_kv_blocks(operations, scope)
+            self._reserve_kv_pages(partition, scope)
             aligned_sessions = transaction.aligned_sessions()
             scope.layout = _PartitionLayout(
                 operations=operations,
@@ -2860,23 +2860,24 @@ class ModelExecutor:
         for identity in selected:
             self._release_locators(self._transport_publications.pop(identity))
 
-    def _apply_new_kv_blocks(
+    def _reserve_kv_pages(
         self,
-        operations: tuple[Operation, ...],
+        partition: BatchPartition,
         scope: _ExecutionScope,
     ) -> None:
-        """Grow each session's KV block lease by the blocks its operation appends.
+        """Atomically bind logical leases to worker-selected physical pages."""
 
-        Registration binds the appended blocks to the session entry before the
-        forward computes attention page indices, so the block table covers the
-        write position as a decode sequence crosses a page boundary. The growth
-        lives in the step's KV transaction; a rejected registration rolls the
-        block table back to its committed state.
-        """
-
-        for operation in operations:
-            if operation.new_kv_blocks:
-                scope.kv.append_kv_blocks(operation.request_key.session_id, operation.new_kv_blocks)
+        operations = {
+            (operation.request_key, operation.op_id): operation
+            for operation in partition.operations
+        }
+        for reservation in partition.kv_reservations:
+            operation = operations[(reservation.request_key, reservation.op_id)]
+            scope.kv.reserve_logical_page_delta(
+                reservation.request_key,
+                reservation.logical_page_delta,
+                expected_capacity_pages=operation.kv_capacity_pages,
+            )
 
     def _stage_input_products(
         self,
@@ -2938,11 +2939,13 @@ class ModelExecutor:
                 if payload_kind is None or height is None or width is None:
                     raise RuntimeError("prepared tensor transfer has no validated geometry")
                 if payload_kind is ProductKind.VISION_FEATURE:
-                    transferred_payload: VisionFeatureProduct | LatentFeatureProduct = VisionFeatureProduct(
-                        features=resident,
-                        height=height,
-                        width=width,
-                        source_base64=None,
+                    transferred_payload: VisionFeatureProduct | LatentFeatureProduct = (
+                        VisionFeatureProduct(
+                            features=resident,
+                            height=height,
+                            width=width,
+                            source_base64=None,
+                        )
                     )
                 elif payload_kind is ProductKind.LATENT_FEATURE and len(tensors) == 1:
                     transferred_payload = LatentFeatureProduct(
@@ -6700,9 +6703,7 @@ def _sample_device_greedy_group(
         valid,
         active,
         device_tokens,
-        cast(torch.Tensor, device_finish)
-        if empty_finish
-        else torch.zeros_like(device_tokens),
+        cast(torch.Tensor, device_finish) if empty_finish else torch.zeros_like(device_tokens),
         completion,
     )
     tagged_tokens = _tagged_token_values(

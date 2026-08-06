@@ -863,6 +863,7 @@ class SnapshotProvider:
         return {
             "session_id": state.session_id,
             "block_ids": list(state.block_ids),
+            "logical_blocks": list(state.logical_blocks),
             "prefix_len": state.prefix_len,
             "length": state.length,
             "group_id": state.group_id,
@@ -1027,6 +1028,7 @@ class SnapshotProvider:
         return KvCommittedState(
             session_id=_uint(data.get("session_id"), "snapshot KV.session_id"),
             block_ids=_uint_tuple(data.get("block_ids"), "snapshot KV.block_ids"),
+            logical_blocks=_uint_tuple(data.get("logical_blocks"), "snapshot KV.logical_blocks"),
             prefix_len=_uint(data.get("prefix_len"), "snapshot KV.prefix_len"),
             length=_uint(data.get("length"), "snapshot KV.length"),
             group_id=_uint(data.get("group_id"), "snapshot KV.group_id"),
@@ -1166,6 +1168,7 @@ class SnapshotProvider:
     def _release_assets(self, locators: Sequence[Locator]) -> None:
         for locator in reversed(tuple(locators)):
             self.transport.release(locator)
+
 
 def _pages_to_json(
     pages: KvPageState | None,

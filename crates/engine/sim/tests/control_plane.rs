@@ -1504,12 +1504,12 @@ fn hybrid_groups_handshake_runs() {
     use uniserve_core::{KvCacheGroupSpec, KvGroupKind};
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
-    // block 0 padding; group 0 full [1,2048), group 1 sliding-window [2048,4096).
+    // Group 0 covers [0, 2048); group 1 covers [2048, 4096).
     sim.set_groups(vec![
         KvCacheGroupSpec {
             group_id: 0,
-            block_offset: 1,
-            num_blocks: 2047,
+            block_offset: 0,
+            num_blocks: 2048,
             kind: KvGroupKind::Full,
         },
         KvCacheGroupSpec {
@@ -3238,10 +3238,10 @@ fn resource_leases_drain_to_zero_after_completion() {
     );
 }
 
-/// Host KV pages remain bound to their worker session until the exact close
-/// acknowledgement orders worker retirement ahead of cross-request reuse.
+/// Logical KV leases remain bound to their request until the exact close
+/// acknowledgement orders retirement ahead of cross-request reuse.
 #[test]
-fn kv_page_ownership_turns_over_after_close_acknowledgement() {
+fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps};
 
@@ -3270,18 +3270,20 @@ fn kv_page_ownership_turns_over_after_close_acknowledgement() {
         fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
             {
                 let mut owners = self.owners.lock().unwrap();
-                for operation in batch.operations() {
-                    let session_id = operation.request_key.session_id;
-                    for block in &operation.new_kv_blocks {
-                        if let Some(owner) = owners.get(&block.0) {
-                            anyhow::ensure!(
-                                *owner == session_id,
-                                "KV page {} remains owned by session {}",
-                                block.0,
-                                owner.0
-                            );
+                for partition in &batch.partitions {
+                    for reservation in &partition.kv_reservations {
+                        let session_id = reservation.request_key.session_id;
+                        for block in &reservation.logical_page_delta {
+                            if let Some(owner) = owners.get(&block.0) {
+                                anyhow::ensure!(
+                                    *owner == session_id,
+                                    "KV lease {} remains owned by session {}",
+                                    block.0,
+                                    owner.0
+                                );
+                            }
+                            owners.insert(block.0, session_id);
                         }
-                        owners.insert(block.0, session_id);
                     }
                 }
             }
@@ -3362,7 +3364,7 @@ fn kv_page_ownership_turns_over_after_close_acknowledgement() {
 
     assert_eq!(finished.len(), receivers.len());
     assert_eq!(scheduler.health_snapshot().active_credit_requests, 0);
-    assert_eq!(scheduler.health_snapshot().free_blocks, 1);
+    assert_eq!(scheduler.health_snapshot().free_blocks, 2);
     assert!(owners.lock().unwrap().is_empty());
 }
 
