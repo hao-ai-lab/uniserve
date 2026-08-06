@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use crate::cpu_continuation::{CpuContinuationPool, CpuMasks, CpuTask, CpuTaskKey};
 use crate::generation::{
     CursorApplyError, CursorProjection, EncoderCachePin, GenerationCursor,
-    GenerationPhase as Phase, GenerationPlanner, PlannedTransition, SchedulerContext,
-    TransitionIntent, TransitionValidationError,
+    GenerationPhase as Phase, GenerationPlanner, PlannedTransition, SchedulerApply,
+    SchedulerContext, TransitionIntent, TransitionValidationError,
 };
 
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -811,15 +811,12 @@ fn policy_str(policy: SchedulingPolicy) -> &'static str {
 }
 
 /// One submitted-but-unresolved operation tracked in a request's ordered queue.
+/// Its apply record is paired by `(operation.request_key, operation.op_id)`.
 struct InflightOp {
-    transition: PlannedTransition,
-    /// The op's wire `op_id`, echoed back on its result.
-    op_id: u64,
+    operation: Operation,
+    apply: SchedulerApply,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
-    /// Worst-case public events reserved before this operation was registered.
-    output_credit_bound: usize,
-    credits: CreditVector,
 }
 
 struct PendingCompletion {
@@ -1944,8 +1941,8 @@ impl Scheduler {
         true
     }
 
-    fn release_transition_resources(&mut self, id: RequestId, transition: &PlannedTransition) {
-        for class in &transition.resources.release_on_apply {
+    fn release_transition_resources(&mut self, id: RequestId, apply: &SchedulerApply) {
+        for class in &apply.release_on_apply {
             match class {
                 uniserve_worker_wire::ResourceClass::ImageLatent => {
                     if let Some(st) = self.running.get_mut(&id) {
@@ -2142,14 +2139,14 @@ impl Scheduler {
         self.inflight_ops
             .values()
             .flatten()
-            .any(|op| op.transition.operation_variant == WorkVariant::TokenExtend)
+            .any(|op| op.operation.work.variant() == WorkVariant::TokenExtend)
     }
 
     fn any_denoise_inflight(&self) -> bool {
         self.inflight_ops
             .values()
             .flatten()
-            .any(|op| op.transition.operation_variant == WorkVariant::GenFlow)
+            .any(|op| op.operation.work.variant() == WorkVariant::GenFlow)
     }
 
     fn has_inflight(&self, id: RequestId) -> bool {
@@ -2164,13 +2161,13 @@ impl Scheduler {
 
     fn projected_cursor(&self, id: RequestId) -> Option<CursorProjection> {
         let st = self.running.get(&id)?;
-        let transitions = self
+        let applies = self
             .inflight_ops
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|op| &op.transition);
-        Some(st.cursor.project(transitions))
+            .map(|op| &op.apply);
+        Some(st.cursor.project(applies))
     }
 
     fn projected_version(&self, id: RequestId) -> Option<u64> {
@@ -2195,12 +2192,12 @@ impl Scheduler {
         })
     }
 
-    fn public_limit_for(&self, id: RequestId, transition: &PlannedTransition) -> u64 {
+    fn public_limit_for(&self, id: RequestId, apply: &SchedulerApply) -> u64 {
         self.running.get(&id).map_or(0, |state| {
             state.public_event_limit.max(
                 state
                     .public_event_seq
-                    .saturating_add(transition_output_bound(transition) as u64),
+                    .saturating_add(apply.output_credit_bound as u64),
             )
         })
     }
@@ -2303,7 +2300,7 @@ impl Scheduler {
             return false;
         };
         if !self.executor.device_products_reachable(
-            predecessor.transition.operation_variant,
+            predecessor.operation.work.variant(),
             WorkVariant::TokenDecode,
         ) {
             return false;
@@ -2318,7 +2315,7 @@ impl Scheduler {
         // successor; any other variant is not a single-token advance.
         if queue.iter().any(|op| {
             !matches!(
-                op.transition.operation_variant,
+                op.operation.work.variant(),
                 WorkVariant::TokenExtend | WorkVariant::TokenDecode
             )
         }) {
@@ -2533,7 +2530,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|operation| operation.output_credit_bound)
+            .map(|operation| operation.apply.output_credit_bound)
             .sum::<usize>();
         available
             .saturating_sub(reserved)
@@ -2550,22 +2547,15 @@ impl Scheduler {
         }
     }
 
-    fn register_inflight(&mut self, transition: PlannedTransition, started: Instant) {
-        let request_id = transition.request_id;
-        let op_id = transition
-            .operation
-            .as_ref()
-            .map_or(0, |operation| operation.op_id.0);
-        let output_credit_bound = transition_output_bound(&transition);
+    fn register_inflight(&mut self, operation: Operation, apply: SchedulerApply, started: Instant) {
+        let request_id = operation.request_key.session_id;
         self.inflight_ops
             .entry(request_id)
             .or_default()
             .push_back(InflightOp {
-                credits: transition.reserved_credits,
-                transition,
-                op_id,
+                operation,
+                apply,
                 started,
-                output_credit_bound,
             });
     }
 
@@ -2577,10 +2567,12 @@ impl Scheduler {
     ) {
         let id = record.request_key.session_id;
         let op_id = record.op_id.0;
-        let known = self
-            .inflight_ops
-            .get(&id)
-            .is_some_and(|queue| queue.iter().any(|inflight| inflight.op_id == op_id));
+        let known = self.inflight_ops.get(&id).is_some_and(|queue| {
+            queue.iter().any(|inflight| {
+                inflight.operation.request_key == record.request_key
+                    && inflight.operation.op_id.0 == op_id
+            })
+        });
         let duplicate = self
             .pending_completions
             .get(&id)
@@ -2616,12 +2608,13 @@ impl Scheduler {
             .iter()
             .filter_map(|(id, pending)| {
                 let inflight = self.inflight_ops.get(id)?.front()?;
-                let completion = pending.get(&inflight.op_id)?;
+                let op_id = inflight.operation.op_id.0;
+                let completion = pending.get(&op_id)?;
                 Some((
-                    completion_priority(inflight.transition.operation_variant),
+                    completion_priority(inflight.operation.work.variant()),
                     completion.arrival_seq,
                     *id,
-                    inflight.op_id,
+                    op_id,
                 ))
             })
             .collect::<Vec<_>>();
@@ -2644,28 +2637,25 @@ impl Scheduler {
     /// Resolve the front in-flight op for `id` by the worker's echoed `op_id`.
     fn pop_inflight(
         &mut self,
-        id: RequestId,
+        request_key: RequestKey,
         op_id: u64,
-    ) -> (Option<PlannedTransition>, Option<Instant>) {
-        let Some(queue) = self.inflight_ops.get_mut(&id) else {
-            return (None, None);
-        };
-        if op_id == 0 || queue.front().is_none_or(|inflight| inflight.op_id != op_id) {
-            return (None, None);
+    ) -> Option<(Operation, SchedulerApply, Instant)> {
+        let id = request_key.session_id;
+        let queue = self.inflight_ops.get_mut(&id)?;
+        if op_id == 0
+            || queue.front().is_none_or(|inflight| {
+                inflight.operation.request_key != request_key || inflight.operation.op_id.0 != op_id
+            })
+        {
+            return None;
         }
         let inflight = queue.pop_front().expect("front checked above");
         let empty = queue.is_empty();
-        let parent_op_id = inflight
-            .transition
-            .operation
-            .as_ref()
-            .map_or(0, |operation| operation.parent.producer_op_id.0);
+        let parent_op_id = inflight.operation.parent.producer_op_id.0;
         let product_credits = inflight
-            .transition
             .operation
-            .as_ref()
-            .into_iter()
-            .flat_map(|operation| operation.outputs.iter())
+            .outputs
+            .iter()
             .filter(|output| {
                 matches!(
                     output.storage_class,
@@ -2675,7 +2665,7 @@ impl Scheduler {
             .map(|output| {
                 let credit = CreditVector {
                     device_products: 1,
-                    latent_artifact_bytes: if inflight.transition.resources.latent_units == 0
+                    latent_artifact_bytes: if !inflight.apply.request_latent_credit
                         && output.storage_class == StorageClass::LatentArena
                     {
                         output.max_bytes()
@@ -2694,10 +2684,10 @@ impl Scheduler {
             })
             .expect("bounded operation product credits fit one vector");
         let transient_credit = inflight
-            .credits
+            .apply
+            .reserved_credits
             .checked_sub(product_credit)
             .expect("product credit is a sub-vector of operation credit");
-        let result = (Some(inflight.transition), Some(inflight.started));
         if empty {
             self.inflight_ops.remove(&id);
         }
@@ -2708,7 +2698,7 @@ impl Scheduler {
         if parent_op_id > 0 {
             self.release_operation_product_credits(id, parent_op_id);
         }
-        result
+        Some((inflight.operation, inflight.apply, inflight.started))
     }
 
     fn release_operation_product_credits(&mut self, id: RequestId, op_id: u64) {
@@ -2908,8 +2898,9 @@ impl Scheduler {
                 } = completion;
                 let id = record.request_key.session_id;
                 let op_id = record.op_id.0;
-                let (transition, started) = self.pop_inflight(id, op_id);
-                let Some(transition) = transition else {
+                let Some((operation, apply, started)) =
+                    self.pop_inflight(record.request_key, op_id)
+                else {
                     self.trace_record(json!({
                         "event": "unknown_result_op_id",
                         "at_s": now(),
@@ -2921,12 +2912,10 @@ impl Scheduler {
                     }
                     continue;
                 };
-                let operation_variant = transition.operation_variant;
+                let operation_variant = operation.work.variant();
                 let view = SequenceView::from_report(&record, products.as_ref());
                 // fold this op's host-side round-trip latency into the history.
-                let roundtrip_us = started
-                    .map(|start| start.elapsed().as_micros() as u64)
-                    .unwrap_or(0);
+                let roundtrip_us = started.elapsed().as_micros() as u64;
                 self.latency
                     .observe(operation_variant.as_wire_str(), roundtrip_us);
                 // record the op-resolved lifecycle event (op_id echoed by the
@@ -2940,29 +2929,24 @@ impl Scheduler {
                         .and_then(|png| validate_png_artifact(png, None))
                         .map(|metadata| (metadata.height, metadata.width));
                     resolved_ops.push(json!({
-                    "request_id": id.0,
-                    "op_id": op_id,
-                    "operation_type": operation_variant.as_wire_str(),
-                    "transition_delta": transition.delta.as_str(),
-                    "transition_new_blocks": transition.resources.new_blocks,
-                    "transition_kv_target": transition.resources.kv_target_tokens,
-                    "transition_scratch_tokens": transition.resources.host_scratch_tokens,
-                    "transition_latent_units": transition.resources.latent_units,
-                    "transition_encoder_pins": transition.resources.encoder_pins.len(),
-                    "transition_replayability": transition.resources.replayability_after_apply.as_str(),
-                    "roundtrip_us": roundtrip_us,
-                    "completion_copy_us": record.timing_counters.copy_us,
-                    "completion_ready_to_observed_us": record.timing_counters.host_us,
-                    "sampled_token": sampled_token_ids_last.is_some(),
-                    "sampled_token_ids_len": sampled_token_ids_len,
-                    "sampled_token_ids_last": sampled_token_ids_last,
-                    "flow_done": view.flow_done,
-                    "steps_completed": record.logical_lengths.latent_len,
-                    "image_done": view.image_png.is_some(),
-                    "image_hw": image_hw,
-                    "kv_tokens": view.kv_visible_len,
-                    "product_handle": view.encode_generation,
-                }));
+                        "request_id": id.0,
+                        "op_id": op_id,
+                        "operation_type": operation_variant.as_wire_str(),
+                        "transition_delta": apply.delta.as_str(),
+                        "transition_replayability": apply.replayability_after_apply.as_str(),
+                        "roundtrip_us": roundtrip_us,
+                        "completion_copy_us": record.timing_counters.copy_us,
+                        "completion_ready_to_observed_us": record.timing_counters.host_us,
+                        "sampled_token": sampled_token_ids_last.is_some(),
+                        "sampled_token_ids_len": sampled_token_ids_len,
+                        "sampled_token_ids_last": sampled_token_ids_last,
+                        "flow_done": view.flow_done,
+                        "steps_completed": record.logical_lengths.latent_len,
+                        "image_done": view.image_png.is_some(),
+                        "image_hw": image_hw,
+                        "kv_tokens": view.kv_visible_len,
+                        "product_handle": view.encode_generation,
+                    }));
                 }
                 if let Some(st) = self.running.get_mut(&id) {
                     let mut ev =
@@ -2980,9 +2964,12 @@ impl Scheduler {
                         .get(&id)
                         .map_or(0, |state| state.version.min(u64::from(u32::MAX)) as u32)
                 });
-                if let Err(error) =
-                    transition.validate_result(&record, products.as_ref(), predicated_parent_point)
-                {
+                if let Err(error) = apply.validate_result(
+                    &operation,
+                    &record,
+                    products.as_ref(),
+                    predicated_parent_point,
+                ) {
                     self.trace_record(json!({
                         "event": "transition_validation_failed",
                         "at_s": now(),
@@ -2999,20 +2986,17 @@ impl Scheduler {
                 let semantic_blocked = self.running.get(&id).is_some_and(|state| state.cancelled)
                     || self.pending_finishes.contains_key(&id);
                 if semantic_blocked {
-                    self.release_transition_resources(id, &transition);
+                    self.release_transition_resources(id, &apply);
                     self.finish_pending_if_idle(id);
                     continue;
                 }
                 let expected_parent = self.fixed_version(id);
-                let prefix_versions = token_prefix_versions(
-                    transition.operation.as_ref(),
-                    &record,
-                    expected_parent.as_ref(),
-                );
+                let prefix_versions =
+                    token_prefix_versions(Some(&operation), &record, expected_parent.as_ref());
                 let cursor_result = self.running.get_mut(&id).map(|state| {
                     state
                         .cursor
-                        .apply_transition(&transition, &record, products.as_ref())
+                        .apply_transition(&operation, &apply, &record, products.as_ref())
                 });
                 if let Some(Err(error)) = cursor_result {
                     self.trace_record(json!({
@@ -3032,34 +3016,29 @@ impl Scheduler {
                 // control emission below decides when that point becomes semantic.
                 let advanced = record.status == OpStatus::Ok
                     && record.selected_point > 0
-                    && transition
-                        .operation
-                        .as_ref()
-                        .is_some_and(|operation| operation.advances_state);
+                    && operation.advances_state;
                 let latest_device_version = if advanced {
-                    transition.operation.as_ref().and_then(|operation| {
-                        let token = operation
-                            .outputs
-                            .iter()
-                            .find(|output| {
-                                output.kind == ProductKind::Token
-                                    && output.storage_class
-                                        == uniserve_worker_wire::StorageClass::DeviceTensor
-                            })
-                            .cloned();
-                        token.map(|token| ResidentDeviceVersion {
-                            producer: operation.work.variant(),
-                            token,
-                            version: VersionRef {
-                                request_key: operation.request_key,
-                                producer_op_id: operation.op_id,
-                                point: Point::Device {
-                                    point_index: record.selected_point,
-                                    selected_point: None,
-                                    producer_plan_digest: operation.plan_digest.clone(),
-                                },
-                            },
+                    let token = operation
+                        .outputs
+                        .iter()
+                        .find(|output| {
+                            output.kind == ProductKind::Token
+                                && output.storage_class
+                                    == uniserve_worker_wire::StorageClass::DeviceTensor
                         })
+                        .cloned();
+                    token.map(|token| ResidentDeviceVersion {
+                        producer: operation.work.variant(),
+                        token,
+                        version: VersionRef {
+                            request_key: operation.request_key,
+                            producer_op_id: operation.op_id,
+                            point: Point::Device {
+                                point_index: record.selected_point,
+                                selected_point: None,
+                                producer_plan_digest: operation.plan_digest.clone(),
+                            },
+                        },
                     })
                 } else {
                     None
@@ -3082,7 +3061,7 @@ impl Scheduler {
                     && let (Some(expected_parent), Some(selected)) =
                         (expected_parent, selected_fixed.clone())
                 {
-                    let public_event_limit = self.public_limit_for(id, &transition);
+                    let public_event_limit = self.public_limit_for(id, &apply);
                     let decoder_decision_required = matches!(
                         operation_variant,
                         WorkVariant::TokenExtend
@@ -3109,16 +3088,14 @@ impl Scheduler {
                         self.queue_commit(id, expected_parent, selected, public_event_limit);
                     }
                 }
-                self.release_transition_resources(id, &transition);
+                self.release_transition_resources(id, &apply);
                 if matches!(
                     operation_variant,
                     WorkVariant::GenFlow | WorkVariant::Materialize
                 ) {
-                    let consumed_latents = transition
-                        .operation
-                        .as_ref()
-                        .into_iter()
-                        .flat_map(|operation| operation.inputs.iter())
+                    let consumed_latents = operation
+                        .inputs
+                        .iter()
                         .filter(|product| product.kind == ProductKind::Latent)
                         .cloned()
                         .collect::<Vec<_>>();
@@ -3132,12 +3109,7 @@ impl Scheduler {
                     .get(&id)
                     .map_or(0, |state| state.public_token_seq);
                 if record.status == OpStatus::Predicated {
-                    let unused_products = transition
-                        .operation
-                        .as_ref()
-                        .into_iter()
-                        .flat_map(|operation| operation.outputs.iter().cloned())
-                        .collect();
+                    let unused_products = operation.outputs.to_vec();
                     self.release_products(unused_products);
                     self.finish_pending_if_idle(id);
                 } else {
@@ -3145,7 +3117,8 @@ impl Scheduler {
                         priority,
                         arrival_seq,
                         id,
-                        transition,
+                        operation,
+                        apply,
                         view,
                         selected_fixed,
                         public_tokens_before,
@@ -3158,7 +3131,8 @@ impl Scheduler {
                 _priority,
                 _seq_index,
                 id,
-                transition,
+                operation,
+                apply,
                 view,
                 selected_fixed,
                 public_tokens_before,
@@ -3166,11 +3140,11 @@ impl Scheduler {
             ) in to_resolve
             {
                 let token_operation = matches!(
-                    transition.operation_variant,
+                    operation.work.variant(),
                     WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
                 );
                 if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
-                    self.resolve(id, transition, view, prefix_versions.clone());
+                    self.resolve(id, operation, apply, view, prefix_versions.clone());
                 }
                 if token_operation {
                     let mut commit_without_decoder_event = None;
@@ -3674,7 +3648,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .any(|op| assembly_lane(op.transition.operation_variant) == AssemblyLane::Prefill)
+            .any(|op| assembly_lane(op.operation.work.variant()) == AssemblyLane::Prefill)
             || self
                 .peek_next_operation_variant(id)
                 .is_some_and(|operation_variant| {
@@ -4010,17 +3984,25 @@ impl Scheduler {
     fn submit_batch(
         &mut self,
         admissions: Vec<Admission>,
-        mut transitions: Vec<PlannedTransition>,
+        transitions: Vec<PlannedTransition>,
         mut controls: Vec<Control>,
     ) {
         let _span =
             tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
         self.step_id += 1;
         let step = self.step_id;
-        // /10: stamp each op's submit time (round-trip latency) + assign its
-        // op_id (lifecycle correlation), and record an OpSubmitted trace event.
         let submit_at = Instant::now();
-        for transition in &mut transitions {
+        let mut wire_ops = Vec::with_capacity(transitions.len());
+        let mut input_products = Vec::new();
+        let mut trace_ops = self
+            .trace_enabled()
+            .then(|| Vec::with_capacity(transitions.len()));
+        let admitted_request_keys = admissions
+            .iter()
+            .map(|admission| admission.request_key)
+            .collect::<HashSet<_>>();
+        let mut logical_page_deltas = HashMap::with_capacity(transitions.len());
+        for mut transition in transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
             let request_id = transition.request_id;
@@ -4072,7 +4054,7 @@ impl Scheduler {
                     .inflight_ops
                     .get(&request_id)
                     .and_then(|queue| queue.back())
-                    .and_then(|op| op.transition.operation.as_ref())
+                    .map(|op| &op.operation)
                 else {
                     tracing::error!(
                         request_id = request_id.0,
@@ -4131,23 +4113,67 @@ impl Scheduler {
                 .map_or(0, |state| state.control_seq);
             transition.kv_capacity_pages =
                 self.bm.blocks_for(request_id).len().min(u32::MAX as usize) as u32;
-            if let Err(error) = transition.assign_operation(
+            let logical_page_delta = if admitted_request_keys.contains(&request_key) {
+                self.bm
+                    .blocks_for(request_id)
+                    .iter()
+                    .take(transition.kv_capacity_pages as usize)
+                    .copied()
+                    .collect()
+            } else {
+                transition.new_blocks.clone()
+            };
+            let output_credit_bound = transition_output_bound(&transition);
+            let registered = transition.register(
                 request_key,
                 OpId(oid),
                 parent,
                 &mut self.next_product_generation,
-            ) {
-                tracing::error!(
-                    request_id = request_id.0,
-                    ?error,
-                    "scheduler authority exhausted product identity space"
-                );
-                self.fatal = true;
-                self.fail_all_running("scheduler authority exhausted product identity space");
-                return;
+                output_credit_bound,
+            );
+            let (operation, apply, payloads) = match registered {
+                Ok(registered) => registered,
+                Err(error) => {
+                    tracing::error!(
+                        request_id = request_id.0,
+                        ?error,
+                        "scheduler authority exhausted product identity space"
+                    );
+                    self.fatal = true;
+                    self.fail_all_running("scheduler authority exhausted product identity space");
+                    return;
+                }
+            };
+            logical_page_deltas
+                .insert((operation.request_key, operation.op_id), logical_page_delta);
+            let operation_variant = operation.work.variant().as_wire_str();
+            if let Some(trace_ops) = trace_ops.as_mut() {
+                let phase = self
+                    .running
+                    .get(&request_id)
+                    .map(|state| phase_str(state.lifecycle.phase));
+                trace_ops.push(json!({
+                    "request_id": request_id.0,
+                    "op_id": operation.op_id.0,
+                    "operation_type": operation_variant,
+                    "phase": phase,
+                    "operation": operation_trace(&operation, &apply),
+                    "transition": apply.delta.as_str(),
+                    "resources": {
+                        "reserved_credits": apply.reserved_credits,
+                        "release_on_apply": apply.release_on_apply,
+                        "request_latent_credit": apply.request_latent_credit,
+                        "replayability_after_apply": apply.replayability_after_apply.as_str(),
+                    },
+                    "visibility": {
+                        "und_tokens": format!("{:?}", apply.visibility.und_tokens),
+                        "generated_image": apply.visibility.generated_image,
+                    },
+                }));
             }
-            let operation_variant = transition.operation_variant.as_wire_str();
-            self.register_inflight(transition.clone(), submit_at);
+            input_products.extend(payloads);
+            self.register_inflight(operation.clone(), apply, submit_at);
+            wire_ops.push(operation);
             if let Some(st) = self.running.get_mut(&request_id) {
                 st.latest_device_version = None;
                 let mut ev =
@@ -4158,11 +4184,11 @@ impl Scheduler {
                 st.trace.push(ev);
             }
         }
-        self.peak_ops_in_batch = self.peak_ops_in_batch.max(transitions.len());
+        self.peak_ops_in_batch = self.peak_ops_in_batch.max(wire_ops.len());
         self.stats
             .general
             .peak_ops
-            .fetch_max(transitions.len(), Ordering::Relaxed);
+            .fetch_max(wire_ops.len(), Ordering::Relaxed);
         self.stats.general.steps.fetch_add(1, Ordering::Relaxed);
         self.stats
             .general
@@ -4176,50 +4202,20 @@ impl Scheduler {
             .kv_cache
             .free_blocks
             .store(self.bm.free_blocks(), Ordering::Relaxed);
-        let mixed = transitions.first().is_some_and(|first| {
-            transitions
+        let mixed = wire_ops.first().is_some_and(|first| {
+            wire_ops
                 .iter()
-                .any(|operation| operation.operation_variant != first.operation_variant)
+                .any(|operation| operation.work.variant() != first.work.variant())
         });
         self.batch_started.insert(step, submit_at);
-        if self.trace_enabled() {
-            let operation_types: Vec<&'static str> = transitions
+        if let Some(trace_ops) = trace_ops {
+            let operation_types: Vec<&'static str> = wire_ops
                 .iter()
-                .map(|operation| operation.operation_variant.as_wire_str())
+                .map(|operation| operation.work.variant().as_wire_str())
                 .collect();
-            let req_ids: Vec<u64> = transitions
+            let req_ids: Vec<u64> = wire_ops
                 .iter()
-                .map(|operation| operation.request_id.0)
-                .collect();
-            let trace_ops: Vec<_> = transitions
-                .iter()
-                .map(|transition| {
-                    let phase = self
-                        .running
-                        .get(&transition.request_id)
-                        .map(|state| phase_str(state.lifecycle.phase));
-                    json!({
-                        "request_id": transition.request_id.0,
-                        "op_id": transition.operation.as_ref().map(|operation| operation.op_id.0),
-                        "operation_type": transition.operation_variant.as_wire_str(),
-                        "phase": phase,
-                        "operation": operation_trace(transition),
-                        "token_cost": planned_op_token_cost(transition),
-                        "transition": transition.delta.as_str(),
-                        "resources": {
-                            "new_blocks": transition.resources.new_blocks,
-                            "kv_target_tokens": transition.resources.kv_target_tokens,
-                            "scratch_tokens": transition.resources.host_scratch_tokens,
-                            "latent_units": transition.resources.latent_units,
-                            "encoder_pins": transition.resources.encoder_pins,
-                            "replayability_after_apply": transition.resources.replayability_after_apply.as_str(),
-                        },
-                        "visibility": {
-                            "und_tokens": format!("{:?}", transition.visibility.und_tokens),
-                            "generated_image": transition.visibility.generated_image,
-                        },
-                    })
-                })
+                .map(|operation| operation.request_key.session_id.0)
                 .collect();
             let admitted_session_ids: Vec<u64> = admissions
                 .iter()
@@ -4229,7 +4225,7 @@ impl Scheduler {
                 "event": "batch_submitted",
                 "at_s": now(),
                 "step_id": step,
-                "batch_size": transitions.len(),
+                "batch_size": wire_ops.len(),
                 "mixed": mixed,
                 "operation_types": operation_types,
                 "request_ids": req_ids,
@@ -4250,13 +4246,13 @@ impl Scheduler {
             }));
         }
         if mixed {
-            let operation_types: Vec<&'static str> = transitions
+            let operation_types: Vec<&'static str> = wire_ops
                 .iter()
-                .map(|operation| operation.operation_variant.as_wire_str())
+                .map(|operation| operation.work.variant().as_wire_str())
                 .collect();
-            let req_ids: Vec<u64> = transitions
+            let req_ids: Vec<u64> = wire_ops
                 .iter()
-                .map(|operation| operation.request_id.0)
+                .map(|operation| operation.request_key.session_id.0)
                 .collect();
             tracing::debug!(
                 step_id = self.step_id,
@@ -4265,38 +4261,6 @@ impl Scheduler {
                 "submitting mixed forward batch"
             );
         }
-        let admitted_request_keys = admissions
-            .iter()
-            .map(|admission| admission.request_key)
-            .collect::<HashSet<_>>();
-        let logical_page_deltas = transitions
-            .iter()
-            .filter_map(|transition| {
-                transition.operation.as_ref().map(|operation| {
-                    let pages = if admitted_request_keys.contains(&operation.request_key) {
-                        self.bm
-                            .blocks_for(operation.request_key.session_id)
-                            .iter()
-                            .take(operation.kv_capacity_pages as usize)
-                            .copied()
-                            .collect()
-                    } else {
-                        transition.new_blocks.clone()
-                    };
-                    ((operation.request_key, operation.op_id), pages)
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        let wire_ops: Vec<uniserve_worker_wire::Operation> = transitions
-            .iter()
-            .filter_map(|transition| transition.operation.clone())
-            .collect();
-        // Host-supplied input product values (prompt/forced/prior/draft tokens,
-        // ingest image bytes) the operations reference through their inputs.
-        let input_products = transitions
-            .iter()
-            .flat_map(|transition| transition.input_products())
-            .collect();
         let releases = wire_ops
             .iter()
             .filter(|operation| operation.parent.producer_op_id.0 > 0)
@@ -5214,11 +5178,12 @@ impl Scheduler {
     fn resolve(
         &mut self,
         id: RequestId,
-        transition: PlannedTransition,
+        operation: Operation,
+        apply: SchedulerApply,
         mut view: SequenceView,
         prefix_versions: Vec<VersionRef>,
     ) {
-        let operation_variant = transition.operation_variant;
+        let operation_variant = operation.work.variant();
         if !view.prompt_logprobs.is_empty() {
             let positions = std::mem::take(&mut view.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
@@ -5229,7 +5194,7 @@ impl Scheduler {
         match operation_variant {
             WorkVariant::TokenExtend => {
                 self.bm.activate(id);
-                match &transition.delta {
+                match &apply.delta {
                     crate::generation::TransitionDelta::CloseKv { .. } => return,
                     crate::generation::TransitionDelta::IngestImageState {
                         is_final_step, ..
@@ -5430,7 +5395,7 @@ impl Scheduler {
             WorkVariant::GenFlow => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
-                    let prev = match transition.delta {
+                    let prev = match apply.delta {
                         crate::generation::TransitionDelta::DenoiseGen { start_step, .. } => {
                             start_step
                         }
@@ -5494,17 +5459,14 @@ impl Scheduler {
                     let Some(feedback_source) = feedback_source else {
                         return self.finish(id, FinishReason::Error);
                     };
-                    let source_product = transition.operation.as_ref().and_then(|operation| {
-                        operation
-                            .outputs
-                            .iter()
-                            .find(|product| {
-                                product.storage_class
-                                    == uniserve_worker_wire::StorageClass::LatentArena
-                                    && product.kind == uniserve_worker_wire::ProductKind::Artifact
-                            })
-                            .cloned()
-                    });
+                    let source_product = operation
+                        .outputs
+                        .iter()
+                        .find(|product| {
+                            product.storage_class == uniserve_worker_wire::StorageClass::LatentArena
+                                && product.kind == uniserve_worker_wire::ProductKind::Artifact
+                        })
+                        .cloned();
                     if feedback_source == uniserve_core::FeedbackSource::DeviceProduct
                         && source_product.is_none()
                     {
@@ -5533,23 +5495,22 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            WorkVariant::EncodeVision | WorkVariant::EncodeLatent => match &transition.delta {
+            WorkVariant::EncodeVision | WorkVariant::EncodeLatent => match &apply.delta {
                 crate::generation::TransitionDelta::EncodeImageStep {
                     encoder_cache_key, ..
                 } => {
-                    let Some(feature) = transition.operation.as_ref().and_then(|operation| {
-                        operation
-                            .outputs
-                            .iter()
-                            .find(|product| {
-                                matches!(
-                                    product.kind,
-                                    uniserve_worker_wire::ProductKind::VisionFeature
-                                        | uniserve_worker_wire::ProductKind::LatentFeature
-                                )
-                            })
-                            .cloned()
-                    }) else {
+                    let Some(feature) = operation
+                        .outputs
+                        .iter()
+                        .find(|product| {
+                            matches!(
+                                product.kind,
+                                uniserve_worker_wire::ProductKind::VisionFeature
+                                    | uniserve_worker_wire::ProductKind::LatentFeature
+                            )
+                        })
+                        .cloned()
+                    else {
                         return self.finish(id, FinishReason::Error);
                     };
                     let result_handle = u64::from(feature.generation);
@@ -5588,19 +5549,18 @@ impl Scheduler {
                     }
                 }
                 crate::generation::TransitionDelta::EncodeFeedbackStep { .. } => {
-                    let Some(feature) = transition.operation.as_ref().and_then(|operation| {
-                        operation
-                            .outputs
-                            .iter()
-                            .find(|product| {
-                                matches!(
-                                    product.kind,
-                                    uniserve_worker_wire::ProductKind::VisionFeature
-                                        | uniserve_worker_wire::ProductKind::LatentFeature
-                                )
-                            })
-                            .cloned()
-                    }) else {
+                    let Some(feature) = operation
+                        .outputs
+                        .iter()
+                        .find(|product| {
+                            matches!(
+                                product.kind,
+                                uniserve_worker_wire::ProductKind::VisionFeature
+                                    | uniserve_worker_wire::ProductKind::LatentFeature
+                            )
+                        })
+                        .cloned()
+                    else {
                         return self.finish(id, FinishReason::Error);
                     };
                     let handle = u64::from(feature.generation);
@@ -6295,26 +6255,21 @@ fn enqueue_public_event(
     false
 }
 
-fn operation_trace(transition: &PlannedTransition) -> serde_json::Value {
-    let parent_kind = transition
-        .operation
-        .as_ref()
-        .map(|operation| match operation.parent.point {
-            Point::Fixed { .. } => "fixed",
-            Point::Device { .. } => "device",
-        });
+fn operation_trace(operation: &Operation, apply: &SchedulerApply) -> serde_json::Value {
+    let parent_kind = match operation.parent.point {
+        Point::Fixed { .. } => "fixed",
+        Point::Device { .. } => "device",
+    };
     json!({
-        "work": transition.operation_variant.as_wire_str(),
-        "domain": format!("{:?}", transition.domain),
+        "work": operation.work.variant().as_wire_str(),
+        "domain": format!("{:?}", operation.domain),
         "parent_kind": parent_kind,
-        "predicated": transition.predicate.is_some(),
-        "token_cost": transition.token_cost,
-        "draft_count": transition.draft_token_ids.len(),
-        "new_blocks": transition.new_blocks.len(),
-        "inputs": transition.inputs.len(),
-        "outputs": transition.outputs.len(),
-        "max_tokens": transition.bounds.max_tokens,
-        "max_kv_pages": transition.bounds.max_kv_pages,
+        "predicated": operation.predicate.is_some(),
+        "inputs": operation.inputs.len(),
+        "outputs": operation.outputs.len(),
+        "max_tokens": operation.bounds.max_tokens,
+        "max_kv_pages": operation.bounds.max_kv_pages,
+        "output_credit_bound": apply.output_credit_bound,
     })
 }
 

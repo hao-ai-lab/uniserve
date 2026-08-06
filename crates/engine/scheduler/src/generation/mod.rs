@@ -21,7 +21,7 @@ const ROUTE: RouteId = RouteId(0);
 
 /// A product reference minted by the planner for an operation output. The
 /// owning `request_key` and `producer_op_id` are placeholder until
-/// [`PlannedTransition::assign_operation`] stamps the real identity. The shape
+/// [`PlannedTransition::register`] stamps the real identity. The shape
 /// bound is empty (it carries identity, not a device geometry).
 fn output_product(
     output_index: u16,
@@ -513,11 +513,12 @@ impl GenerationCursor {
     /// mutate the committed cursor; this is the sole cursor-delta commit path.
     pub(crate) fn apply_transition(
         &mut self,
-        transition: &PlannedTransition,
+        operation: &Operation,
+        apply: &SchedulerApply,
         record: &CompletionRecord,
         products: &[ProductPayload],
     ) -> Result<(), CursorApplyError> {
-        let op_id = transition.operation.as_ref().map_or(0, |op| op.op_id.0);
+        let op_id = operation.op_id.0;
         if op_id == 0 {
             return Err(CursorApplyError::MissingOperationId);
         }
@@ -527,7 +528,7 @@ impl GenerationCursor {
         if record.status == OpStatus::Predicated {
             return Ok(());
         }
-        match transition.delta {
+        match apply.delta {
             TransitionDelta::IngestText {
                 start,
                 end,
@@ -589,10 +590,6 @@ impl GenerationCursor {
                 self.lifecycle.phase = GenerationPhase::PublishKv;
             }
             TransitionDelta::PublishKv { .. } => {
-                let operation = transition
-                    .operation
-                    .as_ref()
-                    .ok_or(CursorApplyError::MissingOperationId)?;
                 self.image_gen.conditioning = products
                     .iter()
                     .find(|payload| {
@@ -606,10 +603,6 @@ impl GenerationCursor {
                 self.lifecycle.phase = GenerationPhase::TransitionGen;
             }
             TransitionDelta::TransitionGen { .. } => {
-                let operation = transition
-                    .operation
-                    .as_ref()
-                    .ok_or(CursorApplyError::MissingOperationId)?;
                 self.image_gen.latent = operation
                     .outputs
                     .iter()
@@ -632,10 +625,6 @@ impl GenerationCursor {
                     .image_gen
                     .steps_done
                     .max(steps_completed.max(start_step.saturating_add(step_count)));
-                let operation = transition
-                    .operation
-                    .as_ref()
-                    .ok_or(CursorApplyError::MissingOperationId)?;
                 self.image_gen.latent = operation
                     .outputs
                     .iter()
@@ -671,15 +660,13 @@ impl GenerationCursor {
                 }
             }
         }
-        self.replay.replayability = match (
-            self.replay.replayability,
-            transition.resources.replayability_after_apply,
-        ) {
-            (Replayability::NotReplayable, _) | (_, Replayability::NotReplayable) => {
-                Replayability::NotReplayable
-            }
-            (Replayability::Replayable, Replayability::Replayable) => Replayability::Replayable,
-        };
+        self.replay.replayability =
+            match (self.replay.replayability, apply.replayability_after_apply) {
+                (Replayability::NotReplayable, _) | (_, Replayability::NotReplayable) => {
+                    Replayability::NotReplayable
+                }
+                (Replayability::Replayable, Replayability::Replayable) => Replayability::Replayable,
+            };
         Ok(())
     }
 
@@ -705,7 +692,7 @@ impl GenerationCursor {
 
     pub(crate) fn project<'a>(
         &self,
-        transitions: impl IntoIterator<Item = &'a PlannedTransition>,
+        applies: impl IntoIterator<Item = &'a SchedulerApply>,
     ) -> CursorProjection {
         let mut projection = CursorProjection {
             phase: self.lifecycle.phase,
@@ -714,8 +701,8 @@ impl GenerationCursor {
             physical_kv_len: self.und.physical_kv_len,
             replayability: self.replay.replayability,
         };
-        for transition in transitions {
-            projection.apply(transition);
+        for apply in applies {
+            projection.apply(apply);
         }
         projection
     }
@@ -828,8 +815,8 @@ pub(crate) struct CursorProjection {
 }
 
 impl CursorProjection {
-    fn apply(&mut self, transition: &PlannedTransition) {
-        match transition.delta {
+    fn apply(&mut self, apply: &SchedulerApply) {
+        match apply.delta {
             TransitionDelta::IngestText {
                 start,
                 end,
@@ -909,7 +896,7 @@ impl CursorProjection {
                 }
             }
         }
-        if transition.resources.replayability_after_apply == Replayability::NotReplayable {
+        if apply.replayability_after_apply == Replayability::NotReplayable {
             self.replayability = Replayability::NotReplayable;
         }
     }
@@ -1789,19 +1776,15 @@ impl GenerationPlanner {
             predicate: None,
             rng,
             control_seq: 0,
-            operation: None,
             reserved_credits: CreditVector::ZERO,
             operation_variant,
             request_id: request.request_id,
-            draft_token_ids: wire.draft_token_ids,
             new_blocks: wire.new_blocks,
             kv_capacity_pages: 0,
             token_cost: wire.token_cost,
             input_tokens: wire.input_tokens,
             input_image_bytes: wire.input_image_bytes,
             sampling_state: wire.sampling_state,
-            host_input: None,
-            sampling_input: None,
             device_parent_point: None,
             delta,
             resources,
@@ -1957,14 +1940,8 @@ pub(crate) enum PlanningError {
     ProductGenerationExhausted,
 }
 
-/// Scheduler-local transition associated with one submitted worker op.
-/// The wire-operation ingredients (`work`, `route`, `domain`, `bounds`,
-/// `inputs`, `outputs`, `rng`, `control_seq`) are lowered by the planner; the
-/// flat [`Operation`] is stamped with request and lineage identity at submit
-/// time by [`PlannedTransition::assign_operation`]. The host-side
-/// `draft_token_ids`, logical KV accounting, and `token_cost` carry scheduler-owned
-/// accounting outside the wire operation.
-#[derive(Debug, Clone)]
+/// Ephemeral scheduler builder consumed when an operation is registered.
+#[derive(Debug)]
 pub(crate) struct PlannedTransition {
     pub(crate) work: Work,
     pub(crate) route: RouteId,
@@ -1975,12 +1952,10 @@ pub(crate) struct PlannedTransition {
     pub(crate) predicate: Option<ProductRef>,
     pub(crate) rng: Option<Rng>,
     pub(crate) control_seq: u64,
-    pub(crate) operation: Option<Operation>,
     /// Exact operation-scoped vector acquired before registration.
     pub(crate) reserved_credits: CreditVector,
     pub(crate) operation_variant: WorkVariant,
     pub(crate) request_id: RequestId,
-    pub(crate) draft_token_ids: Vec<u32>,
     pub(crate) new_blocks: Vec<BlockId>,
     pub(crate) kv_capacity_pages: u32,
     pub(crate) token_cost: usize,
@@ -1990,16 +1965,9 @@ pub(crate) struct PlannedTransition {
     pub(crate) input_image_bytes: Option<Vec<u8>>,
     /// Branch-local processor state consumed by this operation's sampler.
     pub(crate) sampling_state: Option<SamplingState>,
-    /// The reference of the host-supplied input product, stamped with the
-    /// operation identity at [`PlannedTransition::assign_operation`]. Its value
-    /// is transported in the batch's `input_products` under the same identity.
-    pub(crate) host_input: Option<ProductRef>,
-    /// The host-staging product that carries `sampling_state`.
-    pub(crate) sampling_input: Option<ProductRef>,
     /// For a `Point::Device`-rooted successor, the scheduler-owned point index
     /// selected by its parent. `None` for a fixed-parent op, whose parent point
-    /// is carried directly on the parent `Point::Fixed`. Used by
-    /// [`PlannedTransition::validate_result`] to reconstruct the expected point.
+    /// is carried directly on the parent `Point::Fixed`.
     pub(crate) device_parent_point: Option<u32>,
     pub(crate) delta: TransitionDelta,
     pub(crate) resources: TransitionResources,
@@ -2007,16 +1975,32 @@ pub(crate) struct PlannedTransition {
     pub(crate) visibility: OutputVisibilityPlan,
 }
 
+/// Scheduler-owned completion policy and validation state paired with an
+/// immutable registered operation.
+#[derive(Debug)]
+pub(crate) struct SchedulerApply {
+    pub(crate) delta: TransitionDelta,
+    pub(crate) validation: TransitionValidation,
+    pub(crate) visibility: OutputVisibilityPlan,
+    pub(crate) replayability_after_apply: Replayability,
+    pub(crate) release_on_apply: Vec<ResourceClass>,
+    pub(crate) request_latent_credit: bool,
+    pub(crate) reserved_credits: CreditVector,
+    pub(crate) output_credit_bound: usize,
+    pub(crate) device_parent_point: Option<u32>,
+}
+
 impl PlannedTransition {
-    /// Stamp the flat operation with its request key, operation id, and parent
-    /// version. The declared outputs inherit the owning identity.
-    pub(crate) fn assign_operation(
-        &mut self,
+    /// Consume this builder into the immutable operation, its scheduler apply
+    /// record, and the exact host input payloads carried by the submission.
+    pub(crate) fn register(
+        self,
         request_key: RequestKey,
         op_id: OpId,
         parent: VersionRef,
         next_product_generation: &mut u64,
-    ) -> Result<(), PlanningError> {
+        output_credit_bound: usize,
+    ) -> Result<(Operation, SchedulerApply, Vec<ProductPayload>), PlanningError> {
         let required_generations = self
             .outputs
             .iter()
@@ -2079,8 +2063,7 @@ impl PlannedTransition {
         };
         let outputs = self
             .outputs
-            .iter()
-            .cloned()
+            .into_iter()
             .map(|mut product| {
                 product.request_key = request_key;
                 product.producer_op_id = op_id;
@@ -2090,21 +2073,18 @@ impl PlannedTransition {
                 product
             })
             .collect();
-        let mut inputs = self.inputs.clone();
-        // Stamp the host-supplied input product with the operation identity and
-        // list it among the operation's inputs; its value travels in the batch's
-        // `input_products` under this same identity.
-        if let Some(mut product) = host_input {
+        let mut inputs = self.inputs;
+        let host_input = host_input.map(|mut product| {
             product.generation = acquire_generation();
-            self.host_input = Some(product.clone());
-            inputs.push(product);
-        }
-        if let Some(mut product) = sampling_input {
+            product
+        });
+        let sampling_input = sampling_input.map(|mut product| {
             product.generation = acquire_generation();
-            self.sampling_input = Some(product.clone());
-            inputs.push(product);
-        }
-        self.operation = Some(Operation::registered(
+            product
+        });
+        inputs.extend(host_input.iter().cloned());
+        inputs.extend(sampling_input.iter().cloned());
+        let operation = Operation::registered(
             request_key,
             op_id,
             parent,
@@ -2115,48 +2095,45 @@ impl PlannedTransition {
             inputs,
             outputs,
             self.kv_capacity_pages,
-            self.predicate.clone(),
+            self.predicate,
             self.rng,
             self.control_seq,
-        ));
-        Ok(())
-    }
-
-    /// Host-supplied values keyed by the exact input references stamped at
-    /// registration.
-    pub(crate) fn input_products(&self) -> Vec<ProductPayload> {
-        let mut values = Vec::with_capacity(2);
-        if let Some(product) = self.host_input.clone() {
+        );
+        let mut input_products = Vec::with_capacity(2);
+        if let Some(product) = host_input {
             let bytes = if !self.input_tokens.is_empty() {
                 encode_token_product_bytes(&self.input_tokens)
             } else {
-                self.input_image_bytes.clone().unwrap_or_default()
+                self.input_image_bytes.unwrap_or_default()
             };
-            values.push(ProductPayload { product, bytes });
+            input_products.push(ProductPayload { product, bytes });
         }
-        if let (Some(product), Some(state)) =
-            (self.sampling_input.clone(), self.sampling_state.as_ref())
-        {
-            values.push(ProductPayload {
-                product,
-                bytes: encode_sampling_state_bytes(state),
-            });
+        if let (Some(product), Some(bytes)) = (sampling_input, sampling_bytes) {
+            input_products.push(ProductPayload { product, bytes });
         }
-        values
+        let apply = SchedulerApply {
+            delta: self.delta,
+            validation: self.validation,
+            visibility: self.visibility,
+            replayability_after_apply: self.resources.replayability_after_apply,
+            release_on_apply: self.resources.release_on_apply,
+            request_latent_credit: self.resources.latent_units > 0,
+            reserved_credits: self.reserved_credits,
+            output_credit_bound,
+            device_parent_point: self.device_parent_point,
+        };
+        Ok((operation, apply, input_products))
     }
+}
 
+impl SchedulerApply {
     pub(crate) fn validate_result(
         &self,
+        operation: &Operation,
         record: &CompletionRecord,
         products: &[ProductPayload],
         predicated_parent_point: Option<u32>,
     ) -> Result<(), TransitionValidationError> {
-        let Some(operation) = self.operation.as_ref() else {
-            return Err(TransitionValidationError::OpIdMismatch {
-                expected: 0,
-                actual: record.op_id.0,
-            });
-        };
         if record.request_key != operation.request_key {
             return Err(TransitionValidationError::SessionMismatch {
                 expected: operation.request_key.session_id.0,
@@ -2175,7 +2152,7 @@ impl PlannedTransition {
                 ..
             } => parent_point,
             // A device parent carries no host-known point index. The scheduler
-            // threads its selected point onto the transition at submit.
+            // records its selected point in the validation expectations.
             Point::Device { .. } => {
                 let Some(device_parent_point) = self.device_parent_point else {
                     return Err(TransitionValidationError::VersionMismatch {
@@ -2215,7 +2192,7 @@ impl PlannedTransition {
             });
         }
         self.validation
-            .validate(self.operation_variant, record, products)
+            .validate(operation.work.variant(), record, products)
     }
 }
 
@@ -2918,7 +2895,7 @@ mod tests {
         request.sampling.return_prompt_logprobs = true;
         request.sampling.n_prompt_logprobs = 4;
         request.sampling.logprob_token_ids = vec![17, 19, 17];
-        let mut transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new()
             .plan(
                 &request,
                 CursorProjection {
@@ -2957,20 +2934,15 @@ mod tests {
             },
         };
         let mut next_generation = 1;
-        transition
-            .assign_operation(request_key, OpId(21), parent, &mut next_generation)
-            .expect("assign scored prefill");
-        transition
-            .operation
-            .as_ref()
-            .expect("registered operation")
-            .validate()
-            .expect("bounded operation");
+        let (operation, _, _) = transition
+            .register(request_key, OpId(21), parent, &mut next_generation, 0)
+            .expect("register scored prefill");
+        operation.validate().expect("bounded operation");
     }
 
     #[test]
     fn transition_validates_the_token_selected_under_its_branch_state() {
-        let mut transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new()
             .plan(
                 &request(13, vec![11, 12]),
                 CursorProjection {
@@ -3002,11 +2974,10 @@ mod tests {
             },
         };
         let mut next_generation = 1;
-        transition
-            .assign_operation(request_key, OpId(19), parent, &mut next_generation)
-            .expect("assign constrained operation");
-        let sampling_payload = transition
-            .input_products()
+        let (operation, apply, input_products) = transition
+            .register(request_key, OpId(19), parent, &mut next_generation, 0)
+            .expect("register constrained operation");
+        let sampling_payload = input_products
             .into_iter()
             .find(|payload| payload.product.kind == ProductKind::SamplingState)
             .expect("branch-local sampling input");
@@ -3016,18 +2987,11 @@ mod tests {
                 .allowed_token_ids,
             Some(vec![7])
         );
-        assert!(
-            transition
-                .operation
-                .as_ref()
-                .expect("registered operation")
-                .inputs
-                .contains(&sampling_payload.product)
-        );
+        assert!(operation.inputs.contains(&sampling_payload.product));
         let record = completion(request_key, 19, 1);
 
         assert!(matches!(
-            transition.validate_result(&record, &[], None),
+            apply.validate_result(&operation, &record, &[], None),
             Err(TransitionValidationError::SampledTokenOutsideAllowedSet { token_id: 13 })
         ));
     }
@@ -3044,25 +3008,20 @@ mod tests {
                 semantic_digest: digest(),
             },
         };
-        let mut next_generation = 1;
-        transition
-            .assign_operation(request_key, OpId(20), parent, &mut next_generation)
-            .expect("assign predicated operation");
         let mut predicate = transition
-            .operation
-            .as_ref()
-            .expect("registered operation")
             .outputs
             .iter()
             .find(|output| output.kind == ProductKind::Token)
             .expect("token operation decision predicate")
             .clone();
+        predicate.request_key = request_key;
         predicate.producer_op_id = OpId(19);
-        transition
-            .operation
-            .as_mut()
-            .expect("registered operation")
-            .predicate = Some(predicate);
+        predicate.generation = 1;
+        transition.predicate = Some(predicate);
+        let mut next_generation = 1;
+        let (operation, apply, _) = transition
+            .register(request_key, OpId(20), parent, &mut next_generation, 0)
+            .expect("register predicated operation");
         let mut record = completion(request_key, 20, 0);
         record.status = OpStatus::Predicated;
         record.token_span.len = 0;
@@ -3070,12 +3029,15 @@ mod tests {
         record.product_generations.clear();
         record.finish_flags = FinishFlags::default();
 
-        assert_eq!(transition.validate_result(&record, &[], Some(0)), Ok(()));
+        assert_eq!(
+            apply.validate_result(&operation, &record, &[], Some(0)),
+            Ok(())
+        );
         let mut cursor = GenerationCursor::new(GenerationPhase::Prefill, 8, false);
         let mut expected = cursor.clone();
         expected.applied_op_ids.insert(20);
         cursor
-            .apply_transition(&transition, &record, &[])
+            .apply_transition(&operation, &apply, &record, &[])
             .expect("apply predicated completion");
         assert_eq!(cursor, expected);
     }
@@ -3191,7 +3153,7 @@ mod tests {
 
     #[test]
     fn transition_accepts_only_the_registered_completion() {
-        let mut transition = prefill_transition();
+        let transition = prefill_transition();
         let request_key = RequestKey::new(1, RequestId(9), 3);
         let parent = VersionRef {
             request_key,
@@ -3202,10 +3164,15 @@ mod tests {
             },
         };
         let mut next_product_generation = 1_u64;
-        transition
-            .assign_operation(request_key, OpId(17), parent, &mut next_product_generation)
+        let (operation, apply, _) = transition
+            .register(
+                request_key,
+                OpId(17),
+                parent,
+                &mut next_product_generation,
+                0,
+            )
             .expect("generation space");
-        let operation = transition.operation.as_ref().expect("assigned operation");
         let mut generations = operation
             .outputs
             .iter()
@@ -3219,11 +3186,14 @@ mod tests {
         assert_eq!(generations.len(), generation_count);
 
         let record = completion(request_key, 17, 1);
-        assert_eq!(transition.validate_result(&record, &[], None), Ok(()));
+        assert_eq!(
+            apply.validate_result(&operation, &record, &[], None),
+            Ok(())
+        );
 
         let stale = completion(request_key, 17, 2);
         assert!(matches!(
-            transition.validate_result(&stale, &[], None),
+            apply.validate_result(&operation, &stale, &[], None),
             Err(TransitionValidationError::VersionMismatch { .. })
         ));
     }
@@ -3244,23 +3214,16 @@ mod tests {
             },
         };
         let mut next_product_generation = u64::from(u32::MAX);
-        transition
-            .assign_operation(
+        let (operation, _, _) = transition
+            .register(
                 request_key,
                 OpId(17),
                 parent.clone(),
                 &mut next_product_generation,
+                0,
             )
             .expect("last generation");
-        assert_eq!(
-            transition
-                .operation
-                .as_ref()
-                .expect("assigned operation")
-                .outputs[0]
-                .generation,
-            u32::MAX
-        );
+        assert_eq!(operation.outputs[0].generation, u32::MAX);
 
         let mut exhausted = prefill_transition();
         exhausted.outputs.truncate(1);
@@ -3268,7 +3231,14 @@ mod tests {
         exhausted.sampling_state = None;
         assert_eq!(
             exhausted
-                .assign_operation(request_key, OpId(18), parent, &mut next_product_generation,),
+                .register(
+                    request_key,
+                    OpId(18),
+                    parent,
+                    &mut next_product_generation,
+                    0,
+                )
+                .map(|_| ()),
             Err(PlanningError::ProductGenerationExhausted)
         );
         assert_eq!(next_product_generation, u64::from(u32::MAX) + 1);
