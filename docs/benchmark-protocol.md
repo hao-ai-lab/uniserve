@@ -27,7 +27,7 @@ uniserve-eval compare decode-runtime \
   --output-dir /path/to/comparison
 ```
 
-The `decode-runtime` suite supplies its 10% parent-comparison screen. Before each construction commit, run all four suite points for the prospective commit and its direct parent, then compare those two result roots. A single benchmark point can be used in place of a suite name; comparison of a single point requires `--max-regression`. A comparison screen result reports a metric crossing for diagnosis; it does not establish causality by itself.
+The `decode-runtime` suite produces a threshold-free direct-parent report. Before each construction commit, run all four suite points for the prospective commit and its direct parent, then compare those two result roots and submit the raw values for the authorization decision defined by the construction protocol. A single benchmark point can be used in place of a suite name; callers may request an independent numerical screen explicitly with `--max-regression` when another protocol requires one.
 
 ## Configuration
 
@@ -69,4 +69,4 @@ Git state, GPU information, server command, selected environment values, and ser
 
 The direct parent and prospective commit must have identical benchmark names, declared workloads, selected rows, and metric declarations. The comparator reads aggregate metrics from the complete point bundles; it never filters to a successful-request intersection. When the task allows natural EOS or open-ended interleave output, realized token and image counts are measured results rather than workload-equivalence fields.
 
-For higher-is-better metrics the normalized ratio is `candidate / reference`. For lower-is-better metrics it is `reference / candidate`. Every row reports both raw values, raw percentage change, normalized ratio, threshold, and comparison-screen result. A screen crossing is evidence for diagnosis, not an automatic performance gate failure or a reason to halt work.
+The threshold-free report shows metric direction, the direct-parent value, the prospective-commit value, and raw percentage change for every protected metric. It does not aggregate metrics or issue a performance conclusion. When another suite or caller explicitly configures a numerical screen, higher-is-better metrics use `candidate / reference`, lower-is-better metrics use `reference / candidate`, and the report additionally contains the normalized ratio, threshold, and screen result.

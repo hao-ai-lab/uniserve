@@ -12,7 +12,7 @@ def compare_pair(
     reference_directory: str | Path,
     candidate_directory: str | Path,
     *,
-    max_regression: float,
+    max_regression: float | None = None,
 ) -> dict[str, Any]:
     reference = _load_summary(reference_directory)
     candidate = _load_summary(candidate_directory)
@@ -31,34 +31,38 @@ def compare_pair(
         direction = definition.get("direction")
         ref_value = _metric(reference.get("metrics", {}), path)
         cand_value = _metric(candidate.get("metrics", {}), path)
-        normalized_ratio = None
         raw_change_percent = None
-        passed = False
         if ref_value is None or cand_value is None or ref_value <= 0 or cand_value <= 0:
             failures.append(f"metric_unavailable:{path}")
         else:
             raw_change_percent = (cand_value / ref_value - 1.0) * 100.0
-            normalized_ratio = (
-                cand_value / ref_value if direction == "higher" else ref_value / cand_value
+        metric = {
+            "path": path,
+            "direction": direction,
+            "reference": ref_value,
+            "candidate": cand_value,
+            "raw_change_percent": raw_change_percent,
+        }
+        if max_regression is not None:
+            normalized_ratio = None
+            passed = False
+            if ref_value is not None and cand_value is not None and ref_value > 0 and cand_value > 0:
+                normalized_ratio = (
+                    cand_value / ref_value if direction == "higher" else ref_value / cand_value
+                )
+                passed = normalized_ratio >= 1.0 - max_regression
+            metric.update(
+                {
+                    "normalized_ratio": normalized_ratio,
+                    "minimum_ratio": 1.0 - max_regression,
+                    "passed": passed,
+                }
             )
-            passed = normalized_ratio >= 1.0 - max_regression
-        metrics.append(
-            {
-                "path": path,
-                "direction": direction,
-                "reference": ref_value,
-                "candidate": cand_value,
-                "raw_change_percent": raw_change_percent,
-                "normalized_ratio": normalized_ratio,
-                "minimum_ratio": 1.0 - max_regression,
-                "passed": passed,
-            }
-        )
+        metrics.append(metric)
     comparable = not failures
-    return {
+    result = {
         "benchmark": reference.get("benchmark") or candidate.get("benchmark"),
         "comparable": comparable,
-        "passed": comparable and bool(metrics) and all(metric["passed"] for metric in metrics),
         "metrics": metrics,
         "failures": failures,
         "warnings": {
@@ -66,6 +70,11 @@ def compare_pair(
             "candidate": candidate.get("warnings", []),
         },
     }
+    if max_regression is not None:
+        result["passed"] = comparable and bool(metrics) and all(
+            metric["passed"] for metric in metrics
+        )
+    return result
 
 
 def compare_suite(
@@ -73,7 +82,7 @@ def compare_suite(
     candidate_root: str | Path,
     points: Sequence[str],
     *,
-    max_regression: float,
+    max_regression: float | None = None,
 ) -> dict[str, Any]:
     reference_root = Path(reference_root)
     candidate_root = Path(candidate_root)
@@ -85,15 +94,24 @@ def compare_suite(
         )
         for point in points
     ]
-    return {
-        "max_regression": max_regression,
+    result = {
         "valid": all(comparison["comparable"] for comparison in comparisons),
-        "passed": bool(comparisons) and all(comparison["passed"] for comparison in comparisons),
         "comparisons": comparisons,
     }
+    if max_regression is not None:
+        result.update(
+            {
+                "max_regression": max_regression,
+                "passed": bool(comparisons)
+                and all(comparison["passed"] for comparison in comparisons),
+            }
+        )
+    return result
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    if report.get("max_regression") is None:
+        return _render_unscreened_markdown(report)
     lines = [
         "# Benchmark comparison",
         "",
@@ -117,6 +135,34 @@ def render_markdown(report: dict[str, Any]) -> str:
                     change=_percent(metric.get("raw_change_percent")),
                     ratio=_number(metric.get("normalized_ratio")),
                     result="pass" if metric.get("passed") else "fail",
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _render_unscreened_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# Benchmark comparison",
+        "",
+        f"Bundle validity: {'valid' if report.get('valid') else 'invalid'}",
+        "",
+        "| Benchmark | Metric | Direction | Reference | Candidate | Raw change |",
+        "| --- | --- | --- | ---: | ---: | ---: |",
+    ]
+    for comparison in report.get("comparisons", []):
+        if not comparison.get("metrics"):
+            lines.append(
+                f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a |"
+            )
+        for metric in comparison.get("metrics", []):
+            lines.append(
+                "| {benchmark} | `{path}` | {direction} | {reference} | {candidate} | {change} |".format(
+                    benchmark=comparison.get("benchmark"),
+                    path=metric.get("path"),
+                    direction=metric.get("direction"),
+                    reference=_number(metric.get("reference")),
+                    candidate=_number(metric.get("candidate")),
+                    change=_percent(metric.get("raw_change_percent")),
                 )
             )
     return "\n".join(lines) + "\n"

@@ -134,4 +134,3 @@ mean_tpot_ms = "lower"
 
 [suites.decode-runtime]
 points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-c32", "sensenova-uniserve-t2i-c32", "sensenova-uniserve-interleave-c4"]
-max_regression = 0.10

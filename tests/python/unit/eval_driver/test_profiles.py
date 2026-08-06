@@ -23,7 +23,7 @@ def test_decode_runtime_suite_resolves_to_four_explicit_points() -> None:
         ("mean_tpot_ms", "lower"),
         ("images.image_latency_ms.mean", "lower"),
     )
-    assert config.suites["decode-runtime"].max_regression == 0.10
+    assert config.suites["decode-runtime"].max_regression is None
 
 
 def test_toml_rejects_an_unknown_benchmark_field(tmp_path: Path) -> None:

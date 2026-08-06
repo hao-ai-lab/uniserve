@@ -25,4 +25,4 @@ The evaluator refuses to overwrite a non-empty point directory. Validation and c
 
 Add a server command and one explicit benchmark table to [`uniserve_eval/profiles.toml`](../uniserve_eval/profiles.toml). A benchmark selects an existing task implementation, whose public request construction and observable output validation form one polymorphic boundary. Shared transport and metric code do not contain model-specific output rules.
 
-Protected metrics are a TOML mapping from summary paths to `higher` or `lower`. A suite is an ordered list of benchmark names with an optional maximum-regression comparison screen. Product qualification interprets that screen under its own acceptance protocol.
+Protected metrics are a TOML mapping from summary paths to `higher` or `lower`. A suite is an ordered list of benchmark names and may define a comparison screen when its owning protocol requires one. Without a screen, comparison reports raw parent and candidate values without issuing a performance conclusion.

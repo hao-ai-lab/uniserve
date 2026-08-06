@@ -110,8 +110,6 @@ def compare(args: argparse.Namespace) -> None:
     max_regression = args.max_regression
     if max_regression is None:
         max_regression = suite.max_regression if suite is not None else None
-    if max_regression is None:
-        raise ValueError("comparison requires --max-regression or a suite threshold")
     report = compare_suite(
         args.reference_root,
         args.candidate_root,
@@ -127,7 +125,9 @@ def compare(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
         (args.output_dir / "comparison.md").write_text(markdown, encoding="utf-8")
-    if report["passed"] is not True:
+    if report["valid"] is not True or (
+        max_regression is not None and report["passed"] is not True
+    ):
         raise SystemExit(2)
 
 
