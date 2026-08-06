@@ -1,38 +1,33 @@
 //! Data plane, Tier 2: the pluggable byte mover.
 //!
-//! [`TransferAgent`] is the minimal one-sided-RDMA-style surface — register a
-//! local buffer, resolve a remote segment, submit READ/WRITE requests, poll for
-//! completion, and carry an out-of-band notify. It is deliberately addressed in
-//! `(addr, len, device)` triples and opaque locators, never tensors or handles:
-//! the handle semantics live one tier up in `TensorMover` (the engine's
-//! `stage_router`). Backends are selected by a backend string via
-//! [`make_transfer_agent`], exactly like TensorRT-LLM's `dlopen`-loaded
-//! `BaseTransferAgent` leaves and Mooncake's transfer engine.
+//! [`TransferAgent`] registers local buffers, resolves peer segments, submits
+//! READ/WRITE requests, polls completion, and carries an out-of-band notify. It
+//! is addressed in `(addr, len, device)` triples and opaque locators, never
+//! tensors or handles. The handle semantics live one tier up in `TensorMover`
+//! (the engine's `stage_router`). Backends are selected by a backend string via
+//! [`make_transfer_agent`].
 //!
 //! ## Where the bytes actually move
 //!
 //! The control plane (this Rust host) never dereferences a tensor: it only routes
-//! handles and tracks transfer completion. The **byte movement** happens
-//! happens worker↔worker, and because the tensors are torch-owned and addressed
+//! handles and tracks transfer completion. The byte movement happens
+//! worker↔worker, and because the tensors are torch-owned and addressed
 //! by `data_ptr()` integers, the byte-moving Tier-2 backends are realized
 //! **worker-side in Python** — `uniserve_worker/runtime/transfer.py`
-//! implements `shm` (POSIX shared memory), `cuda_ipc` (CUDA IPC handles via
-//! torch reductions), and `mooncake` (one-sided RDMA via Mooncake's
-//! `TransferEngine`), all verified moving real tensors cross-process. The host's
+//! implements `shm` (POSIX shared memory) and `cuda_ipc` (CUDA IPC handles via
+//! torch reductions). The host's
 //! `TransferAgent` here is the host-side tracking tier: [`InProcessAgent`]
-//! models handle registration + the out-of-band notify queue the host watches
-//! for write-driven KV completion. [`make_transfer_agent`] accepts every
-//! backend name (so `--transfer` validates) and returns the host-side tracking
-//! agent; the name is forwarded to the worker, which selects the matching Python
-//! transport.
+//! models handle registration and the out-of-band notify queue the host watches
+//! for write-driven KV completion. [`make_transfer_agent`] validates each
+//! configured backend and returns the host-side tracking agent; the name is
+//! forwarded to the worker, which selects the matching Python transport.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A registrable local buffer: pinned host DRAM or device VRAM. `device` is the
-/// Mooncake-style location label (`"cpu:N"` / `"cuda:N"`) that drives NIC
-/// selection in the RDMA backends; the in-process backend ignores it.
+/// A registrable local buffer: pinned host DRAM or device VRAM. `device` is its
+/// location label (`"cpu:N"` / `"cuda:N"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRegion {
     pub addr: u64,
@@ -40,21 +35,19 @@ pub struct MemoryRegion {
     pub device: String,
 }
 
-/// What [`TransferAgent::register`] returns: the region plus a per-NIC remote
-/// key. `register` only pins memory and builds the MR; the buffer stays owned by
-/// the caller (register-once + reference-by-(segment, offset)).
+/// What [`TransferAgent::register`] returns: the region plus a peer key. The
+/// buffer stays owned by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredRegion {
     pub region: MemoryRegion,
-    /// Per-NIC remote key (degenerate `0` for the in-process backend).
+    /// Peer key (degenerate `0` for the in-process backend).
     pub rkey: u64,
     /// Local segment id assigned at registration; encoded into locators so a
     /// peer can name this region by `(segment_id, absolute addr)`.
     pub segment_id: u64,
 }
 
-/// A resolved remote worker/segment (Mooncake `openSegment` / TRT-LLM
-/// `loadRemoteAgent`). Built from a producer's opaque locator.
+/// A resolved peer segment built from a producer's opaque locator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSegment {
     pub segment_id: u64,
@@ -105,36 +98,29 @@ pub enum TransferStatus {
 /// Tier-2 one-sided byte mover. All addressing is `(addr, len, device)` and
 /// opaque locators — never tensors. See module docs.
 pub trait TransferAgent: Send + Sync {
-    /// Pin a local buffer + build its MR; returns a remotely-addressable
-    /// description. Mooncake `registerLocalMemory` / TRT-LLM `registerMemory`.
+    /// Pin a local buffer and return its peer-addressable description.
     fn register(&self, region: MemoryRegion) -> RegisteredRegion;
 
     /// Release a previously registered region.
     fn deregister(&self, region: &RegisteredRegion);
 
-    /// Resolve a remote segment from a producer's opaque locator. Mooncake
-    /// `openSegment` / TRT-LLM `loadRemoteAgent`.
+    /// Resolve a peer segment from a producer's opaque locator.
     fn open_remote(&self, locator: &[u8]) -> RemoteSegment;
 
-    /// Submit a batch of async one-sided transfers. Mooncake `submitTransfer` /
-    /// TRT-LLM `submitTransferRequests`.
+    /// Submit a batch of asynchronous transfers.
     fn submit(&self, reqs: Vec<TransferReq>) -> TransferTicket;
 
-    /// Poll a ticket for completion (poll model, not callbacks). Mooncake
-    /// `getBatchTransferStatus`.
+    /// Poll a ticket for completion.
     fn poll(&self, ticket: &TransferTicket) -> TransferStatus;
 
-    /// Out-of-band notify: hand the peer a message once transfers land, so no
-    /// separate control RPC is needed. Mooncake `submitTransferWithNotify` /
-    /// TRT-LLM `notifySyncMessage`.
+    /// Hand the peer a message once transfers land.
     fn notify(&self, remote: &RemoteSegment, msg: Vec<u8>);
 
     /// Drain notifies addressed to this agent.
     fn drain_notifies(&self) -> Vec<Vec<u8>>;
 }
 
-/// Backend configuration passed to [`make_transfer_agent`]. Backend-specific
-/// keys (NIC lists, Mooncake metadata server, …) ride in `options`.
+/// Backend configuration passed to [`make_transfer_agent`].
 #[derive(Debug, Clone, Default)]
 pub struct AgentConfig {
     /// This agent's own segment/connection label (e.g. `"cuda:0"`).
@@ -144,13 +130,12 @@ pub struct AgentConfig {
 
 /// Backend names whose byte transport is realized worker-side in Python
 /// (`runtime/transfer.py`). The host only tracks handles for these.
-pub const WORKER_SIDE_BACKENDS: &[&str] = &["shm", "cuda_ipc", "mooncake"];
+pub const WORKER_SIDE_BACKENDS: &[&str] = &["shm", "cuda_ipc"];
 
-/// Select the **host-side** Tier-2 agent by backend name (TRT-LLM's
-/// `dlopen`-by-backend-string model). `inproc`/`local` is the in-process
-/// tracker; `shm`/`cuda_ipc`/`mooncake` also return the host-side tracker
+/// Select the host-side Tier-2 agent by backend name. `inproc`/`local` is the
+/// in-process tracker; `shm`/`cuda_ipc` also return the host-side tracker
 /// ([`InProcessAgent`]) because the host never moves tensors — the real byte
-/// real byte transport for those edges runs worker-side in Python (see module
+/// byte transport for those edges runs worker-side in Python (see module
 /// docs). Unknown names error so a `--transfer` typo fails loudly.
 pub fn make_transfer_agent(
     backend: &str,
@@ -279,8 +264,8 @@ mod tests {
     #[test]
     fn factory_accepts_known_backends_and_rejects_unknown() {
         // Every known backend resolves to a host-side tracking agent (the real
-        // shm/cuda_ipc/mooncake byte transport runs worker-side in Python).
-        for backend in ["inproc", "local", "shm", "cuda_ipc", "mooncake"] {
+        // shm/cuda_ipc byte transport runs worker-side in Python).
+        for backend in ["inproc", "local", "shm", "cuda_ipc"] {
             assert!(
                 make_transfer_agent(backend, &AgentConfig::default()).is_ok(),
                 "backend {backend:?} should resolve"

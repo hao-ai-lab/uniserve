@@ -73,7 +73,19 @@ def test_capability_wire_carries_the_agreement_digests_and_work_shape():
     worker = execution_worker()
     wire = dispatch(worker, {"kind": "get_capabilities"})["capabilities"]
 
-    assert wire["supported_work"]
+    assert wire["supported_work"] == [
+        WorkVariant.TOKEN_EXTEND.value,
+        WorkVariant.TOKEN_DECODE.value,
+        WorkVariant.ENCODE_VISION.value,
+        WorkVariant.ENCODE_LATENT.value,
+        WorkVariant.TRANSFER_PRODUCT.value,
+        WorkVariant.TRANSFER_KV_PUBLISH.value,
+        WorkVariant.TRANSFER_KV_INSTALL.value,
+        WorkVariant.GEN_TRANSITION.value,
+        WorkVariant.GEN_FLOW.value,
+        WorkVariant.MATERIALIZE.value,
+    ]
+    assert wire["execution_constraints"]["max_speculative_points"] == 1
     known = {variant.value for variant in WorkVariant}
     assert all(value in known for value in wire["supported_work"])
 

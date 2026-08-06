@@ -51,30 +51,28 @@ class WorkerContract:
                 f"{sorted(value.value for value in allowed_operation_types)!r}"
             )
         selected_work = set(effective_work)
-        declared_work = set(declared_capabilities.supported_work)
-        system_work = selected_work - declared_work
+        advertised_work = selected_work.intersection(declared_capabilities.supported_work)
+        if not advertised_work:
+            raise capability_mismatch(f"{owner} advertises no executable work")
         declared_routes = declared_capabilities.execution_constraints.route_capabilities
-        if system_work and len(declared_routes) != 1:
-            raise capability_mismatch(
-                f"{owner} must assign shared system work to one explicit execution route"
-            )
         route_capabilities = tuple(
             replace(
                 capability,
                 supported_work=tuple(
                     variant
                     for variant in WorkVariant
-                    if variant in selected_work
-                    and (variant in capability.supported_work or variant in system_work)
+                    if variant in advertised_work and variant in capability.supported_work
                 ),
             )
             for capability in declared_routes
-            if selected_work.intersection(capability.supported_work) or system_work
+            if advertised_work.intersection(capability.supported_work)
         )
         return cls(
             capabilities=replace(
                 declared_capabilities,
-                supported_work=effective_work,
+                supported_work=tuple(
+                    variant for variant in WorkVariant if variant in advertised_work
+                ),
                 pipeline_depth=int(pipeline_depth),
                 execution_constraints=replace(
                     declared_capabilities.execution_constraints,
@@ -140,7 +138,7 @@ def model_free_capabilities(
             completion_slots=window,
             device_products=5 * window,
             kv_pages=int(num_blocks),
-            rollback_deltas=17 * window,
+            rollback_deltas=window,
             latent_artifact_bytes=(1 << 20) * 5 * window,
             pinned_completion_staging_bytes=per_operation_staging * window,
             transfer_bytes=(1 << 20) * window,
@@ -154,7 +152,7 @@ def model_free_capabilities(
             completion_slots=slots,
             device_products=5 * slots,
             kv_pages=int(num_blocks),
-            rollback_deltas=17 * slots,
+            rollback_deltas=slots,
             latent_artifact_bytes=(1 << 20) * 5 * slots,
             pinned_completion_staging_bytes=max(
                 completion_arena_bytes,
@@ -193,7 +191,7 @@ def model_free_capabilities(
         supported_controls=supported_controls,
         execution_constraints=ExecutionConstraints(
             max_batch_operations=max_batch_operations,
-            max_speculative_points=17,
+            max_speculative_points=1,
             device_sequence_lengths=True,
             device_append_offsets=True,
             incremental_kv_publication=True,

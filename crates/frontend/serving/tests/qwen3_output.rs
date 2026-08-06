@@ -76,7 +76,6 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
                 output_token_count: 1,
                 internal_token_count: 0,
                 finish_reason: FinishReason::stop_eos(),
-                kv_transfer_params: None,
             }),
         }),
     ]);

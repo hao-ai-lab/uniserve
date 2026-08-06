@@ -29,8 +29,6 @@ pub struct CollectedTextOutput {
     pub output_token_count: usize,
     pub internal_token_count: usize,
     pub finish_reason: FinishReason,
-    /// Connector-specific KV transfer parameters for disaggregated serving.
-    pub kv_transfer_params: Option<serde_json::Value>,
 }
 
 #[allow(clippy::manual_async_fn, reason = "specify `Send` bound")]
@@ -83,7 +81,6 @@ impl<T: TextOutputStream> T {
                                 output_token_count: 0,
                                 internal_token_count: 0,
                                 finish_reason: FinishReason::Error,
-                                kv_transfer_params: None,
                             })
                         };
 
@@ -99,7 +96,6 @@ impl<T: TextOutputStream> T {
                             collected.finish_reason = finished.finish_reason;
                             collected.output_token_count = finished.output_token_count;
                             collected.internal_token_count = finished.internal_token_count;
-                            collected.kv_transfer_params = finished.kv_transfer_params;
                             return Ok(collected);
                         }
                     }
@@ -171,7 +167,6 @@ mod tests {
                     output_token_count: 2,
                     internal_token_count: 0,
                     finish_reason: FinishReason::stop_eos(),
-                    kv_transfer_params: None,
                 }),
             }),
         ]);
@@ -290,7 +285,6 @@ mod tests {
                     output_token_count: 5,
                     internal_token_count: 0,
                     finish_reason: FinishReason::stop_eos(),
-                    kv_transfer_params: None,
                 }),
             }),
         ]);

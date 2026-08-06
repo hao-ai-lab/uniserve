@@ -284,7 +284,6 @@ mod tests {
                     prompt_tokens: 3,
                     completion_tokens: 8,
                     images: 0,
-                    kv_transfer_params: None,
                 },
             }],
             scheduler_stats: None,

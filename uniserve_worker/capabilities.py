@@ -75,6 +75,8 @@ _OPERATION_TYPE_WORK_VARIANTS: dict[OperationType, tuple[WorkVariant, ...]] = {
     OperationType.TRANSFER_KV: (WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL),
 }
 
+_UNCONFIGURED_WORK = frozenset({WorkVariant.TOKEN_VERIFY, WorkVariant.DRAFT})
+
 
 def work_variants_for_operation_types(
     operation_types: Sequence[OperationType],
@@ -91,6 +93,18 @@ def work_variants_for_operation_types(
         for variant in _OPERATION_TYPE_WORK_VARIANTS[operation_type]
     }
     return tuple(variant for variant in WorkVariant if variant in selected)
+
+
+def configured_work_variants_for_operation_types(
+    operation_types: Sequence[OperationType],
+) -> tuple[WorkVariant, ...]:
+    """Return the work leaves admitted by the configured serving routes."""
+
+    return tuple(
+        variant
+        for variant in work_variants_for_operation_types(operation_types)
+        if variant not in _UNCONFIGURED_WORK
+    )
 
 
 class RequestKind(StrEnum):

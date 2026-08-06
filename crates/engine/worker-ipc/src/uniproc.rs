@@ -53,8 +53,6 @@ pub struct WorkerLaunchConfig {
     pub disable_model_arch: Vec<String>,
     pub mesh: Option<String>,
     pub tp_backend: Option<String>,
-    pub mooncake_device: String,
-    pub mooncake_protocol: String,
     pub torch_compile: bool,
     pub torch_compile_backend: String,
     pub torch_compile_mode: Option<String>,
@@ -92,8 +90,6 @@ impl Default for WorkerLaunchConfig {
             disable_model_arch: Vec::new(),
             mesh: None,
             tp_backend: None,
-            mooncake_device: String::new(),
-            mooncake_protocol: "rdma".to_string(),
             torch_compile: false,
             torch_compile_backend: "inductor".to_string(),
             torch_compile_mode: None,
@@ -146,10 +142,6 @@ impl WorkerLaunchConfig {
         if let Some(value) = &self.tp_backend {
             cmd.arg("--tp-backend").arg(value);
         }
-        if !self.mooncake_device.is_empty() {
-            cmd.arg("--mooncake-device").arg(&self.mooncake_device);
-        }
-        cmd.arg("--mooncake-protocol").arg(&self.mooncake_protocol);
         if self.torch_compile {
             cmd.arg("--torch-compile");
         }
@@ -437,12 +429,12 @@ impl UniprocExecutor {
             .arg(tp_size.to_string());
         // Staged topology: tell the worker which pipeline stage it serves.
         // Omitted for the default `full` worker so the command line stays
-        // byte-identical to the non-disaggregated path.
+        // identical to the direct full-pool command shape.
         if let Some(kind) = worker_kind {
             cmd.arg("--worker-kind").arg(kind);
         }
         // Data-plane Tier-2 backend for this stage's tensor handoffs. The
-        // default (in-process) is omitted so the non-disaggregated worker command
+        // default (in-process) is omitted so the full-pool worker command
         // line stays byte-identical.
         if let Some(backend) = transfer_backend.filter(|b| *b != "inproc") {
             cmd.arg("--transfer-backend").arg(backend);

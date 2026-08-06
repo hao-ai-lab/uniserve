@@ -52,8 +52,6 @@ pub(crate) enum AssistantEvent {
         output_token_count: usize,
         internal_token_count: usize,
         finish_reason: FinishReason,
-        /// Connector-specific KV transfer parameters for disaggregated serving.
-        kv_transfer_params: Option<serde_json::Value>,
     },
 }
 

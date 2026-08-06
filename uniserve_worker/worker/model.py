@@ -147,8 +147,6 @@ class ModelWorker:
         allowed_operation_types: frozenset[OperationType],
         defer_sampling: bool = False,
         transfer_backend: str = "local",
-        mooncake_device: str,
-        mooncake_protocol: str,
         cross_process: bool = False,
         model_spec_digest: str | None = None,
         weight_digest: str | None = None,
@@ -231,8 +229,6 @@ class ModelWorker:
         self.replay = ReplayStore()
         self.mover = Mover(
             transfer_backend=transfer_backend,
-            mooncake_device=mooncake_device,
-            mooncake_protocol=mooncake_protocol,
             transfer_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
                 0
             ].credits.worker.transfer_bytes,

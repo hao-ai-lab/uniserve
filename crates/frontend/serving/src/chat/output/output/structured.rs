@@ -129,7 +129,6 @@ impl StructuredEventState {
         output_token_count: usize,
         internal_token_count: usize,
         finish_reason: FinishReason,
-        kv_transfer_params: Option<serde_json::Value>,
     ) -> Result<Vec<ChatEvent>> {
         let mut events = Vec::new();
         self.close_open_text_block(&mut events);
@@ -141,7 +140,6 @@ impl StructuredEventState {
             visible_output_token_count: output_token_count.saturating_sub(internal_token_count),
             internal_token_count,
             finish_reason,
-            kv_transfer_params,
         });
         Ok(events)
     }
@@ -283,14 +281,12 @@ pub async fn structured_chat_event_stream(
                 output_token_count,
                 internal_token_count,
                 finish_reason,
-                kv_transfer_params,
             } => {
                 for next in state.finish(
                     prompt_token_count,
                     output_token_count,
                     internal_token_count,
                     finish_reason,
-                    kv_transfer_params,
                 )? {
                     y.yield_ok(next).await;
                 }

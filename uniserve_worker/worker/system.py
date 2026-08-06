@@ -31,8 +31,6 @@ class SystemWorker:
         allowed_operation_types: frozenset[OperationType],
         block_size: int,
         transfer_backend: str,
-        mooncake_device: str,
-        mooncake_protocol: str,
         pipeline_depth: int,
         completion_payload_bytes: int,
         device: str,
@@ -80,8 +78,6 @@ class SystemWorker:
         self.replay = ReplayStore()
         self.mover = Mover(
             transfer_backend=transfer_backend,
-            mooncake_device=mooncake_device,
-            mooncake_protocol=mooncake_protocol,
             transfer_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
                 0
             ].credits.worker.transfer_bytes,

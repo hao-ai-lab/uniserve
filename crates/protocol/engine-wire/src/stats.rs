@@ -2,8 +2,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::OpaqueValue;
-
 /// Stores cache hit statistics.
 ///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -40,26 +38,6 @@ pub struct KvCacheEvictionEvent {
     pub idle_seconds: f64,
     /// Time gaps between consecutive accesses before eviction.
     pub reuse_gaps_seconds: Vec<f64>,
-}
-
-/// Per-step iteration decoding stats from scheduler.
-///
-/// Each scheduler step, statistics on spec decoding performance are aggregated
-/// across requests by the scheduler and returned to the frontend in
-/// `GenerationEventBatch -> SchedulerStats`.
-///
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct SpecDecodingStats {
-    /// Configured speculative token count for this scheduler.
-    pub num_spec_tokens: u64,
-    /// Number of drafted speculative decoding attempts.
-    pub num_drafts: u64,
-    /// Number of drafted tokens.
-    pub num_draft_tokens: u64,
-    /// Number of accepted drafted tokens.
-    pub num_accepted_tokens: u64,
-    /// Accepted drafted tokens counted by draft position.
-    pub num_accepted_tokens_per_pos: Vec<u64>,
 }
 
 /// Breakdown of a scheduled prefill computation.
@@ -261,14 +239,8 @@ pub struct SchedulerStats {
     pub max_queue_wait_us: u64,
     /// Local prefix cache statistics.
     pub prefix_cache_stats: PrefixCacheStats,
-    /// External connector prefix cache statistics, when configured.
-    pub connector_prefix_cache_stats: Option<PrefixCacheStats>,
     /// Sampled KV cache eviction events for residency metrics.
     pub kv_cache_eviction_events: Vec<KvCacheEvictionEvent>,
-    /// Speculative decoding scheduler stats, when enabled.
-    pub spec_decoding_stats: Option<SpecDecodingStats>,
-    /// Connector-specific KV transfer stats, kept opaque for now.
-    pub kv_connector_stats: Option<BTreeMap<String, OpaqueValue>>,
     /// CUDA graph runtime stats when graph metrics are enabled.
     pub cudagraph_stats: Option<CudagraphStat>,
     /// Estimated MFU/performance stats, when enabled.

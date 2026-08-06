@@ -12,7 +12,7 @@ from ..capabilities import (
     ResourceClass,
     RouteCreditLimits,
     RouteExecutionCapability,
-    work_variants_for_operation_types,
+    configured_work_variants_for_operation_types,
 )
 from ..foundation.runtime_config import (
     graph_memory_budget_bytes,
@@ -97,7 +97,7 @@ def resolve_capabilities(
         RequestKind.COPY_KV,
         RequestKind.RELEASE_PRODUCTS,
     ]
-    supported_work = work_variants_for_operation_types(
+    supported_work = configured_work_variants_for_operation_types(
         tuple(operation.kind for operation in spec.operations)
     )
     return EngineCaps(
@@ -112,7 +112,7 @@ def resolve_capabilities(
         supported_controls=tuple(controls),
         execution_constraints=ExecutionConstraints(
             max_batch_operations=int(deployment.max_batch_operations),
-            max_speculative_points=17,
+            max_speculative_points=1,
             device_sequence_lengths=True,
             device_append_offsets=True,
             incremental_kv_publication=True,
@@ -166,7 +166,7 @@ def _route_credit_limits(
     max_operations = int(deployment.max_batch_operations)
     slots = pipeline_depth * max_operations
     window = min(slots, max(2, pipeline_depth))
-    max_speculative_points = 17
+    max_speculative_points = 1
     products_per_operation = 5
     transfer_tickets = min(slots, 256)
     block_size = int(deployment.block_size)

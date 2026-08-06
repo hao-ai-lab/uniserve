@@ -24,8 +24,6 @@ pub struct CollectedAssistantMessage {
     pub visible_output_token_count: usize,
     pub internal_token_count: usize,
     pub finish_reason: FinishReason,
-    /// Connector-specific KV transfer parameters for disaggregated serving.
-    pub kv_transfer_params: Option<serde_json::Value>,
 }
 
 /// Per-request stream of chat events.
@@ -87,7 +85,6 @@ impl ChatEventStream {
                     visible_output_token_count,
                     internal_token_count,
                     finish_reason,
-                    kv_transfer_params,
                 } => {
                     return Ok(CollectedAssistantMessage {
                         message: done,
@@ -102,7 +99,6 @@ impl ChatEventStream {
                         visible_output_token_count,
                         internal_token_count,
                         finish_reason,
-                        kv_transfer_params,
                     });
                 }
                 ChatEvent::ToolCallEnd { call, .. } => {
@@ -208,7 +204,6 @@ mod tests {
                     visible_output_token_count: 1,
                     internal_token_count: 0,
                     finish_reason: FinishReason::stop_eos(),
-                    kv_transfer_params: None,
                 }),
             ]),
         );
@@ -247,7 +242,6 @@ mod tests {
                 token_ids: vec![],
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
-                kv_transfer_params: None,
             }
         );
     }

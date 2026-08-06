@@ -36,7 +36,6 @@ _EXPORTS: dict[str, str] = {
     # logits
     "LogitsProcessor": "logits",
     # mesh (parallelism topology + transports)
-    "DataPlaneTowerTransport": "mesh",
     "DeviceMesh": "mesh",
     "MeshAxis": "mesh",
     "TensorParallelSpec": "mesh",
@@ -101,7 +100,6 @@ __all__ = [
     "AutoEncoder",
     "AutoEncoderParams",
     "ColumnParallelLinear",
-    "DataPlaneTowerTransport",
     "DeviceMesh",
     "FusedMoE",
     "GeluAndMul",
@@ -197,7 +195,6 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
     )
     from .logits import LogitsProcessor
     from .mesh import (
-        DataPlaneTowerTransport,
         DeviceMesh,
         MeshAxis,
         TensorParallelSpec,

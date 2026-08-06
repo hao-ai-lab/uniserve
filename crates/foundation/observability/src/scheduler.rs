@@ -29,13 +29,6 @@ pub struct EngineLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct EnginePositionLabels {
-    pub model_name: String,
-    pub engine: u32,
-    pub position: u32,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EnginePathLabels {
     pub model_name: String,
     pub engine: u32,
@@ -126,39 +119,6 @@ pub struct SchedulerMetrics {
         help = "Prefix cache hits, in terms of number of cached tokens."
     )]
     pub prefix_cache_hits: Family<EngineLabels, U64Counter>,
-    #[metric(
-        name = "uniserve:external_prefix_cache_queries",
-        help = "External prefix cache queries from KV connector cross-instance cache sharing, in terms of number of queried tokens."
-    )]
-    pub external_prefix_cache_queries: Family<EngineLabels, U64Counter>,
-    #[metric(
-        name = "uniserve:external_prefix_cache_hits",
-        help = "External prefix cache hits from KV connector cross-instance cache sharing, in terms of number of cached tokens."
-    )]
-    pub external_prefix_cache_hits: Family<EngineLabels, U64Counter>,
-
-    // Speculative decoding counters.
-    #[metric(
-        name = "uniserve:spec_decode_num_drafts",
-        help = "Number of spec decoding drafts."
-    )]
-    pub spec_decode_num_drafts: Family<EngineLabels, U64Counter>,
-    #[metric(
-        name = "uniserve:spec_decode_num_draft_tokens",
-        help = "Number of draft tokens."
-    )]
-    pub spec_decode_num_draft_tokens: Family<EngineLabels, U64Counter>,
-    #[metric(
-        name = "uniserve:spec_decode_num_accepted_tokens",
-        help = "Number of accepted tokens."
-    )]
-    pub spec_decode_num_accepted_tokens: Family<EngineLabels, U64Counter>,
-    #[metric(
-        name = "uniserve:spec_decode_num_accepted_tokens_per_pos",
-        help = "Accepted tokens per draft position."
-    )]
-    pub spec_decode_num_accepted_tokens_per_pos: Family<EnginePositionLabels, U64Counter>,
-
     // Worker-local forward/kernel counters.
     #[metric(
         name = "uniserve:worker_attention_launches",

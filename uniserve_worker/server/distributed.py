@@ -2,16 +2,11 @@
 
 Builds the :class:`DeviceMesh` for this worker process from the parallel layout:
 a tensor-parallel (``tp``) axis backed by a ``torch.distributed`` collective, and
-(when a modality split is requested) a ``tower`` axis. The model sees one bounded
+(when a modality split is requested) a local ``tower`` axis. The model sees one bounded
 mesh view while each transport exposes only the operations its axis supports:
 
-* **In-process tower parallel:** one worker, two devices, a
-  :class:`LocalP2PTransport` over the worker's devices (``tower_devices``).
-* **Cross-process tower disaggregation:** the und and gen towers are separate
-  workers; the tower axis is a :class:`DataPlaneTowerTransport` over the data
-  plane (``cuda_ipc`` / ``mooncake``). Each worker builds a tower view at its own
-  coordinate (``tower_coord``), and the stage router transfers cross-coordinate
-  state before model execution.
+One worker may bind two devices through a :class:`LocalP2PTransport` over its
+``tower_devices``.
 
 The degenerate case (tp_size==1, no tower) returns a trivial single-device mesh
 that is byte-identical to a single-rank worker.
@@ -21,14 +16,12 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Sequence
-from typing import Any
 
 import torch
 
 from ..foundation.errors import distributed_setup_error
 from ..nn.mesh import (
     CollectiveTransport,
-    DataPlaneTowerTransport,
     DeviceMesh,
     LocalP2PTransport,
     MeshAxis,
@@ -48,10 +41,6 @@ def build_device_mesh(
     device: str,
     tower_devices: Sequence[str] | None = None,
     tower_primary: int = 0,
-    tower_coord: int | None = None,
-    tower_size: int | None = None,
-    tower_data_plane: Any | None = None,
-    tower_gate: Any | None = None,
     tp_backend: str | None = None,
     tp_init_method: str | None = None,
 ) -> DeviceMesh:
@@ -62,14 +51,8 @@ def build_device_mesh(
     axis, and ``tower_primary`` is the coordinate holding the shared modules and
     the authoritative KV cache.
 
-    Cross-process tower: pass ``tower_coord`` (this worker's tower coordinate,
-    e.g. 0 for the und worker, 1 for the gen worker) and ``tower_size`` (the
-    number of tower coordinates, default 2). The axis is then a
-    :class:`DataPlaneTowerTransport` over the data plane. Inject
-    ``tower_data_plane`` (a ``TensorStore``-like byte mover) and ``tower_gate``
-    (the transfer-readiness gate). The model code is unchanged:
-    :func:`place_towers` materializes only this worker's coordinate and the KV
-    handoff routes through the data plane.
+    The tower axis is local to this worker and :func:`place_towers` materializes
+    each declared subtree on its configured device.
     """
     tp_rank = int(tp_rank)
     tp_size = int(tp_size)
@@ -86,12 +69,7 @@ def build_device_mesh(
                 init_method_override=tp_init_method,
             )
         )
-    if tower_coord is not None:
-        tower_axis = _build_cross_process_tower_axis(
-            tower_coord, tower_size, tower_data_plane, tower_gate
-        )
-    else:
-        tower_axis = _build_tower_axis(tower_devices, tower_primary)
+    tower_axis = _build_tower_axis(tower_devices, tower_primary)
     if tower_axis is not None:
         axes.append(tower_axis)
     return DeviceMesh.of(*axes, device=local_device)
@@ -171,36 +149,6 @@ def _build_tower_axis(tower_devices: Sequence[str] | None, tower_primary: int) -
         )
     transport = LocalP2PTransport(axis="tower", devices=devices, _coord=primary)
     return MeshAxis(name="tower", size=len(devices), coord=primary, transport=transport)
-
-
-def _build_cross_process_tower_axis(
-    tower_coord: int,
-    tower_size: int | None,
-    data_plane: Any | None,
-    gate: Any | None,
-) -> MeshAxis | None:
-    """Build the cross-process tower axis at this worker's coordinate.
-
-    The transport is the data-plane-backed :class:`DataPlaneTowerTransport`; byte
-    movement (``cuda_ipc`` / ``mooncake``) and the readiness gate are injected by
-    the und/gen worker builder. A size <= 1 means no tower.
-    """
-    size = int(tower_size) if tower_size is not None else 2
-    coord = int(tower_coord)
-    if size <= 1:
-        return None
-    if coord < 0 or coord >= size:
-        raise distributed_setup_error(
-            f"tower_coord {coord} out of range for {size} tower coordinates"
-        )
-    transport = DataPlaneTowerTransport(
-        axis="tower",
-        _size=size,
-        _coord=coord,
-        data_plane=data_plane,
-        gate=gate,
-    )
-    return MeshAxis(name="tower", size=size, coord=coord, transport=transport)
 
 
 def _set_cuda_device(device: torch.device, tp_rank: int) -> None:

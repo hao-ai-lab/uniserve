@@ -42,7 +42,6 @@ pub struct Finished {
     pub output_token_count: usize,
     pub internal_token_count: usize,
     pub finish_reason: FinishReason,
-    pub kv_transfer_params: Option<serde_json::Value>,
 }
 
 /// Internal decoded-text event emitted before higher-level assistant adaptation.
@@ -223,7 +222,6 @@ pub async fn decoded_text_event_stream(
                         output_token_count,
                         internal_token_count: 0,
                         finish_reason: FinishReason::Stop(Some(StopReason::Text(stop_string))),
-                        kv_transfer_params: None,
                     }),
                 })
                 .await;
@@ -317,7 +315,6 @@ pub async fn decoded_text_event_stream(
                 reason,
                 stop_reason,
                 completion_tokens,
-                kv_transfer_params,
                 ..
             } => {
                 emit_start_if_ready!();
@@ -353,7 +350,6 @@ pub async fn decoded_text_event_stream(
                         output_token_count: completion_tokens,
                         internal_token_count: completion_tokens.saturating_sub(output_token_count),
                         finish_reason,
-                        kv_transfer_params,
                     }),
                 })
                 .await;

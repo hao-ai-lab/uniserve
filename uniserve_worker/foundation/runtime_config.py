@@ -183,8 +183,6 @@ class ExecutionConfig:
     kv_memory_fraction: float = 0.70
     tp_backend: str | None = None
     tp_init_method: str | None = None
-    mooncake_device: str = ""
-    mooncake_protocol: str = "rdma"
     cuda_graph: bool = True
     cuda_graph_warmup: bool = True
     cuda_graph_warmup_batches: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
@@ -210,8 +208,6 @@ def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
         ),
         tp_backend=_none_if_empty(namespace.tp_backend),
         tp_init_method=_none_if_empty(namespace.tp_init_method),
-        mooncake_device=str(namespace.mooncake_device or ""),
-        mooncake_protocol=str(namespace.mooncake_protocol or "rdma"),
         cuda_graph=bool(namespace.cuda_graph),
         cuda_graph_warmup=bool(namespace.cuda_graph_warmup),
         cuda_graph_warmup_batches=_parse_positive_int_csv(

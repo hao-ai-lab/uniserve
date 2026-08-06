@@ -190,7 +190,6 @@ pub async fn tool_event_stream(
                 output_token_count,
                 internal_token_count,
                 finish_reason,
-                kv_transfer_params,
             } => {
                 for next in state.finish()? {
                     y.yield_ok(next).await;
@@ -200,7 +199,6 @@ pub async fn tool_event_stream(
                     output_token_count,
                     internal_token_count,
                     finish_reason,
-                    kv_transfer_params,
                 })
                 .await;
             }

@@ -56,7 +56,7 @@ def test_worker_response_variants_project_the_complete_typed_schema():
     assert error["kind"] == "error"
 
 
-def test_worker_contract_assigns_shared_system_work_to_its_execution_route():
+def test_worker_contract_separates_executable_and_advertised_work():
     declared = model_free_capabilities(
         block_size=64,
         supported_work=(WorkVariant.TOKEN_EXTEND, WorkVariant.TOKEN_DECODE),
@@ -79,11 +79,7 @@ def test_worker_contract_assigns_shared_system_work_to_its_execution_route():
         owner="ExecutionWorker",
     )
 
-    expected = (
-        WorkVariant.TOKEN_EXTEND,
-        WorkVariant.TOKEN_DECODE,
-        WorkVariant.MATERIALIZE,
-    )
+    expected = (WorkVariant.TOKEN_EXTEND, WorkVariant.TOKEN_DECODE)
     assert contract.capabilities.supported_work == expected
     assert (
         contract.capabilities.execution_constraints.route_capabilities[0].supported_work == expected

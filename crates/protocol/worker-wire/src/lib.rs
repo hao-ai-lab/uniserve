@@ -1781,7 +1781,7 @@ impl Default for ExecutionConstraints {
     fn default() -> Self {
         Self {
             max_batch_operations: 1,
-            max_speculative_points: 17,
+            max_speculative_points: 1,
             device_sequence_lengths: true,
             device_append_offsets: true,
             incremental_kv_publication: true,

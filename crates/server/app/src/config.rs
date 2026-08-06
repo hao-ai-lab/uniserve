@@ -109,14 +109,14 @@ pub struct EngineSettings {
     /// Python interpreter used to launch the worker.
     pub worker_python: String,
     /// Number of tensor-parallel worker rank processes (tp size of the single
-    /// Full pool in the non-disaggregated default).
+    /// Full pool in the default topology).
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
-    /// `None` is the non-disaggregated default (one Full pool). A multi-stage spec
+    /// `None` selects one Full pool. A multi-stage spec
     /// composes pools behind a `StageRouter`.
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
-    /// `encoder->prefill=cuda_ipc,prefill->decode=mooncake`.
+    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
     pub transfer: Option<String>,
     /// Explicit Python worker launch/runtime configuration.
     pub worker_launch: WorkerLaunchConfig,

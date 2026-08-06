@@ -456,19 +456,14 @@ def place_towers(model: nn.Module, mesh: DeviceMesh) -> None:
     coordinate ``c``; untagged modules stay on the model's primary device (the
     shared/understanding coordinate).
 
-    A trivial or absent ``tower`` axis is a no-op. For a cross-process tower the
-    transport exposes no in-process device map; placement is then a property of
-    which params each worker loads (a coordinate not owned by this worker is simply
-    not materialized), so this pass returns without moving anything.
+    A trivial or absent ``tower`` axis is a no-op.
     """
     axis = mesh.axis("tower") if mesh is not None else None
     if axis is None or int(axis.size) <= 1 or axis.transport is None:
         return
     device_for = getattr(axis.transport, "device", None)
     if not callable(device_for):
-        # Cross-process tower: no in-process peer device to move to; the
-        # per-worker load owns which coordinate's params exist here.
-        return
+        raise RuntimeError("tower transport does not expose its local devices")
     primary = int(axis.coord)
     for module in model.modules():
         coord = get_tower_coord(module)

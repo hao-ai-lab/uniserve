@@ -2,7 +2,7 @@
 
 use uniserve_observability::{
     EngineBackendLabels, EngineComponentLabels, EngineLabels, EngineModeLabels, EnginePathLabels,
-    EnginePositionLabels, SchedulerMetrics, WaitingReasonLabels,
+    SchedulerMetrics, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::SchedulerStats;
@@ -66,49 +66,6 @@ pub fn record_scheduler_stats(
         .prefix_cache_hits
         .get_or_create(&labels)
         .inc_by(stats.prefix_cache_stats.base.hits);
-
-    if let Some(connector_prefix_cache_stats) = &stats.connector_prefix_cache_stats {
-        metrics
-            .external_prefix_cache_queries
-            .get_or_create(&labels)
-            .inc_by(connector_prefix_cache_stats.base.queries);
-        metrics
-            .external_prefix_cache_hits
-            .get_or_create(&labels)
-            .inc_by(connector_prefix_cache_stats.base.hits);
-    }
-
-    // Speculative decoding counters.
-    if let Some(spec_decoding_stats) = &stats.spec_decoding_stats {
-        metrics
-            .spec_decode_num_drafts
-            .get_or_create(&labels)
-            .inc_by(spec_decoding_stats.num_drafts);
-        metrics
-            .spec_decode_num_draft_tokens
-            .get_or_create(&labels)
-            .inc_by(spec_decoding_stats.num_draft_tokens);
-        metrics
-            .spec_decode_num_accepted_tokens
-            .get_or_create(&labels)
-            .inc_by(spec_decoding_stats.num_accepted_tokens);
-
-        for (position, accepted_tokens) in spec_decoding_stats
-            .num_accepted_tokens_per_pos
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            metrics
-                .spec_decode_num_accepted_tokens_per_pos
-                .get_or_create(&EnginePositionLabels {
-                    model_name: model_name.clone(),
-                    engine,
-                    position: position as u32,
-                })
-                .inc_by(accepted_tokens);
-        }
-    }
 
     // Worker-local forward/kernel counters.
     if let Some(worker_stats) = &stats.worker_forward_stats {

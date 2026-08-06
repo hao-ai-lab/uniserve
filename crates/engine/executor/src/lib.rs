@@ -22,7 +22,7 @@ pub trait ModelEngine: Send {
 /// implementation that executes those operations, and its device profile. The
 /// control plane routes on the closed operation union and its nested mode.
 ///
-/// `Full` is the non-disaggregated default: it holds the whole model and runs
+/// `Full` holds the whole model and runs
 /// every model op in one mixed-batch forward. The other kinds are stages peeled
 /// off `Full` (encoder / prefill / decode / sampler / post-process).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,12 +41,12 @@ pub enum WorkerKind {
     /// Post-process only — `encode_frame`; FFmpeg, CPU.
     PostProcess,
     /// Understanding tower — text + vision-encode + sampling. The und half of
-    /// the MoT understanding/generation disaggregation (`two_role`); routes
+    /// the local MoT understanding/generation stage split; routes
     /// every non-generation model op so a `--workers und:1,gen:1` topology
     /// composes the und/gen split through the general `StageRouter::new` path.
     Und,
     /// Generation tower — image denoise/commit + frame encode. The gen half of
-    /// the und/gen disaggregation.
+    /// the Und/Gen stage split.
     Gen,
 }
 
@@ -142,7 +142,7 @@ pub struct PoolSpec {
 }
 
 /// The `--workers` topology: an ordered list of pool specs. `full:1` (one Full
-/// pool, tp = `--worker-ranks`) is the non-disaggregated default.
+/// pool, tp = `--worker-ranks`) is the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkersSpec {
     pub pools: Vec<PoolSpec>,
@@ -203,10 +203,8 @@ impl WorkersSpec {
     }
 }
 
-/// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
-/// `encoder->prefill=cuda_ipc,prefill->decode=mooncake`. The backend string is
-/// passed through to [`make_transfer_agent`](uniserve_worker_ipc_core); the
-/// control plane never interprets it.
+/// Per-edge local data-plane transfer selection (`--transfer`), e.g.
+/// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransferSpec {
     /// (producer kind, consumer kind) → backend name.
@@ -227,7 +225,15 @@ impl TransferSpec {
                 .ok_or_else(|| anyhow::anyhow!("unknown src kind in --transfer {edge:?}"))?;
             let dst = WorkerKind::from_token(dst.trim())
                 .ok_or_else(|| anyhow::anyhow!("unknown dst kind in --transfer {edge:?}"))?;
-            edges.insert((src, dst), backend.trim().to_string());
+            let backend = backend.trim();
+            anyhow::ensure!(
+                matches!(backend, "shm" | "cuda_ipc"),
+                "unsupported local transfer backend {backend:?}"
+            );
+            anyhow::ensure!(
+                edges.insert((src, dst), backend.to_string()).is_none(),
+                "duplicate --transfer edge {edge:?}"
+            );
         }
         Ok(Self { edges })
     }
@@ -566,8 +572,7 @@ mod tests {
         assert!(WorkersSpec::parse("full:1").unwrap().is_single_full());
         assert!(WorkersSpec::parse("bogus:1").is_err());
         assert!(WorkersSpec::parse("").is_err());
-        // The und/gen MoT disaggregation topology composes through the general
-        // staged path (StageRouter::new over Und/Gen pools).
+        // The Und/Gen topology composes through the general staged path.
         let und_gen = WorkersSpec::parse("und:1,gen:1").unwrap();
         assert_eq!(und_gen.pools.len(), 2);
         assert_eq!(und_gen.pools[0].kind, WorkerKind::Und);
@@ -577,17 +582,14 @@ mod tests {
 
     #[test]
     fn transfer_spec_parses_edges_and_defaults_inproc() {
-        let t = TransferSpec::parse(
-            "encoder->prefill=cuda_ipc,prefill->decode=mooncake,decode->sampler=shm",
-        )
-        .unwrap();
+        let t = TransferSpec::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
         assert_eq!(
             t.backend_for(WorkerKind::Encoder, WorkerKind::Prefill),
             "cuda_ipc"
         );
         assert_eq!(
             t.backend_for(WorkerKind::Prefill, WorkerKind::Decode),
-            "mooncake"
+            "shm"
         );
         // Unconfigured edge falls back to the in-process backend.
         assert_eq!(
@@ -595,5 +597,7 @@ mod tests {
             "inproc"
         );
         assert!(TransferSpec::parse("bad-entry").is_err());
+        assert!(TransferSpec::parse("prefill->decode=tcp").is_err());
+        assert!(TransferSpec::parse("prefill->decode=shm,prefill->decode=cuda_ipc").is_err());
     }
 }

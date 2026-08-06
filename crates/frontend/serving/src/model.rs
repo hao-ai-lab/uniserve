@@ -414,7 +414,6 @@ impl Qwen3Desc {
             read_enabled: cache.read,
             write_enabled: cache.write,
             encoder_pin_count: 0,
-            transfer: None,
         };
         let resource_accounting = ResourceAccounting {
             expected_kv_tokens: resources.max_kv_tokens as u64,

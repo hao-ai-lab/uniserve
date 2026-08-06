@@ -33,7 +33,6 @@ use crate::generation::{
     TransitionIntent, TransitionValidationError,
 };
 
-pub const MAX_SPEC_DECODE_POS_STATS: usize = 16;
 pub const DEFAULT_MAX_BATCH: usize = 128;
 pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_NUM_SEQS: usize = 128;
@@ -110,16 +109,6 @@ pub struct TimingStats {
     pub queue_wait_us_max: AtomicU64,
 }
 
-/// Speculative-decode accounting (drafter is default-off).
-#[derive(Default)]
-pub struct SpecDecodeStats {
-    pub max_draft_tokens: AtomicUsize,
-    pub num_drafts: AtomicU64,
-    pub num_draft_tokens: AtomicU64,
-    pub num_accepted_tokens: AtomicU64,
-    pub num_accepted_tokens_per_pos: [AtomicU64; MAX_SPEC_DECODE_POS_STATS],
-}
-
 /// Worker-local forward/kernel counters, aggregated as completed batches
 /// resolve so OpenMetrics can explain scheduler vs worker/kernel latency.
 #[derive(Default)]
@@ -167,7 +156,6 @@ pub struct SchedStats {
     pub encoder: EncoderStats,
     pub resources: ResourceStats,
     pub timing: TimingStats,
-    pub spec_decode: SpecDecodeStats,
     pub worker: WorkerStats,
 }
 
@@ -251,7 +239,6 @@ struct SequenceView {
     sampled_logprob: Option<f32>,
     top_logprobs: Vec<RankedToken>,
     prompt_logprobs: Vec<Vec<RankedToken>>,
-    accepted_draft_tokens: Option<u32>,
     image_png: Option<String>,
     encode_generation: Option<u32>,
     kv_visible_len: u32,
@@ -259,26 +246,10 @@ struct SequenceView {
 }
 
 impl SequenceView {
-    fn from_report(
-        variant: WorkVariant,
-        record: &CompletionRecord,
-        products: &[ProductPayload],
-        draft_token_ids: &[u32],
-    ) -> Self {
+    fn from_report(record: &CompletionRecord, products: &[ProductPayload]) -> Self {
         let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
             .and_then(|payload| LogprobBlob::decode(&payload.bytes).ok())
             .unwrap_or_default();
-        let accepted_draft_tokens = (variant == WorkVariant::TokenVerify).then(|| {
-            let count = record.committed_tokens.len();
-            let accepted = if count <= draft_token_ids.len()
-                && record.committed_tokens.as_slice() == &draft_token_ids[..count]
-            {
-                count
-            } else {
-                count.saturating_sub(1)
-            };
-            accepted.min(u32::MAX as usize) as u32
-        });
         let image_png = find_product(products, record.op_id, ProductKind::Artifact)
             .and_then(|payload| String::from_utf8(payload.bytes.clone()).ok());
         Self {
@@ -286,7 +257,6 @@ impl SequenceView {
             sampled_logprob: logprobs.sampled_logprob,
             top_logprobs: logprobs.top_logprobs,
             prompt_logprobs: logprobs.prompt_logprobs,
-            accepted_draft_tokens,
             image_png,
             encode_generation: record.product_generations.first().copied(),
             kv_visible_len: record.logical_lengths.kv_visible_len,
@@ -589,10 +559,6 @@ pub struct Scheduler {
     denoise_step_burst: u16,
     /// Diagnostic: keep denoise steps out of batches that carry text rows.
     flow_exclusive_batch: bool,
-    /// Default-off n-gram drafter and per-position acceptance accounting. The
-    /// worker target-verifies the drafts and resolve commits only the accepted
-    /// prefix.
-    spec_decode: crate::spec_decode::SpecDecodeAccounting,
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
@@ -849,8 +815,6 @@ struct InflightOp {
     transition: PlannedTransition,
     /// The op's wire `op_id`, echoed back on its result.
     op_id: u64,
-    /// Speculative draft token ids attached to this op (empty when none).
-    spec_tokens: Vec<u32>,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
     /// Worst-case public events reserved before this operation was registered.
@@ -954,8 +918,6 @@ impl Scheduler {
             .num_blocks
             .store(caps.num_blocks as usize, Ordering::Relaxed);
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
-        let spec_decode = crate::spec_decode::SpecDecodeAccounting::new(Arc::clone(&stats));
-        let spec_ngram_max_tokens = spec_decode.max_ngram_tokens();
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
@@ -972,7 +934,6 @@ impl Scheduler {
                     "max_num_seqs": config.max_num_seqs,
                     "long_prefill_threshold": config.long_prefill_threshold,
                     "mixed_prefill_tokens": config.mixed_prefill_tokens,
-                    "spec_ngram_max_tokens": spec_ngram_max_tokens,
                     "denoise_step_burst": denoise_step_burst,
                 },
                 "caps": {
@@ -1020,7 +981,6 @@ impl Scheduler {
             prompt_cohort: None,
             denoise_step_burst,
             flow_exclusive_batch,
-            spec_decode,
             fatal: false,
             ledger: crate::resources::CreditLedger::new(credit_capacity),
             product_credits: HashMap::new(),
@@ -1377,7 +1337,6 @@ impl Scheduler {
                     prompt_tokens: st.context.prompt_ids.len(),
                     completion_tokens: 0,
                     images: 0,
-                    kv_transfer_params: None,
                 });
             }
             ids
@@ -1454,7 +1413,6 @@ impl Scheduler {
                 prompt_tokens: st.context.prompt_ids.len(),
                 completion_tokens: 0,
                 images: 0,
-                kv_transfer_params: None,
             });
         }
     }
@@ -2357,13 +2315,12 @@ impl Scheduler {
             return false;
         }
         // Only plain decode/extend predecessors may carry a device-relay
-        // successor: a speculative (draft-bearing) op has host-visible branching
-        // on acceptance, and any other variant is not a single-token advance.
+        // successor; any other variant is not a single-token advance.
         if queue.iter().any(|op| {
             !matches!(
                 op.transition.operation_variant,
                 WorkVariant::TokenExtend | WorkVariant::TokenDecode
-            ) || !op.spec_tokens.is_empty()
+            )
         }) {
             return false;
         }
@@ -2586,12 +2543,6 @@ impl Scheduler {
 
     fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_operation_variant(id) {
-            Some(WorkVariant::TokenVerify) => self
-                .spec_decode
-                .max_ngram_tokens()
-                .saturating_add(1)
-                .saturating_mul(2)
-                .saturating_add(2),
             Some(WorkVariant::TokenExtend | WorkVariant::TokenDecode) => 4,
             Some(WorkVariant::GenFlow) => usize::from(self.denoise_step_burst).saturating_add(2),
             Some(WorkVariant::Materialize) => 3,
@@ -2605,7 +2556,6 @@ impl Scheduler {
             .operation
             .as_ref()
             .map_or(0, |operation| operation.op_id.0);
-        let spec_tokens = transition.draft_token_ids.clone();
         let output_credit_bound = transition_output_bound(&transition);
         self.inflight_ops
             .entry(request_id)
@@ -2614,7 +2564,6 @@ impl Scheduler {
                 credits: transition.reserved_credits,
                 transition,
                 op_id,
-                spec_tokens,
                 started,
                 output_credit_bound,
             });
@@ -2697,12 +2646,12 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         op_id: u64,
-    ) -> (Option<PlannedTransition>, Vec<u32>, Option<Instant>) {
+    ) -> (Option<PlannedTransition>, Option<Instant>) {
         let Some(queue) = self.inflight_ops.get_mut(&id) else {
-            return (None, Vec::new(), None);
+            return (None, None);
         };
         if op_id == 0 || queue.front().is_none_or(|inflight| inflight.op_id != op_id) {
-            return (None, Vec::new(), None);
+            return (None, None);
         }
         let inflight = queue.pop_front().expect("front checked above");
         let empty = queue.is_empty();
@@ -2748,11 +2697,7 @@ impl Scheduler {
             .credits
             .checked_sub(product_credit)
             .expect("product credit is a sub-vector of operation credit");
-        let result = (
-            Some(inflight.transition),
-            inflight.spec_tokens,
-            Some(inflight.started),
-        );
+        let result = (Some(inflight.transition), Some(inflight.started));
         if empty {
             self.inflight_ops.remove(&id);
         }
@@ -2963,7 +2908,7 @@ impl Scheduler {
                 } = completion;
                 let id = record.request_key.session_id;
                 let op_id = record.op_id.0;
-                let (transition, draft_token_ids, started) = self.pop_inflight(id, op_id);
+                let (transition, started) = self.pop_inflight(id, op_id);
                 let Some(transition) = transition else {
                     self.trace_record(json!({
                         "event": "unknown_result_op_id",
@@ -2977,13 +2922,7 @@ impl Scheduler {
                     continue;
                 };
                 let operation_variant = transition.operation_variant;
-                let view = SequenceView::from_report(
-                    operation_variant,
-                    &record,
-                    products.as_ref(),
-                    &draft_token_ids,
-                );
-                let draft_tokens = draft_token_ids.len();
+                let view = SequenceView::from_report(&record, products.as_ref());
                 // fold this op's host-side round-trip latency into the history.
                 let roundtrip_us = started
                     .map(|start| start.elapsed().as_micros() as u64)
@@ -2994,7 +2933,6 @@ impl Scheduler {
                 // worker, host round-trip + worker compute time).
                 let sampled_token_ids_len = view.committed_tokens.len();
                 let sampled_token_ids_last = view.committed_tokens.last().copied();
-                let accepted_draft_tokens = view.accepted_draft_tokens;
                 if let Some(resolved_ops) = resolved_ops.as_mut() {
                     let image_hw = view
                         .image_png
@@ -3023,14 +2961,8 @@ impl Scheduler {
                     "image_done": view.image_png.is_some(),
                     "image_hw": image_hw,
                     "kv_tokens": view.kv_visible_len,
-                    "num_draft_tokens": draft_tokens,
-                    "num_accepted_tokens": accepted_draft_tokens,
                     "product_handle": view.encode_generation,
                 }));
-                }
-                if draft_tokens > 0 {
-                    self.spec_decode
-                        .record_acceptance(draft_tokens, accepted_draft_tokens);
                 }
                 if let Some(st) = self.running.get_mut(&id) {
                     let mut ev =
@@ -3215,7 +3147,6 @@ impl Scheduler {
                         id,
                         transition,
                         view,
-                        draft_token_ids,
                         selected_fixed,
                         public_tokens_before,
                         prefix_versions,
@@ -3229,7 +3160,6 @@ impl Scheduler {
                 id,
                 transition,
                 view,
-                draft_token_ids,
                 selected_fixed,
                 public_tokens_before,
                 prefix_versions,
@@ -3240,13 +3170,7 @@ impl Scheduler {
                     WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
                 );
                 if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
-                    self.resolve(
-                        id,
-                        transition,
-                        view,
-                        draft_token_ids,
-                        prefix_versions.clone(),
-                    );
+                    self.resolve(id, transition, view, prefix_versions.clone());
                 }
                 if token_operation {
                     let mut commit_without_decoder_event = None;
@@ -4036,13 +3960,6 @@ impl Scheduler {
         }
     }
 
-    fn supports_spec_decode(&self) -> bool {
-        self.caps.supported_work.contains(&WorkVariant::TokenVerify)
-            && self.caps.execution_constraints.device_sequence_lengths
-            && self.caps.execution_constraints.device_append_offsets
-            && self.caps.execution_constraints.max_speculative_points > 1
-    }
-
     fn peek_next_operation_variant(&self, id: RequestId) -> Option<WorkVariant> {
         let st = self.running.get(&id)?;
         if st.image_gen.branch_pending {
@@ -4351,11 +4268,6 @@ impl Scheduler {
                 "submitting mixed forward batch"
             );
         }
-        let spec_draft_counts: Vec<usize> = transitions
-            .iter()
-            .map(|transition| transition.draft_token_ids.len())
-            .filter(|count| *count > 0)
-            .collect();
         let wire_ops: Vec<uniserve_worker_wire::Operation> = transitions
             .iter()
             .filter_map(|transition| transition.operation.clone())
@@ -4399,20 +4311,6 @@ impl Scheduler {
         } else {
             if !controls.is_empty() {
                 self.control_batches.insert(step, controls);
-            }
-            for count in spec_draft_counts {
-                self.stats
-                    .spec_decode
-                    .num_drafts
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .spec_decode
-                    .num_draft_tokens
-                    .fetch_add(count as u64, Ordering::Relaxed);
-                self.stats
-                    .spec_decode
-                    .max_draft_tokens
-                    .fetch_max(count, Ordering::Relaxed);
             }
         }
     }
@@ -4605,8 +4503,8 @@ impl Scheduler {
     /// Data-plane causality gate: whether the request's next op may be dispatched
     /// given that its input tensors must be reachable on the worker that will run
     /// that will run it. Delegates to the executor, which is the `StageRouter`
-    /// under a disaggregated topology and
-    /// reports readiness from its `TensorMover`. Non-disaggregated executors
+    /// under a local staged topology and
+    /// reports readiness from its `TensorMover`. Direct executors
     /// return `true`, so this is a no-op gate in the single-pool default.
     fn stage_ready(&self, id: RequestId) -> bool {
         self.executor.stage_ready(id)
@@ -4715,30 +4613,7 @@ impl Scheduler {
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
-                let tok = if relay_input { 0 } else { st.und.next_token };
-                let spec_token_ids =
-                    if !projected_successor && budget > 1 && self.supports_spec_decode() {
-                        self.running.get(&id).and_then(|st| {
-                            let mut draft = self.spec_decode.draft_tokens(
-                                st,
-                                tok,
-                                sampling_state.allowed_token_ids.as_deref(),
-                                Some(sampling_state.suppressed_token_ids.as_slice())
-                                    .filter(|tokens| !tokens.is_empty()),
-                            )?;
-                            draft.truncate(
-                                self.caps
-                                    .execution_constraints
-                                    .max_speculative_points
-                                    .saturating_sub(1) as usize,
-                            );
-                            (!draft.is_empty()).then_some(draft)
-                        })
-                    } else {
-                        None
-                    };
-                let spec_len = spec_token_ids.as_ref().map_or(0, Vec::len);
-                let capacity_target = self.decode_capacity_target(pos as usize, spec_len);
+                let capacity_target = self.decode_capacity_target(pos as usize, 0);
                 if !self.bm.ensure_capacity(id, capacity_target) {
                     return None;
                 }
@@ -4749,7 +4624,7 @@ impl Scheduler {
                     TransitionIntent::DecodeUnd {
                         position: pos,
                         new_blocks,
-                        spec_token_ids,
+                        spec_token_ids: None,
                         sampling_state,
                         input_token,
                         relay_input,
@@ -5185,49 +5060,6 @@ impl Scheduler {
         }
     }
 
-    fn resolve_spec_decode_text(
-        &mut self,
-        id: RequestId,
-        view: SequenceView,
-        draft_token_ids: Vec<u32>,
-        prefix_versions: &[VersionRef],
-    ) {
-        self.bm.activate(id);
-        let accepted =
-            (view.accepted_draft_tokens.unwrap_or(0) as usize).min(draft_token_ids.len());
-        if view.committed_tokens.len() != accepted.saturating_add(1)
-            || view.committed_tokens[..accepted] != draft_token_ids[..accepted]
-        {
-            return self.finish(id, FinishReason::Error);
-        }
-        if let Some(st) = self.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-        }
-        for (index, tok) in view.committed_tokens.iter().copied().enumerate() {
-            let is_sampled = index == accepted;
-            let logprob = is_sampled.then_some(view.sampled_logprob).flatten();
-            let Some(st) = self.running.get_mut(&id) else {
-                return;
-            };
-            st.und.tokens_emitted += 1;
-            let top_logprobs = is_sampled.then(|| view.top_logprobs.clone());
-            if self.emit_or_finish_und_token(
-                id,
-                tok,
-                logprob,
-                top_logprobs,
-                is_sampled,
-                prefix_versions.get(index),
-            ) {
-                return;
-            }
-            if let Some(st) = self.running.get_mut(&id) {
-                st.und.next_token = tok;
-            }
-            self.invalidate_cpu_masks(id);
-        }
-    }
-
     fn resolve_decode_text(
         &mut self,
         id: RequestId,
@@ -5338,16 +5170,12 @@ impl Scheduler {
         id: RequestId,
         transition: PlannedTransition,
         mut view: SequenceView,
-        draft_token_ids: Vec<u32>,
         prefix_versions: Vec<VersionRef>,
     ) {
         let operation_variant = transition.operation_variant;
         if !view.prompt_logprobs.is_empty() {
             let positions = std::mem::take(&mut view.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
-        }
-        if operation_variant == WorkVariant::TokenVerify && !draft_token_ids.is_empty() {
-            return self.resolve_spec_decode_text(id, view, draft_token_ids, &prefix_versions);
         }
         if operation_variant == WorkVariant::TokenDecode {
             return self.resolve_decode_text(id, view, &prefix_versions);
@@ -6208,7 +6036,6 @@ impl Scheduler {
                 prompt_tokens: st.context.prompt_ids.len(),
                 completion_tokens: st.und.tokens_emitted,
                 images: st.image_gen.images_done,
-                kv_transfer_params: None,
             };
             let closed = enqueue_public_event(&st.event_tx, &mut st.output_journal, terminal);
             if !closed {

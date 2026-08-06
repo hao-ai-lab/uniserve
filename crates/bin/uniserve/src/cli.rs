@@ -166,7 +166,7 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend, e.g.
-    /// `encoder->prefill=cuda_ipc,prefill->decode=mooncake`.
+    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
     #[arg(long)]
     pub transfer: Option<String>,
     /// Response-ring slot capacity in bytes for the worker IPC transport.
@@ -313,12 +313,12 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "tp-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
-    /// Unset = a single Full pool (the non-disaggregated default); a multi-stage
-    /// spec composes pools behind a StageRouter.
+    /// Unset = a single Full pool; a multi-stage spec composes local pools
+    /// behind a StageRouter.
     #[arg(long, hide = true)]
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend, e.g.
-    /// `encoder->prefill=cuda_ipc,prefill->decode=mooncake,decode->sampler=shm`.
+    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
     #[arg(long, hide = true)]
     pub transfer: Option<String>,
     /// KV block size in tokens (the page size).
@@ -573,10 +573,6 @@ pub(crate) struct WorkerLaunchArgs {
     pub worker_mesh: Option<String>,
     #[arg(long, hide = true)]
     pub tp_backend: Option<String>,
-    #[arg(long, default_value = "", hide = true)]
-    pub mooncake_device: String,
-    #[arg(long, default_value = "rdma", hide = true)]
-    pub mooncake_protocol: String,
     #[arg(long = "enable-torch-compile")]
     pub torch_compile: bool,
     #[arg(long, default_value = "inductor", hide = true)]
@@ -635,8 +631,6 @@ impl WorkerLaunchArgs {
             disable_model_arch: self.disable_model_arch.clone(),
             mesh: self.worker_mesh.clone(),
             tp_backend: self.tp_backend.clone(),
-            mooncake_device: self.mooncake_device.clone(),
-            mooncake_protocol: self.mooncake_protocol.clone(),
             torch_compile: self.torch_compile,
             torch_compile_backend: self.torch_compile_backend.clone(),
             torch_compile_mode: self.torch_compile_mode.clone(),
@@ -692,18 +686,6 @@ impl WorkerLaunchArgs {
         }
         push_option(args, "--worker-mesh", cfg.mesh.as_ref());
         push_option(args, "--tp-backend", cfg.tp_backend.as_ref());
-        push_if_changed(
-            args,
-            "--mooncake-device",
-            &cfg.mooncake_device,
-            &default.mooncake_device,
-        );
-        push_if_changed(
-            args,
-            "--mooncake-protocol",
-            &cfg.mooncake_protocol,
-            &default.mooncake_protocol,
-        );
         if cfg.torch_compile {
             args.push("--enable-torch-compile".to_string());
         }
@@ -1214,7 +1196,7 @@ mod tests {
             "--workers",
             "encoder:2,prefill:1:tp=4,decode:1:tp=4",
             "--transfer",
-            "prefill->decode=mooncake",
+            "prefill->decode=cuda_ipc",
         ]);
         let engine_args = runtime.engine_cli_args();
         assert_eq!(
@@ -1223,7 +1205,7 @@ mod tests {
         );
         assert_eq!(
             forwarded_value(&engine_args, "--transfer"),
-            Some("prefill->decode=mooncake"),
+            Some("prefill->decode=cuda_ipc"),
         );
     }
 

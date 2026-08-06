@@ -124,7 +124,7 @@ def test_dispatchers_reject_unknown_overrides():
     with pytest.raises(ValueError, match="unknown provider override"):
         compute.run(_ComputeReq(1), override="cutlass")
     with pytest.raises(ValueError, match="unknown comm provider override"):
-        comm.dispatch(_DispatchReq((1,)), override="mooncake")
+        comm.dispatch(_DispatchReq((1,)), override="ucc")
 
 
 def test_adapter_and_fused_pools_model_composite_provider_axes():

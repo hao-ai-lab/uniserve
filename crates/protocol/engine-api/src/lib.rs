@@ -145,7 +145,6 @@ pub enum GenEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
         images: usize,
-        kv_transfer_params: Option<serde_json::Value>,
     },
     Rejected {
         message: String,
@@ -668,7 +667,6 @@ mod tests {
             prompt_tokens: 4,
             completion_tokens: 9,
             images: 0,
-            kv_transfer_params: None,
         };
 
         match event {
@@ -678,14 +676,12 @@ mod tests {
                 prompt_tokens,
                 completion_tokens,
                 images,
-                kv_transfer_params,
             } => {
                 assert_eq!(reason, FinishReason::Stop);
                 assert_eq!(stop_reason, Some("</s>".to_string()));
                 assert_eq!(prompt_tokens, 4);
                 assert_eq!(completion_tokens, 9);
                 assert_eq!(images, 0);
-                assert_eq!(kv_transfer_params, None);
             }
             other => panic!("expected Finished, got {other:?}"),
         }

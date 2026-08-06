@@ -8,14 +8,10 @@ plane opaquely — the host never parses it.
 
 Backends (one chosen per worker via :func:`make_transport`):
 
-* ``local``    — same process, zero copy (non-disaggregated / tests).
+* ``local``    — same process, zero copy.
 * ``shm``      — same node, host bytes via POSIX shared memory.
 * ``cuda_ipc`` — same node, GPU↔GPU via CUDA IPC (torch's per-storage handle
   cache *is* register-once).
-* ``mooncake`` — same/cross node, one-sided RDMA via Mooncake's ``TransferEngine``
-  (the cross-device/node workhorse: GPUDirect VRAM, NIC selection, same-node
-  fallback). One engine per worker; ``register_memory`` is cached per pointer so
-  each buffer is registered exactly once.
 """
 
 from __future__ import annotations
@@ -24,10 +20,8 @@ import base64
 import concurrent.futures
 import hashlib
 import json
-import os
 import pickle
 import queue
-import socket
 import threading
 import time
 import uuid
@@ -53,7 +47,6 @@ __all__ = [
     "LocalTransport",
     "ShmTransport",
     "CudaIpcTransport",
-    "MooncakeTransport",
     "fetch_locator",
     "make_transport",
     "TransportKind",
@@ -67,7 +60,6 @@ class TransportKind(StrEnum):
     LOCAL = "local"
     SHM = "shm"
     CUDA_IPC = "cuda_ipc"
-    MOONCAKE = "mooncake"
 
 
 TRANSPORTS = tuple(kind.value for kind in TransportKind)
@@ -87,8 +79,7 @@ class Locator:
     dtype: str
     shape: tuple[int, ...]
     device: str
-    addr: int = 0  # absolute addr within the registered region (mooncake)
-    handle: bytes = b""  # transport-specific resolve info (cuda_ipc / shm / local)
+    handle: bytes = b""
     meta: dict[str, Any] = field(default_factory=dict)
 
     def to_bytes(self) -> bytes:
@@ -110,7 +101,6 @@ class Locator:
             "dtype": self.dtype,
             "shape": list(self.shape),
             "device": self.device,
-            "addr": self.addr,
             "handle_b64": base64.b64encode(self.handle).decode("ascii"),
             "meta": self.meta,
         }
@@ -126,7 +116,6 @@ class Locator:
             dtype=str(raw["dtype"]),
             shape=tuple(int(v) for v in raw["shape"]),
             device=str(raw["device"]),
-            addr=int(raw.get("addr", 0)),
             handle=base64.b64decode(str(raw.get("handle_b64", "")).encode("ascii")),
             meta=dict(raw.get("meta") or {}),
         )
@@ -538,7 +527,7 @@ class ShmTransport(Transport):
     bytes into a FRESH named segment. (register-once-by-pointer would be wrong
     here — a producer reuses a logits/scratch buffer across steps with new data
     each time, so a pointer-keyed cache returns stale bytes; the register-once
-    optimization is for the live-buffer RDMA/cuda_ipc transports.) A bounded LRU
+    optimization is for the live-buffer CUDA IPC transport.) A bounded LRU
     of recent segments is kept alive so a consumer can still map them; older
     segments are unlinked once the producer is well past them, and ``release``
     reclaims promptly."""
@@ -889,232 +878,6 @@ class CudaIpcTransport(Transport):
             self._bytes.release(_nbytes(tensor))
 
 
-class MooncakeTransport(Transport):
-    """Same/cross-node one-sided RDMA via Mooncake's ``TransferEngine``.
-
-    One engine per worker, initialized once; ``register_memory`` is cached per
-    pointer so each buffer registers exactly once. Locators name (session, addr);
-    ``fetch`` is a one-sided ``transfer_sync_read`` from the producer, ``push`` a
-    ``transfer_sync_write`` to a remote buffer (the KV edge).
-    """
-
-    name = "mooncake"
-    supports_async_publication = True
-
-    def __init__(
-        self,
-        *,
-        device_name: str = "",
-        protocol: str = "rdma",
-        hostname: str | None = None,
-        metadata_server: str = "P2PHANDSHAKE",
-        byte_capacity: int,
-    ) -> None:
-        _ensure_mooncake_runtime()
-        from mooncake.engine import TransferEngine
-
-        self.engine = TransferEngine()
-        host = hostname or _local_ip()
-        rc = self.engine.initialize(host, metadata_server, protocol, device_name)
-        if rc != 0:
-            raise capability_mismatch(
-                f"Mooncake TransferEngine.initialize failed (code {rc}); "
-                f"protocol={protocol!r} device_name={device_name!r}"
-            )
-        port = self.engine.get_rpc_port()
-        self._session = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-        self._registered: dict[int, int] = {}
-        self._alive: dict[int, "torch.Tensor"] = {}
-        self._producer_events: dict[int, "torch.cuda.Event"] = {}
-        self._lock = threading.Lock()
-        self._bytes = _ByteCapacity(byte_capacity)
-        self._reads = _BoundedTransferPool(
-            workers=2,
-            capacity=256,
-            byte_capacity=self._bytes,
-            name="uniserve-mooncake-read",
-        )
-
-    def session(self) -> str:
-        return self._session
-
-    def _register_once(self, ptr: int, nbytes: int) -> bool:
-        with self._lock:
-            registered = self._registered.get(ptr)
-            if registered is not None:
-                if registered != nbytes:
-                    raise invalid_descriptor(
-                        "Mooncake buffer address was reused with a different byte extent"
-                    )
-                return False
-        rc = self.engine.register_memory(ptr, nbytes)
-        if rc != 0:
-            raise capability_mismatch(f"Mooncake register_memory failed (code {rc})")
-        with self._lock:
-            self._registered[ptr] = nbytes
-        return True
-
-    def _unregister(self, ptr: int) -> None:
-        with self._lock:
-            registered = self._registered.pop(ptr, None)
-        if registered is not None:
-            self.engine.unregister_memory(ptr)
-
-    def _publish_owned(
-        self,
-        tensor: "torch.Tensor",
-        event: "torch.cuda.Event | None" = None,
-    ) -> Locator:
-        t = tensor.detach().contiguous()
-        ptr = int(t.data_ptr())
-        nbytes = _nbytes(t)
-        try:
-            self._register_once(ptr, nbytes)
-        except BaseException:
-            self._bytes.release(nbytes)
-            raise
-        with self._lock:
-            self._alive[ptr] = t
-            if event is not None:
-                self._producer_events[ptr] = event
-        return Locator(
-            transport="mooncake",
-            session=self._session,
-            nbytes=nbytes,
-            dtype=_dtype_to_str(t.dtype),
-            shape=tuple(t.shape),
-            device=str(t.device),
-            addr=ptr,
-        )
-
-    def publish(self, tensor: "torch.Tensor") -> Locator:
-        nbytes = _nbytes(tensor)
-        self._bytes.acquire(nbytes)
-        try:
-            owned = tensor.detach().clone()
-        except BaseException:
-            self._bytes.release(nbytes)
-            raise
-        return self._publish_owned(owned)
-
-    def publish_async(self, tensor: "torch.Tensor") -> Locator:
-        import torch
-
-        nbytes = _nbytes(tensor)
-        self._bytes.acquire(nbytes)
-        try:
-            owned = tensor.detach().clone()
-        except BaseException:
-            self._bytes.release(nbytes)
-            raise
-        try:
-            event = None
-            if owned.is_cuda:
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(owned.device))
-        except BaseException:
-            self._bytes.release(nbytes)
-            raise
-        return self._publish_owned(owned, event)
-
-    def ready(self, locator: Locator) -> bool:
-        with self._lock:
-            event = self._producer_events.get(int(locator.addr))
-            alive = int(locator.addr) in self._alive
-        return alive and (event is None or bool(event.query()))
-
-    def fetch_async(self, locator: Locator) -> TransferTicket:
-        return self._reads.submit(self.fetch, locator, nbytes=locator.nbytes)
-
-    def fetch(self, locator: Locator) -> "torch.Tensor":
-        import torch
-
-        dst = torch.empty(
-            locator.shape, dtype=_dtype_from_str(locator.dtype), device=locator.device
-        )
-        dptr = int(dst.data_ptr())
-        registered_here = self._register_once(dptr, locator.nbytes)
-        try:
-            rc = self.engine.transfer_sync_read(locator.session, dptr, locator.addr, locator.nbytes)
-            if rc != 0:
-                raise capability_mismatch(f"Mooncake transfer_sync_read failed (code {rc})")
-            return dst
-        finally:
-            if registered_here:
-                self._unregister(dptr)
-
-    def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
-        t = tensor.contiguous()
-        ptr = int(t.data_ptr())
-        registered_here = self._register_once(ptr, _nbytes(t))
-        try:
-            rc = self.engine.transfer_sync_write(locator.session, ptr, locator.addr, locator.nbytes)
-            if rc != 0:
-                raise capability_mismatch(f"Mooncake transfer_sync_write failed (code {rc})")
-        finally:
-            if registered_here:
-                self._unregister(ptr)
-
-    def release(self, locator: Locator) -> None:
-        ptr = int(locator.addr)
-        with self._lock:
-            removed = self._alive.pop(ptr, None)
-            self._producer_events.pop(ptr, None)
-        self._unregister(ptr)
-        if removed is not None:
-            self._bytes.release(locator.nbytes)
-
-    def close(self) -> None:
-        self._reads.close()
-        with self._lock:
-            ptrs = list(self._registered)
-            alive = tuple(self._alive.values())
-            self._alive.clear()
-            self._producer_events.clear()
-        for tensor in alive:
-            self._bytes.release(_nbytes(tensor))
-        for ptr in ptrs:
-            try:
-                self._unregister(ptr)
-            except Exception:
-                pass
-
-
-def _ensure_mooncake_runtime() -> None:
-    """Preload the CUDA-12 runtime if Mooncake's prebuilt wheel needs it.
-
-    The ``mooncake-transfer-engine`` wheel links ``libcudart.so.12``; on a
-    CUDA-13 host ``dlopen`` it RTLD_GLOBAL from ``nvidia-cuda-runtime-cu12`` (if
-    installed) so Mooncake's extension resolves it without ``LD_LIBRARY_PATH``.
-    No-op if the runtime library is already resolvable on the host.
-    """
-    import ctypes
-    import glob
-
-    try:
-        import nvidia.cuda_runtime
-
-        roots = list(getattr(nvidia.cuda_runtime, "__path__", []))
-    except Exception:
-        return
-    for root in roots:
-        for so in glob.glob(os.path.join(root, "lib", "libcudart.so.12*")):
-            try:
-                ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
-                return
-            except OSError:
-                continue
-
-
-def _local_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-
-
 def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
     """Select the worker's single Tier-2 transport (mirrors Rust
     ``make_transfer_agent``)."""
@@ -1131,11 +894,4 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
         return ShmTransport(byte_capacity=int(cfg["byte_capacity"]))
     if kind is TransportKind.CUDA_IPC:
         return CudaIpcTransport(byte_capacity=int(cfg["byte_capacity"]))
-    if kind is TransportKind.MOONCAKE:
-        return MooncakeTransport(
-            device_name=str(cfg["device_name"]),
-            protocol=str(cfg["protocol"]),
-            hostname=cfg.get("hostname"),
-            byte_capacity=int(cfg["byte_capacity"]),
-        )
     raise AssertionError(f"unhandled transport kind {kind!r}")

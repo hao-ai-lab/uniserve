@@ -226,7 +226,6 @@ fn build_tokenized(
         read_enabled: cache.read,
         write_enabled: cache.write,
         encoder_pin_count: resources.encoder_cache_keys.len(),
-        transfer: None,
     };
     let resource_accounting = resource_accounting_from(&resources);
 

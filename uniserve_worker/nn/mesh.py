@@ -30,7 +30,6 @@ __all__ = [
     'PeerAxisTransport',
     'CollectiveTransport',
     'LocalP2PTransport',
-    'DataPlaneTowerTransport',
     'MeshAxis',
     'DeviceMesh',
     'TensorParallelSpec',
@@ -233,79 +232,6 @@ class LocalP2PTransport:
         if dev.type != "cuda" or not torch.cuda.is_available():
             return
         torch.cuda.current_stream(dev).wait_event(event)
-
-
-@dataclass(frozen=True)
-class DataPlaneTowerTransport:
-    """Cross-process tower transport backed by the data plane.
-
-    The und and gen towers are separate worker processes and the und→gen KV handoff crosses
-    the process boundary over the data plane (``cuda_ipc`` / ``mooncake``) rather
-    than an in-process NVLink peer copy. The model still expresses the handoff as
-    ``reshard(Pinned(primary) -> Pinned(gen))``; only the bound transport differs.
-
-    The actual publish/fetch and readiness gate are owned by the data-plane /
-    ``StageRouter`` integration. This class fixes the seam:
-
-    * ``publish(t)`` (producer/und side) registers a tensor with the data plane
-      and returns the opaque wire ``locator``; ``receive(locator, like=t)``
-      (consumer/gen side) materializes it on the gen device.
-    * ``record_ready``/``wait_ready`` map to the transfer-readiness gate; the
-      default is a no-op because the gate is enforced host-side.
-    * It exposes **no** ``device(coord)``: a cross-process tower has no
-      in-process peer device, so ``place_towers`` skips device moves and
-      ``route_by_modality`` takes the single-modality in-place path.
-
-    ``data_plane`` is the injected mover (a ``TensorStore``-like object exposing
-    ``publish``/``fetch``).
-    """
-
-    axis: str
-    _size: int
-    _coord: int
-    data_plane: Any = None
-    gate: Any = None
-
-    @property
-    def size(self) -> int:
-        return int(self._size)
-
-    @property
-    def coord(self) -> int:
-        return int(self._coord)
-
-    def publish(self, t: torch.Tensor, *, kind: str = "kv_pages") -> Any:
-        """Producer side: register ``t`` with the data plane, return its wire locator."""
-        if self.data_plane is None:
-            raise RuntimeError("cross-process tower transport requires a data-plane mover")
-        return self.data_plane.publish(t, kind)
-
-    def receive(self, locator: Any, *, like: torch.Tensor | None = None) -> torch.Tensor:
-        """Consumer side: materialize the tensor named by ``locator`` locally."""
-        if self.data_plane is None:
-            raise RuntimeError("cross-process tower transport requires a data-plane mover")
-        del like
-        return self.data_plane.fetch_locator(locator)
-
-    def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor:
-        del non_blocking
-        if int(coord) != self.coord:
-            raise RuntimeError(
-                "cross-process tower values must be transferred before model execution"
-            )
-        return t
-
-    def record_ready(self, coord: int | None = None) -> Any | None:
-        # Readiness is the host-side StageRouter transfer gate, not a local stream
-        # event. The gate (when wired) decides when the gen worker may read the
-        # snapshot; locally there is nothing to record.
-        if self.gate is not None:
-            return self.gate.record_ready(coord)
-        return None
-
-    def wait_ready(self, event: Any | None, coord: int | None = None) -> None:
-        if self.gate is not None:
-            self.gate.wait_ready(event, coord)
 
 
 # ---------------------------------------------------------------------------

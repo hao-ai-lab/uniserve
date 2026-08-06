@@ -6,7 +6,6 @@ import torch
 from uniserve_worker.nn.mesh import (
     CollectiveAxisTransport,
     CollectiveTransport,
-    DataPlaneTowerTransport,
     DeviceMesh,
     LocalP2PTransport,
     MeshAxis,
@@ -61,18 +60,6 @@ def test_mesh_view_rejects_collectives_on_a_routing_axis():
 
     with pytest.raises(RuntimeError, match="does not support all-reduce"):
         view.all_reduce(torch.ones(1), "tower")
-
-
-def test_cross_process_tower_dispatch_is_local_and_rejects_unstaged_peers():
-    transport = DataPlaneTowerTransport(axis="tower", _size=2, _coord=1)
-    view = MeshStore(
-        DeviceMesh.of(MeshAxis("tower", 2, 1, transport), device="cpu")
-    ).view(("tower",))
-    value = torch.tensor([3.0])
-
-    assert view.dispatch(value, "tower", 1) is value
-    with pytest.raises(RuntimeError, match="transferred before model execution"):
-        view.dispatch(value, "tower", 0)
 
 
 def test_local_sharding_rejects_uneven_geometry():

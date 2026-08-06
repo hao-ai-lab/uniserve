@@ -36,7 +36,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transfer-backend",
         default="local",
-        help="data-plane backend: local, shm, cuda_ipc, or mooncake",
+        help="data-plane backend: local, shm, or cuda_ipc",
     )
     parser.add_argument(
         "--defer-sampling",
@@ -74,8 +74,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tp-backend", default=None)
     parser.add_argument("--tp-init-method", default=None)
-    parser.add_argument("--mooncake-device", default="")
-    parser.add_argument("--mooncake-protocol", default="rdma")
     parser.add_argument("--torch-compile", action="store_true", default=False)
     parser.add_argument("--torch-compile-backend", default="inductor")
     parser.add_argument("--torch-compile-mode", default=None)

@@ -35,7 +35,7 @@ fn default_worker_ranks() -> usize {
     1
 }
 
-/// Place a staged pool on GPU `gpu` for tower disaggregation. A plain `cuda`/`gpu`
+/// Place a staged pool on GPU `gpu`. A plain `cuda`/`gpu`
 /// device becomes `cuda:{gpu}` (distinct GPU per pool); an explicit device
 /// (`cuda:1`, `cpu`) is left as the operator set it.
 fn assign_pool_device(device: &str, gpu: usize) -> String {
@@ -81,15 +81,15 @@ pub struct EngineCoreConfig {
     pub worker_python: String,
     /// Number of worker rank processes (1 = UniprocExecutor; >1 spawns a
     /// MultiprocExecutor with one ring per rank). Used as the tp size of the
-    /// single Full pool when `workers` is unset (the non-disaggregated default).
+    /// single Full pool when `workers` is unset.
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
-    /// `None` (or `full:1`) is the non-disaggregated default: a single Full pool
+    /// `None` (or `full:1`) selects a single Full pool
     /// driven directly, with no `StageRouter`. A multi-stage spec composes pools
     /// behind a `StageRouter`.
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
-    /// `encoder->prefill=cuda_ipc,prefill->decode=mooncake`. Passed through to the
+    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Passed through to the
     /// `TensorMover`; unconfigured edges use the in-process backend.
     pub transfer: Option<String>,
     /// Explicit Python worker launch/runtime configuration.
@@ -188,7 +188,7 @@ impl EngineCore {
             .build()
     }
 
-    /// Spawn the non-disaggregated single Full pool (the default path). `tp == 1`
+    /// Spawn the single Full pool. `tp == 1`
     /// is a `UniprocExecutor`; `tp > 1` a `MultiprocExecutor`. No `--worker-kind`
     /// is passed because the worker starts in Full mode by default.
     fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
@@ -258,9 +258,9 @@ impl EngineCore {
         // When the topology peels a Sampler, the model pools (Full/Prefill/Decode)
         // publish logits + defer sampling.
         let has_sampler = workers.pools.iter().any(|p| p.kind == WorkerKind::Sampler);
-        // Tower disaggregation (und/gen) places each pool on its own GPU so the two
+        // The Und/Gen stage split places each pool on its own GPU so the two
         // towers run in parallel and the conditioning KV crosses GPU↔GPU over
-        // cuda_ipc. Non-tower staged topologies keep the shared device (the model-
+        // CUDA IPC. Other staged topologies keep the shared device (the model-
         // free sampler/postprocess pools don't need a dedicated GPU).
         let is_tower = workers
             .pools
@@ -569,7 +569,7 @@ impl EngineCoreBuilder<NeedsExecutor> {
             );
         }
         // Resolve the staged topology. `None` or the trivial single-Full pool
-        // takes the non-disaggregated path below, byte-identical to before;
+        // takes the direct full-pool path below;
         // anything else composes a StageRouter over heterogeneous pools.
         let workers = match config.workers.as_deref() {
             Some(spec) => WorkersSpec::parse(spec).context("invalid --workers spec")?,

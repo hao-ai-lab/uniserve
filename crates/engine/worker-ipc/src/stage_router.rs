@@ -1186,7 +1186,6 @@ mod tests {
             "value": {
                 "height": 16,
                 "locator": {
-                    "addr": 0,
                     "device": "cuda:0",
                     "dtype": "float32",
                     "handle_b64": "",

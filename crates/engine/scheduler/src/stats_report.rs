@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
-use crate::{MAX_SPEC_DECODE_POS_STATS, SchedStats};
+use crate::SchedStats;
 use uniserve_engine_wire::stats::{
-    BaseCacheStats, PrefixCacheStats, SchedulerStats, SpecDecodingStats, WorkerForwardStats,
+    BaseCacheStats, PrefixCacheStats, SchedulerStats, WorkerForwardStats,
 };
 
 /// Converts the scheduler's cumulative counters into per-update deltas for the
@@ -20,10 +20,6 @@ pub struct SchedStatsReporter {
     last_prefix_hit_tokens: u64,
     last_queue_wait_count: u64,
     last_queue_wait_us_total: u64,
-    last_spec_drafts: u64,
-    last_spec_draft_tokens: u64,
-    last_spec_accepted_tokens: u64,
-    last_spec_accepted_tokens_per_pos: [u64; MAX_SPEC_DECODE_POS_STATS],
     last_worker_forward_stats: WorkerForwardStats,
     // cumulative batch-timing counters, delta'd into per-update sums.
     last_worker_exec_us_total: u64,
@@ -98,53 +94,12 @@ impl SchedStatsReporter {
                 preempted_requests: 0,
                 ..Default::default()
             },
-            spec_decoding_stats: self.spec_decoding_stats(stats),
             worker_forward_stats: self.worker_forward_stats(stats),
             worker_exec_us: delta_worker_exec_us,
             batch_roundtrip_us: delta_batch_roundtrip_us,
             batch_count: delta_batch_count,
             ..Default::default()
         }
-    }
-
-    fn spec_decoding_stats(&mut self, stats: &SchedStats) -> Option<SpecDecodingStats> {
-        let drafts = stats.spec_decode.num_drafts.load(Ordering::Relaxed);
-        let draft_tokens = stats.spec_decode.num_draft_tokens.load(Ordering::Relaxed);
-        let accepted_tokens = stats
-            .spec_decode
-            .num_accepted_tokens
-            .load(Ordering::Relaxed);
-        let delta_drafts = drafts.saturating_sub(self.last_spec_drafts);
-        let delta_draft_tokens = draft_tokens.saturating_sub(self.last_spec_draft_tokens);
-        let delta_accepted_tokens = accepted_tokens.saturating_sub(self.last_spec_accepted_tokens);
-        self.last_spec_drafts = drafts;
-        self.last_spec_draft_tokens = draft_tokens;
-        self.last_spec_accepted_tokens = accepted_tokens;
-
-        let mut accepted_per_pos: Vec<u64> = Vec::with_capacity(MAX_SPEC_DECODE_POS_STATS);
-        for idx in 0..MAX_SPEC_DECODE_POS_STATS {
-            let value = stats.spec_decode.num_accepted_tokens_per_pos[idx].load(Ordering::Relaxed);
-            let delta = value.saturating_sub(self.last_spec_accepted_tokens_per_pos[idx]);
-            self.last_spec_accepted_tokens_per_pos[idx] = value;
-            accepted_per_pos.push(delta);
-        }
-        while accepted_per_pos.last().is_some_and(|value| *value == 0) {
-            accepted_per_pos.pop();
-        }
-        if delta_drafts == 0
-            && delta_draft_tokens == 0
-            && delta_accepted_tokens == 0
-            && accepted_per_pos.is_empty()
-        {
-            return None;
-        }
-        Some(SpecDecodingStats {
-            num_spec_tokens: stats.spec_decode.max_draft_tokens.load(Ordering::Relaxed) as u64,
-            num_drafts: delta_drafts,
-            num_draft_tokens: delta_draft_tokens,
-            num_accepted_tokens: delta_accepted_tokens,
-            num_accepted_tokens_per_pos: accepted_per_pos,
-        })
     }
 
     fn worker_forward_stats(&mut self, stats: &SchedStats) -> Option<WorkerForwardStats> {
@@ -526,38 +481,5 @@ mod tests {
         // maps are part of the delta/is_empty bookkeeping, not always-present).
         let wire2 = reporter.snapshot(&stats, 256);
         assert!(wire2.worker_forward_stats.is_none());
-    }
-
-    #[test]
-    fn snapshot_reports_speculative_decode_counters() {
-        let stats = SchedStats::default();
-        stats
-            .spec_decode
-            .max_draft_tokens
-            .store(4, Ordering::Relaxed);
-        stats.spec_decode.num_drafts.store(3, Ordering::Relaxed);
-        stats
-            .spec_decode
-            .num_draft_tokens
-            .store(12, Ordering::Relaxed);
-        stats
-            .spec_decode
-            .num_accepted_tokens
-            .store(7, Ordering::Relaxed);
-        stats.spec_decode.num_accepted_tokens_per_pos[0].store(3, Ordering::Relaxed);
-        stats.spec_decode.num_accepted_tokens_per_pos[1].store(2, Ordering::Relaxed);
-
-        let mut reporter = SchedStatsReporter::default();
-        let wire = reporter.snapshot(&stats, 256);
-        let spec = wire.spec_decoding_stats.expect("spec stats present");
-
-        assert_eq!(spec.num_spec_tokens, 4);
-        assert_eq!(spec.num_drafts, 3);
-        assert_eq!(spec.num_draft_tokens, 12);
-        assert_eq!(spec.num_accepted_tokens, 7);
-        assert_eq!(spec.num_accepted_tokens_per_pos, vec![3, 2]);
-
-        let wire2 = reporter.snapshot(&stats, 256);
-        assert!(wire2.spec_decoding_stats.is_none());
     }
 }

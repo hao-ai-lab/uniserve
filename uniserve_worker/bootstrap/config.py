@@ -168,14 +168,11 @@ def _validate_data_plane(
     backend: str,
     defer_sampling: bool,
 ) -> None:
-    if backend not in {"local", "shm", "cuda_ipc", "mooncake"}:
+    if backend not in {"local", "shm", "cuda_ipc"}:
         raise ValueError(f"unknown --transfer-backend {backend!r}")
-    if worker_kind in {WorkerKind.UND, WorkerKind.GEN} and backend not in {
-        "cuda_ipc",
-        "mooncake",
-    }:
+    if worker_kind in {WorkerKind.UND, WorkerKind.GEN} and backend != "cuda_ipc":
         raise ValueError(
-            f"{worker_kind.value!r} requires a cross-process tower transport (cuda_ipc or mooncake)"
+            f"{worker_kind.value!r} requires same-node CUDA IPC transport"
         )
     if (worker_kind is WorkerKind.SAMPLER or defer_sampling) and backend == "local":
         raise ValueError(f"{worker_kind.value!r} requires a cross-process logits transport")

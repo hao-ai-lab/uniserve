@@ -1128,7 +1128,6 @@ pub struct CacheAccounting {
     pub read_enabled: bool,
     pub write_enabled: bool,
     pub encoder_pin_count: usize,
-    pub transfer: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1501,7 +1500,6 @@ struct ChatDone {
     visible_output_token_count: usize,
     internal_token_count: usize,
     finish_reason: FinishReason,
-    kv_transfer_params: Option<serde_json::Value>,
 }
 
 enum MappedChatEvent {
@@ -1577,7 +1575,6 @@ fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
             visible_output_token_count,
             internal_token_count,
             finish_reason,
-            kv_transfer_params,
             ..
         } => MappedChatEvent::Done(ChatDone {
             prompt_token_count,
@@ -1585,7 +1582,6 @@ fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
             visible_output_token_count,
             internal_token_count,
             finish_reason,
-            kv_transfer_params,
         }),
     }
 }
@@ -1694,7 +1690,6 @@ async fn emit_text_update(
             .saturating_sub(finished.internal_token_count),
         internal_token_count: finished.internal_token_count,
         finish_reason: finished.finish_reason,
-        kv_transfer_params: finished.kv_transfer_params,
     }))
 }
 
@@ -1716,15 +1711,13 @@ async fn emit_terminal(
         done.visible_output_token_count
             .saturating_add(done.internal_token_count)
     );
-    let mut cache = event_context.cache.clone();
-    cache.transfer = done.kv_transfer_params;
     y.yield_ok(ServeEvent::Usage {
         prompt_tokens: done.prompt_token_count.min(u32::MAX as usize) as u32,
         visible_output_tokens: done.visible_output_token_count.min(u32::MAX as usize) as u32,
         internal_tokens: done.internal_token_count.min(u32::MAX as usize) as u32,
         image_count,
         image_steps,
-        cache,
+        cache: event_context.cache.clone(),
         resources: event_context.resources.clone(),
         timings: RuntimeTimings {
             compile_us: event_context.compile_duration_us,
@@ -1909,7 +1902,6 @@ async fn assemble_event_stream(
                     output_token_count: emitted_output_tokens as usize,
                     internal_token_count: 0,
                     finish_reason: FinishReason::Stop(Some(StopReason::Text(stop_string.clone()))),
-                    kv_transfer_params: None,
                 });
             if stop_string.is_none() {
                 stream.acknowledge_text_prefix();
@@ -2158,7 +2150,6 @@ async fn assemble_event_stream(
                 prompt_tokens,
                 completion_tokens,
                 images,
-                kv_transfer_params,
             } => {
                 ensure_output_ready!("terminal event");
                 flush_pending_images!();
@@ -2176,7 +2167,6 @@ async fn assemble_event_stream(
                     internal_token_count: completion_tokens
                         .saturating_sub(emitted_output_tokens as usize),
                     finish_reason: generation_text_finish_reason(reason, stop_reason),
-                    kv_transfer_params,
                 };
                 let done = emit_text_update(
                     &request_id,
@@ -2287,7 +2277,6 @@ mod tests {
                 read_enabled: true,
                 write_enabled: true,
                 encoder_pin_count: 0,
-                transfer: None,
             },
             resources: ResourceAccounting {
                 expected_kv_tokens: 2,
@@ -2353,7 +2342,6 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 1,
             images: 0,
-            kv_transfer_params: None,
         })
         .unwrap();
         drop(tx);
