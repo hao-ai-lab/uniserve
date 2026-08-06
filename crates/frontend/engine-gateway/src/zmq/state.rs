@@ -1,27 +1,26 @@
-//! Frontend-side request and utility registries with per-engine routing state.
+//! Frontend-side request registry with per-engine routing state.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::trace;
 
-use crate::client::state::{OutputReceiver, OutputSender, UtilityReceiver, UtilitySender};
+use crate::client::state::{EventReceiver, EventSender};
 use crate::error::{Error, Result};
-use crate::protocol::EngineCoreOutput;
+use crate::protocol::RoutedGenerationEvent;
 use crate::protocol::stats::SchedulerStats;
 use crate::zmq::EngineId;
 use crate::zmq::transport::ConnectedEngine;
 
 #[derive(Debug)]
 struct TrackedRequest {
-    sender: OutputSender,
+    sender: EventSender,
     engine_id: EngineId,
 }
 
 /// The latest real scheduler-side load snapshot observed from one engine.
 ///
-/// These counters come from `scheduler_stats` on the normal engine output path
+/// These counters come from `scheduler_stats` on the normal engine event path
 /// and are the preferred routing signal once available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EngineLoadSnapshot {
@@ -67,7 +66,7 @@ impl EngineRoutingState {
     }
 }
 
-/// Internal registry for tracking active requests and their output stream
+/// Internal registry for tracking active requests and their event stream
 /// senders.
 ///
 /// This is used to route incoming outputs to the correct request stream, and to
@@ -102,13 +101,13 @@ impl RequestRegistry {
         &mut self,
         request_id: String,
         data_parallel_rank: Option<u32>,
-    ) -> Result<(EngineId, OutputReceiver)> {
+    ) -> Result<(EngineId, EventReceiver)> {
         if self.requests.contains_key(&request_id) {
             return Err(Error::DuplicateRequestId { request_id });
         }
 
         let engine_id = self.choose_engine_for_request(data_parallel_rank)?;
-        let (tx, rx) = mpsc::channel(crate::client::EngineCoreOutputStream::BUFFER_CAPACITY);
+        let (tx, rx) = mpsc::channel(crate::generation::GENERATION_EVENT_BUFFER_CAPACITY);
         self.requests.insert(
             request_id,
             TrackedRequest {
@@ -178,38 +177,29 @@ impl RequestRegistry {
 
     /// Obtain the stream sender for one output. If it indicates the request is
     /// finished, it will be removed from the registry.
-    pub(crate) fn sender_for_output(&mut self, output: &EngineCoreOutput) -> Option<OutputSender> {
-        if output.finished() {
-            self.remove(output.request_id.as_str())
+    pub(crate) fn sender_for_event(
+        &mut self,
+        routed: &RoutedGenerationEvent,
+    ) -> Option<EventSender> {
+        if routed.is_terminal() {
+            self.remove(routed.external_request_id.as_str())
                 .map(|tracked| tracked.0)
         } else {
             self.requests
-                .get(output.request_id.as_str())
+                .get(routed.external_request_id.as_str())
                 .map(|tracked| tracked.sender.clone())
         }
     }
 
-    /// Obtain stream senders for a whole engine output batch under one
+    /// Obtain stream senders for a whole engine event batch under one
     /// registry lock. Finished outputs are removed before returning.
-    pub(crate) fn senders_for_outputs<'a>(
+    pub(crate) fn senders_for_events<'a>(
         &mut self,
-        outputs: impl IntoIterator<Item = &'a EngineCoreOutput>,
-    ) -> Vec<Option<OutputSender>> {
-        outputs
+        events: impl IntoIterator<Item = &'a RoutedGenerationEvent>,
+    ) -> Vec<Option<EventSender>> {
+        events
             .into_iter()
-            .map(|output| self.sender_for_output(output))
-            .collect()
-    }
-
-    /// Remove a batch of requests that have finished or aborted, returning
-    /// their stream senders.
-    pub(crate) fn finish_many<'a>(
-        &mut self,
-        request_ids: impl IntoIterator<Item = &'a String>,
-    ) -> Vec<OutputSender> {
-        request_ids
-            .into_iter()
-            .filter_map(|request_id| self.remove(request_id.as_str()).map(|tracked| tracked.0))
+            .map(|event| self.sender_for_event(event))
             .collect()
     }
 
@@ -231,7 +221,7 @@ impl RequestRegistry {
     }
 
     /// Mark the registry as closed, detach and return all tracked senders.
-    pub(crate) fn close(&mut self) -> Vec<OutputSender> {
+    pub(crate) fn close(&mut self) -> Vec<EventSender> {
         if self.closed {
             return Vec::new();
         }
@@ -246,7 +236,7 @@ impl RequestRegistry {
     /// Remove one request from the local registry. Returns the tracked entry if
     /// it exists.
     #[must_use]
-    pub(crate) fn remove(&mut self, request_id: &str) -> Option<(OutputSender, EngineId)> {
+    pub(crate) fn remove(&mut self, request_id: &str) -> Option<(EventSender, EngineId)> {
         let tracked = self.requests.remove(request_id)?;
         if let Some(state) = self.routing_per_engine.get_mut(&tracked.engine_id) {
             // `inflight` is balanced 1:1 with entries in `self.requests`, so it
@@ -281,334 +271,7 @@ impl RequestRegistry {
         true
     }
 
-    #[cfg(test)]
-    pub(crate) fn contains(&self, request_id: &str) -> bool {
-        self.requests.contains_key(request_id)
-    }
-
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
-    }
-}
-
-/// Internal registry for tracking active utility calls and their waiting
-/// receivers.
-#[derive(Debug)]
-pub(crate) struct UtilityRegistry {
-    closed: bool,
-    next_call_id: AtomicU64,
-    utility_calls: BTreeMap<u64, UtilitySender>,
-}
-
-impl Default for UtilityRegistry {
-    fn default() -> Self {
-        Self {
-            closed: false,
-            next_call_id: AtomicU64::new(1),
-            utility_calls: BTreeMap::default(),
-        }
-    }
-}
-
-impl UtilityRegistry {
-    /// Allocate the next utility `call_id` and register a newly added utility
-    /// call.
-    pub(crate) fn allocate_and_register(&mut self) -> (u64, UtilityReceiver) {
-        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.utility_calls.insert(call_id, tx);
-        (call_id, rx)
-    }
-
-    /// Resolve a utility output to its waiting receiver.
-    pub(crate) fn resolve(&mut self, call_id: &u64) -> Option<UtilitySender> {
-        self.utility_calls.remove(call_id)
-    }
-
-    /// Drop a batch of registered utility calls without delivering a result.
-    /// Used to roll back allocations when the dispatch fan-out fails before
-    /// every engine could accept the request.
-    pub(crate) fn unregister_many(&mut self, call_ids: impl IntoIterator<Item = u64>) {
-        for call_id in call_ids {
-            self.utility_calls.remove(&call_id);
-        }
-    }
-
-    /// Mark the registry as closed, detach and return all tracked senders.
-    pub(crate) fn close(&mut self) -> Vec<UtilitySender> {
-        if self.closed {
-            return Vec::new();
-        }
-
-        self.closed = true;
-        std::mem::take(&mut self.utility_calls)
-            .into_values()
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn contains(&self, call_id: u64) -> bool {
-        self.utility_calls.contains_key(&call_id)
-    }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.closed
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{EngineLoadSnapshot, EngineRoutingState, RequestRegistry, UtilityRegistry};
-    use crate::protocol::{EngineCoreFinishReason, EngineCoreOutput};
-    use crate::zmq::EngineId;
-    use crate::zmq::transport::ConnectedEngine;
-
-    fn ready_response() -> crate::protocol::handshake::EngineCoreReadyResponse {
-        crate::protocol::handshake::EngineCoreReadyResponse {
-            max_model_len: 8192,
-            num_gpu_blocks: 1024,
-            dp_stats_address: None,
-            dtype: crate::protocol::ModelDtype::BFloat16,
-            uniserve_version: "test".to_string(),
-            generation_capabilities: uniserve_core::GenerationRuntimeCapabilities::default(),
-        }
-    }
-
-    fn connected_engine(engine_id: EngineId) -> ConnectedEngine {
-        ConnectedEngine {
-            engine_id,
-            ready_response: ready_response(),
-        }
-    }
-
-    #[test]
-    fn registry_rejects_duplicate_request_ids() {
-        let mut registry = RequestRegistry::new(&[connected_engine(EngineId::from(b"engine-0"))]);
-        registry.register("req-1".to_string(), None).unwrap();
-        let error = registry.register("req-1".to_string(), None).unwrap_err();
-        assert!(matches!(
-            error,
-            crate::error::Error::DuplicateRequestId { request_id } if request_id == "req-1"
-        ));
-    }
-
-    #[test]
-    fn registry_removes_finished_request_on_output() {
-        let mut registry = RequestRegistry::new(&[connected_engine(EngineId::from(b"engine-0"))]);
-        registry.register("req-1".to_string(), None).unwrap();
-
-        let sender = registry.sender_for_output(&EngineCoreOutput {
-            request_id: "req-1".to_string(),
-            finish_reason: Some(EngineCoreFinishReason::Length),
-            ..Default::default()
-        });
-
-        assert!(sender.is_some());
-        assert!(!registry.contains("req-1"));
-    }
-
-    #[test]
-    fn registry_closes_all_requests_on_failure() {
-        let mut registry = RequestRegistry::new(&[connected_engine(EngineId::from(b"engine-0"))]);
-        registry.register("req-1".to_string(), None).unwrap();
-        registry.register("req-2".to_string(), None).unwrap();
-
-        let senders = registry.close();
-
-        assert_eq!(senders.len(), 2);
-        assert!(registry.is_closed());
-    }
-
-    #[test]
-    fn registry_request_stream_has_a_fixed_buffer_bound() {
-        let mut registry = RequestRegistry::new(&[connected_engine(EngineId::from(b"engine-0"))]);
-        let (_, receiver) = registry.register("req-1".to_string(), None).unwrap();
-
-        assert_eq!(
-            receiver.max_capacity(),
-            crate::client::EngineCoreOutputStream::BUFFER_CAPACITY
-        );
-    }
-
-    #[test]
-    fn registry_tracks_engine_id_per_request() {
-        let engine_0 = EngineId::from_engine_index(0);
-        let engine_1 = EngineId::from_engine_index(1);
-        let mut registry = RequestRegistry::new(&[
-            connected_engine(engine_0.clone()),
-            connected_engine(engine_1.clone()),
-        ]);
-        let (chosen_0, _) = registry.register("req-1".to_string(), None).unwrap();
-        let (chosen_1, _) = registry.register("req-2".to_string(), None).unwrap();
-        let (chosen_0_again, _) = registry.register("req-3".to_string(), None).unwrap();
-
-        assert_eq!(chosen_0, engine_0);
-        assert_eq!(chosen_1, engine_1);
-        assert_eq!(chosen_0_again, engine_0);
-
-        let grouped = registry.abortable_request_ids(&[
-            "req-1".to_string(),
-            "req-2".to_string(),
-            "req-3".to_string(),
-        ]);
-        assert_eq!(
-            grouped.get(&engine_0).unwrap(),
-            &vec!["req-1".to_string(), "req-3".to_string()]
-        );
-        assert_eq!(grouped.get(&engine_1).unwrap(), &vec!["req-2".to_string()]);
-    }
-
-    #[test]
-    fn routing_score_uses_inflight_before_stats_arrive() {
-        let state = EngineRoutingState {
-            inflight: 3,
-            last_scheduler_stats: None,
-        };
-
-        assert_eq!(state.routing_score(), 3);
-    }
-
-    #[test]
-    fn routing_score_uses_inflight_as_scheduler_stats_lower_bound() {
-        let state = EngineRoutingState {
-            inflight: 7,
-            last_scheduler_stats: Some(EngineLoadSnapshot {
-                waiting: 0,
-                running: 2,
-            }),
-        };
-
-        assert_eq!(state.routing_score(), 7);
-    }
-
-    #[test]
-    fn routing_score_keeps_extra_waiting_penalty() {
-        let state = EngineRoutingState {
-            inflight: 1,
-            last_scheduler_stats: Some(EngineLoadSnapshot {
-                waiting: 3,
-                running: 2,
-            }),
-        };
-
-        assert_eq!(state.routing_score(), 14);
-    }
-
-    #[test]
-    fn registry_prefers_real_scheduler_stats_over_inflight() {
-        let engine_0 = EngineId::from_engine_index(0);
-        let engine_1 = EngineId::from_engine_index(1);
-        let mut registry = RequestRegistry::new(&[
-            connected_engine(engine_0.clone()),
-            connected_engine(engine_1.clone()),
-        ]);
-
-        assert!(registry.apply_scheduler_counts(
-            0,
-            EngineLoadSnapshot {
-                waiting: 3,
-                running: 2
-            }
-        ));
-        assert!(registry.apply_scheduler_counts(
-            1,
-            EngineLoadSnapshot {
-                waiting: 0,
-                running: 1
-            }
-        ));
-
-        let (chosen, _) = registry.register("req-stats".to_string(), None).unwrap();
-        assert_eq!(chosen, engine_1);
-    }
-
-    #[test]
-    fn register_with_data_parallel_rank_routes_to_specified_engine() {
-        let engine_0 = EngineId::from_engine_index(0);
-        let engine_1 = EngineId::from_engine_index(1);
-        let engine_2 = EngineId::from_engine_index(2);
-        let mut registry = RequestRegistry::new(&[
-            connected_engine(engine_0.clone()),
-            connected_engine(engine_1.clone()),
-            connected_engine(engine_2.clone()),
-        ]);
-
-        let (chosen, _) = registry.register("req-1".to_string(), Some(2)).unwrap();
-        assert_eq!(chosen, engine_2);
-
-        let (chosen, _) = registry.register("req-2".to_string(), Some(0)).unwrap();
-        assert_eq!(chosen, engine_0);
-
-        let (chosen, _) = registry.register("req-3".to_string(), Some(1)).unwrap();
-        assert_eq!(chosen, engine_1);
-    }
-
-    #[test]
-    fn register_with_out_of_range_rank_returns_error() {
-        let mut registry = RequestRegistry::new(&[
-            connected_engine(EngineId::from_engine_index(0)),
-            connected_engine(EngineId::from_engine_index(1)),
-        ]);
-
-        let error = registry.register("req-1".to_string(), Some(2)).unwrap_err();
-        assert!(matches!(
-            error,
-            crate::error::Error::InvalidDataParallelRank {
-                rank: 2,
-                num_engines: 2,
-            }
-        ));
-    }
-
-    #[test]
-    fn registry_remove_does_not_underflow_inflight() {
-        let engine_0 = EngineId::from_engine_index(0);
-        let mut registry = RequestRegistry::new(&[connected_engine(engine_0.clone())]);
-        registry.register("req-1".to_string(), None).unwrap();
-
-        // First remove drops the request and decrements inflight to 0.
-        assert!(registry.remove("req-1").is_some());
-        // A spurious second remove finds nothing in `self.requests`, so the
-        // `?` early-returns before touching `inflight`; the count must stay 0
-        // rather than wrapping to `usize::MAX`.
-        assert!(registry.remove("req-1").is_none());
-
-        // The engine remains routable with a score of 0, proving inflight did
-        // not underflow.
-        let (chosen, _) = registry.register("req-2".to_string(), None).unwrap();
-        assert_eq!(chosen, engine_0);
-    }
-
-    #[test]
-    fn utility_registry_tracks_and_removes_call_ids() {
-        let mut registry = UtilityRegistry::default();
-        let (call_id_1, _rx1) = registry.allocate_and_register();
-        let (call_id_2, _rx2) = registry.allocate_and_register();
-
-        assert_eq!(call_id_1, 1);
-        assert_eq!(call_id_2, 2);
-        assert!(registry.contains(1));
-        assert!(registry.contains(2));
-        assert!(registry.resolve(&1).is_some());
-        assert!(!registry.contains(1));
-        assert!(registry.contains(2));
-    }
-
-    #[test]
-    fn utility_registry_unregister_many_drops_pending_calls() {
-        use tokio::sync::oneshot::error::TryRecvError;
-
-        let mut registry = UtilityRegistry::default();
-        let (call_id_1, mut rx_1) = registry.allocate_and_register();
-        let (call_id_2, mut rx_2) = registry.allocate_and_register();
-        let (call_id_3, _rx_3) = registry.allocate_and_register();
-
-        registry.unregister_many([call_id_1, call_id_2]);
-
-        assert!(!registry.contains(call_id_1));
-        assert!(!registry.contains(call_id_2));
-        assert!(registry.contains(call_id_3));
-        assert!(matches!(rx_1.try_recv(), Err(TryRecvError::Closed)));
-        assert!(matches!(rx_2.try_recv(), Err(TryRecvError::Closed)));
     }
 }

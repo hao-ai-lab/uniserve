@@ -22,7 +22,7 @@
     "endpoint": {"type": "string"},
     "model": {"type": "string"},
     "base_url": {"type": "string"},
-    "server_info": {"type": ["object", "null"]},
+    "server_version": {"type": ["object", "null"]},
     "spec": {"type": "object"},
     "load": {
       "type": "object",

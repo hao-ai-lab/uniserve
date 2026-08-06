@@ -1,13 +1,11 @@
 //! Socket-mode engine client: ZMQ ROUTER/PULL transport to one or more
 //! headless `uniserve engine` processes. The startup handshake carries resolved
-//! generation control tokens, and
-//! [`ZmqEngineCoreClient::submit_generation`] adapts the wire stream back into
-//! typed text+image [`GenEvent`]s.
+//! generation control tokens and carries canonical generation events unchanged.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::{join_all, try_join_all};
+use futures::future::join_all;
 use tokio::sync::mpsc;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, trace};
@@ -15,14 +13,11 @@ use tracing::{debug, info, trace};
 use uniserve_core::GenerationRuntimeCapabilities;
 use uniserve_engine_wire::generation::GenerationControlTokens;
 
-use crate::client::{EngineCoreOutputStream, StreamControlRequest};
+use crate::client::{StreamControl, StreamControlRequest};
 use crate::error::{Error, Result};
-use crate::generation::{
-    GenerationEventStream, generation_event_stream_from_wire, generation_request_to_wire,
-};
+use crate::generation::{GenerationEventStream, GenerationSubmission};
 use crate::protocol::handshake::EngineCoreReadyResponse;
-use crate::protocol::utility::EngineCoreUtilityRequest;
-use crate::protocol::{EngineCoreControlRequest, EngineCoreRequest, ModelDtype};
+use crate::protocol::{EngineRequest, ModelDtype};
 use crate::zmq::imp::{ClientInner, run_output_dispatcher_loop, run_stream_control_loop};
 
 pub(crate) mod imp;
@@ -31,7 +26,7 @@ pub(crate) mod transport;
 
 pub use transport::{ConnectedEngine, EngineId};
 
-/// How the frontend acquires its request/response transport with headless
+/// How the frontend acquires its request/event transport with headless
 /// engine processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportMode {
@@ -340,60 +335,58 @@ impl ZmqEngineCoreClient {
 
 // Client API implementation.
 impl ZmqEngineCoreClient {
-    /// Add a new request to an engine and return a per-request raw output
-    /// stream.
-    pub async fn call(&self, mut req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
-        req.client_index = self.config.client_index;
-        req.validate()?;
-        let acknowledge_on_receive = req.generation.stop_strings.is_empty();
+    pub async fn submit_generation(
+        &self,
+        submission: GenerationSubmission,
+    ) -> Result<GenerationEventStream> {
+        let acknowledge_on_receive = submission.request.stop_strings.is_empty();
+        let request = submission.into_envelope(self.config.client_index);
+        request.validate()?;
         trace!(
-            request_id = %req.request_id,
-            client_index = req.client_index,
-            "sending add request"
+            request_id = %request.external_request_id,
+            client_index = request.client_index,
+            "submitting generation request"
         );
 
-        let request_id = req.request_id.clone();
-        let data_parallel_rank = req.data_parallel_rank;
+        let request_id = request.external_request_id.clone();
+        let data_parallel_rank = request.data_parallel_rank;
         let (engine_id, rx) = self
             .inner
             .register_request(request_id.clone(), data_parallel_rank)?;
 
-        debug!(
-            request_id = req.request_id,
-            ?engine_id,
-            "registered request to engine"
-        );
+        debug!(request_id, ?engine_id, "registered request to engine");
 
         if let Err(error) = self
             .inner
-            .send_to_engine(&engine_id, EngineCoreControlRequest::Add(Box::new(req)))
+            .send_to_engine(&engine_id, EngineRequest::Submit(Box::new(request)))
             .await
         {
-            // Failed to send the request to the engine, roll back the registration.
             self.inner.rollback_request(&request_id);
             return Err(error);
         }
 
-        Ok(EngineCoreOutputStream::new(
-            request_id,
-            self.control_tx.clone(),
+        let cancel_request_id = request_id.clone();
+        let acknowledge_request_id = request_id;
+        let cancel_tx = self.control_tx.clone();
+        let acknowledge_tx = self.control_tx.clone();
+        Ok(GenerationEventStream::with_control_policy(
             rx,
+            move |cause, output_token_count| {
+                let _ = cancel_tx.send(StreamControlRequest {
+                    request_id: cancel_request_id,
+                    control: StreamControl::Cancel {
+                        cause,
+                        output_token_count,
+                    },
+                });
+            },
+            move |output_token_count| {
+                let _ = acknowledge_tx.send(StreamControlRequest {
+                    request_id: acknowledge_request_id.clone(),
+                    control: StreamControl::Acknowledge { output_token_count },
+                });
+            },
             acknowledge_on_receive,
-        ))
-    }
-
-    /// Submit a canonical generation request over the wire and adapt its
-    /// output stream back into typed text-and-image [`GenEvent`]s.
-    pub async fn submit_generation(
-        &self,
-        submission: crate::generation::GenerationSubmission,
-    ) -> Result<GenerationEventStream> {
-        let decoder_ack_required = !submission.request.stop_strings.is_empty();
-        let wire = generation_request_to_wire(submission);
-        let stream = self.call(wire).await?;
-        Ok(generation_event_stream_from_wire(
-            stream,
-            decoder_ack_required,
         ))
     }
 
@@ -426,175 +419,6 @@ impl ZmqEngineCoreClient {
                 .do_cancel_requests(&engine_id, &request_ids)
                 .await?;
         }
-        Ok(())
-    }
-
-    /// Call a typed utility method on all connected engines, returning one
-    /// decoded result per connected engine if all calls succeed or an error
-    /// if any call fails.
-    pub async fn call_utility<T, A>(&self, method: &str, args: A) -> Result<Vec<T>>
-    where
-        T: serde::de::DeserializeOwned,
-        A: serde::Serialize + std::fmt::Debug,
-    {
-        trace!(
-            method,
-            client_index = self.config.client_index,
-            engine_count = self.engines.len(),
-            "sending utility request"
-        );
-
-        // Phase 1: allocate one call id per engine and build the per-engine
-        // request payloads up-front. Any failure here must roll back the call
-        // ids already allocated so they do not leak until shutdown.
-        let mut pending_calls = Vec::with_capacity(self.engines.len());
-        let mut prepared_sends = Vec::with_capacity(self.engines.len());
-        for engine in &self.engines {
-            let (call_id, rx) = match self.inner.allocate_and_register_utility_call() {
-                Ok(pair) => pair,
-                Err(err) => {
-                    self.inner
-                        .unregister_utility_calls(pending_calls.iter().map(|(id, _)| *id));
-                    return Err(err);
-                }
-            };
-            let request = match EngineCoreUtilityRequest::new(
-                self.config.client_index,
-                call_id,
-                method,
-                &args,
-            ) {
-                Ok(request) => request,
-                Err(err) => {
-                    self.inner.unregister_utility_calls(
-                        pending_calls
-                            .iter()
-                            .map(|(id, _)| *id)
-                            .chain(std::iter::once(call_id)),
-                    );
-                    return Err(err.into());
-                }
-            };
-            pending_calls.push((call_id, rx));
-            prepared_sends.push((&engine.engine_id, request));
-        }
-
-        // Phase 2: dispatch every utility request concurrently; fail fast on
-        // the first transport error and roll back.
-        let send_futures = prepared_sends.iter().map(|(engine_id, request)| {
-            self.inner.send_to_engine(
-                engine_id,
-                EngineCoreControlRequest::Utility(Box::new(request.clone())),
-            )
-        });
-        if let Err(err) = try_join_all(send_futures).await {
-            self.inner
-                .unregister_utility_calls(pending_calls.iter().map(|(id, _)| *id));
-            return Err(err);
-        }
-
-        // Phase 3: wait for all engines to respond and preserve the per-engine
-        // result list.
-        let futures = pending_calls.into_iter().map(|(call_id, rx)| async move {
-            let output = rx.await.map_err(|_| Error::UtilityCallClosed {
-                method: method.to_string(),
-                call_id,
-            })??;
-            output.into_typed_result(method).map_err(Error::from)
-        });
-        try_join_all(futures).await
-    }
-
-    /// Execute `collective_rpc` on all engines and flatten all engine results
-    /// into one list.
-    pub async fn collective_rpc<A, K>(
-        &self,
-        method: &str,
-        timeout: Option<f64>,
-        args: A,
-        kwargs: K,
-    ) -> Result<Vec<rmpv::Value>>
-    where
-        A: serde::Serialize + std::fmt::Debug,
-        K: serde::Serialize + std::fmt::Debug,
-    {
-        let results = self
-            .call_utility::<rmpv::Value, _>("collective_rpc", (method, timeout, args, kwargs))
-            .await?;
-
-        Ok(results
-            .into_iter()
-            .flat_map(|result| match result {
-                // Each engine's result is itself the worker-level result list.
-                rmpv::Value::Array(results) => results,
-                other => vec![other],
-            })
-            .collect())
-    }
-
-    /// Return whether the engine is currently sleeping at any level.
-    pub async fn is_sleeping(&self) -> Result<bool> {
-        let results: Vec<bool> = self.call_utility("is_sleeping", ()).await?;
-        let first = *results
-            .first()
-            .ok_or_else(|| Error::InconsistentUtilityResults {
-                method: "is_sleeping".to_string(),
-                values: "[]".to_string(),
-            })?;
-        if results.iter().all(|&v| v == first) {
-            Ok(first)
-        } else {
-            Err(Error::InconsistentUtilityResults {
-                method: "is_sleeping".to_string(),
-                values: format!("{results:?}"),
-            })
-        }
-    }
-
-    /// Reset the multi-modal cache.
-    pub async fn reset_mm_cache(&self) -> Result<()> {
-        self.call_utility::<(), _>("reset_mm_cache", ()).await?;
-        Ok(())
-    }
-
-    /// Reset the encoder cache.
-    pub async fn reset_encoder_cache(&self) -> Result<()> {
-        self.call_utility::<(), _>("reset_encoder_cache", ())
-            .await?;
-        Ok(())
-    }
-
-    /// Reset the prefix cache. Returns `true` only when every engine confirms
-    /// the reset (AND aggregation).
-    pub async fn reset_prefix_cache(
-        &self,
-        reset_running_requests: bool,
-        reset_connector: bool,
-    ) -> Result<bool> {
-        let results: Vec<bool> = self
-            .call_utility(
-                "reset_prefix_cache",
-                (reset_running_requests, reset_connector),
-            )
-            .await?;
-        if results.is_empty() {
-            return Err(Error::InconsistentUtilityResults {
-                method: "reset_prefix_cache".to_string(),
-                values: "[]".to_string(),
-            });
-        }
-        Ok(results.into_iter().all(|ok| ok))
-    }
-
-    /// Put the engines to sleep.
-    pub async fn sleep(&self, level: u32, mode: &str) -> Result<()> {
-        self.call_utility::<(), _>("sleep", (level, mode)).await?;
-        Ok(())
-    }
-
-    /// Wake the engines from sleep.
-    pub async fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()> {
-        self.call_utility::<(), _>("wake_up", (tags,)).await?;
         Ok(())
     }
 

@@ -13,7 +13,8 @@ pub use uniserve_core::{
 /// Finish reasons using the `STOP`/`LENGTH`/`ABORT`/`ERROR` split.
 /// `Stop` is a stop-string or stop-token hit (distinct from model `Eos`);
 /// `Aborted` is a server-side abort (distinct from client `Cancelled`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Eos,
     MaxTokens,
@@ -30,7 +31,7 @@ pub enum FinishReason {
 }
 
 /// One ranked vocabulary candidate at a generated or prompt token position.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TokenLogprob {
     pub token_id: u32,
     pub logprob: f32,
@@ -38,7 +39,7 @@ pub struct TokenLogprob {
 }
 
 /// Ranked candidates for one scored token position.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PositionLogprobs {
     pub entries: Vec<TokenLogprob>,
 }
@@ -94,7 +95,8 @@ impl PublicCommit {
 }
 
 /// Typed text and image event stream emitted to callers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum GenEvent {
     Scheduled {
         queued_at: f64,
@@ -294,13 +296,6 @@ impl GenerationSubmission {
     }
 }
 
-/// Collective RPC reply channel payload.
-pub type CollectiveRpcReply =
-    std::sync::mpsc::Sender<Result<Vec<(u32, bool, Option<String>)>, String>>;
-
-/// Reply channel for one acknowledged prefix-cache reset transaction.
-pub type PrefixCacheResetReply = std::sync::mpsc::Sender<Result<bool, String>>;
-
 /// Command sent from a frontend handler to the scheduler thread.
 pub enum Command {
     Submit(Box<GenerationSubmission>),
@@ -321,21 +316,6 @@ pub enum Command {
     },
     /// Server-side abort → `FinishReason::Aborted`.
     Abort(RequestId),
-    /// Clear the prefix cache after applying the requested running-request policy.
-    ResetPrefixCache {
-        reset_running_requests: bool,
-        reply: PrefixCacheResetReply,
-    },
-    /// Clear the encoder cache (`/reset_encoder_cache`, `/reset_mm_cache`).
-    ResetEncoderCache,
-    /// Pause/resume admission (the `/sleep` and `/wake_up` endpoints).
-    SetSleeping(bool),
-    /// Execute one control method on every worker rank and reply with
-    /// `(rank, ok, message)` acks — the collective_rpc surface.
-    CollectiveRpc {
-        method: String,
-        reply: CollectiveRpcReply,
-    },
     Shutdown,
 }
 
@@ -424,42 +404,6 @@ impl EngineHandle {
     /// Server-side abort, distinct from a client cancel.
     pub fn abort(&self, id: RequestId) {
         let _ = self.send(Command::Abort(id));
-    }
-    /// Clear the prefix cache and wait for the scheduler to acknowledge the transaction.
-    pub fn reset_prefix_cache(&self, reset_running_requests: bool) -> Result<bool, String> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.send(Command::ResetPrefixCache {
-            reset_running_requests,
-            reply: reply_tx,
-        })
-        .map_err(|error| error.to_string())?;
-        reply_rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .map_err(|error| format!("prefix-cache reset reply channel: {error}"))?
-    }
-    /// Clear the encoder cache.
-    pub fn reset_encoder_cache(&self) {
-        let _ = self.send(Command::ResetEncoderCache);
-    }
-    /// Pause/resume admission.
-    pub fn set_sleeping(&self, sleeping: bool) {
-        let _ = self.send(Command::SetSleeping(sleeping));
-    }
-    /// Execute one control method on every worker rank, awaiting per-rank acks
-    /// (blocks the caller; the scheduler executes it inline between steps).
-    pub fn collective_rpc(
-        &self,
-        method: impl Into<String>,
-    ) -> Result<Vec<(u32, bool, Option<String>)>, String> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.send(Command::CollectiveRpc {
-            method: method.into(),
-            reply: reply_tx,
-        })
-        .map_err(|e| e.to_string())?;
-        reply_rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .map_err(|e| format!("collective_rpc reply channel: {e}"))?
     }
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);
@@ -682,62 +626,14 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::with_waker(tx, waker);
 
-        handle.reset_encoder_cache();
-        handle.set_sleeping(true);
+        handle.cancel(RequestId(1));
+        handle.abort(RequestId(2));
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
 
         // Closing the channel means there is no scheduler to wake.
         drop(rx);
-        handle.reset_encoder_cache();
+        handle.cancel(RequestId(3));
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn prefix_cache_reset_round_trips_policy_and_result() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
-        let scheduler = std::thread::spawn(move || match rx.recv().unwrap() {
-            Command::ResetPrefixCache {
-                reset_running_requests,
-                reply,
-            } => {
-                assert!(reset_running_requests);
-                reply.send(Ok(true)).unwrap();
-            }
-            _ => panic!("expected ResetPrefixCache command"),
-        });
-
-        assert!(handle.reset_prefix_cache(true).unwrap());
-        scheduler.join().unwrap();
-    }
-
-    /// `collective_rpc` delivers the method to the scheduler side and returns
-    /// the per-rank acks the scheduler replies with.
-    #[test]
-    fn collective_rpc_round_trips_method_and_reply() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
-
-        // Stand in for the scheduler: receive the command, reply with acks.
-        let scheduler = std::thread::spawn(move || match rx.recv().unwrap() {
-            Command::CollectiveRpc { method, reply } => {
-                assert_eq!(method, "warmup");
-                reply
-                    .send(Ok(vec![
-                        (0, true, None),
-                        (1, false, Some("oops".to_string())),
-                    ]))
-                    .unwrap();
-            }
-            _ => panic!("expected CollectiveRpc command"),
-        });
-
-        let acks = handle.collective_rpc("warmup").unwrap();
-        scheduler.join().unwrap();
-
-        assert_eq!(acks.len(), 2);
-        assert_eq!(acks[0], (0, true, None));
-        assert_eq!(acks[1], (1, false, Some("oops".to_string())));
     }
 
     /// Cloned handles share the same underlying channel: a command sent through

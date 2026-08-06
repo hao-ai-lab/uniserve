@@ -8,8 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Public error type for the engine client.
 ///
-/// Protocol-shape errors (msgpack encode/decode, unsupported fields, utility
-/// result decoding) live in [`uniserve_engine_wire::Error`] and arrive here through the
+/// Protocol-shape errors live in [`uniserve_engine_wire::Error`] and arrive here through the
 /// transparent `Proto` variant; this enum owns transport- and client-lifecycle
 /// failures.
 #[derive(Debug, Error, Macro)]
@@ -41,20 +40,12 @@ pub enum Error {
     DuplicateRequestId { request_id: String },
     #[error("data parallel rank {rank} is out of range for {num_engines} engine(s)")]
     InvalidDataParallelRank { rank: u32, num_engines: u32 },
-    #[error("engine output dispatcher closed: {message}")]
+    #[error("engine event dispatcher closed: {message}")]
     DispatcherClosed { message: String },
     #[error("engine client is closed: {message}")]
     ClientClosed { message: String },
-    #[error("engine application control is unavailable because the execution gateway is closed")]
-    ApplicationControlUnavailable,
-    #[error("request output stream for `{request_id}` closed unexpectedly")]
-    RequestStreamClosed { request_id: String },
-    #[error("utility call `{method}` closed unexpectedly (call_id={call_id})")]
-    UtilityCallClosed { method: String, call_id: u64 },
-    #[error("utility call `{method}` returned inconsistent results across engines: {values}")]
-    InconsistentUtilityResults { method: String, values: String },
-    #[error("unsupported engine control: {control}")]
-    UnsupportedControl { control: String },
+    #[error("engine status is unavailable because the execution gateway is closed")]
+    StatusUnavailable,
 
     /// A special variant to allow cloning the same error.
     #[error(transparent)]

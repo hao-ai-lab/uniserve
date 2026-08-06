@@ -35,7 +35,7 @@ def build_summary(
     task: BenchmarkTask,
     selected_rows: dict[str, Any],
     tokenizer: Any | None = None,
-    server_info: dict[str, Any] | None = None,
+    server_version: dict[str, Any] | None = None,
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if spec.is_stream_task:
@@ -46,7 +46,7 @@ def build_summary(
         metrics = summarize_image(records, dur_s)
 
     validation = task.validate(records).merged(_metric_validation(spec.metrics, metrics))
-    warnings = _warnings(records, server_info, provenance or {})
+    warnings = _warnings(records, server_version, provenance or {})
     classifiers: dict[str, int] = {}
     for record in records:
         classifiers[record.classifier] = classifiers.get(record.classifier, 0) + 1
@@ -70,7 +70,7 @@ def build_summary(
         "metric_definitions": [definition.as_dict() for definition in spec.metrics],
         "validation": validation.as_dict(),
         "warnings": warnings,
-        "server_info": server_info,
+        "server_version": server_version,
         "provenance": provenance or {},
     }
 
@@ -124,12 +124,12 @@ def _metric_validation(
 
 def _warnings(
     records: Sequence[RequestRecord],
-    server_info: dict[str, Any] | None,
+    server_version: dict[str, Any] | None,
     provenance: dict[str, Any],
 ) -> list[str]:
     values = sorted({warning for record in records for warning in record.warnings})
-    if server_info is None:
-        values.append("server_info_unavailable")
+    if server_version is None:
+        values.append("server_version_unavailable")
     if provenance.get("dirty") is True:
         values.append("dirty_workspace")
     return values

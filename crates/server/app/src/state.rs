@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
-use uniserve_engine_gateway::EngineAppControl;
+use uniserve_engine_gateway::EngineStatus;
 use uniserve_serving::ServingRuntime;
 
 const SHUTDOWN_REFCOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -12,7 +12,7 @@ const SHUTDOWN_REFCOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct AppState {
     served_model_name: String,
     runtime: ServingRuntime,
-    engine_control: EngineAppControl,
+    engine_status: EngineStatus,
     enable_log_requests: bool,
     enable_request_id_headers: bool,
     api_key: Option<String>,
@@ -25,7 +25,7 @@ impl AppState {
     pub fn new(
         served_model_name: String,
         runtime: ServingRuntime,
-        engine_control: EngineAppControl,
+        engine_status: EngineStatus,
     ) -> Self {
         assert!(
             !served_model_name.is_empty(),
@@ -34,7 +34,7 @@ impl AppState {
         Self {
             served_model_name,
             runtime,
-            engine_control,
+            engine_status,
             enable_log_requests: false,
             enable_request_id_headers: false,
             api_key: None,
@@ -101,8 +101,8 @@ impl AppState {
         std::slice::from_ref(&self.served_model_name)
     }
 
-    pub fn engine_control(&self) -> &EngineAppControl {
-        &self.engine_control
+    pub fn engine_status(&self) -> &EngineStatus {
+        &self.engine_status
     }
 
     pub fn server_load(&self) -> u64 {

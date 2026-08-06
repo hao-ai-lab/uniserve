@@ -13,9 +13,12 @@ pub(crate) fn unix_timestamp() -> u64 {
     uniserve_core::now_unix_secs_u64()
 }
 
-/// Construct an API error for a failed utility call to the engine core.
-pub(crate) fn utility_call_error(method: &str, error: impl AsReport) -> ApiError {
-    ApiError::server_error(format!("failed to call {method}: {}", error.as_report()))
+/// Construct an API error when engine status is unavailable.
+pub(crate) fn engine_status_error(error: impl AsReport) -> ApiError {
+    ApiError::server_error(format!(
+        "engine status is unavailable: {}",
+        error.as_report()
+    ))
 }
 
 /// Extract the external request ID and tracing metadata from HTTP headers.

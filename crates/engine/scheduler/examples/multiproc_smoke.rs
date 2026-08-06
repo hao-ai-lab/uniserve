@@ -1,6 +1,6 @@
 //! Multi-rank IPC smoke test: spawn stub Python worker processes — one
 //! descriptor ring per rank — behind a `MultiprocExecutor`, drive requests
-//! through the scheduler, and exercise correlated control fan-out.
+//! through the scheduler, and verify generation on every rank.
 use std::collections::HashMap;
 
 use uniserve_core::{
@@ -9,7 +9,7 @@ use uniserve_core::{
     TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine_api::GenEvent;
-use uniserve_executor::{ControlOp, Executor};
+use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
 use uniserve_worker_ipc::MultiprocExecutor;
 
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
     let world = 2usize;
-    let mut executor = MultiprocExecutor::spawn(
+    let executor = MultiprocExecutor::spawn(
         "python3",
         "",
         "cpu",
@@ -36,12 +36,6 @@ fn main() -> anyhow::Result<()> {
         executor.caps().rank.tp_size
     );
     assert_eq!(executor.caps().rank.tp_size as usize, world);
-
-    // The collective_rpc shape: per-rank correlated acks over the real rings.
-    let acks = executor.control_wait(ControlOp::ResetPrefixCache, None)?;
-    println!("control acks: {acks:?}");
-    assert_eq!(acks.len(), world);
-    assert!(acks.iter().all(|a| a.ok));
 
     let mut sched = Scheduler::new(Box::new(executor), ControlTokens::default(), 32);
 

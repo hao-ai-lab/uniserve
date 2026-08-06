@@ -101,7 +101,6 @@ class RequestKind(StrEnum):
     SHUTDOWN = "shutdown"
     COPY_KV = "copy_kv"
     RELEASE_PRODUCTS = "release_products"
-    RESET_PREFIX_CACHE = "reset_prefix_cache"
     GET_METRICS = "get_metrics"
     GET_PRESSURE = "get_pressure"
     SNAPSHOT_SESSION = "snapshot_session"

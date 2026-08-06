@@ -6,14 +6,15 @@
 
 use std::time::Duration;
 
-use futures::StreamExt;
 use uniserve_core::{
     ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
     UndVisibility,
 };
-use uniserve_engine_gateway::transport::protocol::{EngineCoreFinishReason, EngineCoreRequest};
-use uniserve_engine_gateway::transport::{EngineCoreClient, TransportMode, ZmqClientConfig};
+use uniserve_engine_gateway::transport::{
+    EngineCoreClient, GenEvent, GenerationFinishReason, GenerationSubmission, TransportMode,
+    ZmqClientConfig,
+};
 use uniserve_managed_engine::{ManagedEngineConfig, ManagedEngineHandle, allocate_handshake_port};
 
 fn text_generation_request() -> GenerationRequest {
@@ -84,20 +85,29 @@ async fn managed_sim_engine_serves_and_shuts_down() {
     assert!(client.total_num_gpu_blocks() > 0);
 
     // One text generation through the real subprocess.
-    let request = EngineCoreRequest::new("req-managed".to_string(), text_generation_request());
-    let mut stream = client.call(request).await.expect("submit request");
+    let mut stream = client
+        .submit_generation(GenerationSubmission::new(
+            "req-managed",
+            text_generation_request(),
+        ))
+        .await
+        .expect("submit request");
     let mut tokens = 0usize;
     let mut finish = None;
-    while let Some(item) = stream.next().await {
-        let output = item.expect("stream item").output;
-        tokens += output.new_token_ids.len();
-        if let Some(reason) = output.finish_reason {
-            finish = Some(reason);
-            break;
+    while let Some(event) = stream.next().await {
+        match event {
+            GenEvent::TextToken { .. } => tokens += 1,
+            GenEvent::Finished { reason, .. } => {
+                finish = Some(reason);
+                break;
+            }
+            GenEvent::Rejected { message } => panic!("request rejected: {message}"),
+            GenEvent::Error { message } => panic!("engine error: {message}"),
+            _ => {}
         }
     }
     assert!(tokens >= 1);
-    assert_eq!(finish, Some(EngineCoreFinishReason::Stop));
+    assert_eq!(finish, Some(GenerationFinishReason::Eos));
 
     client.shutdown().await.expect("shutdown client");
 

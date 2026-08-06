@@ -269,8 +269,6 @@ def _control(
         worker.copy_kv(_integer_pairs(request, "copies", kind))
     elif kind is RequestKind.RELEASE_PRODUCTS:
         worker.release_products(_integers(request, "product_handles", kind))
-    elif kind is RequestKind.RESET_PREFIX_CACHE:
-        worker.reset_prefix_cache()
     elif kind is RequestKind.SNAPSHOT_SESSION:
         reference = worker.snapshot_session(_integer(request, "session_id", kind))
         return _response(ResponseKind.SNAPSHOT, snapshot=reference.to_wire())

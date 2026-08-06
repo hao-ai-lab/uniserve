@@ -39,7 +39,7 @@ pub fn check_stream_options_requires_stream(
 ///
 /// Valid values are any non-negative integer or the sentinel `-1` (full
 /// vocabulary). `param` lets each surface attribute the error to its own field
-/// (e.g. `prompt_logprobs` for OpenAI bodies, `sampling_params` for /generate).
+/// (for example, `prompt_logprobs` in an OpenAI request body).
 pub fn check_prompt_logprobs_bound(
     prompt_logprobs: i32,
     param: &'static str,

@@ -543,11 +543,6 @@ pub struct Scheduler {
     usable_blocks: usize,
     /// Automatic prefix caching: toggle, hash config, lookup, and reuse.
     prefix_cache: crate::prefix_cache::PrefixCacheCoordinator,
-    /// When sleeping, admission is paused (engine idled).
-    sleeping: bool,
-    /// An acknowledged reset waits for submitted ops to resolve before it can
-    /// invalidate cache ownership atomically.
-    pending_prefix_reset: Option<PendingPrefixCacheReset>,
     /// Pluggable host-side logits-processor pipeline.
     logits_pipeline: Vec<Arc<dyn crate::logits::LogitsProcessor>>,
     custom_logits_processors: usize,
@@ -630,10 +625,6 @@ pub struct Scheduler {
     trace_sink: Option<crate::bench_trace::SchedulerTraceSink>,
     pub peak_ops_in_batch: usize,
     pub stats: Arc<SchedStats>,
-}
-
-struct PendingPrefixCacheReset {
-    reply: uniserve_engine_api::PrefixCacheResetReply,
 }
 
 /// A self-describing health snapshot.
@@ -1010,8 +1001,6 @@ impl Scheduler {
             config,
             usable_blocks,
             prefix_cache: crate::prefix_cache::PrefixCacheCoordinator::new(),
-            sleeping: false,
-            pending_prefix_reset: None,
             logits_pipeline: crate::logits::default_pipeline(),
             custom_logits_processors: 0,
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
@@ -1378,11 +1367,6 @@ impl Scheduler {
 
     /// Abort every queued/gated/running request with a terminal event.
     fn abort_all_requests(&mut self) {
-        if let Some(pending) = self.pending_prefix_reset.take() {
-            let _ = pending.reply.send(Err(
-                "scheduler stopped before the prefix-cache reset completed".to_string(),
-            ));
-        }
         let queued: Vec<RequestId> = {
             let mut ids = Vec::new();
             while let Some(st) = self.pending.pop_request() {
@@ -1422,15 +1406,6 @@ impl Scheduler {
                 output_token_count,
             } => self.mark_stopped(request_id, output_token_count),
             Command::Abort(id) => self.mark_cancelled(id, true, None),
-            Command::ResetPrefixCache {
-                reset_running_requests,
-                reply,
-            } => self.begin_prefix_cache_reset(reset_running_requests, reply),
-            Command::ResetEncoderCache => self.reset_encoder_cache(),
-            Command::SetSleeping(s) => self.set_sleeping(s),
-            Command::CollectiveRpc { method, reply } => {
-                let _ = reply.send(self.collective_rpc(&method));
-            }
             Command::Shutdown => return true,
         }
         false
@@ -1566,55 +1541,6 @@ impl Scheduler {
                 "skipping control absent from worker supported_controls"
             );
         }
-    }
-
-    fn begin_prefix_cache_reset(
-        &mut self,
-        reset_running_requests: bool,
-        reply: uniserve_engine_api::PrefixCacheResetReply,
-    ) {
-        if self.pending_prefix_reset.is_some() {
-            let _ = reply.send(Ok(false));
-            return;
-        }
-        if !self.running.is_empty() {
-            let _ = reply.send(Ok(false));
-            return;
-        }
-        let _ = reset_running_requests;
-        self.pending_prefix_reset = Some(PendingPrefixCacheReset { reply });
-        self.progress_prefix_cache_reset();
-    }
-
-    /// Complete a reset once no worker op can still write request-owned KV.
-    fn progress_prefix_cache_reset(&mut self) -> bool {
-        if self.pending_prefix_reset.is_none() || !self.inflight_ops.is_empty() {
-            return false;
-        }
-        let pending = self
-            .pending_prefix_reset
-            .take()
-            .expect("prefix reset presence checked above");
-        if self.control_allowed(&ControlOp::ResetPrefixCache)
-            && let Err(error) = self
-                .executor
-                .control_wait(ControlOp::ResetPrefixCache, None)
-        {
-            let _ = pending.reply.send(Err(error.to_string()));
-            return true;
-        }
-        self.bm.reset_prefix_cache();
-        self.publish_cache_stats();
-        let _ = pending.reply.send(Ok(true));
-        true
-    }
-
-    /// Pause or resume admission.
-    fn set_sleeping(&mut self, sleeping: bool) {
-        self.sleeping = sleeping;
-    }
-    pub fn is_sleeping(&self) -> bool {
-        self.sleeping
     }
 
     fn trace_record(&mut self, record: serde_json::Value) {
@@ -2142,13 +2068,6 @@ impl Scheduler {
 
         // 2. reap cancellations before assembling.
         self.reap_cancellations();
-
-        // A reset transaction drains already-submitted work and admits no new
-        // operations until request ownership has been rewound or rejected.
-        progressed |= self.progress_prefix_cache_reset();
-        if self.pending_prefix_reset.is_some() {
-            return progressed;
-        }
 
         // 3. Admission owns request/resource residency and progresses even
         // while every execution slot is occupied. This lets the next batch see
@@ -3592,9 +3511,6 @@ impl Scheduler {
     /// allocate their full worst-case KV here, which is what makes them
     /// resident for its complete lifetime.
     fn admit(&mut self) {
-        if self.sleeping {
-            return;
-        }
         let bs = self.caps.block_size as usize;
         loop {
             if self.running.len() >= self.config.max_num_seqs {
@@ -6315,32 +6231,6 @@ impl Scheduler {
             self.ledger.release_request(id);
             self.ledger.assert_released(id);
         }
-    }
-
-    /// Clear the encoder cache (`/reset_encoder_cache` / `/reset_mm_cache`)
-    /// and report freed handles to the worker.
-    fn reset_encoder_cache(&mut self) {
-        let freed = self.enc_cache.clear();
-        if !freed.is_empty() {
-            self.release_products(freed);
-        }
-    }
-
-    /// The collective_rpc surface: execute one payload-free
-    /// control method on every worker rank and await per-rank acks. Executes
-    /// inline in the control loop, like vLLM's utility execution in the engine
-    /// busy loop.
-    fn collective_rpc(&mut self, method: &str) -> Result<Vec<(u32, bool, Option<String>)>, String> {
-        let op = ControlOp::from_method(method)
-            .ok_or_else(|| format!("unsupported collective_rpc method `{method}`"))?;
-        let acks = self
-            .executor
-            .control_wait(op, None)
-            .map_err(|e| e.to_string())?;
-        Ok(acks
-            .into_iter()
-            .map(|a| (a.rank, a.ok, a.message))
-            .collect())
     }
 }
 

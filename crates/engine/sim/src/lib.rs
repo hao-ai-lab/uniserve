@@ -105,7 +105,7 @@ impl SimExecutor {
                     .send(Job::Drop(*session_id))
                     .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
             }
-            ControlOp::CopyKv(_) | ControlOp::ReleaseProducts(_) | ControlOp::ResetPrefixCache => {}
+            ControlOp::CopyKv(_) | ControlOp::ReleaseProducts(_) => {}
             ControlOp::SnapshotSession(_) | ControlOp::RestoreSession(_) => {
                 unreachable!("unsupported controls are rejected before dispatch")
             }
@@ -305,7 +305,6 @@ impl SimEngine {
                 RequestKind::DropSession,
                 RequestKind::CopyKv,
                 RequestKind::ReleaseProducts,
-                RequestKind::ResetPrefixCache,
             ],
             execution_constraints: ExecutionConstraints {
                 max_batch_operations: 1024,
@@ -1123,23 +1122,6 @@ mod tests {
         assert_eq!(completion.committed_tokens, vec![1063]);
         assert_eq!(completion.selected_point, 1);
         assert!(report.partitions[0].registration.visible);
-    }
-
-    #[test]
-    fn control_wait_acknowledges_the_closed_control_algebra() {
-        let mut executor = SimExecutor::new(Box::new(SimEngine::new()));
-        for operation in [
-            ControlOp::DropSession(RequestId(1)),
-            ControlOp::CopyKv(Vec::new()),
-            ControlOp::ReleaseProducts(Vec::new()),
-            ControlOp::ResetPrefixCache,
-        ] {
-            let acknowledgements = executor
-                .control_wait(operation, None)
-                .expect("control acknowledgement");
-            assert_eq!(acknowledgements.len(), 1);
-            assert!(acknowledgements[0].ok);
-        }
     }
 
     #[test]

@@ -289,7 +289,6 @@ pub enum ControlOp {
     DropSession(RequestId),
     CopyKv(Vec<(BlockId, BlockId)>),
     ReleaseProducts(Vec<u64>),
-    ResetPrefixCache,
     SnapshotSession(RequestId),
     RestoreSession(SnapshotRef),
 }
@@ -300,7 +299,6 @@ impl ControlOp {
             Self::DropSession(_) => RequestKind::DropSession,
             Self::CopyKv(_) => RequestKind::CopyKv,
             Self::ReleaseProducts(_) => RequestKind::ReleaseProducts,
-            Self::ResetPrefixCache => RequestKind::ResetPrefixCache,
             Self::SnapshotSession(_) => RequestKind::SnapshotSession,
             Self::RestoreSession(_) => RequestKind::RestoreSession,
         }
@@ -311,23 +309,8 @@ impl ControlOp {
             Self::DropSession(_) => "drop_session",
             Self::CopyKv(_) => "copy_kv",
             Self::ReleaseProducts(_) => "release_products",
-            Self::ResetPrefixCache => "reset_prefix_cache",
             Self::SnapshotSession(_) => "snapshot_session",
             Self::RestoreSession(_) => "restore_session",
-        }
-    }
-
-    /// Reconstruct a payload-free control op from its wire method name.
-    ///
-    /// This is the `collective_rpc` surface: a method name with no payload, so
-    /// only the parameter-free variants are constructible here. Payload-carrying
-    /// variants cannot be rebuilt from a bare method name and return `None`.
-    pub fn from_method(method: &str) -> Option<Self> {
-        match method {
-            "reset_prefix_cache" => Some(Self::ResetPrefixCache),
-            "drop_session" | "copy_kv" | "release_products" | "snapshot_session"
-            | "restore_session" => None,
-            _ => None,
         }
     }
 
@@ -336,7 +319,6 @@ impl ControlOp {
             Self::DropSession(id) => WorkerRequest::drop_session(*id),
             Self::CopyKv(copies) => WorkerRequest::copy_kv(copies.clone()),
             Self::ReleaseProducts(handles) => WorkerRequest::release_products(handles.clone()),
-            Self::ResetPrefixCache => WorkerRequest::reset_prefix_cache(),
             Self::SnapshotSession(id) => WorkerRequest::snapshot_session(*id),
             Self::RestoreSession(snapshot) => WorkerRequest::restore_session(snapshot.clone()),
         };
@@ -496,18 +478,6 @@ mod tests {
     use uniserve_worker_wire::{
         Bounds, Domain, OpId, RequestKey, RouteId, TokenMode, VersionRef, Work,
     };
-
-    #[test]
-    fn payload_free_control_round_trips() {
-        let control = ControlOp::from_method("reset_prefix_cache").unwrap();
-        assert_eq!(control.method(), "reset_prefix_cache");
-        assert!(ControlOp::from_method("drop_session").is_none());
-    }
-
-    #[test]
-    fn from_method_rejects_unknown() {
-        assert!(ControlOp::from_method("definitely_not_a_method").is_none());
-    }
 
     #[test]
     fn worker_kind_round_trips_and_maps_work() {

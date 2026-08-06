@@ -124,7 +124,6 @@ pub struct SegmentTable {
 pub enum CacheEvent {
     BlockStored { hash: u64, block: BlockId },
     BlockRemoved { hash: u64, block: BlockId },
-    AllBlocksCleared,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -617,29 +616,6 @@ impl BlockManager {
         true
     }
 
-    /// Clear the entire prefix cache (the `/reset_prefix_cache` action).
-    /// Cached-but-unreferenced blocks lose their hash and become plain free blocks;
-    /// still-referenced blocks (Active/Reserved) merely drop their hash so they
-    /// return as `Free` rather than `Cached` once dereffed — they are NOT stranded,
-    /// because they remain in their owner's block list and free-queue links are
-    /// untouched. Each cleared `Cached` block is counted as an eviction so the
-    /// eviction counter stays consistent with the allocation-driven eviction path
-    /// (which also bumps `evictions` when it drops a cached block's hash).
-    pub fn reset_prefix_cache(&mut self) {
-        let hashes: Vec<(u64, BlockId)> = self.hash_to_block.drain().collect();
-        for (_h, b) in hashes {
-            let m = &mut self.meta[b.0 as usize];
-            m.hash = None;
-            // clear stored content alongside the hash.
-            m.tokens = Vec::new();
-            if m.state == BlockState::Cached {
-                m.state = BlockState::Free;
-                self.stats.evictions += 1;
-            }
-        }
-        self.push_event(CacheEvent::AllBlocksCleared);
-    }
-
     // ---- sliding window / sink trimming ----
 
     /// For each sliding-window group a request uses, release blocks that fall
@@ -901,20 +877,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_prefix_cache_clears_map() {
-        let mut bm = BlockManager::new(6, 4, 0);
-        let blk = bm.allocate(rid(1), 1).unwrap()[0];
-        let toks = &[1u32, 2, 3, 4];
-        bm.cache_block(blk, 100, toks);
-        bm.release(rid(1));
-        assert_eq!(bm.cached_blocks(), 1);
-        bm.reset_prefix_cache();
-        assert_eq!(bm.cached_blocks(), 0);
-        assert_eq!(bm.lookup_cached(100, toks), None);
-        assert!(bm.drain_events().contains(&CacheEvent::AllBlocksCleared));
-    }
-
-    #[test]
     fn sliding_window_trims_out_of_window_blocks() {
         // group: sliding window of 8 tokens, sink 4 tokens, block_size 4.
         let mut bm = BlockManager::with_groups(
@@ -990,29 +952,6 @@ mod tests {
         bm.release(rid(2));
         assert_eq!(bm.ref_count(blk), 0);
         assert_eq!(bm.lookup_cached(77, toks), Some(blk));
-    }
-
-    #[test]
-    fn reset_prefix_cache_counts_evictions() {
-        // clearing the cache counts each reclaimed cached block as an
-        // eviction, matching the allocation-driven eviction path.
-        let mut bm = BlockManager::new(8, 4, 0);
-        let a = bm.allocate(rid(1), 1).unwrap()[0];
-        let b = bm.allocate(rid(2), 1).unwrap()[0];
-        bm.cache_block(a, 1, &[1, 1, 1, 1]);
-        bm.cache_block(b, 2, &[2, 2, 2, 2]);
-        bm.release(rid(1));
-        bm.release(rid(2)); // both now Cached in the free queue
-        assert_eq!(bm.stats.evictions, 0);
-        bm.reset_prefix_cache();
-        assert_eq!(bm.stats.evictions, 2);
-        assert_eq!(bm.cached_blocks(), 0);
-        // referenced block's hash is dropped but it is not stranded.
-        let c = bm.allocate(rid(3), 1).unwrap()[0];
-        bm.cache_block(c, 3, &[3, 3, 3, 3]);
-        bm.reset_prefix_cache(); // c is Active, not counted, still owned
-        assert_eq!(bm.stats.evictions, 2);
-        assert_eq!(bm.ref_count(c), 1);
     }
 
     #[test]

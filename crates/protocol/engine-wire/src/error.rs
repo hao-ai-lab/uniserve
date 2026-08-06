@@ -1,8 +1,6 @@
 use thiserror::Error;
 use thiserror_ext::Macro;
 
-use crate::utility::UtilityCallId;
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors produced while encoding/decoding the engine wire protocol.
@@ -22,24 +20,6 @@ pub enum Error {
         target_type: &'static str,
         message: String,
     },
-    #[error("messagepack value decode failed")]
-    ValueDecode(#[from] rmpv::decode::Error),
-    #[error("messagepack ext value decode failed: {message}")]
-    ExtValueDecode { message: String },
-    #[error("unsupported auxiliary frame(s): expected 1 frame, got {frame_count}")]
-    UnsupportedAuxFrames { frame_count: usize },
     #[error("invalid canonical generation request: {message}")]
     InvalidGenerationRequest { message: String },
-    #[error("utility call `{method}` (id {call_id}) failed: {message}")]
-    UtilityCallFailed {
-        method: String,
-        call_id: UtilityCallId,
-        message: String,
-    },
-    #[error("utility call `{method}` (id {call_id}) result decode failed: {message}")]
-    UtilityResultDecode {
-        method: String,
-        call_id: UtilityCallId,
-        message: String,
-    },
 }

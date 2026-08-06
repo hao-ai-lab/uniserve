@@ -21,8 +21,7 @@ use crate::protocol::handshake::{
     EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
 use crate::protocol::{
-    ENGINE_CORE_DEAD_SENTINEL, EngineCoreOutputs, decode_engine_outputs, decode_msgpack,
-    encode_msgpack,
+    ENGINE_CORE_DEAD_SENTINEL, GenerationEventBatch, decode_msgpack, encode_msgpack,
 };
 
 /// Opaque routing identity of one engine on the frontend transport.
@@ -489,7 +488,7 @@ pub(crate) async fn send_message(
 /// the provided channel.
 pub(crate) async fn run_output_loop(
     mut output_socket: PullSocket,
-    tx: mpsc::Sender<Result<EngineCoreOutputs>>,
+    tx: mpsc::Sender<Result<GenerationEventBatch>>,
 ) {
     loop {
         let message = match output_socket.recv().await {
@@ -532,7 +531,18 @@ pub(crate) async fn run_output_loop(
             let _ = tx.send(Err(Error::EngineCoreDead)).await;
             return;
         }
-        let decoded = match decode_engine_outputs(&frames) {
+        if frames.len() != 1 {
+            let _ = tx
+                .send(Err(Error::UnexpectedDispatcherOutput {
+                    message: format!(
+                        "generation event batch requires one frame, received {}",
+                        frames.len()
+                    ),
+                }))
+                .await;
+            continue;
+        }
+        let decoded = match decode_msgpack::<GenerationEventBatch>(frame) {
             Ok(decoded) => {
                 trace!(frame_len, "decoded output message");
                 Ok(decoded)

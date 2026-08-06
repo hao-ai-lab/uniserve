@@ -960,7 +960,6 @@ fn request_fixtures() -> Vec<WorkerRequest> {
         WorkerRequest::shutdown(),
         WorkerRequest::copy_kv(vec![(BlockId(1), BlockId(2)), (BlockId(3), BlockId(4))]),
         WorkerRequest::release_products(vec![1, 2, 3]),
-        WorkerRequest::reset_prefix_cache(),
         WorkerRequest::get_metrics(),
         WorkerRequest::get_pressure(),
         WorkerRequest::snapshot_session(RequestId(9)),

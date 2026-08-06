@@ -89,7 +89,7 @@ class BenchmarkRunner:
             finally:
                 if sampler is not None:
                     sampler.stop()
-            server_info = await self._fetch_server_info(client)
+            server_version = await self._fetch_server_version(client)
 
         summary = build_summary(
             self.spec,
@@ -99,7 +99,7 @@ class BenchmarkRunner:
             task=self.task,
             selected_rows=selection,
             tokenizer=inputs.tokenizer,
-            server_info=server_info,
+            server_version=server_version,
             provenance=self.provenance,
         )
         gpu_samples = list(sampler.sample_records) if sampler is not None else []
@@ -145,12 +145,11 @@ class BenchmarkRunner:
             ),
         )
 
-    async def _fetch_server_info(self, client: httpx.AsyncClient) -> dict[str, Any] | None:
-        for endpoint in ("/server_info", "/get_server_info", "/model_info", "/version"):
-            try:
-                response = await client.get(self.base_url + endpoint, timeout=15.0)
-                if response.status_code == 200 and isinstance(payload := response.json(), dict):
-                    return {"endpoint": endpoint, "payload": payload}
-            except Exception:
-                continue
+    async def _fetch_server_version(self, client: httpx.AsyncClient) -> dict[str, Any] | None:
+        try:
+            response = await client.get(self.base_url + "/version", timeout=15.0)
+            if response.status_code == 200 and isinstance(payload := response.json(), dict):
+                return payload
+        except Exception:
+            return None
         return None

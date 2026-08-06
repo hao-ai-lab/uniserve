@@ -35,7 +35,6 @@ uniserve-model-profile.workspace = true
 expect-test.workspace = true
 tempfile.workspace = true
 tokenizers.workspace = true
-uniserve-engine-gateway = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

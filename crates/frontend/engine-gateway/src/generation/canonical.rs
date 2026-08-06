@@ -1,11 +1,8 @@
 use std::collections::BTreeMap;
 
-use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
 use crate::StreamCancelCause;
-use crate::client::EngineCoreOutputStream;
-use crate::protocol::EngineCoreRequest;
 
 pub use uniserve_core::{
     GenerationConstraint, ImageParams, SamplingParams as EngineSamplingParams,
@@ -39,80 +36,23 @@ impl GenerationSubmission {
     }
 }
 
-/// Reverse adaptation of one wire output into the canonical [`GenEvent`] stream.
-use uniserve_engine_wire::translate::wire_output_to_gen_events;
-
 /// Maximum number of canonical generation events buffered per request.
 pub const GENERATION_EVENT_BUFFER_CAPACITY: usize = 64;
 
-fn generation_event_channel() -> (mpsc::Sender<GenEvent>, mpsc::Receiver<GenEvent>) {
-    mpsc::channel(GENERATION_EVENT_BUFFER_CAPACITY)
-}
-
-pub(crate) fn generation_request_to_wire(submission: GenerationSubmission) -> EngineCoreRequest {
-    let mut request = EngineCoreRequest::new(submission.external_request_id, submission.request);
-    request.arrival_time = submission.arrival_time.unwrap_or_else(now_unix_secs);
-    request.data_parallel_rank = submission.data_parallel_rank;
-    request.trace_headers = submission.trace_headers;
-    request
-}
-
-pub(crate) fn generation_event_stream_from_wire(
-    mut stream: EngineCoreOutputStream,
-    decoder_ack_required: bool,
-) -> GenerationEventStream {
-    enum AdapterControl {
-        Cancel(StreamCancelCause, usize),
-        Acknowledge(usize),
-    }
-
-    stream.delegate_acknowledgement();
-    let (tx, rx) = generation_event_channel();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                Some(control) = control_rx.recv() => {
-                    match control {
-                        AdapterControl::Cancel(cause, output_token_count) => {
-                            stream.cancel_at(cause, output_token_count);
-                            return;
-                        }
-                        AdapterControl::Acknowledge(output_token_count) => {
-                            stream.acknowledge_at(output_token_count);
-                        }
-                    }
-                }
-                _ = tx.closed() => return,
-                item = stream.next() => match item {
-                    Some(Ok(out)) => {
-                        for ev in wire_output_to_gen_events(&out.output) {
-                            if tx.send(ev).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Some(Err(error)) => {
-                        let _ = tx.send(GenEvent::Error { message: error.to_string() }).await;
-                        return;
-                    }
-                    None => return,
-                },
-            }
+impl GenerationSubmission {
+    pub(crate) fn into_envelope(
+        self,
+        client_index: u32,
+    ) -> uniserve_engine_wire::GenerationRequestEnvelope {
+        uniserve_engine_wire::GenerationRequestEnvelope {
+            external_request_id: self.external_request_id,
+            arrival_time: self.arrival_time.unwrap_or_else(now_unix_secs),
+            client_index,
+            data_parallel_rank: self.data_parallel_rank,
+            trace_headers: self.trace_headers,
+            request: self.request,
         }
-    });
-    let acknowledge_tx = control_tx.clone();
-    GenerationEventStream::with_control_policy(
-        rx,
-        move |cause, output_token_count| {
-            let _ = control_tx.send(AdapterControl::Cancel(cause, output_token_count));
-        },
-        move |output_token_count| {
-            let _ = acknowledge_tx.send(AdapterControl::Acknowledge(output_token_count));
-        },
-        !decoder_ack_required,
-    )
+    }
 }
 
 /// A typed text-and-image event stream for one canonical generation request.
@@ -224,31 +164,11 @@ impl Drop for GenerationEventStream {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tokio::sync::mpsc::error::TrySendError;
-
     use super::*;
-
-    #[test]
-    fn canonical_generation_queue_applies_backpressure_at_its_bound() {
-        let (tx, _rx) = generation_event_channel();
-        for index in 0..GENERATION_EVENT_BUFFER_CAPACITY {
-            tx.try_send(GenEvent::Error {
-                message: index.to_string(),
-            })
-            .expect("queue has declared capacity");
-        }
-
-        assert!(matches!(
-            tx.try_send(GenEvent::Error {
-                message: "overflow".to_string(),
-            }),
-            Err(TrySendError::Full(_))
-        ));
-    }
 
     #[tokio::test]
     async fn canonical_stream_cancels_at_its_consumed_text_token_prefix() {
-        let (tx, rx) = generation_event_channel();
+        let (tx, rx) = mpsc::channel(GENERATION_EVENT_BUFFER_CAPACITY);
         for id in 1..=3 {
             tx.send(GenEvent::TextToken {
                 id,

@@ -162,7 +162,6 @@ pub struct EngineCore {
     model_name: String,
     model_dtype: ModelDtype,
     max_model_len: u32,
-    sleeping: Arc<AtomicBool>,
     /// Engine-dead latch: set when the scheduler loop exits fatally (worker
     /// death) or panics.
     dead: Arc<AtomicBool>,
@@ -398,7 +397,6 @@ impl EngineCore {
             model_name: config.model,
             model_dtype,
             max_model_len: config.max_model_len,
-            sleeping: Arc::new(AtomicBool::new(false)),
             dead,
             next_id: AtomicU64::new(1),
             sched_thread: Mutex::new(Some(sched_thread)),
@@ -480,45 +478,6 @@ impl EngineCore {
         self.handle
             .submit(request)
             .map_err(|message| anyhow::anyhow!(message))
-    }
-
-    // ---- control surface (the utility-call implementations) ----
-
-    pub fn reset_prefix_cache(
-        &self,
-        reset_running_requests: bool,
-        reset_connector: bool,
-    ) -> anyhow::Result<bool> {
-        if reset_connector {
-            anyhow::bail!("no external prefix-cache connector is configured");
-        }
-        self.handle
-            .reset_prefix_cache(reset_running_requests)
-            .map_err(anyhow::Error::msg)
-    }
-
-    pub fn reset_encoder_cache(&self) {
-        self.handle.reset_encoder_cache();
-    }
-
-    pub fn is_sleeping(&self) -> bool {
-        self.sleeping.load(Ordering::Relaxed)
-    }
-
-    pub fn sleep(&self) {
-        self.sleeping.store(true, Ordering::Relaxed);
-        self.handle.set_sleeping(true);
-    }
-
-    pub fn wake_up(&self) {
-        self.sleeping.store(false, Ordering::Relaxed);
-        self.handle.set_sleeping(false);
-    }
-
-    /// Execute one control method on every worker rank, returning per-rank
-    /// `(rank, ok, message)` acks (the collective_rpc surface).
-    pub fn collective_rpc(&self, method: &str) -> Result<Vec<(u32, bool, Option<String>)>, String> {
-        self.handle.collective_rpc(method)
     }
 
     /// Shut down the scheduler (which tears down the executor/worker) and join

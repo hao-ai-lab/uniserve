@@ -198,9 +198,6 @@ class SystemWorker:
         self.products.release(tuple(int(handle) for handle in handles))
         self.sessions.discard_product_handles({int(handle) for handle in handles})
 
-    def reset_prefix_cache(self) -> None:
-        raise unsupported_control(RequestKind.RESET_PREFIX_CACHE.value)
-
     def snapshot_session(self, session_id: int) -> SnapshotRef:
         if self.snapshot_provider is None:
             raise unsupported_control(RequestKind.SNAPSHOT_SESSION.value)

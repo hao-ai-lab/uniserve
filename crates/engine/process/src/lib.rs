@@ -9,10 +9,9 @@
 //! is sent — READY carries the post-load truth reported by the runtime.
 //!
 //! After startup the process runs three explicit tasks: an input task decodes
-//! `[request-type, payload]` frames from the DEALER
-//! socket into scheduler commands, per-request output tasks translate
-//! `GenEvent` streams into wire outputs, and an output task batches them onto
-//! the PUSH socket.
+//! `[request-type, payload]` frames from the DEALER socket into scheduler
+//! commands, per-request tasks forward canonical generation events, and an
+//! output task batches them onto the PUSH socket.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod stats;
 
@@ -22,19 +21,15 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
-use rmpv::Value;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uniserve_core::RequestId;
 use uniserve_engine_wire::handshake::{HandshakeInitMessage, ReadyMessage};
-use uniserve_engine_wire::utility::{
-    EngineCoreUtilityRequest, UtilityOutput, UtilityResultEnvelope,
-};
 use uniserve_engine_wire::{
-    EngineCoreControlRequest, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
-    decode_msgpack, encode_msgpack,
+    EngineRequest, GenEvent, GenerationEventBatch, GenerationRequestEnvelope,
+    RoutedGenerationEvent, decode_msgpack, encode_msgpack,
 };
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
@@ -43,7 +38,6 @@ use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 use uniserve_engine_runtime::{EngineCore, EngineCoreConfig};
 use uniserve_engine_wire::generation::GenerationControlTokens;
 use uniserve_engine_wire::handshake::EngineCoreReadyResponse;
-use uniserve_engine_wire::translate::{AdapterParams, run_event_adapter, to_generation_request};
 use uniserve_sim::{SimEngine, SimExecutor};
 
 /// Configuration for one headless engine process.
@@ -102,8 +96,7 @@ fn ready_response(core: &EngineCore) -> EngineCoreReadyResponse {
 
 /// One message bound for the output PUSH socket.
 enum OutMsg {
-    Output(Box<EngineCoreOutput>),
-    Utility(UtilityOutput),
+    Event(Box<RoutedGenerationEvent>),
     /// The engine died: emit the ENGINE_CORE_DEAD sentinel and stop.
     Dead,
 }
@@ -121,6 +114,22 @@ fn lock_active(active: &Mutex<ActiveRequests>) -> std::sync::MutexGuard<'_, Acti
             error.into_inner()
         }
     }
+}
+
+fn remove_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: RequestId) {
+    let mut active = lock_active(active);
+    if active.get(request_id) == Some(&rid) {
+        active.remove(request_id);
+    }
+}
+
+fn insert_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: RequestId) -> bool {
+    let mut active = lock_active(active);
+    if active.contains_key(request_id) {
+        return false;
+    }
+    active.insert(request_id.to_string(), rid);
+    true
 }
 
 /// Dial the frontend handshake endpoint, send HELLO, and wait for INIT —
@@ -306,7 +315,7 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
             .await
             .context("engine shutdown task panicked")?,
         Err(core_arc) => {
-            // Adapter tasks still hold clones; shut down through the shared ref.
+            // Event-forwarding tasks still hold clones; shut down through the shared ref.
             core_arc.shutdown();
         }
     }
@@ -335,22 +344,21 @@ async fn run_input_loop(
             );
             continue;
         }
-        let request =
-            match EngineCoreControlRequest::decode_frames(frames[0].as_ref(), frames[1].as_ref()) {
-                None => {
-                    warn!(type_frame = ?frames[0].as_ref(), "unknown request type (ignored)");
-                    continue;
-                }
-                Some(Err(e)) => {
-                    warn!(error = %e, "failed to decode request (ignored)");
-                    continue;
-                }
-                Some(Ok(request)) => request,
-            };
+        let request = match EngineRequest::decode_frames(frames[0].as_ref(), frames[1].as_ref()) {
+            None => {
+                warn!(type_frame = ?frames[0].as_ref(), "unknown request type (ignored)");
+                continue;
+            }
+            Some(Err(e)) => {
+                warn!(error = %e, "failed to decode request (ignored)");
+                continue;
+            }
+            Some(Ok(request)) => request,
+        };
 
         match request {
-            EngineCoreControlRequest::Add(req) => handle_add(core, active, out_tx, *req).await,
-            EngineCoreControlRequest::Abort(ids) => {
+            EngineRequest::Submit(req) => handle_submit(core, active, out_tx, *req).await,
+            EngineRequest::Abort(ids) => {
                 let handle = core.handle();
                 let active = lock_active(active);
                 for id in &ids {
@@ -359,7 +367,7 @@ async fn run_input_loop(
                     }
                 }
             }
-            EngineCoreControlRequest::Cancel(ids) => {
+            EngineRequest::Cancel(ids) => {
                 let handle = core.handle();
                 let active = lock_active(active);
                 for id in &ids {
@@ -368,91 +376,87 @@ async fn run_input_loop(
                     }
                 }
             }
-            EngineCoreControlRequest::CancelAt(requests) => {
+            EngineRequest::CancelAt(requests) => {
                 let handle = core.handle();
                 let active = lock_active(active);
                 for request in requests {
-                    if let Some(rid) = active.get(&request.request_id)
+                    if let Some(rid) = active.get(&request.external_request_id)
                         && let Ok(output_token_count) = usize::try_from(request.output_token_count)
                     {
                         handle.cancel_at(*rid, output_token_count);
                     }
                 }
             }
-            EngineCoreControlRequest::AcknowledgeAt(requests) => {
+            EngineRequest::AcknowledgeAt(requests) => {
                 let handle = core.handle();
                 let active = lock_active(active);
                 for request in requests {
-                    if let Some(rid) = active.get(&request.request_id)
+                    if let Some(rid) = active.get(&request.external_request_id)
                         && let Ok(output_token_count) = usize::try_from(request.output_token_count)
                     {
                         handle.acknowledge_at(*rid, output_token_count);
                     }
                 }
             }
-            EngineCoreControlRequest::StopAt(requests) => {
+            EngineRequest::StopAt(requests) => {
                 let handle = core.handle();
                 let active = lock_active(active);
                 for request in requests {
-                    if let Some(rid) = active.get(&request.request_id)
+                    if let Some(rid) = active.get(&request.external_request_id)
                         && let Ok(output_token_count) = usize::try_from(request.output_token_count)
                     {
                         handle.stop_at(*rid, output_token_count);
                     }
                 }
             }
-            EngineCoreControlRequest::Utility(req) => {
-                let output = execute_utility(core, *req);
-                let _ = out_tx.send(OutMsg::Utility(output)).await;
-            }
-            EngineCoreControlRequest::StartDpWave => {
-                // Reserved: wave coordination for engines sharing collective forward passes.
-                debug!("ignoring START_DP_WAVE (no coordinator)");
-            }
         }
     }
 }
 
-/// Register, translate, and submit one add-request; spawn its event adapter.
-async fn handle_add(
+/// Register and submit one canonical request, then forward its event stream.
+async fn handle_submit(
     core: &Arc<EngineCore>,
     active: &SharedActiveRequests,
     out_tx: &mpsc::Sender<OutMsg>,
-    req: EngineCoreRequest,
+    mut envelope: GenerationRequestEnvelope,
 ) {
-    let request_id = req.request_id.clone();
+    let request_id = envelope.external_request_id.clone();
+    if let Err(error) = envelope.validate() {
+        warn!(request_id, %error, "generation request rejected");
+        let _ = out_tx
+            .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                external_request_id: request_id,
+                event: GenEvent::Rejected {
+                    message: error.to_string(),
+                },
+            })))
+            .await;
+        return;
+    }
     let rid = core.next_request_id();
-    lock_active(active).insert(request_id.clone(), rid);
-
-    let params = AdapterParams {
-        request_id: request_id.clone(),
-        want_logprobs: req.generation.sampling.generated_logprobs_requested(),
-    };
-    let generate = match to_generation_request(&req, rid) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(request_id, %error, "canonical generation request rejected");
-            lock_active(active).remove(&request_id);
-            let _ = out_tx
-                .send(OutMsg::Output(Box::new(EngineCoreOutput {
-                    request_id,
-                    finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
-                    ..Default::default()
-                })))
-                .await;
-            return;
-        }
-    };
-    let mut event_rx = match core.submit(generate) {
+    if !insert_active_request(active, &request_id, rid) {
+        let _ = out_tx
+            .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                external_request_id: request_id,
+                event: GenEvent::Rejected {
+                    message: "request id is already active".to_string(),
+                },
+            })))
+            .await;
+        return;
+    }
+    envelope.request.request_id = rid;
+    let mut event_rx = match core.submit(envelope.request) {
         Ok(event_rx) => event_rx,
-        Err(e) => {
-            warn!(request_id, error = %e, "submit failed");
-            lock_active(active).remove(&request_id);
+        Err(error) => {
+            warn!(request_id, %error, "submit failed");
+            remove_active_request(active, &request_id, rid);
             let _ = out_tx
-                .send(OutMsg::Output(Box::new(EngineCoreOutput {
-                    request_id,
-                    finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
-                    ..Default::default()
+                .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                    external_request_id: request_id,
+                    event: GenEvent::Error {
+                        message: error.to_string(),
+                    },
                 })))
                 .await;
             return;
@@ -463,84 +467,42 @@ async fn handle_add(
     let out_tx = out_tx.clone();
     let active = Arc::clone(active);
     tokio::spawn(async move {
-        run_event_adapter(params, event_rx, |o| {
-            let out_tx = out_tx.clone();
-            async move { out_tx.send(OutMsg::Output(Box::new(o))).await.is_ok() }
-        })
-        .await;
-        lock_active(&active).remove(&request_id);
+        let mut reached_terminal = false;
+        while let Some(event) = event_rx.recv().await {
+            reached_terminal = matches!(
+                event,
+                GenEvent::Finished { .. } | GenEvent::Rejected { .. } | GenEvent::Error { .. }
+            );
+            if out_tx
+                .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                    external_request_id: request_id.clone(),
+                    event,
+                })))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if reached_terminal {
+                break;
+            }
+        }
+        if !reached_terminal {
+            let _ = out_tx
+                .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                    external_request_id: request_id.clone(),
+                    event: GenEvent::Error {
+                        message: "generation event stream closed before a terminal event"
+                            .to_string(),
+                    },
+                })))
+                .await;
+        }
+        remove_active_request(&active, &request_id, rid);
     });
 }
 
-/// Execute one utility call against the engine control surface.
-fn execute_utility(core: &Arc<EngineCore>, req: EngineCoreUtilityRequest) -> UtilityOutput {
-    let method = req.method_name.as_str();
-    let result: Result<Value> = (|| {
-        Ok(match method {
-            "is_sleeping" => Value::Boolean(core.is_sleeping()),
-            "reset_prefix_cache" => {
-                let (reset_running_requests, reset_connector): (bool, bool) =
-                    rmpv::ext::from_value(req.args.clone())
-                        .context("reset_prefix_cache expects (bool, bool)")?;
-                Value::Boolean(core.reset_prefix_cache(reset_running_requests, reset_connector)?)
-            }
-            "reset_mm_cache" | "reset_encoder_cache" => {
-                core.reset_encoder_cache();
-                Value::Nil
-            }
-            "sleep" => {
-                core.sleep();
-                Value::Nil
-            }
-            "wake_up" => {
-                core.wake_up();
-                Value::Nil
-            }
-            "collective_rpc" => {
-                // args = (method, timeout, args, kwargs) — only payload-free descriptor
-                // methods are supported; no arbitrary code or tensors cross the seam.
-                let method = req
-                    .args
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|v| v.as_str())
-                    .context("collective_rpc expects (method, ...)")?
-                    .to_string();
-                let acks = core
-                    .collective_rpc(&method)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                Value::Array(
-                    acks.into_iter()
-                        .map(|(rank, ok, _msg)| {
-                            Value::Map(vec![
-                                (Value::from("rank"), Value::from(rank)),
-                                (Value::from("ok"), Value::Boolean(ok)),
-                            ])
-                        })
-                        .collect(),
-                )
-            }
-            other => bail!("unsupported utility method `{other}`"),
-        })
-    })();
-
-    match result {
-        Ok(value) => UtilityOutput {
-            call_id: req.call_id,
-            failure_message: None,
-            result: Some(UtilityResultEnvelope::without_type_info(value)),
-        },
-        Err(e) => UtilityOutput {
-            call_id: req.call_id,
-            failure_message: Some(e.to_string()),
-            result: None,
-        },
-    }
-}
-
-/// Batch wire outputs onto the PUSH socket. Request outputs coalesce into one
-/// `EngineCoreOutputs` per send; utility outputs go in their own envelope
-/// (the classification contract requires utility-only messages).
+/// Batch canonical generation events onto the PUSH socket.
 async fn run_output_loop(
     engine_index: u32,
     mut socket: PushSocket,
@@ -551,7 +513,6 @@ async fn run_output_loop(
     const MAX_BATCH: usize = 128;
     let mut reporter = stats::SchedStatsReporter::default();
     while let Some(msg) = rx.recv().await {
-        let mut utility_after: Vec<UtilityOutput> = Vec::new();
         let batch = match msg {
             OutMsg::Dead => {
                 let _ = socket
@@ -561,16 +522,12 @@ async fn run_output_loop(
                     .await;
                 return;
             }
-            OutMsg::Output(first) => {
-                let mut outputs = vec![*first];
+            OutMsg::Event(first) => {
+                let mut events = vec![*first];
                 let mut dead_after = false;
-                while outputs.len() < MAX_BATCH {
+                while events.len() < MAX_BATCH {
                     match rx.try_recv() {
-                        Ok(OutMsg::Output(o)) => outputs.push(*o),
-                        Ok(OutMsg::Utility(u)) => {
-                            utility_after.push(u);
-                            break;
-                        }
+                        Ok(OutMsg::Event(event)) => events.push(*event),
                         Ok(OutMsg::Dead) => {
                             dead_after = true;
                             break;
@@ -586,43 +543,27 @@ async fn run_output_loop(
                         .await;
                     return;
                 }
-                Some(EngineCoreOutputs {
+                GenerationEventBatch {
                     engine_index,
-                    outputs,
+                    events,
                     // Live scheduler load rides every request batch: it feeds the frontend's
                     // routing score and Prometheus metrics.
                     scheduler_stats: Some(Box::new(reporter.snapshot(&stats, block_size))),
-                    timestamp: now_secs(),
-                    ..Default::default()
-                })
-            }
-            OutMsg::Utility(u) => {
-                utility_after.push(u);
-                None
+                    emitted_at: now_secs(),
+                }
             }
         };
 
-        for envelope in
-            batch
-                .into_iter()
-                .chain(utility_after.into_iter().map(|u| EngineCoreOutputs {
-                    engine_index,
-                    utility_output: Some(u),
-                    timestamp: now_secs(),
-                    ..Default::default()
-                }))
-        {
-            let bytes = match encode_msgpack(&envelope) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "failed to encode outputs (dropped)");
-                    continue;
-                }
-            };
-            if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
-                warn!(error = %e, "output socket send failed; stopping output loop");
-                return;
+        let bytes = match encode_msgpack(&batch) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(%error, "failed to encode generation event batch");
+                continue;
             }
+        };
+        if let Err(error) = socket.send(ZmqMessage::from(bytes)).await {
+            warn!(%error, "output socket send failed; stopping output loop");
+            return;
         }
     }
 }

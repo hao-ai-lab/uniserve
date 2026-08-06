@@ -1095,7 +1095,6 @@ fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
         ),
         RequestKind::GetCapabilities
         | RequestKind::Shutdown
-        | RequestKind::ResetPrefixCache
         | RequestKind::GetMetrics
         | RequestKind::GetPressure => anyhow::ensure!(
             payload_count == 0,
@@ -3012,7 +3011,6 @@ fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
         RequestKind::Shutdown => fbs::ReqKind::Shutdown,
         RequestKind::CopyKv => fbs::ReqKind::CopyKv,
         RequestKind::ReleaseProducts => fbs::ReqKind::ReleaseProducts,
-        RequestKind::ResetPrefixCache => fbs::ReqKind::ResetPrefixCache,
         RequestKind::GetMetrics => fbs::ReqKind::GetMetrics,
         RequestKind::GetPressure => fbs::ReqKind::GetPressure,
         RequestKind::SnapshotSession => fbs::ReqKind::SnapshotSession,

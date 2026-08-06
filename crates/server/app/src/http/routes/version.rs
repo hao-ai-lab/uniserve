@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::AppState;
 use crate::http::error::ApiError;
-use crate::http::utils::utility_call_error;
+use crate::http::utils::engine_status_error;
 
 #[derive(Serialize)]
 pub(crate) struct VersionResponse {
@@ -19,9 +19,9 @@ pub(super) async fn version(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<VersionResponse>, ApiError> {
     let version = state
-        .engine_control()
+        .engine_status()
         .version()
-        .map_err(|error| utility_call_error("version", error))?;
+        .map_err(engine_status_error)?;
 
     Ok(Json(VersionResponse {
         version,

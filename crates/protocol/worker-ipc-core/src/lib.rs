@@ -510,11 +510,10 @@ fn request_kind_code(kind: RequestKind) -> u8 {
         RequestKind::Shutdown => 5,
         RequestKind::CopyKv => 6,
         RequestKind::ReleaseProducts => 7,
-        RequestKind::ResetPrefixCache => 8,
-        RequestKind::GetMetrics => 9,
-        RequestKind::GetPressure => 10,
-        RequestKind::SnapshotSession => 11,
-        RequestKind::RestoreSession => 12,
+        RequestKind::GetMetrics => 8,
+        RequestKind::GetPressure => 9,
+        RequestKind::SnapshotSession => 10,
+        RequestKind::RestoreSession => 11,
     }
 }
 

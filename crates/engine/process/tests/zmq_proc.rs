@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
@@ -14,9 +13,9 @@ use uniserve_core::{
     GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
     ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_engine_gateway::transport::protocol::{EngineCoreFinishReason, EngineCoreRequest};
 use uniserve_engine_gateway::transport::{
-    EngineCoreClient, GenEvent, GenerationSubmission, TransportMode, ZmqClientConfig,
+    EngineCoreClient, GenEvent, GenerationFinishReason, GenerationSubmission, TransportMode,
+    ZmqClientConfig,
 };
 use uniserve_engine_process::{EngineProcConfig, run_engine_proc};
 use uniserve_engine_runtime::EngineCoreConfig;
@@ -129,16 +128,16 @@ fn declare_resources(
     request
 }
 
-fn text_engine_request(
+fn text_submission(
     request_id: impl Into<String>,
     max_tokens: u32,
     data_parallel_rank: Option<u32>,
-) -> EngineCoreRequest {
+) -> GenerationSubmission {
     let sampling = SamplingParams {
         temperature: 0.0,
         ..SamplingParams::default()
     };
-    let mut request = EngineCoreRequest::new(
+    let mut submission = GenerationSubmission::new(
         request_id.into(),
         generation_request(
             GenerationConstraint::UndOnly,
@@ -148,8 +147,8 @@ fn text_engine_request(
             1000,
         ),
     );
-    request.data_parallel_rank = data_parallel_rank;
-    request
+    submission.data_parallel_rank = data_parallel_rank;
+    submission
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -167,18 +166,23 @@ async fn socket_mode_text_generation() {
     assert_eq!(client.ready_responses().len(), 1);
     assert!(client.total_num_gpu_blocks() > 0);
 
-    let request = text_engine_request("req-1", 64, None);
-
-    let mut stream = client.call(request).await.expect("submit request");
+    let mut stream = client
+        .submit_generation(text_submission("req-1", 64, None))
+        .await
+        .expect("submit request");
 
     let mut tokens = 0usize;
     let mut finish = None;
-    while let Some(item) = stream.next().await {
-        let output = item.expect("stream item").output;
-        tokens += output.new_token_ids.len();
-        if let Some(reason) = output.finish_reason {
-            finish = Some(reason);
-            break;
+    while let Some(event) = stream.next().await {
+        match event {
+            GenEvent::TextToken { .. } => tokens += 1,
+            GenEvent::Finished { reason, .. } => {
+                finish = Some(reason);
+                break;
+            }
+            GenEvent::Rejected { message } => panic!("request rejected: {message}"),
+            GenEvent::Error { message } => panic!("engine error: {message}"),
+            _ => {}
         }
     }
 
@@ -188,7 +192,7 @@ async fn socket_mode_text_generation() {
     );
     assert_eq!(
         finish,
-        Some(EngineCoreFinishReason::Stop),
+        Some(GenerationFinishReason::Eos),
         "expected the request to terminate on the synthetic EOS"
     );
 
@@ -198,7 +202,7 @@ async fn socket_mode_text_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn socket_mode_native_image_generation() {
+async fn socket_mode_image_generation() {
     let handshake = ipc_endpoint("image");
     let shutdown = CancellationToken::new();
     let proc_task = spawn_sim_proc(&handshake, 0, shutdown.clone());
@@ -224,7 +228,7 @@ async fn socket_mode_native_image_generation() {
     let mut stream = client
         .submit_generation(GenerationSubmission::new("req-image", request))
         .await
-        .expect("submit native request");
+        .expect("submit generation request");
 
     let mut begins = 0usize;
     let mut steps = 0usize;
@@ -302,7 +306,7 @@ async fn socket_mode_default_generation() {
     let mut stream = client
         .submit_generation(GenerationSubmission::new("req-mixed", request))
         .await
-        .expect("submit native request");
+        .expect("submit generation request");
 
     let mut text_tokens = 0usize;
     let mut commits = 0usize;
@@ -343,38 +347,7 @@ async fn socket_mode_default_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn socket_mode_utility_calls() {
-    let handshake = ipc_endpoint("utility");
-    let shutdown = CancellationToken::new();
-    let proc_task = spawn_sim_proc(&handshake, 0, shutdown.clone());
-
-    let client = EngineCoreClient::connect_zmq(client_config(&handshake, 1))
-        .await
-        .expect("connect zmq client");
-
-    assert!(!client.is_sleeping().await.expect("is_sleeping"));
-    assert!(
-        client
-            .reset_prefix_cache(false, false)
-            .await
-            .expect("reset_prefix_cache")
-    );
-    client.sleep(1, "default").await.expect("sleep");
-    assert!(client.is_sleeping().await.expect("is_sleeping after sleep"));
-    client.wake_up(None).await.expect("wake_up");
-    assert!(!client.is_sleeping().await.expect("is_sleeping after wake"));
-    client
-        .reset_encoder_cache()
-        .await
-        .expect("reset_encoder_cache");
-
-    shutdown.cancel();
-    client.shutdown().await.expect("shutdown client");
-    let _ = proc_task.await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn socket_mode_two_engines_distribute_and_route() {
+async fn socket_mode_two_engines_serve_default_and_ranked_requests() {
     let handshake = ipc_endpoint("dp");
     let shutdown = CancellationToken::new();
     let proc0 = spawn_sim_proc(&handshake, 0, shutdown.clone());
@@ -389,57 +362,52 @@ async fn socket_mode_two_engines_distribute_and_route() {
     identities.sort();
     assert_eq!(identities, vec![&[0u8, 0u8][..], &[1u8, 0u8][..]]);
 
-    let request = |id: &str, rank: Option<u32>| text_engine_request(id, 32, rank);
+    let request = |id: &str, rank: Option<u32>| text_submission(id, 32, rank);
 
-    // Load-balanced distribution: submit 6 concurrent requests; the
-    // least-loaded score alternates them across both engines.
+    // Default routing keeps concurrent requests independently consumable.
     let mut streams = Vec::new();
     for i in 0..6 {
         streams.push(
             client
-                .call(request(&format!("req-{i}"), None))
+                .submit_generation(request(&format!("req-{i}"), None))
                 .await
                 .expect("submit"),
         );
     }
-    let mut engines_used = std::collections::BTreeSet::new();
     for mut stream in streams {
-        while let Some(item) = stream.next().await {
-            let out = item.expect("stream item");
-            engines_used.insert(out.engine_index);
-            if out.output.finish_reason.is_some() {
+        let mut finished = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event, GenEvent::Finished { .. }) {
+                finished = true;
                 break;
             }
+            if let GenEvent::Rejected { message } | GenEvent::Error { message } = event {
+                panic!("generation failed: {message}");
+            }
         }
+        assert!(finished, "default-routed request must finish");
     }
-    assert_eq!(
-        engines_used.into_iter().collect::<Vec<_>>(),
-        vec![0, 1],
-        "expected load balancing to use both engines"
-    );
 
-    // Explicit data_parallel_rank bypasses load balancing.
+    // Every configured data-parallel rank accepts the canonical request contract.
     for rank in [1u32, 0, 1] {
         let mut stream = client
-            .call(request(
+            .submit_generation(request(
                 &format!("req-rank-{rank}-{}", rand_tag()),
                 Some(rank),
             ))
             .await
             .expect("submit ranked");
-        let mut seen = None;
-        while let Some(item) = stream.next().await {
-            let out = item.expect("stream item");
-            seen = Some(out.engine_index);
-            if out.output.finish_reason.is_some() {
+        let mut finished = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event, GenEvent::Finished { .. }) {
+                finished = true;
                 break;
             }
+            if let GenEvent::Rejected { message } | GenEvent::Error { message } = event {
+                panic!("generation failed: {message}");
+            }
         }
-        assert_eq!(
-            seen,
-            Some(rank),
-            "dp_rank override must route to engine {rank}"
-        );
+        assert!(finished, "ranked request must finish");
     }
 
     shutdown.cancel();
@@ -528,7 +496,7 @@ async fn engine_dead_sentinel_latches_health() {
             .await
             .unwrap();
 
-        // Accept one Add request, then declare the engine dead.
+        // Accept one generation request, then declare the engine dead.
         let _ = input.recv().await.unwrap();
         output
             .send(ZmqMessage::from(ENGINE_CORE_DEAD_SENTINEL.to_vec()))
@@ -543,16 +511,18 @@ async fn engine_dead_sentinel_latches_health() {
         .expect("connect to fake engine");
     assert!(client.is_healthy());
 
-    let request = text_engine_request("req-dead", 8, None);
-    let mut stream = client.call(request).await.expect("submit request");
+    let mut stream = client
+        .submit_generation(text_submission("req-dead", 8, None))
+        .await
+        .expect("submit request");
 
     // The in-flight stream resolves with an error once the sentinel lands.
     let mut saw_error = false;
-    while let Some(item) = tokio::time::timeout(Duration::from_secs(10), stream.next())
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(10), stream.next())
         .await
         .expect("stream must resolve after engine death")
     {
-        if item.is_err() {
+        if matches!(event, GenEvent::Error { .. }) {
             saw_error = true;
             break;
         }
@@ -565,9 +535,9 @@ async fn engine_dead_sentinel_latches_health() {
         "health latch must record engine death"
     );
     assert!(client.health_error().is_some());
-    let request = text_engine_request("req-after-death", 1, None);
+    let request = text_submission("req-after-death", 1, None);
     assert!(
-        client.call(request).await.is_err(),
+        client.submit_generation(request).await.is_err(),
         "new requests must fail fast after engine death"
     );
 

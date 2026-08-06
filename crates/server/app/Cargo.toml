@@ -10,7 +10,6 @@ axum.workspace = true
 futures.workspace = true
 http-body.workspace = true
 libc.workspace = true
-rmpv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 socket2.workspace = true
@@ -25,7 +24,6 @@ uniserve-engine-gateway.workspace = true
 uniserve-engine-api.workspace = true
 uniserve-executor.workspace = true
 uniserve-engine-runtime.workspace = true
-uniserve-engine-wire.workspace = true
 uniserve-model-profile.workspace = true
 uniserve-observability.workspace = true
 uniserve-protocol-adapters.workspace = true
@@ -40,8 +38,6 @@ validator.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 tower.workspace = true
-uniserve-engine-gateway = { workspace = true, features = ["test-util"] }
-uniserve-testkit.workspace = true
 
 [lints]
 workspace = true

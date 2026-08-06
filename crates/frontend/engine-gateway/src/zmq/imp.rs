@@ -1,6 +1,4 @@
-//! Shared client internals: request/utility registries behind one lock each,
-//! the output dispatcher loop, the stream-cancellation loop, and persistent health
-//! state.
+//! Shared request routing, event dispatch, exact-prefix control, and health state.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -10,20 +8,17 @@ use futures::future::join_all;
 use parking_lot::Mutex;
 use thiserror_ext::AsReport as _;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 use zeromq::RouterSendHalf;
 
-use crate::client::state::{OutputReceiver, UtilityReceiver};
-use crate::client::stream::EngineCoreStreamOutput;
+use crate::client::state::EventReceiver;
 use crate::client::{StreamCancelCause, StreamControl, StreamControlRequest};
-use crate::error::{client_closed, dispatcher_closed, unexpected_dispatcher_output};
+use crate::error::{client_closed, dispatcher_closed};
 use crate::protocol::stats::SchedulerStats;
-use crate::protocol::utility::UtilityOutput;
 use crate::protocol::{
-    ClassifiedEngineCoreOutputs, EngineCoreAcknowledgeAt, EngineCoreCancelAt,
-    EngineCoreControlRequest, EngineCoreOutput, EngineCoreOutputs, EngineCoreStopAt,
+    AcknowledgeAt, CancelAt, EngineRequest, GenerationEventBatch, RoutedGenerationEvent, StopAt,
 };
-use crate::zmq::state::{RequestRegistry, UtilityRegistry};
+use crate::zmq::state::RequestRegistry;
 use crate::zmq::transport::{self, ConnectedEngine, EngineId};
 use crate::{Error, Result};
 
@@ -31,7 +26,6 @@ pub(crate) struct ClientInner {
     input_send: RouterSendHalf,
     model_name: String,
     request_reg: Mutex<RequestRegistry>,
-    utility_reg: Mutex<UtilityRegistry>,
     health_error: ArcSwapOption<Error>,
 }
 
@@ -47,7 +41,6 @@ impl ClientInner {
             input_send,
             model_name,
             request_reg: Mutex::new(RequestRegistry::new(engines)),
-            utility_reg: Mutex::new(UtilityRegistry::default()),
             health_error: ArcSwapOption::empty(),
         }
     }
@@ -67,7 +60,7 @@ impl ClientInner {
         &self,
         request_id: String,
         data_parallel_rank: Option<u32>,
-    ) -> Result<(EngineId, OutputReceiver)> {
+    ) -> Result<(EngineId, EventReceiver)> {
         let mut registry = self.request_reg.lock();
         if registry.is_closed() {
             return Err(self.closed_error());
@@ -75,23 +68,7 @@ impl ClientInner {
         registry.register(request_id, data_parallel_rank)
     }
 
-    /// Allocate the next utility `call_id` and register its waiting receiver.
-    pub(crate) fn allocate_and_register_utility_call(&self) -> Result<(u64, UtilityReceiver)> {
-        let mut registry = self.utility_reg.lock();
-        if registry.is_closed() {
-            return Err(self.closed_error());
-        }
-        Ok(registry.allocate_and_register())
-    }
-
-    /// Undo a batch of utility call allocations when the fan-out send fails
-    /// partway through. Silently ignores unknown call ids so callers can pass
-    /// the full set without first filtering successful sends.
-    pub(crate) fn unregister_utility_calls(&self, call_ids: impl IntoIterator<Item = u64>) {
-        self.utility_reg.lock().unregister_many(call_ids);
-    }
-
-    /// Undo a request registration when `add_request` fails.
+    /// Undo a request registration when submission fails.
     pub(crate) fn rollback_request(&self, request_id: &str) {
         let _ = self.request_reg.lock().remove(request_id);
     }
@@ -110,22 +87,13 @@ impl ClientInner {
         Ok(registry.abortable_request_ids(request_ids))
     }
 
-    /// Obtain stream senders for a whole engine output batch with one registry
+    /// Obtain stream senders for a whole engine event batch with one registry
     /// lock acquisition.
-    pub(crate) fn take_senders_for_outputs<'a>(
+    pub(crate) fn take_senders_for_events<'a>(
         &self,
-        outputs: impl IntoIterator<Item = &'a EngineCoreOutput>,
-    ) -> Vec<Option<mpsc::Sender<Result<EngineCoreStreamOutput>>>> {
-        self.request_reg.lock().senders_for_outputs(outputs)
-    }
-
-    /// Remove a batch of requests that have finished or aborted, returning
-    /// their stream senders.
-    pub(crate) fn finish_requests<'a>(
-        &self,
-        request_ids: impl IntoIterator<Item = &'a String>,
-    ) -> Vec<mpsc::Sender<Result<EngineCoreStreamOutput>>> {
-        self.request_reg.lock().finish_many(request_ids)
+        events: impl IntoIterator<Item = &'a RoutedGenerationEvent>,
+    ) -> Vec<Option<mpsc::Sender<uniserve_engine_api::GenEvent>>> {
+        self.request_reg.lock().senders_for_events(events)
     }
 
     /// Apply one scheduler stats update for the given engine to the local
@@ -137,19 +105,15 @@ impl ClientInner {
             .apply_scheduler_stats(engine_index, stats)
     }
 
-    /// Close all active request streams and utility calls with the first
-    /// persistent health error.
+    /// Close every active event stream with the first persistent health error.
     pub(crate) fn close_registries(&self, error: Arc<Error>) {
         let persistent_error = self.record_health_error(error);
         let request_senders = self.request_reg.lock().close();
-        let utility_senders = self.utility_reg.lock().close();
 
-        // Notify all ongoing requests that the client is closed.
         for sender in request_senders {
-            let _ = sender.try_send(Err(Error::Shared(Arc::clone(&persistent_error))));
-        }
-        for sender in utility_senders {
-            let _ = sender.send(Err(Error::Shared(Arc::clone(&persistent_error))));
+            let _ = sender.try_send(uniserve_engine_api::GenEvent::Error {
+                message: persistent_error.to_string(),
+            });
         }
     }
 
@@ -163,31 +127,14 @@ impl ClientInner {
         self.health_error.load().is_none()
     }
 
-    /// Resolve one utility output to the waiting caller. Returns `true` if a
-    /// waiting caller existed.
-    pub(crate) fn resolve_utility_output(&self, output: UtilityOutput) -> bool {
-        let Some(call_id) = output.call_id.as_u64() else {
-            // All utility calls issued by this client have unsigned call IDs.
-            return false;
-        };
-
-        match self.utility_reg.lock().resolve(&call_id) {
-            Some(sender) => {
-                sender.send(Ok(output)).unwrap_or_default();
-                true
-            }
-            None => false,
-        }
-    }
-
     /// Send one control-path message to the engine. The request type tag is
     /// derived from the variant, so the type frame and payload frame cannot
-    /// disagree. Add requests should first be registered via `register_request`
+    /// disagree. Generation requests are registered through `register_request`
     /// to ensure the request stream is tracked.
     pub(crate) async fn send_to_engine(
         &self,
         engine_id: &EngineId,
-        request: EngineCoreControlRequest,
+        request: EngineRequest,
     ) -> Result<()> {
         let (type_frame, payload) = request.encode_frames()?;
         let mut input_send = self.input_send.clone();
@@ -201,11 +148,8 @@ impl ClientInner {
         engine_id: &EngineId,
         request_ids: &[String],
     ) -> Result<()> {
-        self.send_to_engine(
-            engine_id,
-            EngineCoreControlRequest::Abort(request_ids.to_vec()),
-        )
-        .await
+        self.send_to_engine(engine_id, EngineRequest::Abort(request_ids.to_vec()))
+            .await
     }
 
     pub(crate) async fn do_cancel_requests(
@@ -213,65 +157,50 @@ impl ClientInner {
         engine_id: &EngineId,
         request_ids: &[String],
     ) -> Result<()> {
-        self.send_to_engine(
-            engine_id,
-            EngineCoreControlRequest::Cancel(request_ids.to_vec()),
-        )
-        .await
+        self.send_to_engine(engine_id, EngineRequest::Cancel(request_ids.to_vec()))
+            .await
     }
 
     pub(crate) async fn do_cancel_at_requests(
         &self,
         engine_id: &EngineId,
-        requests: &[EngineCoreCancelAt],
+        requests: &[CancelAt],
     ) -> Result<()> {
-        self.send_to_engine(
-            engine_id,
-            EngineCoreControlRequest::CancelAt(requests.to_vec()),
-        )
-        .await
+        self.send_to_engine(engine_id, EngineRequest::CancelAt(requests.to_vec()))
+            .await
     }
 
     pub(crate) async fn do_acknowledge_at_requests(
         &self,
         engine_id: &EngineId,
-        requests: &[EngineCoreAcknowledgeAt],
+        requests: &[AcknowledgeAt],
     ) -> Result<()> {
-        self.send_to_engine(
-            engine_id,
-            EngineCoreControlRequest::AcknowledgeAt(requests.to_vec()),
-        )
-        .await
+        self.send_to_engine(engine_id, EngineRequest::AcknowledgeAt(requests.to_vec()))
+            .await
     }
 
     pub(crate) async fn do_stop_at_requests(
         &self,
         engine_id: &EngineId,
-        requests: &[EngineCoreStopAt],
+        requests: &[StopAt],
     ) -> Result<()> {
-        self.send_to_engine(
-            engine_id,
-            EngineCoreControlRequest::StopAt(requests.to_vec()),
-        )
-        .await
+        self.send_to_engine(engine_id, EngineRequest::StopAt(requests.to_vec()))
+            .await
     }
 
-    /// Shut down by closing all active request streams and utility calls with a
-    /// sticky client closed error.
+    /// Shut down by closing all active request streams with a sticky client closed error.
     pub(crate) fn shutdown(&self) {
         self.close_registries(Arc::new(client_closed!("engine client shut down")));
     }
 
-    /// Remove the request from the active registry for stream cancellation and return
-    /// the engine that the request was originally routed to, if it is still
-    /// active.
-    pub(crate) fn take_stream_cancel_target(&self, request_id: &str) -> Option<EngineId> {
-        let mut registry = self.request_reg.lock();
-        let (_, engine_id) = registry.remove(request_id)?;
+    /// Return the engine that owns a detached stream. The registry retains the request until its
+    /// terminal event so its external identity cannot be reused while cancellation is in flight.
+    pub(crate) fn detached_stream_cancel_target(&self, request_id: &str) -> Option<EngineId> {
+        let registry = self.request_reg.lock();
         if registry.is_closed() {
             return None;
         }
-        Some(engine_id)
+        registry.engine_for_request(request_id)
     }
 
     pub(crate) fn stream_control_target(&self, request_id: &str) -> Option<EngineId> {
@@ -318,9 +247,9 @@ pub(crate) async fn run_stream_control_loop(
     let mut batch: Vec<StreamControlRequest> = Vec::new();
 
     while control_rx.recv_many(&mut batch, MAX_DRAIN).await > 0 {
-        let mut cutoffs_by_engine: BTreeMap<EngineId, Vec<EngineCoreCancelAt>> = BTreeMap::new();
-        let mut stops_by_engine: BTreeMap<EngineId, Vec<EngineCoreStopAt>> = BTreeMap::new();
-        let mut acknowledgements_by_engine: BTreeMap<EngineId, Vec<EngineCoreAcknowledgeAt>> =
+        let mut cutoffs_by_engine: BTreeMap<EngineId, Vec<CancelAt>> = BTreeMap::new();
+        let mut stops_by_engine: BTreeMap<EngineId, Vec<StopAt>> = BTreeMap::new();
+        let mut acknowledgements_by_engine: BTreeMap<EngineId, Vec<AcknowledgeAt>> =
             BTreeMap::new();
 
         for StreamControlRequest {
@@ -333,32 +262,30 @@ pub(crate) async fn run_stream_control_loop(
                     cause,
                     output_token_count,
                 } => {
-                    let Some(engine_id) = inner.take_stream_cancel_target(&request_id) else {
+                    let Some(engine_id) = inner.detached_stream_cancel_target(&request_id) else {
                         debug!(request_id, "skip stream cancellation for inactive request");
                         continue;
                     };
                     match cause {
                         StreamCancelCause::DroppedStream => {
                             info!(request_id, "cancelling request due to dropped stream");
-                            cutoffs_by_engine.entry(engine_id).or_default().push(
-                                EngineCoreCancelAt {
-                                    request_id,
+                            cutoffs_by_engine
+                                .entry(engine_id)
+                                .or_default()
+                                .push(CancelAt {
+                                    external_request_id: request_id,
                                     output_token_count: output_token_count as u64,
-                                },
-                            );
+                                });
                         }
                         StreamCancelCause::StopStringMatched => {
                             debug!(
                                 request_id,
                                 "cancelling request after frontend stop-string match"
                             );
-                            stops_by_engine
-                                .entry(engine_id)
-                                .or_default()
-                                .push(EngineCoreStopAt {
-                                    request_id,
-                                    output_token_count: output_token_count as u64,
-                                });
+                            stops_by_engine.entry(engine_id).or_default().push(StopAt {
+                                external_request_id: request_id,
+                                output_token_count: output_token_count as u64,
+                            });
                         }
                     }
                 }
@@ -373,8 +300,8 @@ pub(crate) async fn run_stream_control_loop(
                     acknowledgements_by_engine
                         .entry(engine_id)
                         .or_default()
-                        .push(EngineCoreAcknowledgeAt {
-                            request_id,
+                        .push(AcknowledgeAt {
+                            external_request_id: request_id,
                             output_token_count: output_token_count as u64,
                         });
                 }
@@ -417,111 +344,65 @@ pub(crate) async fn run_stream_control_loop(
     }
 }
 
-/// Background loop that listens for engine outputs and dispatches them to
+/// Background loop that listens for engine events and dispatches them to
 /// the corresponding request streams based on their `request_id`.
 pub(crate) async fn run_output_dispatcher_loop(
     inner: Arc<ClientInner>,
-    mut output_rx: mpsc::Receiver<Result<EngineCoreOutputs>>,
+    mut output_rx: mpsc::Receiver<Result<GenerationEventBatch>>,
 ) {
     let result: Result<()> = async {
         loop {
-            let outputs = match output_rx.recv().await {
-                Some(outputs) => outputs,
-                None => Err(dispatcher_closed!(
-                    "engine output dispatcher channel closed"
-                )),
+            let batch = match output_rx.recv().await {
+                Some(batch) => batch,
+                None => Err(dispatcher_closed!("engine event dispatcher channel closed")),
             }?;
 
-            match outputs.classify() {
-                ClassifiedEngineCoreOutputs::RequestBatch(batch) => {
-                    let senders = inner.take_senders_for_outputs(&batch.outputs);
-                    let mut deliveries = BTreeMap::<
-                        String,
-                        Vec<(
-                            mpsc::Sender<Result<EngineCoreStreamOutput>>,
-                            EngineCoreStreamOutput,
-                        )>,
-                    >::new();
-                    for (output, sender) in batch.outputs.into_iter().zip(senders) {
-                        let request_id = output.request_id.clone();
-                        let Some(sender) = sender else {
-                            debug!(request_id, "dropping output for inactive request");
-                            continue;
-                        };
-
-                        let wrapped_output = EngineCoreStreamOutput {
-                            engine_index: batch.engine_index,
-                            timestamp: batch.timestamp,
-                            output,
-                        };
-                        deliveries
-                            .entry(request_id)
-                            .or_default()
-                            .push((sender, wrapped_output));
-                    }
-                    join_all(
-                        deliveries
-                            .into_iter()
-                            .map(|(request_id, outputs)| async move {
-                                for (sender, output) in outputs {
-                                    if sender.send(Ok(output)).await.is_err() {
-                                        debug!(
-                                            request_id,
-                                            "request output stream receiver dropped"
-                                        );
-                                        break;
-                                    }
-                                }
-                            }),
-                    )
-                    .await;
-
-                    // Safety net for requests the engine marked finished
-                    // without a terminal output.
-                    if let Some(finished_requests) = batch.finished_requests.as_ref() {
-                        for request_id in finished_requests {
-                            trace!(request_id, "request completed via finished_requests");
+            let senders = inner.take_senders_for_events(&batch.events);
+            let mut deliveries = BTreeMap::<
+                String,
+                Vec<(
+                    mpsc::Sender<uniserve_engine_api::GenEvent>,
+                    uniserve_engine_api::GenEvent,
+                )>,
+            >::new();
+            for (routed, sender) in batch.events.into_iter().zip(senders) {
+                let request_id = routed.external_request_id;
+                let Some(sender) = sender else {
+                    debug!(request_id, "dropping event for inactive request");
+                    continue;
+                };
+                deliveries
+                    .entry(request_id)
+                    .or_default()
+                    .push((sender, routed.event));
+            }
+            join_all(
+                deliveries
+                    .into_iter()
+                    .map(|(request_id, events)| async move {
+                        for (sender, event) in events {
+                            if sender.send(event).await.is_err() {
+                                debug!(request_id, "generation event receiver dropped");
+                                break;
+                            }
                         }
-                        drop(inner.finish_requests(finished_requests));
-                    }
+                    }),
+            )
+            .await;
 
-                    if let Some(scheduler_stats) = batch.scheduler_stats.as_ref() {
-                        if !inner.apply_scheduler_stats(batch.engine_index, scheduler_stats) {
-                            debug!(
-                                engine_index = batch.engine_index,
-                                "dropping scheduler stats for unknown engine"
-                            );
-                        }
-                        crate::metrics::record_scheduler_stats(
-                            &uniserve_observability::METRICS.scheduler,
-                            inner.model_name(),
-                            batch.engine_index,
-                            scheduler_stats,
-                        );
-                    }
+            if let Some(scheduler_stats) = batch.scheduler_stats.as_ref() {
+                if !inner.apply_scheduler_stats(batch.engine_index, scheduler_stats) {
+                    debug!(
+                        engine_index = batch.engine_index,
+                        "dropping scheduler stats for unknown engine"
+                    );
                 }
-                ClassifiedEngineCoreOutputs::Utility(utility) => {
-                    let call_id = utility.output.call_id;
-                    if inner.resolve_utility_output(utility.output) {
-                        trace!(
-                            %call_id,
-                            engine_index = utility.engine_index,
-                            "resolved utility output"
-                        );
-                    } else {
-                        warn!(
-                            %call_id,
-                            engine_index = utility.engine_index,
-                            "dropping output for unexpected utility call"
-                        );
-                    }
-                }
-                other @ (ClassifiedEngineCoreOutputs::DpControl { .. }
-                | ClassifiedEngineCoreOutputs::Other(_)) => {
-                    Err::<(), _>(unexpected_dispatcher_output!(
-                        "received unexpected output on main dispatcher path: {other:?}"
-                    ))?;
-                }
+                crate::metrics::record_scheduler_stats(
+                    &uniserve_observability::METRICS.scheduler,
+                    inner.model_name(),
+                    batch.engine_index,
+                    scheduler_stats,
+                );
             }
         }
     }

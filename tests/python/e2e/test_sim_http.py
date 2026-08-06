@@ -301,6 +301,9 @@ def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
     # configured HTTP, scheduler, generation-event, and geometry contracts.
     image_start_id = active_sensenova_control_ids(active_sensenova_model())["<img>"]
     with sim_server(tmp_path) as base_url:
+        health_response = httpx.get(f"{base_url}/health", timeout=30)
+        health_response.raise_for_status()
+
         metrics_response = httpx.get(f"{base_url}/metrics", timeout=30)
         metrics_response.raise_for_status()
         assert metrics_response.text
@@ -350,6 +353,42 @@ def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
         assert chat_sse_text(text_events)
         assert chat_sse_finish(text_events) == "stop"
         assert text_events[-1]["type"] == "sse_done"
+
+        cancellation_id = "stream-cancellation"
+        with httpx.stream(
+            "POST",
+            f"{base_url}/v1/chat/completions",
+            headers={"X-Request-Id": cancellation_id},
+            json={
+                "model": "SenseNova-U1",
+                "stream": True,
+                "messages": [{"role": "user", "content": "Keep generating."}],
+                "modalities": ["text"],
+                "min_tokens": 512,
+                "max_completion_tokens": 512,
+            },
+            timeout=60,
+        ) as response:
+            response.raise_for_status()
+            assert any(
+                line.startswith("data: ") and line != "data: [DONE]"
+                for line in response.iter_lines()
+            )
+
+        followup_id = "post-cancellation"
+        cancellation_followup = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            headers={"X-Request-Id": followup_id},
+            json={
+                "model": "SenseNova-U1",
+                "messages": [{"role": "user", "content": "Confirm recovery."}],
+                "modalities": ["text"],
+                "max_completion_tokens": 16,
+            },
+            timeout=60,
+        )
+        cancellation_followup.raise_for_status()
+        assert cancellation_followup.json()["id"] == f"chatcmpl-{followup_id}"
 
         image_response = httpx.post(
             f"{base_url}/v1/images/generations",

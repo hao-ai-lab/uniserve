@@ -91,7 +91,6 @@ impl SchedStatsReporter {
             max_queue_wait_us: stats.timing.queue_wait_us_max.load(Ordering::Relaxed),
             prefix_cache_stats: PrefixCacheStats {
                 base: BaseCacheStats {
-                    reset: false,
                     requests: 0,
                     queries: delta_queries * block_size as u64,
                     hits: delta_hit_tokens,

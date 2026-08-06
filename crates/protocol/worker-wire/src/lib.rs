@@ -2163,7 +2163,6 @@ pub enum RequestKind {
     Shutdown,
     CopyKv,
     ReleaseProducts,
-    ResetPrefixCache,
     GetMetrics,
     GetPressure,
     SnapshotSession,
@@ -2171,7 +2170,7 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::GetCapabilities,
         Self::Execute,
         Self::PollCompletions,
@@ -2179,7 +2178,6 @@ impl RequestKind {
         Self::Shutdown,
         Self::CopyKv,
         Self::ReleaseProducts,
-        Self::ResetPrefixCache,
         Self::GetMetrics,
         Self::GetPressure,
         Self::SnapshotSession,
@@ -2195,7 +2193,6 @@ impl RequestKind {
             Self::Shutdown => "shutdown",
             Self::CopyKv => "copy_kv",
             Self::ReleaseProducts => "release_products",
-            Self::ResetPrefixCache => "reset_prefix_cache",
             Self::GetMetrics => "get_metrics",
             Self::GetPressure => "get_pressure",
             Self::SnapshotSession => "snapshot_session",
@@ -2287,9 +2284,6 @@ impl WorkerRequest {
             product_handles: Some(product_handles),
             ..Self::bare(RequestKind::ReleaseProducts)
         }
-    }
-    pub fn reset_prefix_cache() -> Self {
-        Self::bare(RequestKind::ResetPrefixCache)
     }
     pub fn get_metrics() -> Self {
         Self::bare(RequestKind::GetMetrics)

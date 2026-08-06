@@ -8,16 +8,13 @@ mod client;
 mod error;
 pub mod generation;
 pub mod metrics;
-pub mod mock;
-#[doc(hidden)]
-pub mod test_utils;
 pub mod zmq;
 
 pub use uniserve_engine_wire as protocol;
 
 pub use client::{
-    EngineAppControl, EngineCoreClient, EngineCoreOutputStream, EngineCoreStreamOutput,
-    InProcessEngineClient, StreamCancelCause, StreamControl, StreamControlRequest,
+    EngineCoreClient, EngineStatus, InProcessEngineClient, StreamCancelCause, StreamControl,
+    StreamControlRequest,
 };
 pub use error::{Error, Result};
 pub use generation::{
@@ -25,7 +22,6 @@ pub use generation::{
     GenerationFinishReason, GenerationPositionLogprobs, GenerationSubmission,
     GenerationTokenLogprob, ImageParams, PublicCommit, PublicModality, SemanticRoot,
 };
-pub use mock::{MockClientMessage, MockEngine};
 pub use zmq::{EngineId, TransportMode, ZmqClientConfig, ZmqEngineCoreClient};
 
 /// Runtime transport seam for generation submission and request control.
@@ -67,9 +63,9 @@ impl EngineGateway {
         &self.client
     }
 
-    /// Create the application-owned lifecycle and administration capability.
-    pub fn app_control(&self) -> EngineAppControl {
-        EngineAppControl::new(&self.client)
+    /// Create the application-owned health and build-provenance view.
+    pub fn status(&self) -> EngineStatus {
+        EngineStatus::new(&self.client)
     }
 
     pub async fn submit_generation(
@@ -102,14 +98,12 @@ impl EngineGateway {
 /// Namespaced transport interface for callers that do not use generation lowering.
 pub mod transport {
     pub use super::protocol;
-    pub use super::test_utils;
     pub use super::{
-        EngineAppControl, EngineCoreClient, EngineCoreOutputStream, EngineCoreStreamOutput,
-        EngineId, EngineSamplingParams, Error, GenEvent, GenerationConstraint,
-        GenerationEventStream, GenerationFinishReason, GenerationSubmission, ImageParams,
-        InProcessEngineClient, MockClientMessage, MockEngine, PublicCommit, PublicModality, Result,
-        SemanticRoot, StreamCancelCause, StreamControl, StreamControlRequest, TransportMode,
-        ZmqClientConfig, ZmqEngineCoreClient,
+        EngineCoreClient, EngineId, EngineSamplingParams, EngineStatus, Error, GenEvent,
+        GenerationConstraint, GenerationEventStream, GenerationFinishReason, GenerationSubmission,
+        ImageParams, InProcessEngineClient, PublicCommit, PublicModality, Result, SemanticRoot,
+        StreamCancelCause, StreamControl, StreamControlRequest, TransportMode, ZmqClientConfig,
+        ZmqEngineCoreClient,
     };
     pub use super::{generation, metrics, zmq};
 }
@@ -122,26 +116,4 @@ pub struct EngineGatewaySnapshot {
     pub max_model_len: u32,
     pub model_dtype: uniserve_core::ModelDtype,
     pub generation_capabilities: uniserve_core::GenerationRuntimeCapabilities,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn application_control_does_not_keep_execution_gateway_alive() {
-        let (client, _mock) = EngineCoreClient::connect_mock("test-model");
-        let gateway = EngineGateway::new(client);
-        let control = gateway.app_control();
-        assert!(control.is_healthy());
-        assert_eq!(control.version().unwrap(), "mock");
-
-        gateway.shutdown().await.unwrap();
-
-        assert!(!control.is_healthy());
-        assert!(matches!(
-            control.version(),
-            Err(Error::ApplicationControlUnavailable)
-        ));
-    }
 }

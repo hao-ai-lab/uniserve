@@ -1,17 +1,8 @@
-//! Per-request output stream channel types shared by the client backends and
-//! [`super::stream::EngineCoreOutputStream`].
+//! Per-request canonical event channels shared by client backends.
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use crate::Result;
-use crate::client::stream::EngineCoreStreamOutput;
-use crate::protocol::utility::UtilityOutput;
+use uniserve_engine_api::GenEvent;
 
-/// Sender half of one request's output stream channel.
-pub(crate) type OutputSender = mpsc::Sender<Result<EngineCoreStreamOutput>>;
-/// Receiver half of one request's output stream channel.
-pub(crate) type OutputReceiver = mpsc::Receiver<Result<EngineCoreStreamOutput>>;
-/// Sender half of one utility call's result channel.
-pub(crate) type UtilitySender = oneshot::Sender<Result<UtilityOutput>>;
-/// Receiver half of one utility call's result channel.
-pub(crate) type UtilityReceiver = oneshot::Receiver<Result<UtilityOutput>>;
+pub(crate) type EventSender = mpsc::Sender<GenEvent>;
+pub(crate) type EventReceiver = mpsc::Receiver<GenEvent>;

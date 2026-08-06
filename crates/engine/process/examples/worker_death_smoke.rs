@@ -8,15 +8,15 @@
 
 use std::time::Duration;
 
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::{
     ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
     UndVisibility,
 };
-use uniserve_engine_gateway::transport::protocol::EngineCoreRequest;
-use uniserve_engine_gateway::transport::{EngineCoreClient, TransportMode, ZmqClientConfig};
+use uniserve_engine_gateway::transport::{
+    EngineCoreClient, GenEvent, GenerationSubmission, TransportMode, ZmqClientConfig,
+};
 use uniserve_engine_process::{EngineProcConfig, run_engine_proc};
 use uniserve_engine_runtime::{EngineBackend, EngineCoreConfig};
 
@@ -92,33 +92,25 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     println!("connected; submitting a request the worker will die under...");
 
-    let request = EngineCoreRequest::new("req-death".to_string(), text_generation_request());
-    let mut stream = client.call(request).await?;
+    let mut stream = client
+        .submit_generation(GenerationSubmission::new(
+            "req-death",
+            text_generation_request(),
+        ))
+        .await?;
 
-    // The in-flight request fails either as a terminal Error output (the
-    // request-level path) or as a stream error once the dead sentinel closes
-    // the registries — both are acceptable failure shapes.
+    // The in-flight request resolves with a canonical error event.
     let mut saw_error = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let item = tokio::time::timeout_at(deadline, stream.next()).await;
         match item {
-            Ok(Some(Ok(out))) => {
-                if out.output.finish_reason
-                    == Some(
-                        uniserve_engine_gateway::transport::protocol::EngineCoreFinishReason::Error,
-                    )
-                {
-                    println!("request resolved with finish_reason=Error as expected");
-                    saw_error = true;
-                    break;
-                }
-            }
-            Ok(Some(Err(e))) => {
-                println!("stream failed as expected: {e}");
+            Ok(Some(GenEvent::Error { message })) => {
+                println!("request failed as expected: {message}");
                 saw_error = true;
                 break;
             }
+            Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => break,
         }

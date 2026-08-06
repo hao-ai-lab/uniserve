@@ -8,8 +8,6 @@ use crate::OpaqueValue;
 ///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BaseCacheStats {
-    /// Whether the cache was reset.
-    pub reset: bool,
     /// The number of requests in this update.
     pub requests: u64,
     /// The number of queries in these requests.
@@ -18,13 +16,10 @@ pub struct BaseCacheStats {
     pub hits: u64,
 }
 
-/// Stores prefix cache hit statistics.
-/// - `reset`: Whether `reset_prefix_cache` was invoked.
-/// - `queries`: Refers to the number of tokens that were queried.
-///
+/// Stores prefix cache hit statistics. `queries` counts queried tokens.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrefixCacheStats {
-    /// Embedded base cache counters and reset flag.
+    /// Embedded base cache counters.
     #[serde(flatten)]
     pub base: BaseCacheStats,
     /// The number of requests preempted before this stats update.
@@ -51,7 +46,7 @@ pub struct KvCacheEvictionEvent {
 ///
 /// Each scheduler step, statistics on spec decoding performance are aggregated
 /// across requests by the scheduler and returned to the frontend in
-/// `EngineCoreOutputs -> SchedulerStats`.
+/// `GenerationEventBatch -> SchedulerStats`.
 ///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpecDecodingStats {
@@ -70,8 +65,7 @@ pub struct SpecDecodingStats {
 /// Breakdown of a scheduled prefill computation.
 ///
 /// Python models this as a plain `@dataclass`, so it is serialized by msgspec
-/// as a map (named fields) rather than in the array-like form used by
-/// `EngineCoreOutput` itself.
+/// as a map with named fields.
 ///
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefillStats {

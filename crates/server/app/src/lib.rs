@@ -253,7 +253,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     };
 
     let gateway = EngineGateway::new(client).with_log_stats(!config.disable_log_stats);
-    let engine_control = gateway.app_control();
+    let engine_status = gateway.status();
     let snapshot = gateway.snapshot();
     let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
     profile.context_limits.max_model_tokens = Some(route_max_model_len);
@@ -272,7 +272,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let runtime = ServingRuntime::new(model, gateway);
 
     Ok(Arc::new(
-        AppState::new(public_model_name, runtime, engine_control)
+        AppState::new(public_model_name, runtime, engine_status)
             .with_log_requests(config.enable_log_requests)
             .with_request_id_headers(config.enable_request_id_headers)
             .with_api_key(config.api_key.clone())

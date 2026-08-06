@@ -228,21 +228,6 @@ impl EncoderCacheManager {
         }
         freed
     }
-
-    /// Invalidate the whole cache. Unpinned worker handles are returned
-    /// immediately; pinned entries retire until their final reference drops.
-    pub fn clear(&mut self) -> Vec<ProductRef> {
-        let mut freed = Vec::new();
-        for (hash, entry) in std::mem::take(&mut self.entries) {
-            if entry.ref_cnt == 0 {
-                freed.push(entry.product);
-            } else {
-                self.retired.entry(hash).or_default().push(entry);
-            }
-        }
-        self.evictable.clear();
-        freed
-    }
 }
 
 #[cfg(test)]
@@ -299,32 +284,5 @@ mod tests {
         cache.insert(2, product(200));
         assert_eq!(cache.lookup_product(1), Some(pinned));
         assert_eq!(cache.stats.over_budget_inserts, 1);
-    }
-
-    #[test]
-    fn cache_reset_reclaims_a_pinned_product_after_its_reader_releases() {
-        let mut cache = EncoderCacheManager::new(2);
-        let pinned = product(100);
-        cache.insert(1, pinned.clone());
-        assert_eq!(cache.acquire(1), Some(pinned.clone()));
-        cache.clear();
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.release(1, &pinned), Some(pinned));
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn an_equivalent_retired_reference_reactivates_with_its_pin_count() {
-        let mut cache = EncoderCacheManager::new(2);
-        let product = product(100);
-        cache.insert(1, product.clone());
-        cache.acquire(1);
-        cache.clear();
-        cache.insert(1, product.clone());
-        assert_eq!(cache.acquire(1), Some(product.clone()));
-        assert_eq!(cache.len(), 1);
-        cache.release(1, &product);
-        cache.release(1, &product);
-        assert_eq!(cache.peek_product(1), Some(product));
     }
 }

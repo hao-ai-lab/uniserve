@@ -2,14 +2,10 @@ use std::sync::{Arc, Weak};
 
 use crate::GenerationEventStream;
 use crate::error::{Error, Result};
-use crate::protocol::EngineCoreRequest;
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype};
 
 pub(crate) mod state;
-pub(crate) mod stream;
-
-pub use stream::{EngineCoreOutputStream, EngineCoreStreamOutput};
 
 /// The reason a request stream is being cancelled when its output stream is
 /// dropped.
@@ -66,7 +62,6 @@ pub struct StreamControlRequest {
 /// preserving one frontend-facing client API for in-process, socket, and mock
 /// modes.
 pub trait InProcessEngineClient: Send + Sync {
-    fn call(&self, req: EngineCoreRequest) -> Result<EngineCoreOutputStream>;
     fn submit_generation(
         &self,
         submission: crate::generation::GenerationSubmission,
@@ -84,17 +79,6 @@ pub trait InProcessEngineClient: Send + Sync {
     fn health_error(&self) -> Option<Arc<Error>> {
         None
     }
-    fn collective_rpc(&self, method: &str) -> Result<Vec<rmpv::Value>>;
-    fn is_sleeping(&self) -> Result<bool>;
-    fn reset_mm_cache(&self) -> Result<()>;
-    fn reset_encoder_cache(&self) -> Result<()>;
-    fn reset_prefix_cache(
-        &self,
-        reset_running_requests: bool,
-        reset_connector: bool,
-    ) -> Result<bool>;
-    fn sleep(&self, level: u32, mode: &str) -> Result<()>;
-    fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()>;
     fn shutdown(self: Box<Self>) -> Result<()>;
 }
 
@@ -105,25 +89,21 @@ pub trait InProcessEngineClient: Send + Sync {
 ///   process.
 /// - [`Self::Zmq`]: the socket transport to one or more headless
 ///   `uniserve engine` processes.
-/// - [`Self::Mock`]: an in-process scriptable engine used by the test suite
-///   (see [`crate::mock`]).
 pub enum EngineCoreClient {
     InProcess(Box<dyn InProcessEngineClient>),
     Zmq(Box<crate::zmq::ZmqEngineCoreClient>),
-    Mock(crate::mock::MockEngineClient),
 }
 
-/// Owned, typed application control capability for an engine connection.
+/// Owned, typed health and build-provenance capability for an engine connection.
 ///
 /// The weak reference keeps this capability independent of execution
-/// ownership and deliberately exposes neither generation submission nor raw
-/// transport calls.
+/// ownership and deliberately exposes no generation submission capability.
 #[derive(Clone)]
-pub struct EngineAppControl {
+pub struct EngineStatus {
     client: Weak<EngineCoreClient>,
 }
 
-impl EngineAppControl {
+impl EngineStatus {
     pub(crate) fn new(client: &Arc<EngineCoreClient>) -> Self {
         Self {
             client: Arc::downgrade(client),
@@ -131,9 +111,7 @@ impl EngineAppControl {
     }
 
     fn client(&self) -> Result<Arc<EngineCoreClient>> {
-        self.client
-            .upgrade()
-            .ok_or(Error::ApplicationControlUnavailable)
+        self.client.upgrade().ok_or(Error::StatusUnavailable)
     }
 
     pub fn version(&self) -> Result<String> {
@@ -151,52 +129,6 @@ impl EngineAppControl {
             .upgrade()
             .and_then(|client| client.health_error())
     }
-
-    pub async fn collective_rpc<A, K>(
-        &self,
-        method: &str,
-        timeout: Option<f64>,
-        args: A,
-        kwargs: K,
-    ) -> Result<Vec<rmpv::Value>>
-    where
-        A: serde::Serialize + std::fmt::Debug,
-        K: serde::Serialize + std::fmt::Debug,
-    {
-        self.client()?
-            .collective_rpc(method, timeout, args, kwargs)
-            .await
-    }
-
-    pub async fn is_sleeping(&self) -> Result<bool> {
-        self.client()?.is_sleeping().await
-    }
-
-    pub async fn reset_mm_cache(&self) -> Result<()> {
-        self.client()?.reset_mm_cache().await
-    }
-
-    pub async fn reset_encoder_cache(&self) -> Result<()> {
-        self.client()?.reset_encoder_cache().await
-    }
-
-    pub async fn reset_prefix_cache(
-        &self,
-        reset_running_requests: bool,
-        reset_connector: bool,
-    ) -> Result<bool> {
-        self.client()?
-            .reset_prefix_cache(reset_running_requests, reset_connector)
-            .await
-    }
-
-    pub async fn sleep(&self, level: u32, mode: &str) -> Result<()> {
-        self.client()?.sleep(level, mode).await
-    }
-
-    pub async fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()> {
-        self.client()?.wake_up(tags).await
-    }
 }
 
 impl EngineCoreClient {
@@ -212,21 +144,6 @@ impl EngineCoreClient {
         )))
     }
 
-    /// Build a mock-backed client plus its scripting handle (test infrastructure).
-    pub fn connect_mock(model_name: impl Into<String>) -> (Self, crate::mock::MockEngine) {
-        let (client, engine) = crate::mock::connect_mock(model_name);
-        (Self::Mock(client), engine)
-    }
-
-    /// Add a request and return its per-request raw output stream.
-    pub async fn call(&self, req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
-        match self {
-            Self::InProcess(c) => c.call(req),
-            Self::Zmq(c) => c.call(req).await,
-            Self::Mock(c) => c.call(req),
-        }
-    }
-
     /// Submit a canonical generation request and return its typed event stream.
     pub async fn submit_generation(
         &self,
@@ -235,15 +152,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.submit_generation(submission),
             Self::Zmq(c) => c.submit_generation(submission).await,
-            Self::Mock(c) => {
-                let decoder_ack_required = !submission.request.stop_strings.is_empty();
-                let wire = crate::generation::generation_request_to_wire(submission);
-                let stream = c.call(wire)?;
-                Ok(crate::generation::generation_event_stream_from_wire(
-                    stream,
-                    decoder_ack_required,
-                ))
-            }
         }
     }
 
@@ -252,10 +160,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.cancel(ids),
             Self::Zmq(c) => c.cancel(ids).await,
-            Self::Mock(c) => {
-                c.cancel(ids);
-                Ok(())
-            }
         }
     }
 
@@ -264,10 +168,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.abort(ids),
             Self::Zmq(c) => c.abort(ids).await,
-            Self::Mock(c) => {
-                c.abort(ids);
-                Ok(())
-            }
         }
     }
 
@@ -276,7 +176,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.engine_count(),
             Self::Zmq(c) => c.engine_count(),
-            Self::Mock(_) => 1,
         }
     }
 
@@ -284,7 +183,7 @@ impl EngineCoreClient {
     pub fn engine_identities(&self) -> Vec<&[u8]> {
         match self {
             Self::Zmq(c) => c.engine_identities(),
-            Self::InProcess(_) | Self::Mock(_) => Vec::new(),
+            Self::InProcess(_) => Vec::new(),
         }
     }
 
@@ -292,7 +191,7 @@ impl EngineCoreClient {
     pub fn ready_responses(&self) -> Vec<&EngineCoreReadyResponse> {
         match self {
             Self::Zmq(c) => c.ready_responses(),
-            Self::InProcess(_) | Self::Mock(_) => Vec::new(),
+            Self::InProcess(_) => Vec::new(),
         }
     }
 
@@ -301,7 +200,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.model_dtype(),
             Self::Zmq(c) => c.model_dtype(),
-            Self::Mock(_) => ModelDtype::BFloat16,
         }
     }
 
@@ -310,7 +208,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.uniserve_version(),
             Self::Zmq(c) => c.engine_version(),
-            Self::Mock(_) => "mock",
         }
     }
 
@@ -319,7 +216,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.total_num_gpu_blocks(),
             Self::Zmq(c) => c.total_num_gpu_blocks(),
-            Self::Mock(_) => 0,
         }
     }
 
@@ -328,7 +224,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.max_model_len(),
             Self::Zmq(c) => c.max_model_len(),
-            Self::Mock(_) => 32768,
         }
     }
 
@@ -338,23 +233,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.generation_capabilities(),
             Self::Zmq(c) => c.generation_capabilities(),
-            Self::Mock(_) => GenerationRuntimeCapabilities {
-                supports_understanding: true,
-                supports_vision_encode: true,
-                supports_latent_encode: true,
-                supports_image_generation: true,
-                max_latent_units: 1 << 20,
-                latent_downsample: 16,
-                max_vae_grid_tokens: 4096,
-                max_vit_grid_tokens: 4096,
-                max_latent_feature_bytes: 1 << 28,
-                max_vision_feature_bytes: 1 << 28,
-                commit_marker_tokens: 2,
-                max_cfg_branches: 3,
-                scratch_capacity_tokens: 1 << 20,
-                scratch_block_size: 64,
-                encoder_cache_entries: 256,
-            },
         }
     }
 
@@ -363,7 +241,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.model_name(),
             Self::Zmq(c) => c.model_name(),
-            Self::Mock(c) => c.model_name(),
         }
     }
 
@@ -372,7 +249,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.is_healthy(),
             Self::Zmq(c) => c.is_healthy(),
-            Self::Mock(_) => true,
         }
     }
 
@@ -381,90 +257,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.health_error(),
             Self::Zmq(c) => c.health_error(),
-            Self::Mock(_) => None,
-        }
-    }
-
-    /// Run `collective_rpc` across engines and their worker ranks.
-    pub async fn collective_rpc<A, K>(
-        &self,
-        method: &str,
-        timeout: Option<f64>,
-        args: A,
-        kwargs: K,
-    ) -> Result<Vec<rmpv::Value>>
-    where
-        A: serde::Serialize + std::fmt::Debug,
-        K: serde::Serialize + std::fmt::Debug,
-    {
-        match self {
-            Self::InProcess(c) => c.collective_rpc(method),
-            Self::Zmq(c) => c.collective_rpc(method, timeout, args, kwargs).await,
-            Self::Mock(_) => Ok(Vec::new()),
-        }
-    }
-
-    /// Whether the engine is currently sleeping.
-    pub async fn is_sleeping(&self) -> Result<bool> {
-        match self {
-            Self::InProcess(c) => c.is_sleeping(),
-            Self::Zmq(c) => c.is_sleeping().await,
-            Self::Mock(_) => Ok(false),
-        }
-    }
-
-    /// Reset the multimodal cache.
-    pub async fn reset_mm_cache(&self) -> Result<()> {
-        match self {
-            Self::InProcess(c) => c.reset_mm_cache(),
-            Self::Zmq(c) => c.reset_mm_cache().await,
-            Self::Mock(_) => Ok(()),
-        }
-    }
-
-    /// Reset the encoder cache.
-    pub async fn reset_encoder_cache(&self) -> Result<()> {
-        match self {
-            Self::InProcess(c) => c.reset_encoder_cache(),
-            Self::Zmq(c) => c.reset_encoder_cache().await,
-            Self::Mock(_) => Ok(()),
-        }
-    }
-
-    /// Reset the prefix cache.
-    pub async fn reset_prefix_cache(
-        &self,
-        reset_running_requests: bool,
-        reset_connector: bool,
-    ) -> Result<bool> {
-        match self {
-            Self::InProcess(c) => c.reset_prefix_cache(reset_running_requests, reset_connector),
-            Self::Zmq(c) => {
-                c.reset_prefix_cache(reset_running_requests, reset_connector)
-                    .await
-            }
-            Self::Mock(_) if reset_connector => Err(Error::UnsupportedControl {
-                control: "external prefix-cache reset".to_string(),
-            }),
-            Self::Mock(_) => Ok(true),
-        }
-    }
-
-    /// Put the engine to sleep.
-    pub async fn sleep(&self, level: u32, mode: &str) -> Result<()> {
-        match self {
-            Self::InProcess(c) => c.sleep(level, mode),
-            Self::Zmq(c) => c.sleep(level, mode).await,
-            Self::Mock(_) => Ok(()),
-        }
-    }
-
-    /// Wake the engine from sleep.
-    pub async fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()> {
-        match self {
-            Self::InProcess(c) => c.wake_up(tags),
-            Self::Zmq(c) => c.wake_up(tags).await,
-            Self::Mock(_) => Ok(()),
         }
     }
 
@@ -473,7 +265,6 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.shutdown(),
             Self::Zmq(c) => c.shutdown().await,
-            Self::Mock(_) => Ok(()),
         }
     }
 }

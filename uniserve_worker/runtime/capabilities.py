@@ -95,7 +95,6 @@ def resolve_capabilities(
     controls = [
         RequestKind.DROP_SESSION,
         RequestKind.COPY_KV,
-        RequestKind.RESET_PREFIX_CACHE,
         RequestKind.RELEASE_PRODUCTS,
     ]
     supported_work = work_variants_for_operation_types(

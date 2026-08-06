@@ -18,7 +18,7 @@ uniserve-eval run decode-runtime \
   --output-root /path/to/results
 ```
 
-Run the reference and candidate separately, then compare their immutable result roots offline:
+Run the direct parent and prospective commit separately, then compare their result roots offline:
 
 ```bash
 uniserve-eval compare decode-runtime \
@@ -27,7 +27,7 @@ uniserve-eval compare decode-runtime \
   --output-dir /path/to/comparison
 ```
 
-The `decode-runtime` suite supplies its 5% maximum-regression comparison screen. A single benchmark point can be used in place of a suite name; comparison of a single point requires `--max-regression`. A comparison screen result reports a metric crossing; the consuming qualification protocol interprets it as evidence and determines the required investigation or repair.
+The `decode-runtime` suite supplies its 10% parent-comparison screen. Before each construction commit, run all four suite points for the prospective commit and its direct parent, then compare those two result roots. A single benchmark point can be used in place of a suite name; comparison of a single point requires `--max-regression`. A comparison screen result reports a metric crossing for diagnosis; it does not establish causality by itself.
 
 ## Configuration
 
@@ -63,10 +63,10 @@ Each point directory contains `run.json`, `summary.json`, `summary.md`, `request
 
 `summary.json` contains the explicit workload, selected-row count and SHA-256, raw metrics, task validation checks, warnings, and diagnostic provenance. Point validity is the conjunction of declared request count, successful completion, task output semantics, and availability of protected metrics.
 
-Git state, GPU information, server command, selected environment values, and server information are diagnostic. Their absence does not change observable request validity.
+Git state, GPU information, server command, selected environment values, and server version provenance are diagnostic. Their absence does not change observable request validity.
 
 ## Comparison
 
-Reference and candidate must have identical benchmark names, declared workloads, selected rows, and metric declarations. The comparator reads aggregate metrics from the complete point bundles; it never filters to a successful-request intersection. When the task allows natural EOS or open-ended interleave output, realized token, image, and transition counts are measured results rather than workload-equivalence fields.
+The direct parent and prospective commit must have identical benchmark names, declared workloads, selected rows, and metric declarations. The comparator reads aggregate metrics from the complete point bundles; it never filters to a successful-request intersection. When the task allows natural EOS or open-ended interleave output, realized token, image, and transition counts are measured results rather than workload-equivalence fields.
 
 For higher-is-better metrics the normalized ratio is `candidate / reference`. For lower-is-better metrics it is `reference / candidate`. Every row reports both raw values, raw percentage change, normalized ratio, threshold, and comparison-screen result. A screen crossing is evidence for diagnosis, not an automatic performance gate failure or a reason to halt work.

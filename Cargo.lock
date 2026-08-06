@@ -358,20 +358,6 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
-dependencies = [
- "bytemuck_derive",
-]
-
-[[package]]
-name = "bytemuck_derive"
-version = "1.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
 
 [[package]]
 name = "byteorder"
@@ -1040,18 +1026,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enum-as-inner"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0359ee92f81184d7985519e474bda2a5738476334edd3746c9b1265c067afe70"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
 name = "enum-iterator"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1460,7 +1434,6 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
- "bytemuck",
  "cfg-if",
  "crunchy",
  "zerocopy",
@@ -3542,18 +3515,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_default"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "486b028b311aaaea83e0ba65a3e6e3cbef381e74e9d0bd6263faefd1fb503c1d"
-dependencies = [
- "darling 0.20.11",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
 name = "serde_derive"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3587,17 +3548,6 @@ dependencies = [
  "itoa",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "serde_repr"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -4429,7 +4379,6 @@ dependencies = [
  "serde",
  "serde_json",
  "uniserve-serving",
- "uniserve-testkit",
 ]
 
 [[package]]
@@ -4495,32 +4444,21 @@ dependencies = [
 name = "uniserve-engine-gateway"
 version = "0.2.0"
 dependencies = [
- "anyhow",
  "arc-swap",
  "bytes",
- "clap",
- "easy-ext",
- "enum-as-inner",
- "expect-test",
  "futures",
  "hex",
  "parking_lot",
- "rmpv",
- "serde",
- "serde_json",
  "task-local",
  "thiserror 2.0.18",
  "thiserror-ext",
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "uniserve-core",
  "uniserve-engine-api",
  "uniserve-engine-wire",
  "uniserve-observability",
- "uniserve-worker-wire",
- "uuid",
  "zeromq",
 ]
 
@@ -4530,8 +4468,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
- "futures",
- "rmpv",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4553,7 +4489,6 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "futures",
- "rmpv",
  "serde",
  "thiserror-ext",
  "tokio",
@@ -4572,26 +4507,13 @@ dependencies = [
 name = "uniserve-engine-wire"
 version = "0.2.0"
 dependencies = [
- "bytemuck",
- "byteorder",
  "bytes",
- "easy-ext",
- "enum-as-inner",
- "expect-test",
- "half",
- "itertools 0.14.0",
  "rmp-serde",
  "rmpv",
  "serde",
- "serde_default",
- "serde_json",
- "serde_repr",
  "serde_tuple",
- "serde_with",
  "thiserror 2.0.18",
  "thiserror-ext",
- "tokio",
- "tracing",
  "uniserve-core",
  "uniserve-engine-api",
 ]
@@ -4741,7 +4663,6 @@ dependencies = [
  "futures",
  "http-body",
  "libc",
- "rmpv",
  "serde",
  "serde_json",
  "socket2",
@@ -4756,7 +4677,6 @@ dependencies = [
  "uniserve-engine-api",
  "uniserve-engine-gateway",
  "uniserve-engine-runtime",
- "uniserve-engine-wire",
  "uniserve-executor",
  "uniserve-model-profile",
  "uniserve-observability",
@@ -4764,7 +4684,6 @@ dependencies = [
  "uniserve-scheduler",
  "uniserve-serving",
  "uniserve-sim",
- "uniserve-testkit",
  "uniserve-worker-ipc",
  "uuid",
  "validator",
@@ -4818,29 +4737,6 @@ dependencies = [
  "uniserve-executor",
  "uniserve-scheduler",
  "uniserve-worker-ipc",
- "uniserve-worker-wire",
-]
-
-[[package]]
-name = "uniserve-testkit"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "futures",
- "png",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokenizers",
- "tokio",
- "uniserve-core",
- "uniserve-engine-api",
- "uniserve-engine-gateway",
- "uniserve-executor",
- "uniserve-model-profile",
- "uniserve-serving",
  "uniserve-worker-wire",
 ]
 

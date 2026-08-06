@@ -1614,9 +1614,6 @@ fn prefix_cache_reuses_shared_prompt() {
     );
     assert!(stats.prefix.hit_tokens.load(Ordering::Relaxed) >= 512);
 
-    // resetting the prefix cache clears it.
-    assert!(handle.reset_prefix_cache(false).unwrap());
-
     handle.shutdown();
     let _ = jh.join();
 }
@@ -1960,8 +1957,6 @@ fn multimodal_encode_then_cache_hit() {
         "repeated image must hit the encoder cache"
     );
 
-    handle.reset_encoder_cache();
-    thread::sleep(Duration::from_millis(20));
     handle.shutdown();
     let _ = jh.join();
 }

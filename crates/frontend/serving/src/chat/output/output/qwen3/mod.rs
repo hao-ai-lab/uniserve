@@ -57,7 +57,7 @@ impl Qwen3ChatOutputProcessor {
         })
     }
 
-    /// Transforms a raw generate-output token stream into structured chat
+    /// Transforms a committed token stream into structured chat
     /// events through three sequential stages once text decoding has
     /// already happened:
     ///

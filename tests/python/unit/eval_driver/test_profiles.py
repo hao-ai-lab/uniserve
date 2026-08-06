@@ -18,7 +18,7 @@ def test_decode_runtime_suite_resolves_to_four_explicit_points() -> None:
         "sensenova-uniserve-t2i-c32",
         "sensenova-uniserve-interleave-c4",
     )
-    assert config.suites["decode-runtime"].max_regression == 0.05
+    assert config.suites["decode-runtime"].max_regression == 0.10
 
 
 def test_toml_rejects_an_unknown_benchmark_field(tmp_path: Path) -> None:

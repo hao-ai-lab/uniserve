@@ -708,7 +708,6 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
         RequestKind::Shutdown => intern!(py, "shutdown"),
         RequestKind::CopyKv => intern!(py, "copy_kv"),
         RequestKind::ReleaseProducts => intern!(py, "release_products"),
-        RequestKind::ResetPrefixCache => intern!(py, "reset_prefix_cache"),
         RequestKind::GetMetrics => intern!(py, "get_metrics"),
         RequestKind::GetPressure => intern!(py, "get_pressure"),
         RequestKind::SnapshotSession => intern!(py, "snapshot_session"),

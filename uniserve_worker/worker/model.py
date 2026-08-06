@@ -917,9 +917,6 @@ class ModelWorker:
         self.products.release(tuple(int(handle) for handle in handles))
         self.sessions.discard_product_handles({int(handle) for handle in handles})
 
-    def reset_prefix_cache(self) -> None:
-        return None
-
     def snapshot_session(self, session_id: int) -> SnapshotRef:
         if self.snapshot_provider is None:
             raise capability_mismatch("this worker has no configured snapshot provider")

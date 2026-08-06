@@ -75,7 +75,6 @@ enum ReqKind : ubyte {
   Shutdown,
   CopyKv,
   ReleaseProducts,
-  ResetPrefixCache,
   GetMetrics,
   GetPressure,
   SnapshotSession,
