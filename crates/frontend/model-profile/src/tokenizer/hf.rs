@@ -6,8 +6,9 @@ use fastokens::decoders::Decoder as FastokensDecoder;
 use thiserror_ext::AsReport as _;
 use tracing::info;
 
+use crate::tokenizer::Result;
 use crate::tokenizer::byte_level_decode::decode_byte_level as decode_tokens_byte_level;
-use crate::tokenizer::{Result, Tokenizer};
+use crate::tokenizer::incremental::IncrementalDecoder;
 
 fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
     fn count_byte_level(decoder: &FastokensDecoder) -> usize {
@@ -63,16 +64,14 @@ impl HuggingFaceTokenizer {
             special_token_ids: Arc::from(special_token_ids),
         })
     }
-}
-
-impl Tokenizer for HuggingFaceTokenizer {
-    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+    /// Encode one prompt string into token IDs.
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         self.tokenizer
             .encode_with_special_tokens(text, add_special_tokens)
             .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report()))
     }
 
-    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+    pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         if self.byte_level {
             decode_fastokens_byte_level(&self.tokenizer, token_ids, skip_special_tokens)
         } else {
@@ -82,16 +81,31 @@ impl Tokenizer for HuggingFaceTokenizer {
         }
     }
 
-    fn token_to_id(&self, token: &str) -> Option<u32> {
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.tokenizer.token_to_id(token)
     }
 
-    fn id_to_token(&self, id: u32) -> Option<String> {
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.tokenizer.id_to_token(id).map(ToOwned::to_owned)
     }
 
-    fn is_special_id(&self, token_id: u32) -> bool {
+    pub fn is_special_id(&self, token_id: u32) -> bool {
         self.special_token_ids.binary_search(&token_id).is_ok()
+    }
+
+    /// Create a stateful incremental decoder primed with the given prompt tokens.
+    pub fn create_decode_stream(
+        &self,
+        prompt_token_ids: &[u32],
+        skip_special_tokens: bool,
+        min_bytes_to_buffer: usize,
+    ) -> IncrementalDecoder<'_> {
+        IncrementalDecoder::new(
+            self,
+            prompt_token_ids,
+            skip_special_tokens,
+            min_bytes_to_buffer,
+        )
     }
 }
 
@@ -101,7 +115,7 @@ mod tests {
     use tokenizers::models::bpe::BPE;
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use super::{HuggingFaceTokenizer, Tokenizer};
+    use super::HuggingFaceTokenizer;
 
     fn tiny_bpe_tokenizer() -> TokenizerBuilder {
         let model = BPE::builder()

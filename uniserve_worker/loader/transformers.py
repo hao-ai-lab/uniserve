@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 import torch
 from torch import nn
+from transformers import AutoTokenizer
 
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.runtime_config import ExecutionConfig
@@ -52,24 +53,19 @@ def dtype_from_name(name: str) -> torch.dtype:
 
 
 def _load_tokenizer(
-    tokenizer_cls: Any,
     model_dir: str,
-    *,
-    use_fast: bool = False,
-    extra_special_tokens: dict[str, Any] | None = None,
 ) -> Any:
     """Load a tokenizer and attach ``model_dir`` context to failures."""
 
     try:
-        return tokenizer_cls.from_pretrained(
+        return AutoTokenizer.from_pretrained(
             model_dir,
-            use_fast=use_fast,
-            extra_special_tokens=dict(extra_special_tokens or {}),
+            use_fast=False,
             trust_remote_code=False,
         )
     except Exception as exc:  # pragma: no cover - error-context wrapper.
         raise RuntimeError(
-            f"failed to load tokenizer from {model_dir!r} (use_fast={use_fast}): {exc}"
+            f"failed to load the configured SenseNova tokenizer from {model_dir!r}: {exc}"
         ) from exc
 
 
@@ -106,10 +102,7 @@ def load_native_transformers_checkpoint(
     *,
     config_cls: Any,
     model_cls: Any,
-    tokenizer_cls: Any,
     attention_backend: str | None = None,
-    use_fast: bool = False,
-    extra_special_tokens: dict[str, Any] | None = None,
     min_version_key: str | None = None,
     code_version: str | None = None,
     weight_spec: WeightSpec,
@@ -137,12 +130,7 @@ def load_native_transformers_checkpoint(
     config.uniserve_attention_backend = attn_backend
     _check_min_code_version(config, min_version_key, code_version)
 
-    tokenizer = _load_tokenizer(
-        tokenizer_cls,
-        model_dir,
-        use_fast=use_fast,
-        extra_special_tokens=extra_special_tokens,
-    )
+    tokenizer = _load_tokenizer(model_dir)
     quant_config = QuantizationConfig.from_model_config(config)
     with init_empty_weights():
         model = model_cls(
@@ -214,11 +202,7 @@ def _stream_checkpoint_weights(
     """Stream declared weights into final device storage and reject drift."""
 
     expected = set(model.state_dict().keys())
-    in_scope = {
-        name
-        for name in expected
-        if _tower_includes(weight_spec.tower, name, model_scope)
-    }
+    in_scope = {name for name in expected if _tower_includes(weight_spec.tower, name, model_scope)}
     optional = {name for name, param in model.named_parameters() if is_optional_checkpoint(param)}
     loaded: set[str] = set()
     unexpected: list[str] = []
@@ -256,11 +240,7 @@ def _stream_checkpoint_weights(
                 dtype=dtype,
             )
             loaded.add(target_name)
-    tied = {
-        transform.target
-        for transform in weight_spec.transforms
-        if isinstance(transform, Tie)
-    }
+    tied = {transform.target for transform in weight_spec.transforms if isinstance(transform, Tie)}
     missing = sorted(in_scope - loaded - optional - tied)
     if missing or unexpected:
         raise RuntimeError(

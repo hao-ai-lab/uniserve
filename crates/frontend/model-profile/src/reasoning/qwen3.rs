@@ -2,7 +2,7 @@ use crate::tokenizer::DynTokenizer;
 
 use super::{DelimitedReasoningParser, ReasoningDelta, Result};
 
-/// Reasoning parser for the Qwen3/Qwen3.5 family.
+/// Reasoning parser for the configured Qwen3 description.
 ///
 /// This parser uses standard `<think>...</think>` delimiters and defaults to
 /// waiting for an explicit start token when prompt initialization finds no

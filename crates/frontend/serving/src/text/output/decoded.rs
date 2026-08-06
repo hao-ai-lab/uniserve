@@ -68,7 +68,7 @@ struct TokenDecode {
 }
 
 fn decode_one_token(
-    decoder: &mut dyn IncrementalDecoder,
+    decoder: &mut IncrementalDecoder<'_>,
     token_id: u32,
     output_token_count: usize,
     options: &mut TextDecodeOptions,
@@ -175,7 +175,7 @@ pub async fn decoded_text_event_stream(
                 })
                 .transpose()?;
             let decoded = decode_one_token(
-                decoder.as_mut(),
+                &mut decoder,
                 token_id,
                 output_token_count,
                 &mut decode_options,

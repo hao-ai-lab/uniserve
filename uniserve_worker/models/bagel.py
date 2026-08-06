@@ -92,7 +92,7 @@ from ..spec import (
 __all__ = [
     "LLMConfig",
     "BagelConfig",
-    "BagelForUnifiedGeneration",
+    "BagelForConditionalGeneration",
 ]
 
 _BAGEL_RMS_NORM_EPS = 1e-6
@@ -452,7 +452,7 @@ _BAGEL_STACKED = (
 )
 
 
-class BagelForUnifiedGeneration(nn.Module):
+class BagelForConditionalGeneration(nn.Module):
     """Stateless BAGEL neural graph for the declared MoT, ViT, and VAE routes."""
 
     weight_spec = WeightSpec(
@@ -503,7 +503,7 @@ class BagelForUnifiedGeneration(nn.Module):
             timestep_shift=float(self.cfg.timestep_shift),
         )
         return ModelSpec(
-            architecture="BagelForUnifiedGeneration",
+            architecture="BagelForConditionalGeneration",
             routes=(
                 # Token and flow rows share the MoT backbone in one forward.
                 RouteSpec(

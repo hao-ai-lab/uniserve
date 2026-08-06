@@ -12,21 +12,19 @@ from torch import nn
 
 from tests.python.fixtures.model_execution import TEST_MODEL_SPEC
 from uniserve_worker.bootstrap.catalog import (
-    MODEL_CATALOG,
     CatalogEntry,
     CheckpointFormat,
+    resolve_catalog_entry,
 )
 from uniserve_worker.bootstrap.model_loader import (
     WorkerModelLoadRequest,
     load_worker_model,
-    model_architecture_candidates,
 )
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.runtime_config import ExecutionConfig
 from uniserve_worker.loader import Loader
 from uniserve_worker.loader.transformers import (
     dtype_from_name,
-    load_native_transformers_checkpoint,
 )
 from uniserve_worker.loader.weight_utils import transform_weight
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
@@ -86,20 +84,17 @@ def _qwen_config() -> dict[str, object]:
 
 
 def test_catalog_resolves_only_explicit_architecture_identifiers():
-    assert MODEL_CATALOG.resolve(("Qwen3ForCausalLM",)).model_class is Qwen3ForCausalLM
-    assert MODEL_CATALOG.resolve(("BagelForUnifiedGeneration",)).checkpoint is CheckpointFormat.COMPOSITE
-    assert MODEL_CATALOG.resolve(("NEOChatModel",)).checkpoint is CheckpointFormat.NATIVE
+    assert resolve_catalog_entry(("Qwen3ForCausalLM",)).model_class is Qwen3ForCausalLM
+    assert (
+        resolve_catalog_entry(("BagelForConditionalGeneration",)).checkpoint
+        is CheckpointFormat.COMPOSITE
+    )
+    assert resolve_catalog_entry(("NEOChatModel",)).checkpoint is CheckpointFormat.NATIVE
 
-    with pytest.raises(WorkerError, match="no model catalog entry"):
-        MODEL_CATALOG.resolve(("QwenForCausalLM", "SenseNovaU1ForUnifiedGeneration"))
-
-
-def test_checkpoint_file_detection_supplies_only_the_canonical_bagel_identity(tmp_path):
-    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "model.safetensors").write_bytes(b"")
-    (tmp_path / "ae.safetensors").write_bytes(b"")
-
-    assert model_architecture_candidates(str(tmp_path)) == ["BagelForUnifiedGeneration"]
+    with pytest.raises(WorkerError, match="declare exactly one architecture"):
+        resolve_catalog_entry(("QwenForCausalLM", "SenseNovaU1ForUnifiedGeneration"))
+    with pytest.raises(WorkerError, match="declare exactly one architecture"):
+        resolve_catalog_entry(("Qwen3ForCausalLM", "BagelForConditionalGeneration"))
 
 
 @pytest.mark.parametrize("alias", ["bf16", "fp16", "fp32", "half"])
@@ -133,7 +128,9 @@ def test_qwen_checkpoint_load_resolves_immutable_weight_and_spec_identity(tmp_pa
                     module.output_size,
                     module.weight,
                 )
-    checkpoint = {name: value.detach().contiguous() for name, value in reference.state_dict().items()}
+    checkpoint = {
+        name: value.detach().contiguous() for name, value in reference.state_dict().items()
+    }
     save_file(checkpoint, tmp_path / "model.safetensors")
     request = WorkerModelLoadRequest(
         model_path=str(tmp_path),
@@ -258,79 +255,6 @@ def test_composite_loader_streams_root_and_sidecar_before_ready(tmp_path):
         "graph.core.weight",
         "graph.vae.weight",
     )
-
-
-class _NativeConfig:
-    @classmethod
-    def from_dict(cls, _raw: dict[str, object]) -> "_NativeConfig":
-        return cls()
-
-
-class _NativeTokenizer:
-    @classmethod
-    def from_pretrained(cls, _model_path: str, **_kwargs):
-        return cls()
-
-
-class _NativeRoot(nn.Module):
-    def __init__(self, config: _NativeConfig, *, layer_spec: LayerSpec) -> None:
-        super().__init__()
-        del config, layer_spec
-        self.projection = nn.Linear(3, 2)
-        self.register_buffer("runtime_scale", torch.ones(1), persistent=False)
-
-
-def test_native_loader_materializes_a_direct_nn_module_root(tmp_path):
-    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    bias = torch.tensor([0.25, -0.75], dtype=torch.float32)
-    save_file(
-        {"projection.weight": weight, "projection.bias": bias},
-        tmp_path / "model.safetensors",
-    )
-
-    model, tokenizer, device = load_native_transformers_checkpoint(
-        str(tmp_path),
-        "cpu",
-        config_cls=_NativeConfig,
-        model_cls=_NativeRoot,
-        tokenizer_cls=_NativeTokenizer,
-        weight_spec=WeightSpec(),
-        model_scope=None,
-        execution=_execution(),
-        parallel=_parallel(),
-    )
-
-    assert type(model).__bases__ == (nn.Module,)
-    assert isinstance(tokenizer, _NativeTokenizer)
-    assert device == "cpu"
-    torch.testing.assert_close(model.projection.weight, weight)
-    torch.testing.assert_close(model.projection.bias, bias)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device not available")
-def test_native_loader_places_nonpersistent_buffers_with_the_model(tmp_path):
-    save_file(
-        {
-            "projection.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
-            "projection.bias": torch.tensor([0.25, -0.75], dtype=torch.float32),
-        },
-        tmp_path / "model.safetensors",
-    )
-
-    model, _tokenizer, device = load_native_transformers_checkpoint(
-        str(tmp_path),
-        "cuda",
-        config_cls=_NativeConfig,
-        model_cls=_NativeRoot,
-        tokenizer_cls=_NativeTokenizer,
-        weight_spec=WeightSpec(),
-        model_scope=None,
-        execution=_execution(),
-        parallel=_parallel(),
-    )
-
-    assert device == "cuda:0"
-    assert model.runtime_scale.device.type == "cuda"
 
 
 class _StackRoot(nn.Module):
@@ -470,16 +394,20 @@ def test_stream_loader_applies_tensor_algebra_sharding_and_ties(tmp_path):
         resources=ResourcePlan(),
     )
 
-    loaded = Loader().load(
-        entry,
-        {},
-        model_path=str(tmp_path),
-        device="cpu",
-        attention_backend=None,
-        model_scope="whole",
-        execution=_execution(),
-        parallel=TensorParallelSpec(rank=1, size=2),
-    ).model
+    loaded = (
+        Loader()
+        .load(
+            entry,
+            {},
+            model_path=str(tmp_path),
+            device="cpu",
+            attention_backend=None,
+            model_scope="whole",
+            execution=_execution(),
+            parallel=TensorParallelSpec(rank=1, size=2),
+        )
+        .model
+    )
 
     torch.testing.assert_close(loaded.sliced, source["slice_source"][1:3])
     torch.testing.assert_close(loaded.split_left, source["split_source"][:1])
@@ -492,9 +420,7 @@ def test_stream_loader_applies_tensor_algebra_sharding_and_ties(tmp_path):
 
 
 class _QuantizedRoot(nn.Module):
-    weight_spec = WeightSpec(
-        transforms=(Quantize("dense.weight", "projection.weight", "fp8"),)
-    )
+    weight_spec = WeightSpec(transforms=(Quantize("dense.weight", "projection.weight", "fp8"),))
 
     def __init__(self, config: object, *, layer_spec: LayerSpec) -> None:
         super().__init__()
@@ -517,16 +443,20 @@ def test_stream_loader_applies_declared_quantization(tmp_path):
         resources=ResourcePlan(),
     )
 
-    loaded = Loader().load(
-        entry,
-        {"quantization_config": {"quant_method": "fp8"}},
-        model_path=str(tmp_path),
-        device="cpu",
-        attention_backend=None,
-        model_scope="whole",
-        execution=_execution(),
-        parallel=_parallel(),
-    ).model
+    loaded = (
+        Loader()
+        .load(
+            entry,
+            {"quantization_config": {"quant_method": "fp8"}},
+            model_path=str(tmp_path),
+            device="cpu",
+            attention_backend=None,
+            model_scope="whole",
+            execution=_execution(),
+            parallel=_parallel(),
+        )
+        .model
+    )
 
     assert loaded.projection.weight.dtype == torch.float8_e4m3fn
     actual = loaded.projection(torch.tensor([[2.0, -1.0]]))

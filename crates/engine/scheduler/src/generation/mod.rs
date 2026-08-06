@@ -260,7 +260,7 @@ fn token_outputs(
 
 /// Products emitted by the state-advancing feedback extend. The completion
 /// predicate identifies the final feedback state transition independently of
-/// whether the dialect also requests a sampled continuation token.
+/// whether the model policy also requests a sampled continuation token.
 fn feedback_state_outputs(
     logprob_bound: Option<u64>,
     sample_continuation: bool,

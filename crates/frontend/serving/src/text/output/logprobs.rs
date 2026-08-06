@@ -1,7 +1,7 @@
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use uniserve_engine_gateway::generation::GenerationPositionLogprobs;
-use uniserve_model_profile::tokenizer::Tokenizer;
+use uniserve_model_profile::tokenizer::HuggingFaceTokenizer;
 
 use crate::text::error::Error;
 
@@ -54,8 +54,8 @@ pub struct DecodedPromptLogprobs {
 ///
 /// Each returned position corresponds to one generated token position from the
 /// same `llm` update.
-pub(crate) fn decode_logprobs<T: Tokenizer + ?Sized>(
-    tokenizer: &T,
+pub(crate) fn decode_logprobs(
+    tokenizer: &HuggingFaceTokenizer,
     positions: &[GenerationPositionLogprobs],
     skip_special_tokens: bool,
 ) -> Result<DecodedLogprobs, Error> {
@@ -73,9 +73,9 @@ pub(crate) fn decode_logprobs<T: Tokenizer + ?Sized>(
 /// The returned payload stores the first prompt token separately and decodes
 /// the remaining scored prompt positions into `scored_positions`, matching
 /// the reference prompt-logprobs semantics.
-pub(crate) fn decode_prompt_logprobs<T: Tokenizer + ?Sized>(
+pub(crate) fn decode_prompt_logprobs(
     request_id: &str,
-    tokenizer: &T,
+    tokenizer: &HuggingFaceTokenizer,
     prompt_token_ids: &[u32],
     positions: &[GenerationPositionLogprobs],
     skip_special_tokens: bool,
@@ -103,8 +103,8 @@ pub(crate) fn decode_prompt_logprobs<T: Tokenizer + ?Sized>(
 ///
 /// This decodes every candidate token ID independently through the active text
 /// backend.
-fn decode_position_logprobs<T: Tokenizer + ?Sized>(
-    tokenizer: &T,
+fn decode_position_logprobs(
+    tokenizer: &HuggingFaceTokenizer,
     position: &GenerationPositionLogprobs,
     skip_special_tokens: bool,
 ) -> Result<DecodedPositionLogprobs, Error> {

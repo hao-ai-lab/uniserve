@@ -1,19 +1,19 @@
 use crate::text::tokenizer::DynTokenizer;
-use uniserve_model_profile::dialect::{DelimitedTextPolicy, OutputFilterPolicy};
+use uniserve_model_profile::omni::{DelimitedTextPolicy, OutputFilterPolicy};
 use uniserve_model_profile::reasoning::DelimitedReasoningParser;
 
-pub(crate) struct DialectOutputProcessor {
+pub(crate) struct SenseNovaOutputProcessor {
     reasoning: Option<DelimitedReasoningParser>,
-    visible_wrappers: DialectVisibleWrapperFilter,
+    visible_wrappers: VisibleWrapperFilter,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct DialectTextDelta {
+pub(crate) struct SenseNovaTextDelta {
     pub(crate) visible: String,
     pub(crate) reasoning: String,
 }
 
-impl DialectOutputProcessor {
+impl SenseNovaOutputProcessor {
     pub(crate) fn new(
         spec: OutputFilterPolicy,
         tokenizer: DynTokenizer,
@@ -29,11 +29,11 @@ impl DialectOutputProcessor {
         };
         Ok(Self {
             reasoning,
-            visible_wrappers: DialectVisibleWrapperFilter::new(spec.visible_wrappers),
+            visible_wrappers: VisibleWrapperFilter::new(spec.visible_wrappers),
         })
     }
 
-    pub(crate) fn push(&mut self, text: &str) -> DialectTextDelta {
+    pub(crate) fn push(&mut self, text: &str) -> SenseNovaTextDelta {
         let (content, reasoning) = if let Some(parser) = self.reasoning.as_mut() {
             let delta = parser.push(text);
             (
@@ -43,19 +43,19 @@ impl DialectOutputProcessor {
         } else {
             (text.to_string(), String::new())
         };
-        DialectTextDelta {
+        SenseNovaTextDelta {
             visible: self.visible_wrappers.push(&content),
             reasoning,
         }
     }
 }
 
-struct DialectVisibleWrapperFilter {
+struct VisibleWrapperFilter {
     wrappers: Vec<DelimitedTextPolicy>,
     pending: String,
 }
 
-impl DialectVisibleWrapperFilter {
+impl VisibleWrapperFilter {
     fn new(wrappers: Vec<DelimitedTextPolicy>) -> Self {
         Self {
             wrappers,

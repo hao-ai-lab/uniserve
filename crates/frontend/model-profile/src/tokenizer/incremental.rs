@@ -1,30 +1,10 @@
 use std::mem::take;
 
-use crate::tokenizer::{Result, Tokenizer};
+use crate::tokenizer::{HuggingFaceTokenizer, Result};
 
-/// Stateful incremental decoder that emits text chunks one token at a time.
-pub trait IncrementalDecoder: Send {
-    /// Push one generated token and return how many new string bytes were
-    /// added.
-    fn push_token(&mut self, token_id: u32) -> Result<usize>;
-
-    /// Consume any text which is currently ready.
-    fn next_chunk(&mut self) -> Option<String>;
-
-    /// Flush any remaining buffered text that has not yet been emitted.
-    ///
-    /// Called after the final generated token to force out buffered/incomplete
-    /// fragments.
-    fn flush(&mut self, truncate_output_to: Option<usize>) -> Result<(Option<String>, String)>;
-
-    /// Return cumulative decoded text so far.
-    fn output(&self) -> &str;
-}
-/// [`IncrementalDecoder`] built on [`Tokenizer::decode`] with prefix-diffing.
-///
-/// This is the same sliding-window algorithm used by `tokenizers::DecodeStream`
-pub(crate) struct DecodeStream<'a, T: Tokenizer + ?Sized> {
-    tokenizer: &'a T,
+/// Stateful incremental decoder built on the configured Hugging Face tokenizer with prefix-diffing.
+pub struct IncrementalDecoder<'a> {
+    tokenizer: &'a HuggingFaceTokenizer,
     skip_special_tokens: bool,
     min_bytes_to_buffer: usize,
     // mutated state
@@ -44,9 +24,9 @@ pub(crate) struct DecodeStream<'a, T: Tokenizer + ?Sized> {
     pending_since_emit: usize,
 }
 
-impl<'a, T: Tokenizer + ?Sized> DecodeStream<'a, T> {
+impl<'a> IncrementalDecoder<'a> {
     pub(crate) fn new(
-        tokenizer: &'a T,
+        tokenizer: &'a HuggingFaceTokenizer,
         prompt_token_ids: &[u32],
         skip_special_tokens: bool,
         min_bytes_to_buffer: usize,
@@ -81,7 +61,7 @@ const SAFE_SUFFIX_MAX: usize = 6;
 /// withholding it until flush.
 const MAX_PENDING_TOKENS: usize = 32;
 
-impl<T: Tokenizer + ?Sized> DecodeStream<'_, T> {
+impl IncrementalDecoder<'_> {
     /// Seed `self.prefix` from the shortest trailing suffix whose decoded text
     /// has no U+FFFD — a clean decode means the suffix starts and ends at
     /// valid UTF-8/token boundaries, so priming from it is equivalent to
@@ -121,8 +101,9 @@ impl<T: Tokenizer + ?Sized> DecodeStream<'_, T> {
     }
 }
 
-impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
-    fn push_token(&mut self, token_id: u32) -> Result<usize> {
+impl IncrementalDecoder<'_> {
+    /// Push one generated token and return how many new string bytes were added.
+    pub fn push_token(&mut self, token_id: u32) -> Result<usize> {
         if !self.prompt_seeded {
             self.prompt_seeded = true;
             if !self.ids.is_empty() {
@@ -153,7 +134,7 @@ impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
         Ok(new_chunk.len())
     }
 
-    fn next_chunk(&mut self) -> Option<String> {
+    pub fn next_chunk(&mut self) -> Option<String> {
         let cutoff = self
             .cumulative_output
             .len()
@@ -167,7 +148,7 @@ impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
         })
     }
 
-    fn flush(&mut self, truncate_output_to: Option<usize>) -> Result<(Option<String>, String)> {
+    pub fn flush(&mut self, truncate_output_to: Option<usize>) -> Result<(Option<String>, String)> {
         if !self.ids.is_empty() {
             let string = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
             let prefix_len = self.prefix.len();
@@ -188,7 +169,7 @@ impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
         Ok((last_chunk, take(&mut self.cumulative_output)))
     }
 
-    fn output(&self) -> &str {
+    pub fn output(&self) -> &str {
         &self.cumulative_output
     }
 }

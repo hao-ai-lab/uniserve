@@ -182,7 +182,7 @@ async fn collect_chat_events(
     let mut completed_image_ids = Vec::<String>::new();
     let mut finish_status = None;
     // Structured chat processors finalize text through OutputBlockEnd. The
-    // profile-owned dialect processor emits semantic deltas directly, so keep
+    // The description-owned processor emits semantic deltas directly, so keep
     // a fallback copy for non-streaming collection without duplicating blocks
     // from the structured path.
     let mut loose_text = String::new();

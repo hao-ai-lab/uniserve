@@ -42,15 +42,20 @@ fn runtime_control_tokens(
     profile: &ModelProfile,
     backend: EngineBackendKind,
 ) -> RuntimeControlTokens {
-    let dialect = profile.generation_dialect.as_ref();
-    let bos = dialect.map_or(0, |value| value.controls.bos);
-    let start_of_image = dialect.map_or(0, |value| value.controls.start_of_image);
-    let end_of_image = dialect.map_or(0, |value| value.controls.end_of_image);
-    let primary_eos = dialect
-        .map(|value| value.controls.eos)
+    let controls = match profile {
+        ModelProfile::Qwen3(_) => None,
+        ModelProfile::SenseNova(profile) => Some(&profile.preprocessing.controls),
+        ModelProfile::Bagel(profile) => Some(&profile.preprocessing.controls),
+    };
+    let bos = controls.map_or(0, |value| value.bos);
+    let start_of_image = controls.map_or(0, |value| value.start_of_image);
+    let end_of_image = controls.map_or(0, |value| value.end_of_image);
+    let primary_eos = controls
+        .map(|value| value.eos)
         .filter(|value| *value != 0)
-        .or(profile.stop_tokens.primary_eos_token_id);
+        .or(profile.common().stop_tokens.primary_eos_token_id);
     let mut eos = profile
+        .common()
         .stop_tokens
         .eos_token_ids
         .iter()
@@ -104,9 +109,9 @@ async fn resolve_model_assets(
     let max_model_tokens = config
         .engine
         .max_model_len
-        .or(profile.context_limits.max_model_tokens)
+        .or(profile.common().context_limits.max_model_tokens)
         .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
-    profile.context_limits.max_model_tokens = Some(max_model_tokens);
+    profile.common_mut().context_limits.max_model_tokens = Some(max_model_tokens);
     let renderer = HfChatRenderer::load(
         &files,
         ChatTemplateLoadOptions {
@@ -256,7 +261,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let engine_status = gateway.status();
     let snapshot = gateway.snapshot();
     let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
-    profile.context_limits.max_model_tokens = Some(route_max_model_len);
+    profile.common_mut().context_limits.max_model_tokens = Some(route_max_model_len);
     let model = ResolvedModel::resolve(
         profile,
         tokenizer,

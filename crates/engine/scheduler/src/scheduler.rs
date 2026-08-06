@@ -5325,7 +5325,7 @@ impl Scheduler {
                 if let Some(st) = self.running.get_mut(&id) {
                     self.prefix_cache.cache_blocks(st, &mut self.bm, bs);
                 }
-                // A dialect-lowered prefix may already end at a branch trigger.
+                // A description-lowered prefix may already end at a branch trigger.
                 // Treat that boundary exactly like a sampled trigger.
                 if self.prefilled_gen_trigger(id) {
                     self.begin_image(id);

@@ -148,7 +148,7 @@ fn qwen_history() -> ChatRequest {
 }
 
 #[test]
-fn qwen_family_render_is_deterministic_across_repeated_renders() {
+fn qwen3_render_is_deterministic_across_repeated_renders() {
     let renderer = HfChatRenderer::new(
         Some(QWEN3_TEMPLATE.to_owned()),
         HashMap::new(),
@@ -167,7 +167,7 @@ fn qwen_family_render_is_deterministic_across_repeated_renders() {
 }
 
 #[test]
-fn qwen_family_preserves_prior_assistant_completion_text_byte_identically() {
+fn qwen3_preserves_prior_assistant_completion_text_byte_identically() {
     let request = qwen_history();
     let rendered = hf_render(
         QWEN3_TEMPLATE,
@@ -208,7 +208,7 @@ fn assistant_tool_call_history(arguments: &str) -> Vec<ChatMessage> {
 }
 
 #[test]
-fn hf_family_tool_call_arguments_preserve_key_order_via_items_iteration() {
+fn configured_template_preserves_tool_argument_order_via_items_iteration() {
     // The HF path exposes tool-call arguments as a structured map. Iterating
     // `.items()` must yield the original (non-alphabetical) key order, and the
     // numeric spellings must match serde_json's normalized output.
@@ -222,7 +222,7 @@ fn hf_family_tool_call_arguments_preserve_key_order_via_items_iteration() {
 }
 
 #[test]
-fn hf_family_tojson_preserves_key_order_and_number_precision() {
+fn configured_template_tojson_preserves_key_order_and_number_precision() {
     // Rendering the arguments back through HF `tojson` must keep insertion order
     // (no implicit sort) and the normalized number spelling.
     let request = base_request(assistant_tool_call_history(MIXED_ARGS));

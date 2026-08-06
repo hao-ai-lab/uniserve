@@ -211,8 +211,10 @@ pub enum OutputProcessorPolicy {
     None,
     /// Qwen3 chat reasoning + tool parsing over decoded text.
     Qwen3(Box<ChatRequest>),
-    /// SenseNova/Bagel output filter over committed text.
-    Dialect(uniserve_model_profile::dialect::OutputFilterPolicy),
+    /// SenseNova reasoning and visible-answer filtering over committed text.
+    SenseNova(uniserve_model_profile::omni::OutputFilterPolicy),
+    /// Bagel committed-event output policy.
+    Bagel,
 }
 
 /// Submission-envelope inputs carried alongside the engine request.
@@ -225,7 +227,7 @@ pub struct SubmissionMetadata {
 #[derive(Debug, Clone)]
 pub struct ModelEventIdentity {
     pub profile_id: String,
-    pub dialect_id: String,
+    pub description_id: String,
 }
 
 /// The sole value submitted to the engine gateway, produced by

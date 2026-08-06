@@ -45,7 +45,7 @@ pub use input::{
 pub use model::{BagelDesc, Qwen3Desc, ResolvedModel, SenseNovaDesc};
 
 use crate::chat::{AssistantBlockKind, AssistantContentBlock, ChatEvent, Qwen3ChatOutputProcessor};
-use crate::omni::output::{DialectOutputProcessor, DialectTextDelta};
+use crate::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 use crate::text::output::stop_string_holdback_bytes;
 use crate::text::{
     DecodedLogprobs, DecodedPromptLogprobs, DecodedTextEvent, FinishReason, StopReason,
@@ -273,7 +273,7 @@ impl ServingRuntime {
         if !self.requests.register(
             request_id.clone(),
             identity.profile_id.clone(),
-            identity.dialect_id.clone(),
+            identity.description_id.clone(),
             0,
             RequestLifecycleState::Compiling,
         ) {
@@ -341,7 +341,7 @@ impl ServingRuntime {
 
         let event_context = EventContext {
             profile_id: identity.profile_id.clone(),
-            dialect_id: identity.dialect_id.clone(),
+            description_id: identity.description_id.clone(),
             compile_duration_us,
             cache,
             resources,
@@ -524,7 +524,7 @@ pub enum RequestLifecycleState {
 pub struct RequestStatsSnapshot {
     pub request_id: ServeRequestId,
     pub profile_id: String,
-    pub dialect_id: String,
+    pub description_id: String,
     pub state: RequestLifecycleState,
     pub prompt_tokens: u32,
     pub visible_output_tokens: u32,
@@ -540,13 +540,13 @@ impl RequestStatsSnapshot {
     fn submitting(
         request_id: ServeRequestId,
         profile_id: String,
-        dialect_id: String,
+        description_id: String,
         compile_us: u64,
     ) -> Self {
         Self {
             request_id,
             profile_id,
-            dialect_id,
+            description_id,
             state: RequestLifecycleState::Submitting,
             prompt_tokens: 0,
             visible_output_tokens: 0,
@@ -597,7 +597,7 @@ impl RuntimeRequestRegistry {
         &self,
         request_id: ServeRequestId,
         profile_id: String,
-        dialect_id: String,
+        description_id: String,
         compile_us: u64,
         initial_state: RequestLifecycleState,
     ) -> bool {
@@ -610,7 +610,7 @@ impl RuntimeRequestRegistry {
         let mut stats = RequestStatsSnapshot::submitting(
             request_id.clone(),
             profile_id,
-            dialect_id,
+            description_id,
             compile_us,
         );
         stats.state = initial_state;
@@ -883,7 +883,7 @@ impl RuntimeRequestRegistry {
 #[derive(Debug, Clone)]
 struct EventContext {
     profile_id: String,
-    dialect_id: String,
+    description_id: String,
     compile_duration_us: u64,
     cache: CacheAccounting,
     resources: ResourceAccounting,
@@ -1154,7 +1154,7 @@ pub enum ServeEvent {
     Accepted {
         request_id: ServeRequestId,
         profile_id: String,
-        dialect_id: String,
+        description_id: String,
         compile_duration_us: u64,
         prompt_token_count: usize,
         prompt_token_ids: Vec<u32>,
@@ -1362,8 +1362,8 @@ enum OutputSink {
     Raw,
     /// Qwen3 chat reasoning/tool parsing.
     Chat(ChatOutputBridge),
-    /// SenseNova/Bagel output filter over committed text.
-    Dialect(DialectOutputProcessor),
+    /// SenseNova reasoning and visible-answer filtering.
+    SenseNova(SenseNovaOutputProcessor),
 }
 
 fn build_output_sink(
@@ -1373,7 +1373,7 @@ fn build_output_sink(
     prompt_token_ids: &[u32],
 ) -> Result<OutputSink> {
     match policy {
-        OutputProcessorPolicy::None => Ok(OutputSink::Raw),
+        OutputProcessorPolicy::None | OutputProcessorPolicy::Bagel => Ok(OutputSink::Raw),
         OutputProcessorPolicy::Qwen3(request) => {
             let mut request = *request;
             let processor =
@@ -1389,8 +1389,8 @@ fn build_output_sink(
                 })?;
             Ok(OutputSink::Chat(bridge))
         }
-        OutputProcessorPolicy::Dialect(output_filter) => {
-            let processor = DialectOutputProcessor::new(
+        OutputProcessorPolicy::SenseNova(output_filter) => {
+            let processor = SenseNovaOutputProcessor::new(
                 output_filter,
                 std::sync::Arc::clone(tokenizer),
                 prompt_token_ids,
@@ -1399,7 +1399,7 @@ fn build_output_sink(
                 request_id: request_id.clone(),
                 message: error.to_string(),
             })?;
-            Ok(OutputSink::Dialect(processor))
+            Ok(OutputSink::SenseNova(processor))
         }
     }
 }
@@ -1643,9 +1643,9 @@ async fn emit_text_update(
         return Ok(done);
     }
 
-    let delta: DialectTextDelta = match sink {
-        OutputSink::Dialect(processor) => processor.push(&text),
-        OutputSink::Raw => DialectTextDelta {
+    let delta: SenseNovaTextDelta = match sink {
+        OutputSink::SenseNova(processor) => processor.push(&text),
+        OutputSink::Raw => SenseNovaTextDelta {
             visible: text,
             reasoning: String::new(),
         },
@@ -1798,7 +1798,7 @@ async fn assemble_event_stream(
             y.yield_ok(ServeEvent::Accepted {
                 request_id: request_id.clone(),
                 profile_id: event_context.profile_id.clone(),
-                dialect_id: event_context.dialect_id.clone(),
+                description_id: event_context.description_id.clone(),
                 compile_duration_us: event_context.compile_duration_us,
                 prompt_token_count: prompt_token_ids.len(),
                 prompt_token_ids: prompt_token_ids.clone(),
@@ -2271,7 +2271,7 @@ mod tests {
     fn event_context() -> EventContext {
         EventContext {
             profile_id: "profile".to_string(),
-            dialect_id: "bagel".to_string(),
+            description_id: "bagel".to_string(),
             compile_duration_us: 7,
             cache: CacheAccounting {
                 read_enabled: true,
@@ -2301,15 +2301,8 @@ mod tests {
         }
     }
 
-    fn bagel_filter() -> OutputProcessorPolicy {
-        let tokenizer = crate::test_support::configured_tokenizer();
-        let dialect = uniserve_model_profile::dialect::resolve_generation_dialect(
-            uniserve_model_profile::ModelDescription::Bagel,
-            tokenizer.as_ref(),
-        )
-        .expect("resolve dialect")
-        .expect("BAGEL dialect");
-        OutputProcessorPolicy::Dialect(dialect.output_filter.clone())
+    fn bagel_output_policy() -> OutputProcessorPolicy {
+        OutputProcessorPolicy::Bagel
     }
 
     #[tokio::test]
@@ -2355,7 +2348,7 @@ mod tests {
             true,
             true,
             TextDecodeOptions::default(),
-            bagel_filter(),
+            bagel_output_policy(),
             GenerationEventStream::new(rx),
         )
         .collect::<Vec<_>>()
@@ -2406,7 +2399,7 @@ mod tests {
             false,
             false,
             TextDecodeOptions::default(),
-            bagel_filter(),
+            bagel_output_policy(),
             GenerationEventStream::new(rx),
         );
         tokio::pin!(events);

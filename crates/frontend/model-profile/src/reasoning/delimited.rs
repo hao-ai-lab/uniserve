@@ -1,4 +1,4 @@
-use crate::tokenizer::{DynTokenizer, Tokenizer};
+use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
 use super::{ReasoningDelta, ReasoningError, Result};
 
@@ -155,7 +155,7 @@ fn last_reasoning_boundary(
     prompt_token_ids: &[u32],
     start_token_id: u32,
     end_token_id: u32,
-    tokenizer: &dyn Tokenizer,
+    tokenizer: &HuggingFaceTokenizer,
 ) -> Option<bool> {
     for token_id in prompt_token_ids.iter().rev() {
         if *token_id == start_token_id {

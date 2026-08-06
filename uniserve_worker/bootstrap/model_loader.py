@@ -19,7 +19,7 @@ from ..loader.paths import read_config, resolve_model_path
 from ..nn.mesh import TensorParallelSpec
 from ..runtime.compile import TorchCompileConfig, compile_model_pieces
 from ..spec import DeploymentOverlay, ModelLoadScope, ModelSpec, resolved_digest
-from .catalog import MODEL_CATALOG, CatalogEntry
+from .catalog import CatalogEntry, resolve_catalog_entry
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +53,9 @@ class LoadedWorkerModel:
 
 def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
     model_path = resolve_model_path(request.model_path)
-    entry = MODEL_CATALOG.resolve(model_architecture_candidates(model_path))
-    _require_supported_scope(entry, request.scope)
     config = read_config(model_path)
+    entry = resolve_catalog_entry(tuple(str(value) for value in config.get("architectures") or ()))
+    _require_supported_scope(entry, request.scope)
 
     loaded = Loader().load(
         entry,
@@ -211,13 +211,3 @@ def _compile_model(model: nn.Module, execution: ExecutionConfig) -> None:
             "enabled model-stack torch.compile pieces count=%s",
             report.compiled,
         )
-
-
-def model_architecture_candidates(model_path: str) -> list[str]:
-    config = read_config(model_path)
-    architectures = [str(value) for value in config.get("architectures") or []]
-    model_type = config.get("model_type")
-    if model_type is not None:
-        architectures.append(str(model_type))
-    architectures.extend(MODEL_CATALOG.detect_architectures(model_path))
-    return architectures

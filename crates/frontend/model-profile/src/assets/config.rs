@@ -6,7 +6,7 @@ use thiserror_ext::AsReport as _;
 
 use crate::assets::error::{Error, Result};
 
-/// Minimal subset of `tokenizer_config.json` needed by chat/EOS handling.
+/// Tokenizer metadata consumed by configured chat rendering and stop handling.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct HfTokenizerConfig {
@@ -15,8 +15,7 @@ pub struct HfTokenizerConfig {
     pub chat_template: Option<String>,
 }
 
-/// Hugging Face named special tokens may be serialized as a string or an
-/// object carrying the token content.
+/// A named Hugging Face special token represented as text or an object.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum NamedSpecialToken {
@@ -45,13 +44,11 @@ impl From<NamedSpecialToken> for String {
 impl NamedSpecialToken {
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Text(value) => value,
-            Self::WithContent { content } => content,
+            Self::Text(value) | Self::WithContent { content: value } => value,
         }
     }
 }
 
-/// Minimal set of special-token entries needed by chat/EOS handling.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -63,7 +60,6 @@ pub struct HfSpecialTokens {
 }
 
 impl HfSpecialTokens {
-    /// Returns true if we don't discover any special tokens in the config.
     pub fn is_empty(&self) -> bool {
         self.bos_token.is_none()
             && self.eos_token.is_none()
@@ -72,31 +68,16 @@ impl HfSpecialTokens {
     }
 }
 
-/// Minimal subset of `config.json` (the model's main HF config).
-///
-/// This intentionally supports only the two layouts we currently care about in
-/// the Rust frontend:
-/// - pure text models that keep text metadata at the top level
-/// - composite models that expose a single nested `text_config` or `llm_config`
-///
-/// We do not support additional entry points such as `decoder`, `generator`, or
-/// `text_encoder`.
+/// Model metadata used to bind Qwen3, SenseNova, or Bagel to its description.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
     model_type: Option<String>,
     max_position_embeddings: Option<u32>,
-    num_attention_heads: Option<u32>,
-    num_experts: Option<OneOrManyExpertCount>,
-    moe_num_experts: Option<OneOrManyExpertCount>,
-    n_routed_experts: Option<OneOrManyExpertCount>,
-    num_local_experts: Option<OneOrManyExpertCount>,
-    block_configs: Vec<BlockConfig>,
-    text_config: Option<Box<ModelConfig>>,
     llm_config: Option<Box<ModelConfig>>,
 }
 
-/// Minimal subset of `generation_config.json`.
+/// Generation defaults consumed by configured request lowering.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct GenerationConfig {
@@ -109,7 +90,6 @@ pub struct GenerationConfig {
     pub max_new_tokens: Option<u32>,
 }
 
-/// HF generation configs allow either one EOS id or a list of EOS ids.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum OneOrManyTokenIds {
@@ -126,151 +106,32 @@ impl OneOrManyTokenIds {
     }
 }
 
-/// Hugging Face configs may expose the expert count either as one integer or
-/// as a list of repeated integers.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum OneOrManyExpertCount {
-    One(u32),
-    Many(Vec<u32>),
-}
-
-impl OneOrManyExpertCount {
-    fn first_value(&self) -> u32 {
-        match self {
-            Self::One(value) => *value,
-            // Python currently takes the first value for list[int] expert
-            // counts in remote-code configs.
-            Self::Many(values) => values.first().copied().unwrap_or(0),
-        }
-    }
-}
-
-/// Heterogeneous block-level MoE metadata used as a fallback when no top-level
-/// expert-count field is available.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct BlockConfig {
-    pub block_type: String,
-    pub n_routed_experts: u32,
-}
-
 impl ModelConfig {
-    /// Return the config that the Rust frontend treats as the text/LLM config.
-    ///
-    /// This is deliberately narrower than Python/transformers: we only support
-    /// either the top-level config itself or one supported nested text config.
-    fn effective_text_config(&self) -> &Self {
-        self.text_config
-            .as_deref()
-            .or(self.llm_config.as_deref())
-            .unwrap_or(self)
+    fn language_model(&self) -> &Self {
+        self.llm_config.as_deref().unwrap_or(self)
     }
 
-    /// Return the effective Hugging Face `model_type` used by the Rust
-    /// frontend.
-    ///
-    /// This follows the same simplified text-config selection as the rest of
-    /// this type: the top-level config wins, otherwise a single nested
-    /// supported nested text config may provide the value.
     pub fn model_type(&self) -> Option<&str> {
-        self.model_type
-            .as_deref()
-            .or_else(|| self.text_config.as_deref()?.model_type())
-            .or_else(|| self.llm_config.as_deref()?.model_type())
-    }
-
-    /// Reject ambiguous or partial nested text configs.
-    ///
-    /// This keeps the simplified Rust-side parsing honest: if a model declares
-    /// `text_config`, it must at least look like a real text model config.
-    fn validate_text_config_selection(&self) -> Result<()> {
-        if self.text_config.is_some() && self.llm_config.is_some() {
-            return Err(Error::message(
-                "the model config declares both `text_config` and `llm_config`".to_string(),
-            ));
-        }
-        if let Some(text_config) = self.text_config.as_deref().or(self.llm_config.as_deref())
-            && text_config.num_attention_heads.is_none()
-        {
-            return Err(Error::message(
-                "the text config extracted from the model config does not have `num_attention_heads`"
-                    .to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Match Python's current expert-count priority on the selected text
-    /// config.
-    ///
-    /// The only intentional simplification here is how we pick the text config:
-    /// Rust only looks at the top level or one supported nested text config,
-    /// not the broader transformers composite-config surface.
-    fn num_experts_from_block_configs(&self) -> u32 {
-        self.effective_text_config()
-            .block_configs
-            .iter()
-            .filter(|block| block.block_type == "moe")
-            .map(|block| block.n_routed_experts)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub fn num_experts(&self) -> u32 {
-        let config = self.effective_text_config();
-        let direct = [
-            config.num_experts.as_ref(),
-            config.moe_num_experts.as_ref(),
-            config.n_routed_experts.as_ref(),
-            config.num_local_experts.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(OneOrManyExpertCount::first_value)
-        .next()
-        .unwrap_or(0);
-
-        if direct > 0 {
-            direct
-        } else {
-            self.num_experts_from_block_configs()
-        }
-    }
-
-    pub fn is_moe(&self) -> bool {
-        self.num_experts() > 0
+        self.model_type.as_deref()
     }
 
     pub fn max_position_embeddings(&self) -> Option<u32> {
-        self.effective_text_config().max_position_embeddings
+        self.language_model().max_position_embeddings
     }
 }
 
-/// Load the tokenizer-side EOS metadata if a config file is present.
 pub fn load_tokenizer_config(path: Option<&Path>) -> Result<HfTokenizerConfig> {
     read_json_file(path)
 }
 
-/// Load the generation-side EOS metadata if a config file is present.
 pub fn load_generation_config(path: Option<&Path>) -> Result<GenerationConfig> {
     read_json_file(path)
 }
 
-/// Load the model-side config (`config.json`) if present.
 pub fn load_model_config(path: Option<&Path>) -> Result<ModelConfig> {
-    let config: ModelConfig = read_json_file(path)?;
-    config.validate_text_config_selection()?;
-    Ok(config)
+    read_json_file(path)
 }
 
-/// Thin adapter over the shared [`uniserve_config::read_json_file`] loader.
-///
-/// model-assets needs two things on top of the shared helper: an optional path
-/// (returning `T::default` when absent) and the model-assets [`Error`] type.
-/// The actual read/parse logic lives in `uniserve_config` so JSON-loading
-/// improvements there (error wording, line/column, JSON5,...) reach us too.
 fn read_json_file<T>(path: Option<&Path>) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Default,
@@ -287,127 +148,27 @@ mod tests {
     use super::ModelConfig;
 
     #[test]
-    fn model_config_detects_moe_from_named_expert_fields() {
-        let field_names = [
-            "num_experts",
-            "moe_num_experts",
-            "n_routed_experts",
-            "num_local_experts",
-        ];
-
-        for field_name in field_names {
-            let config: ModelConfig =
-                serde_json::from_str(&format!(r#"{{"{field_name}": 64}}"#)).unwrap();
-            assert_eq!(config.num_experts(), 64, "field_name={field_name}");
-            assert!(config.is_moe(), "field_name={field_name}");
+    fn configured_model_layouts_expose_context_limits() {
+        for (source, model_type, max_tokens) in [
+            (
+                r#"{"model_type":"qwen3","num_attention_heads":64,"max_position_embeddings":40960}"#,
+                "qwen3",
+                40960,
+            ),
+            (
+                r#"{"model_type":"neo_chat","llm_config":{"model_type":"qwen3","num_attention_heads":32,"max_position_embeddings":262144}}"#,
+                "neo_chat",
+                262144,
+            ),
+            (
+                r#"{"model_type":"bagel","llm_config":{"model_type":"qwen2","num_attention_heads":28,"max_position_embeddings":32768}}"#,
+                "bagel",
+                32768,
+            ),
+        ] {
+            let config: ModelConfig = serde_json::from_str(source).unwrap();
+            assert_eq!(config.model_type(), Some(model_type));
+            assert_eq!(config.max_position_embeddings(), Some(max_tokens));
         }
-    }
-
-    #[test]
-    fn model_config_uses_first_value_for_list_expert_counts() {
-        let config: ModelConfig = serde_json::from_str(r#"{"num_experts":[16,16]}"#).unwrap();
-
-        assert_eq!(config.num_experts(), 16);
-        assert!(config.is_moe());
-    }
-
-    #[test]
-    fn model_config_falls_back_to_block_configs_maximum() {
-        let config: ModelConfig = serde_json::from_str(
-            r#"{
-                "block_configs": [
-                    {"block_type":"attention","n_routed_experts":9},
-                    {"block_type":"moe","n_routed_experts":32},
-                    {"block_type":"moe","n_routed_experts":64}
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.num_experts(), 64);
-        assert!(config.is_moe());
-    }
-
-    #[test]
-    fn model_config_prefers_nested_text_config_like_python_hf_text_config() {
-        let config: ModelConfig = serde_json::from_str(
-            r#"{
-                "model_type": "top_level",
-                "num_experts": 64,
-                "max_position_embeddings": 8192,
-                "text_config": {
-                    "model_type": "nested",
-                    "num_attention_heads": 32,
-                    "num_local_experts": 8,
-                    "max_position_embeddings": 4096
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.num_experts(), 8);
-        assert_eq!(config.model_type(), Some("top_level"));
-        assert_eq!(config.max_position_embeddings(), Some(4096));
-        assert!(config.is_moe());
-    }
-
-    #[test]
-    fn model_config_reads_sensenova_llm_config() {
-        let config: ModelConfig = serde_json::from_str(
-            r#"{
-                "model_type": "neo_chat",
-                "llm_config": {
-                    "model_type": "qwen3",
-                    "num_attention_heads": 32,
-                    "max_position_embeddings": 262144
-                }
-            }"#,
-        )
-        .unwrap();
-
-        config.validate_text_config_selection().unwrap();
-        assert_eq!(config.model_type(), Some("neo_chat"));
-        assert_eq!(config.max_position_embeddings(), Some(262144));
-    }
-
-    #[test]
-    fn model_config_defaults_to_non_moe_when_no_expert_metadata_exists() {
-        let config: ModelConfig =
-            serde_json::from_str(r#"{"max_position_embeddings":4096}"#).unwrap();
-
-        assert_eq!(config.num_experts(), 0);
-        assert!(!config.is_moe());
-        assert_eq!(config.max_position_embeddings(), Some(4096));
-    }
-
-    #[test]
-    fn model_config_rejects_nested_text_config_without_attention_heads() {
-        let config: ModelConfig =
-            serde_json::from_str(r#"{"text_config":{"max_position_embeddings":4096}}"#).unwrap();
-
-        let error = config.validate_text_config_selection().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not have `num_attention_heads`"),
-        );
-    }
-
-    #[test]
-    fn model_config_rejects_ambiguous_nested_text_configs() {
-        let config: ModelConfig = serde_json::from_str(
-            r#"{
-                "text_config":{"num_attention_heads":32},
-                "llm_config":{"num_attention_heads":32}
-            }"#,
-        )
-        .unwrap();
-
-        let error = config.validate_text_config_selection().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("declares both `text_config` and `llm_config`")
-        );
     }
 }

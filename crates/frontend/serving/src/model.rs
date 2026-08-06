@@ -16,9 +16,10 @@ use uniserve_core::{
     GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams as EngineSamplingParams,
     UndVisibility,
 };
-use uniserve_model_profile::dialect::GenerationDialectProfile;
+use uniserve_model_profile::omni::bagel::BagelProfile;
+use uniserve_model_profile::omni::sensenova::SenseNovaProfile;
 use uniserve_model_profile::tokenizer::DynTokenizer;
-use uniserve_model_profile::{ModelDescription, ModelIdentity, ModelProfile};
+use uniserve_model_profile::{CommonModelProfile, ModelIdentity, ModelProfile};
 
 use crate::chat::{ChatRequest, HfChatRenderer, Qwen3ChatOutputProcessor};
 use crate::input::{
@@ -52,7 +53,7 @@ pub struct SenseNovaDesc {
     identity: ModelIdentity,
     tokenizer: DynTokenizer,
     renderer: HfChatRenderer,
-    dialect: GenerationDialectProfile,
+    preprocessing: SenseNovaProfile,
     capabilities: GenerationRuntimeCapabilities,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
@@ -63,7 +64,7 @@ pub struct BagelDesc {
     identity: ModelIdentity,
     tokenizer: DynTokenizer,
     renderer: HfChatRenderer,
-    dialect: GenerationDialectProfile,
+    preprocessing: BagelProfile,
     capabilities: GenerationRuntimeCapabilities,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
@@ -81,22 +82,11 @@ impl ResolvedModel {
         capabilities: GenerationRuntimeCapabilities,
         max_model_tokens: u32,
     ) -> Result<Self> {
-        let default_max_output_tokens = profile
-            .context_limits
-            .max_output_tokens
-            .or(profile.generation_defaults.max_output_tokens);
-        let hints = sampling_hints(&profile, max_model_tokens);
-        let identity = profile.identity.clone();
-
-        match profile.description {
-            ModelDescription::Qwen3 => {
-                if profile.generation_dialect.is_some() {
-                    return Err(ServeError::ModelResolution(
-                        "Qwen3 description cannot own an omni generation dialect".to_string(),
-                    ));
-                }
+        match profile {
+            ModelProfile::Qwen3(profile) => {
+                let hints = sampling_hints(&profile.common, max_model_tokens);
                 Ok(Self::Qwen3(Qwen3Desc {
-                    identity,
+                    identity: profile.common.identity,
                     tokenizer,
                     renderer,
                     hints,
@@ -104,34 +94,33 @@ impl ResolvedModel {
                     logprobs_supported: true,
                 }))
             }
-            ModelDescription::SenseNova => {
-                let dialect = profile.generation_dialect.ok_or_else(|| {
-                    ServeError::ModelResolution(
-                        "SenseNova description requires its built-in generation dialect"
-                            .to_string(),
-                    )
-                })?;
+            ModelProfile::SenseNova(profile) => {
+                let default_max_output_tokens = profile
+                    .common
+                    .context_limits
+                    .max_output_tokens
+                    .or(profile.common.generation_defaults.max_output_tokens);
                 Ok(Self::SenseNova(SenseNovaDesc {
-                    identity,
+                    identity: profile.common.identity,
                     tokenizer,
                     renderer,
-                    dialect,
+                    preprocessing: profile.preprocessing,
                     capabilities,
                     default_max_output_tokens,
                     max_model_tokens,
                 }))
             }
-            ModelDescription::Bagel => {
-                let dialect = profile.generation_dialect.ok_or_else(|| {
-                    ServeError::ModelResolution(
-                        "Bagel description requires its built-in generation dialect".to_string(),
-                    )
-                })?;
+            ModelProfile::Bagel(profile) => {
+                let default_max_output_tokens = profile
+                    .common
+                    .context_limits
+                    .max_output_tokens
+                    .or(profile.common.generation_defaults.max_output_tokens);
                 Ok(Self::Bagel(BagelDesc {
-                    identity,
+                    identity: profile.common.identity,
                     tokenizer,
                     renderer,
-                    dialect,
+                    preprocessing: profile.preprocessing,
                     capabilities,
                     default_max_output_tokens,
                     max_model_tokens,
@@ -154,12 +143,12 @@ impl ResolvedModel {
         &self.served_identity().model_id
     }
 
-    /// Event identity (`profile_id` + `dialect_id`) stamped onto `Accepted`.
+    /// Event identity stamped onto `Accepted`.
     pub fn event_identity(&self) -> ModelEventIdentity {
         let identity = self.served_identity();
         ModelEventIdentity {
             profile_id: identity.profile_id.clone(),
-            dialect_id: identity.dialect_id.clone(),
+            description_id: identity.description_id.clone(),
         }
     }
 
@@ -174,11 +163,7 @@ impl ResolvedModel {
 
     /// True when the description supports image output.
     pub fn supports_image_output(&self) -> bool {
-        match self {
-            Self::Qwen3(_) => false,
-            Self::SenseNova(d) => d.dialect.supports_constraint(GenerationConstraint::GenOnly),
-            Self::Bagel(d) => d.dialect.supports_constraint(GenerationConstraint::GenOnly),
-        }
+        !matches!(self, Self::Qwen3(_))
     }
 
     /// True when the description supports image input.
@@ -210,8 +195,22 @@ impl ResolvedModel {
                     ..Default::default()
                 },
             ),
-            Self::SenseNova(d) => (&d.capabilities, omni_capability_needs(&d.dialect, request)),
-            Self::Bagel(d) => (&d.capabilities, omni_capability_needs(&d.dialect, request)),
+            Self::SenseNova(d) => (
+                &d.capabilities,
+                omni_capability_needs(
+                    &d.preprocessing.generation_policy,
+                    &d.preprocessing.image_ingest,
+                    request,
+                ),
+            ),
+            Self::Bagel(d) => (
+                &d.capabilities,
+                omni_capability_needs(
+                    &d.preprocessing.generation_policy,
+                    &d.preprocessing.image_ingest,
+                    request,
+                ),
+            ),
         };
         if let Err(capability) = capabilities.covers(&needs) {
             return Err(reject(capability));
@@ -224,28 +223,24 @@ impl ResolvedModel {
     pub fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
         match self {
             Self::Qwen3(d) => d.tokenize(request),
-            Self::SenseNova(d) => crate::omni::tokenize_omni(
-                &crate::omni::OmniContext {
-                    dialect: &d.dialect,
-                    tokenizer: std::sync::Arc::clone(&d.tokenizer),
-                    renderer: &d.renderer,
-                    capabilities: &d.capabilities,
-                    default_max_output_tokens: d.default_max_output_tokens,
-                    max_model_tokens: d.max_model_tokens,
-                    identity: self.event_identity(),
-                },
+            Self::SenseNova(d) => crate::omni::tokenize_sensenova(
+                &d.preprocessing,
+                std::sync::Arc::clone(&d.tokenizer),
+                &d.renderer,
+                &d.capabilities,
+                d.default_max_output_tokens,
+                d.max_model_tokens,
+                self.event_identity(),
                 request,
             ),
-            Self::Bagel(d) => crate::omni::tokenize_omni(
-                &crate::omni::OmniContext {
-                    dialect: &d.dialect,
-                    tokenizer: std::sync::Arc::clone(&d.tokenizer),
-                    renderer: &d.renderer,
-                    capabilities: &d.capabilities,
-                    default_max_output_tokens: d.default_max_output_tokens,
-                    max_model_tokens: d.max_model_tokens,
-                    identity: self.event_identity(),
-                },
+            Self::Bagel(d) => crate::omni::tokenize_bagel(
+                &d.preprocessing,
+                std::sync::Arc::clone(&d.tokenizer),
+                &d.renderer,
+                &d.capabilities,
+                d.default_max_output_tokens,
+                d.max_model_tokens,
+                self.event_identity(),
                 request,
             ),
         }
@@ -253,7 +248,8 @@ impl ResolvedModel {
 }
 
 fn omni_capability_needs(
-    dialect: &GenerationDialectProfile,
+    policy: &GenerationPolicyDescriptor,
+    image_ingest: &uniserve_core::ImageIngestRecipe,
     request: &GenerateReqInput,
 ) -> GenerationCapabilityNeeds {
     let has_input_image = request.has_input_image();
@@ -264,16 +260,16 @@ fn omni_capability_needs(
     } else {
         GenerationConstraint::Default
     };
-    let behavior = GenerationBehaviorDescriptor::resolve(constraint, &dialect.generation_policy);
+    let behavior = GenerationBehaviorDescriptor::resolve(constraint, policy);
     let context_steps = if has_input_image {
-        dialect.image_ingest.steps.clone()
+        image_ingest.steps.clone()
     } else {
         Vec::new()
     };
-    behavior.capability_needs(&dialect.generation_policy, context_steps)
+    behavior.capability_needs(policy, context_steps)
 }
 
-fn sampling_hints(profile: &ModelProfile, max_model_tokens: u32) -> SamplingHints {
+fn sampling_hints(profile: &CommonModelProfile, max_model_tokens: u32) -> SamplingHints {
     let primary = profile.stop_tokens.primary_eos_token_id;
     let mut extra: BTreeSet<u32> = profile.stop_tokens.eos_token_ids.clone();
     if let Some(primary) = primary {
@@ -451,7 +447,7 @@ impl Qwen3Desc {
             },
             identity: ModelEventIdentity {
                 profile_id: self.identity.profile_id.clone(),
-                dialect_id: self.identity.dialect_id.clone(),
+                description_id: self.identity.description_id.clone(),
             },
             cache: cache_accounting,
             resources: resource_accounting,
@@ -576,7 +572,7 @@ struct LoweredSampling {
 /// with and without a leading space (prefix-space convention) and deduping.
 fn tokenize_bad_words(
     bad_words: &[String],
-    tokenizer: &dyn uniserve_model_profile::tokenizer::Tokenizer,
+    tokenizer: &uniserve_model_profile::tokenizer::HuggingFaceTokenizer,
 ) -> std::result::Result<Option<Vec<Vec<u32>>>, String> {
     if bad_words.is_empty() {
         return Ok(None);

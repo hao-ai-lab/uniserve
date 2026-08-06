@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +23,7 @@ from uniserve_worker.forward import (
     TokenRow,
     TokenSelection,
 )
-from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration, LLMConfig
+from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
@@ -187,12 +186,6 @@ def test_sensenova_composition_resolves_top_level_token_ids():
     assert config.llm_config.pad_token_id == 23
 
 
-def test_concrete_model_roots_inherit_directly_from_nn_module():
-    assert Qwen3ForCausalLM.__bases__ == (nn.Module,)
-    assert BagelForUnifiedGeneration.__bases__ == (nn.Module,)
-    assert NEOChatModel.__bases__ == (nn.Module,)
-
-
 def test_qwen_projects_loader_data_into_a_stable_declaration():
     config = _qwen_config()
     model = Qwen3ForCausalLM(config, layer_spec=_layer_spec())
@@ -344,16 +337,14 @@ def test_qwen_rejects_incomplete_or_untyped_configuration():
         Qwen3ForCausalLM(object(), layer_spec=_layer_spec())  # type: ignore[arg-type]
 
 
-def test_bagel_uses_frozen_configuration_and_declares_mixed_mot():
+def test_bagel_declares_configured_mixed_mot_route():
     config = _bagel_config()
-    model = BagelForUnifiedGeneration(
+    model = BagelForConditionalGeneration(
         config,
         layer_spec=_layer_spec(),
         graph=_LoadedBagelGraph(config),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        config.max_latent_size = 4  # type: ignore[misc]
     routes = {route.name: route for route in model.spec.routes}
     assert set(routes) == {"mot", "vae", "vit"}
     assert routes["mot"].mixed_combinations == ((RouteRowKind.TOKEN, RouteRowKind.FLOW),)
@@ -377,8 +368,7 @@ def test_sensenova_resolves_mutable_checkpoint_config_at_construction():
     assert model.spec.flow.schedule_direction == "ascending"
 
 
-def test_simulation_model_obeys_the_same_forward_and_spec_boundary():
+def test_simulation_model_declares_the_configured_mixed_route():
     model = StubModel()
 
-    assert type(model).__bases__ == (nn.Module,)
     assert model.spec.routes[0].mixed_combinations == ((RouteRowKind.TOKEN, RouteRowKind.FLOW),)

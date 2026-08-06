@@ -15,13 +15,13 @@ use crate::{ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingPa
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerationConstraint {
-    /// Both Und and Gen branches are enabled when the dialect supports them.
+    /// Both Und and Gen branches are enabled when the model description supports them.
     #[default]
     Default,
     /// Only the Und branch may produce user-visible output.
     UndOnly,
     /// Only the Gen branch may produce user-visible output. Und tokens may still
-    /// be generated internally when the dialect requires them for control.
+    /// be generated internally when the model description requires them for control.
     GenOnly,
 }
 
@@ -99,7 +99,7 @@ pub enum SegmentPlacement {
     Append,
 }
 
-/// Dialect-lowered recipe for turning an image segment into context.
+/// Model-description recipe for turning an image segment into context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageIngestRecipe {
     pub steps: Vec<ImageIngestStep>,
@@ -181,7 +181,7 @@ pub enum ImageKvEffect {
     Bounded { max_tokens: u32 },
 }
 
-/// Generated-image feedback recipe supplied by the dialect.
+/// Generated-image feedback recipe supplied by the model description.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeneratedImageFeedbackRecipe {
     pub source: FeedbackSource,
@@ -208,7 +208,7 @@ pub enum FeedbackNextToken {
     Token { token_id: u32 },
 }
 
-/// Dialect token-trigger matching lowered to scheduler-readable data.
+/// Model-description token-trigger matching lowered to scheduler-readable data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TriggerPolicyDescriptor {
@@ -337,14 +337,14 @@ impl Default for TerminationPolicyDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenOnlyStartPolicyDescriptor {
-    /// Decode internal Und tokens until the dialect's trigger opens Gen.
+    /// Decode internal Und tokens until the model trigger opens Gen.
     #[default]
     DiscoverTrigger,
     /// Enter Gen immediately after all context segments are prepared.
     Immediate,
 }
 
-/// Dialect-lowered generation policy consumed by the scheduler planner.
+/// Model-description generation policy consumed by the scheduler planner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationPolicyDescriptor {
     pub trigger: TriggerPolicyDescriptor,
@@ -359,7 +359,7 @@ pub struct GenerationPolicyDescriptor {
 ///
 /// Keeping these decisions explicit prevents scheduler code from interpreting
 /// public constraint names. The profile/compiler resolves this descriptor from
-/// the constraint and dialect policy before admission.
+/// the constraint and model policy before admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationBehaviorDescriptor {
     pub und_decode: bool,

@@ -200,8 +200,7 @@ class Loader:
         parallel: TensorParallelSpec,
     ) -> LoadedModel:
         config_class = entry.config_class
-        tokenizer_class = entry.tokenizer_class
-        if config_class is None or tokenizer_class is None:
+        if config_class is None:
             raise capability_mismatch("native catalog entry is incomplete")
         spec = _class_weight_spec(entry.model_class)
         role = None if model_scope == "whole" else model_scope
@@ -210,10 +209,7 @@ class Loader:
             device,
             config_cls=config_class,
             model_cls=entry.model_class,
-            tokenizer_cls=tokenizer_class,
             attention_backend=attention_backend,
-            use_fast=bool(entry.tokenizer_use_fast),
-            extra_special_tokens=dict(entry.tokenizer_special_tokens),
             min_version_key=entry.minimum_code_version_key,
             code_version=entry.code_version,
             weight_spec=spec,
