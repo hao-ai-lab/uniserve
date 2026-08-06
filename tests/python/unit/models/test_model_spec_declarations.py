@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from uniserve_worker.batch import WorkVariant
 from uniserve_worker.forward import (
     AttentionSelection,
     EmptyKvView,
@@ -30,7 +31,7 @@ from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.layer import LayerSpec
 from uniserve_worker.nn.mesh import TensorParallelSpec
 from uniserve_worker.server.stub import StubModel
-from uniserve_worker.spec import OperationType, RouteRowKind
+from uniserve_worker.spec import RouteRowKind
 
 pytestmark = pytest.mark.unit
 
@@ -195,10 +196,10 @@ def test_qwen_projects_loader_data_into_a_stable_declaration():
     assert model.spec.architecture == "Qwen3ForCausalLM"
     assert model.spec.cache.num_layers == 1
     assert model.spec.routes[0].shape.max_tokens_per_row == 128
-    assert model.spec.operation_types() == {
-        OperationType.SEQUENCE_EXTEND,
-        OperationType.SEQUENCE_DECODE,
-        OperationType.SEQUENCE_VERIFY,
+    assert model.spec.operation_variants() == {
+        WorkVariant.TOKEN_EXTEND,
+        WorkVariant.TOKEN_DECODE,
+        WorkVariant.TOKEN_VERIFY,
     }
 
 

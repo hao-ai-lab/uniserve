@@ -2,108 +2,40 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
 from .batch import (
-    Operation,
-    ProductKind,
     SamplingOwnership,
     SnapshotRef,
     WorkVariant,
     protocol_layout_digest,
     route_capability_digest,
 )
-from .foundation.errors import capability_mismatch, invalid_descriptor
-from .spec import OperationType
+from .foundation.errors import invalid_descriptor
 
-_WORK_OPERATION_TYPES: dict[WorkVariant, OperationType] = {
-    WorkVariant.TOKEN_EXTEND: OperationType.SEQUENCE_EXTEND,
-    WorkVariant.TOKEN_DECODE: OperationType.SEQUENCE_DECODE,
-    WorkVariant.TOKEN_VERIFY: OperationType.SEQUENCE_VERIFY,
-    WorkVariant.ENCODE_VISION: OperationType.ENCODE_VISION,
-    WorkVariant.ENCODE_LATENT: OperationType.ENCODE_LATENT,
-    WorkVariant.TRANSFER_PRODUCT: OperationType.TRANSFER_PRODUCT,
-    WorkVariant.TRANSFER_KV_PUBLISH: OperationType.TRANSFER_KV,
-    WorkVariant.TRANSFER_KV_INSTALL: OperationType.TRANSFER_KV,
-    WorkVariant.GEN_TRANSITION: OperationType.FLOW,
-    WorkVariant.GEN_FLOW: OperationType.FLOW,
-}
-
-
-def operation_type(operation: Operation) -> OperationType:
-    """Resolve one registered operation onto its internal execution type.
-
-    Sampling is device postprocessing inside ``Token(*)`` and has no route of
-    its own, so no ``Work`` variant maps to ``SEQUENCE_SAMPLE``. ``Draft`` has no
-    depth-one route. Materialization is resolved from its exact input product:
-    a latent input selects the model image-decode operation while transported or
-    resident image inputs select the model-free frame operation.
-    """
-
-    variant = operation.work.variant
-    if variant is WorkVariant.MATERIALIZE:
-        return (
-            OperationType.MATERIALIZE_IMAGE
-            if any(reference.kind is ProductKind.LATENT for reference in operation.inputs)
-            else OperationType.MATERIALIZE_FRAME
-        )
-    selected = _WORK_OPERATION_TYPES.get(variant)
-    if selected is None:
-        raise capability_mismatch(f"work variant {variant.value!r} has no route")
-    return selected
-
-
-# The route enum an operation runs under maps onto one or more closed work
-# variants. Route selection stays keyed by ``OperationType`` inside the worker;
-# the capability wire and its digests are keyed by ``WorkVariant``, so the two
-# are bridged here. ``SEQUENCE_SAMPLE`` has no variant (sampling is device
-# postprocessing inside the token modes) and contributes no work.
-_OPERATION_TYPE_WORK_VARIANTS: dict[OperationType, tuple[WorkVariant, ...]] = {
-    OperationType.SEQUENCE_EXTEND: (WorkVariant.TOKEN_EXTEND,),
-    OperationType.SEQUENCE_DECODE: (WorkVariant.TOKEN_DECODE,),
-    OperationType.SEQUENCE_VERIFY: (WorkVariant.TOKEN_VERIFY,),
-    OperationType.SEQUENCE_SAMPLE: (),
-    OperationType.FLOW: (WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW),
-    OperationType.ENCODE_VISION: (WorkVariant.ENCODE_VISION,),
-    OperationType.ENCODE_LATENT: (WorkVariant.ENCODE_LATENT,),
-    OperationType.MATERIALIZE_IMAGE: (WorkVariant.MATERIALIZE,),
-    OperationType.MATERIALIZE_FRAME: (WorkVariant.MATERIALIZE,),
-    OperationType.TRANSFER_PRODUCT: (WorkVariant.TRANSFER_PRODUCT,),
-    OperationType.TRANSFER_KV: (WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL),
-}
-
+# Two work variants are never admitted onto a configured serving route:
+# ``TOKEN_VERIFY`` is speculative acceptance the scheduler drives inside token
+# decode, and ``DRAFT`` has no depth-one route. Both are folded out of every
+# advertised capability.
 _UNCONFIGURED_WORK = frozenset({WorkVariant.TOKEN_VERIFY, WorkVariant.DRAFT})
 
 
-def work_variants_for_operation_types(
-    operation_types: Sequence[OperationType],
-) -> tuple[WorkVariant, ...]:
-    """The closed work variants a set of route operation types supports.
+def configured_work_variants(variants: Iterable[WorkVariant]) -> tuple[WorkVariant, ...]:
+    """The admitted work leaves among ``variants``.
 
-    The result is deduplicated and ordered by the canonical ``WorkVariant``
-    position, matching the order the route-capability digest folds them in.
+    The result excludes the unconfigured work and is ordered by the canonical
+    ``WorkVariant`` position, matching the order the route-capability digest
+    folds them in.
     """
 
-    selected = {
-        variant
-        for operation_type in operation_types
-        for variant in _OPERATION_TYPE_WORK_VARIANTS[operation_type]
-    }
-    return tuple(variant for variant in WorkVariant if variant in selected)
-
-
-def configured_work_variants_for_operation_types(
-    operation_types: Sequence[OperationType],
-) -> tuple[WorkVariant, ...]:
-    """Return the work leaves admitted by the configured serving routes."""
-
+    selected = set(variants)
     return tuple(
         variant
-        for variant in work_variants_for_operation_types(operation_types)
-        if variant not in _UNCONFIGURED_WORK
+        for variant in WorkVariant
+        if variant in selected and variant not in _UNCONFIGURED_WORK
     )
 
 

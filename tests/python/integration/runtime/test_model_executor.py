@@ -37,6 +37,7 @@ from uniserve_worker.batch import (
     ProductKind,
     Release,
     TokenMode,
+    WorkVariant,
 )
 from uniserve_worker.execution.executor import (
     completion_report_ready,
@@ -59,7 +60,6 @@ from uniserve_worker.spec import (
     OperationStageCondition,
     OperationStagePurpose,
     OperationStageSpec,
-    OperationType,
     PositionLayout,
     RouteRowKind,
 )
@@ -119,7 +119,7 @@ class _RetainedImageStateModel(_ObservedModel):
         )
         operations = tuple(
             OperationSpec(
-                OperationType.ENCODE_VISION,
+                WorkVariant.ENCODE_VISION,
                 (
                     OperationStageSpec(
                         "encode",
@@ -134,7 +134,7 @@ class _RetainedImageStateModel(_ObservedModel):
                     ),
                 ),
             )
-            if operation.kind is OperationType.ENCODE_VISION
+            if operation.kind is WorkVariant.ENCODE_VISION
             else operation
             for operation in self.spec.operations
         )

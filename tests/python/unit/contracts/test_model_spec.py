@@ -8,14 +8,13 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL_SPEC
+from uniserve_worker.batch import WorkVariant
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.spec import (
     ModelSpec,
     OperationSpec,
     OperationStageSpec,
-    OperationType,
     Rename,
-    RouteOutputKind,
     RoutePlacement,
     RouteRowKind,
     RouteShape,
@@ -32,7 +31,6 @@ def _route(**overrides: object) -> RouteSpec:
     values: dict[str, object] = {
         "name": "text",
         "row_kinds": (RouteRowKind.TOKEN,),
-        "output_kinds": (RouteOutputKind.TOKEN,),
         "mixed_combinations": (),
         "dtype": "float32",
         "placement": RoutePlacement.PRIMARY,
@@ -52,7 +50,7 @@ def _spec(**overrides: object) -> ModelSpec:
         "routes": (route,),
         "operations": (
             OperationSpec(
-                OperationType.SEQUENCE_EXTEND,
+                WorkVariant.TOKEN_EXTEND,
                 (OperationStageSpec(route.name, RouteRowKind.TOKEN),),
             ),
         ),
@@ -96,9 +94,6 @@ def test_route_requires_a_closed_aligned_row_output_vocabulary():
         _route(row_kinds=(RouteRowKind.TOKEN, RouteRowKind.TOKEN))
     assert repeated.value.code is ErrorCode.INVALID_DESCRIPTOR
 
-    with pytest.raises(WorkerError, match="map each row kind"):
-        _route(output_kinds=())
-
     with pytest.raises(WorkerError, match="mixes a row kind it does not accept"):
         _route(mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),))
 
@@ -112,7 +107,7 @@ def test_model_spec_rejects_ambiguous_or_invalid_operation_routes():
         _spec(
             operations=(
                 OperationSpec(
-                    OperationType.SEQUENCE_EXTEND,
+                    WorkVariant.TOKEN_EXTEND,
                     (OperationStageSpec("missing", RouteRowKind.TOKEN),),
                 ),
             )
@@ -122,7 +117,7 @@ def test_model_spec_rejects_ambiguous_or_invalid_operation_routes():
         _spec(
             operations=(
                 OperationSpec(
-                    OperationType.FLOW,
+                    WorkVariant.GEN_TRANSITION,
                     (OperationStageSpec(route.name, RouteRowKind.FLOW),),
                 ),
             ),
@@ -131,16 +126,13 @@ def test_model_spec_rejects_ambiguous_or_invalid_operation_routes():
 
 
 def test_flow_operation_requires_a_flow_spec():
-    flow_route = _route(
-        row_kinds=(RouteRowKind.FLOW,),
-        output_kinds=(RouteOutputKind.FLOW,),
-    )
+    flow_route = _route(row_kinds=(RouteRowKind.FLOW,))
     with pytest.raises(WorkerError, match="declares no FlowSpec"):
         _spec(
             routes=(flow_route,),
             operations=(
                 OperationSpec(
-                    OperationType.FLOW,
+                    WorkVariant.GEN_TRANSITION,
                     (OperationStageSpec(flow_route.name, RouteRowKind.FLOW),),
                 ),
             ),

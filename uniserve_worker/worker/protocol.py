@@ -15,42 +15,38 @@ from ..capabilities import (
     ResourceClass,
     RouteCreditLimits,
     RouteExecutionCapability,
-    work_variants_for_operation_types,
 )
 from ..foundation.errors import capability_mismatch
-from ..spec import OperationType
 
 
 @dataclass(frozen=True, slots=True)
 class WorkerContract:
     capabilities: EngineCaps
-    effective_operation_types: frozenset[OperationType]
+    effective_work_variants: frozenset[WorkVariant]
 
     @classmethod
     def compile(
         cls,
         declared_capabilities: EngineCaps,
         *,
-        allowed_operation_types: frozenset[OperationType],
-        implemented_operation_types: frozenset[OperationType],
+        allowed_work_variants: frozenset[WorkVariant],
+        implemented_work_variants: frozenset[WorkVariant],
         pipeline_depth: int,
         owner: str,
     ) -> WorkerContract:
         if int(pipeline_depth) <= 0:
             raise capability_mismatch("worker pipeline depth must be positive")
-        effective = tuple(
-            operation_type
-            for operation_type in OperationType
-            if operation_type in allowed_operation_types
-            and operation_type in implemented_operation_types
-        )
-        effective_work = work_variants_for_operation_types(effective)
-        if not effective_work:
+        # The worker executes every implemented leaf it is admitted to, including
+        # unadvertised protocol leaves (Verify, Draft); the wire capability only
+        # advertises the configured subset, which the declared capabilities have
+        # already narrowed. Admission stays unfiltered so those leaves execute.
+        effective = allowed_work_variants & implemented_work_variants
+        if not effective:
             raise capability_mismatch(
-                f"{owner} implements none of the requested operation types "
-                f"{sorted(value.value for value in allowed_operation_types)!r}"
+                f"{owner} implements none of the requested work variants "
+                f"{sorted(value.value for value in allowed_work_variants)!r}"
             )
-        selected_work = set(effective_work)
+        selected_work = set(effective)
         advertised_work = selected_work.intersection(declared_capabilities.supported_work)
         if not advertised_work:
             raise capability_mismatch(f"{owner} advertises no executable work")
@@ -79,7 +75,7 @@ class WorkerContract:
                     route_capabilities=route_capabilities,
                 ),
             ),
-            effective_operation_types=frozenset(effective),
+            effective_work_variants=frozenset(effective),
         )
 
 

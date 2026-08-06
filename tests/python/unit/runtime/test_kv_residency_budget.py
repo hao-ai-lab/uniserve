@@ -5,6 +5,7 @@ import dataclasses
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL_SPEC
+from uniserve_worker.batch import WorkVariant
 from uniserve_worker.foundation.runtime_config import (
     graph_memory_budget_bytes,
     graph_padding_block_count,
@@ -21,7 +22,7 @@ from uniserve_worker.runtime.latent_capacity import (
     latent_store_capacity_bytes,
 )
 from uniserve_worker.runtime.product_capacity import device_product_arena_bytes
-from uniserve_worker.spec import OperationType, PerBranch, ResourcePlan
+from uniserve_worker.spec import PerBranch, ResourcePlan
 
 pytestmark = pytest.mark.unit
 
@@ -150,9 +151,9 @@ def test_sequence_capabilities_provision_every_bounded_device_product_slot() -> 
         for operation in TEST_MODEL_SPEC.operations
         if operation.kind
         in {
-            OperationType.SEQUENCE_EXTEND,
-            OperationType.SEQUENCE_DECODE,
-            OperationType.SEQUENCE_VERIFY,
+            WorkVariant.TOKEN_EXTEND,
+            WorkVariant.TOKEN_DECODE,
+            WorkVariant.TOKEN_VERIFY,
         }
     )
     spec = dataclasses.replace(TEST_MODEL_SPEC, operations=operations, flow=None)

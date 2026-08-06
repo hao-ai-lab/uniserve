@@ -22,7 +22,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         from ..worker.system import SystemWorker
 
         return SystemWorker(
-            allowed_operation_types=plan.allowed_operation_types,
+            allowed_work_variants=plan.allowed_work_variants,
             block_size=config.resources.block_size,
             transfer_backend=config.data_plane.backend,
             pipeline_depth=config.ipc.pipeline_depth,
@@ -124,7 +124,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         attention=attention,
         execution=config.execution,
         tokenizer=tokenizer,
-        allowed_operation_types=plan.allowed_operation_types,
+        allowed_work_variants=plan.allowed_work_variants,
         defer_sampling=config.data_plane.defer_sampling,
         transfer_backend=config.data_plane.backend,
         cross_process=config.worker_kind.value != "full",

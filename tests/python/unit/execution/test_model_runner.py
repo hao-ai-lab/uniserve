@@ -11,11 +11,9 @@ from torch import nn
 
 from tests.python.fixtures.model_execution import TEST_MODEL_SPEC
 from uniserve_worker.execution._forward_plan import (
+    ForwardBinding,
     ForwardPlan,
     GraphKey,
-    OutputKind,
-    OutputSlot,
-    TransactionId,
 )
 from uniserve_worker.execution.model_runner import ModelRunner, RunPath, _stage_rows
 from uniserve_worker.forward import (
@@ -147,11 +145,26 @@ def _plan(
         route=RouteId("mixed"),
         rows=rows,
         context=_context(),
-        outputs=(
-            OutputSlot(0, 0, OutputKind.TOKEN, "float32"),
-            OutputSlot(1, 1, OutputKind.FLOW, flow_output_dtype),
+        bindings=(
+            ForwardBinding(
+                row_id=0,
+                slot=0,
+                output_dtype="float32",
+                session_id=1,
+                epoch=1,
+                op_id=1,
+                base_version=0,
+            ),
+            ForwardBinding(
+                row_id=1,
+                slot=1,
+                output_dtype=flow_output_dtype,
+                session_id=2,
+                epoch=1,
+                op_id=2,
+                base_version=0,
+            ),
         ),
-        transaction=TransactionId(((1, 1, 1), (2, 1, 2)), (0, 0)),
         graph_key=GraphKey(
             model_revision="revision",
             spec_digest="d" * 64,

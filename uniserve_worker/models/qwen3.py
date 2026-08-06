@@ -46,6 +46,7 @@ __all__ = [
 
 import torch.nn as nn
 
+from ..batch import WorkVariant
 from ..nn import (
     FusedMoE,
     LayerSpec,
@@ -69,8 +70,6 @@ from ..spec import (
     ModelSpec,
     OperationSpec,
     OperationStageSpec,
-    OperationType,
-    RouteOutputKind,
     RoutePlacement,
     RouteRowKind,
     RouteShape,
@@ -521,7 +520,6 @@ class Qwen3ForCausalLM(nn.Module):
                 RouteSpec(
                     name="text",
                     row_kinds=(RouteRowKind.TOKEN,),
-                    output_kinds=(RouteOutputKind.TOKEN,),
                     mixed_combinations=(),
                     dtype="bfloat16",
                     placement=RoutePlacement.PRIMARY,
@@ -536,9 +534,9 @@ class Qwen3ForCausalLM(nn.Module):
             operations=tuple(
                 OperationSpec(kind, (OperationStageSpec("text", RouteRowKind.TOKEN),))
                 for kind in (
-                    OperationType.SEQUENCE_EXTEND,
-                    OperationType.SEQUENCE_DECODE,
-                    OperationType.SEQUENCE_VERIFY,
+                    WorkVariant.TOKEN_EXTEND,
+                    WorkVariant.TOKEN_DECODE,
+                    WorkVariant.TOKEN_VERIFY,
                 )
             ),
             weights=self.weight_spec,

@@ -63,15 +63,15 @@ class MetricsService:
     def now_ns(self) -> int:
         return self._clock()
 
-    def record_execute(self, duration_ns: int, operation_types: Sequence[str]) -> None:
+    def record_execute(self, duration_ns: int, variant_labels: Sequence[str]) -> None:
         duration_ns = max(0, int(duration_ns))
         self.executes += 1
-        self.operations_total += len(operation_types)
+        self.operations_total += len(variant_labels)
         self.exec_ns_total += duration_ns
         self.last_exec_ns = duration_ns
-        share = duration_ns // max(1, len(operation_types))
-        for operation_type in operation_types:
-            key = str(operation_type)
+        share = duration_ns // max(1, len(variant_labels))
+        for label in variant_labels:
+            key = str(label)
             self.operation_counts[key] += 1
             self.operation_ns[key] += share
 

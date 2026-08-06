@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 
-from ..batch import Batch, CompletionReport, SnapshotRef
-from ..capabilities import RequestKind, ResourceClass, work_variants_for_operation_types
+from ..batch import Batch, CompletionReport, SnapshotRef, WorkVariant
+from ..capabilities import RequestKind, ResourceClass, configured_work_variants
 from ..execution import ModelExecutor
 from ..foundation.errors import unsupported_control
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
@@ -18,7 +18,6 @@ from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.snapshot_store import SnapshotProvider
 from ..runtime.transfer import Locator
-from ..spec import OperationType
 from .protocol import WorkerContract, model_free_capabilities
 
 
@@ -28,7 +27,7 @@ class SystemWorker:
     def __init__(
         self,
         *,
-        allowed_operation_types: frozenset[OperationType],
+        allowed_work_variants: frozenset[WorkVariant],
         block_size: int,
         transfer_backend: str,
         pipeline_depth: int,
@@ -37,9 +36,9 @@ class SystemWorker:
         snapshot_dir: str | None = None,
         restore_snapshots: bool = False,
     ) -> None:
-        supported = frozenset({OperationType.SEQUENCE_SAMPLE, OperationType.MATERIALIZE_FRAME})
-        if not allowed_operation_types or not allowed_operation_types <= supported:
-            raise ValueError("system worker received a model-backed operation type")
+        supported = frozenset({WorkVariant.MATERIALIZE})
+        if not allowed_work_variants <= supported:
+            raise ValueError("system worker received a model-backed work variant")
         controls: tuple[RequestKind, ...] = (
             RequestKind.DROP_SESSION,
             RequestKind.RELEASE_PRODUCTS,
@@ -52,8 +51,8 @@ class SystemWorker:
             )
         declared = model_free_capabilities(
             block_size=int(block_size),
-            supported_work=work_variants_for_operation_types(
-                tuple(value for value in OperationType if value in allowed_operation_types)
+            supported_work=configured_work_variants(
+                tuple(value for value in WorkVariant if value in allowed_work_variants)
             ),
             supported_controls=controls,
             resource_classes=(ResourceClass.ENCODER_OUTPUT,),
@@ -62,8 +61,8 @@ class SystemWorker:
         )
         self._contract = WorkerContract.compile(
             declared,
-            allowed_operation_types=allowed_operation_types,
-            implemented_operation_types=allowed_operation_types,
+            allowed_work_variants=allowed_work_variants,
+            implemented_work_variants=allowed_work_variants,
             pipeline_depth=pipeline_depth,
             owner=type(self).__name__,
         )
@@ -100,7 +99,7 @@ class SystemWorker:
             tokenizer=None,
             model_spec_digest=None,
             weight_digest=None,
-            allowed_operation_types=allowed_operation_types,
+            allowed_work_variants=allowed_work_variants,
             trace=self.trace,
             pipeline_depth=pipeline_depth,
             completion_payload_bytes=completion_payload_bytes,

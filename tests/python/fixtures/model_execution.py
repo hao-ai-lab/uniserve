@@ -1,5 +1,6 @@
 """Canonical immutable model declarations for execution-boundary tests."""
 
+from uniserve_worker.batch import WorkVariant
 from uniserve_worker.spec import (
     CacheSpec,
     DeploymentOverlay,
@@ -13,10 +14,8 @@ from uniserve_worker.spec import (
     NoiseScaleSpec,
     OperationSpec,
     OperationStageSpec,
-    OperationType,
     PositionLayout,
     ResourcePlan,
-    RouteOutputKind,
     RoutePlacement,
     RouteRowKind,
     RouteShape,
@@ -35,12 +34,6 @@ TEST_MODEL_SPEC = ModelSpec(
                 RouteRowKind.ENCODE,
                 RouteRowKind.DECODE,
             ),
-            output_kinds=(
-                RouteOutputKind.TOKEN,
-                RouteOutputKind.FLOW,
-                RouteOutputKind.ENCODE,
-                RouteOutputKind.DECODE,
-            ),
             mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
             dtype="float32",
             placement=RoutePlacement.PRIMARY,
@@ -51,31 +44,35 @@ TEST_MODEL_SPEC = ModelSpec(
     ),
     operations=(
         OperationSpec(
-            OperationType.SEQUENCE_EXTEND,
+            WorkVariant.TOKEN_EXTEND,
             (OperationStageSpec("test", RouteRowKind.TOKEN),),
         ),
         OperationSpec(
-            OperationType.SEQUENCE_DECODE,
+            WorkVariant.TOKEN_DECODE,
             (OperationStageSpec("test", RouteRowKind.TOKEN),),
         ),
         OperationSpec(
-            OperationType.SEQUENCE_VERIFY,
+            WorkVariant.TOKEN_VERIFY,
             (OperationStageSpec("test", RouteRowKind.TOKEN),),
         ),
         OperationSpec(
-            OperationType.FLOW,
+            WorkVariant.GEN_TRANSITION,
             (OperationStageSpec("test", RouteRowKind.FLOW),),
         ),
         OperationSpec(
-            OperationType.MATERIALIZE_IMAGE,
+            WorkVariant.GEN_FLOW,
+            (OperationStageSpec("test", RouteRowKind.FLOW),),
+        ),
+        OperationSpec(
+            WorkVariant.MATERIALIZE,
             (OperationStageSpec("test", RouteRowKind.DECODE),),
         ),
         OperationSpec(
-            OperationType.ENCODE_LATENT,
+            WorkVariant.ENCODE_LATENT,
             (OperationStageSpec("test", RouteRowKind.ENCODE),),
         ),
         OperationSpec(
-            OperationType.ENCODE_VISION,
+            WorkVariant.ENCODE_VISION,
             (OperationStageSpec("test", RouteRowKind.ENCODE),),
         ),
     ),

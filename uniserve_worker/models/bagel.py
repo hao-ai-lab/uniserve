@@ -8,6 +8,7 @@ from typing import Any, Mapping, cast
 import torch
 import torch.nn as nn
 
+from ..batch import WorkVariant
 from ..forward import (
     DecodeOutput,
     DecodeRow,
@@ -73,10 +74,8 @@ from ..spec import (
     OperationStageCondition,
     OperationStagePurpose,
     OperationStageSpec,
-    OperationType,
     PositionLayout,
     Rename,
-    RouteOutputKind,
     RoutePlacement,
     RouteRowKind,
     RouteShape,
@@ -509,7 +508,6 @@ class BagelForConditionalGeneration(nn.Module):
                 RouteSpec(
                     name="mot",
                     row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW),
-                    output_kinds=(RouteOutputKind.TOKEN, RouteOutputKind.FLOW),
                     mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
                     dtype="bfloat16",
                     placement=RoutePlacement.PRIMARY,
@@ -527,7 +525,6 @@ class BagelForConditionalGeneration(nn.Module):
                 RouteSpec(
                     name="vae",
                     row_kinds=(RouteRowKind.ENCODE, RouteRowKind.DECODE),
-                    output_kinds=(RouteOutputKind.ENCODE, RouteOutputKind.DECODE),
                     mixed_combinations=(),
                     dtype="bfloat16",
                     placement=RoutePlacement.GENERATION,
@@ -542,7 +539,6 @@ class BagelForConditionalGeneration(nn.Module):
                 RouteSpec(
                     name="vit",
                     row_kinds=(RouteRowKind.ENCODE,),
-                    output_kinds=(RouteOutputKind.ENCODE,),
                     mixed_combinations=(),
                     dtype="bfloat16",
                     placement=RoutePlacement.PRIMARY,
@@ -557,31 +553,36 @@ class BagelForConditionalGeneration(nn.Module):
             ),
             operations=(
                 OperationSpec(
-                    OperationType.SEQUENCE_EXTEND, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                    WorkVariant.TOKEN_EXTEND, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
                 ),
                 OperationSpec(
-                    OperationType.SEQUENCE_DECODE, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                    WorkVariant.TOKEN_DECODE, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
                 ),
                 OperationSpec(
-                    OperationType.SEQUENCE_VERIFY, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                    WorkVariant.TOKEN_VERIFY, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
                 ),
-                OperationSpec(OperationType.FLOW, (OperationStageSpec("mot", RouteRowKind.FLOW),)),
                 OperationSpec(
-                    OperationType.ENCODE_VISION,
+                    WorkVariant.GEN_TRANSITION, (OperationStageSpec("mot", RouteRowKind.FLOW),)
+                ),
+                OperationSpec(
+                    WorkVariant.GEN_FLOW, (OperationStageSpec("mot", RouteRowKind.FLOW),)
+                ),
+                OperationSpec(
+                    WorkVariant.ENCODE_VISION,
                     (
                         OperationStageSpec("vit", RouteRowKind.ENCODE),
                         OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
                     ),
                 ),
                 OperationSpec(
-                    OperationType.ENCODE_LATENT,
+                    WorkVariant.ENCODE_LATENT,
                     (
                         OperationStageSpec("vae", RouteRowKind.ENCODE),
                         OperationStageSpec("mot", RouteRowKind.FLOW, OperationStagePurpose.STATE),
                     ),
                 ),
                 OperationSpec(
-                    OperationType.MATERIALIZE_IMAGE,
+                    WorkVariant.MATERIALIZE,
                     (
                         OperationStageSpec("vae", RouteRowKind.DECODE),
                         OperationStageSpec(
@@ -592,9 +593,13 @@ class BagelForConditionalGeneration(nn.Module):
                         ),
                     ),
                 ),
-                OperationSpec(OperationType.TRANSFER_PRODUCT),
+                OperationSpec(WorkVariant.TRANSFER_PRODUCT),
                 OperationSpec(
-                    OperationType.TRANSFER_KV,
+                    WorkVariant.TRANSFER_KV_PUBLISH,
+                    (OperationStageSpec("mot", RouteRowKind.FLOW),),
+                ),
+                OperationSpec(
+                    WorkVariant.TRANSFER_KV_INSTALL,
                     (OperationStageSpec("mot", RouteRowKind.FLOW),),
                 ),
             ),

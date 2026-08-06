@@ -59,7 +59,6 @@ from uniserve_worker.batch import (
 from uniserve_worker.batch import (
     ErrorCode as ProtocolErrorCode,
 )
-from uniserve_worker.capabilities import operation_type
 from uniserve_worker.forward import (
     AttentionSelection,
     AttnPlan,
@@ -204,7 +203,6 @@ from uniserve_worker.spec import (
     OperationStageCondition,
     OperationStagePurpose,
     OperationStageSpec,
-    OperationType,
     PositionLayout,
     RoutePlacement,
     RouteRowKind,
@@ -214,11 +212,9 @@ from uniserve_worker.spec import (
 )
 
 from ._forward_plan import (
+    ForwardBinding,
     ForwardPlan,
     GraphKey,
-    OutputKind,
-    OutputSlot,
-    TransactionId,
 )
 from ._inputs import PreparedImage, patch_grid_shape, prepare_image, prepare_tensor_image
 from .model_runner import ModelRunner, RunObservation, RunPath
@@ -244,11 +240,6 @@ class _ForwardTask:
     causal: bool = True
     attention_indexes: torch.Tensor | None = None
     text_local_indices: tuple[int, ...] = ()
-    # The parent point index this task advances from. A device-relay successor
-    # roots on its predecessor's device point (no host point index), so the base
-    # is threaded here from the caller's `_parent_base_point` rather than being
-    # re-derived from the parent, which would reject the device parent.
-    base_point: int = 0
 
     @property
     def query_tokens(self) -> int:
@@ -1543,7 +1534,7 @@ class ModelExecutor:
         tokenizer: Any | None,
         model_spec_digest: str | None,
         weight_digest: str | None,
-        allowed_operation_types: frozenset[OperationType],
+        allowed_work_variants: frozenset[WorkVariant],
         trace: ExecutionTrace,
         pipeline_depth: int = 1,
         defer_sampling: bool = False,
@@ -1551,8 +1542,8 @@ class ModelExecutor:
         cpu_task_capacity: int,
         pinned_staging_capacity: int,
     ) -> None:
-        if not allowed_operation_types:
-            raise ValueError("executor must accept at least one operation type")
+        if not allowed_work_variants:
+            raise ValueError("executor must accept at least one work variant")
         if (spec is None) != (deployment is None):
             raise ValueError("model spec and deployment overlay must be present together")
         if runner is not None and (spec is None or weights is None):
@@ -1569,11 +1560,11 @@ class ModelExecutor:
                 raise capability_mismatch(
                     "executor base-weight identity does not match its weight set"
                 )
-            unsupported = allowed_operation_types - spec.operation_types()
-            system_only = {OperationType.SEQUENCE_SAMPLE, OperationType.MATERIALIZE_FRAME}
+            unsupported = allowed_work_variants - spec.operation_variants()
+            system_only = frozenset({WorkVariant.MATERIALIZE})
             if unsupported - system_only:
                 raise capability_mismatch(
-                    "executor operation set exceeds the model declaration: "
+                    "executor work set exceeds the model declaration: "
                     f"{sorted(value.value for value in unsupported - system_only)!r}"
                 )
         self.spec = spec
@@ -1591,7 +1582,7 @@ class ModelExecutor:
         self.tokenizer = tokenizer
         self.model_spec_digest = model_spec_digest
         self.weight_digest = weight_digest
-        self.allowed_operation_types = allowed_operation_types
+        self.allowed_work_variants = allowed_work_variants
         self.trace = trace
         self.defer_sampling = bool(defer_sampling)
         self._device = (
@@ -1635,8 +1626,8 @@ class ModelExecutor:
             else {operation.kind: operation.stages for operation in spec.operations}
         )
         self._primary_stages = {
-            operation_type: primary[0]
-            for operation_type, stages in self._operation_stages.items()
+            variant: primary[0]
+            for variant, stages in self._operation_stages.items()
             if len(
                 primary := tuple(
                     stage for stage in stages if stage.purpose is OperationStagePurpose.PRIMARY
@@ -2500,9 +2491,9 @@ class ModelExecutor:
         ):
             raise invalid_descriptor("execution batch exceeds the deployment operation limit")
         for operation in batch.operations:
-            selected_type = operation_type(operation)
-            if selected_type not in self.allowed_operation_types:
-                raise unsupported_operation(selected_type.value, operation.request_key.session_id)
+            variant = operation.work.variant
+            if variant not in self.allowed_work_variants:
+                raise unsupported_operation(variant.value, operation.request_key.session_id)
         groups: dict[int, list[BatchPartition]] = defaultdict(list)
         for partition in batch.partitions:
             groups[partition.submission_group].append(partition)
@@ -2513,7 +2504,7 @@ class ModelExecutor:
             if self.spec is None:
                 raise invalid_descriptor("tensorized mixed submission has no declared model route")
             primary_stages = tuple(
-                self._primary_stage(operation_type(operation))
+                self._primary_stage(operation.work.variant)
                 for partition in partitions
                 for operation in partition.operations
             )
@@ -3469,16 +3460,19 @@ class ModelExecutor:
                 backend=self._attention_selection().identity,
                 topology=self._topology_key(route),
             )
-            slots = tuple(
-                OutputSlot(
-                    task.row.row_id,
-                    task.row.output_slot,
-                    _output_kind(task.row),
-                    (
+            bindings = tuple(
+                ForwardBinding(
+                    row_id=task.row.row_id,
+                    slot=task.row.output_slot,
+                    output_dtype=(
                         cast(FlowSpec, cast(ModelSpec, self.spec).flow).prediction_dtype
                         if isinstance(task.row, FlowRow)
                         else route.dtype
                     ),
+                    session_id=task.operation.request_key.session_id,
+                    epoch=task.operation.request_key.epoch,
+                    op_id=task.operation.op_id,
+                    base_version=_parent_base_point(task.operation, task.session),
                 )
                 for task in tasks
             )
@@ -3486,18 +3480,7 @@ class ModelExecutor:
                 route=RouteId(route.name),
                 rows=tuple(task.row for task in tasks),
                 context=context,
-                outputs=slots,
-                transaction=TransactionId(
-                    tuple(
-                        (
-                            task.operation.request_key.session_id,
-                            task.operation.request_key.epoch,
-                            task.operation.op_id,
-                        )
-                        for task in tasks
-                    ),
-                    tuple(task.base_point for task in tasks),
-                ),
+                bindings=bindings,
                 graph_key=graph_key,
                 graph_eligible=route.graph_eligible,
                 device=device,
@@ -3742,31 +3725,45 @@ class ModelExecutor:
                 f"operation stage references unknown route {stage.route!r}"
             ) from None
 
-    def _stages(self, operation_type: OperationType) -> tuple[OperationStageSpec, ...]:
-        stages = self._operation_stages.get(operation_type)
+    def _stages(self, variant: WorkVariant) -> tuple[OperationStageSpec, ...]:
+        stages = self._operation_stages.get(variant)
         if stages is None:
             if self.spec is None:
                 return ()
-            raise invalid_descriptor(f"model does not declare operation {operation_type.value!r}")
+            raise invalid_descriptor(f"model does not declare operation {variant.value!r}")
         return stages
 
-    def _primary_stage(self, operation_type: OperationType) -> OperationStageSpec:
-        stage = self._primary_stages.get(operation_type)
+    def _operation_stages_for(self, operation: Operation) -> tuple[OperationStageSpec, ...]:
+        """The model stages one registered operation lowers to.
+
+        Materialization is polymorphic on its input: a latent input drives the
+        model image-decode stages, while a transported or resident image frame
+        is model-free and lowers to no neural stage.
+        """
+
+        if operation.work.variant is WorkVariant.MATERIALIZE and not any(
+            reference.kind is ProductKind.LATENT for reference in operation.inputs
+        ):
+            return ()
+        return self._stages(operation.work.variant)
+
+    def _primary_stage(self, variant: WorkVariant) -> OperationStageSpec:
+        stage = self._primary_stages.get(variant)
         if stage is None:
             raise invalid_descriptor(
-                f"operation {operation_type.value!r} requires exactly one primary neural stage"
+                f"operation {variant.value!r} requires exactly one primary neural stage"
             )
         return stage
 
     def _state_stages(
         self,
-        operation_type: OperationType,
+        variant: WorkVariant,
         *,
         retain_image: bool,
     ) -> tuple[OperationStageSpec, ...]:
         return tuple(
             stage
-            for stage in self._stages(operation_type)
+            for stage in self._stages(variant)
             if stage.purpose is OperationStagePurpose.STATE
             and (stage.condition is OperationStageCondition.ALWAYS or retain_image)
         )
@@ -4001,7 +3998,7 @@ class ModelExecutor:
                 raise invalid_descriptor("vision feature product has the wrong resident payload")
             outcome = yield from self._state_driver(
                 operation,
-                OperationType.ENCODE_VISION,
+                WorkVariant.ENCODE_VISION,
                 scope,
                 height=payload.height,
                 width=payload.width,
@@ -4016,7 +4013,7 @@ class ModelExecutor:
                 raise invalid_descriptor("latent feature product has the wrong resident payload")
             outcome = yield from self._state_driver(
                 operation,
-                OperationType.ENCODE_LATENT,
+                WorkVariant.ENCODE_LATENT,
                 scope,
                 height=payload.height,
                 width=payload.width,
@@ -4221,7 +4218,7 @@ class ModelExecutor:
         entry: KvEntry | None = None,
         weights: WeightSet | None = None,
     ) -> _ForwardTask:
-        stage = self._primary_stage(operation_type(operation))
+        stage = self._primary_stage(operation.work.variant)
         if stage.row is not RouteRowKind.TOKEN:
             raise invalid_descriptor("sequence operation primary stage is not a token row")
         if len(token_ids) != len(positions) or not token_ids:
@@ -4251,7 +4248,6 @@ class ModelExecutor:
             entry=self.kv.get(operation.request_key.session_id) if entry is None else entry,
             write_kv=True,
             causal=True,
-            base_point=int(positions[0]),
         )
 
     def _commit_task_kv(
@@ -4923,7 +4919,7 @@ class ModelExecutor:
     ) -> torch.Tensor:
         flow = cast(ModelSpec, self.spec).flow
         assert flow is not None
-        route = self._route(self._primary_stage(OperationType.FLOW))
+        route = self._route(self._primary_stage(operation.work.variant))
         device = torch.device(self._route_device(route))
         dtype = _torch_dtype(route.dtype)
         rng = operation.rng
@@ -5020,7 +5016,7 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> _ForwardTask:
         session = self.sessions.get(operation.request_key.session_id)
-        primary = self._primary_stage(OperationType.FLOW)
+        primary = self._primary_stage(operation.work.variant)
         route = self._route(primary)
         if RouteRowKind.TOKEN not in route.row_kinds:
             raise invalid_descriptor("flow prefix route does not accept token rows")
@@ -5065,7 +5061,7 @@ class ModelExecutor:
         session = self.sessions.get(operation.request_key.session_id)
         flow = cast(ModelSpec, self.spec).flow
         assert flow is not None
-        stage = self._primary_stage(OperationType.FLOW)
+        stage = self._primary_stage(operation.work.variant)
         if stage.row is not RouteRowKind.FLOW:
             raise invalid_descriptor("flow operation primary stage is not a flow row")
         row_id = scope.row_id()
@@ -5294,7 +5290,7 @@ class ModelExecutor:
         image_spec = spec.inputs.images
         if image_spec is None:
             raise invalid_descriptor("encode operation requires declared image transforms")
-        selected_type = operation_type(operation)
+        selected_type = operation.work.variant
         mode = EncodeMode(cast(str, operation.work.mode))
         session_id = operation.request_key.session_id
         feature_outputs = tuple(
@@ -5406,7 +5402,6 @@ class ModelExecutor:
     ) -> _Driver:
         session_id = operation.request_key.session_id
         session = self.sessions.get(session_id)
-        selected_type = operation_type(operation)
         latent_inputs = tuple(
             reference for reference in operation.inputs if reference.kind is ProductKind.LATENT
         )
@@ -5437,7 +5432,7 @@ class ModelExecutor:
             raise invalid_descriptor("image materialization requires a completed latent trajectory")
 
         if flow.materialization is MaterializationKind.DECODE_ROUTE:
-            stage = self._primary_stage(selected_type)
+            stage = self._primary_stage(operation.work.variant)
             if stage.row is not RouteRowKind.DECODE:
                 raise invalid_descriptor("decode materialization requires a decode primary stage")
             row_id = scope.row_id()
@@ -5461,7 +5456,7 @@ class ModelExecutor:
         elif flow.materialization is MaterializationKind.RGB_LATENT:
             if any(
                 stage.purpose is OperationStagePurpose.PRIMARY
-                for stage in self._stages(selected_type)
+                for stage in self._operation_stages_for(operation)
             ):
                 raise invalid_descriptor(
                     "RGB-latent materialization must not declare a decode route"
@@ -5664,7 +5659,7 @@ class ModelExecutor:
     def _state_driver(
         self,
         operation: Operation,
-        operation_type: OperationType,
+        variant: WorkVariant,
         scope: _ExecutionScope,
         *,
         height: int,
@@ -5681,7 +5676,7 @@ class ModelExecutor:
         committed_tokens: tuple[int | _CompletionToken, ...] = ()
         products: tuple[ProductPayload, ...] = ()
         state_query_tokens = 0
-        for stage in self._state_stages(operation_type, retain_image=retain_image):
+        for stage in self._state_stages(variant, retain_image=retain_image):
             if stage.row is RouteRowKind.ENCODE:
                 if image is None:
                     raise invalid_descriptor("image state encode stage has no image tensor")
@@ -6170,16 +6165,6 @@ def _cumulative(
         slot=slot,
         name=name,
     )
-
-
-def _output_kind(row: ForwardRow) -> OutputKind:
-    if isinstance(row, TokenRow):
-        return OutputKind.TOKEN
-    if isinstance(row, FlowRow):
-        return OutputKind.FLOW
-    if isinstance(row, EncodeRow):
-        return OutputKind.ENCODE
-    return OutputKind.DECODE
 
 
 def _binding_identity(tasks: Sequence[_ForwardTask]) -> int:

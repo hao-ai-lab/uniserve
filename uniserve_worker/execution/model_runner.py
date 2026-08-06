@@ -54,7 +54,7 @@ from uniserve_worker.runtime.host_staging import (
     pack_integer_tensors,
 )
 
-from ._forward_plan import ForwardPlan, OutputSlot
+from ._forward_plan import ForwardBinding, ForwardPlan
 
 
 class RunPath(StrEnum):
@@ -167,7 +167,7 @@ class ModelRunner:
         _mark_staging_submitted(plan)
         try:
             output.validate_for(batch)
-            _validate_tensors(batch, output, plan.outputs, torch.device(plan.device))
+            _validate_tensors(batch, output, plan.bindings, torch.device(plan.device))
         except Exception as error:
             self.trace.emit(
                 ExecutionPhase.FORWARD_COMPLETION,
@@ -192,14 +192,14 @@ class ModelRunner:
                 f"route execution path {graph_path!r} made {calls} model forward calls",
                 phase="graph_execution",
                 route=str(plan.route),
-                operations=plan.transaction.operations,
+                operations=plan.operations,
             )
         if graph_path == RunPath.GRAPH_FALLBACK.value and calls not in {1, 2}:
             raise ComputeError(
                 f"graph fallback made {calls} model forward calls",
                 phase="graph_execution",
                 route=str(plan.route),
-                operations=plan.transaction.operations,
+                operations=plan.operations,
             )
         path = RunPath(graph_path)
         duration_us = (time.perf_counter_ns() - started) // 1000
@@ -232,12 +232,8 @@ class ModelRunner:
 
 def _trace_operations(plan: ForwardPlan) -> tuple[OperationTrace, ...]:
     return tuple(
-        OperationTrace(session_id, epoch, op_id, version)
-        for (session_id, epoch, op_id), version in zip(
-            plan.transaction.operations,
-            plan.transaction.base_versions,
-            strict=True,
-        )
+        OperationTrace(binding.session_id, binding.epoch, binding.op_id, binding.base_version)
+        for binding in plan.bindings
     )
 
 
@@ -256,7 +252,7 @@ def _input_failure(error: BaseException, plan: ForwardPlan, phase: str) -> Input
         str(error) or type(error).__name__,
         phase=phase,
         route=str(plan.route),
-        operations=plan.transaction.operations,
+        operations=plan.operations,
     )
 
 
@@ -267,7 +263,7 @@ def _compute_failure(error: BaseException, plan: ForwardPlan, phase: str) -> Com
         str(error) or type(error).__name__,
         phase=phase,
         route=str(plan.route),
-        operations=plan.transaction.operations,
+        operations=plan.operations,
     )
 
 
@@ -283,7 +279,7 @@ def _execution_failure(error: BaseException, plan: ForwardPlan) -> WorkerError:
             str(error) or type(error).__name__,
             phase="graph_or_device",
             route=str(plan.route),
-            operations=plan.transaction.operations,
+            operations=plan.operations,
             retryable=classified.retryable,
             fatal=classified.fatal,
         )
@@ -291,7 +287,7 @@ def _execution_failure(error: BaseException, plan: ForwardPlan) -> WorkerError:
         str(error) or type(error).__name__,
         phase="neural_execution",
         route=str(plan.route),
-        operations=plan.transaction.operations,
+        operations=plan.operations,
     )
 
 
@@ -304,7 +300,7 @@ def _enrich(error: _WorkerFailure, plan: ForwardPlan, phase: str) -> _WorkerFail
     if error.route is None:
         error.route = str(plan.route)
     if not error.operations:
-        error.operations = plan.transaction.operations
+        error.operations = plan.operations
     return error
 
 
@@ -481,15 +477,15 @@ def _stage_row(row: ForwardRow, device: torch.device) -> ForwardRow:
 def _validate_tensors(
     batch: ForwardBatch,
     output: ForwardOutput,
-    outputs: tuple[OutputSlot, ...],
+    bindings: tuple[ForwardBinding, ...],
     device: torch.device,
 ) -> None:
-    for input_row, output_row, declared in zip(
-        batch.rows, output.rows, outputs, strict=True
+    for input_row, output_row, binding in zip(
+        batch.rows, output.rows, bindings, strict=True
     ):
-        expected_dtype = getattr(torch, declared.dtype.removeprefix("torch."), None)
+        expected_dtype = getattr(torch, binding.output_dtype.removeprefix("torch."), None)
         if not isinstance(expected_dtype, torch.dtype):
-            raise ValueError(f"forward output declares unknown dtype {declared.dtype!r}")
+            raise ValueError(f"forward output declares unknown dtype {binding.output_dtype!r}")
         tensor = _output_tensor(output_row)
         if tensor.device != device:
             raise ValueError(

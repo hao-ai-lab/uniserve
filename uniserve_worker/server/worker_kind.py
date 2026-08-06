@@ -1,10 +1,10 @@
-"""Deployment roles and their exact execution-operation routes."""
+"""Deployment roles and the exact wire work variants each is admitted to run."""
 
 from __future__ import annotations
 
 from enum import StrEnum
 
-from ..spec import OperationType
+from ..batch import WorkVariant
 
 
 class WorkerKind(StrEnum):
@@ -18,8 +18,8 @@ class WorkerKind(StrEnum):
     GEN = "gen"
 
     @property
-    def allowed_operation_types(self) -> frozenset[OperationType]:
-        """The route operation types this deployment role is admitted to run."""
+    def allowed_work_variants(self) -> frozenset[WorkVariant]:
+        """The wire work variants this deployment role is admitted to run."""
 
         return _ROUTES[self]
 
@@ -29,38 +29,38 @@ class WorkerKind(StrEnum):
 
 
 _ROUTES = {
-    WorkerKind.FULL: frozenset(OperationType),
-    WorkerKind.ENCODER: frozenset(
-        {OperationType.ENCODE_VISION, OperationType.ENCODE_LATENT}
-    ),
-    WorkerKind.PREFILL: frozenset({OperationType.SEQUENCE_EXTEND}),
+    WorkerKind.FULL: frozenset(WorkVariant),
+    WorkerKind.ENCODER: frozenset({WorkVariant.ENCODE_VISION, WorkVariant.ENCODE_LATENT}),
+    WorkerKind.PREFILL: frozenset({WorkVariant.TOKEN_EXTEND}),
     WorkerKind.DECODE: frozenset(
         {
-            OperationType.SEQUENCE_DECODE,
-            OperationType.SEQUENCE_VERIFY,
-            OperationType.FLOW,
-            OperationType.MATERIALIZE_IMAGE,
-            OperationType.TRANSFER_KV,
+            WorkVariant.TOKEN_DECODE,
+            WorkVariant.TOKEN_VERIFY,
+            WorkVariant.GEN_TRANSITION,
+            WorkVariant.GEN_FLOW,
+            WorkVariant.MATERIALIZE,
+            WorkVariant.TRANSFER_KV_PUBLISH,
+            WorkVariant.TRANSFER_KV_INSTALL,
         }
     ),
-    WorkerKind.SAMPLER: frozenset({OperationType.SEQUENCE_SAMPLE}),
-    WorkerKind.POSTPROCESS: frozenset({OperationType.MATERIALIZE_FRAME}),
+    WorkerKind.SAMPLER: frozenset(),
+    WorkerKind.POSTPROCESS: frozenset({WorkVariant.MATERIALIZE}),
     WorkerKind.UND: frozenset(
         {
-            OperationType.SEQUENCE_EXTEND,
-            OperationType.SEQUENCE_DECODE,
-            OperationType.SEQUENCE_VERIFY,
-            OperationType.SEQUENCE_SAMPLE,
-            OperationType.ENCODE_VISION,
-            OperationType.ENCODE_LATENT,
-            OperationType.TRANSFER_KV,
+            WorkVariant.TOKEN_EXTEND,
+            WorkVariant.TOKEN_DECODE,
+            WorkVariant.TOKEN_VERIFY,
+            WorkVariant.ENCODE_VISION,
+            WorkVariant.ENCODE_LATENT,
+            WorkVariant.TRANSFER_KV_PUBLISH,
+            WorkVariant.TRANSFER_KV_INSTALL,
         }
     ),
     WorkerKind.GEN: frozenset(
         {
-            OperationType.FLOW,
-            OperationType.MATERIALIZE_IMAGE,
-            OperationType.MATERIALIZE_FRAME,
+            WorkVariant.GEN_TRANSITION,
+            WorkVariant.GEN_FLOW,
+            WorkVariant.MATERIALIZE,
         }
     ),
 }

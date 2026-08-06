@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from ..batch import WorkVariant
 from ..server.worker_kind import WorkerKind
-from ..spec import ModelLoadScope, OperationType
+from ..spec import ModelLoadScope
 
 
 class WorkerImplementation(StrEnum):
@@ -19,7 +20,7 @@ class WorkerPlan:
     worker_kind: WorkerKind
     implementation: WorkerImplementation
     model_scope: ModelLoadScope | None
-    allowed_operation_types: frozenset[OperationType]
+    allowed_work_variants: frozenset[WorkVariant]
 
     @property
     def requires_model(self) -> bool:
@@ -45,7 +46,7 @@ def resolve_worker_plan(worker_kind: WorkerKind) -> WorkerPlan:
         worker_kind=worker_kind,
         implementation=implementation,
         model_scope=scope,
-        allowed_operation_types=worker_kind.allowed_operation_types,
+        allowed_work_variants=worker_kind.allowed_work_variants,
     )
 
 

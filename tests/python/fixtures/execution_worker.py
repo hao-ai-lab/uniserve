@@ -38,7 +38,7 @@ def execution_worker(
         ),
         execution=ExecutionConfig(cuda_graph=False, prefill_cuda_graph=False),
         tokenizer=None,
-        allowed_operation_types=ready.spec.operation_types(),
+        allowed_work_variants=ready.spec.operation_variants(),
         defer_sampling=defer_sampling,
         transfer_backend=transfer_backend,
         pipeline_depth=pipeline_depth,

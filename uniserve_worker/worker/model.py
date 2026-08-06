@@ -24,6 +24,7 @@ from ..batch import (
     RequestKey,
     SnapshotRef,
     StorageClass,
+    WorkVariant,
 )
 from ..capabilities import RequestKind
 from ..execution import ModelExecutor, ModelRunner
@@ -47,7 +48,7 @@ from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.residency import ResidencyStore
 from ..runtime.snapshot_store import SnapshotProvider
-from ..spec import DeploymentOverlay, ModelSpec, OperationType, RouteRowKind, resolved_digest
+from ..spec import DeploymentOverlay, ModelSpec, RouteRowKind, resolved_digest
 from .protocol import WorkerContract
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ class ModelWorker:
         attention: AttentionSelection,
         execution: ExecutionConfig,
         tokenizer: object | None,
-        allowed_operation_types: frozenset[OperationType],
+        allowed_work_variants: frozenset[WorkVariant],
         defer_sampling: bool = False,
         transfer_backend: str = "local",
         cross_process: bool = False,
@@ -209,9 +210,8 @@ class ModelWorker:
             )
         self._contract = WorkerContract.compile(
             declared,
-            allowed_operation_types=allowed_operation_types,
-            implemented_operation_types=frozenset(model_spec.operation_types())
-            | frozenset({OperationType.SEQUENCE_SAMPLE, OperationType.MATERIALIZE_FRAME}),
+            allowed_work_variants=allowed_work_variants,
+            implemented_work_variants=frozenset(model_spec.operation_variants()),
             pipeline_depth=pipeline_depth,
             owner=type(self).__name__,
         )
@@ -286,7 +286,7 @@ class ModelWorker:
             tokenizer=tokenizer,
             model_spec_digest=self.model_spec_digest,
             weight_digest=self.weight_digest,
-            allowed_operation_types=frozenset(self._contract.effective_operation_types),
+            allowed_work_variants=frozenset(self._contract.effective_work_variants),
             trace=self.trace,
             pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
@@ -488,8 +488,8 @@ class ModelWorker:
             encode_token_product_bytes,
         )
 
-        types = self._contract.effective_operation_types
-        if OperationType.SEQUENCE_EXTEND not in types:
+        variants = self._contract.effective_work_variants
+        if WorkVariant.TOKEN_EXTEND not in variants:
             return
         pool = self.kv.pool
         if pool is None or self.sessions.session_ids():
@@ -505,7 +505,7 @@ class ModelWorker:
             if (
                 self._execution.cuda_graph
                 and self._execution.cuda_graph_warmup
-                and OperationType.SEQUENCE_DECODE in types
+                and WorkVariant.TOKEN_DECODE in variants
             )
             else (1,)
         )
@@ -613,10 +613,10 @@ class ModelWorker:
                     operations=tuple(operations),
                     input_products=tuple(payloads),
                 ),
-                retain_device_outputs=OperationType.SEQUENCE_DECODE in types,
+                retain_device_outputs=WorkVariant.TOKEN_DECODE in variants,
             )
             predecessors.update(zip(session_ids, operations, strict=True))
-            if OperationType.SEQUENCE_DECODE not in types:
+            if WorkVariant.TOKEN_DECODE not in variants:
                 return
             repeats = 2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
             for batch_size in batch_sizes:
@@ -788,7 +788,7 @@ class ModelWorker:
         )
 
         if (
-            OperationType.FLOW not in self._contract.effective_operation_types
+            WorkVariant.GEN_TRANSITION not in self._contract.effective_work_variants
             or self.model_spec.flow is None
         ):
             return

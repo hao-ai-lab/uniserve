@@ -12,7 +12,7 @@ from ..capabilities import (
     ResourceClass,
     RouteCreditLimits,
     RouteExecutionCapability,
-    configured_work_variants_for_operation_types,
+    configured_work_variants,
 )
 from ..foundation.runtime_config import (
     graph_memory_budget_bytes,
@@ -97,8 +97,8 @@ def resolve_capabilities(
         RequestKind.COPY_KV,
         RequestKind.RELEASE_PRODUCTS,
     ]
-    supported_work = configured_work_variants_for_operation_types(
-        tuple(operation.kind for operation in spec.operations)
+    supported_work = configured_work_variants(
+        operation.kind for operation in spec.operations
     )
     return EngineCaps(
         block_size=int(deployment.block_size),

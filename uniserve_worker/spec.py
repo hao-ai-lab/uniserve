@@ -17,6 +17,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum, StrEnum
 from typing import Any, TypeAlias
 
+from .batch import WorkVariant
 from .foundation.errors import invalid_descriptor
 
 _FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
@@ -33,12 +34,10 @@ __all__ = [
     "MaterializationKind",
     "NoiseScaleSpec",
     "NoiseScaleMode",
-    "OperationKind",
     "OperationSpec",
     "OperationStageCondition",
     "OperationStagePurpose",
     "OperationStageSpec",
-    "OperationType",
     "PositionLayout",
     "ImageInputSpec",
     "ImagePatchSpec",
@@ -53,7 +52,6 @@ __all__ = [
     "ModelLoadScope",
     "PerBranch",
     "ResourcePlan",
-    "RouteOutputKind",
     "RoutePlacement",
     "RouteRowKind",
     "RouteShape",
@@ -79,45 +77,6 @@ __all__ = [
     "active_latent_capacity_tokens",
     "resolved_digest",
 ]
-
-
-class OperationKind(StrEnum):
-    SEQUENCE = "sequence"
-    FLOW = "flow"
-    ENCODE = "encode"
-    MATERIALIZE = "materialize"
-    TRANSFER = "transfer"
-
-
-class OperationType(StrEnum):
-    SEQUENCE_EXTEND = "sequence_extend"
-    SEQUENCE_DECODE = "sequence_decode"
-    SEQUENCE_VERIFY = "sequence_verify"
-    SEQUENCE_SAMPLE = "sequence_sample"
-    FLOW = "flow"
-    ENCODE_VISION = "encode_vision"
-    ENCODE_LATENT = "encode_latent"
-    MATERIALIZE_IMAGE = "materialize_image"
-    MATERIALIZE_FRAME = "materialize_frame"
-    TRANSFER_PRODUCT = "transfer_product"
-    TRANSFER_KV = "transfer_kv"
-
-    @property
-    def kind(self) -> OperationKind:
-        if self in {
-            OperationType.SEQUENCE_EXTEND,
-            OperationType.SEQUENCE_DECODE,
-            OperationType.SEQUENCE_VERIFY,
-            OperationType.SEQUENCE_SAMPLE,
-        }:
-            return OperationKind.SEQUENCE
-        if self is OperationType.FLOW:
-            return OperationKind.FLOW
-        if self in {OperationType.ENCODE_VISION, OperationType.ENCODE_LATENT}:
-            return OperationKind.ENCODE
-        if self in {OperationType.MATERIALIZE_IMAGE, OperationType.MATERIALIZE_FRAME}:
-            return OperationKind.MATERIALIZE
-        return OperationKind.TRANSFER
 
 
 class UnmatchedWeightPolicy(StrEnum):
@@ -391,13 +350,6 @@ class RouteRowKind(StrEnum):
     DECODE = "decode"
 
 
-class RouteOutputKind(StrEnum):
-    TOKEN = "token"
-    FLOW = "flow"
-    ENCODE = "encode"
-    DECODE = "decode"
-
-
 class RoutePlacement(StrEnum):
     PRIMARY = "primary"
     GENERATION = "generation"
@@ -450,11 +402,11 @@ class OperationSpec:
     name.
     """
 
-    kind: OperationType
+    kind: WorkVariant
     stages: tuple[OperationStageSpec, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, OperationType):
+        if not isinstance(self.kind, WorkVariant):
             raise invalid_descriptor(f"invalid operation kind {self.kind!r}")
         primary = sum(stage.purpose is OperationStagePurpose.PRIMARY for stage in self.stages)
         if primary > 1:
@@ -496,7 +448,6 @@ class RouteSpec:
 
     name: str
     row_kinds: tuple[RouteRowKind, ...]
-    output_kinds: tuple[RouteOutputKind, ...]
     mixed_combinations: tuple[tuple[RouteRowKind, ...], ...]
     dtype: str
     placement: RoutePlacement
@@ -509,19 +460,6 @@ class RouteSpec:
             raise invalid_descriptor("RouteSpec.name must not be empty")
         if not self.row_kinds or len(set(self.row_kinds)) != len(self.row_kinds):
             raise invalid_descriptor(f"route {self.name!r} row kinds must be non-empty and unique")
-        if len(self.output_kinds) != len(self.row_kinds):
-            raise invalid_descriptor(f"route {self.name!r} must map each row kind to one output")
-        expected_outputs = {
-            RouteRowKind.TOKEN: RouteOutputKind.TOKEN,
-            RouteRowKind.FLOW: RouteOutputKind.FLOW,
-            RouteRowKind.ENCODE: RouteOutputKind.ENCODE,
-            RouteRowKind.DECODE: RouteOutputKind.DECODE,
-        }
-        if any(
-            expected_outputs[row] is not output
-            for row, output in zip(self.row_kinds, self.output_kinds, strict=True)
-        ):
-            raise invalid_descriptor(f"route {self.name!r} row/output mapping is invalid")
         normalized_combinations = set()
         for combination in self.mixed_combinations:
             if len(combination) < 2 or len(set(combination)) != len(combination):
@@ -904,20 +842,23 @@ class ModelSpec:
                     raise invalid_descriptor(
                         f"operation {operation.kind.value!r} maps {stage.row.value!r} onto route {stage.route!r}, which does not accept it"
                     )
-        if self.flow is None and OperationType.FLOW in operation_kinds:
+        if self.flow is None and (
+            WorkVariant.GEN_TRANSITION in operation_kinds
+            or WorkVariant.GEN_FLOW in operation_kinds
+        ):
             raise invalid_descriptor(
                 "a route accepts flow work but the ModelSpec declares no FlowSpec"
             )
 
-    def operation_types(self) -> frozenset[OperationType]:
-        """Union of the operation types accepted across every declared route."""
+    def operation_variants(self) -> frozenset[WorkVariant]:
+        """Union of the work variants accepted across every declared route."""
         return frozenset(operation.kind for operation in self.operations)
 
-    def operation(self, kind: OperationType) -> OperationSpec:
+    def operation(self, variant: WorkVariant) -> OperationSpec:
         for operation in self.operations:
-            if operation.kind is kind:
+            if operation.kind is variant:
                 return operation
-        raise invalid_descriptor(f"model does not declare operation {kind.value!r}")
+        raise invalid_descriptor(f"model does not declare operation {variant.value!r}")
 
 
 @dataclass(frozen=True)

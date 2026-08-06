@@ -8,10 +8,9 @@ import pytest
 from torch import nn
 
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.batch import DevicePoint, ProductKind, TokenMode
+from uniserve_worker.batch import DevicePoint, ProductKind, TokenMode, WorkVariant
 from uniserve_worker.forward import ForwardBatch, ForwardOutput
 from uniserve_worker.server.stub import StubModel
-from uniserve_worker.spec import OperationType
 
 pytestmark = pytest.mark.integration
 
@@ -59,7 +58,7 @@ def test_warmup_image_geometry_fits_the_declared_latent_capacity() -> None:
 def test_warmup_sequence_qualifies_continuous_device_decode_and_cleans_up() -> None:
     model = _Observed()
     worker = execution_worker(model)
-    if OperationType.SEQUENCE_EXTEND not in worker.contract.effective_operation_types:
+    if WorkVariant.TOKEN_EXTEND not in worker.contract.effective_work_variants:
         pytest.skip("stub does not support sequence extend")
 
     worker._execution = replace(
@@ -130,7 +129,7 @@ def test_warmup_sequence_qualifies_continuous_device_decode_and_cleans_up() -> N
 def test_warmup_flow_drives_a_real_forward_and_cleans_up() -> None:
     model = _Observed()
     worker = execution_worker(model)
-    if OperationType.FLOW not in worker.contract.effective_operation_types:
+    if WorkVariant.GEN_TRANSITION not in worker.contract.effective_work_variants:
         pytest.skip("stub does not support flow")
 
     baseline = (worker.kv.resident_block_count(), worker.kv.scratch_token_count())

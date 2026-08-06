@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from tests.python.fixtures.depth_one import materialize_operation, root_parent, und_admission
@@ -20,9 +22,15 @@ from uniserve_worker.batch import (
     Work,
     WorkVariant,
 )
-from uniserve_worker.capabilities import operation_type
 from uniserve_worker.server.app import WorkerServer, dispatch
-from uniserve_worker.spec import OperationType
+from uniserve_worker.server.stub import StubModel
+from uniserve_worker.spec import (
+    OperationSpec,
+    OperationStageCondition,
+    OperationStagePurpose,
+    OperationStageSpec,
+    RouteRowKind,
+)
 from uniserve_worker.worker.protocol import WorkerContract, model_free_capabilities
 
 pytestmark = pytest.mark.contract
@@ -63,18 +71,18 @@ def test_worker_contract_separates_executable_and_advertised_work():
         pipeline_depth=2,
         completion_payload_bytes=1 << 20,
     )
-    operations = frozenset(
+    work = frozenset(
         {
-            OperationType.SEQUENCE_EXTEND,
-            OperationType.SEQUENCE_DECODE,
-            OperationType.MATERIALIZE_FRAME,
+            WorkVariant.TOKEN_EXTEND,
+            WorkVariant.TOKEN_DECODE,
+            WorkVariant.MATERIALIZE,
         }
     )
 
     contract = WorkerContract.compile(
         declared,
-        allowed_operation_types=operations,
-        implemented_operation_types=operations,
+        allowed_work_variants=work,
+        implemented_work_variants=work,
         pipeline_depth=2,
         owner="ExecutionWorker",
     )
@@ -84,10 +92,35 @@ def test_worker_contract_separates_executable_and_advertised_work():
     assert (
         contract.capabilities.execution_constraints.route_capabilities[0].supported_work == expected
     )
-    assert contract.effective_operation_types == operations
+    assert contract.effective_work_variants == work
 
 
-def test_materialization_operation_type_is_fixed_by_its_registered_input_product():
+def _materialize_state_model() -> StubModel:
+    """A stub whose materialize op declares a retained-image state stage."""
+
+    model = StubModel()
+    operations = tuple(
+        OperationSpec(
+            WorkVariant.MATERIALIZE,
+            (
+                OperationStageSpec(
+                    "stub",
+                    RouteRowKind.FLOW,
+                    OperationStagePurpose.STATE,
+                    OperationStageCondition.RETAIN_IMAGE,
+                ),
+            ),
+        )
+        if operation.kind is WorkVariant.MATERIALIZE
+        else operation
+        for operation in model.spec.operations
+    )
+    model.spec = replace(model.spec, operations=operations)
+    return model
+
+
+def test_materialization_stages_are_fixed_by_its_registered_input_product():
+    executor = execution_worker(_materialize_state_model()).executor
     admission = und_admission(17)
     rk = admission.request_key
     parent = root_parent(admission)
@@ -125,5 +158,8 @@ def test_materialization_operation_type_is_fixed_by_its_registered_input_product
         inputs=(transported_frame,),
     )
 
-    assert operation_type(image) is OperationType.MATERIALIZE_IMAGE
-    assert operation_type(frame) is OperationType.MATERIALIZE_FRAME
+    # A latent-backed materialize lowers to the model's declared image stages;
+    # a transported frame is model-free and lowers to no neural stage.
+    assert executor._operation_stages_for(image) == executor._stages(WorkVariant.MATERIALIZE)
+    assert executor._operation_stages_for(image)
+    assert executor._operation_stages_for(frame) == ()

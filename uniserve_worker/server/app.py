@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..batch import Batch, CompletionReport, PartitionCompletion, SnapshotRef
-from ..capabilities import RequestKind, ResponseKind, operation_type
+from ..capabilities import RequestKind, ResponseKind
 from ..execution.executor import finalize_completion_report, partition_completion_ready
 from ..foundation.env import env_int
 from ..foundation.errors import (
@@ -33,13 +33,13 @@ class _PendingExecution:
         self,
         worker: Worker,
         prepared: object,
-        operation_types: list[str],
+        variant_labels: list[str],
         metrics: MetricsService,
         started: int,
     ) -> None:
         self.worker = worker
         self.prepared = prepared
-        self.operation_types = operation_types
+        self.variant_labels = variant_labels
         self.metrics = metrics
         self.started = started
 
@@ -60,7 +60,7 @@ class _PendingExecution:
             raise RuntimeError("prepared worker execution returned an invalid report")
         self.metrics.record_execute(
             self.metrics.now_ns() - self.started,
-            self.operation_types,
+            self.variant_labels,
         )
         return result
 
@@ -198,17 +198,17 @@ def _execute(worker: Worker, request: Mapping[str, Any], metrics: MetricsService
             f"execution batch contains work variants outside worker capabilities: {names!r}"
         )
     started = metrics.now_ns()
-    operation_types = [operation_type(value).value for value in batch.operations]
+    variant_labels = [operation.work.variant.value for operation in batch.operations]
     prepare = getattr(worker, "prepare_execute", None)
     prepared = prepare(batch) if callable(prepare) else None
     if prepared is not None:
-        pending = _PendingExecution(worker, prepared, operation_types, metrics, started)
+        pending = _PendingExecution(worker, prepared, variant_labels, metrics, started)
         if not pending.ready():
             return _response(ResponseKind.RESULT, completion_report=pending)
         result = pending.resolve()
     else:
         result = worker.execute(batch)
-        metrics.record_execute(metrics.now_ns() - started, operation_types)
+        metrics.record_execute(metrics.now_ns() - started, variant_labels)
     # Carry the report object so the progress loop can query its completion
     # events and serialize only records whose pinned copies are ready.
     return _response(ResponseKind.RESULT, completion_report=result)

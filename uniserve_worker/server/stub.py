@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..batch import WorkVariant
 from ..forward import (
     EncodeKind,
     EncodeOutput,
@@ -46,11 +47,9 @@ from ..spec import (
     NoiseScaleSpec,
     OperationSpec,
     OperationStageSpec,
-    OperationType,
     PerBranch,
     PositionLayout,
     ResourcePlan,
-    RouteOutputKind,
     RoutePlacement,
     RouteRowKind,
     RouteShape,
@@ -127,7 +126,6 @@ class StubModel(nn.Module):
                 RouteSpec(
                     name="stub",
                     row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW),
-                    output_kinds=(RouteOutputKind.TOKEN, RouteOutputKind.FLOW),
                     mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
                     dtype="bfloat16",
                     placement=RoutePlacement.PRIMARY,
@@ -138,7 +136,6 @@ class StubModel(nn.Module):
                 RouteSpec(
                     name="encode",
                     row_kinds=(RouteRowKind.ENCODE,),
-                    output_kinds=(RouteOutputKind.ENCODE,),
                     mixed_combinations=(),
                     dtype="bfloat16",
                     placement=RoutePlacement.PRIMARY,
@@ -153,32 +150,37 @@ class StubModel(nn.Module):
             ),
             operations=(
                 OperationSpec(
-                    OperationType.SEQUENCE_EXTEND,
+                    WorkVariant.TOKEN_EXTEND,
                     (OperationStageSpec("stub", RouteRowKind.TOKEN),),
                 ),
                 OperationSpec(
-                    OperationType.SEQUENCE_DECODE,
+                    WorkVariant.TOKEN_DECODE,
                     (OperationStageSpec("stub", RouteRowKind.TOKEN),),
                 ),
                 OperationSpec(
-                    OperationType.SEQUENCE_VERIFY,
+                    WorkVariant.TOKEN_VERIFY,
                     (OperationStageSpec("stub", RouteRowKind.TOKEN),),
                 ),
                 OperationSpec(
-                    OperationType.FLOW,
+                    WorkVariant.GEN_TRANSITION,
                     (OperationStageSpec("stub", RouteRowKind.FLOW),),
                 ),
                 OperationSpec(
-                    OperationType.ENCODE_VISION,
+                    WorkVariant.GEN_FLOW,
+                    (OperationStageSpec("stub", RouteRowKind.FLOW),),
+                ),
+                OperationSpec(
+                    WorkVariant.ENCODE_VISION,
                     (OperationStageSpec("encode", RouteRowKind.ENCODE),),
                 ),
                 OperationSpec(
-                    OperationType.ENCODE_LATENT,
+                    WorkVariant.ENCODE_LATENT,
                     (OperationStageSpec("encode", RouteRowKind.ENCODE),),
                 ),
-                OperationSpec(OperationType.MATERIALIZE_IMAGE),
-                OperationSpec(OperationType.TRANSFER_PRODUCT),
-                OperationSpec(OperationType.TRANSFER_KV),
+                OperationSpec(WorkVariant.MATERIALIZE),
+                OperationSpec(WorkVariant.TRANSFER_PRODUCT),
+                OperationSpec(WorkVariant.TRANSFER_KV_PUBLISH),
+                OperationSpec(WorkVariant.TRANSFER_KV_INSTALL),
             ),
             weights=WeightSpec(),
             inputs=InputSpec(

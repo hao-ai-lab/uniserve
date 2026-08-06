@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ...batch import WorkVariant
 from ...forward import (
     EncodeKind,
     EncodeOutput,
@@ -77,9 +78,7 @@ from ...spec import (
     OperationStageCondition,
     OperationStagePurpose,
     OperationStageSpec,
-    OperationType,
     PositionLayout,
-    RouteOutputKind,
     RoutePlacement,
     RouteRowKind,
     RouteShape,
@@ -733,7 +732,6 @@ class NEOChatModel(nn.Module):
                 RouteSpec(
                     name="mot",
                     row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW),
-                    output_kinds=(RouteOutputKind.TOKEN, RouteOutputKind.FLOW),
                     mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
                     dtype="bfloat16",
                     placement=RoutePlacement.MESH,
@@ -747,7 +745,6 @@ class NEOChatModel(nn.Module):
                 RouteSpec(
                     name="vit",
                     row_kinds=(RouteRowKind.ENCODE,),
-                    output_kinds=(RouteOutputKind.ENCODE,),
                     mixed_combinations=(),
                     dtype="bfloat16",
                     placement=RoutePlacement.PRIMARY,
@@ -762,24 +759,29 @@ class NEOChatModel(nn.Module):
             ),
             operations=(
                 OperationSpec(
-                    OperationType.SEQUENCE_EXTEND, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                    WorkVariant.TOKEN_EXTEND, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
                 ),
                 OperationSpec(
-                    OperationType.SEQUENCE_DECODE, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                    WorkVariant.TOKEN_DECODE, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
                 ),
                 OperationSpec(
-                    OperationType.SEQUENCE_VERIFY, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                    WorkVariant.TOKEN_VERIFY, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
                 ),
-                OperationSpec(OperationType.FLOW, (OperationStageSpec("mot", RouteRowKind.FLOW),)),
                 OperationSpec(
-                    OperationType.ENCODE_VISION,
+                    WorkVariant.GEN_TRANSITION, (OperationStageSpec("mot", RouteRowKind.FLOW),)
+                ),
+                OperationSpec(
+                    WorkVariant.GEN_FLOW, (OperationStageSpec("mot", RouteRowKind.FLOW),)
+                ),
+                OperationSpec(
+                    WorkVariant.ENCODE_VISION,
                     (
                         OperationStageSpec("vit", RouteRowKind.ENCODE),
                         OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
                     ),
                 ),
                 OperationSpec(
-                    OperationType.MATERIALIZE_IMAGE,
+                    WorkVariant.MATERIALIZE,
                     (
                         OperationStageSpec(
                             "vit",
@@ -795,9 +797,16 @@ class NEOChatModel(nn.Module):
                         ),
                     ),
                 ),
-                OperationSpec(OperationType.TRANSFER_PRODUCT),
+                OperationSpec(WorkVariant.TRANSFER_PRODUCT),
                 OperationSpec(
-                    OperationType.TRANSFER_KV,
+                    WorkVariant.TRANSFER_KV_PUBLISH,
+                    (
+                        OperationStageSpec("vit", RouteRowKind.ENCODE, OperationStagePurpose.STATE),
+                        OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
+                    ),
+                ),
+                OperationSpec(
+                    WorkVariant.TRANSFER_KV_INSTALL,
                     (
                         OperationStageSpec("vit", RouteRowKind.ENCODE, OperationStagePurpose.STATE),
                         OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
