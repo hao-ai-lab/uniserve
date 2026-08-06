@@ -18,6 +18,11 @@ def test_decode_runtime_suite_resolves_to_four_explicit_points() -> None:
         "sensenova-uniserve-t2i-c32",
         "sensenova-uniserve-interleave-c4",
     )
+    assert tuple((metric.name, metric.direction) for metric in points[-1].metrics) == (
+        ("mean_ttft_ms", "lower"),
+        ("mean_tpot_ms", "lower"),
+        ("images.image_latency_ms.mean", "lower"),
+    )
     assert config.suites["decode-runtime"].max_regression == 0.10
 
 

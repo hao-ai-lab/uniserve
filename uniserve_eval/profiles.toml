@@ -131,9 +131,6 @@ wire = "openai_chat"
 mean_ttft_ms = "lower"
 mean_tpot_ms = "lower"
 "images.image_latency_ms.mean" = "lower"
-"modality_interleave.transition_latency_ms.mean" = "lower"
-"modality_interleave.text_to_image_latency_ms.mean" = "lower"
-"modality_interleave.image_to_text_latency_ms.mean" = "lower"
 
 [suites.decode-runtime]
 points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-c32", "sensenova-uniserve-t2i-c32", "sensenova-uniserve-interleave-c4"]

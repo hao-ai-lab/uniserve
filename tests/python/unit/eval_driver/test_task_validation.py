@@ -80,8 +80,6 @@ def test_interleave_sends_no_count_and_checks_point_average() -> None:
         task="interleave",
         success=True,
         generated_text="answer",
-        output_modalities=["text"],
-        modality_events=[{"modalities": ["text"], "client_time": 1.0}],
         output_len_source="server_usage",
         prompt_len_source="server_usage",
     )
@@ -90,11 +88,6 @@ def test_interleave_sends_no_count_and_checks_point_average() -> None:
         task="interleave",
         success=True,
         generated_text="answer",
-        output_modalities=["text", "image"],
-        modality_events=[
-            {"modalities": ["text"], "client_time": 1.0},
-            {"modalities": ["image"], "client_time": 2.0},
-        ],
         output_len_source="server_usage",
         prompt_len_source="server_usage",
         images=2,

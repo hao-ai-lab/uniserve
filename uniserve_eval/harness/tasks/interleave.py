@@ -59,13 +59,8 @@ class InterleaveTask(BenchmarkTask):
         )
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
-        from ..metrics.stream import interleave_transition_summary
-
         checks = image_integrity_checks(records, width=self.spec.width, height=self.spec.height)
-        checks["visible_text"] = bool(records) and all(
-            bool(record.generated_text) and "text" in record.output_modalities
-            for record in records
-        )
+        checks["visible_text"] = bool(records) and all(record.generated_text for record in records)
         checks["server_usage"] = bool(records) and all(
             record.output_len_source == "server_usage" and record.prompt_len_source == "server_usage"
             for record in records
@@ -74,9 +69,6 @@ class InterleaveTask(BenchmarkTask):
         mean_images = total_images / len(records) if records else 0.0
         minimum = self.spec.minimum_average_images
         checks["minimum_average_images"] = minimum is None or mean_images >= minimum
-        checks["client_transition_timestamps"] = interleave_transition_summary(
-            list(records)
-        )["valid"]
         zero_image_requests = sum(record.images == 0 for record in records)
         return ValidationResult(
             checks=checks,

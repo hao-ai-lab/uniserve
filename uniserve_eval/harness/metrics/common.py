@@ -66,8 +66,6 @@ class RequestRecord:
     # Visible content chunks (OpenAI streaming), retained only for the optional
     # retokenized-ITL cross-check that mirrors sglang.
     text_chunks: list[str] = field(default_factory=list)
-    output_modalities: list[str] = field(default_factory=list)
-    modality_events: list[dict[str, Any]] = field(default_factory=list)
 
     # Image accounting. ``image_latencies`` is per-image E2E from request start to image availability; ``first_image_latency`` is time to the first image signal; ``image_gen_seconds`` is populated only when a backend exposes a per-image generation span; ``image_steps`` is populated only when a backend reports per-image diffusion steps.
     images: int = 0
@@ -165,21 +163,6 @@ class RequestRecord:
             "generated_text_sha256": (
                 hashlib.sha256(generated_text_bytes).hexdigest() if generated_text_bytes else None
             ),
-            "output_modalities": list(self.output_modalities),
-            "modality_events": [
-                {
-                    "modalities": list(event.get("modalities", [])),
-                    "text_bytes": int(event.get("text_bytes", 0)),
-                    "image_count": int(event.get("image_count", 0)),
-                    "client_offset_ms": (
-                        (float(event["client_time"]) - self.start_time) * 1000.0
-                        if isinstance(event.get("client_time"), (int, float))
-                        and not isinstance(event.get("client_time"), bool)
-                        else None
-                    ),
-                }
-                for event in self.modality_events
-            ],
             "images": self.images,
             "image_outputs": [image.metadata_dict() for image in self.decoded_images],
             "first_image_latency_ms": (

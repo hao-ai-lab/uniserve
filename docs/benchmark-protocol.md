@@ -55,7 +55,7 @@ Text with `ignore_eos = true` must reach each row's requested completion length 
 
 T2I declares `image_count`; every request must return exactly that many decoded images with the declared dimensions.
 
-Interleave sends no image-count field. Individual requests may emit zero or multiple images. When `minimum_average_images` is configured, the evaluator applies it to `sum(images) / request_count` across the full point. Realized image and transition metrics use decoded public stream events and client receive timestamps.
+Interleave sends no image-count field. Individual requests may emit zero or multiple images. When `minimum_average_images` is configured, the evaluator applies it to `sum(images) / request_count` across the full point. Realized image metrics use decoded public stream events and client receive timestamps.
 
 ## Result bundle
 
@@ -67,6 +67,6 @@ Git state, GPU information, server command, selected environment values, and ser
 
 ## Comparison
 
-The direct parent and prospective commit must have identical benchmark names, declared workloads, selected rows, and metric declarations. The comparator reads aggregate metrics from the complete point bundles; it never filters to a successful-request intersection. When the task allows natural EOS or open-ended interleave output, realized token, image, and transition counts are measured results rather than workload-equivalence fields.
+The direct parent and prospective commit must have identical benchmark names, declared workloads, selected rows, and metric declarations. The comparator reads aggregate metrics from the complete point bundles; it never filters to a successful-request intersection. When the task allows natural EOS or open-ended interleave output, realized token and image counts are measured results rather than workload-equivalence fields.
 
 For higher-is-better metrics the normalized ratio is `candidate / reference`. For lower-is-better metrics it is `reference / candidate`. Every row reports both raw values, raw percentage change, normalized ratio, threshold, and comparison-screen result. A screen crossing is evidence for diagnosis, not an automatic performance gate failure or a reason to halt work.

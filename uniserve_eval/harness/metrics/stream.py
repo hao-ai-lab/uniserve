@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import numpy as np
@@ -67,92 +66,7 @@ def summarize_stream(
     image_block = _image_block(successful, duration)
     if image_block is not None:
         summary["images"] = image_block
-    if successful and all(record.task == "interleave" for record in successful):
-        summary["modality_interleave"] = interleave_transition_summary(successful)
     return summary
-
-
-def interleave_transition_summary(records: list[RequestRecord]) -> dict[str, Any]:
-    timings = [_request_transition_timing(record) for record in records]
-    complete = [timing for timing in timings if timing["valid"]]
-    transitions = [
-        value for timing in complete for value in timing["transition_latencies"]
-    ]
-    text_to_image = [
-        value for timing in complete for value in timing["text_to_image_latencies"]
-    ]
-    image_to_text = [
-        value for timing in complete for value in timing["image_to_text_latencies"]
-    ]
-    patterns: dict[str, int] = {}
-    for timing in timings:
-        signature = str(timing["signature"])
-        patterns[signature] = patterns.get(signature, 0) + 1
-    return {
-        "valid": bool(records) and len(complete) == len(records),
-        "request_count": len(records),
-        "complete_request_count": len(complete),
-        "realized_transition_count": len(transitions),
-        "patterns": patterns,
-        "transition_latency_ms": distribution(transitions, scale=1000),
-        "text_to_image_latency_ms": distribution(text_to_image, scale=1000),
-        "image_to_text_latency_ms": distribution(image_to_text, scale=1000),
-    }
-
-
-def _request_transition_timing(record: RequestRecord) -> dict[str, Any]:
-    segments: list[dict[str, Any]] = []
-    valid = bool(record.modality_events)
-    previous_timestamp: float | None = None
-    for event in record.modality_events:
-        modalities = event.get("modalities")
-        timestamp = event.get("client_time")
-        if (
-            not isinstance(modalities, list)
-            or len(modalities) != 1
-            or modalities[0] not in {"text", "image"}
-            or isinstance(timestamp, bool)
-            or not isinstance(timestamp, (int, float))
-            or not math.isfinite(float(timestamp))
-        ):
-            valid = False
-            continue
-        timestamp = float(timestamp)
-        if previous_timestamp is not None and timestamp < previous_timestamp:
-            valid = False
-        previous_timestamp = timestamp
-        modality = modalities[0]
-        if segments and segments[-1]["modality"] == modality:
-            segments[-1]["last"] = timestamp
-        else:
-            segments.append({"modality": modality, "first": timestamp, "last": timestamp})
-
-    signature = "->".join(str(segment["modality"]) for segment in segments)
-    valid = valid and bool(segments) and signature == "->".join(record.output_modalities)
-    transitions: list[float] = []
-    text_to_image: list[float] = []
-    image_to_text: list[float] = []
-    for source, destination in zip(segments, segments[1:]):
-        latency = float(destination["first"]) - float(source["last"])
-        if latency < 0:
-            valid = False
-            continue
-        transitions.append(latency)
-        if source["modality"] == "text" and destination["modality"] == "image":
-            text_to_image.append(latency)
-        elif source["modality"] == "image" and destination["modality"] == "text":
-            image_to_text.append(latency)
-        else:
-            valid = False
-    if len(transitions) != max(0, len(record.output_modalities) - 1):
-        valid = False
-    return {
-        "valid": valid,
-        "signature": signature,
-        "transition_latencies": transitions if valid else [],
-        "text_to_image_latencies": text_to_image if valid else [],
-        "image_to_text_latencies": image_to_text if valid else [],
-    }
 
 
 def _image_block(successful: list[RequestRecord], dur_s: float) -> dict[str, Any] | None:
