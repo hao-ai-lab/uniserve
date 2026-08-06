@@ -10,7 +10,7 @@
 //!
 //! After startup the process runs three explicit tasks: an input task decodes
 //! `[request-type, payload]` frames from the DEALER
-//! socket into scheduler commands, per-request adapter tasks translate
+//! socket into scheduler commands, per-request output tasks translate
 //! `GenEvent` streams into wire outputs, and an output task batches them onto
 //! the PUSH socket.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -495,17 +495,6 @@ fn execute_utility(core: &Arc<EngineCore>, req: EngineCoreUtilityRequest) -> Uti
             "wake_up" => {
                 core.wake_up();
                 Value::Nil
-            }
-            "add_lora" => {
-                let (lora,): (uniserve_engine_wire::lora::LoraRequest,) =
-                    rmpv::ext::from_value(req.args.clone())
-                        .context("add_lora expects (LoraRequest,)")?;
-                Value::Boolean(core.add_lora(lora.lora_int_id as u32, lora.lora_path.clone()))
-            }
-            "remove_lora" => {
-                let (lora_id,): (u64,) = rmpv::ext::from_value(req.args.clone())
-                    .context("remove_lora expects (lora_id,)")?;
-                Value::Boolean(core.remove_lora(lora_id as u32))
             }
             "collective_rpc" => {
                 // args = (method, timeout, args, kwargs) — only payload-free descriptor

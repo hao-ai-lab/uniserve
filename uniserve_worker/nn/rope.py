@@ -499,7 +499,6 @@ def qk_norm_rope(
     axis_dims: tuple[int, ...] | None = None,
     identity_axes: tuple[int, ...] | None = None,
     quant: object | None = None,
-    adapters: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the shared Q/K normalization and rotary-position equation."""
 
@@ -520,7 +519,6 @@ def qk_norm_rope(
             axis_dims,
             identity_axes,
             quant,
-            adapters,
         )
     )
 

@@ -1,10 +1,8 @@
 //! Sole internal generate-class admission value ([`GenerateReqInput`]) and the
 //! sole value submitted to the engine gateway ([`TokenizedGenerateReqInput`]).
 //!
-//! These types contain no grammar, structured-output, adapter, drafter,
-//! disaggregated-transfer, or preemption controls. Model-private prompt recipes,
-//! token placement, generation policies, and output filters never appear here —
-//! they live behind [`crate::model::ResolvedModel::tokenize`].
+//! Model-private prompt recipes, token placement, generation policies, and
+//! output filters live behind [`crate::model::ResolvedModel::tokenize`].
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -235,8 +233,7 @@ pub struct ModelEventIdentity {
 #[derive(Debug, Clone)]
 pub struct TokenizedGenerateReqInput {
     pub request_id: ServeRequestId,
-    /// Canonical engine request. `lora_id` and `grammar` are always `None` from
-    /// the public funnel.
+    /// Canonical engine request from the public funnel.
     pub request: GenerationRequest,
     pub prompt_token_ids: Vec<u32>,
     pub decode: TextDecodeOptions,

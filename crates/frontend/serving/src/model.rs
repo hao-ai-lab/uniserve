@@ -404,8 +404,6 @@ impl Qwen3Desc {
             stop_strings: request.stop.stop_strings.clone(),
             stop_token_ids: lowered.stop_token_ids,
             priority: request.scheduling.priority,
-            lora_id: None,
-            grammar: None,
             cache: cache.clone(),
             policy,
             resources: resources.clone(),
@@ -424,8 +422,6 @@ impl Qwen3Desc {
             scratch_units: 0,
             host_scratch_tokens: 0,
             encoder_cache_pins: 0,
-            grammar_states: 0,
-            adapter_slots: 0,
             replayable: true,
         };
 

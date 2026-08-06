@@ -123,7 +123,6 @@ from uniserve_worker.nn.diffusion.schedule import (
 from uniserve_worker.nn.mesh import BroadcastTransport
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.nn.vision.patching import patchify_batch, unpatchify_batch
-from uniserve_worker.runtime.adapter_store import AdapterStore
 from uniserve_worker.runtime.completion_store import (
     CompletionArena,
     CompletionByteCapture,
@@ -1538,7 +1537,7 @@ class ModelExecutor:
         latents: LatentStore,
         products: ProductStore,
         replay: ReplayStore,
-        adapters: AdapterStore | None,
+        weights: WeightSet | None,
         mesh: MeshStore | None,
         transport: Transport | None,
         tokenizer: Any | None,
@@ -1556,8 +1555,8 @@ class ModelExecutor:
             raise ValueError("executor must accept at least one operation type")
         if (spec is None) != (deployment is None):
             raise ValueError("model spec and deployment overlay must be present together")
-        if runner is not None and (spec is None or adapters is None):
-            raise ValueError("model execution requires declarations and an adapter store")
+        if runner is not None and (spec is None or weights is None):
+            raise ValueError("model execution requires declarations and base weights")
         if (runner is None) != (attention is None):
             raise ValueError("model runner and attention selection must be provisioned together")
         if spec is not None:
@@ -1566,9 +1565,9 @@ class ModelExecutor:
                 raise capability_mismatch(
                     "executor model-spec identity does not match its declarations"
                 )
-            if weight_digest is None or adapters is None or adapters.base.digest != weight_digest:
+            if weight_digest is None or weights is None or weights.digest != weight_digest:
                 raise capability_mismatch(
-                    "executor base-weight identity does not match its adapter store"
+                    "executor base-weight identity does not match its weight set"
                 )
             unsupported = allowed_operation_types - spec.operation_types()
             system_only = {OperationType.SEQUENCE_SAMPLE, OperationType.MATERIALIZE_FRAME}
@@ -1586,7 +1585,7 @@ class ModelExecutor:
         self.latents = latents
         self.products = products
         self.replay = replay
-        self.adapters = adapters
+        self.weights = weights
         self.mesh = mesh
         self.transport = transport
         self.tokenizer = tokenizer
@@ -2072,7 +2071,7 @@ class ModelExecutor:
                 kv_entries=scope.kv.entries(
                     tuple(operation.request_key.session_id for operation in operations)
                 ),
-                weights=tuple(self._weights(session) for session in aligned_sessions),
+                weights=tuple(self._weights() for _ in aligned_sessions),
                 identities=tuple(_operation_identity(operation) for operation in operations),
             )
             self._reserve_outputs(operations, scope)
@@ -3727,10 +3726,10 @@ class ModelExecutor:
         )
         return view, attention
 
-    def _weights(self, session: RequestSession) -> WeightSet:
-        if self.adapters is None:
+    def _weights(self) -> WeightSet:
+        if self.weights is None:
             raise RuntimeError("model route has no immutable weight authority")
-        return self.adapters.view(session.adapter_id)
+        return self.weights
 
     def _route(self, stage: OperationStageSpec) -> RouteSpec:
         try:
@@ -4242,7 +4241,7 @@ class ModelExecutor:
         return _ForwardTask(
             operation=operation,
             session=session,
-            weights=self._weights(session) if weights is None else weights,
+            weights=self._weights() if weights is None else weights,
             stage=stage,
             route=self._route(stage),
             row=row,
@@ -5035,7 +5034,7 @@ class ModelExecutor:
         return _ForwardTask(
             operation=operation,
             session=session,
-            weights=self._weights(session),
+            weights=self._weights(),
             stage=stage,
             route=route,
             row=row,
@@ -5113,7 +5112,7 @@ class ModelExecutor:
         return _ForwardTask(
             operation=operation,
             session=session,
-            weights=self._weights(session),
+            weights=self._weights(),
             stage=stage,
             route=self._route(stage),
             row=row,
@@ -5442,7 +5441,7 @@ class ModelExecutor:
             task = _ForwardTask(
                 operation=operation,
                 session=session,
-                weights=self._weights(session),
+                weights=self._weights(),
                 stage=stage,
                 route=self._route(stage),
                 row=DecodeRow(
@@ -5653,7 +5652,7 @@ class ModelExecutor:
         return _ForwardTask(
             operation=operation,
             session=session,
-            weights=self._weights(session),
+            weights=self._weights(),
             stage=stage,
             route=self._route(stage),
             row=row,
@@ -5833,7 +5832,7 @@ class ModelExecutor:
         return _ForwardTask(
             operation=operation,
             session=session,
-            weights=self._weights(session),
+            weights=self._weights(),
             stage=stage,
             route=self._route(stage),
             row=row,
@@ -5944,7 +5943,7 @@ class ModelExecutor:
         return _ForwardTask(
             operation=operation,
             session=session,
-            weights=self._weights(session),
+            weights=self._weights(),
             stage=stage,
             route=self._route(stage),
             row=row,

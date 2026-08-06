@@ -42,8 +42,6 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
-        lora_id: None,
-        grammar: None,
         cache: Default::default(),
         policy,
         resources: GenerationResourceBounds {

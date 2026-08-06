@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use uniserve_core::RequestId;
 
 pub use uniserve_core::{
-    GenerationConstraint as Constraint, GenerationRequest, GrammarSpec, ImageParams as ImgParams,
+    GenerationConstraint as Constraint, GenerationRequest, ImageParams as ImgParams,
     SamplingParams as SampParams,
 };
 
@@ -330,15 +330,6 @@ pub enum Command {
     ResetEncoderCache,
     /// Pause/resume admission (the `/sleep` and `/wake_up` endpoints).
     SetSleeping(bool),
-    /// Load a LoRA adapter (the `/v1/load_lora_adapter` endpoint).
-    LoadLora {
-        id: u32,
-        path: String,
-    },
-    /// Unload a LoRA adapter (the `/v1/unload_lora_adapter` endpoint).
-    UnloadLora {
-        id: u32,
-    },
     /// Execute one control method on every worker rank and reply with
     /// `(rank, ok, message)` acks — the collective_rpc surface.
     CollectiveRpc {
@@ -454,13 +445,6 @@ impl EngineHandle {
     pub fn set_sleeping(&self, sleeping: bool) {
         let _ = self.send(Command::SetSleeping(sleeping));
     }
-    /// Load/unload a LoRA adapter through the control plane.
-    pub fn load_lora(&self, id: u32, path: String) {
-        let _ = self.send(Command::LoadLora { id, path });
-    }
-    pub fn unload_lora(&self, id: u32) {
-        let _ = self.send(Command::UnloadLora { id });
-    }
     /// Execute one control method on every worker rank, awaiting per-rank acks
     /// (blocks the caller; the scheduler executes it inline between steps).
     pub fn collective_rpc(
@@ -510,8 +494,6 @@ mod tests {
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
-            lora_id: None,
-            grammar: None,
             cache: Default::default(),
             policy,
             resources: GenerationResourceBounds {
@@ -536,9 +518,7 @@ mod tests {
         assert!(request.stop_strings.is_empty());
         assert!(request.stop_token_ids.is_empty());
         assert_eq!(request.priority, 0);
-        assert_eq!(request.lora_id, None);
         assert_eq!(request.context_image_count(), 0);
-        assert_eq!(request.grammar, None);
         assert!(request.cache.read);
         assert!(request.cache.write);
         assert!(request.validate().is_ok());
@@ -671,29 +651,6 @@ mod tests {
         match rx.recv().unwrap() {
             Command::Abort(id) => assert_eq!(id, RequestId(2)),
             _ => panic!("expected Abort command"),
-        }
-    }
-
-    /// LoRA load/unload map onto their respective commands with id and path
-    /// preserved.
-    #[test]
-    fn load_and_unload_lora_send_lora_commands() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
-
-        handle.load_lora(3, "/adapters/x".to_string());
-        handle.unload_lora(3);
-
-        match rx.recv().unwrap() {
-            Command::LoadLora { id, path } => {
-                assert_eq!(id, 3);
-                assert_eq!(path, "/adapters/x");
-            }
-            _ => panic!("expected LoadLora command"),
-        }
-        match rx.recv().unwrap() {
-            Command::UnloadLora { id } => assert_eq!(id, 3),
-            _ => panic!("expected UnloadLora command"),
         }
     }
 

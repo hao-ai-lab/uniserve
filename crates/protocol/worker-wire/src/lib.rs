@@ -884,7 +884,7 @@ pub enum CloseReason {
 }
 
 /// The entire request-runtime command channel. Administrative worker commands
-/// (drop session, copy KV, adapters, prefix-cache reset, snapshot and restore)
+/// (drop session, copy KV, prefix-cache reset, snapshot and restore)
 /// are a separate channel and are not part of `Control`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
@@ -1043,7 +1043,6 @@ pub struct Admission {
     pub digest: Digest,
     pub und: Option<UndAdmission>,
     pub gen_admission: Option<GenAdmission>,
-    pub adapter_id: Option<u32>,
 }
 
 impl Admission {
@@ -1051,7 +1050,6 @@ impl Admission {
         request_key: RequestKey,
         und: Option<UndAdmission>,
         gen_admission: Option<GenAdmission>,
-        adapter_id: Option<u32>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             und.is_some() || gen_admission.is_some(),
@@ -1062,7 +1060,6 @@ impl Admission {
             digest: String::new(),
             und,
             gen_admission,
-            adapter_id,
         };
         admission.digest = admission.payload_digest();
         Ok(admission)
@@ -1082,7 +1079,6 @@ impl Admission {
         digest.option(self.gen_admission.as_ref(), |digest, branch| {
             digest.image(&branch.image)
         });
-        digest.option(self.adapter_id, CanonicalDigest::u32);
         digest.finish()
     }
 
@@ -1761,16 +1757,6 @@ impl CompletionReport {
 // Capabilities and startup agreement
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AdapterMode {
-    #[default]
-    None,
-    EngineWide,
-    PerRequest,
-    MultiAdapter,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteExecutionCapability {
     pub route: RouteId,
@@ -1853,7 +1839,6 @@ pub struct EngineCaps {
     pub pipeline_depth: u32,
     pub encoder_cache_budget: u32,
     pub supported_controls: Vec<RequestKind>,
-    pub adapter_mode: AdapterMode,
     pub execution_constraints: ExecutionConstraints,
     pub resource_classes: Vec<ResourceClass>,
     pub model_spec_digest: Digest,
@@ -1891,7 +1876,6 @@ impl EngineCaps {
         digest.u32(self.max_vit_grid_tokens);
         digest.u64(self.max_latent_feature_bytes);
         digest.u64(self.max_vision_feature_bytes);
-        digest.u8(self.adapter_mode as u8);
         digest.u32(self.execution_constraints.max_batch_operations);
         digest.u32(self.execution_constraints.max_speculative_points);
         digest.bool(self.execution_constraints.device_sequence_lengths);
@@ -2052,7 +2036,6 @@ impl Default for EngineCaps {
             pipeline_depth: 1,
             encoder_cache_budget: 0,
             supported_controls: Vec::new(),
-            adapter_mode: AdapterMode::None,
             execution_constraints: ExecutionConstraints::default(),
             resource_classes: Vec::new(),
             model_spec_digest: String::new(),
@@ -2179,8 +2162,6 @@ pub enum RequestKind {
     DropSession,
     Shutdown,
     CopyKv,
-    LoadAdapter,
-    UnloadAdapter,
     ReleaseProducts,
     ResetPrefixCache,
     GetMetrics,
@@ -2190,15 +2171,13 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 12] = [
         Self::GetCapabilities,
         Self::Execute,
         Self::PollCompletions,
         Self::DropSession,
         Self::Shutdown,
         Self::CopyKv,
-        Self::LoadAdapter,
-        Self::UnloadAdapter,
         Self::ReleaseProducts,
         Self::ResetPrefixCache,
         Self::GetMetrics,
@@ -2215,8 +2194,6 @@ impl RequestKind {
             Self::DropSession => "drop_session",
             Self::Shutdown => "shutdown",
             Self::CopyKv => "copy_kv",
-            Self::LoadAdapter => "load_adapter",
-            Self::UnloadAdapter => "unload_adapter",
             Self::ReleaseProducts => "release_products",
             Self::ResetPrefixCache => "reset_prefix_cache",
             Self::GetMetrics => "get_metrics",
@@ -2257,8 +2234,6 @@ pub struct WorkerRequest {
     pub step_id: Option<u64>,
     pub session_id: Option<RequestId>,
     pub copies: Option<Vec<(BlockId, BlockId)>>,
-    pub adapter_id: Option<u32>,
-    pub adapter_path: Option<String>,
     pub product_handles: Option<Vec<u64>>,
     pub snapshot: Option<SnapshotRef>,
 }
@@ -2272,8 +2247,6 @@ impl WorkerRequest {
             step_id: None,
             session_id: None,
             copies: None,
-            adapter_id: None,
-            adapter_path: None,
             product_handles: None,
             snapshot: None,
         }
@@ -2307,19 +2280,6 @@ impl WorkerRequest {
         Self {
             copies: Some(copies),
             ..Self::bare(RequestKind::CopyKv)
-        }
-    }
-    pub fn load_adapter(adapter_id: u32, adapter_path: String) -> Self {
-        Self {
-            adapter_id: Some(adapter_id),
-            adapter_path: Some(adapter_path),
-            ..Self::bare(RequestKind::LoadAdapter)
-        }
-    }
-    pub fn unload_adapter(adapter_id: u32) -> Self {
-        Self {
-            adapter_id: Some(adapter_id),
-            ..Self::bare(RequestKind::UnloadAdapter)
         }
     }
     pub fn release_products(product_handles: Vec<u64>) -> Self {

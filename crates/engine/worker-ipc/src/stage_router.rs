@@ -373,9 +373,6 @@ impl StageRouter {
             .filter_map(|variant| routed_caps(variant).map(|caps| caps.encoder_cache_budget))
             .min()
             .unwrap_or(0);
-        if let Some(decode) = routed_caps(WorkVariant::TokenDecode) {
-            merged.adapter_mode = decode.adapter_mode;
-        }
         merged.restored_snapshots.clear();
         merged.route_capability_digest = merged.compute_route_capability_digest();
         merged.validate()?;
@@ -1138,7 +1135,6 @@ mod tests {
                 finish_token_ids: Vec::new(),
                 kv: KvAllocation::default(),
             }),
-            None,
             None,
         )
         .unwrap()

@@ -19,7 +19,6 @@ use uniserve_engine_api::{
 };
 
 /// Normalize frontend sampling values into the canonical scheduler shape.
-/// Grammar and cache policy are lowered into their dedicated request fields.
 pub fn to_uniserve_sampling(sp: Option<&EngineCoreSamplingParams>) -> USampling {
     let Some(sp) = sp else {
         return USampling::default();
@@ -631,8 +630,6 @@ mod tests {
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
-            lora_id: None,
-            grammar: None,
             cache: Default::default(),
             policy,
             resources: GenerationResourceBounds {

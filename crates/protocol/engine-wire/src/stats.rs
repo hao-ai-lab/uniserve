@@ -247,9 +247,6 @@ pub struct SchedulerStats {
     pub num_running_reqs: u64,
     /// Length of the "waiting" request queue.
     pub num_waiting_reqs: u64,
-    /// Length of the "skipped waiting" queue.
-    #[serde(default)]
-    pub num_skipped_waiting_reqs: u64,
     /// Internal DP load-balancing step counter.
     pub step_counter: u64,
     /// Internal DP load-balancing wave number.
@@ -278,10 +275,6 @@ pub struct SchedulerStats {
     pub spec_decoding_stats: Option<SpecDecodingStats>,
     /// Connector-specific KV transfer stats, kept opaque for now.
     pub kv_connector_stats: Option<BTreeMap<String, OpaqueValue>>,
-    /// Waiting request counts per LoRA adapter.
-    pub waiting_lora_adapters: BTreeMap<String, u64>,
-    /// Running request counts per LoRA adapter.
-    pub running_lora_adapters: BTreeMap<String, u64>,
     /// CUDA graph runtime stats when graph metrics are enabled.
     pub cudagraph_stats: Option<CudagraphStat>,
     /// Estimated MFU/performance stats, when enabled.

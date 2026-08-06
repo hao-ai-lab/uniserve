@@ -11,7 +11,7 @@ pub enum ApiError {
         message: String,
         param: Option<&'static str>,
     },
-    /// The requested model name does not match any served model or adapter.
+    /// The requested model name does not match any served model.
     ModelNotFound { model: String },
     /// An internal conversion invariant failed.
     ServerError { message: String },

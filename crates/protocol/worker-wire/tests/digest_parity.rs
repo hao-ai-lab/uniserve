@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use uniserve_core::{BlockId, RequestId};
 use uniserve_worker_wire::{
-    AdapterMode, Bounds, CompletionRecord, CreditDimension, CreditVector, DType, DimBound, Domain,
-    DrawLayout, EngineCaps, ExecutionConstraints, FinishFlags, LogicalLengths, OpId, OpStatus,
-    Operation, Point, PointRange, ProductKind, ProductRef, RequestKey, Rng, RouteCreditLimits,
+    Bounds, CompletionRecord, CreditDimension, CreditVector, DType, DimBound, Domain, DrawLayout,
+    EngineCaps, ExecutionConstraints, FinishFlags, LogicalLengths, OpId, OpStatus, Operation,
+    Point, PointRange, ProductKind, ProductRef, RequestKey, Rng, RouteCreditLimits,
     RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound, StorageClass, TimingCounters,
     TokenMode, TokenSpan, VersionRef, Work, WorkVariant, protocol_layout_digest,
 };
@@ -225,7 +225,6 @@ fn emit_digest_parity_fixture() {
         max_vit_grid_tokens: 64,
         max_latent_feature_bytes: 1 << 20,
         max_vision_feature_bytes: 1 << 21,
-        adapter_mode: AdapterMode::PerRequest,
         execution_constraints: ExecutionConstraints {
             max_batch_operations: 16,
             route_capabilities: vec![RouteExecutionCapability {
@@ -298,7 +297,6 @@ fn emit_digest_parity_fixture() {
             "max_vit_grid_tokens": caps.max_vit_grid_tokens,
             "max_latent_feature_bytes": caps.max_latent_feature_bytes,
             "max_vision_feature_bytes": caps.max_vision_feature_bytes,
-            "adapter_mode": "per_request",
             "max_batch_operations": caps.execution_constraints.max_batch_operations,
             "max_speculative_points": caps.execution_constraints.max_speculative_points,
             "device_sequence_lengths": caps.execution_constraints.device_sequence_lengths,

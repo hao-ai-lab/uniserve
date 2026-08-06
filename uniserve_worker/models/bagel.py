@@ -458,7 +458,6 @@ class BagelForUnifiedGeneration(nn.Module):
     weight_spec = WeightSpec(
         files=("ema.safetensors", "model.safetensors"),
         transforms=(*_BAGEL_RENAMES, *_BAGEL_STACKED),
-        adapter_renames=(Rename("base_model.model.", ""),),
         unmatched=UnmatchedWeightPolicy.SKIP,
         sidecars=(Sidecar(file="ae.safetensors", module="vae", optional_substrings=("reg",)),),
     )

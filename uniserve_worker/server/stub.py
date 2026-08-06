@@ -98,7 +98,6 @@ def stub_deployment(block_size: int = DEFAULT_BLOCK_SIZE) -> DeploymentOverlay:
             image_latent=LatentTokens(downsample=STUB_LATENT_DOWNSAMPLE),
             scratch=PerBranch(fixed_tokens=STUB_SCRATCH_TOKENS),
         ),
-        adapter_mode="none",
         max_batch_operations=DEFAULT_MAX_BATCH_OPS,
         generation_device=None,
     )

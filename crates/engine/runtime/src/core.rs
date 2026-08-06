@@ -515,16 +515,6 @@ impl EngineCore {
         self.handle.set_sleeping(false);
     }
 
-    pub fn add_lora(&self, lora_id: u32, path: String) -> bool {
-        self.handle.load_lora(lora_id, path);
-        true
-    }
-
-    pub fn remove_lora(&self, lora_id: u32) -> bool {
-        self.handle.unload_lora(lora_id);
-        true
-    }
-
     /// Execute one control method on every worker rank, returning per-rank
     /// `(rank, ok, message)` acks (the collective_rpc surface).
     pub fn collective_rpc(&self, method: &str) -> Result<Vec<(u32, bool, Option<String>)>, String> {

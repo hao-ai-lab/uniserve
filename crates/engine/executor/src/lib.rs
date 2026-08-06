@@ -289,8 +289,6 @@ pub enum ControlOp {
     DropSession(RequestId),
     CopyKv(Vec<(BlockId, BlockId)>),
     ReleaseProducts(Vec<u64>),
-    LoadAdapter { adapter_id: u32, path: String },
-    UnloadAdapter { adapter_id: u32 },
     ResetPrefixCache,
     SnapshotSession(RequestId),
     RestoreSession(SnapshotRef),
@@ -302,8 +300,6 @@ impl ControlOp {
             Self::DropSession(_) => RequestKind::DropSession,
             Self::CopyKv(_) => RequestKind::CopyKv,
             Self::ReleaseProducts(_) => RequestKind::ReleaseProducts,
-            Self::LoadAdapter { .. } => RequestKind::LoadAdapter,
-            Self::UnloadAdapter { .. } => RequestKind::UnloadAdapter,
             Self::ResetPrefixCache => RequestKind::ResetPrefixCache,
             Self::SnapshotSession(_) => RequestKind::SnapshotSession,
             Self::RestoreSession(_) => RequestKind::RestoreSession,
@@ -315,8 +311,6 @@ impl ControlOp {
             Self::DropSession(_) => "drop_session",
             Self::CopyKv(_) => "copy_kv",
             Self::ReleaseProducts(_) => "release_products",
-            Self::LoadAdapter { .. } => "load_adapter",
-            Self::UnloadAdapter { .. } => "unload_adapter",
             Self::ResetPrefixCache => "reset_prefix_cache",
             Self::SnapshotSession(_) => "snapshot_session",
             Self::RestoreSession(_) => "restore_session",
@@ -331,8 +325,8 @@ impl ControlOp {
     pub fn from_method(method: &str) -> Option<Self> {
         match method {
             "reset_prefix_cache" => Some(Self::ResetPrefixCache),
-            "drop_session" | "copy_kv" | "release_products" | "load_adapter" | "unload_adapter"
-            | "snapshot_session" | "restore_session" => None,
+            "drop_session" | "copy_kv" | "release_products" | "snapshot_session"
+            | "restore_session" => None,
             _ => None,
         }
     }
@@ -342,10 +336,6 @@ impl ControlOp {
             Self::DropSession(id) => WorkerRequest::drop_session(*id),
             Self::CopyKv(copies) => WorkerRequest::copy_kv(copies.clone()),
             Self::ReleaseProducts(handles) => WorkerRequest::release_products(handles.clone()),
-            Self::LoadAdapter { adapter_id, path } => {
-                WorkerRequest::load_adapter(*adapter_id, path.clone())
-            }
-            Self::UnloadAdapter { adapter_id } => WorkerRequest::unload_adapter(*adapter_id),
             Self::ResetPrefixCache => WorkerRequest::reset_prefix_cache(),
             Self::SnapshotSession(id) => WorkerRequest::snapshot_session(*id),
             Self::RestoreSession(snapshot) => WorkerRequest::restore_session(snapshot.clone()),

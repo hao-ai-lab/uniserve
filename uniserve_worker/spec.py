@@ -46,7 +46,6 @@ __all__ = [
     "InputSpec",
     "FeatureInjectionSpec",
     "FeatureLayout",
-    "AdapterResourcePolicy",
     "EncoderResourcePolicy",
     "KvBlockResourcePolicy",
     "LatentTokens",
@@ -287,10 +286,8 @@ class WeightSpec:
     files: tuple[str, ...] = ()
     sidecars: tuple[Sidecar, ...] = ()
     transforms: tuple[WeightTransform, ...] = ()
-    adapter_renames: tuple[Rename, ...] = ()
     targets: tuple[WeightTarget, ...] = ()
     unmatched: UnmatchedWeightPolicy = UnmatchedWeightPolicy.KEEP
-    adapter_unmatched: UnmatchedWeightPolicy = UnmatchedWeightPolicy.KEEP
     tower: TowerSplit | None = None
 
     def __post_init__(self) -> None:
@@ -312,10 +309,6 @@ class KvBlockResourcePolicy(StrEnum):
 
 class EncoderResourcePolicy(StrEnum):
     PER_HANDLE = "per_handle"
-
-
-class AdapterResourcePolicy(StrEnum):
-    PER_ADAPTER = "per_adapter"
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +342,6 @@ class ResourcePlan:
     image_latent: LatentTokens | None = None
     scratch: PerBranch | None = None
     encoder_output: EncoderResourcePolicy | None = None
-    adapter: AdapterResourcePolicy | None = None
 
     def classes(self) -> tuple[str, ...]:
         result: list[str] = []
@@ -361,8 +353,6 @@ class ResourcePlan:
             result.append("image_latent")
         if self.scratch is not None:
             result.append("scratch")
-        if self.adapter is not None:
-            result.append("adapter")
         return tuple(result)
 
 
@@ -950,7 +940,6 @@ class DeploymentOverlay:
     kv_cache_dtype: str | None
     kv_memory_fraction: float
     resources: ResourcePlan
-    adapter_mode: str
     max_batch_operations: int
     generation_device: str | None
 
@@ -974,10 +963,6 @@ class DeploymentOverlay:
         if self.kv_cache_dtype is not None and self.kv_cache_dtype not in _KV_STORE_DTYPES:
             raise invalid_descriptor(
                 f"DeploymentOverlay.kv_cache_dtype must be one of {sorted(_KV_STORE_DTYPES)!r}"
-            )
-        if self.adapter_mode not in {"none", "engine_wide", "per_request", "multi_adapter"}:
-            raise invalid_descriptor(
-                f"DeploymentOverlay.adapter_mode has unknown value {self.adapter_mode!r}"
             )
         if int(self.max_batch_operations) < 1:
             raise invalid_descriptor("DeploymentOverlay.max_batch_operations must be at least 1")

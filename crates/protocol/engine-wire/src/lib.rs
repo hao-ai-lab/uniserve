@@ -19,7 +19,7 @@ use crate::generation::GenerationOutput;
 use crate::logprobs::MaybeWireLogprobs;
 use crate::stats::{PrefillStats, SchedulerStats};
 use crate::utility::UtilityOutput;
-use uniserve_core::{GenerationRequest, GrammarSpec};
+use uniserve_core::GenerationRequest;
 
 /// Dynamic msgpack value used for schema positions that are preserved but not
 /// yet strongly typed.
@@ -27,10 +27,6 @@ pub type OpaqueValue = Value;
 
 fn default_opaque_value_nil() -> OpaqueValue {
     Value::Nil
-}
-
-fn is_false(v: &bool) -> bool {
-    !v
 }
 
 fn default_top_p() -> f32 {
@@ -46,7 +42,6 @@ pub mod error;
 pub mod generation;
 pub mod handshake;
 pub mod logprobs;
-pub mod lora;
 pub mod stats;
 pub mod tensor;
 pub mod translate;
@@ -298,39 +293,6 @@ pub enum StopReason {
     Text(String),
 }
 
-/// Parameters for configuring structured outputs (guided decoding).
-///
-/// Exactly one constraint field (`json`, `regex`, `choice`, `grammar`,
-/// `json_object`, or `structural_tag`) should be set. The engine backend
-/// selects the appropriate grammar compiler based on which field
-/// is present.
-///
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StructuredOutputsParams {
-    /// JSON schema (as a dict/object or JSON string) constraining the output.
-    pub json: Option<serde_json::Value>,
-    /// Regular expression the output must match.
-    pub regex: Option<String>,
-    /// List of allowed output strings (the model must produce one of these).
-    pub choice: Option<Vec<String>>,
-    /// Context-free grammar (in EBNF-like notation) the output must conform to.
-    pub grammar: Option<String>,
-    /// When `true`, output must be valid JSON (free-form, no schema).
-    pub json_object: Option<bool>,
-    /// Disable any additional whitespace in guided JSON output.
-    #[serde(skip_serializing_if = "crate::is_false")]
-    pub disable_any_whitespace: bool,
-    /// Disable `additionalProperties` in JSON schema output.
-    #[serde(skip_serializing_if = "crate::is_false")]
-    pub disable_additional_properties: bool,
-    /// Custom whitespace pattern for guided JSON output.
-    pub whitespace_pattern: Option<String>,
-    /// Structural tag configuration (JSON-encoded string).
-    pub structural_tag: Option<String>,
-}
-
 /// Engine-facing sampling parameters for text generation.
 ///
 /// This is the normalized southbound subset used by the frontend when it talks
@@ -404,10 +366,6 @@ pub struct EngineCoreSamplingParams {
     /// Tokenized bad words to avoid during generation.
     #[serde(default, rename = "_bad_words_token_ids")]
     pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
-    /// Tokenizer-specific structured-output constraint compiled by the serving
-    /// runtime before this engine boundary.
-    #[serde(default)]
-    pub grammar: Option<GrammarSpec>,
     /// Specific token IDs for which log probabilities should be returned at
     /// each position.
     ///
@@ -446,7 +404,6 @@ impl EngineCoreSamplingParams {
             logit_bias: None,
             allowed_token_ids: None,
             bad_words_token_ids: None,
-            grammar: None,
             logprob_token_ids: None,
             skip_reading_prefix_cache: None,
         }
@@ -644,8 +601,6 @@ mod tests {
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
-            lora_id: None,
-            grammar: None,
             cache: Default::default(),
             policy,
             resources: GenerationResourceBounds {

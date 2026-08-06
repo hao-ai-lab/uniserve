@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from ..batch import SamplingOwnership
 from ..capabilities import (
-    AdapterMode,
     CreditVector,
     EngineCaps,
     ExecutionConstraints,
@@ -99,8 +98,6 @@ def resolve_capabilities(
         RequestKind.RESET_PREFIX_CACHE,
         RequestKind.RELEASE_PRODUCTS,
     ]
-    if resources.adapter is not None:
-        controls.extend((RequestKind.LOAD_ADAPTER, RequestKind.UNLOAD_ADAPTER))
     supported_work = work_variants_for_operation_types(
         tuple(operation.kind for operation in spec.operations)
     )
@@ -114,7 +111,6 @@ def resolve_capabilities(
         latent_downsample=int(flow.latent_downsample) if flow is not None else 1,
         bytes_per_token=bytes_per_token,
         supported_controls=tuple(controls),
-        adapter_mode=AdapterMode(deployment.adapter_mode),
         execution_constraints=ExecutionConstraints(
             max_batch_operations=int(deployment.max_batch_operations),
             max_speculative_points=17,

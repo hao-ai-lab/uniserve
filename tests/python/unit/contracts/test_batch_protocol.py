@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from uniserve_worker.batch import (
-    AdapterMode,
     Admission,
     AttentionRegime,
     Batch,
@@ -190,7 +189,6 @@ def test_route_capability_digest_matches_rust() -> None:
             sample["max_vit_grid_tokens"],
             sample["max_latent_feature_bytes"],
             sample["max_vision_feature_bytes"],
-            AdapterMode(sample["adapter_mode"]),
             sample["max_batch_operations"],
             sample["max_speculative_points"],
             sample["device_sequence_lengths"],

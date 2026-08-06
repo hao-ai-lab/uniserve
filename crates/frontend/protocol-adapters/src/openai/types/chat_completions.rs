@@ -318,7 +318,7 @@ mod tests {
         let value = serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "hi"}],
-            "grammar": "root ::= 'yes'"
+            "unsupported_option": true
         });
         assert!(serde_json::from_value::<ChatCompletionRequest>(value).is_err());
     }

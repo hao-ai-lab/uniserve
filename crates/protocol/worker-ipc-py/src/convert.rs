@@ -65,8 +65,6 @@ pub(crate) fn execute_request_to_py<'py>(
         )?,
         None => dict.set_item(intern!(py, "copies"), py.None())?,
     }
-    dict.set_item(intern!(py, "adapter_id"), request.adapter_id)?;
-    dict.set_item(intern!(py, "adapter_path"), request.adapter_path.as_deref())?;
     match &request.product_handles {
         Some(handles) => dict.set_item(
             intern!(py, "product_handles"),
@@ -239,7 +237,6 @@ fn admission_to_py<'py>(
             .map(|branch| gen_admission_to_py(py, branch))
             .transpose()?,
     )?;
-    dict.set_item(intern!(py, "adapter_id"), admission.adapter_id)?;
     Ok(dict)
 }
 
@@ -710,8 +707,6 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
         RequestKind::DropSession => intern!(py, "drop_session"),
         RequestKind::Shutdown => intern!(py, "shutdown"),
         RequestKind::CopyKv => intern!(py, "copy_kv"),
-        RequestKind::LoadAdapter => intern!(py, "load_adapter"),
-        RequestKind::UnloadAdapter => intern!(py, "unload_adapter"),
         RequestKind::ReleaseProducts => intern!(py, "release_products"),
         RequestKind::ResetPrefixCache => intern!(py, "reset_prefix_cache"),
         RequestKind::GetMetrics => intern!(py, "get_metrics"),
@@ -1520,7 +1515,6 @@ mod tests {
                     },
                 }),
                 None,
-                Some(7),
             )
             .unwrap(),
             Admission::new(
@@ -1529,7 +1523,6 @@ mod tests {
                 Some(GenAdmission {
                     image: full_image(),
                 }),
-                None,
             )
             .unwrap(),
             Admission::new(
@@ -1543,7 +1536,6 @@ mod tests {
                 Some(GenAdmission {
                     image: full_image(),
                 }),
-                None,
             )
             .unwrap(),
         ];
@@ -1650,8 +1642,6 @@ mod tests {
             request.call_id = Some(3);
             request.session_id = Some(RequestId(u64::MAX));
             request.copies = Some(vec![(BlockId(1), BlockId(2)), (BlockId(3), BlockId(4))]);
-            request.adapter_id = Some(5);
-            request.adapter_path = Some("/adapters/a".to_owned());
             request.product_handles = Some(vec![1, u64::MAX]);
             request.snapshot = Some(SnapshotRef {
                 version: VersionRef {

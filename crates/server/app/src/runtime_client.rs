@@ -7,7 +7,6 @@ use tracing::{debug, warn};
 use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, RequestId};
 use uniserve_engine_api::{EngineHandle, GenEvent};
 use uniserve_engine_gateway::transport::protocol::EngineCoreRequest;
-use uniserve_engine_gateway::transport::protocol::lora::LoraRequest;
 use uniserve_engine_gateway::transport::{
     EngineCoreOutputStream, EngineCoreStreamOutput, Error, GenerationEventStream,
     GenerationSubmission, InProcessEngineClient, Result, StreamCancelCause, StreamControl,
@@ -346,17 +345,6 @@ impl InProcessEngineClient for RuntimeEngineClient {
         Ok(())
     }
 
-    fn add_lora(&self, lora_request: &LoraRequest) -> Result<bool> {
-        Ok(self.core.add_lora(
-            lora_request.lora_int_id as u32,
-            lora_request.lora_path.clone(),
-        ))
-    }
-
-    fn remove_lora(&self, lora_id: u64) -> Result<bool> {
-        Ok(self.core.remove_lora(lora_id as u32))
-    }
-
     fn collective_rpc(&self, method: &str) -> Result<Vec<rmpv::Value>> {
         let acks = self
             .core
@@ -423,8 +411,6 @@ mod tests {
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
-            lora_id: None,
-            grammar: None,
             cache: Default::default(),
             policy,
             resources: GenerationResourceBounds {
@@ -503,8 +489,6 @@ mod tests {
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
-            lora_id: None,
-            grammar: None,
             cache: Default::default(),
             policy,
             resources: GenerationResourceBounds {

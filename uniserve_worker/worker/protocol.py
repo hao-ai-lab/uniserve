@@ -7,7 +7,6 @@ from typing import Protocol, runtime_checkable
 
 from ..batch import Batch, CompletionReport, SamplingOwnership, SnapshotRef, WorkVariant
 from ..capabilities import (
-    AdapterMode,
     CreditVector,
     EngineCaps,
     ExecutionConstraints,
@@ -99,10 +98,6 @@ class Worker(Protocol):
 
     def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None: ...
 
-    def load_adapter(self, adapter_id: int, adapter_path: str) -> None: ...
-
-    def unload_adapter(self, adapter_id: int) -> None: ...
-
     def release_products(self, handles: tuple[int, ...]) -> None: ...
 
     def reset_prefix_cache(self) -> None: ...
@@ -126,7 +121,6 @@ def model_free_capabilities(
     latent_downsample: int = 1,
     encoder_cache_budget: int = 0,
     resource_classes: tuple[ResourceClass, ...] = (ResourceClass.KV_BLOCK,),
-    adapter_mode: AdapterMode = AdapterMode.NONE,
     max_batch_operations: int = 1024,
     pipeline_depth: int,
     bytes_per_token: int = 1,
@@ -199,7 +193,6 @@ def model_free_capabilities(
         pipeline_depth=int(pipeline_depth),
         encoder_cache_budget=encoder_cache_budget,
         supported_controls=supported_controls,
-        adapter_mode=adapter_mode,
         execution_constraints=ExecutionConstraints(
             max_batch_operations=max_batch_operations,
             max_speculative_points=17,

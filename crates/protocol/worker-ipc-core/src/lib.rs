@@ -509,14 +509,12 @@ fn request_kind_code(kind: RequestKind) -> u8 {
         RequestKind::DropSession => 4,
         RequestKind::Shutdown => 5,
         RequestKind::CopyKv => 6,
-        RequestKind::LoadAdapter => 7,
-        RequestKind::UnloadAdapter => 8,
-        RequestKind::ReleaseProducts => 9,
-        RequestKind::ResetPrefixCache => 10,
-        RequestKind::GetMetrics => 11,
-        RequestKind::GetPressure => 12,
-        RequestKind::SnapshotSession => 13,
-        RequestKind::RestoreSession => 14,
+        RequestKind::ReleaseProducts => 7,
+        RequestKind::ResetPrefixCache => 8,
+        RequestKind::GetMetrics => 9,
+        RequestKind::GetPressure => 10,
+        RequestKind::SnapshotSession => 11,
+        RequestKind::RestoreSession => 12,
     }
 }
 

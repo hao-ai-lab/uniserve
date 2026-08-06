@@ -267,13 +267,6 @@ def _control(
         worker.drop_session(_integer(request, "session_id", kind))
     elif kind is RequestKind.COPY_KV:
         worker.copy_kv(_integer_pairs(request, "copies", kind))
-    elif kind is RequestKind.LOAD_ADAPTER:
-        worker.load_adapter(
-            _integer(request, "adapter_id", kind),
-            _string(request, "adapter_path", kind),
-        )
-    elif kind is RequestKind.UNLOAD_ADAPTER:
-        worker.unload_adapter(_integer(request, "adapter_id", kind))
     elif kind is RequestKind.RELEASE_PRODUCTS:
         worker.release_products(_integers(request, "product_handles", kind))
     elif kind is RequestKind.RESET_PREFIX_CACHE:

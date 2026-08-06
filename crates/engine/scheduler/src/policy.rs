@@ -14,7 +14,6 @@ pub struct PolicySnapshot {
     // queue depths
     pub waiting: usize,
     pub running: usize,
-    pub skipped_waiting: usize,
     pub in_flight: usize,
     // resource pressure
     pub free_blocks: usize,

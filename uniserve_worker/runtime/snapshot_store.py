@@ -27,7 +27,6 @@ from ..batch import (
     VersionRef,
 )
 from ..foundation.errors import invalid_descriptor
-from .adapter_store import AdapterSnapshot, AdapterStore
 from .kv_store import KvBranchState, KvCommittedState, KvPageState, KvSnapshot, KvStore
 from .latent_store import LatentRecord, LatentStore
 from .product_store import (
@@ -46,7 +45,7 @@ from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
 from .transfer import Locator, Transport, fetch_locator
 
-SNAPSHOT_FORMAT_VERSION = 8
+SNAPSHOT_FORMAT_VERSION = 9
 _ASSET_PREFIX = "asset:"
 
 
@@ -57,7 +56,6 @@ class _DecodedSnapshot:
     latents: tuple[LatentRecord, ...]
     products: tuple[ProductRecord, ...]
     replay: tuple[ReplayRecord, ...]
-    adapter: AdapterSnapshot | None
     published_assets: tuple[Locator, ...] = ()
 
 
@@ -77,7 +75,6 @@ class SnapshotProvider:
         latents: LatentStore,
         products: ProductStore,
         replay: ReplayStore,
-        adapters: AdapterStore | None,
         transport: Transport,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
@@ -92,7 +89,6 @@ class SnapshotProvider:
         self.latents = latents
         self.products = products
         self.replay = replay
-        self.adapters = adapters
         self.transport = transport
         self._lock = RLock()
         self._current_refs: dict[int, SnapshotRef] = {}
@@ -133,7 +129,6 @@ class SnapshotProvider:
                 ),
                 products=self.products.snapshot_records(requested),
                 replay=self.replay.snapshot_records(requested),
-                adapter=None if self.adapters is None else self.adapters.snapshot(),
             )
             digest = self._write_object(manifest, tensors)
             refs = tuple(
@@ -150,7 +145,6 @@ class SnapshotProvider:
                 session_id = ref.version.request_key.session_id
                 entries[str(session_id)] = ref.to_wire()
                 self._current_refs[session_id] = ref
-            catalog["adapter"] = self._adapter_catalog_entry(digest, manifest.get("adapter"))
             self._write_catalog(catalog)
             replacements = {
                 raw: self._durable_locator(raw, digest, key) for raw, key in locator_assets.items()
@@ -158,22 +152,6 @@ class SnapshotProvider:
             self.products.rewrite_locators(requested, replacements)
             self.kv.rewrite_locators(requested, replacements)
             return refs, replacements
-
-    def snapshot_global(self) -> None:
-        with self._lock:
-            adapter = None if self.adapters is None else self.adapters.snapshot()
-            manifest, tensors, _ = self._encode(
-                sessions=(),
-                kv=(),
-                latents=(),
-                products=(),
-                replay=(),
-                adapter=adapter,
-            )
-            digest = self._write_object(manifest, tensors)
-            catalog = self._read_catalog()
-            catalog["adapter"] = self._adapter_catalog_entry(digest, manifest.get("adapter"))
-            self._write_catalog(catalog)
 
     def drop_session(self, session_id: int) -> None:
         with self._lock:
@@ -216,7 +194,6 @@ class SnapshotProvider:
                 for locator, session_ids in groups.items():
                     manifest, tensors = self._load_object(locator)
                     decoded_groups.append(self._decode(manifest, tensors, session_ids))
-                adapter = self._load_catalog_adapter(catalog)
             except BaseException:
                 for group in decoded_groups:
                     self._release_assets(group.published_assets)
@@ -227,12 +204,11 @@ class SnapshotProvider:
                 latents=tuple(record for group in decoded_groups for record in group.latents),
                 products=tuple(record for group in decoded_groups for record in group.products),
                 replay=tuple(record for group in decoded_groups for record in group.replay),
-                adapter=adapter,
                 published_assets=tuple(
                     locator for group in decoded_groups for locator in group.published_assets
                 ),
             )
-            if decoded.sessions or adapter is not None:
+            if decoded.sessions:
                 self._restore(decoded)
             actual = {
                 session.session_id: session.committed_version() for session in decoded.sessions
@@ -254,7 +230,6 @@ class SnapshotProvider:
         latents: Sequence[LatentRecord],
         products: Sequence[ProductRecord],
         replay: Sequence[ReplayRecord],
-        adapter: AdapterSnapshot | None,
     ) -> tuple[dict[str, object], dict[str, torch.Tensor], dict[str, str]]:
         tensors: dict[str, torch.Tensor] = {}
         locator_assets: dict[str, str] = {}
@@ -314,7 +289,6 @@ class SnapshotProvider:
                     }
                     for value in replay
                 ],
-                "adapter": self._adapter_to_json(adapter, tensor),
             }
         )
         manifest["tensor_keys"] = sorted(tensors)
@@ -385,14 +359,12 @@ class SnapshotProvider:
                 self._product_from_json(value, tensors, assets) for value in raw_products
             )
             replay = tuple(self._replay_from_json(value) for value in raw_replay)
-            adapter = self._adapter_from_json(manifest.get("adapter"), tensors)
             decoded = _DecodedSnapshot(
                 sessions,
                 kv,
                 latents,
                 products,
                 replay,
-                adapter,
                 published_assets,
             )
             self._validate_decoded(decoded, selected)
@@ -414,13 +386,6 @@ class SnapshotProvider:
         prior_latents = self.latents.snapshot_records(session_ids)
         prior_products = self.products.snapshot_records(session_ids)
         prior_replay = self.replay.snapshot_records(session_ids)
-        prior_adapter = None if self.adapters is None else self.adapters.snapshot()
-        unaffected = set(self.sessions.session_ids()) - session_ids
-        if unaffected and not _same_adapter(prior_adapter, decoded.adapter):
-            self._release_assets(decoded.published_assets)
-            raise invalid_descriptor(
-                "snapshot adapter state conflicts with unaffected live sessions"
-            )
         try:
             self.kv.restore_committed(decoded.kv, session_ids)
             self.latents.restore_records(session_ids, decoded.latents)
@@ -450,12 +415,6 @@ class SnapshotProvider:
                 )
             self.sessions.restore_sessions(decoded.sessions, session_ids)
             self.replay.restore_records(session_ids, decoded.replay)
-            if self.adapters is not None:
-                if decoded.adapter is None:
-                    raise invalid_descriptor("model snapshot is missing adapter state")
-                self.adapters.restore(decoded.adapter)
-            elif decoded.adapter is not None:
-                raise invalid_descriptor("model-free worker received adapter snapshot state")
             self.kv.retain_restored_publications(decoded.kv, self.transport)
         except BaseException:
             self.kv.restore_committed(prior_kv, session_ids)
@@ -486,8 +445,6 @@ class SnapshotProvider:
                 )
             self.sessions.restore_sessions(prior_sessions, session_ids)
             self.replay.restore_records(session_ids, prior_replay)
-            if self.adapters is not None and prior_adapter is not None:
-                self.adapters.restore(prior_adapter)
             self._release_assets(decoded.published_assets)
             raise
 
@@ -505,16 +462,11 @@ class SnapshotProvider:
             raise invalid_descriptor("snapshot repeats a latent product reference")
         if len(product_by_handle) != len(decoded.products):
             raise invalid_descriptor("snapshot repeats a product handle")
-        adapter_id = None if decoded.adapter is None else decoded.adapter.adapter_id
         for session in decoded.sessions:
             runtime = session.runtime_for(session.resolved_version())
             if runtime is None or runtime.kv_length != kv_by_session[session.session_id].length:
                 raise invalid_descriptor(
                     f"session {session.session_id} runtime state does not align with KV"
-                )
-            if session.adapter_id != adapter_id:
-                raise invalid_descriptor(
-                    f"session {session.session_id} adapter identity is not restorable"
                 )
             if session.latent_product is not None:
                 latent = latent_by_reference.get(session.latent_product)
@@ -633,7 +585,6 @@ class SnapshotProvider:
             return {
                 "format_version": SNAPSHOT_FORMAT_VERSION,
                 "sessions": {},
-                "adapter": None,
             }
         try:
             value = json.loads(self.catalog_path.read_text(encoding="utf-8"))
@@ -649,7 +600,6 @@ class SnapshotProvider:
         return {
             "format_version": SNAPSHOT_FORMAT_VERSION,
             "sessions": dict(sessions),
-            "adapter": data.get("adapter"),
         }
 
     def _write_catalog(self, catalog: Mapping[str, object]) -> None:
@@ -696,7 +646,6 @@ class SnapshotProvider:
             "image": None if session.image is None else session.image.to_wire(),
             "negative_token_ids": list(session.negative_token_ids),
             "finish_token_ids": list(session.finish_token_ids),
-            "adapter_id": session.adapter_id,
             "committed_op_id": session.committed_op_id,
             # ``str`` finalizes a digest still deferred behind an in-flight decode
             # response; snapshotting is a control op off the decode critical path.
@@ -850,7 +799,6 @@ class SnapshotProvider:
             finish_token_ids=_uint_tuple(
                 data.get("finish_token_ids"), "snapshot session.finish_token_ids"
             ),
-            adapter_id=_optional_uint(data.get("adapter_id"), "snapshot session.adapter_id"),
             version=_uint(data.get("version"), "snapshot session.version"),
             resolved_op_id=_uint(data.get("resolved_op_id"), "snapshot session.resolved_op_id"),
             resolved_digest=_digest(
@@ -1183,52 +1131,6 @@ class SnapshotProvider:
             ),
         )
 
-    @staticmethod
-    def _adapter_to_json(
-        snapshot: AdapterSnapshot | None,
-        tensor: Any,
-    ) -> dict[str, object] | None:
-        if snapshot is None:
-            return None
-        return {
-            "adapter_id": snapshot.adapter_id,
-            "version": snapshot.version,
-            "digest": snapshot.digest,
-            "overrides": [
-                {
-                    "name": name,
-                    "tensor": tensor(f"adapter.{index}", value),
-                }
-                for index, (name, value) in enumerate(sorted(snapshot.overrides.items()))
-            ],
-        }
-
-    @staticmethod
-    def _adapter_from_json(
-        value: object,
-        tensors: Mapping[str, torch.Tensor],
-    ) -> AdapterSnapshot | None:
-        if value is None:
-            return None
-        data = _mapping(value, "snapshot adapter")
-        overrides: dict[str, torch.Tensor] = {}
-        for raw in _sequence(data.get("overrides"), "snapshot adapter.overrides"):
-            entry = _mapping(raw, "snapshot adapter override")
-            name = _string(entry.get("name"), "snapshot adapter override.name")
-            if name in overrides:
-                raise invalid_descriptor("snapshot adapter repeats an override")
-            overrides[name] = _tensor(
-                tensors,
-                entry.get("tensor"),
-                "snapshot adapter override.tensor",
-            )
-        return AdapterSnapshot(
-            adapter_id=_optional_uint(data.get("adapter_id"), "snapshot adapter.adapter_id"),
-            version=_uint(data.get("version"), "snapshot adapter.version"),
-            digest=_digest(data.get("digest"), "snapshot adapter.digest"),
-            overrides=overrides,
-        )
-
     def _restore_assets(
         self,
         manifest: Mapping[str, object],
@@ -1264,48 +1166,6 @@ class SnapshotProvider:
     def _release_assets(self, locators: Sequence[Locator]) -> None:
         for locator in reversed(tuple(locators)):
             self.transport.release(locator)
-
-    @staticmethod
-    def _adapter_catalog_entry(
-        digest: str,
-        adapter: object,
-    ) -> dict[str, object] | None:
-        if adapter is None:
-            return None
-        data = _mapping(adapter, "snapshot adapter")
-        return {
-            "object": digest,
-            "adapter_id": data.get("adapter_id"),
-            "version": data.get("version"),
-            "digest": data.get("digest"),
-        }
-
-    def _load_catalog_adapter(
-        self,
-        catalog: Mapping[str, object],
-    ) -> AdapterSnapshot | None:
-        value = catalog.get("adapter")
-        if value is None:
-            return None
-        data = _mapping(value, "snapshot catalog.adapter")
-        locator = _digest(data.get("object"), "snapshot catalog.adapter.object")
-        manifest, tensors = self._load_object(locator)
-        self._validate_manifest_identity(manifest, tensors)
-        adapter = self._adapter_from_json(manifest.get("adapter"), tensors)
-        if adapter is None:
-            raise invalid_descriptor("snapshot catalog adapter object has no adapter state")
-        if (
-            adapter.adapter_id,
-            adapter.version,
-            adapter.digest,
-        ) != (
-            _optional_uint(data.get("adapter_id"), "snapshot catalog.adapter.adapter_id"),
-            _uint(data.get("version"), "snapshot catalog.adapter.version"),
-            _digest(data.get("digest"), "snapshot catalog.adapter.digest"),
-        ):
-            raise invalid_descriptor("snapshot catalog adapter identity conflicts")
-        return adapter
-
 
 def _pages_to_json(
     pages: KvPageState | None,
@@ -1509,25 +1369,6 @@ def _asset_references(value: object) -> set[str]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return {key for member in value for key in _asset_references(member)}
     return set()
-
-
-def _same_adapter(
-    left: AdapterSnapshot | None,
-    right: AdapterSnapshot | None,
-) -> bool:
-    if left is None or right is None:
-        return left is right
-    return (
-        left.adapter_id,
-        left.version,
-        left.digest,
-        tuple(sorted(left.overrides)),
-    ) == (
-        right.adapter_id,
-        right.version,
-        right.digest,
-        tuple(sorted(right.overrides)),
-    )
 
 
 def _tensor(

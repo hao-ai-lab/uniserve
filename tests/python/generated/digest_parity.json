@@ -247,7 +247,6 @@
     "max_vit_grid_tokens": 64,
     "max_latent_feature_bytes": 1048576,
     "max_vision_feature_bytes": 2097152,
-    "adapter_mode": "per_request",
     "max_batch_operations": 16,
     "max_speculative_points": 17,
     "device_sequence_lengths": true,
@@ -301,5 +300,5 @@
     "model_dtype": "bfloat16",
     "attention_backend": "flashinfer"
   },
-  "route_capability_digest": "f738e7e6304d9f8c98bd847b014c7e14495cf4ef0882bf28998e5a7395eb0368"
+  "route_capability_digest": "833beca29d1b60a0fc38fc97d7e7af6b54f8d8f5010dd7126f2849aaab28e7e2"
 }

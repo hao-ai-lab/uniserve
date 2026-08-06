@@ -16,7 +16,6 @@ from ..models.qwen3 import Qwen3ForCausalLM
 from ..models.sensenova.config import NeoChatConfig
 from ..models.sensenova.model import _MODEL_CODE_VERSION, NEOChatModel
 from ..spec import (
-    AdapterResourcePolicy,
     EncoderResourcePolicy,
     KvBlockResourcePolicy,
     LatentTokens,
@@ -67,7 +66,6 @@ class CatalogEntry:
     minimum_code_version_key: str | None = None
     code_version: str | None = None
     serving_dtype: str = "bfloat16"
-    adapter_mode: str = "none"
     scopes: tuple[ModelLoadScope, ...] = (ModelLoadScope.WHOLE,)
     required_files: tuple[str, ...] = ()
     alternative_files: tuple[str, ...] = ()
@@ -87,10 +85,6 @@ class CatalogEntry:
             self.config_class is None or self.tokenizer_class is None
         ):
             raise invalid_descriptor("native catalog entries require config and tokenizer classes")
-        if self.adapter_mode not in {"none", "engine_wide", "per_request", "multi_adapter"}:
-            raise invalid_descriptor(
-                f"catalog entry has unknown adapter mode {self.adapter_mode!r}"
-            )
         if not self.scopes:
             raise invalid_descriptor("catalog entries require at least one materialization scope")
         config_fields = tuple(field for field, _file in self.config_files)
@@ -155,9 +149,7 @@ MODEL_CATALOG = Catalog(
                 encoder_output=EncoderResourcePolicy.PER_HANDLE,
                 image_latent=LatentTokens(downsample=16),
                 scratch=PerBranch(fixed_tokens=65536, mirror_kv=True),
-                adapter=AdapterResourcePolicy.PER_ADAPTER,
             ),
-            adapter_mode="engine_wide",
             config_class=BagelConfig,
             graph_class=_BagelGraph,
             required_files=("ae.safetensors",),

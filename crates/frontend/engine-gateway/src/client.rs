@@ -4,7 +4,6 @@ use crate::GenerationEventStream;
 use crate::error::{Error, Result};
 use crate::protocol::EngineCoreRequest;
 use crate::protocol::handshake::EngineCoreReadyResponse;
-use crate::protocol::lora::LoraRequest;
 use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype};
 
 pub(crate) mod state;
@@ -94,8 +93,6 @@ pub trait InProcessEngineClient: Send + Sync {
         reset_running_requests: bool,
         reset_connector: bool,
     ) -> Result<bool>;
-    fn add_lora(&self, lora_request: &LoraRequest) -> Result<bool>;
-    fn remove_lora(&self, lora_id: u64) -> Result<bool>;
     fn sleep(&self, level: u32, mode: &str) -> Result<()>;
     fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()>;
     fn shutdown(self: Box<Self>) -> Result<()>;
@@ -191,14 +188,6 @@ impl EngineAppControl {
         self.client()?
             .reset_prefix_cache(reset_running_requests, reset_connector)
             .await
-    }
-
-    pub async fn add_lora(&self, request: &LoraRequest) -> Result<bool> {
-        self.client()?.add_lora(request).await
-    }
-
-    pub async fn remove_lora(&self, lora_id: u64) -> Result<bool> {
-        self.client()?.remove_lora(lora_id).await
     }
 
     pub async fn sleep(&self, level: u32, mode: &str) -> Result<()> {
@@ -457,24 +446,6 @@ impl EngineCoreClient {
             Self::Mock(_) if reset_connector => Err(Error::UnsupportedControl {
                 control: "external prefix-cache reset".to_string(),
             }),
-            Self::Mock(_) => Ok(true),
-        }
-    }
-
-    /// Load or refresh one LoRA adapter.
-    pub async fn add_lora(&self, lora_request: &LoraRequest) -> Result<bool> {
-        match self {
-            Self::InProcess(c) => c.add_lora(lora_request),
-            Self::Zmq(c) => c.add_lora(lora_request).await,
-            Self::Mock(_) => Ok(true),
-        }
-    }
-
-    /// Remove one LoRA adapter.
-    pub async fn remove_lora(&self, lora_id: u64) -> Result<bool> {
-        match self {
-            Self::InProcess(c) => c.remove_lora(lora_id),
-            Self::Zmq(c) => c.remove_lora(lora_id).await,
             Self::Mock(_) => Ok(true),
         }
     }

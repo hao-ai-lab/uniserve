@@ -8,11 +8,11 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 
 use crate::schema::uniserve::wire as fbs;
 use crate::{
-    AdapterMode, Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason,
-    CompletionRecord, CompletionReport, Control, CreditVector, DType, DimBound, Disposition,
-    Domain, DrawLayout, EngineCaps, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
-    ExecutionConstraints, FinishFlags, GenAdmission, KvAllocation, LogicalLengths, OpId, OpStatus,
-    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
+    CompletionReport, Control, CreditVector, DType, DimBound, Disposition, Domain, DrawLayout,
+    EngineCaps, ErrorCode, ErrorOperationIdentity, ExecutionCapability, ExecutionConstraints,
+    FinishFlags, GenAdmission, KvAllocation, LogicalLengths, OpId, OpStatus, Operation,
+    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
     RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng,
     RouteCreditLimits, RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound,
     SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, Work,
@@ -84,8 +84,6 @@ fn request_from_table(request: fbs::WorkerRequest<'_>) -> anyhow::Result<WorkerR
                 .map(|pair| (BlockId(pair.src()), BlockId(pair.dst())))
                 .collect()
         }),
-        adapter_id: request.adapter_id(),
-        adapter_path: request.adapter_path().map(str::to_string),
         product_handles: request
             .product_handles()
             .map(|items| items.iter().collect()),
@@ -216,7 +214,6 @@ fn admission_from_table(admission: fbs::Admission<'_>) -> anyhow::Result<Admissi
             .gen_admission()
             .map(gen_admission_from_table)
             .transpose()?,
-        adapter_id: admission.adapter_id(),
     };
     admission.validate()?;
     Ok(admission)
@@ -696,7 +693,6 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
             })
             .transpose()?
             .unwrap_or_default(),
-        adapter_mode: adapter_mode_from_fb(caps.adapter_mode())?,
         execution_constraints: caps
             .execution_constraints()
             .map(|constraints| -> anyhow::Result<ExecutionConstraints> {
@@ -1022,8 +1018,6 @@ fn request_to_fb(request: &WorkerRequest) -> anyhow::Result<fbs::WorkerRequestT>
                 })
                 .collect()
         }),
-        adapter_id: request.adapter_id,
-        adapter_path: request.adapter_path.clone(),
         product_handles: request.product_handles.clone(),
         snapshot: request.snapshot.as_ref().map(snapshot_to_fb).map(Box::new),
     })
@@ -1046,8 +1040,6 @@ fn request_from_fb(request: fbs::WorkerRequestT) -> anyhow::Result<WorkerRequest
                 .map(|pair| (BlockId(pair.src), BlockId(pair.dst)))
                 .collect()
         }),
-        adapter_id: request.adapter_id,
-        adapter_path: request.adapter_path,
         product_handles: request.product_handles,
         snapshot: request
             .snapshot
@@ -1063,7 +1055,6 @@ fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
         + usize::from(request.step_id.is_some())
         + usize::from(request.session_id.is_some())
         + usize::from(request.copies.is_some())
-        + usize::from(request.adapter_id.is_some())
         + usize::from(request.product_handles.is_some())
         + usize::from(request.snapshot.is_some());
     match request.kind {
@@ -1090,19 +1081,6 @@ fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
             request.copies.is_some() && payload_count == 1,
             "copy_kv requires exactly one block-pair list"
         ),
-        RequestKind::LoadAdapter => anyhow::ensure!(
-            request.adapter_id.is_some()
-                && request
-                    .adapter_path
-                    .as_deref()
-                    .is_some_and(|path| !path.is_empty())
-                && payload_count == 1,
-            "load_adapter requires an id and path"
-        ),
-        RequestKind::UnloadAdapter => anyhow::ensure!(
-            request.adapter_id.is_some() && request.adapter_path.is_none() && payload_count == 1,
-            "unload_adapter requires exactly one id"
-        ),
         RequestKind::ReleaseProducts => anyhow::ensure!(
             request.product_handles.is_some() && payload_count == 1,
             "release_products requires exactly one handle list"
@@ -1120,7 +1098,7 @@ fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
         | RequestKind::ResetPrefixCache
         | RequestKind::GetMetrics
         | RequestKind::GetPressure => anyhow::ensure!(
-            payload_count == 0 && request.adapter_path.is_none(),
+            payload_count == 0,
             "control request carries an unexpected payload"
         ),
     }
@@ -1393,7 +1371,6 @@ fn admission_to_fb(admission: &Admission) -> anyhow::Result<fbs::AdmissionT> {
             .as_ref()
             .map(gen_admission_to_fb)
             .map(Box::new),
-        adapter_id: admission.adapter_id,
     })
 }
 
@@ -1410,7 +1387,6 @@ fn admission_from_fb(admission: fbs::AdmissionT) -> anyhow::Result<Admission> {
             .gen_admission
             .map(|branch| gen_admission_from_fb(*branch))
             .transpose()?,
-        adapter_id: admission.adapter_id,
     };
     admission.validate()?;
     Ok(admission)
@@ -2177,7 +2153,6 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
                 .map(request_kind_to_fb)
                 .collect(),
         ),
-        adapter_mode: adapter_mode_to_fb(caps.adapter_mode),
         execution_constraints: Some(Box::new(fbs::ExecutionConstraintsT {
             max_batch_operations: caps.execution_constraints.max_batch_operations,
             max_speculative_points: caps.execution_constraints.max_speculative_points,
@@ -2272,7 +2247,6 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
             .into_iter()
             .map(request_kind_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        adapter_mode: adapter_mode_from_fb(caps.adapter_mode)?,
         execution_constraints: caps
             .execution_constraints
             .map(|constraints| -> anyhow::Result<ExecutionConstraints> {
@@ -3037,8 +3011,6 @@ fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
         RequestKind::DropSession => fbs::ReqKind::DropSession,
         RequestKind::Shutdown => fbs::ReqKind::Shutdown,
         RequestKind::CopyKv => fbs::ReqKind::CopyKv,
-        RequestKind::LoadAdapter => fbs::ReqKind::LoadAdapter,
-        RequestKind::UnloadAdapter => fbs::ReqKind::UnloadAdapter,
         RequestKind::ReleaseProducts => fbs::ReqKind::ReleaseProducts,
         RequestKind::ResetPrefixCache => fbs::ReqKind::ResetPrefixCache,
         RequestKind::GetMetrics => fbs::ReqKind::GetMetrics,
@@ -3093,36 +3065,12 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> anyhow::Result<ResponseKind> {
     }
 }
 
-fn adapter_mode_to_fb(mode: AdapterMode) -> fbs::AdapterMode {
-    match mode {
-        AdapterMode::None => fbs::AdapterMode::None,
-        AdapterMode::EngineWide => fbs::AdapterMode::EngineWide,
-        AdapterMode::PerRequest => fbs::AdapterMode::PerRequest,
-        AdapterMode::MultiAdapter => fbs::AdapterMode::MultiAdapter,
-    }
-}
-
-fn adapter_mode_from_fb(mode: fbs::AdapterMode) -> anyhow::Result<AdapterMode> {
-    if mode == fbs::AdapterMode::None {
-        Ok(AdapterMode::None)
-    } else if mode == fbs::AdapterMode::EngineWide {
-        Ok(AdapterMode::EngineWide)
-    } else if mode == fbs::AdapterMode::PerRequest {
-        Ok(AdapterMode::PerRequest)
-    } else if mode == fbs::AdapterMode::MultiAdapter {
-        Ok(AdapterMode::MultiAdapter)
-    } else {
-        bail!("unknown adapter mode {}", mode.0)
-    }
-}
-
 fn resource_class_to_fb(class: ResourceClass) -> fbs::ResourceClass {
     match class {
         ResourceClass::KvBlock => fbs::ResourceClass::KvBlock,
         ResourceClass::EncoderOutput => fbs::ResourceClass::EncoderOutput,
         ResourceClass::ImageLatent => fbs::ResourceClass::ImageLatent,
         ResourceClass::Scratch => fbs::ResourceClass::Scratch,
-        ResourceClass::Adapter => fbs::ResourceClass::Adapter,
     }
 }
 
@@ -3135,8 +3083,6 @@ fn resource_class_from_fb(class: fbs::ResourceClass) -> anyhow::Result<ResourceC
         Ok(ResourceClass::ImageLatent)
     } else if class == fbs::ResourceClass::Scratch {
         Ok(ResourceClass::Scratch)
-    } else if class == fbs::ResourceClass::Adapter {
-        Ok(ResourceClass::Adapter)
     } else {
         bail!("unknown resource class {}", class.0)
     }

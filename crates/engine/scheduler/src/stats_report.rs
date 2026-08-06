@@ -82,7 +82,6 @@ impl SchedStatsReporter {
         SchedulerStats {
             num_running_reqs: stats.general.running.load(Ordering::Relaxed) as u64,
             num_waiting_reqs: stats.general.pending.load(Ordering::Relaxed) as u64,
-            num_skipped_waiting_reqs: stats.general.skipped_waiting.load(Ordering::Relaxed) as u64,
             step_counter: stats.general.steps.load(Ordering::Relaxed),
             current_wave: 0,
             kv_cache_usage,

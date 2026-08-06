@@ -186,7 +186,6 @@ def _deployment_overlay(
         kv_cache_dtype=execution.kv_cache_dtype,
         kv_memory_fraction=execution.kv_memory_fraction,
         resources=entry.resources,
-        adapter_mode=entry.adapter_mode,
         max_batch_operations=DEFAULT_MAX_BATCH_OPS,
         generation_device=request.generation_device,
     )

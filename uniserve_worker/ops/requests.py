@@ -67,7 +67,6 @@ class QKNormRopeReq:
     # correct because the supplied cos/sin tables already encode the identity.
     identity_axes: tuple[int, ...] | None = None
     quant: Any | None = None
-    adapters: Any | None = None
 
 
 @dataclass(frozen=True)

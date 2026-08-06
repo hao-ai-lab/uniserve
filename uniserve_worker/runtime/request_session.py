@@ -121,7 +121,6 @@ class RequestSession:
     image: ImageParams | None
     negative_token_ids: tuple[int, ...]
     finish_token_ids: tuple[int, ...]
-    adapter_id: int | None
     version: int = 0
     resolved_op_id: int = 0
     resolved_digest: str = ""
@@ -310,7 +309,6 @@ class SessionStore:
             image=None if admission.gen_admission is None else admission.gen_admission.image,
             negative_token_ids=(() if admission.und is None else admission.und.negative_token_ids),
             finish_token_ids=(() if admission.und is None else admission.und.finish_token_ids),
-            adapter_id=admission.adapter_id,
             resolved_digest=admission.digest,
             committed_digest=admission.digest,
             logical_position=prefix_len,

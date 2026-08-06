@@ -31,8 +31,8 @@ from ..forward import AttentionSelection
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import ExecutionConfig, graph_memory_budget_bytes
 from ..foundation.sizing import device_total_bytes
+from ..loader.weight_set import WeightSet
 from ..nn.mesh import DeviceMesh
-from ..runtime.adapter_store import AdapterStore
 from ..runtime.capabilities import resolve_capabilities
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.graph_store import GraphStore
@@ -164,12 +164,8 @@ class ModelWorker:
         self.model = model
         self.model_spec = model_spec
         self.deployment = deployment
-        self.adapter_store = AdapterStore(
-            model,
-            weights=model_spec.weights,
-            base_digest=weight_digest,
-        )
-        self.weight_digest = self.adapter_store.base.digest
+        self.weights = WeightSet.from_module(model, digest=weight_digest)
+        self.weight_digest = self.weights.digest
         self.model_spec_digest = model_spec_digest or resolved_digest(model_spec, deployment)
         if self.model_spec_digest != resolved_digest(model_spec, deployment):
             raise capability_mismatch("loaded model-spec digest does not match its declarations")
@@ -265,7 +261,7 @@ class ModelWorker:
             latents=self.latents,
             products=self.products,
             replay=self.replay,
-            adapters=self.adapter_store,
+            weights=self.weights,
             mesh=MeshStore(mesh),
             transport=self.mover.transport,
             tokenizer=tokenizer,
@@ -308,7 +304,6 @@ class ModelWorker:
                 latents=self.latents,
                 products=self.products,
                 replay=self.replay,
-                adapters=self.adapter_store,
                 transport=self.mover.transport,
             )
             restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
@@ -914,25 +909,6 @@ class ModelWorker:
     def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None:
         self.kv.copy(copies)
 
-    def load_adapter(self, adapter_id: int, adapter_path: str) -> None:
-        if self.deployment.adapter_mode == "none":
-            raise capability_mismatch("this worker does not declare adapter controls")
-        if self.sessions.session_ids():
-            raise capability_mismatch("adapter changes require no live sessions")
-        count = self.adapter_store.load(int(adapter_id), str(adapter_path))
-        if self.snapshot_provider is not None:
-            self.snapshot_provider.snapshot_global()
-        logger.info("loaded adapter %s with %d parameter overrides", adapter_id, count)
-
-    def unload_adapter(self, adapter_id: int) -> None:
-        if self.deployment.adapter_mode == "none":
-            raise capability_mismatch("this worker does not declare adapter controls")
-        if self.sessions.session_ids():
-            raise capability_mismatch("adapter changes require no live sessions")
-        self.adapter_store.unload(int(adapter_id))
-        if self.snapshot_provider is not None:
-            self.snapshot_provider.snapshot_global()
-
     def release_products(self, handles: tuple[int, ...]) -> None:
         records = tuple(
             record for handle in handles if (record := self.products.get(int(handle))) is not None
@@ -961,14 +937,12 @@ class ModelWorker:
             "scratch": self.kv.scratch_token_count(),
             "image_latent": self.latents.resident_byte_count(),
             "encoder_output": self.products.encoder_output_count(),
-            "adapter": self.adapter_store.loaded_count(),
         }
         totals = {
             "kv_block": int(caps.num_blocks),
             "scratch": int(caps.scratch_capacity_tokens),
             "image_latent": int(self.latents.capacity_bytes),
             "encoder_output": int(caps.encoder_cache_budget),
-            "adapter": 1,
         }
         return [
             _pressure(value.value, counts[value.value], totals[value.value])

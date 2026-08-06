@@ -226,7 +226,6 @@ mod tests {
                 kv: Default::default(),
             }),
             None,
-            None,
         )
         .expect("admission");
         let parent = VersionRef::admission_root(request_key, OpId(1), admission.digest.clone());

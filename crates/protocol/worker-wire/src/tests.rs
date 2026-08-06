@@ -188,7 +188,6 @@ fn admission() -> Admission {
             kv: KvAllocation::default(),
         }),
         None,
-        None,
     )
     .unwrap()
 }
@@ -879,7 +878,6 @@ fn comprehensive_batch() -> Batch {
             },
         }),
         None,
-        Some(6),
     )
     .unwrap();
     let gen_admission = Admission::new(
@@ -888,7 +886,6 @@ fn comprehensive_batch() -> Batch {
         Some(GenAdmission {
             image: full_image(),
         }),
-        None,
     )
     .unwrap();
     let controls = vec![
@@ -962,8 +959,6 @@ fn request_fixtures() -> Vec<WorkerRequest> {
         WorkerRequest::drop_session(RequestId(42)),
         WorkerRequest::shutdown(),
         WorkerRequest::copy_kv(vec![(BlockId(1), BlockId(2)), (BlockId(3), BlockId(4))]),
-        WorkerRequest::load_adapter(3, "adapters/alpha".into()),
-        WorkerRequest::unload_adapter(3),
         WorkerRequest::release_products(vec![1, 2, 3]),
         WorkerRequest::reset_prefix_cache(),
         WorkerRequest::get_metrics(),
@@ -1005,7 +1000,6 @@ fn full_caps() -> EngineCaps {
         pipeline_depth: 2,
         encoder_cache_budget: 77,
         supported_controls: vec![RequestKind::Execute, RequestKind::DropSession],
-        adapter_mode: AdapterMode::PerRequest,
         execution_constraints: ExecutionConstraints {
             max_batch_operations: 64,
             route_capabilities: vec![RouteExecutionCapability {
@@ -1018,7 +1012,7 @@ fn full_caps() -> EngineCaps {
             }],
             ..ExecutionConstraints::default()
         },
-        resource_classes: vec![ResourceClass::KvBlock, ResourceClass::Adapter],
+        resource_classes: vec![ResourceClass::KvBlock],
         model_spec_digest: digest_string(0x21),
         weight_digest: digest_string(0x22),
         restored_snapshots: vec![

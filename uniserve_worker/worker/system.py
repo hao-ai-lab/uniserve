@@ -98,7 +98,7 @@ class SystemWorker:
             latents=self.latents,
             products=self.products,
             replay=self.replay,
-            adapters=None,
+            weights=None,
             mesh=None,
             transport=self.mover.transport,
             tokenizer=None,
@@ -137,7 +137,6 @@ class SystemWorker:
                 latents=self.latents,
                 products=self.products,
                 replay=self.replay,
-                adapters=None,
                 transport=self.mover.transport,
             )
             restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
@@ -190,14 +189,6 @@ class SystemWorker:
     def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None:
         del copies
         raise unsupported_control(RequestKind.COPY_KV.value)
-
-    def load_adapter(self, adapter_id: int, adapter_path: str) -> None:
-        del adapter_id, adapter_path
-        raise unsupported_control(RequestKind.LOAD_ADAPTER.value)
-
-    def unload_adapter(self, adapter_id: int) -> None:
-        del adapter_id
-        raise unsupported_control(RequestKind.UNLOAD_ADAPTER.value)
 
     def release_products(self, handles: tuple[int, ...]) -> None:
         records = tuple(

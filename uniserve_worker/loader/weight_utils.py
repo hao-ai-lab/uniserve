@@ -64,12 +64,10 @@ class WeightFragment:
     quantization: str | None = None
 
 
-def map_weight_name(spec: WeightSpec, name: str, *, adapter: bool = False) -> str | None:
+def map_weight_name(spec: WeightSpec, name: str) -> str | None:
     """Apply the declared checkpoint namespace transform exactly once."""
 
-    transforms = spec.adapter_renames if adapter else spec.transforms
-    unmatched = spec.adapter_unmatched if adapter else spec.unmatched
-    for transform in transforms:
+    for transform in spec.transforms:
         if not isinstance(transform, Rename):
             continue
         if transform.exact:
@@ -83,7 +81,7 @@ def map_weight_name(spec: WeightSpec, name: str, *, adapter: bool = False) -> st
         for source, target in transform.substitutions:
             mapped = mapped.replace(source, target)
         return mapped
-    return name if unmatched is UnmatchedWeightPolicy.KEEP else None
+    return name if spec.unmatched is UnmatchedWeightPolicy.KEEP else None
 
 
 def resolve_weight_files(model_path: str | Path) -> list[Path]:

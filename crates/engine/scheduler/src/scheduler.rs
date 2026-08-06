@@ -58,8 +58,6 @@ pub struct GeneralStats {
     pub steps: AtomicU64,
     pub running: AtomicUsize,
     pub pending: AtomicUsize,
-    /// Requests gated on grammar compilation (vLLM's skipped_waiting).
-    pub skipped_waiting: AtomicUsize,
     pub in_flight: AtomicUsize,
 }
 
@@ -191,7 +189,6 @@ use uniserve_worker_wire::{
     UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
 };
 
-use crate::grammar::{GrammarCompiler, GrammarMatcher};
 use crate::image_artifact::validate_png_artifact;
 use crate::queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 use serde_json::json;
@@ -396,9 +393,8 @@ pub struct SchedulerConfig {
     /// prompt cannot monopolize a step even within the budget. `usize::MAX`
     /// disables it (the budget binds).
     pub long_prefill_threshold: usize,
-    /// Admission backpressure — maximum waiting requests (pending +
-    /// grammar-gated + terminal-output-retained) buffered before new submits
-    /// are rejected at enqueue.
+    /// Admission backpressure — maximum waiting requests buffered before new
+    /// submits are rejected at enqueue.
     pub max_num_waiting: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as a mixed extend+decode forward. `0` keeps prefill and decode in
@@ -462,12 +458,9 @@ pub struct ReqState {
     pub(crate) aborted: bool,
     /// The frontend decoder selected an exact terminal stop prefix.
     pub(crate) stop_matched: bool,
-    /// Structured-output matcher (compiled grammar and progress).
-    pub(crate) grammar: Option<GrammarMatcher>,
-    /// At most one CPU mask task may own this lineage's matcher state.
+    /// At most one CPU continuation may run for this lineage.
     pub(crate) cpu_pending: Option<CpuTaskKey>,
     pub(crate) cpu_masks: Option<CpuMasks>,
-    pub(crate) cpu_tokens_to_advance: Vec<u32>,
     pub(crate) cpu_generation: u64,
     /// This request's lifecycle trace.
     pub(crate) trace: crate::trace::RequestTrace,
@@ -572,11 +565,6 @@ pub struct Scheduler {
     retiring_sessions: HashMap<RequestId, RequestKey>,
     order: Vec<RequestId>, // stable iteration order
     pending: Box<dyn RequestQueue>,
-    /// The structured-output gate: requests whose grammar is still compiling
-    /// (vLLM's skipped_waiting). Admission drains the compiler each pass and
-    /// only then queues these.
-    skipped_waiting: HashMap<RequestId, ReqState>,
-    grammar_compiler: GrammarCompiler,
     cpu_continuations: CpuContinuationPool,
     cpu_task_timeout: Duration,
     /// Request-local continuation deadlines, bounded by the CPU task pool. This
@@ -1032,8 +1020,6 @@ impl Scheduler {
             completed_outputs: HashMap::new(),
             retiring_sessions: HashMap::new(),
             order: Vec::new(),
-            skipped_waiting: HashMap::new(),
-            grammar_compiler: GrammarCompiler::with_waker(cpu_waker.clone()),
             cpu_continuations: CpuContinuationPool::new(cpu_waker),
             cpu_task_timeout: Duration::from_secs(30),
             cpu_deadlines: HashMap::new(),
@@ -1154,7 +1140,6 @@ impl Scheduler {
         crate::policy::PolicySnapshot {
             waiting: self.pending.len(),
             running: self.running.len(),
-            skipped_waiting: self.skipped_waiting.len(),
             in_flight: self.executor.in_flight(),
             free_blocks: self.bm.free_blocks(),
             total_blocks: self.usable_blocks,
@@ -1298,9 +1283,9 @@ impl Scheduler {
                 // arrives as a command or as freed capacity from a command
                 // (cancel/finish), and the timeout doubles as the worker
                 // liveness probe so a worker that dies with nothing in flight
-                // is detected promptly. When gated on grammar compilation we use
-                // the shorter slice so the compiler is polled responsively.
-                let wait = if self.skipped_waiting.is_empty() && !self.cpu_tasks_pending() {
+                // is detected promptly. CPU continuations require a shorter
+                // slice so ready results are incorporated promptly.
+                let wait = if !self.cpu_tasks_pending() {
                     IDLE_LIVENESS_POLL
                 } else {
                     std::time::Duration::from_millis(1)
@@ -1338,10 +1323,10 @@ impl Scheduler {
     }
 
     /// Event-driven park over result, command, worker-death, CPU-continuation,
-    /// grammar, and output-capacity wakes. The timeout is a liveness backstop.
+    /// and output-capacity wakes. The timeout is a liveness backstop.
     fn park_event_driven(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        let timeout = if !self.skipped_waiting.is_empty() || self.cpu_tasks_pending() {
+        let timeout = if self.cpu_tasks_pending() {
             Duration::from_millis(1)
         } else if self.executor.in_flight() > 0 {
             SCHEDULER_WAIT_SLICE
@@ -1414,16 +1399,6 @@ impl Scheduler {
             ids
         };
         let _ = queued;
-        for (_, st) in self.skipped_waiting.drain() {
-            let _ = st.event_tx.send(GenEvent::Finished {
-                reason: FinishReason::Aborted,
-                stop_reason: None,
-                prompt_tokens: st.context.prompt_ids.len(),
-                completion_tokens: 0,
-                images: 0,
-                kv_transfer_params: None,
-            });
-        }
         let running: Vec<RequestId> = self.running.keys().copied().collect();
         for id in running {
             self.finish(id, FinishReason::Aborted);
@@ -1452,15 +1427,6 @@ impl Scheduler {
                 reply,
             } => self.begin_prefix_cache_reset(reset_running_requests, reply),
             Command::ResetEncoderCache => self.reset_encoder_cache(),
-            Command::LoadLora { id, path } => {
-                self.gated_control(ControlOp::LoadAdapter {
-                    adapter_id: id,
-                    path,
-                });
-            }
-            Command::UnloadLora { id } => {
-                self.gated_control(ControlOp::UnloadAdapter { adapter_id: id });
-            }
             Command::SetSleeping(s) => self.set_sleeping(s),
             Command::CollectiveRpc { method, reply } => {
                 let _ = reply.send(self.collective_rpc(&method));
@@ -1490,32 +1456,6 @@ impl Scheduler {
             st.cancelled = true;
             st.aborted = abort;
             st.stop_matched = false;
-        }
-        // a request still gated on grammar compilation can be cancelled too
-        if let Some(st) = self.skipped_waiting.remove(&id) {
-            let reason = if abort {
-                FinishReason::Aborted
-            } else {
-                FinishReason::Cancelled
-            };
-            self.trace_request_finished(
-                id,
-                &reason,
-                None,
-                st.context.prompt_ids.len(),
-                0,
-                0,
-                "skipped_waiting",
-            );
-            let _ = st.event_tx.send(GenEvent::Finished {
-                reason,
-                stop_reason: None,
-                prompt_tokens: st.context.prompt_ids.len(),
-                completion_tokens: 0,
-                images: 0,
-                kv_transfer_params: None,
-            });
-            return;
         }
         // also drop from the waiting queue if not yet admitted (reporting the reason)
         if let Some(st) = self.pending.remove_request(id) {
@@ -1710,7 +1650,6 @@ impl Scheduler {
             },
             "pending": self.pending.len(),
             "running": self.running.len(),
-            "skipped_waiting": self.skipped_waiting.len(),
         }));
     }
 
@@ -1769,12 +1708,11 @@ impl Scheduler {
             });
             return;
         }
-        // admission backpressure. Shed load instead of letting the waiting
-        // queues (pending + grammar-gated) grow without bound under overload —
+        // Admission backpressure sheds load instead of letting the waiting
+        // queue grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
         // in-flight request. Reject the new submit with a typed event.
-        let waiting =
-            self.pending.len() + self.skipped_waiting.len() + self.completed_outputs.len();
+        let waiting = self.pending.len() + self.completed_outputs.len();
         if waiting >= self.config.max_num_waiting {
             self.record_decision(
                 req.request_id,
@@ -1843,31 +1781,13 @@ impl Scheduler {
             cancelled: false,
             aborted: false,
             stop_matched: false,
-            grammar: None,
             cpu_pending: None,
             cpu_masks: None,
-            cpu_tokens_to_advance: Vec::new(),
             cpu_generation: 0,
             trace,
             req,
         };
         self.next_epoch = self.next_epoch.saturating_add(1);
-        // Structured-output gate: a request with a grammar
-        // waits in skipped_waiting until its compilation finishes; admission
-        // collects ready grammars each pass.
-        if let Some(spec) = st.req.grammar.clone() {
-            let id = st.req.request_id;
-            match self.grammar_compiler.submit(id, spec) {
-                Ok(()) => {
-                    self.trace_request_queued(&st, "skipped_waiting");
-                    self.skipped_waiting.insert(id, st);
-                }
-                Err(message) => {
-                    let _ = st.event_tx.send(GenEvent::Rejected { message });
-                }
-            }
-            return;
-        }
         self.trace_request_queued(&st, "pending");
         self.pending.add_request(st);
     }
@@ -2274,10 +2194,6 @@ impl Scheduler {
             .pending
             .store(self.pending.len(), Ordering::Relaxed);
         self.stats
-            .general
-            .skipped_waiting
-            .store(self.skipped_waiting.len(), Ordering::Relaxed);
-        self.stats
             .kv_cache
             .free_blocks
             .store(self.bm.free_blocks(), Ordering::Relaxed);
@@ -2543,7 +2459,6 @@ impl Scheduler {
     fn device_token_relay_eligible(state: &ReqState) -> bool {
         let sampling = &state.req.sampling;
         (!state.req.behavior.gen_output || state.req.policy.trigger.direct_token().is_some())
-            && state.grammar.is_none()
             && state.req.stop_strings.is_empty()
             && state.req.stop_token_ids.is_empty()
             && sampling.temperature <= 0.0
@@ -2577,7 +2492,6 @@ impl Scheduler {
                 && !state.ingest.round_closing
                 && (!state.req.behavior.gen_output
                     || state.req.policy.trigger.direct_token().is_some())
-                && state.grammar.is_none()
         })
     }
 
@@ -2593,8 +2507,7 @@ impl Scheduler {
     }
 
     fn cpu_continuation_required(&self, state: &ReqState) -> bool {
-        state.req.grammar.is_some()
-            || self.custom_logits_processors > 0
+        self.custom_logits_processors > 0
             || state.req.sampling.min_tokens > 0
             || !state.req.sampling.bad_words_ids.is_empty()
             || state.req.sampling.allowed_token_ids.is_some()
@@ -2603,9 +2516,7 @@ impl Scheduler {
     fn cpu_continuation_ready(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|state| {
             !self.cpu_continuation_required(state)
-                || (state.cpu_pending.is_none()
-                    && state.cpu_masks.is_some()
-                    && state.cpu_tokens_to_advance.is_empty())
+                || (state.cpu_pending.is_none() && state.cpu_masks.is_some())
         })
     }
 
@@ -2639,19 +2550,12 @@ impl Scheduler {
                 point: state.version,
                 generation: state.cpu_generation,
             };
-            let mut grammar_stops = eos.clone();
-            grammar_stops.extend(state.req.stop_token_ids.iter().copied());
-            grammar_stops.sort_unstable();
-            grammar_stops.dedup();
             let task = CpuTask {
                 key,
-                matcher: state.grammar.take(),
-                tokens_to_advance: std::mem::take(&mut state.cpu_tokens_to_advance),
                 n_generated: state.und.tokens_emitted,
                 eos,
                 generated: state.replay.generated_ids.clone(),
                 sampling: state.req.sampling.clone(),
-                grammar_stops,
                 pipeline,
             };
             match self.cpu_continuations.try_submit(task) {
@@ -2661,10 +2565,7 @@ impl Scheduler {
                         .insert(key, Instant::now() + self.cpu_task_timeout);
                     progressed = true;
                 }
-                Err(task) => {
-                    let task = *task;
-                    state.grammar = task.matcher;
-                    state.cpu_tokens_to_advance = task.tokens_to_advance;
+                Err(_) => {
                     break;
                 }
             }
@@ -2690,7 +2591,6 @@ impl Scheduler {
                 continue;
             }
             state.cpu_pending = None;
-            state.grammar = result.matcher;
             match result.outcome {
                 Ok(masks) => state.cpu_masks = Some(masks),
                 Err(error) => {
@@ -3695,22 +3595,6 @@ impl Scheduler {
         if self.sleeping {
             return;
         }
-        // Open the structured-output gate for grammars that finished compiling.
-        for (id, compiled) in self.grammar_compiler.drain_ready() {
-            let Some(mut st) = self.skipped_waiting.remove(&id) else {
-                continue;
-            };
-            match compiled {
-                Ok(matcher) => {
-                    st.grammar = Some(matcher);
-                    self.pending.add_request(st);
-                }
-                Err(message) => {
-                    tracing::error!(request_id = id.0, %message, "grammar admission failed");
-                    let _ = st.event_tx.send(GenEvent::Rejected { message });
-                }
-            }
-        }
         let bs = self.caps.block_size as usize;
         loop {
             if self.running.len() >= self.config.max_num_seqs {
@@ -4118,7 +4002,6 @@ impl Scheduler {
                         st.req.behavior.gen_output.then(|| GenAdmission {
                             image: st.req.image.clone(),
                         }),
-                        st.req.lora_id,
                     )
                     .expect("validated request produces a valid admission");
                     // The admission-root version is produced by the synthetic
@@ -4460,10 +4343,6 @@ impl Scheduler {
             .pending
             .store(self.pending.len(), Ordering::Relaxed);
         self.stats
-            .general
-            .skipped_waiting
-            .store(self.skipped_waiting.len(), Ordering::Relaxed);
-        self.stats
             .kv_cache
             .free_blocks
             .store(self.bm.free_blocks(), Ordering::Relaxed);
@@ -4533,7 +4412,6 @@ impl Scheduler {
                 },
                 "running": self.running.len(),
                 "pending": self.pending.len(),
-                "skipped_waiting": self.skipped_waiting.len(),
                 "in_flight_before_submit": self.executor.in_flight(),
                 "free_blocks": self.bm.free_blocks(),
                 "reserved_blocks": self.reserved_blocks,
@@ -5381,16 +5259,14 @@ impl Scheduler {
         }
     }
 
-    fn advance_grammar(&mut self, id: RequestId, token_id: u32) -> bool {
+    fn invalidate_cpu_masks(&mut self, id: RequestId) {
         let required = self
             .running
             .get(&id)
             .is_some_and(|state| self.cpu_continuation_required(state));
         if required && let Some(state) = self.running.get_mut(&id) {
             state.cpu_masks = None;
-            state.cpu_tokens_to_advance.push(token_id);
         }
-        true
     }
 
     fn resolve_spec_decode_text(
@@ -5432,9 +5308,7 @@ impl Scheduler {
             if let Some(st) = self.running.get_mut(&id) {
                 st.und.next_token = tok;
             }
-            if !self.advance_grammar(id, tok) {
-                return;
-            }
+            self.invalidate_cpu_masks(id);
         }
     }
 
@@ -5529,9 +5403,7 @@ impl Scheduler {
                 st.lifecycle.phase = Phase::DecodeUnd;
                 st.und.round_tokens.push(tok);
             }
-            if !self.advance_grammar(id, tok) {
-                return;
-            }
+            self.invalidate_cpu_masks(id);
             if can_open_gen_branch
                 && images_done < max_images
                 && self
@@ -5655,9 +5527,7 @@ impl Scheduler {
                             st.lifecycle.phase = Phase::DecodeUnd;
                             st.und.round_tokens.push(tok);
                         }
-                        if !self.advance_grammar(id, tok) {
-                            return;
-                        }
+                        self.invalidate_cpu_masks(id);
                         if can_open_gen_branch
                             && images_done < max_images
                             && self
@@ -5756,9 +5626,7 @@ impl Scheduler {
                     st.und.next_token = tok;
                     st.lifecycle.phase = Phase::DecodeUnd;
                 }
-                if !self.advance_grammar(id, tok) {
-                    return;
-                }
+                self.invalidate_cpu_masks(id);
                 if can_open_gen_branch
                     && images_done < max_images
                     && self
@@ -6743,8 +6611,6 @@ mod tests {
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
             priority: 0,
-            lora_id: None,
-            grammar: None,
             cache: Default::default(),
             policy,
             resources: GenerationResourceBounds {

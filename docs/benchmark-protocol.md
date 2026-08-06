@@ -27,7 +27,7 @@ uniserve-eval compare decode-runtime \
   --output-dir /path/to/comparison
 ```
 
-The `decode-runtime` suite supplies its 5% maximum-regression threshold. A single benchmark point can be used in place of a suite name; comparison of a single point requires `--max-regression`.
+The `decode-runtime` suite supplies its 5% maximum-regression comparison screen. A single benchmark point can be used in place of a suite name; comparison of a single point requires `--max-regression`. A comparison screen result reports a metric crossing; the consuming qualification protocol interprets it as evidence and determines the required investigation or repair.
 
 ## Configuration
 
@@ -67,6 +67,6 @@ Git state, GPU information, server command, selected environment values, and ser
 
 ## Comparison
 
-Reference and candidate must have identical benchmark names, workloads, selected rows, and metric declarations. The comparator reads aggregate metrics from the complete point bundles; it never filters to a successful-request intersection.
+Reference and candidate must have identical benchmark names, declared workloads, selected rows, and metric declarations. The comparator reads aggregate metrics from the complete point bundles; it never filters to a successful-request intersection. When the task allows natural EOS or open-ended interleave output, realized token, image, and transition counts are measured results rather than workload-equivalence fields.
 
-For higher-is-better metrics the normalized ratio is `candidate / reference`. For lower-is-better metrics it is `reference / candidate`. Every row reports both raw values, raw percentage change, normalized ratio, threshold, and result.
+For higher-is-better metrics the normalized ratio is `candidate / reference`. For lower-is-better metrics it is `reference / candidate`. Every row reports both raw values, raw percentage change, normalized ratio, threshold, and comparison-screen result. A screen crossing is evidence for diagnosis, not an automatic performance gate failure or a reason to halt work.

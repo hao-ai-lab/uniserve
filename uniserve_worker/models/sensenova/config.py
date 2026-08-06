@@ -113,8 +113,6 @@ class NeoChatConfig(PretrainedConfig):
         self,
         vision_config: Any | None = None,
         llm_config: Any | None = None,
-        use_backbone_lora: int = 0,
-        use_llm_lora: int = 0,
         downsample_ratio: float = 0.5,
         template: str | None = None,
         **kwargs: Any,
@@ -135,8 +133,6 @@ class NeoChatConfig(PretrainedConfig):
             NeoVisionConfig(**vision_config) if isinstance(vision_config, dict) else vision_config
         )
         self.llm_config = build_neo_llm_config(llm_config)
-        self.use_backbone_lora = use_backbone_lora
-        self.use_llm_lora = use_llm_lora
         self.downsample_ratio = downsample_ratio
         self.template = template
         self.tie_word_embeddings = self.llm_config.tie_word_embeddings
@@ -146,8 +142,6 @@ class NeoChatConfig(PretrainedConfig):
         output["vision_config"] = self.vision_config.to_dict()
         output["llm_config"] = self.llm_config.to_dict()
         output["model_type"] = self.__class__.model_type
-        output["use_backbone_lora"] = self.use_backbone_lora
-        output["use_llm_lora"] = self.use_llm_lora
         output["downsample_ratio"] = self.downsample_ratio
         output["template"] = self.template
         return output

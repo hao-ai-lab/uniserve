@@ -105,11 +105,7 @@ impl SimExecutor {
                     .send(Job::Drop(*session_id))
                     .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
             }
-            ControlOp::CopyKv(_)
-            | ControlOp::ReleaseProducts(_)
-            | ControlOp::LoadAdapter { .. }
-            | ControlOp::UnloadAdapter { .. }
-            | ControlOp::ResetPrefixCache => {}
+            ControlOp::CopyKv(_) | ControlOp::ReleaseProducts(_) | ControlOp::ResetPrefixCache => {}
             ControlOp::SnapshotSession(_) | ControlOp::RestoreSession(_) => {
                 unreachable!("unsupported controls are rejected before dispatch")
             }
@@ -309,8 +305,6 @@ impl SimEngine {
                 RequestKind::DropSession,
                 RequestKind::CopyKv,
                 RequestKind::ReleaseProducts,
-                RequestKind::LoadAdapter,
-                RequestKind::UnloadAdapter,
                 RequestKind::ResetPrefixCache,
             ],
             execution_constraints: ExecutionConstraints {
@@ -1042,7 +1036,6 @@ mod tests {
                 kv: KvAllocation::default(),
             }),
             None,
-            None,
         )
         .expect("admission")
     }
@@ -1139,11 +1132,6 @@ mod tests {
             ControlOp::DropSession(RequestId(1)),
             ControlOp::CopyKv(Vec::new()),
             ControlOp::ReleaseProducts(Vec::new()),
-            ControlOp::LoadAdapter {
-                adapter_id: 7,
-                path: "/tmp/adapter".into(),
-            },
-            ControlOp::UnloadAdapter { adapter_id: 7 },
             ControlOp::ResetPrefixCache,
         ] {
             let acknowledgements = executor

@@ -21,7 +21,6 @@ use crate::generation::{
     GenerationEventStream, generation_event_stream_from_wire, generation_request_to_wire,
 };
 use crate::protocol::handshake::EngineCoreReadyResponse;
-use crate::protocol::lora::LoraRequest;
 use crate::protocol::utility::EngineCoreUtilityRequest;
 use crate::protocol::{EngineCoreControlRequest, EngineCoreRequest, ModelDtype};
 use crate::zmq::imp::{ClientInner, run_output_dispatcher_loop, run_stream_control_loop};
@@ -585,24 +584,6 @@ impl ZmqEngineCoreClient {
             });
         }
         Ok(results.into_iter().all(|ok| ok))
-    }
-
-    /// Load or refresh one LoRA adapter on every connected engine.
-    pub async fn add_lora(&self, lora_request: &LoraRequest) -> Result<bool> {
-        Ok(self
-            .call_utility::<bool, _>("add_lora", (lora_request,))
-            .await?
-            .into_iter()
-            .all(|loaded| loaded))
-    }
-
-    /// Remove one LoRA adapter from every connected engine.
-    pub async fn remove_lora(&self, lora_id: u64) -> Result<bool> {
-        Ok(self
-            .call_utility::<bool, _>("remove_lora", (lora_id,))
-            .await?
-            .into_iter()
-            .all(|removed| removed))
     }
 
     /// Put the engines to sleep.

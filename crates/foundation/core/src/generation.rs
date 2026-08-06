@@ -455,22 +455,6 @@ impl GenerationCapabilityNeeds {
     }
 }
 
-/// Structured-output grammar lowered before scheduler admission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum GrammarSpec {
-    /// Output must be exactly one of these token-id sequences.
-    Choice { token_sequences: Vec<Vec<u32>> },
-    /// A tokenizer-specific grammar compiled by the serving runtime. Both
-    /// serializations are immutable value data; mutable matcher state remains
-    /// scheduler-local.
-    Compiled {
-        token_bytes: Vec<Vec<u8>>,
-        compiled_grammar_json: String,
-        stop_token_ids: Vec<u32>,
-    },
-}
-
 /// Conservative request-level resource declaration produced by compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationResourceBounds {
@@ -948,8 +932,6 @@ pub struct GenerationRequest {
     pub stop_strings: Vec<String>,
     pub stop_token_ids: Vec<u32>,
     pub priority: i32,
-    pub lora_id: Option<u32>,
-    pub grammar: Option<GrammarSpec>,
     pub cache: GenerationCachePolicyDescriptor,
     pub policy: GenerationPolicyDescriptor,
     pub resources: GenerationResourceBounds,
@@ -1100,23 +1082,6 @@ impl GenerationRequest {
         if self.stop_strings.iter().any(String::is_empty) {
             return Err(GenerationRequestError::EmptyStopString);
         }
-        if let Some(grammar) = &self.grammar {
-            match grammar {
-                GrammarSpec::Choice { token_sequences }
-                    if token_sequences.is_empty() || token_sequences.iter().any(Vec::is_empty) =>
-                {
-                    return Err(GenerationRequestError::InvalidGrammar);
-                }
-                GrammarSpec::Compiled {
-                    token_bytes,
-                    compiled_grammar_json,
-                    ..
-                } if token_bytes.is_empty() || compiled_grammar_json.is_empty() => {
-                    return Err(GenerationRequestError::InvalidGrammar);
-                }
-                GrammarSpec::Choice { .. } | GrammarSpec::Compiled { .. } => {}
-            }
-        }
         Ok(())
     }
 
@@ -1220,8 +1185,6 @@ pub enum GenerationRequestError {
     },
     #[error("stop strings must not be empty")]
     EmptyStopString,
-    #[error("grammar must contain at least one executable token path")]
-    InvalidGrammar,
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
     #[error("invalid image parameters: {0}")]
@@ -1330,12 +1293,6 @@ mod tests {
             stop_strings: vec!["stop".into()],
             stop_token_ids: vec![2],
             priority: 3,
-            lora_id: Some(5),
-            grammar: Some(GrammarSpec::Compiled {
-                token_bytes: vec![vec![b'a'], vec![b'b']],
-                compiled_grammar_json: "{}".into(),
-                stop_token_ids: vec![2],
-            }),
             cache: GenerationCachePolicyDescriptor {
                 read: false,
                 write: false,

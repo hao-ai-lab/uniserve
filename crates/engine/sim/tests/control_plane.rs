@@ -127,8 +127,6 @@ fn generation_request(
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 0,
-        lora_id: None,
-        grammar: None,
         cache,
         policy,
         resources,
@@ -2854,58 +2852,6 @@ fn sequence_admission_carries_the_prefix_reuse_boundary() {
         prefix_of(2),
         vec![9 * block_size],
         "a prefix-cache-hit admission must register prefix_len == cached blocks x block size"
-    );
-}
-
-/// Structured outputs end to end under the sim: a guided choice gates on grammar
-/// compilation (skipped_waiting), masks every decode step to the choice trie,
-/// and terminates after one alternative completes.
-#[test]
-fn guided_choice_constrains_output() {
-    use uniserve_engine_api::GrammarSpec;
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000); // the grammar, not the sim EOS, must terminate it
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let sched = Scheduler::new(executor, ctrl(), 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut req = generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        64,
-    );
-    req.grammar = Some(GrammarSpec::Choice {
-        token_sequences: vec![vec![2000, 2001, 2002], vec![3000]],
-    });
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut toks = Vec::new();
-    let mut reason = None;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while reason.is_none() && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(GenEvent::TextToken { id, .. }) => toks.push(id),
-            Ok(GenEvent::Finished { reason: r, .. }) => reason = Some(r),
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert_eq!(
-        reason,
-        Some(FinishReason::Eos),
-        "the completed grammar must force EOS"
-    );
-    assert!(
-        toks == vec![2000, 2001, 2002] || toks == vec![3000],
-        "output must be exactly one allowed choice, got {toks:?}"
     );
 }
 

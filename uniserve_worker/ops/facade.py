@@ -63,7 +63,6 @@ def qk_norm_rope(
     axis_dims=None,
     identity_axes=None,
     quant=None,
-    adapters=None,
     override: str | None = None,
 ):
     from .providers import qk_norm_rope_dispatcher
@@ -82,7 +81,6 @@ def qk_norm_rope(
             None if axis_dims is None else tuple(int(v) for v in axis_dims),
             None if identity_axes is None else tuple(int(v) for v in identity_axes),
             quant,
-            adapters,
         ),
         override=override,
     )

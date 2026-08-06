@@ -5,8 +5,6 @@ use uniserve_engine_gateway::Error as GatewayError;
 pub enum Error {
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
-    #[error("invalid structured-output constraint: {0}")]
-    StructuredOutput(String),
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[from] uniserve_core::SamplingParamsError),
     #[error("{field} must be non-negative or -1, got {value}")]
@@ -15,8 +13,6 @@ pub enum Error {
     MinTokensExceedsMaximum { min_tokens: u32, max_tokens: u32 },
     #[error("text request `{request_id}` must contain at least one prompt token ID")]
     EmptyPromptTokenIds { request_id: String },
-    #[error("text request `{request_id}` has an adapter id outside the scheduler id space")]
-    AdapterIdOutOfRange { request_id: String },
     #[error("invalid canonical generation request: {0}")]
     InvalidGenerationRequest(String),
     #[error(

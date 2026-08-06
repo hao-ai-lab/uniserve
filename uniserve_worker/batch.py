@@ -158,13 +158,6 @@ class CloseReason(StrEnum):
     PREEMPTED = "preempted"
 
 
-class AdapterMode(StrEnum):
-    NONE = "none"
-    ENGINE_WIDE = "engine_wide"
-    PER_REQUEST = "per_request"
-    MULTI_ADAPTER = "multi_adapter"
-
-
 # Ordered `(kind, mode)` for every closed `Work` leaf; the position is the
 # canonical variant index used on the wire and in the plan digest.
 _WORK_VARIANTS: tuple[tuple[str, str | None], ...] = (
@@ -198,7 +191,6 @@ _OP_STATUS_INDEX = {member: index for index, member in enumerate(OpStatus)}
 _DRAW_LAYOUT_INDEX = {member: index for index, member in enumerate(DrawLayout)}
 _DISPOSITION_INDEX = {member: index for index, member in enumerate(Disposition)}
 _CLOSE_REASON_INDEX = {member: index for index, member in enumerate(CloseReason)}
-_ADAPTER_MODE_INDEX = {member: index for index, member in enumerate(AdapterMode)}
 _SAMPLING_OWNERSHIP_INDEX = {member: index for index, member in enumerate(SamplingOwnership)}
 
 # The native worker transport attaches this process-local token only after the
@@ -377,7 +369,6 @@ def route_capability_digest(
     max_vit_grid_tokens: int,
     max_latent_feature_bytes: int,
     max_vision_feature_bytes: int,
-    adapter_mode: AdapterMode,
     max_batch_operations: int,
     max_speculative_points: int,
     device_sequence_lengths: bool,
@@ -414,7 +405,6 @@ def route_capability_digest(
     digest.u32(max_vit_grid_tokens)
     digest.u64(max_latent_feature_bytes)
     digest.u64(max_vision_feature_bytes)
-    digest.u8(_ADAPTER_MODE_INDEX[AdapterMode(adapter_mode)])
     digest.u32(max_batch_operations)
     digest.u32(max_speculative_points)
     digest.boolean(device_sequence_lengths)
@@ -1829,13 +1819,10 @@ class Admission:
     digest: str
     und: UndAdmission | None
     gen_admission: GenAdmission | None
-    adapter_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.und is None and self.gen_admission is None:
             raise invalid_descriptor("admission must declare an understanding or generation branch")
-        if self.adapter_id is not None:
-            _nonnegative(self.adapter_id, "admission.adapter_id")
 
     @classmethod
     def create(
@@ -1844,9 +1831,8 @@ class Admission:
         *,
         und: UndAdmission | None = None,
         gen_admission: GenAdmission | None = None,
-        adapter_id: int | None = None,
     ) -> Admission:
-        value = cls(request_key, "", und, gen_admission, adapter_id)
+        value = cls(request_key, "", und, gen_admission)
         return replace(value, digest=value.payload_digest())
 
     @classmethod
@@ -1865,7 +1851,6 @@ class Admission:
                 if data.get("gen_admission") is None
                 else GenAdmission.from_wire(data["gen_admission"], f"{where}.gen_admission")
             ),
-            adapter_id=_optional_uint(data.get("adapter_id"), f"{where}.adapter_id"),
         )
         admission.validate()
         return admission
@@ -1883,7 +1868,6 @@ class Admission:
         _digest_request_key(digest, self.request_key)
         digest.option(self.und, lambda value: _digest_und_admission(digest, value))
         digest.option(self.gen_admission, lambda value: _digest_image(digest, value.image))
-        digest.option(self.adapter_id, digest.u32)
         return digest.finish()
 
     def to_wire(self) -> dict[str, object]:
@@ -1892,7 +1876,6 @@ class Admission:
             "digest": self.digest,
             "und": None if self.und is None else self.und.to_wire(),
             "gen_admission": None if self.gen_admission is None else self.gen_admission.to_wire(),
-            "adapter_id": self.adapter_id,
         }
 
 

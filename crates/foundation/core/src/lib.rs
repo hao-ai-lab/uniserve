@@ -17,7 +17,7 @@ pub use generation::{
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,
     GenerationCapabilityNeeds, GenerationConstraint, GenerationConstraintParseError,
     GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
-    GenerationResourceBounds, GenerationResourceError, GenerationRuntimeCapabilities, GrammarSpec,
+    GenerationResourceBounds, GenerationResourceError, GenerationRuntimeCapabilities,
     ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPlacement,
     TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction, UndVisibility,
     VisibilityPolicyDescriptor, denoise_scratch_tokens, encoder_cache_key,

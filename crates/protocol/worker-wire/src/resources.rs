@@ -14,7 +14,6 @@ pub enum ResourceClass {
     EncoderOutput,
     ImageLatent,
     Scratch,
-    Adapter,
 }
 
 impl ResourceClass {
@@ -24,7 +23,6 @@ impl ResourceClass {
             ResourceClass::EncoderOutput => "encoder_output",
             ResourceClass::ImageLatent => "image_latent",
             ResourceClass::Scratch => "scratch",
-            ResourceClass::Adapter => "adapter",
         }
     }
 
@@ -34,7 +32,6 @@ impl ResourceClass {
             ResourceClass::EncoderOutput => "handles",
             ResourceClass::ImageLatent => "bytes",
             ResourceClass::Scratch => "bytes",
-            ResourceClass::Adapter => "adapters",
         }
     }
 }

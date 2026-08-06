@@ -318,7 +318,7 @@ def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
             json={
                 "model": "SenseNova-U1",
                 "messages": [{"role": "user", "content": "hello"}],
-                "grammar": "root ::= 'yes'",
+                "unsupported_option": True,
             },
             timeout=30,
         )

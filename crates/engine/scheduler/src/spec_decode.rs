@@ -92,7 +92,6 @@ impl SpecDecodeAccounting {
         // whose per-token response semantics are not yet represented.
         st.is_replayable_text()
             && !st.req.behavior.gen_output
-            && st.grammar.is_none()
             && st.req.stop_strings.is_empty()
             && st.und.tokens_emitted >= sp.min_tokens
             && !sp.generated_logprobs_requested()

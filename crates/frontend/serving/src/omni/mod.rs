@@ -242,8 +242,6 @@ fn build_tokenized(
         stop_strings: request.stop.stop_strings.clone(),
         stop_token_ids: lowered.stop_token_ids,
         priority: request.scheduling.priority,
-        lora_id: None,
-        grammar: None,
         cache,
         policy,
         resources,
@@ -289,8 +287,6 @@ fn resource_accounting_from(resources: &GenerationResourceBounds) -> ResourceAcc
         scratch_units: resources.max_scratch_units,
         host_scratch_tokens: resources.max_host_scratch_tokens,
         encoder_cache_pins: resources.encoder_cache_keys.len(),
-        grammar_states: 0,
-        adapter_slots: 0,
         replayable: !resources.generated_feedback_makes_non_replayable,
     }
 }

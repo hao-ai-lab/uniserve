@@ -34,8 +34,6 @@ fn text_request() -> GenerationRequest {
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
         priority: 4,
-        lora_id: None,
-        grammar: None,
         cache: Default::default(),
         policy,
         resources: GenerationResourceBounds {

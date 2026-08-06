@@ -1138,8 +1138,6 @@ pub struct ResourceAccounting {
     pub scratch_units: u64,
     pub host_scratch_tokens: u64,
     pub encoder_cache_pins: usize,
-    pub grammar_states: usize,
-    pub adapter_slots: usize,
     pub replayable: bool,
 }
 

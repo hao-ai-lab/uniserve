@@ -6,7 +6,7 @@ import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker import batch
-from uniserve_worker.batch import AdapterMode, WorkVariant
+from uniserve_worker.batch import WorkVariant
 from uniserve_worker.capabilities import EngineCaps
 from uniserve_worker.server.app import dispatch
 
@@ -44,7 +44,6 @@ def _recompute_route_digest(wire: dict) -> str:
         wire["max_vit_grid_tokens"],
         wire["max_latent_feature_bytes"],
         wire["max_vision_feature_bytes"],
-        AdapterMode(wire["adapter_mode"]),
         wire["execution_constraints"]["max_batch_operations"],
         wire["execution_constraints"]["max_speculative_points"],
         wire["execution_constraints"]["device_sequence_lengths"],

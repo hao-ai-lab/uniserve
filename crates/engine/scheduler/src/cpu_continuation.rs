@@ -1,10 +1,9 @@
-//! Bounded per-lineage CPU continuations for grammar and custom token masks.
+//! Bounded per-lineage CPU continuations for configured token processors.
 
 use std::sync::Arc;
 
 use uniserve_core::{RequestId, SamplingParams};
 
-use crate::grammar::{GrammarMatcher, grammar_allowed_tokens};
 use crate::logits::{LogitsProcessor, ProcCtx, run_pipeline_checked};
 
 const CPU_TASK_CAPACITY: usize = 256;
@@ -26,53 +25,32 @@ pub(crate) struct CpuMasks {
 
 pub(crate) struct CpuTask {
     pub key: CpuTaskKey,
-    pub matcher: Option<GrammarMatcher>,
-    pub tokens_to_advance: Vec<u32>,
     pub n_generated: usize,
     pub eos: Vec<u32>,
     pub generated: Vec<u32>,
     pub sampling: SamplingParams,
-    pub grammar_stops: Vec<u32>,
     pub pipeline: Vec<Arc<dyn LogitsProcessor>>,
 }
 
 pub(crate) struct CpuResult {
     pub key: CpuTaskKey,
-    pub matcher: Option<GrammarMatcher>,
     pub outcome: Result<CpuMasks, String>,
 }
 
 impl CpuTask {
-    fn execute(mut self) -> CpuResult {
+    fn execute(self) -> CpuResult {
         let outcome = (|| {
-            if let Some(matcher) = self.matcher.as_mut() {
-                for token in self.tokens_to_advance.iter().copied() {
-                    matcher.advance(token)?;
-                }
-            }
             let ctx = ProcCtx {
                 n_generated: self.n_generated,
                 eos: &self.eos,
                 generated: &self.generated,
                 sampling: &self.sampling,
             };
-            let (mut allowed, suppress) = run_pipeline_checked(&self.pipeline, &ctx)?;
-            if let Some(matcher) = self.matcher.as_mut() {
-                let (complete, continuations) = matcher.next_mask()?;
-                let grammar = grammar_allowed_tokens(complete, continuations, &self.grammar_stops);
-                allowed = Some(match allowed {
-                    Some(tokens) => tokens
-                        .into_iter()
-                        .filter(|token| grammar.contains(token))
-                        .collect(),
-                    None => grammar,
-                });
-            }
+            let (allowed, suppress) = run_pipeline_checked(&self.pipeline, &ctx)?;
             Ok(CpuMasks { allowed, suppress })
         })();
         CpuResult {
             key: self.key,
-            matcher: self.matcher,
             outcome,
         }
     }

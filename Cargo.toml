@@ -130,7 +130,6 @@ trait-set = "0.3.0"
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
 winnow = "1.0.2"
-xgrammar-rs = { version = "0.1.33", default-features = false }
 zeromq = { version = "0.6.0", default-features = false, features = [
     "tokio-runtime",
     "all-transport",

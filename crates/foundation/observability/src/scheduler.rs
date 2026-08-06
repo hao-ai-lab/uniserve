@@ -90,7 +90,7 @@ pub struct SchedulerMetrics {
         name = "uniserve:num_requests_waiting_by_reason",
         help = "Number of waiting requests by reason. \
              Reason labels: 'capacity' = waiting for scheduling capacity; \
-             'deferred' = deferred by transient constraints (LoRA budget, KV transfer, \
+             'deferred' = deferred by transient constraints (KV transfer, \
              blocked status). Sum of all reasons equals uniserve:num_requests_waiting."
     )]
     pub scheduler_waiting_by_reason: Family<WaitingReasonLabels, U64Gauge>,

@@ -74,8 +74,6 @@ enum ReqKind : ubyte {
   DropSession,
   Shutdown,
   CopyKv,
-  LoadAdapter,
-  UnloadAdapter,
   ReleaseProducts,
   ResetPrefixCache,
   GetMetrics,
@@ -85,8 +83,7 @@ enum ReqKind : ubyte {
 }
 
 enum RespKind : ubyte { Capabilities, Result, Ok, Error, Metrics, Pressure, Snapshot }
-enum AdapterMode : ubyte { None, EngineWide, PerRequest, MultiAdapter }
-enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent, Scratch, Adapter }
+enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent, Scratch }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
 
 table U32List { items:[uint]; }
@@ -228,7 +225,6 @@ table EngineCaps {
   pipeline_depth:uint;
   encoder_cache_budget:uint;
   supported_controls:[ReqKind];
-  adapter_mode:AdapterMode;
   execution_constraints:ExecutionConstraints;
   resource_classes:[ResourceClass];
   model_spec_digest:string;
@@ -415,7 +411,6 @@ table Admission {
   digest:string;
   und:UndAdmission;
   gen_admission:GenAdmission;
-  adapter_id:uint = null;
 }
 
 table BatchPartition {
@@ -524,8 +519,6 @@ table WorkerRequest {
   step_id:ulong = null;
   session_id:ulong = null;
   copies:[BlockPair];
-  adapter_id:uint = null;
-  adapter_path:string;
   product_handles:[ulong];
   snapshot:SnapshotRef;
 }

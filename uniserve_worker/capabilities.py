@@ -8,9 +8,6 @@ from enum import StrEnum
 from typing import Any, TypeVar, cast
 
 from .batch import (
-    AdapterMode as _WireAdapterMode,
-)
-from .batch import (
     Operation,
     ProductKind,
     SamplingOwnership,
@@ -103,8 +100,6 @@ class RequestKind(StrEnum):
     DROP_SESSION = "drop_session"
     SHUTDOWN = "shutdown"
     COPY_KV = "copy_kv"
-    LOAD_ADAPTER = "load_adapter"
-    UNLOAD_ADAPTER = "unload_adapter"
     RELEASE_PRODUCTS = "release_products"
     RESET_PREFIX_CACHE = "reset_prefix_cache"
     GET_METRICS = "get_metrics"
@@ -123,19 +118,11 @@ class ResponseKind(StrEnum):
     SNAPSHOT = "snapshot"
 
 
-class AdapterMode(StrEnum):
-    NONE = "none"
-    ENGINE_WIDE = "engine_wide"
-    PER_REQUEST = "per_request"
-    MULTI_ADAPTER = "multi_adapter"
-
-
 class ResourceClass(StrEnum):
     KV_BLOCK = "kv_block"
     ENCODER_OUTPUT = "encoder_output"
     IMAGE_LATENT = "image_latent"
     SCRATCH = "scratch"
-    ADAPTER = "adapter"
 
 
 class KvGroupKind(StrEnum):
@@ -359,7 +346,6 @@ class EngineCaps:
     pipeline_depth: int
     encoder_cache_budget: int
     supported_controls: tuple[RequestKind, ...]
-    adapter_mode: AdapterMode
     execution_constraints: ExecutionConstraints
     resource_classes: tuple[ResourceClass, ...]
     model_spec_digest: str
@@ -425,11 +411,6 @@ class EngineCaps:
         )
         if restored_session_ids != tuple(sorted(set(restored_session_ids))):
             raise invalid_descriptor("capabilities restored snapshots are not canonical")
-        if self.adapter_mode is not AdapterMode.NONE and not {
-            RequestKind.LOAD_ADAPTER,
-            RequestKind.UNLOAD_ADAPTER,
-        } <= set(self.supported_controls):
-            raise invalid_descriptor("adapter capability requires load and unload controls")
         # The two agreement digests are a pure function of this capability's own
         # fields, so they are computed here at the authoritative construction
         # point. Every construction path (declaration, wire decode, ``replace``)
@@ -446,7 +427,6 @@ class EngineCaps:
                 self.max_vit_grid_tokens,
                 self.max_latent_feature_bytes,
                 self.max_vision_feature_bytes,
-                _WireAdapterMode(self.adapter_mode.value),
                 self.execution_constraints.max_batch_operations,
                 self.execution_constraints.max_speculative_points,
                 self.execution_constraints.device_sequence_lengths,
@@ -531,7 +511,6 @@ class EngineCaps:
                     _seq(data.get("supported_controls", ()), f"{where}.supported_controls")
                 )
             ),
-            adapter_mode=_enum(AdapterMode, data.get("adapter_mode"), f"{where}.adapter_mode"),
             execution_constraints=ExecutionConstraints(
                 max_batch_operations=_uint(
                     _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
@@ -665,7 +644,6 @@ class EngineCaps:
             "pipeline_depth": self.pipeline_depth,
             "encoder_cache_budget": self.encoder_cache_budget,
             "supported_controls": [value.value for value in self.supported_controls],
-            "adapter_mode": self.adapter_mode.value,
             "execution_constraints": {
                 "max_batch_operations": self.execution_constraints.max_batch_operations,
                 "max_speculative_points": self.execution_constraints.max_speculative_points,

@@ -124,7 +124,6 @@ TEST_DEPLOYMENT = DeploymentOverlay(
     kv_cache_dtype=None,
     kv_memory_fraction=1.0,
     resources=ResourcePlan(),
-    adapter_mode="none",
     max_batch_operations=1024,
     generation_device=None,
 )
