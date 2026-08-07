@@ -122,12 +122,14 @@ class WorkerServeLoop:
                     self.worker_server.respond(self.shutdown[1])
                     return
                 if self.inflight:
-                    # Device work is in flight but none is query-ready. Park on
-                    # the IPC command wake so a new submission advances the loop
-                    # immediately; the bounded timeout is the query-only
-                    # completion-readiness re-check floor, since device readiness
-                    # carries no operating-system wake.
-                    self._wait_incoming()
+                    # Device work is in flight but none is query-ready. Device
+                    # readiness carries no operating-system wake, so the
+                    # controller advances on query-only progress: it re-checks
+                    # readiness and picks up any inbound submission on the next
+                    # turn without yielding. Observing completion within the query
+                    # cadence keeps its host-side latency negligible against the
+                    # device step it completes; an idle controller (nothing in
+                    # flight) instead blocks on the command wake below.
                     continue
                 request = self._receive()
                 response = self.worker_server.handle(request)
@@ -141,13 +143,6 @@ class WorkerServeLoop:
             close = getattr(self.worker_server.worker, "close", None)
             if callable(close):
                 close()
-
-    # 50-microsecond floor between query-only completion-readiness re-checks
-    # while device work is in flight; an inbound command wake returns earlier.
-    _INFLIGHT_WAIT_US = 50
-
-    def _wait_incoming(self) -> None:
-        self.ipc_endpoint.wait_incoming(self._INFLIGHT_WAIT_US)
 
     def _refill(self) -> None:
         while self.shutdown is None and len(self.inflight) < self.worker_server.pipeline_depth:
