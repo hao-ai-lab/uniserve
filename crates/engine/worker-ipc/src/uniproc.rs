@@ -944,7 +944,7 @@ impl Executor for UniprocExecutor {
     /// Fire-and-forget control op. The returned `u64` MUST be treated as opaque: callers
     /// should discard it and use [`Executor::control_wait`] when they need to correlate an
     /// ack. In this single-worker transport the value happens to be the genuine wire
-    /// call_id the worker echoes, but the multiproc/disagg transports return a private
+    /// call_id the worker echoes, but the multiproc transport returns a private
     /// counter that matches no worker request, so no caller may assume these semantics.
     /// `0` is returned for empty copy or product-release controls that are never sent.
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {

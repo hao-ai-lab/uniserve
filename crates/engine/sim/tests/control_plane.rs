@@ -841,6 +841,134 @@ fn pipeline_depth_is_token_identical() {
 }
 
 #[test]
+fn stochastic_decode_relays_a_device_selected_successor_before_observation() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, OpId, Point, WorkVariant};
+
+    // (op_id, variant, device_parent, in_flight_at_submit)
+    type OpLog = Arc<Mutex<Vec<(OpId, WorkVariant, bool, usize)>>>;
+
+    struct Recording {
+        inner: SimExecutor,
+        ops: OpLog,
+    }
+
+    impl Executor for Recording {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+        fn can_submit(&self) -> bool {
+            self.inner.can_submit()
+        }
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            let in_flight = self.inner.in_flight();
+            for envelope in batch.operations() {
+                let device_parent = matches!(envelope.parent.point, Point::Device { .. });
+                self.ops.lock().unwrap().push((
+                    envelope.op_id,
+                    envelope.work.variant(),
+                    device_parent,
+                    in_flight,
+                ));
+            }
+            self.inner.submit(batch)
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            self.inner.poll()
+        }
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.inner.next_result()
+        }
+        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(operation)
+        }
+        fn control_wait(
+            &mut self,
+            operation: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(operation, targets)
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let sampling = SamplingParams {
+        temperature: 0.8,
+        top_k: 32,
+        top_p: 0.9,
+        seed: Some(917),
+        ..SamplingParams::default()
+    };
+
+    let mut runs = Vec::new();
+    for depth in [1u32, 2] {
+        let mut sim = SimEngine::new();
+        sim.set_pipeline_depth(depth);
+        sim.set_text_len(8);
+        let ops: OpLog = Arc::new(Mutex::new(Vec::new()));
+        let executor = Recording {
+            inner: SimExecutor::new(Box::new(sim)),
+            ops: ops.clone(),
+        };
+        let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+        let request = generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3, 4, 5]),
+            sampling.clone(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            16,
+        );
+        let mut events = scheduler.submit_for_test(request);
+        let mut tokens = Vec::new();
+        let mut finished = false;
+        for _ in 0..256 {
+            scheduler.step();
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    GenEvent::TextToken { id, .. } => tokens.push(id),
+                    GenEvent::Finished { .. } => finished = true,
+                    _ => {}
+                }
+            }
+            if finished {
+                break;
+            }
+        }
+        drop(scheduler);
+        runs.push((tokens, Arc::try_unwrap(ops).unwrap().into_inner().unwrap()));
+    }
+
+    let (serial_tokens, _) = &runs[0];
+    let (relayed_tokens, relayed_ops) = &runs[1];
+    assert!(!serial_tokens.is_empty(), "the request produced tokens");
+    // Depth equivalence: relayed stochastic tokens equal the serial oracle.
+    assert_eq!(
+        serial_tokens, relayed_tokens,
+        "stochastic tokens differ between serial and device-relay execution"
+    );
+    // Production trace: a stochastic decode successor was submitted from the
+    // parent's device-selected point while the parent was still in flight, i.e.
+    // before its completion could be observed on the host.
+    assert!(
+        relayed_ops
+            .iter()
+            .any(|(_, variant, device_parent, in_flight)| {
+                *variant == WorkVariant::TokenDecode && *device_parent && *in_flight > 0
+            }),
+        "expected a stochastic decode successor relayed from a device point before observation"
+    );
+}
+
+#[test]
 fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{

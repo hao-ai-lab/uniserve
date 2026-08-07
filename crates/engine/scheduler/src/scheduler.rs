@@ -2335,15 +2335,24 @@ impl Scheduler {
     }
 
     fn device_token_relay_eligible(state: &ReqState) -> bool {
+        // A successor may consume the parent's device-selected point before host
+        // observation whenever its own sampling is device-representable from
+        // registered coordinates alone. Greedy and stochastic selection with
+        // temperature, top-k, top-p, min-p, and typical filtering qualify: the
+        // draw is fixed by the successor's registered RNG coordinates and the
+        // filters act on the device logits. Processors whose next state depends
+        // on the parent's not-yet-observed token -- penalties over the recent
+        // window, bad-word and allowed-token masks, minimum-token floors, stop
+        // decisions, and requested logprobs -- keep the request host-paced.
         let sampling = &state.req.sampling;
         (!state.req.behavior.gen_output || state.req.policy.trigger.direct_token().is_some())
             && state.req.stop_strings.is_empty()
             && state.req.stop_token_ids.is_empty()
-            && sampling.temperature <= 0.0
             && sampling.min_tokens == 0
             && !sampling.generated_logprobs_requested()
             && sampling.bad_words_ids.is_empty()
             && sampling.allowed_token_ids.is_none()
+            && sampling.forced_token_ids.is_empty()
             && sampling.repetition_penalty == 1.0
             && sampling.frequency_penalty == 0.0
             && sampling.presence_penalty == 0.0
@@ -2781,8 +2790,7 @@ impl Scheduler {
         } else {
             // Non-fatal worker errors keep the worker up. `retryable` is
             // surfaced so a recoverable class (OOM/transient) is visible to
-            // operators; an automatic requeue path lands with the drafter/retry
-            // budget work and is intentionally not attempted here.
+            // operators; no automatic requeue is attempted here.
             tracing::warn!(
                 ?code,
                 retryable,
@@ -5851,6 +5859,13 @@ impl Scheduler {
                     && state.public_event_seq > before
                 {
                     state.public_token_seq = state.public_token_seq.saturating_add(1);
+                    if let Some(root) = root {
+                        state.trace.stamp_existing(
+                            root.producer_op_id,
+                            crate::trace::LifecyclePhase::PubliclyCommitted,
+                            uniserve_core::now_monotonic_us(),
+                        );
+                    }
                 }
                 true
             }
