@@ -62,6 +62,9 @@ class _Endpoint:
     def recv(self) -> dict[str, object]:
         return self.requests.popleft()
 
+    def wait_incoming(self, timeout_us: int) -> None:
+        return None
+
     def respond(self, response: dict[str, object]) -> None:
         self.responses.append(response)
 

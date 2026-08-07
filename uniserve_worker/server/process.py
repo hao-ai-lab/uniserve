@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
@@ -84,6 +83,8 @@ class WorkerIpcTransport(Protocol):
 
     def respond(self, response: dict[str, Any]) -> None: ...
 
+    def wait_incoming(self, timeout_us: int) -> None: ...
+
 
 class WorkerServeLoop:
     """Launch a bounded request pipeline and finalize responses when ready."""
@@ -121,7 +122,12 @@ class WorkerServeLoop:
                     self.worker_server.respond(self.shutdown[1])
                     return
                 if self.inflight:
-                    time.sleep(0.00005)
+                    # Device work is in flight but none is query-ready. Park on
+                    # the IPC command wake so a new submission advances the loop
+                    # immediately; the bounded timeout is the query-only
+                    # completion-readiness re-check floor, since device readiness
+                    # carries no operating-system wake.
+                    self._wait_incoming()
                     continue
                 request = self._receive()
                 response = self.worker_server.handle(request)
@@ -135,6 +141,13 @@ class WorkerServeLoop:
             close = getattr(self.worker_server.worker, "close", None)
             if callable(close):
                 close()
+
+    # 50-microsecond floor between query-only completion-readiness re-checks
+    # while device work is in flight; an inbound command wake returns earlier.
+    _INFLIGHT_WAIT_US = 50
+
+    def _wait_incoming(self) -> None:
+        self.ipc_endpoint.wait_incoming(self._INFLIGHT_WAIT_US)
 
     def _refill(self) -> None:
         while self.shutdown is None and len(self.inflight) < self.worker_server.pipeline_depth:

@@ -93,6 +93,17 @@ impl PyServer {
         Ok(Some(pythonize_request(py, &req)?))
     }
 
+    fn wait_incoming(&self, py: Python<'_>, timeout_us: u64) -> PyResult<()> {
+        let endpoint = self.take_endpoint()?;
+        let (endpoint, result) = py.detach(move || {
+            let result = endpoint.wait_incoming(std::time::Duration::from_micros(timeout_us));
+            (endpoint, result)
+        });
+        self.replace_endpoint(endpoint)?;
+        result.map_err(|err| py_runtime(format!("failed to wait for IPC command: {err:#}")))?;
+        Ok(())
+    }
+
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
         // Hot path: the per-step completion report, extracted without the
         // reflective serde walk. Anything else (or any unexpected shape)

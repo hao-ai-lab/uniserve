@@ -203,13 +203,18 @@ impl ClientEvents {
 /// the host wakes immediately.
 pub(crate) struct ServerEvents {
     wake_notifier: Notifier<IxService>,
+    wake_listener: Listener<IxService>,
 }
 
 impl ServerEvents {
     pub(crate) fn open(node: &Node<IxService>, service: &str) -> anyhow::Result<Self> {
         let wake = open_event_service(node, &wake_event_name(service))?;
         let wake_notifier = make_notifier(&wake, EVT_RESULT)?;
-        Ok(Self { wake_notifier })
+        let wake_listener = make_listener(&wake)?;
+        Ok(Self {
+            wake_notifier,
+            wake_listener,
+        })
     }
 
     /// Tell the host a response is available in the request-response ring.
@@ -217,6 +222,17 @@ impl ServerEvents {
         let _ = self
             .wake_notifier
             .notify_with_custom_event_id(EventId::new(EVT_RESULT));
+    }
+
+    /// Park until an inbound command wake fires or `timeout` elapses, draining
+    /// every pending event id. The command ingress fires `EVT_COMMAND` on send,
+    /// so an idle server wakes immediately instead of polling; the timeout is the
+    /// safety-net re-check floor for a missed notification.
+    pub(crate) fn wait_command(&self, timeout: Duration) -> anyhow::Result<()> {
+        self.wake_listener
+            .timed_wait_all(|_id| {}, timeout)
+            .map_err(|e| anyhow::anyhow!("waiting on iceoryx2 server wake listener: {e:?}"))?;
+        Ok(())
     }
 }
 

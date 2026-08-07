@@ -44,7 +44,6 @@ _PERMITTED_PREFIXES = (
     "host-plan:",
     "reference-backend:",
     "sim-stub:",
-    "controller-yield:",
 )
 
 # (module, enclosing qualname, pattern) -> classification.
@@ -151,13 +150,6 @@ ALLOWLIST: dict[tuple[str, str, str], str] = {
     ("uniserve_worker/server/stub.py", "_token_ids", ".tolist()"): (
         "sim-stub: simulation worker deterministic next-token map"
     ),
-    # Controller yield: the one steady-state CPU yield between query-only
-    # readiness polls while device work is in flight. It waits on no device or
-    # transport value; specs/tasks.md tracks replacing it with a completion
-    # host-callback signal so the controller becomes poll-free.
-    ("uniserve_worker/server/process.py", "WorkerServeLoop.run", "time.sleep()"): (
-        "controller-yield: bounded CPU yield between query-only readiness polls"
-    ),
 }
 
 
@@ -261,14 +253,13 @@ def test_every_classification_states_a_permitted_phase() -> None:
     )
 
 
-def test_only_the_controller_yield_is_a_steady_state_site() -> None:
-    # Every other classified site is proven to run in startup, administration,
-    # delivery of a ready host product, a query-only ticket, host-known plan
-    # construction, or a non-configured reference/sim backend. The controller
-    # yield is the sole steady-state entry and is singular.
+def test_no_steady_state_controller_yield_remains() -> None:
+    # Every classified site runs in startup, administration, delivery of a ready
+    # host product, a query-only ticket, host-known plan construction, or a
+    # non-configured reference/sim backend. The worker controller parks on the
+    # IPC command wake rather than sleep-polling, so no steady-state yield is
+    # classified here.
     steady = sorted(
         site for site, reason in ALLOWLIST.items() if reason.startswith("controller-yield:")
     )
-    assert steady == [
-        ("uniserve_worker/server/process.py", "WorkerServeLoop.run", "time.sleep()"),
-    ]
+    assert steady == []

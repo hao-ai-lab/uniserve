@@ -394,7 +394,22 @@ impl ServerEndpoint {
             if let Some(frame) = self.try_recv()? {
                 return Ok(frame);
             }
-            std::thread::sleep(EVENT_WAIT_SAFETY_NET);
+            self.wait_incoming(EVENT_WAIT_SAFETY_NET)?;
+        }
+    }
+
+    /// Park until an inbound command wake fires or `timeout` elapses. When the
+    /// event-driven boundary is enabled the server parks on its wake listener,
+    /// so an idle controller advances on notification rather than a sleep poll;
+    /// otherwise it falls back to the safety-net sleep. The caller re-checks the
+    /// transport after each return, so a spurious wake is harmless.
+    pub fn wait_incoming(&self, timeout: Duration) -> anyhow::Result<()> {
+        match &self.events {
+            Some(events) => events.wait_command(timeout),
+            None => {
+                std::thread::sleep(timeout);
+                Ok(())
+            }
         }
     }
 
