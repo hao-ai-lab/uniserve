@@ -614,6 +614,40 @@ pub struct HealthSnapshot {
     pub op_latency_us: Vec<(String, u64)>,
 }
 
+/// One credit dimension's negotiated capacity and current reservation.
+#[derive(Debug, Clone)]
+pub struct CreditDimensionMetric {
+    pub dimension: uniserve_worker_wire::CreditDimension,
+    pub capacity: u64,
+    pub used: u64,
+}
+
+/// Aggregate delay across one lifecycle phase span over completed operations.
+#[derive(Debug, Clone)]
+pub struct PhaseSpanDelay {
+    pub from: crate::trace::LifecyclePhase,
+    pub to: crate::trace::LifecyclePhase,
+    pub count: u64,
+    pub sum_us: u64,
+    pub max_us: u64,
+}
+
+/// The resource and window observability surface keyed to the credit ledger and
+/// the operation lifecycle. Credit acquisitions and releases conserve: when no
+/// request is active every dimension's `used` is zero and `acquisitions` equals
+/// `releases`.
+#[derive(Debug, Clone)]
+pub struct ResourceWindowMetrics {
+    pub credits: Vec<CreditDimensionMetric>,
+    pub acquisitions: u64,
+    pub releases: u64,
+    pub would_block: u64,
+    pub invariant_violations: u64,
+    pub max_unresolved_window: u32,
+    pub peak_ops_in_batch: usize,
+    pub phase_delays: Vec<PhaseSpanDelay>,
+}
+
 fn now() -> f64 {
     // route through the single shared epoch helper so every
     // component's wall-clock timestamps match. It never panics on the hot loop:
@@ -1116,6 +1150,62 @@ impl Scheduler {
     /// reconstructable record after a request has finished.
     pub fn take_completed_traces(&mut self) -> Vec<crate::trace::RequestTrace> {
         self.completed_traces.drain(..).collect()
+    }
+
+    /// The resource and window observability surface: per-credit-dimension
+    /// capacity and reservation, ledger conservation counters, the unresolved
+    /// window bound and observed peak, and aggregate lifecycle-phase delays over
+    /// completed operations.
+    pub fn resource_window_metrics(&self) -> ResourceWindowMetrics {
+        use crate::trace::LifecyclePhase as P;
+        let capacity = self.ledger.capacity();
+        let used = self.ledger.used();
+        let credits = uniserve_worker_wire::CreditDimension::ALL
+            .into_iter()
+            .map(|dimension| CreditDimensionMetric {
+                dimension,
+                capacity: capacity.get(dimension),
+                used: used.get(dimension),
+            })
+            .collect();
+        let spans = [
+            (P::Submitted, P::CompletionObserved),
+            (P::CompletionObserved, P::SemanticallyCommitted),
+            (P::SemanticallyCommitted, P::PubliclyCommitted),
+            (P::Planned, P::PhysicallyReclaimed),
+        ];
+        let mut phase_delays: Vec<PhaseSpanDelay> = spans
+            .iter()
+            .map(|(from, to)| PhaseSpanDelay {
+                from: *from,
+                to: *to,
+                count: 0,
+                sum_us: 0,
+                max_us: 0,
+            })
+            .collect();
+        for trace in &self.completed_traces {
+            for op in trace.operations() {
+                for (index, (from, to)) in spans.iter().enumerate() {
+                    if let Some(delay) = op.span_us(*from, *to) {
+                        let entry = &mut phase_delays[index];
+                        entry.count += 1;
+                        entry.sum_us += delay;
+                        entry.max_us = entry.max_us.max(delay);
+                    }
+                }
+            }
+        }
+        ResourceWindowMetrics {
+            credits,
+            acquisitions: self.ledger.stats.acquisitions,
+            releases: self.ledger.stats.releases,
+            would_block: self.ledger.stats.would_block,
+            invariant_violations: self.ledger.stats.invariant_violations,
+            max_unresolved_window: self.caps.execution_constraints.max_unresolved_window,
+            peak_ops_in_batch: self.peak_ops_in_batch,
+            phase_delays,
+        }
     }
 
     /// A health snapshot the engine can expose: queue +
@@ -1919,6 +2009,7 @@ impl Scheduler {
             return false;
         }
         transition.reserved_credits = operation_credits;
+        transition.reserved_us = uniserve_core::now_monotonic_us();
         if let Some(st) = self.running.get_mut(&id) {
             st.resources.worker_image_latent_units = st
                 .resources
@@ -2726,6 +2817,15 @@ impl Scheduler {
             .cloned()
             .collect::<Vec<_>>();
         self.release_product_credits(products);
+        // The operation's device products are now freed under event-safe
+        // reclamation; record the terminal lifecycle phase.
+        if let Some(st) = self.running.get_mut(&id) {
+            st.trace.stamp_existing(
+                uniserve_worker_wire::OpId(op_id),
+                crate::trace::LifecyclePhase::PhysicallyReclaimed,
+                uniserve_core::now_monotonic_us(),
+            );
+        }
     }
 
     fn release_product_credits(&mut self, products: Vec<ProductRef>) {
@@ -4173,6 +4273,8 @@ impl Scheduler {
                 transition.new_blocks.clone()
             };
             let output_credit_bound = transition_output_bound(&transition);
+            let planned_us = transition.planned_us;
+            let reserved_us = transition.reserved_us;
             let registered = transition.register(
                 request_key,
                 OpId(oid),
@@ -4227,6 +4329,22 @@ impl Scheduler {
             if let Some(st) = self.running.get_mut(&request_id) {
                 st.latest_device_version = None;
                 let now_us = uniserve_core::now_monotonic_us();
+                // Backfill the two pre-registration phases from the builder now
+                // that the operation carries its canonical identity.
+                st.trace.stamp(
+                    op_key,
+                    Some(operation_variant),
+                    crate::trace::LifecyclePhase::Planned,
+                    planned_us,
+                );
+                if reserved_us != 0 {
+                    st.trace.stamp(
+                        op_key,
+                        Some(operation_variant),
+                        crate::trace::LifecyclePhase::LogicalResourcesReserved,
+                        reserved_us,
+                    );
+                }
                 st.trace.stamp(
                     op_key,
                     Some(operation_variant),

@@ -19,9 +19,10 @@ pub use policy::{DecisionLog, LatencyHistory, PolicyDecision, PolicyReason, Poli
 pub use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 pub use resources::{CreditExhausted, CreditLedger, LedgerStats};
 pub use scheduler::{
-    ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    ControlTokens, CreditDimensionMetric, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    HealthSnapshot, SchedStats, Scheduler, SchedulerConfig, SchedulingPolicy,
+    HealthSnapshot, PhaseSpanDelay, ResourceWindowMetrics, SchedStats, Scheduler, SchedulerConfig,
+    SchedulingPolicy,
 };
 pub use stats_report::SchedStatsReporter;
 pub use trace::{LifecyclePhase, OperationKey, OperationLifecycle, RequestTrace};

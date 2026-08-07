@@ -841,6 +841,89 @@ fn pipeline_depth_is_token_identical() {
 }
 
 #[test]
+fn resource_metrics_conserve_credits_and_record_the_full_lifecycle() {
+    use uniserve_scheduler::LifecyclePhase;
+
+    let mut sim = SimEngine::new();
+    sim.set_pipeline_depth(2);
+    sim.set_text_len(6);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let request = generation_request(
+        RequestId(1),
+        text_context(vec![1, 2, 3, 4, 5]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        16,
+    );
+    let mut events = scheduler.submit_for_test(request);
+    let mut finished = false;
+    for _ in 0..512 {
+        scheduler.step();
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, GenEvent::Finished { .. }) {
+                finished = true;
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "request finished");
+    for _ in 0..32 {
+        scheduler.step();
+    }
+
+    let metrics = scheduler.resource_window_metrics();
+    assert_eq!(
+        metrics.credits.len(),
+        12,
+        "every credit dimension is reported"
+    );
+    assert_eq!(metrics.invariant_violations, 0);
+    assert!(
+        metrics.credits.iter().all(|dimension| dimension.used == 0),
+        "credits conserve: no dimension leaks after completion"
+    );
+    assert!(metrics.max_unresolved_window >= 1);
+    let roundtrip = metrics
+        .phase_delays
+        .iter()
+        .find(|delay| {
+            matches!(delay.from, LifecyclePhase::Submitted)
+                && matches!(delay.to, LifecyclePhase::CompletionObserved)
+        })
+        .expect("submit->observed span present");
+    assert!(roundtrip.count > 0, "device roundtrip delays recorded");
+
+    let traces = scheduler.take_completed_traces();
+    let trace = traces
+        .iter()
+        .find(|trace| trace.request_key.session_id == RequestId(1))
+        .expect("completed trace archived");
+    assert!(
+        trace.is_ordered(),
+        "operation lifecycle stamps are causally ordered"
+    );
+    let resolved = trace
+        .operations()
+        .iter()
+        .find(|op| op.reached(LifecyclePhase::CompletionObserved))
+        .expect("a resolved operation");
+    for phase in [
+        LifecyclePhase::Planned,
+        LifecyclePhase::WorkerRegistrationComplete,
+        LifecyclePhase::Submitted,
+        LifecyclePhase::DeviceExecutionStarted,
+        LifecyclePhase::ProducerReady,
+        LifecyclePhase::CompletionCopyReady,
+        LifecyclePhase::CompletionObserved,
+    ] {
+        assert!(resolved.reached(phase), "resolved op reached {phase:?}");
+    }
+}
+
+#[test]
 fn stochastic_decode_relays_a_device_selected_successor_before_observation() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, OpId, Point, WorkVariant};

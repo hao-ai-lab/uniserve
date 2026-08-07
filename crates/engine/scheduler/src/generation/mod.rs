@@ -1779,6 +1779,8 @@ impl GenerationPlanner {
             reserved_credits: CreditVector::ZERO,
             operation_variant,
             request_id: request.request_id,
+            planned_us: uniserve_core::now_monotonic_us(),
+            reserved_us: 0,
             new_blocks: wire.new_blocks,
             kv_capacity_pages: 0,
             token_cost: wire.token_cost,
@@ -1956,6 +1958,12 @@ pub(crate) struct PlannedTransition {
     pub(crate) reserved_credits: CreditVector,
     pub(crate) operation_variant: WorkVariant,
     pub(crate) request_id: RequestId,
+    /// Monotonic microsecond stamps for the two pre-registration lifecycle
+    /// phases. They are carried here because an operation gains its canonical
+    /// `op_id` only at registration; the scheduler backfills them onto the
+    /// operation lifecycle once the identity exists.
+    pub(crate) planned_us: u64,
+    pub(crate) reserved_us: u64,
     pub(crate) new_blocks: Vec<BlockId>,
     pub(crate) kv_capacity_pages: u32,
     pub(crate) token_cost: usize,
