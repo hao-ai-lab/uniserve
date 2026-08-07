@@ -296,6 +296,15 @@ def test_route_capability_digest_matches_rust() -> None:
                         tuple(capability["credits"]["per_request"]),
                         tuple(capability["credits"]["worker"]),
                     ),
+                    capability["max_unresolved_window"],
+                    capability["legal_feature_bitset"],
+                    capability["sampler_processors"],
+                    capability["processor_order_revision"],
+                    capability["rng_layouts"],
+                    capability["graph_eligible"],
+                    capability["gen_conditioning"],
+                    capability["max_points_per_operation"],
+                    tuple(capability["mixed_row_combinations"]),
                 )
                 for capability in sample["route_capabilities"]
             ),

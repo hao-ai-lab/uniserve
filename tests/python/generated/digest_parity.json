@@ -292,12 +292,24 @@
             16,
             268435456
           ]
-        }
+        },
+        "max_unresolved_window": 4,
+        "legal_feature_bitset": 31,
+        "sampler_processors": 16383,
+        "processor_order_revision": 1,
+        "rng_layouts": 5,
+        "graph_eligible": true,
+        "gen_conditioning": 2,
+        "max_points_per_operation": 17,
+        "mixed_row_combinations": [
+          3,
+          5
+        ]
       }
     ],
     "kv_dtype": "bfloat16",
     "model_dtype": "bfloat16",
     "attention_backend": "flashinfer"
   },
-  "route_capability_digest": "45a3ffb3fa96561884fd12535385287600a62f95c84bd71b72d0174ef8c1d12b"
+  "route_capability_digest": "2c93a187c28082fb1644935e4b1fb61ee04018f95d3118bb7be5f395fe53b25f"
 }

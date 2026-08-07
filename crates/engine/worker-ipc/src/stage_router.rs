@@ -1111,6 +1111,15 @@ mod tests {
                     credits: uniserve_worker_wire::ExecutionConstraints::default()
                         .route_capabilities[0]
                         .credits,
+                    max_unresolved_window: 1,
+                    legal_feature_bitset: 0,
+                    sampler_processors: 0,
+                    processor_order_revision: 1,
+                    rng_layouts: 1,
+                    graph_eligible: false,
+                    gen_conditioning: 0,
+                    max_points_per_operation: 1,
+                    mixed_row_combinations: Vec::new(),
                 }],
                 ..Default::default()
             },

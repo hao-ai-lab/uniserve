@@ -24,6 +24,7 @@ from ..foundation.runtime_config import (
 from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
 from ..spec import (
     DeploymentOverlay,
+    FlowConditioningKind,
     ModelSpec,
     OperationStagePurpose,
     OperationStageSpec,
@@ -37,6 +38,18 @@ from .product_capacity import device_product_arena_bytes
 # operation boundary, so a route sharing them advances state in place and is not
 # safe to preempt.
 _STATEFUL_RESOURCE_CLASSES = frozenset({"kv_block", "image_latent", "scratch"})
+
+# Sampler-processor, RNG-layout, and processor-order constants mirroring the
+# worker-wire capability constants byte-for-byte. The full sampler-processor set
+# is the fourteen bits of the canonical processor order; the legal-continuation
+# feature set is the device-representable subset (temperature, top-k, top-p,
+# min-p, typical) for which a successor may relay before host observation.
+PROCESSOR_ORDER_REVISION = 1
+_ALL_SAMPLER_PROCESSORS = (1 << 14) - 1
+_LEGAL_CONTINUATION_FEATURES = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
+_RNG_TARGET_SAMPLING = 1 << 0
+_RNG_FLOW_NOISE = 1 << 2
+_ROUTE_ROW_KIND_BIT = {kind: 1 << index for index, kind in enumerate(RouteRowKind)}
 
 __all__ = ["prove_depth_one_lowering", "resolve_capabilities"]
 
@@ -197,6 +210,23 @@ def resolve_capabilities(
     # Sampling reduces full-vocabulary logits on one designated rank; no route
     # declares a deterministically sharded sampler.
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
+    # DR-072 route facts derived from the model spec: captured-graph eligibility,
+    # the exact tensorized mixed row combinations (each a bitset of row kinds),
+    # the Gen conditioning form, and the RNG draw spaces the route addresses.
+    route_graph_eligible = all(route.graph_eligible for route in spec.routes)
+    mixed_row_combinations = tuple(
+        sorted(
+            {
+                sum(_ROUTE_ROW_KIND_BIT[kind] for kind in combination)
+                for route in spec.routes
+                for combination in route.mixed_combinations
+            }
+        )
+    )
+    gen_conditioning = (
+        list(FlowConditioningKind).index(flow.conditioning) if flow is not None else 0
+    )
+    rng_layouts = _RNG_TARGET_SAMPLING | (_RNG_FLOW_NOISE if flow is not None else 0)
     return EngineCaps(
         block_size=int(deployment.block_size),
         num_blocks=int(capacity.num_blocks),
@@ -222,6 +252,17 @@ def resolve_capabilities(
                     sampling_ownership=sampling_ownership,
                     preemptible=preemptible,
                     credits=credit_limits,
+                    max_unresolved_window=int(
+                        credit_limits.per_request.registered_operations
+                    ),
+                    legal_feature_bitset=_LEGAL_CONTINUATION_FEATURES,
+                    sampler_processors=_ALL_SAMPLER_PROCESSORS,
+                    processor_order_revision=PROCESSOR_ORDER_REVISION,
+                    rng_layouts=rng_layouts,
+                    graph_eligible=route_graph_eligible,
+                    gen_conditioning=gen_conditioning,
+                    max_points_per_operation=max_speculative_points,
+                    mixed_row_combinations=mixed_row_combinations,
                 ),
             ),
         ),

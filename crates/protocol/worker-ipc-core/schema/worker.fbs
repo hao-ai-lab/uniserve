@@ -172,6 +172,15 @@ table RouteExecutionCapability {
   sampling_ownership:SamplingOwnership;
   preemptible:bool;
   credits:RouteCreditLimits;
+  max_unresolved_window:uint;
+  legal_feature_bitset:uint;
+  sampler_processors:uint;
+  processor_order_revision:uint;
+  rng_layouts:uint;
+  graph_eligible:bool;
+  gen_conditioning:ubyte;
+  max_points_per_operation:uint;
+  mixed_row_combinations:[uint];
 }
 
 table CreditVector {

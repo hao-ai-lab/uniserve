@@ -744,6 +744,20 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
                                                 .credits()
                                                 .context("route capability has no credit limits")?,
                                         )?,
+                                        max_unresolved_window: capability.max_unresolved_window(),
+                                        legal_feature_bitset: capability.legal_feature_bitset(),
+                                        sampler_processors: capability.sampler_processors(),
+                                        processor_order_revision: capability
+                                            .processor_order_revision(),
+                                        rng_layouts: capability.rng_layouts(),
+                                        graph_eligible: capability.graph_eligible(),
+                                        gen_conditioning: capability.gen_conditioning(),
+                                        max_points_per_operation: capability
+                                            .max_points_per_operation(),
+                                        mixed_row_combinations: capability
+                                            .mixed_row_combinations()
+                                            .map(|items| items.iter().collect())
+                                            .unwrap_or_default(),
                                     })
                                 })
                                 .collect::<anyhow::Result<Vec<_>>>()
@@ -2219,6 +2233,15 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
                         sampling_ownership: sampling_ownership_to_fb(capability.sampling_ownership),
                         preemptible: capability.preemptible,
                         credits: Some(Box::new(route_credit_limits_to_fb(capability.credits))),
+                        max_unresolved_window: capability.max_unresolved_window,
+                        legal_feature_bitset: capability.legal_feature_bitset,
+                        sampler_processors: capability.sampler_processors,
+                        processor_order_revision: capability.processor_order_revision,
+                        rng_layouts: capability.rng_layouts,
+                        graph_eligible: capability.graph_eligible,
+                        gen_conditioning: capability.gen_conditioning,
+                        max_points_per_operation: capability.max_points_per_operation,
+                        mixed_row_combinations: Some(capability.mixed_row_combinations.clone()),
                     })
                     .collect(),
             ),
@@ -2322,6 +2345,17 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
                                         .credits
                                         .context("route capability has no credit limits")?,
                                 )?,
+                                max_unresolved_window: capability.max_unresolved_window,
+                                legal_feature_bitset: capability.legal_feature_bitset,
+                                sampler_processors: capability.sampler_processors,
+                                processor_order_revision: capability.processor_order_revision,
+                                rng_layouts: capability.rng_layouts,
+                                graph_eligible: capability.graph_eligible,
+                                gen_conditioning: capability.gen_conditioning,
+                                max_points_per_operation: capability.max_points_per_operation,
+                                mixed_row_combinations: capability
+                                    .mixed_row_combinations
+                                    .unwrap_or_default(),
                             })
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?,

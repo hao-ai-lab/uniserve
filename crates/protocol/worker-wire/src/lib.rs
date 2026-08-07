@@ -1821,6 +1821,35 @@ impl CompletionReport {
 // Capabilities and startup agreement
 // ---------------------------------------------------------------------------
 
+/// Revision of the canonical sampler processor order a route applies. Bumped
+/// whenever the fixed processor order changes so a mismatched worker is rejected.
+pub const PROCESSOR_ORDER_REVISION: u32 = 1;
+
+/// Sampler processor bits a route may declare in `sampler_processors`.
+pub mod sampler_processor {
+    pub const TEMPERATURE: u32 = 1 << 0;
+    pub const TOP_K: u32 = 1 << 1;
+    pub const TOP_P: u32 = 1 << 2;
+    pub const MIN_P: u32 = 1 << 3;
+    pub const TYPICAL: u32 = 1 << 4;
+    pub const REPETITION_PENALTY: u32 = 1 << 5;
+    pub const FREQUENCY_PENALTY: u32 = 1 << 6;
+    pub const PRESENCE_PENALTY: u32 = 1 << 7;
+    pub const LOGIT_BIAS: u32 = 1 << 8;
+    pub const ALLOWED_TOKENS: u32 = 1 << 9;
+    pub const BAD_WORDS: u32 = 1 << 10;
+    pub const MIN_TOKENS: u32 = 1 << 11;
+    pub const FORCED_TOKENS: u32 = 1 << 12;
+    pub const LOGPROBS: u32 = 1 << 13;
+}
+
+/// RNG draw-layout bits a route may declare in `rng_layouts`.
+pub mod rng_layout {
+    pub const TARGET_SAMPLING: u32 = 1 << 0;
+    pub const SPECULATIVE_PROPOSAL: u32 = 1 << 1;
+    pub const FLOW_NOISE: u32 = 1 << 2;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteExecutionCapability {
     pub route: RouteId,
@@ -1829,6 +1858,34 @@ pub struct RouteExecutionCapability {
     pub sampling_ownership: SamplingOwnership,
     pub preemptible: bool,
     pub credits: RouteCreditLimits,
+    /// Maximum unresolved successor depth the route admits.
+    #[serde(default)]
+    pub max_unresolved_window: u32,
+    /// Bitset of sampling features for which a depth beyond one is legal; an
+    /// operation whose sampling sets any feature outside this set is host-paced.
+    #[serde(default)]
+    pub legal_feature_bitset: u32,
+    /// Bitset of sampler processors the route's device sampler implements.
+    #[serde(default)]
+    pub sampler_processors: u32,
+    /// Revision of the canonical processor order the sampler applies.
+    #[serde(default)]
+    pub processor_order_revision: u32,
+    /// Bitset of RNG draw layouts the route addresses.
+    #[serde(default)]
+    pub rng_layouts: u32,
+    /// Whether the route lowers to a captured-graph execution.
+    #[serde(default)]
+    pub graph_eligible: bool,
+    /// Gen conditioning form; zero when the route establishes no Gen state.
+    #[serde(default)]
+    pub gen_conditioning: u8,
+    /// Maximum selected points one operation of the route may produce.
+    #[serde(default)]
+    pub max_points_per_operation: u32,
+    /// Exact tensorized mixed row combinations, each a bitset of row kinds.
+    #[serde(default)]
+    pub mixed_row_combinations: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1874,6 +1931,15 @@ impl Default for ExecutionConstraints {
                         ..CreditVector::ZERO
                     },
                 },
+                max_unresolved_window: 1,
+                legal_feature_bitset: 0,
+                sampler_processors: 0,
+                processor_order_revision: PROCESSOR_ORDER_REVISION,
+                rng_layouts: rng_layout::TARGET_SAMPLING,
+                graph_eligible: false,
+                gen_conditioning: 0,
+                max_points_per_operation: 1,
+                mixed_row_combinations: Vec::new(),
             }],
         }
     }
@@ -1972,6 +2038,21 @@ impl EngineCaps {
             digest.bool(capability.preemptible);
             digest.credit_vector(capability.credits.per_request);
             digest.credit_vector(capability.credits.worker);
+            digest.u32(capability.max_unresolved_window);
+            digest.u32(capability.legal_feature_bitset);
+            digest.u32(capability.sampler_processors);
+            digest.u32(capability.processor_order_revision);
+            digest.u32(capability.rng_layouts);
+            digest.bool(capability.graph_eligible);
+            digest.u8(capability.gen_conditioning);
+            digest.u32(capability.max_points_per_operation);
+            let mut combinations = capability.mixed_row_combinations.clone();
+            combinations.sort_unstable();
+            combinations.dedup();
+            digest.u64(combinations.len() as u64);
+            for combination in combinations {
+                digest.u32(combination);
+            }
         }
         digest.string(&self.kv_dtype);
         digest.string(&self.model_dtype);

@@ -400,6 +400,15 @@ def route_capability_digest(
             SamplingOwnership,
             bool,
             tuple[Sequence[int], Sequence[int]],
+            int,
+            int,
+            int,
+            int,
+            int,
+            bool,
+            int,
+            int,
+            Sequence[int],
         ]
     ],
     kv_dtype: str,
@@ -438,6 +447,15 @@ def route_capability_digest(
         sampling_ownership,
         preemptible,
         credits,
+        cap_max_unresolved_window,
+        legal_feature_bitset,
+        sampler_processors,
+        processor_order_revision,
+        rng_layouts,
+        graph_eligible,
+        gen_conditioning,
+        max_points_per_operation,
+        mixed_row_combinations,
     ) in ordered_capabilities:
         digest.u32(route)
         variants = sorted(
@@ -454,6 +472,18 @@ def route_capability_digest(
             raise ValueError("route credit digest requires all twelve dimensions")
         for value in (*per_request, *worker):
             digest.u64(int(value))
+        digest.u32(int(cap_max_unresolved_window))
+        digest.u32(int(legal_feature_bitset))
+        digest.u32(int(sampler_processors))
+        digest.u32(int(processor_order_revision))
+        digest.u32(int(rng_layouts))
+        digest.boolean(bool(graph_eligible))
+        digest.u8(int(gen_conditioning))
+        digest.u32(int(max_points_per_operation))
+        combinations = sorted({int(combination) for combination in mixed_row_combinations})
+        digest.u64(len(combinations))
+        for combination in combinations:
+            digest.u32(combination)
     digest.string(kv_dtype)
     digest.string(model_dtype)
     digest.string(attention_backend)

@@ -61,6 +61,15 @@ def _recompute_route_digest(wire: dict) -> str:
                     tuple(capability["credits"]["per_request"][name] for name in credit_fields),
                     tuple(capability["credits"]["worker"][name] for name in credit_fields),
                 ),
+                capability["max_unresolved_window"],
+                capability["legal_feature_bitset"],
+                capability["sampler_processors"],
+                capability["processor_order_revision"],
+                capability["rng_layouts"],
+                capability["graph_eligible"],
+                capability["gen_conditioning"],
+                capability["max_points_per_operation"],
+                tuple(capability["mixed_row_combinations"]),
             )
             for capability in wire["execution_constraints"]["route_capabilities"]
         ),

@@ -224,6 +224,15 @@ class RouteExecutionCapability:
     sampling_ownership: SamplingOwnership
     preemptible: bool
     credits: RouteCreditLimits
+    max_unresolved_window: int = 1
+    legal_feature_bitset: int = 0
+    sampler_processors: int = 0
+    processor_order_revision: int = 0
+    rng_layouts: int = 0
+    graph_eligible: bool = False
+    gen_conditioning: int = 0
+    max_points_per_operation: int = 1
+    mixed_row_combinations: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.route < 0:
@@ -238,6 +247,16 @@ class RouteExecutionCapability:
             raise invalid_descriptor(
                 "route request credits must include registration and execution"
             )
+        if self.max_unresolved_window < 1:
+            raise invalid_descriptor("route unresolved-window depth must be positive")
+        if self.max_points_per_operation < 1:
+            raise invalid_descriptor("route must admit at least one point per operation")
+        if self.legal_feature_bitset & ~self.sampler_processors:
+            raise invalid_descriptor(
+                "route legal-continuation features must be a subset of its sampler processors"
+            )
+        if len(self.mixed_row_combinations) != len(set(self.mixed_row_combinations)):
+            raise invalid_descriptor("route mixed row combinations must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +411,15 @@ class EngineCaps:
                             capability.credits.per_request.digest_values(),
                             capability.credits.worker.digest_values(),
                         ),
+                        capability.max_unresolved_window,
+                        capability.legal_feature_bitset,
+                        capability.sampler_processors,
+                        capability.processor_order_revision,
+                        capability.rng_layouts,
+                        capability.graph_eligible,
+                        capability.gen_conditioning,
+                        capability.max_points_per_operation,
+                        capability.mixed_row_combinations,
                     )
                     for capability in self.execution_constraints.route_capabilities
                 ),
@@ -546,6 +574,36 @@ class EngineCaps:
                             ).get("credits"),
                             f"{where}.execution_constraints.route_capabilities[{index}].credits",
                         ),
+                        max_unresolved_window=int(
+                            _map(item, f"{where}.rc[{index}]").get("max_unresolved_window", 1)
+                        ),
+                        legal_feature_bitset=int(
+                            _map(item, f"{where}.rc[{index}]").get("legal_feature_bitset", 0)
+                        ),
+                        sampler_processors=int(
+                            _map(item, f"{where}.rc[{index}]").get("sampler_processors", 0)
+                        ),
+                        processor_order_revision=int(
+                            _map(item, f"{where}.rc[{index}]").get("processor_order_revision", 0)
+                        ),
+                        rng_layouts=int(
+                            _map(item, f"{where}.rc[{index}]").get("rng_layouts", 0)
+                        ),
+                        graph_eligible=bool(
+                            _map(item, f"{where}.rc[{index}]").get("graph_eligible", False)
+                        ),
+                        gen_conditioning=int(
+                            _map(item, f"{where}.rc[{index}]").get("gen_conditioning", 0)
+                        ),
+                        max_points_per_operation=int(
+                            _map(item, f"{where}.rc[{index}]").get("max_points_per_operation", 1)
+                        ),
+                        mixed_row_combinations=tuple(
+                            int(value)
+                            for value in _map(item, f"{where}.rc[{index}]").get(
+                                "mixed_row_combinations", ()
+                            )
+                        ),
                     )
                     for index, item in enumerate(
                         _seq(
@@ -614,6 +672,15 @@ class EngineCaps:
                         "sampling_ownership": capability.sampling_ownership.value,
                         "preemptible": capability.preemptible,
                         "credits": capability.credits.to_wire(),
+                        "max_unresolved_window": capability.max_unresolved_window,
+                        "legal_feature_bitset": capability.legal_feature_bitset,
+                        "sampler_processors": capability.sampler_processors,
+                        "processor_order_revision": capability.processor_order_revision,
+                        "rng_layouts": capability.rng_layouts,
+                        "graph_eligible": capability.graph_eligible,
+                        "gen_conditioning": capability.gen_conditioning,
+                        "max_points_per_operation": capability.max_points_per_operation,
+                        "mixed_row_combinations": list(capability.mixed_row_combinations),
                     }
                     for capability in self.execution_constraints.route_capabilities
                 ],
