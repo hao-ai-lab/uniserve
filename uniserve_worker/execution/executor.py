@@ -263,7 +263,10 @@ class _ForwardTask:
 @dataclass(frozen=True, slots=True)
 class _SamplingRow:
     parameters: SamplingParams
-    recent_counts: tuple[tuple[int, int], ...]
+    # Dense per-vocabulary count of generated tokens preceding this point, read
+    # from the request's device-resident committed penalty base plus any draft
+    # prefix. ``None`` when the row uses no penalties.
+    penalty_counts: torch.Tensor | None
     allowed: tuple[int, ...] | None
     suppress: tuple[int, ...]
     draw: float
@@ -288,6 +291,10 @@ class _SampleTask:
     continuation_product: DeviceProductWrite | None = None
     predicate: torch.Tensor | None = None
     tagged_predicate: bool = False
+    # The request's device-resident committed penalty base to fold this
+    # operation's selected token into after sampling. ``None`` when the request
+    # uses no penalties.
+    penalty_base: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3939,7 +3946,7 @@ class ModelExecutor:
         rows = tuple(
             _SamplingRow(
                 parameters=prompt_parameters,
-                recent_counts=(),
+                penalty_counts=None,
                 allowed=None,
                 suppress=(),
                 draw=0.0,
@@ -4571,13 +4578,35 @@ class ModelExecutor:
             if stochastic
             else 0
         )
-        base_counts = dict(state.recent_counts)
+        rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
+        if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
+            raise invalid_descriptor("sampling task positions do not align with its logits")
+        vocab = int(rows.shape[1])
+        uses_penalties = (
+            sampling.repetition_penalty != 1.0
+            or sampling.frequency_penalty != 0.0
+            or sampling.presence_penalty != 0.0
+        )
+        # The device-resident committed penalty base. Every generated token folds
+        # in as its operation executes, so a successor registered before its
+        # predecessors are observed still reads their counts. No host token
+        # history participates.
+        penalty_base = (
+            self._session_penalty_base(session, vocab, rows.device) if uses_penalties else None
+        )
         forced_token_ids = sampling.forced_token_ids
         descriptors: list[_SamplingRow] = []
         for index, position in enumerate(positions):
-            prefix_counts = dict(base_counts)
-            for token_id in draft_token_ids[:index]:
-                prefix_counts[int(token_id)] = prefix_counts.get(int(token_id), 0) + 1
+            if penalty_base is None:
+                row_counts = None
+            elif index == 0 or not draft_token_ids:
+                row_counts = penalty_base
+            else:
+                # A speculative point folds its accepted draft prefix on top of
+                # the committed base for that point's penalties.
+                row_counts = penalty_base.clone()
+                for token_id in draft_token_ids[:index]:
+                    row_counts[int(token_id)] += 1
             # Processor step 2 forced-token constraint: point `index` of the
             # operation's span narrows selection to `forced_token_ids[index]`,
             # overriding any allowed-token whitelist for that point.
@@ -4589,7 +4618,7 @@ class ModelExecutor:
             descriptors.append(
                 _SamplingRow(
                     parameters=sampling,
-                    recent_counts=tuple(sorted(prefix_counts.items())),
+                    penalty_counts=row_counts,
                     allowed=row_allowed,
                     suppress=state.suppressed_token_ids,
                     finish_token_ids=finish_token_ids,
@@ -4604,9 +4633,6 @@ class ModelExecutor:
             )
         descriptor_rows = tuple(descriptors)
         operation_identity = _operation_identity(operation)
-        rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
-        if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
-            raise invalid_descriptor("sampling task positions do not align with its logits")
         device_greedy = not draft_token_ids and all(
             _device_greedy_row(row) for row in descriptor_rows
         )
@@ -4622,7 +4648,7 @@ class ModelExecutor:
             )
             penalty_token_ids, penalty_counts, parameter_values = _sampling_task_tensors(
                 descriptor_rows,
-                vocab=int(rows.shape[1]),
+                vocab=vocab,
                 device=rows.device,
             )
         token_product = scope.token_writes.get(operation_identity)
@@ -4649,7 +4675,28 @@ class ModelExecutor:
             continuation_product=continuation_product,
             predicate=None if predicate_value is None else predicate_value[0],
             tagged_predicate=False if predicate_value is None else predicate_value[1],
+            penalty_base=penalty_base,
         )
+
+    def _session_penalty_base(
+        self,
+        session: RequestSession,
+        vocab: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """The request's device-resident committed penalty count base.
+
+        Allocated lazily as a dense per-vocabulary int32 count tensor the first
+        time a penalty-bearing operation samples for this session. Every
+        subsequent operation reads and folds into the same tensor, so penalties
+        stay device-continuous across the unresolved window.
+        """
+
+        base = session.penalty_counts
+        if base is None or int(base.numel()) != vocab or base.device != device:
+            base = torch.zeros(vocab, dtype=torch.int32, device=device)
+            session.penalty_counts = base
+        return base
 
     def _transition_driver(
         self,
@@ -6405,36 +6452,22 @@ def _sampling_task_tensors(
     vocab: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    first = rows[0]
-    parameters = first.parameters
-    uses_penalties = (
-        parameters.repetition_penalty != 1.0
-        or parameters.frequency_penalty != 0.0
-        or parameters.presence_penalty != 0.0
-    )
-    recent = (
-        tuple((token_id, count) for token_id, count in first.recent_counts if 0 <= token_id < vocab)
-        if uses_penalties
-        else ()
-    )
-    width = min(vocab, bucketed_length(len(recent)))
-    used = {token_id for token_id, _count in recent}
+    # Penalties are applied densely from the device-resident count base in the
+    # general sampling path; the fused top-k path never receives a penalty-
+    # bearing operation. The sparse penalty tensors are therefore always empty
+    # and exist only to satisfy the shared batch layout for the fused path.
+    width = min(vocab, bucketed_length(0))
     padding: list[int] = []
     candidate = vocab - 1
-    while len(recent) + len(padding) < width:
-        if candidate not in used:
-            padding.append(candidate)
+    while len(padding) < width:
+        padding.append(candidate)
         candidate -= 1
     token_ids = torch.tensor(
-        (*[token_id for token_id, _count in recent], *padding),
+        tuple(padding),
         dtype=torch.long,
         device=device,
     ).reshape(1, width)
-    counts = torch.tensor(
-        (*[count for _token_id, count in recent], *([0] * len(padding))),
-        dtype=torch.float32,
-        device=device,
-    ).reshape(1, width)
+    counts = torch.zeros((1, width), dtype=torch.float32, device=device)
     row_count = len(rows)
     parameter_values = torch.tensor(
         [
@@ -6781,8 +6814,14 @@ def _fused_top_k(task: _SampleTask, vocab: int) -> int:
     wants_logprobs = (
         parameters.return_logprobs or int(row.n_logprobs) > 0 or bool(parameters.logprob_token_ids)
     )
+    uses_penalties = (
+        parameters.repetition_penalty != 1.0
+        or parameters.frequency_penalty != 0.0
+        or parameters.presence_penalty != 0.0
+    )
     if (
         wants_logprobs
+        or uses_penalties
         or row.allowed is not None
         or row.suppress
         or parameters.logit_bias
@@ -6980,6 +7019,18 @@ def _sample_task_group(
         )
     )
     active = _sample_predicates(tasks, task_tokens.device)
+    # Fold each operation's selected token into its request's device-resident
+    # committed penalty base, weighted by whether the point is active and valid
+    # so a predicated no-op or an invalid distribution never contributes. The
+    # base was already read for this operation's own penalties above, so its own
+    # token never penalizes itself; the fold makes it visible to the next
+    # operation in the window before this one is host-observed.
+    for index, task in enumerate(tasks):
+        base = task.penalty_base
+        if base is None:
+            continue
+        weight = (active[index] & task_valid[index]).to(dtype=base.dtype).reshape(1)
+        base.scatter_add_(0, task_tokens[index].reshape(1).to(dtype=torch.int64), weight)
     device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
         tasks,
         task_tokens,
@@ -7326,50 +7377,40 @@ def _shape_sampling_logits_batch(
             float("-inf"),
         )
 
-    penalty_indexes: list[int] = []
-    repetitions: list[float] = []
-    frequencies: list[float] = []
-    presences: list[float] = []
-    occurrences: list[int] = []
-    for row_index, row in enumerate(rows):
-        parameters = row.parameters
-        if (
-            parameters.repetition_penalty == 1.0
-            and parameters.frequency_penalty == 0.0
-            and parameters.presence_penalty == 0.0
-        ):
-            continue
-        for token_id, count in row.recent_counts:
-            if 0 <= token_id < vocab:
-                penalty_indexes.append(row_index * vocab + token_id)
-                repetitions.append(float(parameters.repetition_penalty))
-                frequencies.append(float(parameters.frequency_penalty))
-                presences.append(float(parameters.presence_penalty))
-                occurrences.append(count)
-    if penalty_indexes:
-        indexes = torch.tensor(
-            penalty_indexes,
-            dtype=torch.long,
-            device=work.device,
-        )
-        penalty_values = torch.tensor(
-            tuple(zip(repetitions, frequencies, presences, occurrences, strict=True)),
+    # Penalties over the device-resident committed count base. Each penalty row
+    # carries a dense per-vocabulary count vector (committed generated tokens
+    # plus any speculative prefix); repetition is multiplicative and sign-aware,
+    # frequency scales with the count, and presence is a flat once-appeared
+    # subtraction. Masked (-inf) entries are preserved.
+    penalty_rows = [
+        row_index for row_index, row in enumerate(rows) if row.penalty_counts is not None
+    ]
+    if penalty_rows:
+        row_index_tensor = torch.tensor(penalty_rows, dtype=torch.long, device=work.device)
+        counts = torch.stack(
+            [cast(torch.Tensor, rows[row_index].penalty_counts) for row_index in penalty_rows]
+        ).to(dtype=work.dtype)
+        params = torch.tensor(
+            [
+                (
+                    float(rows[row_index].parameters.repetition_penalty),
+                    float(rows[row_index].parameters.frequency_penalty),
+                    float(rows[row_index].parameters.presence_penalty),
+                )
+                for row_index in penalty_rows
+            ],
             dtype=work.dtype,
             device=work.device,
         )
-        values = work.reshape(-1).index_select(0, indexes)
-        repetition = penalty_values[:, 0]
-        repeated = torch.where(
-            values > 0.0,
-            values / repetition,
-            values * repetition,
-        )
-        adjusted = repeated - penalty_values[:, 1] * penalty_values[:, 3] - penalty_values[:, 2]
-        work.reshape(-1).index_copy_(
-            0,
-            indexes,
-            torch.where(torch.isneginf(values), values, adjusted),
-        )
+        repetition = params[:, 0].unsqueeze(1)
+        frequency = params[:, 1].unsqueeze(1)
+        presence = params[:, 2].unsqueeze(1)
+        values = work.index_select(0, row_index_tensor)
+        seen = counts > 0
+        repeated = torch.where(values > 0.0, values / repetition, values * repetition)
+        adjusted = repeated - frequency * counts - presence
+        apply = seen & ~torch.isneginf(values)
+        work.index_copy_(0, row_index_tensor, torch.where(apply, adjusted, values))
 
     bias_indexes: list[int] = []
     bias_values: list[float] = []

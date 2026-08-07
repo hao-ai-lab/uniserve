@@ -1601,10 +1601,12 @@ pub fn decode_token_product_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u32>> {
 ///
 /// Token ids in every field are strictly increasing. `allowed_token_ids`
 /// distinguishes no whitelist (`None`) from a present empty whitelist, which
-/// deterministically represents an invalid all-masked distribution.
+/// deterministically represents an invalid all-masked distribution. Penalty
+/// token counts are not carried here: they are a device-resident committed base
+/// plus bounded per-operation deltas the worker folds on commit, so no host
+/// token history participates in a successor's sampling input.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SamplingState {
-    pub recent_counts: Vec<(u32, u32)>,
     pub allowed_token_ids: Option<Vec<u32>>,
     pub suppressed_token_ids: Vec<u32>,
     pub finish_token_ids: Vec<u32>,
@@ -1613,16 +1615,6 @@ pub struct SamplingState {
 
 impl SamplingState {
     pub fn canonicalize(&mut self) {
-        self.recent_counts.retain(|(_, count)| *count > 0);
-        self.recent_counts.sort_unstable_by_key(|(token, _)| *token);
-        self.recent_counts.dedup_by(|next, prior| {
-            if next.0 == prior.0 {
-                prior.1 = prior.1.saturating_add(next.1);
-                true
-            } else {
-                false
-            }
-        });
         if let Some(allowed) = &mut self.allowed_token_ids {
             allowed.sort_unstable();
             allowed.dedup();
@@ -1636,24 +1628,21 @@ impl SamplingState {
 
 /// Encode canonical branch-local sampling state.
 ///
-/// Layout: recent count and `(token, count)` pairs; one allowed-presence byte;
-/// an allowed count and ids when present; then a suppressed count and ids.
+/// Layout: one allowed-presence byte; an allowed count and ids when present;
+/// then a suppressed count and ids; then a finish count and ids; then one
+/// force-finish byte.
 pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
     let mut canonical = state.clone();
     canonical.canonicalize();
     let allowed_len = canonical.allowed_token_ids.as_ref().map_or(0, Vec::len);
     let mut bytes = Vec::with_capacity(
-        9 + canonical.recent_counts.len() * 8
-            + allowed_len * 4
+        1 + allowed_len * 4
+            + 4
             + canonical.suppressed_token_ids.len() * 4
+            + 4
             + canonical.finish_token_ids.len() * 4
             + 1,
     );
-    bytes.extend_from_slice(&(canonical.recent_counts.len() as u32).to_le_bytes());
-    for (token, count) in canonical.recent_counts {
-        bytes.extend_from_slice(&token.to_le_bytes());
-        bytes.extend_from_slice(&count.to_le_bytes());
-    }
     match canonical.allowed_token_ids {
         Some(allowed) => {
             bytes.push(1);
@@ -1700,18 +1689,6 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> anyhow::Result<SamplingState
     }
 
     let mut offset = 0;
-    let recent_len = take_u32(bytes, &mut offset)?;
-    let mut recent_counts = Vec::with_capacity(recent_len as usize);
-    for _ in 0..recent_len {
-        let token = take_u32(bytes, &mut offset)?;
-        let count = take_u32(bytes, &mut offset)?;
-        anyhow::ensure!(count > 0, "sampling-state recent count must be positive");
-        recent_counts.push((token, count));
-    }
-    anyhow::ensure!(
-        recent_counts.windows(2).all(|pair| pair[0].0 < pair[1].0),
-        "sampling-state recent token ids are not canonical"
-    );
     anyhow::ensure!(
         offset < bytes.len(),
         "sampling-state bytes omit allowed presence"
@@ -1747,7 +1724,6 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> anyhow::Result<SamplingState
         "sampling-state bytes contain trailing data"
     );
     Ok(SamplingState {
-        recent_counts,
         allowed_token_ids,
         suppressed_token_ids,
         finish_token_ids,

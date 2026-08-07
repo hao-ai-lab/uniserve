@@ -1051,6 +1051,213 @@ fn stochastic_decode_relays_a_device_selected_successor_before_observation() {
     );
 }
 
+/// Run one text request through a scheduler at `depth`, taping every submitted
+/// operation's `(variant, device_parent, in_flight_at_submit)`. Returns the
+/// emitted token ids and the operation tape. Shared by the generalized
+/// device-continuation depth oracle: at depth one every successor roots on the
+/// fixed committed parent (the serial reference); at higher depth an eligible
+/// successor roots on the predecessor's device-selected point while the
+/// predecessor is still in flight, i.e. before its completion is observed.
+fn relay_run(
+    sampling: SamplingParams,
+    stop_token_ids: Vec<u32>,
+    max_und_tokens: usize,
+    text_len: usize,
+    depth: u32,
+) -> (
+    Vec<u32>,
+    Vec<(uniserve_worker_wire::WorkVariant, bool, usize)>,
+) {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, Point, WorkVariant};
+
+    type Tape = Arc<Mutex<Vec<(WorkVariant, bool, usize)>>>;
+
+    struct Tap {
+        inner: SimExecutor,
+        ops: Tape,
+    }
+
+    impl Executor for Tap {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+        fn can_submit(&self) -> bool {
+            self.inner.can_submit()
+        }
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            let in_flight = self.inner.in_flight();
+            for envelope in batch.operations() {
+                let device_parent = matches!(envelope.parent.point, Point::Device { .. });
+                self.ops
+                    .lock()
+                    .unwrap()
+                    .push((envelope.work.variant(), device_parent, in_flight));
+            }
+            self.inner.submit(batch)
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            self.inner.poll()
+        }
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.inner.next_result()
+        }
+        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(operation)
+        }
+        fn control_wait(
+            &mut self,
+            operation: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(operation, targets)
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let mut sim = SimEngine::new();
+    sim.set_pipeline_depth(depth);
+    sim.set_text_len(text_len);
+    let ops: Tape = Arc::new(Mutex::new(Vec::new()));
+    let executor = Tap {
+        inner: SimExecutor::new(Box::new(sim)),
+        ops: ops.clone(),
+    };
+    let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let mut request = generation_request(
+        RequestId(1),
+        text_context(vec![1, 2, 3, 4, 5]),
+        sampling,
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        max_und_tokens,
+    );
+    request.stop_token_ids = stop_token_ids;
+    let mut events = scheduler.submit_for_test(request);
+    let mut tokens = Vec::new();
+    let mut finished = false;
+    for _ in 0..512 {
+        scheduler.step();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                GenEvent::TextToken { id, .. } => tokens.push(id),
+                GenEvent::Finished { .. } => finished = true,
+                _ => {}
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    drop(scheduler);
+    (tokens, Arc::try_unwrap(ops).unwrap().into_inner().unwrap())
+}
+
+/// S16 generalized device-continuation depth oracle. Every admitted
+/// device-representable processor combination — penalties, requested logprobs,
+/// the minimum-token floor, static allowed-token masks, positional forced
+/// tokens, and device stop-token finish predicates — produces the identical
+/// committed token sequence at depth one (serial, fixed-parent) and at higher
+/// depth (a successor relayed from the predecessor's device point before host
+/// observation). Penalty counts are folded from a device-resident base, so the
+/// successor sees its ancestors' tokens without observing them on the host.
+#[test]
+fn generalized_processor_successors_match_depth_one_before_observation() {
+    use uniserve_worker_wire::WorkVariant;
+
+    let cases: Vec<(&str, SamplingParams, Vec<u32>)> = vec![
+        (
+            "repetition+frequency+presence penalties",
+            SamplingParams {
+                temperature: 0.9,
+                top_k: 40,
+                seed: Some(7),
+                repetition_penalty: 1.3,
+                frequency_penalty: 0.7,
+                presence_penalty: 0.4,
+                ..SamplingParams::default()
+            },
+            Vec::new(),
+        ),
+        (
+            "requested logprobs",
+            SamplingParams {
+                temperature: 0.7,
+                seed: Some(11),
+                n_logprobs: 5,
+                ..SamplingParams::default()
+            },
+            Vec::new(),
+        ),
+        (
+            "minimum-token floor over stop tokens",
+            SamplingParams {
+                temperature: 0.0,
+                min_tokens: 6,
+                ..SamplingParams::default()
+            },
+            vec![1_002, 1_003],
+        ),
+        (
+            "greedy penalties with logprobs and a stop token",
+            SamplingParams {
+                temperature: 0.0,
+                repetition_penalty: 1.5,
+                frequency_penalty: 0.25,
+                n_logprobs: 3,
+                ..SamplingParams::default()
+            },
+            vec![1_004],
+        ),
+        (
+            "static allowed-token whitelist under stochastic sampling",
+            SamplingParams {
+                temperature: 0.8,
+                seed: Some(29),
+                allowed_token_ids: Some(vec![1_000, 1_001, 1_002, 1_003, 1_004, 1_005]),
+                ..SamplingParams::default()
+            },
+            Vec::new(),
+        ),
+    ];
+
+    for (label, sampling, stop_token_ids) in cases {
+        let (serial, serial_ops) = relay_run(sampling.clone(), stop_token_ids.clone(), 24, 12, 1);
+        let (relayed, relayed_ops) = relay_run(sampling, stop_token_ids, 24, 12, 2);
+
+        assert!(!serial.is_empty(), "[{label}] produced no tokens");
+        assert_eq!(
+            serial, relayed,
+            "[{label}] device-relay tokens diverged from the depth-one serial oracle",
+        );
+        // The depth-one reference never registers a successor ahead of an
+        // in-flight predecessor: every submitted op sees an empty pipeline.
+        assert!(
+            serial_ops.iter().all(|(_, _, in_flight)| *in_flight == 0),
+            "[{label}] the depth-one oracle submitted a successor before observation",
+        );
+        // The depth-two run proves production continuity: a decode successor was
+        // submitted from a device point while its predecessor was still in
+        // flight, before any completion could be observed on the host.
+        assert!(
+            relayed_ops
+                .iter()
+                .any(|(variant, device_parent, in_flight)| {
+                    *variant == WorkVariant::TokenDecode && *device_parent && *in_flight > 0
+                }),
+            "[{label}] expected a decode successor relayed from a device point before observation",
+        );
+    }
+}
+
 #[test]
 fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
     use std::sync::{Arc, Mutex};
@@ -1706,6 +1913,215 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
     };
     assert_eq!(*committed_point, 1);
     assert_eq!(*close_point, 1);
+}
+
+/// S17 provisional-descendant retraction with lineage isolation. A stop-string
+/// request samples device-continuously: it registers a bounded provisional
+/// decode successor from its predecessor's device point before that predecessor
+/// is host-observed. A matched stop then retracts the provisional descendant to
+/// the exact accepted prefix through the ordered close cutoff, while an
+/// unrelated request runs to natural completion the whole time.
+#[test]
+fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests_continue() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, Point, WorkVariant};
+
+    // (request_id, variant, device_parent, in_flight_at_submit)
+    type OpLog = Arc<Mutex<Vec<(u64, WorkVariant, bool, usize)>>>;
+
+    struct Recording {
+        inner: SimExecutor,
+        ops: OpLog,
+        controls: Arc<Mutex<Vec<Control>>>,
+    }
+
+    impl Executor for Recording {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+        fn can_submit(&self) -> bool {
+            self.inner.can_submit()
+        }
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            let in_flight = self.inner.in_flight();
+            for envelope in batch.operations() {
+                self.ops.lock().unwrap().push((
+                    envelope.request_key.session_id.0,
+                    envelope.work.variant(),
+                    matches!(envelope.parent.point, Point::Device { .. }),
+                    in_flight,
+                ));
+            }
+            self.controls
+                .lock()
+                .unwrap()
+                .extend(batch.controls.iter().cloned());
+            self.inner.submit(batch)
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+            self.inner.poll()
+        }
+        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
+            self.inner.next_result()
+        }
+        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(op)
+        }
+        fn control_wait(
+            &mut self,
+            op: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(op, targets)
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1024);
+    sim.set_pipeline_depth(2);
+    let ops: OpLog = Arc::new(Mutex::new(Vec::new()));
+    let controls = Arc::new(Mutex::new(Vec::new()));
+    let executor = Recording {
+        inner: SimExecutor::new(Box::new(sim)),
+        ops: Arc::clone(&ops),
+        controls: Arc::clone(&controls),
+    };
+    let scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    // An unrelated greedy request that must complete on its own throughout.
+    let unrelated = generation_request(
+        RequestId(1),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        6,
+    );
+    let mut unrelated_events = handle.submit(unrelated).unwrap();
+
+    // A stop-string request that samples device-continuously. It is never
+    // acknowledged, so its held commits accumulate up to the bounded horizon and
+    // a provisional decode successor is registered before observation.
+    let mut stopping = generation_request(
+        RequestId(2),
+        text_context(vec![1, 2, 3]),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        1024,
+    );
+    stopping.stop_strings = vec!["boundary".to_string()];
+    let mut events = handle.submit(stopping).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut consumed_tokens = 0;
+    while consumed_tokens < 2 && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::TextToken { .. }) => {
+                consumed_tokens += 1;
+                // Accept the first token so the second is a committed-ahead
+                // provisional descendant the stop then retracts.
+                if consumed_tokens == 1 {
+                    handle.acknowledge_at(RequestId(2), 1);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(
+        consumed_tokens, 2,
+        "stop-string request produced provisional tokens"
+    );
+    handle.stop_at(RequestId(2), 1);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stop_reason = None;
+    let mut unrelated_reason = None;
+    while Instant::now() < deadline {
+        while let Ok(event) = events.try_recv() {
+            if let GenEvent::Finished { reason, .. } = event {
+                stop_reason = Some(reason);
+            }
+        }
+        while let Ok(event) = unrelated_events.try_recv() {
+            if let GenEvent::Finished { reason, .. } = event {
+                unrelated_reason = Some(reason);
+            }
+        }
+        if stop_reason.is_some() && unrelated_reason.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+
+    // Lineage isolation: the unrelated request completed on its own while the
+    // stop-string request held its commits.
+    assert!(
+        matches!(
+            unrelated_reason,
+            Some(FinishReason::Eos | FinishReason::MaxTokens)
+        ),
+        "unrelated request must complete while the stop-string lineage is suspended, got {unrelated_reason:?}",
+    );
+    // The stop-string request retracted to the exact accepted prefix.
+    assert_eq!(stop_reason, Some(FinishReason::Stop));
+
+    let ops = ops.lock().unwrap();
+    // Production trace: a provisional decode successor for the stop-string
+    // request was submitted from a device point while its predecessor was still
+    // in flight, before any completion could be observed on the host.
+    assert!(
+        ops.iter()
+            .any(|(request, variant, device_parent, in_flight)| {
+                *request == RequestId(2).0
+                    && *variant == WorkVariant::TokenDecode
+                    && *device_parent
+                    && *in_flight > 0
+            }),
+        "expected a provisional device-relayed successor for the stop-string request",
+    );
+    let submitted_token_ops = ops
+        .iter()
+        .filter(|(request, variant, _, _)| {
+            *request == RequestId(2).0
+                && matches!(variant, WorkVariant::TokenExtend | WorkVariant::TokenDecode)
+        })
+        .count();
+    let controls = controls.lock().unwrap();
+    let committed = controls
+        .iter()
+        .filter(|control| {
+            matches!(control, Control::Commit { request_key, .. } if request_key.session_id.0 == RequestId(2).0)
+        })
+        .count();
+    // Only the accepted prefix commits; every provisional descendant beyond it
+    // was submitted before observation and then retracted rather than committed.
+    assert_eq!(committed, 1, "only the acknowledged prefix commits");
+    assert!(
+        submitted_token_ops > committed,
+        "provisional descendants ({submitted_token_ops} submitted) were retracted, not committed ({committed})",
+    );
+    assert!(
+        controls.iter().any(|control| {
+            matches!(control, Control::Close { request_key, .. } if request_key.session_id.0 == RequestId(2).0)
+        }),
+        "stopped lineage must close at its exact cutoff",
+    );
 }
 
 /// the EngineCaps hybrid-group handshake builds a multi-group block

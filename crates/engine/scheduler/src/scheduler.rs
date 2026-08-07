@@ -412,8 +412,14 @@ pub struct ReqState {
     pub(crate) output_journal: VecDeque<GenEvent>,
     /// Fixed semantic cutoffs indexed by public text-token count.
     pub(crate) token_cutoffs: BTreeMap<usize, VersionRef>,
-    /// State advance waiting for the frontend decoder's exact-prefix decision.
-    pub(crate) semantic_commit: Option<PendingSemanticCommit>,
+    /// Ordered semantic commits held for the frontend decoder's exact-prefix
+    /// decision, oldest first. A stop-string request may register bounded
+    /// provisional descendants before their predecessors are decoded, so more
+    /// than one commit can await a decision at once; each carries the exact
+    /// chained parent so the worker applies them in order once acknowledged.
+    /// The frontend can retract every descendant beyond a matched stop by an
+    /// exact cutoff, dropping the un-acknowledged tail without committing it.
+    pub(crate) pending_commits: VecDeque<PendingSemanticCommit>,
     pub(crate) cancel_cutoff: Option<VersionRef>,
     /// Exact worker-local selected-point product for the latest resolved state,
     /// together with the work variant that owns its physical pool. The scheduler
@@ -1515,25 +1521,11 @@ impl Scheduler {
             return;
         }
 
-        let pending = self.running.get_mut(&id).and_then(|state| {
-            if state
-                .semantic_commit
-                .as_ref()
-                .is_some_and(|pending| pending.token_count == Some(output_token_count))
-            {
-                state.semantic_commit.take()
-            } else {
-                None
-            }
-        });
-        let requires_decoder_commit = self.running.get(&id).is_some_and(|state| {
-            !state.req.stop_strings.is_empty() && state.semantic_commit.is_some()
-        });
-        if requires_decoder_commit {
-            self.finish_after_inflight(id, FinishReason::Error, None);
-            return;
-        }
-
+        // Release every held commit whose decoded prefix the frontend has now
+        // accepted, oldest first, so the worker applies them in exact chained
+        // parent order. A held commit with no public token of its own shares the
+        // count of the commit ahead of it and releases with it.
+        let mut ready: Vec<PendingSemanticCommit> = Vec::new();
         if let Some(state) = self.running.get_mut(&id) {
             state.semantic_token_seq = output_token_count;
             if let Some((&acknowledged_cutoff, _)) =
@@ -1543,16 +1535,26 @@ impl Scheduler {
                     .token_cutoffs
                     .retain(|token_count, _| *token_count >= acknowledged_cutoff);
             }
+            while state.pending_commits.front().is_some_and(|pending| {
+                pending
+                    .token_count
+                    .is_some_and(|tc| tc <= output_token_count)
+            }) {
+                ready.push(state.pending_commits.pop_front().expect("front present"));
+            }
         }
-        if let Some(pending) = pending {
+        if ready.is_empty() {
+            return;
+        }
+        for pending in ready {
             self.queue_commit(
                 id,
                 pending.expected_parent,
                 pending.selected,
                 pending.public_event_limit,
             );
-            self.finish_pending_if_idle(id);
         }
+        self.finish_pending_if_idle(id);
     }
 
     fn mark_stopped(&mut self, id: RequestId, output_token_count: usize) {
@@ -1563,6 +1565,10 @@ impl Scheduler {
             self.finish_after_inflight(id, FinishReason::Error, None);
             return;
         };
+        // Every provisional descendant beyond the matched stop is retracted: its
+        // held commit is dropped un-applied and the ordered close cutoff
+        // dominates it. Prefixes acknowledged before the match already committed.
+        state.pending_commits.clear();
         state.cancel_cutoff = Some(cutoff);
         state.cancelled = true;
         state.aborted = false;
@@ -1741,7 +1747,7 @@ impl Scheduler {
             semantic_token_seq: 0,
             output_journal: VecDeque::new(),
             token_cutoffs: BTreeMap::new(),
-            semantic_commit: None,
+            pending_commits: VecDeque::new(),
             cancel_cutoff: None,
             latest_device_version: None,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
@@ -2427,27 +2433,23 @@ impl Scheduler {
 
     fn device_token_relay_eligible(state: &ReqState) -> bool {
         // A successor may consume the parent's device-selected point before host
-        // observation whenever its own sampling is device-representable from
-        // registered coordinates alone. Greedy and stochastic selection with
-        // temperature, top-k, top-p, min-p, and typical filtering qualify: the
-        // draw is fixed by the successor's registered RNG coordinates and the
-        // filters act on the device logits. Processors whose next state depends
-        // on the parent's not-yet-observed token -- penalties over the recent
-        // window, bad-word and allowed-token masks, minimum-token floors, stop
-        // decisions, and requested logprobs -- keep the request host-paced.
+        // observation whenever its own sampling state is device-representable
+        // from registered coordinates and device products alone. Greedy and
+        // stochastic selection (temperature, top-k, top-p, min-p, typical),
+        // penalties folded from a device-resident committed count base plus
+        // per-operation deltas, requested logprobs, the minimum-token floor and
+        // force-finish flag (staged at the successor's exact projected point),
+        // static allowed-token, logit-bias, and single-token bad-word masks,
+        // positional forced tokens, and device finish predicates (EOS and
+        // stop-token ids) all qualify. Stop strings also qualify: the request
+        // samples device-continuously and registers bounded provisional
+        // descendants, and a matched stop retracts every descendant beyond the
+        // exact accepted prefix through the ordered close cutoff. Only
+        // multi-token bad-word automata keep the request host-paced, because
+        // their next mask depends on the not-yet-observed suffix.
         let sampling = &state.req.sampling;
         (!state.req.behavior.gen_output || state.req.policy.trigger.direct_token().is_some())
-            && state.req.stop_strings.is_empty()
-            && state.req.stop_token_ids.is_empty()
-            && sampling.min_tokens == 0
-            && !sampling.generated_logprobs_requested()
-            && sampling.bad_words_ids.is_empty()
-            && sampling.allowed_token_ids.is_none()
-            && sampling.forced_token_ids.is_empty()
-            && sampling.repetition_penalty == 1.0
-            && sampling.frequency_penalty == 0.0
-            && sampling.presence_penalty == 0.0
-            && sampling.logit_bias.is_empty()
+            && sampling.bad_words_ids.iter().all(|word| word.len() == 1)
     }
 
     /// Whether the latest host-resolved token may remain the exact device input
@@ -2480,15 +2482,27 @@ impl Scheduler {
             && self
                 .running
                 .get(&id)
-                .is_some_and(|state| state.semantic_commit.is_none())
+                .is_some_and(|state| self.pending_commit_horizon_open(state))
             && (!self.has_inflight(id) || self.can_queue_decode_successor(id))
     }
 
-    fn cpu_continuation_required(&self, state: &ReqState) -> bool {
+    /// Whether the request may register another operation without exceeding its
+    /// bounded provisional horizon. A request with no held commits is always
+    /// open; a stop-string request that has decoded prefixes awaiting the
+    /// frontend decision may run ahead by at most the unresolved-window depth,
+    /// after which it waits for an acknowledgement so the horizon stays finite.
+    fn pending_commit_horizon_open(&self, state: &ReqState) -> bool {
+        let horizon = self.caps.execution_constraints.max_unresolved_window.max(1) as usize;
+        state.pending_commits.len() < horizon
+    }
+
+    /// A request needs the asynchronous CPU-continuation future only for custom
+    /// logit processors, whose semantics are arbitrary host code. The built-in
+    /// minimum-token floor, bad-word, and allowed-token masks are cheap,
+    /// position- or set-derived host computations that run inline in
+    /// [`Self::token_masks`], so they never suspend the request behind a future.
+    fn cpu_continuation_required(&self, _state: &ReqState) -> bool {
         self.custom_logits_processors > 0
-            || state.req.sampling.min_tokens > 0
-            || !state.req.sampling.bad_words_ids.is_empty()
-            || state.req.sampling.allowed_token_ids.is_some()
     }
 
     fn cpu_continuation_ready(&self, id: RequestId) -> bool {
@@ -3208,6 +3222,13 @@ impl Scheduler {
                     };
                 }
                 let selected_fixed = self.fixed_version(id);
+                // A stop-string token op defers its semantic commit until the
+                // frontend decoder rules on its exact prefix; every other
+                // advancing op commits immediately in completion order. The
+                // deferred commit is carried to the resolve pass below, where the
+                // op's public token count is known and it joins the ordered
+                // pending-commit queue.
+                let mut deferred_commit: Option<(VersionRef, VersionRef, u64)> = None;
                 if advanced
                     && let (Some(expected_parent), Some(selected)) =
                         (expected_parent, selected_fixed.clone())
@@ -3223,18 +3244,7 @@ impl Scheduler {
                         .get(&id)
                         .is_some_and(|state| !state.req.stop_strings.is_empty());
                     if decoder_decision_required {
-                        let pending = PendingSemanticCommit {
-                            token_count: None,
-                            expected_parent,
-                            selected,
-                            public_event_limit,
-                        };
-                        if let Some(state) = self.running.get_mut(&id)
-                            && state.semantic_commit.replace(pending).is_some()
-                        {
-                            self.finish_after_inflight(id, FinishReason::Error, None);
-                            continue;
-                        }
+                        deferred_commit = Some((expected_parent, selected, public_event_limit));
                     } else {
                         self.queue_commit(id, expected_parent, selected, public_event_limit);
                     }
@@ -3274,6 +3284,7 @@ impl Scheduler {
                         selected_fixed,
                         public_tokens_before,
                         prefix_versions,
+                        deferred_commit,
                     ));
                 }
             }
@@ -3288,6 +3299,7 @@ impl Scheduler {
                 selected_fixed,
                 public_tokens_before,
                 prefix_versions,
+                deferred_commit,
             ) in to_resolve
             {
                 let token_operation = matches!(
@@ -3298,9 +3310,10 @@ impl Scheduler {
                     self.resolve(id, operation, apply, view, prefix_versions.clone());
                 }
                 if token_operation {
-                    let mut commit_without_decoder_event = None;
+                    let mut immediate_commit: Option<(VersionRef, VersionRef, u64)> = None;
                     if let Some(state) = self.running.get_mut(&id) {
-                        if state.public_token_seq > public_tokens_before {
+                        let emitted_public = state.public_token_seq > public_tokens_before;
+                        if emitted_public {
                             let emitted = state.public_token_seq - public_tokens_before;
                             for (offset, selected) in
                                 prefix_versions.into_iter().take(emitted).enumerate()
@@ -3315,22 +3328,45 @@ impl Scheduler {
                             {
                                 state.token_cutoffs.insert(state.public_token_seq, selected);
                             }
-                            if !state.req.stop_strings.is_empty()
-                                && let Some(pending) = state.semantic_commit.as_mut()
-                            {
-                                pending.token_count = Some(state.public_token_seq);
+                        }
+                        if let Some((expected_parent, selected, public_event_limit)) =
+                            deferred_commit
+                        {
+                            // Chain the deferred commit onto the tip of the
+                            // pending queue so the worker applies commits in
+                            // exact parent order once the decoder acknowledges
+                            // each prefix. An op that emits no public token
+                            // joins the token count of the commit ahead of it,
+                            // or commits immediately when the queue is empty.
+                            let chained_parent = state
+                                .pending_commits
+                                .back()
+                                .map(|pending| pending.selected.clone())
+                                .unwrap_or(expected_parent);
+                            let token_count = if emitted_public {
+                                Some(state.public_token_seq)
+                            } else {
+                                state
+                                    .pending_commits
+                                    .back()
+                                    .and_then(|pending| pending.token_count)
+                            };
+                            if token_count.is_none() && state.pending_commits.is_empty() {
+                                immediate_commit =
+                                    Some((chained_parent, selected, public_event_limit));
+                            } else {
+                                state.pending_commits.push_back(PendingSemanticCommit {
+                                    token_count,
+                                    expected_parent: chained_parent,
+                                    selected,
+                                    public_event_limit,
+                                });
                             }
-                        } else if !state.req.stop_strings.is_empty() {
-                            commit_without_decoder_event = state.semantic_commit.take();
                         }
                     }
-                    if let Some(pending) = commit_without_decoder_event {
-                        self.queue_commit(
-                            id,
-                            pending.expected_parent,
-                            pending.selected,
-                            pending.public_event_limit,
-                        );
+                    if let Some((expected_parent, selected, public_event_limit)) = immediate_commit
+                    {
+                        self.queue_commit(id, expected_parent, selected, public_event_limit);
                     }
                 }
                 self.finish_pending_if_idle(id);
@@ -4764,7 +4800,7 @@ impl Scheduler {
                     return None;
                 }
                 let chunk: Vec<u32> = prompt[cursor..end].to_vec();
-                let sampling_state = self.sampling_state(id);
+                let sampling_state = self.sampling_state(id, 0);
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
@@ -4780,16 +4816,16 @@ impl Scheduler {
             }
             Phase::DecodeUnd => {
                 let projected_successor = self.has_inflight(id);
-                let mut sampling_state = self.sampling_state(id);
-                if projected_successor {
-                    let state = self.running.get(&id)?;
-                    sampling_state.force_finish = state
-                        .und
-                        .tokens_emitted
-                        .saturating_add(self.inflight_len(id))
-                        .saturating_add(1)
-                        >= state.req.max_und_tokens;
-                }
+                // A successor registered before its predecessors resolve is
+                // `inflight_len` unresolved points ahead of the committed cursor;
+                // its minimum-token floor and force-finish flag are staged at
+                // that exact projected point.
+                let projected = if projected_successor {
+                    self.inflight_len(id)
+                } else {
+                    0
+                };
+                let sampling_state = self.sampling_state(id, projected);
                 let st = self.running.get(&id)?;
                 // The prior committed token this decode continues from. It is
                 // attached as a host input only when no exact selected-point
@@ -4967,7 +5003,7 @@ impl Scheduler {
                 };
                 let projection = self.projected_cursor(id)?;
                 let new_blocks = self.take_new_blocks(id);
-                let sampling_state = self.sampling_state(id);
+                let sampling_state = self.sampling_state(id, 0);
                 self.plan_intent(
                     id,
                     projection,
@@ -5111,7 +5147,7 @@ impl Scheduler {
         {
             return None;
         }
-        let sampling_state = self.sampling_state(id);
+        let sampling_state = self.sampling_state(id, 0);
         let new_blocks = self.take_new_blocks(id);
         self.plan_intent(
             id,
@@ -5164,11 +5200,18 @@ impl Scheduler {
         )
     }
 
-    /// bounded recent-output window for penalties (only carried when a
-    /// penalty is active, to keep the op small — risk 4).
-    /// run the host-side logits-processor pipeline to compute the op's
-    /// allowed/suppress masks (min-tokens, bad-words, allowed-tokens).
-    fn token_masks(&mut self, id: RequestId) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
+    /// Compute the operation's allowed/suppress masks from the host-side
+    /// logits-processor pipeline (minimum-token floor, bad-words, allowed
+    /// tokens). `n_generated` is the count of generated tokens the sampled point
+    /// follows: for a successor registered before its predecessors are observed
+    /// it is the committed count plus the unresolved window depth, so the
+    /// minimum-token floor is evaluated at the successor's own exact point
+    /// without reading any device token.
+    fn token_masks(
+        &mut self,
+        id: RequestId,
+        n_generated: usize,
+    ) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
         let st = match self.running.get(&id) {
             Some(s) => s,
             None => return (None, None),
@@ -5181,7 +5224,7 @@ impl Scheduler {
                 .unwrap_or((Some(Vec::new()), None));
         }
         let ctx = crate::logits::ProcCtx {
-            n_generated: st.und.tokens_emitted,
+            n_generated,
             eos: &self.ctrl.eos,
             generated: &st.replay.generated_ids,
             sampling: &st.req.sampling,
@@ -5202,36 +5245,30 @@ impl Scheduler {
         (allowed, suppress)
     }
 
-    fn sampling_state(&mut self, id: RequestId) -> SamplingState {
-        let (allowed_token_ids, suppressed_token_ids) = self.token_masks(id);
+    /// The branch-local static sampling state staged for one operation.
+    ///
+    /// `projected` is the number of unresolved predecessors the operation is
+    /// registered behind: zero for a host-paced operation, the in-flight window
+    /// depth for a successor registered before its predecessors are observed.
+    /// The minimum-token floor and the force-finish flag are evaluated at the
+    /// operation's own exact point (`tokens_emitted + projected`). Penalty
+    /// counts are never staged here — they are a device-resident committed base
+    /// plus per-operation deltas the worker folds on commit, so no host token
+    /// history participates in a successor's penalty input.
+    fn sampling_state(&mut self, id: RequestId, projected: usize) -> SamplingState {
+        let n_generated = self.running.get(&id).map_or(0, |state| {
+            state.und.tokens_emitted.saturating_add(projected)
+        });
+        let (allowed_token_ids, suppressed_token_ids) = self.token_masks(id, n_generated);
         let Some(state) = self.running.get(&id) else {
             return SamplingState::default();
         };
-        let recent_counts = Some(state)
-            .filter(|state| {
-                let sampling = &state.req.sampling;
-                sampling.repetition_penalty != 1.0
-                    || sampling.frequency_penalty != 0.0
-                    || sampling.presence_penalty != 0.0
-            })
-            .map(|state| {
-                let mut counts = std::collections::BTreeMap::<u32, u32>::new();
-                for &token in &state.replay.generated_ids {
-                    counts
-                        .entry(token)
-                        .and_modify(|count| *count = count.saturating_add(1))
-                        .or_insert(1);
-                }
-                counts.into_iter().collect()
-            })
-            .unwrap_or_default();
         let finish_token_ids = canonical_continuation_stop_token_ids(&state.req, &self.ctrl.eos);
         SamplingState {
-            recent_counts,
             allowed_token_ids,
             suppressed_token_ids: suppressed_token_ids.unwrap_or_default(),
             finish_token_ids,
-            force_finish: state.und.tokens_emitted.saturating_add(1) >= state.req.max_und_tokens,
+            force_finish: n_generated.saturating_add(1) >= state.req.max_und_tokens,
         }
     }
 
@@ -6112,7 +6149,7 @@ impl Scheduler {
             && self
                 .running
                 .get(&id)
-                .is_some_and(|state| state.semantic_commit.is_some());
+                .is_some_and(|state| !state.pending_commits.is_empty());
         if !self.has_inflight(id) && !semantic_pending {
             self.finish_with(id, reason, stop_reason);
             return;
@@ -6133,7 +6170,7 @@ impl Scheduler {
             || self
                 .running
                 .get(&id)
-                .is_some_and(|state| state.semantic_commit.is_some())
+                .is_some_and(|state| !state.pending_commits.is_empty())
         {
             return;
         }

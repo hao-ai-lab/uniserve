@@ -41,17 +41,23 @@ def _row(
     session_seed: int,
     position: int,
     recent: tuple[int, ...] = (),
+    vocab: int = 0,
     allowed: tuple[int, ...] | None = None,
     suppress: tuple[int, ...] = (),
     finish: tuple[int, ...] = (),
     force_finish: bool = False,
 ) -> _SamplingRow:
-    counts: dict[int, int] = {}
-    for token_id in recent:
-        counts[token_id] = counts.get(token_id, 0) + 1
+    # The committed penalty base is a dense per-vocabulary count vector, the same
+    # device-resident representation the worker folds each generated token into.
+    penalty_counts: torch.Tensor | None = None
+    if recent:
+        width = max(vocab, max(recent) + 1)
+        penalty_counts = torch.zeros(width, dtype=torch.int32)
+        for token_id in recent:
+            penalty_counts[token_id] += 1
     return _SamplingRow(
         parameters=parameters,
-        recent_counts=tuple(counts.items()),
+        penalty_counts=penalty_counts,
         allowed=allowed,
         suppress=suppress,
         draw=_draw_for(session_seed, position, parameters.temperature),
@@ -94,19 +100,23 @@ def _reference_workspace(logits: torch.Tensor, row: _SamplingRow) -> torch.Tenso
     suppressed = tuple(dict.fromkeys(value for value in row.suppress if 0 <= value < vocab))
     if suppressed:
         work[torch.tensor(suppressed, dtype=torch.long, device=work.device)] = float("-inf")
-    for token_id, count in row.recent_counts:
-        value = work[token_id]
-        if torch.isneginf(value):
-            continue
-        if row.parameters.repetition_penalty != 1.0:
-            value = torch.where(
-                value > 0,
-                value / row.parameters.repetition_penalty,
-                value * row.parameters.repetition_penalty,
+    if row.penalty_counts is not None:
+        for token_id in range(min(int(row.penalty_counts.numel()), vocab)):
+            count = int(row.penalty_counts[token_id])
+            if count == 0:
+                continue
+            value = work[token_id]
+            if torch.isneginf(value):
+                continue
+            if row.parameters.repetition_penalty != 1.0:
+                value = torch.where(
+                    value > 0,
+                    value / row.parameters.repetition_penalty,
+                    value * row.parameters.repetition_penalty,
+                )
+            work[token_id] = (
+                value - row.parameters.frequency_penalty * count - row.parameters.presence_penalty
             )
-        work[token_id] = (
-            value - row.parameters.frequency_penalty * count - row.parameters.presence_penalty
-        )
     for token_id, bias in row.parameters.logit_bias:
         if 0 <= token_id < vocab and not torch.isneginf(work[token_id]):
             work[token_id] += bias
@@ -196,6 +206,7 @@ def test_heterogeneous_rows_match_shaped_logits_plus_semantic_inverse_cdf_draws(
             session_seed=19,
             position=8,
             recent=(3, 3, 1),
+            vocab=6,
             suppress=(4,),
         ),
         _row(
@@ -316,7 +327,7 @@ def test_logprob_values_ranks_and_entry_sets_match_full_vocab_reference() -> Non
         n_logprobs=3,
         logprob_token_ids=(0, 5, 2, 5),
     )
-    row = _row(parameters, session_seed=41, position=12, recent=(1, 1, 4))
+    row = _row(parameters, session_seed=41, position=12, recent=(1, 1, 4), vocab=6)
     logits = torch.tensor([0.1, 1.4, 0.7, 2.0, -0.2, 1.1])
     actual = _sample_task_batch((_task(logits, row),))[0]
     expected_token, work = _reference_token(logits, row)

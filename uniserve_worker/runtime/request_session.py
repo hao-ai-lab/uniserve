@@ -6,7 +6,10 @@ import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
+
+if TYPE_CHECKING:
+    import torch
 
 from ..batch import (
     Admission,
@@ -143,6 +146,13 @@ class RequestSession:
     rng_counter: int = 0
     last_op_id: int | None = None
     last_step_id: int | None = None
+    # Device-resident committed penalty count base: a dense per-vocabulary count
+    # tensor the sampler folds each generated token into as its operation
+    # executes. A successor reads it before its predecessors are host-observed,
+    # so repetition/frequency/presence penalties are device-continuous without
+    # any host token history. Allocated lazily on the first penalty-bearing
+    # operation; ``None`` while the request uses no penalties.
+    penalty_counts: "torch.Tensor | None" = None
 
     @property
     def session_id(self) -> int:

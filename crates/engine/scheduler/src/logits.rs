@@ -1,13 +1,15 @@
-//! Host-side logits-processor pipeline, mirroring the reference `LogitsProcessor`
-//! ABC. The *math* processors
-//! (min-p, penalties, logit bias, top-k/p, temperature) are parameters the worker
-//! consumes; the *control-flow* processors here run in the Rust control plane and
-//! are expressed to the worker as small id masks (`allowed_tokens`/`suppress_tokens`).
+//! Host-side logits-processor pipeline. The math processors (min-p, penalties,
+//! logit bias, top-k/p, temperature) are parameters the device sampler consumes;
+//! the control-flow processors here compute the minimum-token floor, bad-word,
+//! and allowed-token masks and express them to the worker as small id masks
+//! (`allowed_tokens`/`suppress_tokens`).
 //!
-//! The point is the seam: a new processor is added by pushing it onto the
-//! pipeline (`Scheduler::with_logits_processor`) — the scheduler's per-step
-//! masking code never changes. This also leaves the clean insertion point for
-//! guided decoding (out of scope) without committing to it.
+//! The pipeline is the seam: a processor is added by pushing it onto the
+//! pipeline (`Scheduler::with_logits_processor`) and the scheduler's per-step
+//! masking code is unchanged. The built-in masks are cheap host- or
+//! position-derived computations that run inline; an admitted custom processor
+//! runs on the shared bounded CPU-continuation future so its arbitrary host code
+//! suspends only its own request lineage.
 
 use std::sync::Arc;
 use uniserve_core::SamplingParams;

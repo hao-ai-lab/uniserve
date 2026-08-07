@@ -577,7 +577,6 @@ fn token_product_bytes_round_trip() {
 #[test]
 fn sampling_state_bytes_preserve_empty_allowed_and_canonical_sets() {
     let state = SamplingState {
-        recent_counts: vec![(9, 1), (3, 2), (9, 4)],
         allowed_token_ids: Some(Vec::new()),
         suppressed_token_ids: vec![7, 2, 7],
         finish_token_ids: vec![11, 5, 11],
@@ -588,7 +587,6 @@ fn sampling_state_bytes_preserve_empty_allowed_and_canonical_sets() {
     assert_eq!(
         decoded,
         SamplingState {
-            recent_counts: vec![(3, 2), (9, 5)],
             allowed_token_ids: Some(Vec::new()),
             suppressed_token_ids: vec![2, 7],
             finish_token_ids: vec![5, 11],

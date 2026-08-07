@@ -534,7 +534,6 @@ def test_token_product_bytes_round_trip() -> None:
 def test_sampling_state_bytes_preserve_branch_local_processor_semantics() -> None:
     encoded = encode_sampling_state_bytes(
         SamplingState(
-            recent_counts=((9, 1), (3, 2), (9, 4)),
             allowed_token_ids=(),
             suppressed_token_ids=(7, 2, 7),
             finish_token_ids=(11, 5, 11),
@@ -543,7 +542,6 @@ def test_sampling_state_bytes_preserve_branch_local_processor_semantics() -> Non
     )
 
     assert decode_sampling_state_bytes(encoded) == SamplingState(
-        recent_counts=((3, 2), (9, 5)),
         allowed_token_ids=(),
         suppressed_token_ids=(2, 7),
         finish_token_ids=(5, 11),

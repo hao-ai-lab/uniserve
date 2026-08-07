@@ -233,6 +233,12 @@ struct SimSession {
     flow_step: u16,
     predicate_values: HashMap<ProductRef, bool>,
     terminal: BTreeMap<u64, RecordedCompletion>,
+    /// Device-resident committed penalty count base. Each generated token folds
+    /// in as its operation executes; a successor reads it before its
+    /// predecessor is host-observed, so penalties are device-continuous. The
+    /// GPU-free oracle keeps a host histogram; the production worker keeps the
+    /// equivalent device count tensor plus per-operation deltas.
+    penalty_counts: BTreeMap<u32, u32>,
 }
 
 impl SimSession {
@@ -253,7 +259,25 @@ impl SimSession {
             flow_step: 0,
             predicate_values: HashMap::new(),
             terminal: BTreeMap::new(),
+            penalty_counts: BTreeMap::new(),
         }
+    }
+
+    /// The committed recent-output histogram used for penalties, in canonical
+    /// ascending token order.
+    fn recent_counts(&self) -> Vec<(u32, u32)> {
+        self.penalty_counts
+            .iter()
+            .map(|(token, count)| (*token, *count))
+            .collect()
+    }
+
+    /// Fold one generated token into the committed penalty base.
+    fn fold_penalty_token(&mut self, token: u32) {
+        self.penalty_counts
+            .entry(token)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
     }
 
     fn sampling(&self) -> Option<&SamplingParams> {
@@ -435,7 +459,10 @@ impl SimEngine {
                 } else {
                     0.0
                 };
-                let recent_counts = state.map_or(&[][..], |value| value.recent_counts.as_slice());
+                // Penalty counts are device-resident, not carried in the staged
+                // state: the successor reads the committed base folded from
+                // ancestral tokens before any of them is host-observed.
+                let recent_counts = session.recent_counts();
                 let allowed = state
                     .and_then(|value| value.allowed_token_ids.as_deref())
                     .or_else(|| {
@@ -459,7 +486,7 @@ impl SimEngine {
                 Ok(try_apply_sampling_counts(
                     &mut logits,
                     sampling,
-                    recent_counts,
+                    &recent_counts,
                     allowed,
                     suppress,
                     sampling.n_logprobs as usize,
@@ -624,6 +651,11 @@ impl SimEngine {
                         }
                     }
                     record.committed_tokens = vec![output.token];
+                    // Fold the generated token into the device-resident penalty
+                    // base so the next operation's penalties see it before this
+                    // one is host-observed. A false-predicate no-op never reaches
+                    // this branch, so a retracted point is never folded.
+                    session.fold_penalty_token(output.token);
                     let blob = LogprobBlob {
                         sampled_logprob: session
                             .sampling()

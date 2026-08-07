@@ -2333,9 +2333,13 @@ def decode_token_product_bytes(data: bytes) -> tuple[int, ...]:
 
 @dataclass(frozen=True, slots=True)
 class SamplingState:
-    """Canonical branch-local token processor inputs for one operation."""
+    """Canonical branch-local token processor inputs for one operation.
 
-    recent_counts: tuple[tuple[int, int], ...] = ()
+    Penalty token counts are not carried here: they are a device-resident
+    committed base plus bounded per-operation deltas the worker folds on commit,
+    so no host token history participates in a successor's sampling input.
+    """
+
     allowed_token_ids: tuple[int, ...] | None = None
     suppressed_token_ids: tuple[int, ...] = ()
     finish_token_ids: tuple[int, ...] = ()
@@ -2343,11 +2347,6 @@ class SamplingState:
 
 
 def encode_sampling_state_bytes(state: SamplingState) -> bytes:
-    counts: dict[int, int] = {}
-    for token, count in state.recent_counts:
-        if count > 0:
-            counts[int(token)] = min((1 << 32) - 1, counts.get(int(token), 0) + int(count))
-    recent = tuple(sorted(counts.items()))
     allowed = (
         None
         if state.allowed_token_ids is None
@@ -2355,9 +2354,7 @@ def encode_sampling_state_bytes(state: SamplingState) -> bytes:
     )
     suppressed = tuple(sorted(set(int(token) for token in state.suppressed_token_ids)))
     finish = tuple(sorted(set(int(token) for token in state.finish_token_ids)))
-    out = bytearray(struct.pack("<I", len(recent)))
-    for token, count in recent:
-        out += struct.pack("<II", token, count)
+    out = bytearray()
     if allowed is None:
         out += b"\x00"
     else:
@@ -2391,11 +2388,6 @@ def decode_sampling_state_bytes(data: bytes) -> SamplingState:
             raise invalid_descriptor("sampling-state token ids are not canonical")
         return values
 
-    recent = tuple((take_u32(), take_u32()) for _ in range(take_u32()))
-    if any(count == 0 for _token, count in recent):
-        raise invalid_descriptor("sampling-state recent count must be positive")
-    if any(left[0] >= right[0] for left, right in zip(recent, recent[1:], strict=False)):
-        raise invalid_descriptor("sampling-state recent token ids are not canonical")
     if offset >= len(data):
         raise invalid_descriptor("sampling-state bytes omit allowed presence")
     presence = data[offset]
@@ -2416,7 +2408,7 @@ def decode_sampling_state_bytes(data: bytes) -> SamplingState:
         raise invalid_descriptor(f"sampling-state force-finish {force_finish} is invalid")
     if offset != len(data):
         raise invalid_descriptor("sampling-state bytes contain trailing data")
-    return SamplingState(recent, allowed, suppressed, finish, bool(force_finish))
+    return SamplingState(allowed, suppressed, finish, bool(force_finish))
 
 
 @dataclass(frozen=True, slots=True)

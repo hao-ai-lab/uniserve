@@ -41,7 +41,7 @@ def _task(
 ) -> _SampleTask:
     row = _SamplingRow(
         parameters=parameters,
-        recent_counts=(),
+        penalty_counts=None,
         allowed=None,
         suppress=suppress,
         draw=(
