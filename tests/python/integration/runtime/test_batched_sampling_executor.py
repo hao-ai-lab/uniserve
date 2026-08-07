@@ -587,6 +587,37 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
     assert result.completions[0].committed_tokens == (7,)
 
 
+def test_forced_token_schedule_overrides_selection() -> None:
+    worker = execution_worker()
+    admission = und_admission(
+        43,
+        block_ids=(11,),
+        sampling=SamplingParams(
+            temperature=0.0,
+            ignore_eos=True,
+            forced_token_ids=(7,),
+        ),
+    )
+    operation, token_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+
+    result = worker.execute(
+        execution_batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(operation,),
+            input_products=(token_input,),
+        )
+    )
+
+    assert result.completions[0].committed_tokens == (7,)
+
+
 def test_all_masked_branch_state_produces_an_error_completion() -> None:
     worker = execution_worker()
     admission = und_admission(42, block_ids=(10,))

@@ -822,7 +822,6 @@ struct InflightOp {
 struct PendingCompletion {
     record: CompletionRecord,
     products: Arc<[ProductPayload]>,
-    worker_us: u64,
     arrival_seq: u64,
 }
 
@@ -1631,9 +1630,9 @@ impl Scheduler {
         // Context-image requests prefill the text before each image position,
         // then encode the image into that marker gap.
         let phase0 = Phase::Prefill;
-        // A lifecycle trace keyed by trace/request/op ids.
+        // A lifecycle trace keyed by the canonical request key.
         let trace = crate::trace::RequestTrace::new(
-            req.request_id,
+            RequestKey::new(self.authority_id, req.request_id, self.next_epoch),
             uniserve_core::TraceId(req.request_id.0),
         );
         let st = ReqState {
@@ -2225,6 +2224,11 @@ impl Scheduler {
         };
         state.committed_producer_op_id = selected.producer_op_id.0;
         state.public_event_limit = public_event_limit;
+        state.trace.stamp_existing(
+            selected.producer_op_id,
+            crate::trace::LifecyclePhase::SemanticallyCommitted,
+            uniserve_core::now_monotonic_us(),
+        );
         self.pending_controls.push_back(Control::Commit {
             request_key: selected.request_key,
             control_seq: state.control_seq,
@@ -2560,12 +2564,7 @@ impl Scheduler {
             });
     }
 
-    fn stage_completion(
-        &mut self,
-        record: CompletionRecord,
-        products: Arc<[ProductPayload]>,
-        worker_us: u64,
-    ) {
+    fn stage_completion(&mut self, record: CompletionRecord, products: Arc<[ProductPayload]>) {
         let id = record.request_key.session_id;
         let op_id = record.op_id.0;
         let known = self.inflight_ops.get(&id).is_some_and(|queue| {
@@ -2597,7 +2596,6 @@ impl Scheduler {
             PendingCompletion {
                 record,
                 products,
-                worker_us,
                 arrival_seq,
             },
         );
@@ -2703,6 +2701,13 @@ impl Scheduler {
     }
 
     fn release_operation_product_credits(&mut self, id: RequestId, op_id: u64) {
+        if let Some(st) = self.running.get_mut(&id) {
+            st.trace.stamp_existing(
+                uniserve_worker_wire::OpId(op_id),
+                crate::trace::LifecyclePhase::ReleaseIssued,
+                uniserve_core::now_monotonic_us(),
+            );
+        }
         let products = self
             .product_credits
             .keys()
@@ -2877,9 +2882,8 @@ impl Scheduler {
         }
         for partition in report.partitions {
             let products = Arc::<[ProductPayload]>::from(partition.products);
-            let partition_worker_us = partition.worker_exec_us.unwrap_or(0);
             for record in partition.completions {
-                self.stage_completion(record, Arc::clone(&products), partition_worker_us);
+                self.stage_completion(record, Arc::clone(&products));
             }
         }
         let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
@@ -2894,7 +2898,6 @@ impl Scheduler {
                 let PendingCompletion {
                     record,
                     products,
-                    worker_us: completion_worker_us,
                     arrival_seq,
                 } = completion;
                 let id = record.request_key.session_id;
@@ -2950,15 +2953,54 @@ impl Scheduler {
                     }));
                 }
                 if let Some(st) = self.running.get_mut(&id) {
-                    let mut ev =
-                        crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpResolved);
-                    ev.op_id = Some(op_id);
-                    ev.op_kind = Some(operation_variant.as_wire_str());
-                    ev.roundtrip_us = roundtrip_us;
-                    ev.worker_us = completion_worker_us;
-                    ev.completion_copy_us = record.timing_counters.copy_us;
-                    ev.completion_ready_to_observed_us = record.timing_counters.host_us;
-                    st.trace.push(ev);
+                    let op_key = crate::trace::OperationKey::from(&operation);
+                    let kind = operation_variant.as_wire_str();
+                    let observed_us = uniserve_core::now_monotonic_us();
+                    // Device phases are reconstructed from the completion
+                    // record's asynchronously reported durations, anchored at
+                    // submission and clamped to the host observation.
+                    let submitted_us = st
+                        .trace
+                        .operations()
+                        .iter()
+                        .find(|op| op.key.op_id == op_key.op_id)
+                        .and_then(|op| op.at(crate::trace::LifecyclePhase::Submitted));
+                    if let Some(submitted_us) = submitted_us {
+                        let timing = &record.timing_counters;
+                        let device_started = submitted_us
+                            .saturating_add(timing.queued_us)
+                            .min(observed_us);
+                        let producer_ready = device_started
+                            .saturating_add(timing.device_us)
+                            .min(observed_us);
+                        let copy_ready = producer_ready
+                            .saturating_add(timing.copy_us)
+                            .min(observed_us);
+                        st.trace.stamp(
+                            op_key,
+                            Some(kind),
+                            crate::trace::LifecyclePhase::DeviceExecutionStarted,
+                            device_started,
+                        );
+                        st.trace.stamp(
+                            op_key,
+                            Some(kind),
+                            crate::trace::LifecyclePhase::ProducerReady,
+                            producer_ready,
+                        );
+                        st.trace.stamp(
+                            op_key,
+                            Some(kind),
+                            crate::trace::LifecyclePhase::CompletionCopyReady,
+                            copy_ready,
+                        );
+                    }
+                    st.trace.stamp(
+                        op_key,
+                        Some(kind),
+                        crate::trace::LifecyclePhase::CompletionObserved,
+                        observed_us,
+                    );
                 }
                 let predicated_parent_point = (record.status == OpStatus::Predicated).then(|| {
                     self.running
@@ -3581,9 +3623,7 @@ impl Scheduler {
                 scheduled_at,
             },
         );
-        st.trace.push(crate::trace::TraceEvent::at(
-            crate::trace::TraceEventKind::Admitted,
-        ));
+        st.trace.mark_admitted(uniserve_core::now_monotonic_us());
         self.running.insert(id, st);
         self.order.push(id);
         self.reserved_encoder_entries = self
@@ -4173,16 +4213,24 @@ impl Scheduler {
                 }));
             }
             input_products.extend(payloads);
+            let op_key = crate::trace::OperationKey::from(&operation);
             self.register_inflight(operation.clone(), apply, submit_at);
             wire_ops.push(operation);
             if let Some(st) = self.running.get_mut(&request_id) {
                 st.latest_device_version = None;
-                let mut ev =
-                    crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpSubmitted);
-                ev.op_id = Some(oid);
-                ev.op_kind = Some(operation_variant);
-                ev.step_id = step;
-                st.trace.push(ev);
+                let now_us = uniserve_core::now_monotonic_us();
+                st.trace.stamp(
+                    op_key,
+                    Some(operation_variant),
+                    crate::trace::LifecyclePhase::WorkerRegistrationComplete,
+                    now_us,
+                );
+                st.trace.stamp(
+                    op_key,
+                    Some(operation_variant),
+                    crate::trace::LifecyclePhase::Submitted,
+                    now_us,
+                );
             }
         }
         self.peak_ops_in_batch = self.peak_ops_in_batch.max(wire_ops.len());
@@ -6021,9 +6069,10 @@ impl Scheduler {
             }
             self.release_products(free_encoder_products);
             // close + archive the lifecycle trace (reconstructable post-finish).
-            let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::Finished);
-            ev.finish_reason = Some(finish_reason_str(&reason));
-            st.trace.push(ev);
+            st.trace.mark_finished(
+                finish_reason_str(&reason),
+                uniserve_core::now_monotonic_us(),
+            );
             if self.completed_traces.len() >= 64 {
                 self.completed_traces.pop_front();
             }

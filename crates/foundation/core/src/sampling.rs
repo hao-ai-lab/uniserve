@@ -1,10 +1,11 @@
 //! The worker-side sampling math, shared by the GPU-free `SimEngine` and
-//! mirrored by the Python worker. It applies the logits transforms in the reference's
+//! mirrored by the Python worker. It applies the canonical fixed processor
 //! order:
 //!
-//! allowed-token mask → suppress (bad-words / min-tokens) → logit bias →
+//! allowed/forced-token mask → bad-word suppress → min-token suppress →
 //! penalties (repetition / frequency / presence over the recent window) →
-//! temperature → min-p → top-k → top-p → sample → gather logprobs.
+//! logit bias → temperature → top-k → top-p → min-p → typical →
+//! distribution validation → inverse-CDF draw → gather logprobs.
 //!
 //! It operates on a logits slice and the per-request `SamplingParams` plus the
 //! small descriptor lists the host computed (recent tokens, allowed/suppress
@@ -40,6 +41,13 @@ pub fn apply_sampling(
         let count = counts.entry(token).or_default();
         *count = count.saturating_add(1);
     }
+    let key = crate::philox::sampling_key(
+        seed_from(p, recent),
+        0,
+        0,
+        0,
+        crate::philox::DRAW_LAYOUT_TARGET,
+    );
     try_apply_sampling_counts(
         logits,
         p,
@@ -47,16 +55,17 @@ pub fn apply_sampling(
         allowed,
         suppress,
         n_logprobs,
-        seed_from(p, recent),
+        crate::philox::sampling_uniform(key, 0, 0, 0),
     )
     .expect("sampling inputs must leave a valid distribution")
 }
 
 /// Apply the full sampling pipeline from canonical branch-local token counts.
 ///
-/// `draw_seed` names one semantic sampling coordinate. `None` represents a
-/// deterministic invalid distribution: empty logits, NaNs, infinities, or a
-/// transform sequence that masks every vocabulary entry.
+/// `draw` is the canonical uniform in `[0, 1)` produced by
+/// [`crate::philox::sampling_uniform`] for one semantic sampling coordinate.
+/// `None` represents a deterministic invalid distribution: empty logits, NaNs,
+/// infinities, or a transform sequence that masks every vocabulary entry.
 pub fn try_apply_sampling_counts(
     logits: &mut [f32],
     p: &SamplingParams,
@@ -64,7 +73,7 @@ pub fn try_apply_sampling_counts(
     allowed: Option<&[u32]>,
     suppress: Option<&[u32]>,
     n_logprobs: usize,
-    draw_seed: u64,
+    draw: f32,
 ) -> Option<SampleOutput> {
     let v = logits.len();
     if !valid_distribution(logits) {
@@ -93,13 +102,7 @@ pub fn try_apply_sampling_counts(
             }
         }
     }
-    // 3. logit bias.
-    for &(t, b) in &p.logit_bias {
-        if (t as usize) < v && logits[t as usize] != NEG_INF {
-            logits[t as usize] += b;
-        }
-    }
-    // 4. penalties over the recent output window.
+    // 5. penalties over the recent output window.
     if p.repetition_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0 {
         for &(t, count) in recent_counts {
             let i = t as usize;
@@ -120,10 +123,16 @@ pub fn try_apply_sampling_counts(
             logits[i] -= p.presence_penalty;
         }
     }
+    // 6. logit bias.
+    for &(t, b) in &p.logit_bias {
+        if (t as usize) < v && logits[t as usize] != NEG_INF {
+            logits[t as usize] += b;
+        }
+    }
     if !valid_distribution(logits) {
         return None;
     }
-    // 5. temperature (0 == greedy; applied at sample time).
+    // 7. temperature (0 == greedy; applied at sample time).
     let greedy = p.temperature <= 0.0;
     if !greedy {
         for l in logits.iter_mut() {
@@ -132,18 +141,7 @@ pub fn try_apply_sampling_counts(
             }
         }
     }
-    // 6. min-p: drop tokens below `min_p * max_prob`.
-    if p.min_p > 0.0 {
-        let probs = softmax(logits);
-        let maxp = probs.iter().cloned().fold(0.0f32, f32::max);
-        let thresh = p.min_p * maxp;
-        for (i, &pr) in probs.iter().enumerate() {
-            if pr < thresh {
-                logits[i] = NEG_INF;
-            }
-        }
-    }
-    // 7. top-k.
+    // 8a. top-k.
     if p.top_k > 0 && (p.top_k as usize) < v {
         let mut idx: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
         idx.sort_by(|&a, &b| {
@@ -155,7 +153,7 @@ pub fn try_apply_sampling_counts(
             logits[i] = NEG_INF;
         }
     }
-    // 8. top-p (nucleus).
+    // 8b. top-p (nucleus).
     if p.top_p < 1.0 && p.top_p > 0.0 {
         let probs = softmax(logits);
         let mut order: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
@@ -177,6 +175,46 @@ pub fn try_apply_sampling_counts(
             logits[i] = NEG_INF;
         }
     }
+    // 8c. min-p: drop tokens below `min_p * max_prob`.
+    if p.min_p > 0.0 {
+        let probs = softmax(logits);
+        let maxp = probs.iter().cloned().fold(0.0f32, f32::max);
+        let thresh = p.min_p * maxp;
+        for (i, &pr) in probs.iter().enumerate() {
+            if pr < thresh {
+                logits[i] = NEG_INF;
+            }
+        }
+    }
+    // 8d. typical: keep the locally-typical set whose surprisal deviates least
+    // from the distribution entropy, until its cumulative mass reaches
+    // `typical_p`.
+    if p.typical_p < 1.0 && p.typical_p > 0.0 {
+        let probs = softmax(logits);
+        let entropy: f32 = probs
+            .iter()
+            .map(|&pr| if pr > 0.0 { -pr * pr.ln() } else { 0.0 })
+            .sum();
+        let mut order: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
+        let score = |i: usize| ((-probs[i].ln()) - entropy).abs();
+        order.sort_by(|&a, &b| {
+            score(a)
+                .partial_cmp(&score(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cum = 0.0f32;
+        let mut cutoff = order.len();
+        for (rank, &i) in order.iter().enumerate() {
+            cum += probs[i];
+            if cum >= p.typical_p {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        for &i in order.iter().skip(cutoff) {
+            logits[i] = NEG_INF;
+        }
+    }
     if !valid_distribution(logits) {
         return None;
     }
@@ -186,7 +224,7 @@ pub fn try_apply_sampling_counts(
         argmax(logits)
     } else {
         let probs = softmax(logits);
-        sample_categorical(&probs, draw_seed)
+        sample_categorical(&probs, draw)
     };
 
     // 10. gather logprobs (softmax of the final, masked logits).
@@ -313,62 +351,18 @@ fn log_softmax(logits: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn sample_categorical(probs: &[f32], rng: u64) -> u32 {
-    // splitmix64 finalizer for a deterministic, dependency-free draw. A single
-    // xorshift step leaves nearby seeds (which `seed_from` readily produces —
-    // consecutive `recent.len` or adjacent last-token ids) strongly
-    // correlated; splitmix64's avalanche mixes those into well-separated draws.
-    let r = ((splitmix64(rng) >> 11) as f64 / (1u64 << 53) as f64) as f32;
+fn sample_categorical(probs: &[f32], draw: f32) -> u32 {
+    // Inverse-CDF selection over the ascending vocabulary: the first entry whose
+    // inclusive cumulative probability reaches the canonical uniform draw. The
+    // boundary matches the production worker's `(cumulative < draw).sum()`.
     let mut cum = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cum += p;
-        if r <= cum {
+        if draw <= cum {
             return i as u32;
         }
     }
     (probs.len().saturating_sub(1)) as u32
-}
-
-/// splitmix64 mixing function: a strong, dependency-free finalizer that maps a
-/// 64-bit seed to a well-distributed 64-bit value, decorrelating seeds that
-/// differ only in their low bits.
-fn splitmix64(seed: u64) -> u64 {
-    let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
-
-/// Derive one random seed from request identity and semantic sampling
-/// coordinates. The mapping is independent of batching, launch order, and
-/// completion order and mirrors the production worker's coordinate function.
-#[allow(clippy::too_many_arguments)]
-pub fn semantic_sampling_seed(
-    session_seed: u64,
-    authority_id: u64,
-    session_id: u64,
-    epoch: u64,
-    semantic_token_index: u64,
-    processor_stage: u64,
-    draw_index: u64,
-) -> u64 {
-    [
-        authority_id,
-        session_id,
-        epoch,
-        semantic_token_index,
-        processor_stage,
-        draw_index,
-    ]
-    .into_iter()
-    .fold(session_seed, splitmix_coordinate)
-}
-
-fn splitmix_coordinate(seed: u64, coordinate: u64) -> u64 {
-    let mut value = seed.wrapping_add(coordinate.wrapping_add(1).wrapping_mul(0x9E3779B97F4A7C15));
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
-    value ^ (value >> 31)
 }
 
 fn seed_from(p: &SamplingParams, recent: &[u32]) -> u64 {
@@ -440,7 +434,7 @@ mod tests {
             None,
             None,
             0,
-            0,
+            0.0,
         )
         .expect("valid distribution");
         assert_ne!(output.token, 3);
@@ -452,20 +446,12 @@ mod tests {
         let params = SamplingParams::default();
         let mut all_masked = base_logits();
         assert!(
-            try_apply_sampling_counts(&mut all_masked, &params, &[], Some(&[]), None, 0, 0,)
+            try_apply_sampling_counts(&mut all_masked, &params, &[], Some(&[]), None, 0, 0.0,)
                 .is_none()
         );
 
         let mut nan = vec![0.0, f32::NAN];
-        assert!(try_apply_sampling_counts(&mut nan, &params, &[], None, None, 0, 0).is_none());
-    }
-
-    #[test]
-    fn semantic_sampling_coordinate_matches_worker_mapping() {
-        assert_eq!(
-            semantic_sampling_seed(11, 3, 5, 7, 13, 17, 19),
-            13_207_301_388_388_605_805
-        );
+        assert!(try_apply_sampling_counts(&mut nan, &params, &[], None, None, 0, 0.0).is_none());
     }
 
     #[test]
@@ -712,78 +698,34 @@ mod tests {
         assert_eq!(lp[1], lp[2], "presence: count-2 and count-1 tokens tied");
     }
 
-    // ----------------------------------------------------------------------
-    // sample_categorical determinism + splitmix64 avalanche, exercised through
-    // the public `apply_sampling` path with temperature > 0 so the categorical
-    // branch (not argmax) runs. Properties are asserted statistically with a
-    // documented tolerance, decoupled from the exact mixing constants.
-    // ----------------------------------------------------------------------
-
-    /// Draw a token through the public sampler for a given integer seed over a
-    /// flat (uniform-target) logits vector of width `v`.
-    fn sample_uniform(seed: u64, v: usize) -> u32 {
-        let mut l = vec![0.0f32; v]; // equal logits => uniform target probs
+    #[test]
+    fn typical_keeps_the_locally_typical_set() {
+        // A sharply-peaked distribution: the single most-typical token (the one
+        // whose surprisal is closest to the entropy) survives a small typical_p.
+        let mut l = vec![0.0, 5.0, 0.1, 0.2, 0.05];
         let p = SamplingParams {
-            temperature: 1.0,
-            seed: Some(seed),
+            typical_p: 0.1,
             ..Default::default()
         };
-        apply_sampling(&mut l, &p, &[], None, None, 0).token
-    }
-
-    #[test]
-    fn sample_categorical_is_deterministic_per_seed() {
-        // Identical seed + params + recent window => identical token, every time.
-        for &seed in &[1u64, 7, 12345, 0xDEAD_BEEF, u64::MAX] {
-            let a = sample_uniform(seed, 16);
-            let b = sample_uniform(seed, 16);
-            assert_eq!(a, b, "seed {seed} must reproduce the same draw");
-        }
-    }
-
-    #[test]
-    fn sample_categorical_distribution_is_roughly_uniform() {
-        // Over a seed corpus with a flat target, splitmix64's avalanche should
-        // spread draws across all buckets. Tolerance is generous (max relative
-        // deviation < 0.30 over N=2000, V=8; observed ~0.11) so the test tracks
-        // the *property* of good mixing, not the specific mixing function.
-        const N: u64 = 2000;
-        const V: usize = 8;
-        let mut counts = [0u64; V];
-        for seed in 0..N {
-            counts[sample_uniform(seed, V) as usize] += 1;
-        }
-        let expected = N as f64 / V as f64;
-        for (bucket, &c) in counts.iter().enumerate() {
-            let rel_dev = (c as f64 - expected).abs() / expected;
-            assert!(
-                rel_dev < 0.30,
-                "bucket {bucket} count {c} deviates {rel_dev:.3} (>0.30) from uniform {expected}"
-            );
-        }
-    }
-
-    #[test]
-    fn adjacent_low_bit_seeds_decorrelate() {
-        // splitmix64 avalanche means seeds differing only in low bits map to
-        // well-separated draws. Over consecutive odd seeds (the minimal distinct
-        // step, since `seed_from` ORs in the low bit) draws differ far more often
-        // than a mixer that preserved low-bit correlation would allow.
-        const V: usize = 8;
-        const PAIRS: u64 = 2000;
-        let mut distinct = 0u64;
-        for k in (1..(1 + 2 * PAIRS)).step_by(2) {
-            if sample_uniform(k, V) != sample_uniform(k + 2, V) {
-                distinct += 1;
-            }
-        }
-        let frac = distinct as f64 / PAIRS as f64;
-        // A perfect uniform mapping over V=8 gives ~7/8=0.875 distinct; require
-        // well above 0.6 (observed ~0.87). A degenerate low-bit-preserving mixer
-        // would collapse neighbors to identical buckets, scoring near 0.
+        try_apply_sampling_counts(&mut l, &p, &[], None, None, 0, 0.0).expect("valid");
+        let surviving = l.iter().filter(|&&v| v != NEG_INF).count();
         assert!(
-            frac > 0.6,
-            "adjacent-seed distinct fraction {frac:.3} too low; low bits not avalanched"
+            (1..5).contains(&surviving),
+            "typical must prune the atypical tail"
         );
+    }
+
+    #[test]
+    fn inverse_cdf_selects_the_first_entry_reaching_the_draw() {
+        // Ascending inclusive cumulative probability [0.2, 0.5, 1.0]. The draw
+        // boundary is `draw <= cumulative[i]`, matching the production worker.
+        let probs = [0.2f32, 0.3, 0.5];
+        assert_eq!(sample_categorical(&probs, 0.0), 0);
+        assert_eq!(sample_categorical(&probs, 0.2), 0);
+        assert_eq!(sample_categorical(&probs, 0.2001), 1);
+        assert_eq!(sample_categorical(&probs, 0.5), 1);
+        assert_eq!(sample_categorical(&probs, 0.7), 2);
+        // A draw at or past the final cumulative selects the last entry.
+        assert_eq!(sample_categorical(&probs, 1.0), 2);
     }
 }

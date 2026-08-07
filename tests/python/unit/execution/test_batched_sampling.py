@@ -17,7 +17,18 @@ from uniserve_worker.execution.executor import (
     _SamplingRow,
 )
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.rng import sampling_draw_seed, uniform_samples
+from uniserve_worker.runtime.rng import (
+    DRAW_LAYOUT_TARGET,
+    sampling_key,
+    sampling_uniform,
+)
+
+
+def _draw_for(session_seed: int, position: int, temperature: float) -> float:
+    if temperature <= 0:
+        return 0.0
+    key = sampling_key(session_seed, 0, 0, 0, DRAW_LAYOUT_TARGET)
+    return sampling_uniform(key, position)
 
 pytestmark = pytest.mark.unit
 
@@ -43,7 +54,7 @@ def _row(
         recent_counts=tuple(counts.items()),
         allowed=allowed,
         suppress=suppress,
-        draw_seed=sampling_draw_seed(session_seed, position),
+        draw=_draw_for(session_seed, position, parameters.temperature),
         n_logprobs=parameters.n_logprobs,
         finish_token_ids=finish,
         force_finish=force_finish,
@@ -54,15 +65,7 @@ def _task(logits: torch.Tensor, row: _SamplingRow) -> _SampleTask:
     values = logits.reshape(1, -1)
     if _device_greedy_row(row):
         return _SampleTask(_ENVELOPE, values, (row,), None, None, None, None)
-    draws = (
-        uniform_samples(
-            (1,),
-            seed=row.draw_seed,
-            device=values.device,
-        )
-        if row.parameters.temperature > 0
-        else torch.zeros((1,), dtype=torch.float32, device=values.device)
-    )
+    draws = torch.tensor([float(row.draw)], dtype=torch.float32, device=values.device)
     penalty_token_ids, penalty_counts, parameter_values = _sampling_task_tensors(
         (row,),
         vocab=int(values.shape[1]),
@@ -91,9 +94,6 @@ def _reference_workspace(logits: torch.Tensor, row: _SamplingRow) -> torch.Tenso
     suppressed = tuple(dict.fromkeys(value for value in row.suppress if 0 <= value < vocab))
     if suppressed:
         work[torch.tensor(suppressed, dtype=torch.long, device=work.device)] = float("-inf")
-    for token_id, bias in row.parameters.logit_bias:
-        if 0 <= token_id < vocab and not torch.isneginf(work[token_id]):
-            work[token_id] += bias
     for token_id, count in row.recent_counts:
         value = work[token_id]
         if torch.isneginf(value):
@@ -107,10 +107,11 @@ def _reference_workspace(logits: torch.Tensor, row: _SamplingRow) -> torch.Tenso
         work[token_id] = (
             value - row.parameters.frequency_penalty * count - row.parameters.presence_penalty
         )
+    for token_id, bias in row.parameters.logit_bias:
+        if 0 <= token_id < vocab and not torch.isneginf(work[token_id]):
+            work[token_id] += bias
     if row.parameters.temperature > 0:
         work /= row.parameters.temperature
-    if row.parameters.min_p > 0:
-        work[work < work.max() + torch.log(torch.tensor(row.parameters.min_p))] = float("-inf")
     if 0 < row.parameters.top_k < vocab:
         values, indexes = torch.topk(work, row.parameters.top_k, sorted=False)
         masked = torch.full_like(work, float("-inf"))
@@ -123,18 +124,26 @@ def _reference_workspace(logits: torch.Tensor, row: _SamplingRow) -> torch.Tenso
         drop[1:] = drop[:-1].clone()
         drop[0] = False
         work[indexes[drop]] = float("-inf")
+    if row.parameters.min_p > 0:
+        work[work < work.max() + torch.log(torch.tensor(row.parameters.min_p))] = float("-inf")
+    if row.parameters.typical_p < 1:
+        probs = torch.softmax(work, dim=-1)
+        log_probs = probs.log()
+        entropy = -(probs * log_probs).nan_to_num(0.0).sum()
+        scores = ((-log_probs) - entropy).abs()
+        order = torch.argsort(scores)
+        cumulative = probs[order].cumsum(dim=-1)
+        drop = cumulative >= row.parameters.typical_p
+        keep = torch.ones_like(drop)
+        keep[1:] = ~drop[:-1].clone()
+        work[order[~keep]] = float("-inf")
     return work
 
 
 def _reference_token(logits: torch.Tensor, row: _SamplingRow) -> tuple[int, torch.Tensor]:
     work = _reference_workspace(logits, row)
     if row.parameters.temperature > 0:
-        draw = uniform_samples(
-            (1,),
-            seed=row.draw_seed,
-            device=work.device,
-        )[0]
-        token = int((torch.softmax(work, dim=-1).cumsum(dim=-1) < draw).sum())
+        token = int((torch.softmax(work, dim=-1).cumsum(dim=-1) < float(row.draw)).sum())
     else:
         token = int(torch.argmax(work))
     return min(token, int(work.numel()) - 1), work
@@ -206,6 +215,19 @@ def test_heterogeneous_rows_match_shaped_logits_plus_semantic_inverse_cdf_draws(
 
     assert tuple(value.token_id for value in actual) == expected
     assert actual[0].token_id == int(torch.argmax(_reference_workspace(logits[0], rows[0])))
+
+
+def test_typical_sampling_matches_the_processor_order_reference() -> None:
+    logits = torch.tensor([0.4, 2.1, 0.9, 1.5, -0.3, 1.9, 0.1, 2.0])
+    for typical_p in (0.3, 0.6, 0.9):
+        row = _row(
+            SamplingParams(temperature=1.0, typical_p=typical_p, seed=5),
+            session_seed=5,
+            position=2,
+        )
+        actual = _sample_task_batch((_task(logits, row),))[0]
+        expected, _work = _reference_token(logits, row)
+        assert actual.token_id == expected
 
 
 def test_semantic_draw_is_batch_invariant_order_invariant_and_replay_stable() -> None:

@@ -15,8 +15,13 @@ from uniserve_worker.execution.executor import (
     _SamplingRow,
     _semantic_sampling_draws,
 )
+from uniserve_worker.foundation.sync_detector import SyncDetector
 from uniserve_worker.runtime.completion_store import CompletionArena
-from uniserve_worker.runtime.rng import sampling_draw_seed
+from uniserve_worker.runtime.rng import (
+    DRAW_LAYOUT_TARGET,
+    sampling_key,
+    sampling_uniform,
+)
 
 pytestmark = [
     pytest.mark.integration,
@@ -39,7 +44,14 @@ def _task(
         recent_counts=(),
         allowed=None,
         suppress=suppress,
-        draw_seed=sampling_draw_seed(int(parameters.seed or 0), position),
+        draw=(
+            sampling_uniform(
+                sampling_key(int(parameters.seed or 0), 0, 0, 0, DRAW_LAYOUT_TARGET),
+                position,
+            )
+            if float(parameters.temperature) > 0
+            else 0.0
+        ),
         n_logprobs=int(parameters.n_logprobs),
         finish_token_ids=(3,),
     )
@@ -167,3 +179,42 @@ def test_top_k_fast_path_and_logprob_path_use_the_same_inverse_cdf_order() -> No
     logprob_result = _sample_task_batch((with_logprobs,))[0]
 
     assert int(fast_result.token_id) == int(logprob_result.token_id)
+
+
+def test_sync_detector_observes_a_real_synchronizing_operation() -> None:
+    detector = SyncDetector()
+    values = torch.randn(32, device="cuda:0")
+    with detector.guard("probe"):
+        _ = int((values + 1.0).sum().item())
+    assert detector.detections >= 1
+
+
+def test_device_sampling_records_zero_forbidden_synchronizations() -> None:
+    device = torch.device("cuda:0")
+    tasks = (
+        _task(torch.tensor([0.2, 0.7, 2.1, 0.4], device=device), SamplingParams(), 3),
+        _task(
+            torch.tensor([1.2, 0.5, 0.8, 1.7], device=device),
+            SamplingParams(temperature=0.8, top_p=0.9, seed=17),
+            7,
+        ),
+        _task(
+            torch.tensor([0.1, 1.3, 0.6, 2.0], device=device),
+            SamplingParams(temperature=0.7, top_k=3, seed=29, return_logprobs=True, n_logprobs=2),
+            11,
+        ),
+    )
+    arena = CompletionArena(depth=1, token_capacity=64, devices=(device,))
+    lease = arena.reserve(len(tasks), devices=(device,))
+
+    detector = SyncDetector()
+    with detector.guard("sample", enforce=True):
+        sampled = _sample_task_batch(tasks, lease)
+
+    assert all(value.device_token is not None for value in sampled)
+    assert detector.detections == 0
+    lease.seal()
+    for row in range(len(tasks)):
+        while not lease.ready():
+            pass
+        lease.observe(row, lease.generation)

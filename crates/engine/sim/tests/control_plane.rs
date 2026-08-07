@@ -3474,20 +3474,41 @@ fn lifecycle_trace_and_health_snapshot() {
         "trace must span admit→finish"
     );
     assert!(t.resolved_ops() > 0, "ops must resolve");
-    assert_eq!(t.request_id, RequestId(1), "trace is tied to the request");
+    assert_eq!(
+        t.request_key.session_id,
+        RequestId(1),
+        "trace is tied to the request"
+    );
     assert_eq!(t.trace_id.0, 1, "trace id is assigned");
+    assert!(
+        t.is_ordered(),
+        "every operation's lifecycle stamps are ordered"
+    );
     let submitted: Vec<_> = t
-        .events
+        .operations()
         .iter()
-        .filter(|e| e.kind == uniserve_scheduler::TraceEventKind::OpSubmitted)
+        .filter(|op| op.reached(uniserve_scheduler::LifecyclePhase::Submitted))
         .collect();
     assert!(!submitted.is_empty());
     assert!(
-        submitted
-            .iter()
-            .all(|e| e.op_id.is_some() && e.op_kind.is_some()),
-        "every submitted op carries an op_id + kind for correlation"
+        submitted.iter().all(|op| op.op_kind.is_some()),
+        "every submitted op carries a kind for correlation"
     );
+    // A resolved op reconstructs its device phases from the completion record.
+    let resolved = t
+        .operations()
+        .iter()
+        .find(|op| op.reached(uniserve_scheduler::LifecyclePhase::CompletionObserved))
+        .expect("at least one operation resolved");
+    for phase in [
+        uniserve_scheduler::LifecyclePhase::Submitted,
+        uniserve_scheduler::LifecyclePhase::DeviceExecutionStarted,
+        uniserve_scheduler::LifecyclePhase::ProducerReady,
+        uniserve_scheduler::LifecyclePhase::CompletionCopyReady,
+        uniserve_scheduler::LifecyclePhase::CompletionObserved,
+    ] {
+        assert!(resolved.reached(phase), "resolved op reached {phase:?}");
+    }
 }
 
 #[test]

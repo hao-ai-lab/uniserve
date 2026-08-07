@@ -1,4 +1,12 @@
-"""Semantic counter-based random coordinates for deterministic execution."""
+"""Semantic counter-based random coordinates for deterministic execution.
+
+The token sampler draws through the canonical Philox4x32-10 mapping defined
+here and mirrored bit-for-bit by the Rust simulator in
+``crates/foundation/core/src/philox.rs``. A draw is addressed only by its
+request lineage and semantic coordinates, so the same coordinate yields the
+same uniform in every language and is independent of batch order, execution
+depth, accepted proposal length, completion order, and replay.
+"""
 
 from __future__ import annotations
 
@@ -6,58 +14,86 @@ from collections.abc import Sequence
 
 import torch
 
-from uniserve_worker.batch import RequestKey
-
 _U64 = 0xFFFFFFFFFFFFFFFF
+_U32 = 0xFFFFFFFF
 _SPLITMIX64_GAMMA = 0x9E3779B97F4A7C15
 
+_PHILOX_M0 = 0xD2511F53
+_PHILOX_M1 = 0xCD9E8D57
+_PHILOX_KEY_BUMP_0 = 0x9E3779B9
+_PHILOX_KEY_BUMP_1 = 0xBB67AE85
 
-def sampling_draw_seed(session_seed: int, position: int) -> int:
-    """Return the retry-stable seed for one sequence-position draw."""
+# Draw layout identifiers matching the wire ``DrawLayout`` discriminants. They
+# separate the proposal and target draw spaces so rejected proposals cannot
+# shift target coordinates.
+DRAW_LAYOUT_TARGET = 0
+DRAW_LAYOUT_PROPOSAL = 1
+DRAW_LAYOUT_FLOW_NOISE = 2
 
-    return _splitmix_coordinate(session_seed, position)
 
-
-def semantic_sampling_seed(
-    request_key: RequestKey,
+def sampling_key(
     session_seed: int,
-    semantic_token_index: int,
-    *,
-    processor_stage: int = 0,
-    draw_index: int = 0,
+    authority_id: int,
+    session_id: int,
+    epoch: int,
+    draw_layout: int,
 ) -> int:
-    """Return the Philox seed for one exact semantic sampling coordinate."""
+    """Return the 64-bit Philox key for one request lineage and draw space."""
 
     value = int(session_seed) & _U64
     for coordinate in (
-        int(request_key.authority_id),
-        int(request_key.session_id),
-        int(request_key.epoch),
-        int(semantic_token_index),
-        int(processor_stage),
-        int(draw_index),
+        int(authority_id),
+        int(session_id),
+        int(epoch),
+        int(draw_layout),
     ):
         value = _splitmix_coordinate(value, coordinate)
     return value
+
+
+def philox4x32_10(
+    counter: tuple[int, int, int, int],
+    key: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Return the ten-round Philox4x32 bijection of ``counter`` under ``key``."""
+
+    c0, c1, c2, c3 = (int(word) & _U32 for word in counter)
+    k0, k1 = (int(word) & _U32 for word in key)
+    for rounds in range(10):
+        if rounds > 0:
+            k0 = (k0 + _PHILOX_KEY_BUMP_0) & _U32
+            k1 = (k1 + _PHILOX_KEY_BUMP_1) & _U32
+        p0 = _PHILOX_M0 * c0
+        p1 = _PHILOX_M1 * c2
+        hi0, lo0 = (p0 >> 32) & _U32, p0 & _U32
+        hi1, lo1 = (p1 >> 32) & _U32, p1 & _U32
+        c0, c1, c2, c3 = (hi1 ^ c1 ^ k0) & _U32, lo1, (hi0 ^ c3 ^ k1) & _U32, lo0
+    return c0, c1, c2, c3
+
+
+def sampling_uniform(
+    key: int,
+    semantic_token_index: int,
+    processor_stage: int = 0,
+    draw_index: int = 0,
+) -> float:
+    """Return one uniform draw in ``[0, 1)`` for a semantic coordinate."""
+
+    index = int(semantic_token_index)
+    counter = (
+        index & _U32,
+        (index >> 32) & _U32,
+        int(processor_stage) & _U32,
+        int(draw_index) & _U32,
+    )
+    words = philox4x32_10(counter, (int(key) & _U32, (int(key) >> 32) & _U32))
+    return (words[0] >> 8) * (1.0 / 16_777_216.0)
 
 
 def flow_noise_seed(session_seed: int, semantic_image_index: int) -> int:
     """Return the schedule-stable seed for one semantic image's initial noise."""
 
     return _splitmix_coordinate(session_seed, semantic_image_index)
-
-
-def uniform_samples(
-    shape: Sequence[int],
-    *,
-    seed: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Draw explicit uniform samples from a generator local to one semantic seed."""
-
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(seed))
-    return torch.rand(tuple(int(value) for value in shape), device=device, generator=generator)
 
 
 def normal_noise(
@@ -89,9 +125,12 @@ def _splitmix_coordinate(seed: int, coordinate: int) -> int:
 
 
 __all__ = [
+    "DRAW_LAYOUT_FLOW_NOISE",
+    "DRAW_LAYOUT_PROPOSAL",
+    "DRAW_LAYOUT_TARGET",
     "flow_noise_seed",
     "normal_noise",
-    "sampling_draw_seed",
-    "semantic_sampling_seed",
-    "uniform_samples",
+    "philox4x32_10",
+    "sampling_key",
+    "sampling_uniform",
 ]

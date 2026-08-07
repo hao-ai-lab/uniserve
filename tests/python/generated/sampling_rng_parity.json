@@ -1,0 +1,2748 @@
+{
+  "probs": [
+    0.125,
+    0.1875,
+    0.0625,
+    0.25,
+    0.3125,
+    0.0625
+  ],
+  "cases": [
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 2391539541053276776,
+      "words": [
+        3935247944,
+        1621999728,
+        1938852391,
+        1702036543
+      ],
+      "uniform_bits": 1063948062,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 2391539541053276776,
+      "words": [
+        341752261,
+        4221785957,
+        2759986585,
+        205486505
+      ],
+      "uniform_bits": 1034089928,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 2391539541053276776,
+      "words": [
+        1987977948,
+        4216963342,
+        1958908370,
+        112886653
+      ],
+      "uniform_bits": 1055718468,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 2391539541053276776,
+      "words": [
+        272027332,
+        617281758,
+        3382447771,
+        1054887514
+      ],
+      "uniform_bits": 1031911024,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 920862675595841680,
+      "words": [
+        2043155333,
+        3883435585,
+        63825091,
+        2003263293
+      ],
+      "uniform_bits": 1056149542,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 920862675595841680,
+      "words": [
+        4031301274,
+        3758334132,
+        2167694902,
+        3438735931
+      ],
+      "uniform_bits": 1064323270,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 920862675595841680,
+      "words": [
+        3941328538,
+        2555362968,
+        1843920408,
+        760636047
+      ],
+      "uniform_bits": 1063971814,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 920862675595841680,
+      "words": [
+        2457280929,
+        182741819,
+        894177820,
+        1968911198
+      ],
+      "uniform_bits": 1058174753,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 12365375887819322540,
+      "words": [
+        3519869006,
+        2278266905,
+        1363118571,
+        1358964641
+      ],
+      "uniform_bits": 1062325488,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 12365375887819322540,
+      "words": [
+        1852993749,
+        1064220138,
+        2320000246,
+        2854934404
+      ],
+      "uniform_bits": 1054663904,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 12365375887819322540,
+      "words": [
+        1960024198,
+        2295839676,
+        3966552596,
+        226201608
+      ],
+      "uniform_bits": 1055500080,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 12365375887819322540,
+      "words": [
+        699143986,
+        2028363317,
+        1518039720,
+        4092569545
+      ],
+      "uniform_bits": 1042722908,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9525647252769408357,
+      "words": [
+        2108316540,
+        2061392225,
+        2997633431,
+        2214992439
+      ],
+      "uniform_bits": 1056658614,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9525647252769408357,
+      "words": [
+        2287573666,
+        1213113057,
+        4197462010,
+        1228783033
+      ],
+      "uniform_bits": 1057511834,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9525647252769408357,
+      "words": [
+        2855326769,
+        2420950621,
+        458011677,
+        996544846
+      ],
+      "uniform_bits": 1059729620,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 9525647252769408357,
+      "words": [
+        2828675328,
+        811360022,
+        4179095809,
+        1393214574
+      ],
+      "uniform_bits": 1059625513,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10215422311649880565,
+      "words": [
+        846032075,
+        3146935361,
+        2489179980,
+        140939313
+      ],
+      "uniform_bits": 1045018032,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10215422311649880565,
+      "words": [
+        2319785248,
+        1444712779,
+        3869204156,
+        2928135805
+      ],
+      "uniform_bits": 1057637661,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10215422311649880565,
+      "words": [
+        3124109980,
+        1885796451,
+        2088850418,
+        4123407770
+      ],
+      "uniform_bits": 1060779554,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 10215422311649880565,
+      "words": [
+        3522717066,
+        3146869124,
+        3831988882,
+        2365519033
+      ],
+      "uniform_bits": 1062336613,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 11786136924292232648,
+      "words": [
+        4154909644,
+        2932412265,
+        2390647450,
+        1372808908
+      ],
+      "uniform_bits": 1064806115,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 11786136924292232648,
+      "words": [
+        145430611,
+        2834135195,
+        1691638025,
+        486662266
+      ],
+      "uniform_bits": 1024110976,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 11786136924292232648,
+      "words": [
+        3875909683,
+        2282241539,
+        3811675404,
+        711397622
+      ],
+      "uniform_bits": 1063716272,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 11786136924292232648,
+      "words": [
+        3412773678,
+        696410736,
+        4294436402,
+        1581479187
+      ],
+      "uniform_bits": 1061907147,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17144623578091845970,
+      "words": [
+        1735848695,
+        2225995992,
+        1478468414,
+        4017177672
+      ],
+      "uniform_bits": 1053748708,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17144623578091845970,
+      "words": [
+        3385744601,
+        1780086864,
+        357867083,
+        3194339502
+      ],
+      "uniform_bits": 1061801564,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17144623578091845970,
+      "words": [
+        2385105082,
+        490892453,
+        1572388749,
+        1323306429
+      ],
+      "uniform_bits": 1057892816,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 17144623578091845970,
+      "words": [
+        949328399,
+        1101937269,
+        2317230487,
+        4243326679
+      ],
+      "uniform_bits": 1046632040,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 14812011847041461105,
+      "words": [
+        221352105,
+        2244143682,
+        557907072,
+        2070760348
+      ],
+      "uniform_bits": 1028856064,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 14812011847041461105,
+      "words": [
+        3264705679,
+        4283815673,
+        1165920991,
+        1236377492
+      ],
+      "uniform_bits": 1061328756,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 14812011847041461105,
+      "words": [
+        2070002405,
+        346230797,
+        1016526667,
+        2173204955
+      ],
+      "uniform_bits": 1056359284,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 14812011847041461105,
+      "words": [
+        4284945980,
+        358262886,
+        3052507170,
+        3015367689
+      ],
+      "uniform_bits": 1065314070,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9014599998503523811,
+      "words": [
+        2777598243,
+        876089171,
+        604694197,
+        4036958355
+      ],
+      "uniform_bits": 1059425993,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9014599998503523811,
+      "words": [
+        41815724,
+        3715454200,
+        1943371167,
+        1879227747
+      ],
+      "uniform_bits": 1008698240,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9014599998503523811,
+      "words": [
+        1332841509,
+        96814256,
+        731882202,
+        1294754309
+      ],
+      "uniform_bits": 1050600216,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 0,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 9014599998503523811,
+      "words": [
+        1128959245,
+        79788306,
+        2052653610,
+        3306959514
+      ],
+      "uniform_bits": 1049007386,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 16321491304643971414,
+      "words": [
+        4268443850,
+        3285022121,
+        3499820504,
+        1432586528
+      ],
+      "uniform_bits": 1065249608,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 16321491304643971414,
+      "words": [
+        182502053,
+        2650555110,
+        711587396,
+        970901656
+      ],
+      "uniform_bits": 1026427936,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 16321491304643971414,
+      "words": [
+        585575933,
+        3855290349,
+        177988682,
+        2196353878
+      ],
+      "uniform_bits": 1040948404,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 16321491304643971414,
+      "words": [
+        1349429961,
+        2625305913,
+        1881799259,
+        3416513682
+      ],
+      "uniform_bits": 1050729812,
+      "selected_token": 2
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 7437125459209307225,
+      "words": [
+        3905743754,
+        4153473950,
+        682189733,
+        2175636580
+      ],
+      "uniform_bits": 1063832811,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 7437125459209307225,
+      "words": [
+        2602893056,
+        2424288920,
+        3942045296,
+        2688881561
+      ],
+      "uniform_bits": 1058743551,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 7437125459209307225,
+      "words": [
+        557049305,
+        3235255153,
+        548412447,
+        265948451
+      ],
+      "uniform_bits": 1040502676,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 7437125459209307225,
+      "words": [
+        3005591502,
+        1794627640,
+        3935742734,
+        1725413957
+      ],
+      "uniform_bits": 1060316591,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 15463258474376039085,
+      "words": [
+        3206358968,
+        3902355872,
+        2953537167,
+        769703353
+      ],
+      "uniform_bits": 1061100839,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 15463258474376039085,
+      "words": [
+        2848676488,
+        2611670706,
+        656878449,
+        2327822162
+      ],
+      "uniform_bits": 1059703642,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 15463258474376039085,
+      "words": [
+        4070730820,
+        4210476357,
+        2460246408,
+        2440234332
+      ],
+      "uniform_bits": 1064477292,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 15463258474376039085,
+      "words": [
+        2231774495,
+        1859355966,
+        3197044618,
+        3072415219
+      ],
+      "uniform_bits": 1057293869,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 440277536637365150,
+      "words": [
+        985751238,
+        1321009306,
+        1372520838,
+        230994762
+      ],
+      "uniform_bits": 1047201144,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 440277536637365150,
+      "words": [
+        917319687,
+        69114906,
+        2641242711,
+        1006974007
+      ],
+      "uniform_bits": 1046131904,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 440277536637365150,
+      "words": [
+        3461522849,
+        2728831800,
+        306391789,
+        911691070
+      ],
+      "uniform_bits": 1062097573,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 440277536637365150,
+      "words": [
+        837315304,
+        2204230537,
+        1795129750,
+        692061587
+      ],
+      "uniform_bits": 1044881832,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6487604068895210725,
+      "words": [
+        1974483418,
+        3944841551,
+        751118121,
+        1037214058
+      ],
+      "uniform_bits": 1055613042,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6487604068895210725,
+      "words": [
+        463308788,
+        3831061221,
+        276659113,
+        3486644919
+      ],
+      "uniform_bits": 1037888568,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6487604068895210725,
+      "words": [
+        1119296627,
+        923633655,
+        2073004278,
+        49671718
+      ],
+      "uniform_bits": 1048931896,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 6487604068895210725,
+      "words": [
+        1897639139,
+        2359851179,
+        3951832616,
+        794020805
+      ],
+      "uniform_bits": 1055012696,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17073655010450817055,
+      "words": [
+        19028300,
+        782218119,
+        2569155473,
+        3575306484
+      ],
+      "uniform_bits": 999369856,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17073655010450817055,
+      "words": [
+        2232180280,
+        2598863686,
+        36428382,
+        256864159
+      ],
+      "uniform_bits": 1057295454,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17073655010450817055,
+      "words": [
+        2443623873,
+        712295845,
+        2403553871,
+        199415831
+      ],
+      "uniform_bits": 1058121405,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 17073655010450817055,
+      "words": [
+        1663264745,
+        1879257504,
+        1322459925,
+        3533459697
+      ],
+      "uniform_bits": 1053181646,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 2683534742688207316,
+      "words": [
+        3892476985,
+        4169153768,
+        4224794760,
+        616336195
+      ],
+      "uniform_bits": 1063780988,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 2683534742688207316,
+      "words": [
+        2829532294,
+        2861229390,
+        3253410391,
+        427182264
+      ],
+      "uniform_bits": 1059628860,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 2683534742688207316,
+      "words": [
+        2785970835,
+        2280454681,
+        3331773009,
+        3602204596
+      ],
+      "uniform_bits": 1059458698,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 2683534742688207316,
+      "words": [
+        51477792,
+        527801117,
+        2667738206,
+        4008285527
+      ],
+      "uniform_bits": 1011113792,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6783979570543282954,
+      "words": [
+        4118824355,
+        2879528772,
+        2771606647,
+        2889599405
+      ],
+      "uniform_bits": 1064665157,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6783979570543282954,
+      "words": [
+        890119707,
+        1527746468,
+        3195736443,
+        4169635338
+      ],
+      "uniform_bits": 1045706904,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6783979570543282954,
+      "words": [
+        2553752452,
+        19461255,
+        3479953338,
+        987927970
+      ],
+      "uniform_bits": 1058551595,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 6783979570543282954,
+      "words": [
+        3499900357,
+        3259175619,
+        2058414383,
+        1472391018
+      ],
+      "uniform_bits": 1062247485,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 12029266337277158761,
+      "words": [
+        3952590084,
+        832643198,
+        2225741016,
+        3723799751
+      ],
+      "uniform_bits": 1064015805,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 12029266337277158761,
+      "words": [
+        3971279842,
+        2785081201,
+        4011859791,
+        4109417347
+      ],
+      "uniform_bits": 1064088811,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 12029266337277158761,
+      "words": [
+        753593383,
+        3543987036,
+        2570247118,
+        820682308
+      ],
+      "uniform_bits": 1043573680,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 1,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 12029266337277158761,
+      "words": [
+        626420317,
+        3522341300,
+        4237058144,
+        100311673
+      ],
+      "uniform_bits": 1041586600,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4109926519158326112,
+      "words": [
+        2177592239,
+        3251902610,
+        2795784348,
+        256312422
+      ],
+      "uniform_bits": 1057082219,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4109926519158326112,
+      "words": [
+        3154524532,
+        382015068,
+        4041660692,
+        1163711286
+      ],
+      "uniform_bits": 1060898361,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4109926519158326112,
+      "words": [
+        3848725245,
+        1502916338,
+        139576908,
+        3298802888
+      ],
+      "uniform_bits": 1063610082,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 4109926519158326112,
+      "words": [
+        2380477691,
+        1019913545,
+        2469551689,
+        4230417156
+      ],
+      "uniform_bits": 1057874740,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9821593556879270147,
+      "words": [
+        1331915300,
+        1129311146,
+        2597120514,
+        1839337617
+      ],
+      "uniform_bits": 1050592980,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9821593556879270147,
+      "words": [
+        794988376,
+        1292878093,
+        2890613236,
+        474866762
+      ],
+      "uniform_bits": 1044220476,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9821593556879270147,
+      "words": [
+        293039354,
+        3900961975,
+        624802668,
+        3201721600
+      ],
+      "uniform_bits": 1032567648,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 9821593556879270147,
+      "words": [
+        1855761910,
+        3712269075,
+        2645099956,
+        1664074684
+      ],
+      "uniform_bits": 1054685530,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4937017967270176091,
+      "words": [
+        3922361999,
+        1144847482,
+        3797199706,
+        1931024875
+      ],
+      "uniform_bits": 1063897726,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4937017967270176091,
+      "words": [
+        2157193581,
+        134339044,
+        453129068,
+        2785423886
+      ],
+      "uniform_bits": 1057002537,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4937017967270176091,
+      "words": [
+        4174763938,
+        3088064402,
+        2956561800,
+        1276134131
+      ],
+      "uniform_bits": 1064883671,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 4937017967270176091,
+      "words": [
+        513308898,
+        2683735500,
+        328071287,
+        1895554046
+      ],
+      "uniform_bits": 1039451072,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17937440209816916264,
+      "words": [
+        3085101752,
+        930091842,
+        2253779797,
+        4192531125
+      ],
+      "uniform_bits": 1060627178,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17937440209816916264,
+      "words": [
+        18274167,
+        3989251552,
+        221470055,
+        939172079
+      ],
+      "uniform_bits": 998992768,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 17937440209816916264,
+      "words": [
+        4003193479,
+        1469569242,
+        3774788968,
+        1074637385
+      ],
+      "uniform_bits": 1064213474,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 17937440209816916264,
+      "words": [
+        3062672317,
+        2754666859,
+        1164297611,
+        786839478
+      ],
+      "uniform_bits": 1060539563,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9902760370835941306,
+      "words": [
+        1514484597,
+        225784225,
+        503565503,
+        2824275728
+      ],
+      "uniform_bits": 1052019302,
+      "selected_token": 2
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9902760370835941306,
+      "words": [
+        964979729,
+        4221691110,
+        3670542383,
+        319617902
+      ],
+      "uniform_bits": 1046876592,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 9902760370835941306,
+      "words": [
+        2827920703,
+        3720498616,
+        2062903472,
+        1328843427
+      ],
+      "uniform_bits": 1059622565,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 9902760370835941306,
+      "words": [
+        2324942026,
+        3589622448,
+        2772667290,
+        780759648
+      ],
+      "uniform_bits": 1057657804,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 5861662661177361544,
+      "words": [
+        1896251057,
+        41008919,
+        4209141860,
+        1850246160
+      ],
+      "uniform_bits": 1055001852,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 5861662661177361544,
+      "words": [
+        2563071990,
+        2982317003,
+        3982605336,
+        4204813358
+      ],
+      "uniform_bits": 1058587999,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 5861662661177361544,
+      "words": [
+        2425144067,
+        675906610,
+        3290762474,
+        3078270230
+      ],
+      "uniform_bits": 1058049219,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 5861662661177361544,
+      "words": [
+        2311965339,
+        1218420313,
+        2806655805,
+        2558718311
+      ],
+      "uniform_bits": 1057607114,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4543632651406063425,
+      "words": [
+        399247829,
+        3237894215,
+        784297282,
+        1750020482
+      ],
+      "uniform_bits": 1035886664,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4543632651406063425,
+      "words": [
+        959016169,
+        3395402534,
+        356899066,
+        1933850332
+      ],
+      "uniform_bits": 1046783408,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4543632651406063425,
+      "words": [
+        2490908525,
+        342622699,
+        3542717366,
+        504003984
+      ],
+      "uniform_bits": 1058306111,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 4543632651406063425,
+      "words": [
+        1904496611,
+        2993369253,
+        2256536179,
+        3926249858
+      ],
+      "uniform_bits": 1055066270,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10231010897587062652,
+      "words": [
+        672049522,
+        2897097463,
+        859385068,
+        3988422027
+      ],
+      "uniform_bits": 1042299556,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10231010897587062652,
+      "words": [
+        3738824564,
+        983360012,
+        229810629,
+        1506858082
+      ],
+      "uniform_bits": 1063180783,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10231010897587062652,
+      "words": [
+        859587006,
+        1205145369,
+        2791011222,
+        2408475742
+      ],
+      "uniform_bits": 1045229828,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 10231010897587062652,
+      "words": [
+        2310181769,
+        1858218311,
+        2487455754,
+        560728322
+      ],
+      "uniform_bits": 1057600147,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10368731747094861839,
+      "words": [
+        2712841111,
+        348107975,
+        1144820369,
+        1698642068
+      ],
+      "uniform_bits": 1059173035,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10368731747094861839,
+      "words": [
+        3140846019,
+        3240368869,
+        1271989759,
+        1806656729
+      ],
+      "uniform_bits": 1060844929,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 10368731747094861839,
+      "words": [
+        895620467,
+        4019281740,
+        4250118990,
+        1634275225
+      ],
+      "uniform_bits": 1045792852,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 81985529216486895,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 10368731747094861839,
+      "words": [
+        3309469694,
+        1382919561,
+        2974459023,
+        847540368
+      ],
+      "uniform_bits": 1061503615,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 71079956591447702,
+      "words": [
+        275815907,
+        811055020,
+        1737525474,
+        2156663127
+      ],
+      "uniform_bits": 1032029416,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 71079956591447702,
+      "words": [
+        3932583040,
+        1928939643,
+        1886977641,
+        4282446089
+      ],
+      "uniform_bits": 1063937652,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 71079956591447702,
+      "words": [
+        2305146443,
+        2783745764,
+        939087931,
+        1309527461
+      ],
+      "uniform_bits": 1057580478,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 71079956591447702,
+      "words": [
+        2573059805,
+        2105232752,
+        2861190195,
+        324804327
+      ],
+      "uniform_bits": 1058627014,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6898983489236980361,
+      "words": [
+        3206204126,
+        1935671359,
+        2238526650,
+        726729402
+      ],
+      "uniform_bits": 1061100234,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6898983489236980361,
+      "words": [
+        2275462993,
+        437561861,
+        1874784455,
+        2512326957
+      ],
+      "uniform_bits": 1057464527,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6898983489236980361,
+      "words": [
+        3800797103,
+        960762024,
+        3706677203,
+        3791591993
+      ],
+      "uniform_bits": 1063422863,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 6898983489236980361,
+      "words": [
+        1384522830,
+        1385635066,
+        3196759831,
+        2111377987
+      ],
+      "uniform_bits": 1051003976,
+      "selected_token": 2
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6497759917431391075,
+      "words": [
+        4279062565,
+        4147294967,
+        2268239300,
+        570575522
+      ],
+      "uniform_bits": 1065291088,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6497759917431391075,
+      "words": [
+        696860336,
+        1485845737,
+        1359500164,
+        4237539580
+      ],
+      "uniform_bits": 1042687224,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 6497759917431391075,
+      "words": [
+        4290142517,
+        303251730,
+        2972498921,
+        3447388269
+      ],
+      "uniform_bits": 1065334369,
+      "selected_token": 5
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 0,
+      "session_id": 0,
+      "epoch": 0,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 6497759917431391075,
+      "words": [
+        2864505115,
+        482541662,
+        1205864923,
+        2589314804
+      ],
+      "uniform_bits": 1059765473,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 7685010690696164484,
+      "words": [
+        3191699762,
+        2391828848,
+        306993255,
+        2767459417
+      ],
+      "uniform_bits": 1061043577,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 7685010690696164484,
+      "words": [
+        2099923171,
+        3438711843,
+        2196009841,
+        2449979502
+      ],
+      "uniform_bits": 1056593040,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 7685010690696164484,
+      "words": [
+        1922854454,
+        710960201,
+        951725788,
+        508355563
+      ],
+      "uniform_bits": 1055209692,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 7685010690696164484,
+      "words": [
+        3046257833,
+        1253571695,
+        3946159472,
+        2073721278
+      ],
+      "uniform_bits": 1060475444,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 1765539851551443472,
+      "words": [
+        1752492636,
+        1899362041,
+        3555980692,
+        2930096726
+      ],
+      "uniform_bits": 1053878740,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 1765539851551443472,
+      "words": [
+        3208481967,
+        1478070530,
+        2219514476,
+        501365324
+      ],
+      "uniform_bits": 1061109132,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 1765539851551443472,
+      "words": [
+        1101568052,
+        37569314,
+        1017590159,
+        4005168208
+      ],
+      "uniform_bits": 1048793392,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 1765539851551443472,
+      "words": [
+        2364723493,
+        803345456,
+        4105903495,
+        4095084055
+      ],
+      "uniform_bits": 1057813201,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 11565796037977309360,
+      "words": [
+        99490907,
+        2080660378,
+        2514900351,
+        1776903116
+      ],
+      "uniform_bits": 1019069312,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 11565796037977309360,
+      "words": [
+        1068182055,
+        2064811430,
+        3643012083,
+        3030286435
+      ],
+      "uniform_bits": 1048489128,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 11565796037977309360,
+      "words": [
+        249994361,
+        3122466551,
+        1451043623,
+        2315040620
+      ],
+      "uniform_bits": 1030646208,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 7,
+      "session_id": 11,
+      "epoch": 3,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 11565796037977309360,
+      "words": [
+        130704286,
+        3563238109,
+        2865616765,
+        2349429774
+      ],
+      "uniform_bits": 1022970976,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 18214018200916436437,
+      "words": [
+        1007254557,
+        147198003,
+        2586972660,
+        3050040535
+      ],
+      "uniform_bits": 1047537136,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 18214018200916436437,
+      "words": [
+        2307116148,
+        202467273,
+        1775689951,
+        3123938375
+      ],
+      "uniform_bits": 1057588172,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 18214018200916436437,
+      "words": [
+        1712735219,
+        3790829929,
+        109377926,
+        3561831311
+      ],
+      "uniform_bits": 1053568134,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 0,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 18214018200916436437,
+      "words": [
+        2271726630,
+        2377752539,
+        1097376232,
+        284501779
+      ],
+      "uniform_bits": 1057449932,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 15463099458890134485,
+      "words": [
+        3933683768,
+        3496571310,
+        1395448995,
+        3783083856
+      ],
+      "uniform_bits": 1063941952,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 15463099458890134485,
+      "words": [
+        2808973656,
+        2938904259,
+        2767170817,
+        2650469755
+      ],
+      "uniform_bits": 1059548553,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 15463099458890134485,
+      "words": [
+        3155691809,
+        3768967564,
+        1762300614,
+        2991279723
+      ],
+      "uniform_bits": 1060902921,
+      "selected_token": 4
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 1,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 15463099458890134485,
+      "words": [
+        926495691,
+        1893528223,
+        3775998154,
+        4104548970
+      ],
+      "uniform_bits": 1046275276,
+      "selected_token": 1
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 0,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4862151946606540687,
+      "words": [
+        2406302108,
+        3053114744,
+        395641990,
+        2188009182
+      ],
+      "uniform_bits": 1057975617,
+      "selected_token": 3
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 1,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4862151946606540687,
+      "words": [
+        360852190,
+        3162153668,
+        133752411,
+        3010627362
+      ],
+      "uniform_bits": 1034686800,
+      "selected_token": 0
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 40,
+      "processor_stage": 0,
+      "draw_index": 0,
+      "key": 4862151946606540687,
+      "words": [
+        1514528945,
+        251591468,
+        2322441561,
+        486990336
+      ],
+      "uniform_bits": 1052019648,
+      "selected_token": 2
+    },
+    {
+      "session_seed": 18446744073709551615,
+      "authority_id": 4000000000,
+      "session_id": 5,
+      "epoch": 900,
+      "draw_layout": 2,
+      "semantic_token_index": 5000000000,
+      "processor_stage": 2,
+      "draw_index": 7,
+      "key": 4862151946606540687,
+      "words": [
+        3837574259,
+        1409172668,
+        2241663663,
+        2988630043
+      ],
+      "uniform_bits": 1063566524,
+      "selected_token": 4
+    }
+  ]
+}

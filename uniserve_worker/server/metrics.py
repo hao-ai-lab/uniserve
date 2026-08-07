@@ -9,6 +9,7 @@ from dataclasses import fields
 from typing import Any, Callable
 
 from ..batch import WorkerForwardStats
+from ..foundation.sync_detector import sync_detector
 
 __all__ = ["MetricsService"]
 
@@ -131,6 +132,7 @@ class MetricsService:
             "control_ok": dict(self.control_ok),
             "control_err": dict(self.control_err),
             "error_counts": dict(self.error_counts),
+            "forbidden_sync_detections": sync_detector().detections,
             **graph_scalars,
             "cuda_graph_runtime_mode_counts": dict(runtime_modes),
             "forward": forward,

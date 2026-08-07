@@ -115,6 +115,8 @@ table SamplingParams {
   return_prompt_logprobs:bool;
   n_prompt_logprobs:uint;
   logprob_token_ids:[uint];
+  typical_p:float = 1.0;
+  forced_token_ids:[uint];
 }
 
 table ImageParams {

@@ -7,6 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub mod generation;
+pub mod philox;
 pub mod product_blob;
 pub mod program;
 pub mod program_cursor;
@@ -22,10 +23,7 @@ pub use generation::{
     TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction, UndVisibility,
     VisibilityPolicyDescriptor, denoise_scratch_tokens, encoder_cache_key,
 };
-pub use sampling::{
-    SampleOutput, apply_sampling, score_token_logprobs, semantic_sampling_seed,
-    try_apply_sampling_counts,
-};
+pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs, try_apply_sampling_counts};
 
 /// A cloneable, thread-safe wake the command ingress fires after enqueuing a
 /// command, so a parked event-driven executor wakes immediately instead of
@@ -98,9 +96,17 @@ pub fn now_unix_secs_u64() -> u64 {
 /// Process-local monotonic time in fractional seconds from a stable epoch.
 /// Differences between values remain valid across wall-clock adjustments.
 pub fn now_monotonic_secs() -> f64 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
+
+/// Process-local monotonic time in whole microseconds from the same epoch as
+/// [`now_monotonic_secs`]. Used for lifecycle phase stamps, whose differences
+/// stay valid across wall-clock adjustments.
+pub fn now_monotonic_us() -> u64 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Logical KV block id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -214,8 +220,18 @@ pub struct SamplingParams {
     /// If set, only these token ids may be sampled (whitelist mask).
     #[serde(default)]
     pub allowed_token_ids: Option<Vec<u32>>,
+    /// Typical-sampling mass cutoff over the locally-typical set (1.0 == no-op).
+    #[serde(default = "default_typical_p")]
+    pub typical_p: f32,
+    /// Forced-decoding schedule: point `i` of an operation's span is forced to
+    /// `forced_token_ids[i]` when present, overriding stochastic selection.
+    #[serde(default)]
+    pub forced_token_ids: Vec<u32>,
 }
 fn default_repetition_penalty() -> f32 {
+    1.0
+}
+fn default_typical_p() -> f32 {
     1.0
 }
 
@@ -321,6 +337,8 @@ impl Default for SamplingParams {
             logprob_token_ids: Vec::new(),
             bad_words_ids: Vec::new(),
             allowed_token_ids: None,
+            typical_p: 1.0,
+            forced_token_ids: Vec::new(),
         }
     }
 }

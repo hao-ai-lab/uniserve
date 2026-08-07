@@ -546,6 +546,8 @@ impl Qwen3Desc {
             logprob_token_ids: stop.logprob_token_ids.clone().unwrap_or_default(),
             bad_words_ids: bad_words_ids.unwrap_or_default(),
             allowed_token_ids: stop.allowed_token_ids.clone(),
+            typical_p: 1.0,
+            forced_token_ids: Vec::new(),
         };
         core.validate().map_err(|error| error.to_string())?;
 

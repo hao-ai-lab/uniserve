@@ -349,6 +349,11 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
             .map(|tokens| u32_list(py, tokens))
             .transpose()?,
     )?;
+    dict.set_item(intern!(py, "typical_p"), sampling.typical_p)?;
+    dict.set_item(
+        intern!(py, "forced_token_ids"),
+        u32_list(py, &sampling.forced_token_ids)?,
+    )?;
     Ok(dict)
 }
 
@@ -1412,6 +1417,8 @@ mod tests {
             logprob_token_ids: vec![7, 8, 9],
             bad_words_ids: vec![vec![1, 2], vec![3]],
             allowed_token_ids: Some(vec![4, 5, 6]),
+            typical_p: 0.9,
+            forced_token_ids: vec![15, 16],
         }
     }
 

@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
+use uniserve_core::philox;
 use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{
-    ImageParams, RequestId, SampleOutput, SamplingParams, semantic_sampling_seed,
-    try_apply_sampling_counts,
+    ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
 };
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
@@ -403,7 +403,7 @@ impl SimEngine {
         let mut logits = self.synth_logits(session_id, index);
         match session.sampling() {
             Some(sampling) => {
-                let draw_seed = if sampling.temperature > 0.0 {
+                let draw = if sampling.temperature > 0.0 {
                     let rng = operation.rng.ok_or_else(|| {
                         anyhow::anyhow!("stochastic sampling operation has no RNG coordinates")
                     })?;
@@ -415,17 +415,16 @@ impl SimEngine {
                         rng.seed == sampling.seed.unwrap_or(0),
                         "operation RNG seed disagrees with admitted sampling"
                     );
-                    semantic_sampling_seed(
+                    let key = philox::sampling_key(
                         rng.seed,
                         operation.request_key.authority_id,
                         session_id.0,
                         operation.request_key.epoch,
-                        rng.semantic_index_base,
-                        0,
-                        0,
-                    )
+                        philox::DRAW_LAYOUT_TARGET,
+                    );
+                    philox::sampling_uniform(key, rng.semantic_index_base, 0, 0)
                 } else {
-                    0
+                    0.0
                 };
                 let recent_counts = state.map_or(&[][..], |value| value.recent_counts.as_slice());
                 let allowed = state
@@ -439,6 +438,15 @@ impl SimEngine {
                 let suppress = state
                     .map(|value| value.suppressed_token_ids.as_slice())
                     .filter(|tokens| !tokens.is_empty());
+                // Processor step 2 forced-token constraint: a decode operation
+                // samples a single span point, so its forced token is the first
+                // entry of the schedule and overrides any allowed-token mask.
+                let forced = sampling
+                    .forced_token_ids
+                    .first()
+                    .copied()
+                    .map(|token| [token]);
+                let allowed = forced.as_ref().map(|slot| slot.as_slice()).or(allowed);
                 Ok(try_apply_sampling_counts(
                     &mut logits,
                     sampling,
@@ -446,7 +454,7 @@ impl SimEngine {
                     allowed,
                     suppress,
                     sampling.n_logprobs as usize,
-                    draw_seed,
+                    draw,
                 ))
             }
             None => Ok(Some(SampleOutput {

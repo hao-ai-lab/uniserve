@@ -24,5 +24,5 @@ pub use scheduler::{
     HealthSnapshot, SchedStats, Scheduler, SchedulerConfig, SchedulingPolicy,
 };
 pub use stats_report::SchedStatsReporter;
-pub use trace::{RequestTrace, TraceEvent, TraceEventKind};
+pub use trace::{LifecyclePhase, OperationKey, OperationLifecycle, RequestTrace};
 pub use uniserve_executor::{ControlAck, ControlOp, Executor};

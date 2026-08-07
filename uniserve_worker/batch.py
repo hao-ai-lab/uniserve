@@ -480,6 +480,8 @@ class SamplingParams:
     logprob_token_ids: tuple[int, ...] = ()
     bad_words_ids: tuple[tuple[int, ...], ...] = ()
     allowed_token_ids: tuple[int, ...] | None = None
+    typical_p: float = 1.0
+    forced_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -498,6 +500,8 @@ class SamplingParams:
             raise invalid_descriptor("sampling.top_p must be in (0, 1]")
         if not 0 <= self.min_p <= 1:
             raise invalid_descriptor("sampling.min_p must be in [0, 1]")
+        if not 0 < self.typical_p <= 1:
+            raise invalid_descriptor("sampling.typical_p must be in (0, 1]")
         if self.repetition_penalty <= 0:
             raise invalid_descriptor("sampling.repetition_penalty must be positive")
         if any(not math.isfinite(float(bias)) for _, bias in self.logit_bias):
@@ -560,6 +564,10 @@ class SamplingParams:
                 if data.get("allowed_token_ids") is None
                 else _uints(data["allowed_token_ids"], f"{where}.allowed_token_ids")
             ),
+            typical_p=_float(data.get("typical_p", 1.0), f"{where}.typical_p"),
+            forced_token_ids=_uints(
+                data.get("forced_token_ids", ()), f"{where}.forced_token_ids"
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -584,6 +592,8 @@ class SamplingParams:
             "allowed_token_ids": (
                 None if self.allowed_token_ids is None else list(self.allowed_token_ids)
             ),
+            "typical_p": self.typical_p,
+            "forced_token_ids": list(self.forced_token_ids),
         }
 
 
@@ -2704,6 +2714,8 @@ def _digest_sampling(digest: _Digest, value: SamplingParams) -> None:
     for tokens in value.bad_words_ids:
         digest.u32s(tokens)
     digest.option(value.allowed_token_ids, digest.u32s)
+    digest.f32(value.typical_p)
+    digest.u32s(value.forced_token_ids)
 
 
 def _digest_image(digest: _Digest, value: ImageParams) -> None:

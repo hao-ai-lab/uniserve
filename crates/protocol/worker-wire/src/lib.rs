@@ -2677,6 +2677,8 @@ impl CanonicalDigest {
         self.option(value.allowed_token_ids.as_deref(), |digest, tokens| {
             digest.u32s(tokens.iter().copied())
         });
+        self.f32(value.typical_p);
+        self.u32s(value.forced_token_ids.iter().copied());
     }
 
     fn image(&mut self, value: &ImageParams) {

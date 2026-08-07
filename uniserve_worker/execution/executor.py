@@ -175,10 +175,11 @@ from uniserve_worker.runtime.request_session import (
     StepTxn,
 )
 from uniserve_worker.runtime.rng import (
+    DRAW_LAYOUT_TARGET,
     flow_noise_seed,
     normal_noise,
-    semantic_sampling_seed,
-    uniform_samples,
+    sampling_key,
+    sampling_uniform,
 )
 from uniserve_worker.runtime.transfer import (
     TRANSFER_DESCRIPTOR_PREFIX,
@@ -265,7 +266,7 @@ class _SamplingRow:
     recent_counts: tuple[tuple[int, int], ...]
     allowed: tuple[int, ...] | None
     suppress: tuple[int, ...]
-    draw_seed: int
+    draw: float
     n_logprobs: int
     finish_token_ids: tuple[int, ...] = ()
     force_finish: bool = False
@@ -3941,7 +3942,7 @@ class ModelExecutor:
                 recent_counts=(),
                 allowed=None,
                 suppress=(),
-                draw_seed=0,
+                draw=0.0,
                 n_logprobs=int(sampling.n_prompt_logprobs),
             )
             for _ in targets
@@ -4558,28 +4559,45 @@ class ModelExecutor:
                     "sampling positions disagree with registered semantic RNG coordinates"
                 )
         rng_seed = 0 if rng is None else int(rng.seed)
+        stochastic = float(sampling.temperature) > 0.0
+        draw_key = (
+            sampling_key(
+                rng_seed,
+                int(operation.request_key.authority_id),
+                int(operation.request_key.session_id),
+                int(operation.request_key.epoch),
+                DRAW_LAYOUT_TARGET,
+            )
+            if stochastic
+            else 0
+        )
         base_counts = dict(state.recent_counts)
+        forced_token_ids = sampling.forced_token_ids
         descriptors: list[_SamplingRow] = []
         for index, position in enumerate(positions):
             prefix_counts = dict(base_counts)
             for token_id in draft_token_ids[:index]:
                 prefix_counts[int(token_id)] = prefix_counts.get(int(token_id), 0) + 1
+            # Processor step 2 forced-token constraint: point `index` of the
+            # operation's span narrows selection to `forced_token_ids[index]`,
+            # overriding any allowed-token whitelist for that point.
+            row_allowed = (
+                (int(forced_token_ids[index]),)
+                if index < len(forced_token_ids)
+                else allowed_token_ids
+            )
             descriptors.append(
                 _SamplingRow(
                     parameters=sampling,
                     recent_counts=tuple(sorted(prefix_counts.items())),
-                    allowed=allowed_token_ids,
+                    allowed=row_allowed,
                     suppress=state.suppressed_token_ids,
                     finish_token_ids=finish_token_ids,
                     force_finish=state.force_finish,
-                    draw_seed=(
-                        semantic_sampling_seed(
-                            operation.request_key,
-                            rng_seed,
-                            int(position),
-                        )
-                        if float(sampling.temperature) > 0.0
-                        else 0
+                    draw=(
+                        sampling_uniform(draw_key, int(position))
+                        if stochastic
+                        else 0.0
                     ),
                     n_logprobs=int(sampling.n_logprobs),
                 )
@@ -6768,6 +6786,7 @@ def _fused_top_k(task: _SampleTask, vocab: int) -> int:
         or row.allowed is not None
         or row.suppress
         or parameters.logit_bias
+        or float(parameters.typical_p) < 1.0
         or top_k <= 0
         or top_k > 128
         or top_k >= vocab
@@ -7253,37 +7272,15 @@ def _semantic_sampling_draws(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    stochastic = tuple(
-        index for index, row in enumerate(rows) if float(row.parameters.temperature) > 0.0
+    # Each row's draw is the canonical Philox uniform for its semantic
+    # coordinate, computed from host-known identity when the descriptor was
+    # built. Greedy rows carry a zero draw. Uploading the host-resident vector
+    # keeps the request path free of any device-to-host observation.
+    return torch.tensor(
+        [float(row.draw) for row in rows],
+        dtype=torch.float32,
+        device=device,
     )
-    if len(stochastic) == len(rows):
-        return torch.cat(
-            tuple(
-                uniform_samples(
-                    (1,),
-                    seed=row.draw_seed,
-                    device=device,
-                )
-                for row in rows
-            ),
-            dim=0,
-        )
-    draws = torch.zeros((len(rows),), dtype=torch.float32, device=device)
-    if stochastic:
-        indexes = torch.tensor(stochastic, dtype=torch.long, device=device)
-        stochastic_draws = torch.cat(
-            tuple(
-                uniform_samples(
-                    (1,),
-                    seed=rows[index].draw_seed,
-                    device=device,
-                )
-                for index in stochastic
-            ),
-            dim=0,
-        )
-        draws.index_copy_(0, indexes, stochastic_draws)
-    return draws
 
 
 def _shape_sampling_logits_batch(
@@ -7327,27 +7324,6 @@ def _shape_sampling_logits_batch(
             0,
             torch.tensor(suppressed_flat, dtype=torch.long, device=work.device),
             float("-inf"),
-        )
-
-    bias_indexes: list[int] = []
-    bias_values: list[float] = []
-    for row_index, row in enumerate(rows):
-        for token_id, bias in row.parameters.logit_bias:
-            index = int(token_id)
-            if 0 <= index < vocab:
-                bias_indexes.append(row_index * vocab + index)
-                bias_values.append(float(bias))
-    if bias_indexes:
-        work.reshape(-1).index_put_(
-            (
-                torch.tensor(
-                    bias_indexes,
-                    dtype=torch.long,
-                    device=work.device,
-                ),
-            ),
-            torch.tensor(bias_values, dtype=work.dtype, device=work.device),
-            accumulate=True,
         )
 
     penalty_indexes: list[int] = []
@@ -7395,6 +7371,27 @@ def _shape_sampling_logits_batch(
             torch.where(torch.isneginf(values), values, adjusted),
         )
 
+    bias_indexes: list[int] = []
+    bias_values: list[float] = []
+    for row_index, row in enumerate(rows):
+        for token_id, bias in row.parameters.logit_bias:
+            index = int(token_id)
+            if 0 <= index < vocab:
+                bias_indexes.append(row_index * vocab + index)
+                bias_values.append(float(bias))
+    if bias_indexes:
+        work.reshape(-1).index_put_(
+            (
+                torch.tensor(
+                    bias_indexes,
+                    dtype=torch.long,
+                    device=work.device,
+                ),
+            ),
+            torch.tensor(bias_values, dtype=work.dtype, device=work.device),
+            accumulate=True,
+        )
+
     parameter_values = torch.tensor(
         [
             (
@@ -7414,15 +7411,6 @@ def _shape_sampling_logits_batch(
         torch.ones((), dtype=work.dtype, device=work.device),
     )
     work.div_(divisors.unsqueeze(1))
-
-    min_p_rows = tuple(index for index, row in enumerate(rows) if float(row.parameters.min_p) > 0.0)
-    if min_p_rows:
-        indexes = torch.tensor(min_p_rows, dtype=torch.long, device=work.device)
-        subset = work.index_select(0, indexes)
-        min_p = parameter_values.index_select(0, indexes)[:, 1]
-        min_threshold = subset.max(dim=-1).values + torch.log(min_p)
-        subset.masked_fill_(subset < min_threshold.unsqueeze(1), float("-inf"))
-        work.index_copy_(0, indexes, subset)
 
     top_k_groups: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(rows):
@@ -7486,6 +7474,43 @@ def _shape_sampling_logits_batch(
         truncated = torch.full_like(subset, float("-inf"))
         truncated.scatter_(1, token_indexes, ordered)
         work.index_copy_(0, indexes, truncated)
+
+    min_p_rows = tuple(index for index, row in enumerate(rows) if float(row.parameters.min_p) > 0.0)
+    if min_p_rows:
+        indexes = torch.tensor(min_p_rows, dtype=torch.long, device=work.device)
+        subset = work.index_select(0, indexes)
+        min_p = parameter_values.index_select(0, indexes)[:, 1]
+        min_threshold = subset.max(dim=-1).values + torch.log(min_p)
+        subset.masked_fill_(subset < min_threshold.unsqueeze(1), float("-inf"))
+        work.index_copy_(0, indexes, subset)
+
+    typical_rows = tuple(
+        index for index, row in enumerate(rows) if float(row.parameters.typical_p) < 1.0
+    )
+    if typical_rows:
+        indexes = torch.tensor(typical_rows, dtype=torch.long, device=work.device)
+        subset = work.index_select(0, indexes)
+        typical_p = torch.tensor(
+            [float(rows[index].parameters.typical_p) for index in typical_rows],
+            dtype=work.dtype,
+            device=work.device,
+        )
+        probs = torch.softmax(subset, dim=-1)
+        log_probs = probs.log()
+        entropy = -(probs * log_probs).nan_to_num(0.0).sum(dim=-1, keepdim=True)
+        scores = ((-log_probs) - entropy).abs()
+        order = torch.argsort(scores, dim=-1)
+        cumulative = probs.gather(1, order).cumsum(dim=-1)
+        over = cumulative >= typical_p.unsqueeze(1)
+        drop = torch.cat(
+            (
+                torch.zeros((len(typical_rows), 1), dtype=torch.bool, device=work.device),
+                over[:, :-1],
+            ),
+            dim=1,
+        )
+        subset.scatter_(1, order, subset.gather(1, order).masked_fill(drop, float("-inf")))
+        work.index_copy_(0, indexes, subset)
 
     valid = (
         ~torch.isnan(work).any(dim=-1)

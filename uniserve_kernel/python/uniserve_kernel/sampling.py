@@ -75,6 +75,10 @@ def _sample_top_k_tensor(
         dim=-1,
         sorted=True,
     )
+    cumulative = torch.softmax(candidates, dim=-1).cumsum(dim=-1)
+    over = cumulative > parameters[:, 1].unsqueeze(1)
+    drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
+    candidates = torch.where(drop, float("-inf"), candidates)
     min_p = parameters[:, 2]
     min_threshold = candidates[:, 0] + torch.log(min_p)
     candidates = torch.where(
@@ -82,10 +86,6 @@ def _sample_top_k_tensor(
         candidates,
         float("-inf"),
     )
-    cumulative = torch.softmax(candidates, dim=-1).cumsum(dim=-1)
-    over = cumulative > parameters[:, 1].unsqueeze(1)
-    drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
-    candidates = torch.where(drop, float("-inf"), candidates)
     probabilities = torch.softmax(candidates, dim=-1)
     token_order = torch.argsort(token_indexes, dim=-1)
     ordered_probabilities = probabilities.gather(1, token_order)

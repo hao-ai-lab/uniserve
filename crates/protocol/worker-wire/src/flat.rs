@@ -836,6 +836,11 @@ fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> anyhow::Result<Samp
             .logprob_token_ids()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
+        typical_p: sampling.typical_p(),
+        forced_token_ids: sampling
+            .forced_token_ids()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
     };
     validate_sampling(&sampling)?;
     Ok(sampling)
@@ -2403,6 +2408,8 @@ fn sampling_to_fb(sampling: &SamplingParams) -> anyhow::Result<fbs::SamplingPara
         return_prompt_logprobs: sampling.return_prompt_logprobs,
         n_prompt_logprobs: sampling.n_prompt_logprobs,
         logprob_token_ids: Some(sampling.logprob_token_ids.clone()),
+        typical_p: sampling.typical_p,
+        forced_token_ids: Some(sampling.forced_token_ids.clone()),
     })
 }
 
@@ -2438,6 +2445,8 @@ fn sampling_from_fb(sampling: fbs::SamplingParamsT) -> anyhow::Result<SamplingPa
         return_prompt_logprobs: sampling.return_prompt_logprobs,
         n_prompt_logprobs: sampling.n_prompt_logprobs,
         logprob_token_ids: sampling.logprob_token_ids.unwrap_or_default(),
+        typical_p: sampling.typical_p,
+        forced_token_ids: sampling.forced_token_ids.unwrap_or_default(),
     };
     validate_sampling(&sampling)?;
     Ok(sampling)
@@ -2457,6 +2466,10 @@ fn validate_sampling(sampling: &SamplingParams) -> anyhow::Result<()> {
     for (_, value) in &sampling.logit_bias {
         anyhow::ensure!(value.is_finite(), "logit bias must be finite");
     }
+    anyhow::ensure!(
+        sampling.typical_p.is_finite() && sampling.typical_p > 0.0 && sampling.typical_p <= 1.0,
+        "sampling.typical_p must be in (0, 1]"
+    );
     Ok(())
 }
 
