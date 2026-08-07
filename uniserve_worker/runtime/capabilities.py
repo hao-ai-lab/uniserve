@@ -34,11 +34,6 @@ from ..spec import (
 from .latent_capacity import latent_store_capacity_bytes
 from .product_capacity import device_product_arena_bytes
 
-# KV, latent, and scratch residency hold committed request state across the
-# operation boundary, so a route sharing them advances state in place and is not
-# safe to preempt.
-_STATEFUL_RESOURCE_CLASSES = frozenset({"kv_block", "image_latent", "scratch"})
-
 # Sampler-processor, RNG-layout, and processor-order constants mirroring the
 # worker-wire capability constants byte-for-byte. The full sampler-processor set
 # is the fourteen bits of the canonical processor order; the legal-continuation
@@ -204,9 +199,11 @@ def resolve_capabilities(
     # acceptance window is a single verified point.
     max_speculative_points = 2 if WorkVariant.DRAFT in supported_work else 1
     tensorized_mixed = _route_tensorized_mixed(spec, primary_by_variant)
-    # A route holding paged KV, latent, or scratch residency advances committed
-    # request state in place and is not safe to preempt mid-operation.
-    preemptible = not _STATEFUL_RESOURCE_CLASSES.intersection(resources.classes())
+    # Preemption is not a configured serving capability: every route advertises
+    # a non-preemptible checkpoint scope, and the scheduler treats a resident
+    # request as non-preemptible. Snapshot export and restore are administrative
+    # operations outside steady-state request execution.
+    preemptible = False
     # Sampling reduces full-vocabulary logits on one designated rank; no route
     # declares a deterministically sharded sampler.
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK

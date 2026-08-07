@@ -1931,14 +1931,7 @@ impl Scheduler {
 
     fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
         let downsample = (self.caps.latent_downsample as u64).max(1);
-        let (height, width) = if st.has_context_images()
-            && st.image_gen.image_hw.0 > 0
-            && st.image_gen.image_hw.1 > 0
-        {
-            (st.image_gen.image_hw.0, st.image_gen.image_hw.1)
-        } else {
-            (st.req.image.height, st.req.image.width)
-        };
+        let (height, width) = (st.req.image.height, st.req.image.width);
         ceil_div_u64((height as u64).max(1), downsample)
             * ceil_div_u64((width as u64).max(1), downsample)
     }

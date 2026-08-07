@@ -69,8 +69,9 @@ TRANSPORTS = tuple(kind.value for kind in TransportKind)
 class Locator:
     """Compact, wire-ready reference into a registered region.
 
-    Carried opaquely by the control plane (producer ``SeqResult`` → host →
-    consumer ``ForwardOp``) and resolved only by the consumer's transport.
+    Carried opaquely as an exact generation-tagged product reference from the
+    producing operation, through the control plane, to the consuming operation,
+    and resolved only by the consumer's transport.
     """
 
     transport: str

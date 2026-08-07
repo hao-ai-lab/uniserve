@@ -105,6 +105,17 @@ def test_capability_wire_carries_the_agreement_digests_and_work_shape():
     assert wire["route_capability_digest"] == _recompute_route_digest(wire)
 
 
+def test_every_route_advertises_preemption_unsupported():
+    # Preemption is not a configured serving capability: every advertised route
+    # declares a non-preemptible checkpoint scope regardless of its residency
+    # classes, matching the unsupported-preemption declaration.
+    worker = execution_worker()
+    wire = dispatch(worker, {"kind": "get_capabilities"})["capabilities"]
+    routes = wire["execution_constraints"]["route_capabilities"]
+    assert routes, "worker advertises at least one route capability"
+    assert all(capability["preemptible"] is False for capability in routes)
+
+
 def test_capability_wire_round_trips_and_recomputes_stable_digests():
     worker = execution_worker()
     caps = worker.contract.capabilities

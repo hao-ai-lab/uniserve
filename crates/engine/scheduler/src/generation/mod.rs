@@ -478,7 +478,6 @@ impl GenerationCursor {
                 branch_pending: false,
                 cond_pos: 0,
                 steps_done: 0,
-                image_hw: (0, 0),
                 conditioning: None,
                 latent: None,
             },
@@ -767,7 +766,6 @@ pub struct GenCursor {
     pub(crate) branch_pending: bool,
     pub(crate) cond_pos: u32,
     pub(crate) steps_done: u16,
-    pub(crate) image_hw: (u32, u32),
     /// The published KV product a denoise op conditions on, captured from the
     /// producing operation's completion products.
     pub(crate) conditioning: Option<ProductRef>,
