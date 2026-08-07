@@ -1,7 +1,7 @@
 """Portable torch SDPA attention backend."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -60,9 +60,16 @@ class TorchSDPAAttentionBackend:
         scale: float,
         context: ForwardContext | None = None,
     ) -> torch.Tensor:
-        del context
+        plan = None if context is None else context.attention
+        base_lens = getattr(plan, "cache_seqlens_cpu", None)
+        if base_lens is None:
+            raise ValueError(
+                "torch_sdpa paged decode requires a plan carrying host-known "
+                "cache_seqlens_cpu instead of a device cache-length tensor"
+            )
+        del cache_seqlens
+        lengths = tuple(int(value) for value in base_lens)
         q_rows, restore = _paged_query_rows(q, int(block_table.shape[0]))
-        lengths = _integer_values(cache_seqlens, "cache sequence lengths")
         if len(lengths) != len(q_rows):
             raise ValueError("paged query rows do not match cache sequence lengths")
         current_k = current_v = None
@@ -115,12 +122,26 @@ class TorchSDPAAttentionBackend:
         block_table: torch.Tensor | None = None,
         context: ForwardContext | None = None,
     ) -> torch.Tensor:
-        del max_seqlen_q, max_seqlen_k, context
+        del max_seqlen_q, max_seqlen_k
         if q.ndim != 3:
             raise ValueError("portable varlen attention expects packed [tokens, heads, dim] queries")
-        q_offsets = _validated_offsets(cu_seqlens_q, int(q.shape[0]), "query")
-        k_limit = int(k.shape[0]) if block_table is None else None
-        k_offsets = _validated_offsets(cu_seqlens_k, k_limit, "key")
+        if block_table is not None:
+            # Paged varlen carries a PagedVarlenPlan whose host-mirrored per-row
+            # query/key lengths give the packed offsets without reading the
+            # device ``cu_seqlens`` tensors back to the host.
+            plan = None if context is None else context.attention
+            query_lens = getattr(plan, "query_lens_cpu", None)
+            kv_lens = getattr(plan, "kv_seqlens_cpu", None)
+            if query_lens is None or kv_lens is None:
+                raise ValueError(
+                    "torch_sdpa paged varlen requires a plan carrying host-known "
+                    "query_lens_cpu and kv_seqlens_cpu"
+                )
+            q_offsets = _offsets_from_lengths(query_lens)
+            k_offsets = _offsets_from_lengths(kv_lens)
+        else:
+            q_offsets = _validated_offsets(cu_seqlens_q, int(q.shape[0]), "query")
+            k_offsets = _validated_offsets(cu_seqlens_k, int(k.shape[0]), "key")
         if len(q_offsets) != len(k_offsets):
             raise ValueError("query and key varlen metadata have different row counts")
         if block_table is not None and int(block_table.shape[0]) != len(q_offsets) - 1:
@@ -330,6 +351,15 @@ def _integer_values(value: torch.Tensor, name: str) -> tuple[int, ...]:
     return tuple(int(item) for item in value.detach().to(device="cpu").tolist())
 
 
+def _offsets_from_lengths(lengths: Sequence[int]) -> tuple[int, ...]:
+    """Cumulative packed offsets ``[0, l0, l0+l1, ...]`` from host segment lengths."""
+
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + int(length))
+    return tuple(offsets)
+
+
 def _validated_offsets(
     value: torch.Tensor,
     terminal: int | None,
@@ -402,10 +432,12 @@ def _read_paged_row(cache: torch.Tensor, pages: torch.Tensor, length: int) -> to
     page_size = int(cache.shape[1])
     page_count = (length + page_size - 1) // page_size
     page_ids = pages[:page_count].to(device=cache.device, dtype=torch.int64)
-    if int(page_ids.numel()) != page_count or bool((page_ids < 0).any()) or bool(
-        (page_ids >= cache.shape[0]).any()
-    ):
+    if int(page_ids.numel()) != page_count:
         raise ValueError("page table does not cover the requested cache length")
+    # Physical page ids are validated host-side when the page table is
+    # registered, so no on-device bound check is taken here; an out-of-range id
+    # surfaces as a CUDA index error from ``index_select`` (mirroring the
+    # fa4_cute append path) rather than a per-read device-to-host sync.
     return cache.index_select(0, page_ids).reshape(-1, cache.shape[2], cache.shape[3])[:length]
 
 
@@ -417,12 +449,20 @@ def _write_paged_row(
 ) -> None:
     if values.ndim != 3 or values.shape[1:] != cache.shape[2:]:
         raise ValueError("paged cache write geometry does not match cache storage")
-    for offset in range(int(values.shape[0])):
-        position = start + offset
-        logical_page, page_offset = divmod(position, int(cache.shape[1]))
-        if logical_page >= int(pages.numel()):
-            raise ValueError("page table does not cover the paged cache write")
-        page = int(pages[logical_page].item())
-        if page < 0 or page >= int(cache.shape[0]):
-            raise ValueError("paged cache write references an invalid page")
-        cache[page, page_offset].copy_(values[offset])
+    count = int(values.shape[0])
+    if count == 0:
+        return
+    page_size = int(cache.shape[1])
+    if start + count > int(pages.numel()) * page_size:
+        raise ValueError("page table does not cover the paged cache write")
+    # Vectorized on-device scatter: destination pages and offsets are derived
+    # from the host-known ``start``/``count`` and gathered from the page table,
+    # so the write incurs no per-token ``.item()`` sync. Physical page ids are
+    # host-validated at registration (see ``_read_paged_row``).
+    positions = start + torch.arange(count, device=cache.device, dtype=torch.int64)
+    logical = positions // page_size
+    offsets = positions % page_size
+    page_ids = pages.to(device=cache.device, dtype=torch.int64).index_select(0, logical)
+    flat = page_ids * page_size + offsets
+    source = values if values.dtype == cache.dtype else values.to(cache.dtype)
+    cache.view(-1, cache.shape[2], cache.shape[3]).index_copy_(0, flat, source.contiguous())

@@ -30,12 +30,18 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
+    DeviceDim,
+    DType,
     ErrorCode,
     GenAdmission,
     ImageParams,
     OpStatus,
+    PointRange,
     ProductKind,
+    ProductRef,
     Release,
+    ShapeBound,
+    StorageClass,
     TokenMode,
     WorkVariant,
 )
@@ -50,6 +56,8 @@ from uniserve_worker.forward import (
     PagedDecodePlan,
     TokenRow,
 )
+from uniserve_worker.foundation.errors import ErrorCode as HostErrorCode
+from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.completion_store import CompletionArena
 from uniserve_worker.runtime.transfer import TRANSFER_DESCRIPTOR_PREFIX
 from uniserve_worker.server.stub import _next_token
@@ -139,6 +147,28 @@ class _RetainedImageStateModel(_ObservedModel):
             for operation in self.spec.operations
         )
         self.spec = replace(self.spec, operations=operations, inputs=inputs)
+
+
+class _SupersetMixedModel(_ObservedModel):
+    """Declares its token/flow route mixing a strict superset of the admitted
+    row kinds, so a plain token+flow submission is a subset that is not itself a
+    declared combination."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        routes = tuple(
+            replace(
+                route,
+                row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW, RouteRowKind.ENCODE),
+                mixed_combinations=(
+                    (RouteRowKind.TOKEN, RouteRowKind.FLOW, RouteRowKind.ENCODE),
+                ),
+            )
+            if route.name == "stub"
+            else route
+            for route in self.spec.routes
+        )
+        self.spec = replace(self.spec, routes=routes)
 
 
 def _publish_conditioning(worker: object, admission: Admission, *, op_id: int, step_id: int):
@@ -360,6 +390,48 @@ def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
     assert len(mixed_model.calls) == 1
     assert set(mixed_model.calls[0][1]) == {"TokenRow", "FlowRow"}
     assert len(split_model.calls) == 2
+
+
+def test_undeclared_tensorized_mixed_combination_is_rejected():
+    worker = execution_worker(_SupersetMixedModel())
+    token_admission = und_admission(1, block_ids=(0,))
+    flow_admission = gen_admission(2, ImageParams(steps=1, height=16, width=16, seed=29))
+    token, token_input = token_operation(
+        token_admission.request_key,
+        op_id=11,
+        parent=root_parent(token_admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    conditioning = ProductRef(
+        request_key=flow_admission.request_key,
+        producer_op_id=1,
+        output_index=0,
+        generation=1,
+        kind=ProductKind.KV,
+        storage_class=StorageClass.PAGED_KV,
+        dtype=DType.U8,
+        shape_bound=ShapeBound((DeviceDim(1 << 20),)),
+        point_range=PointRange(),
+    )
+    transition, _latent = gen_transition_operation(
+        flow_admission.request_key,
+        op_id=11,
+        parent=root_parent(flow_admission),
+        conditioning=conditioning,
+    )
+
+    with pytest.raises(WorkerError) as rejected:
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                admissions=(token_admission,),
+                operations=(token, transition),
+                input_products=(token_input,),
+            )
+        )
+
+    assert rejected.value.code is HostErrorCode.INVALID_DESCRIPTOR
 
 
 def test_request_scoped_operation_identity_preserves_homogeneous_decode():

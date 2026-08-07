@@ -46,6 +46,7 @@ def _recompute_route_digest(wire: dict) -> str:
         wire["max_vision_feature_bytes"],
         wire["execution_constraints"]["max_batch_operations"],
         wire["execution_constraints"]["max_speculative_points"],
+        wire["execution_constraints"]["max_unresolved_window"],
         wire["execution_constraints"]["device_sequence_lengths"],
         wire["execution_constraints"]["device_append_offsets"],
         wire["execution_constraints"]["incremental_kv_publication"],

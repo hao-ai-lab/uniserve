@@ -31,12 +31,13 @@ class TopK(nn.Module):
 
 
 class FusedMoE(nn.Module):
-    """Reference per-expert masked-loop MoE dispatch.
+    """Reference per-expert dense-masked MoE dispatch.
 
     Despite the name, this performs no kernel fusion or token grouping: it loops
-    over experts, gathers each expert's routed tokens via a boolean mask, and
-    accumulates the weighted expert outputs back into place. It is the
-    deterministic correctness floor that model code builds on.
+    over experts, evaluates each expert on every token, and accumulates the
+    outputs scaled by a per-token routing gate that is zero wherever the router
+    did not select that expert. It is the deterministic correctness floor that
+    model code builds on.
     """
 
     def __init__(
@@ -63,10 +64,10 @@ class FusedMoE(nn.Module):
         weights = weights.to(flat.dtype)
         out = torch.zeros_like(flat)
         for expert_idx, expert in enumerate(self.experts):
-            hits = expert_ids == expert_idx
-            if not hits.any():
-                continue
-            token_idx, kth = hits.nonzero(as_tuple=True)
-            expert_out = expert(flat[token_idx], mesh)
-            out[token_idx] += expert_out * weights[token_idx, kth].unsqueeze(-1).to(expert_out.dtype)
+            # Per-token gate for this expert: the routed weight where the router
+            # selected it, zero everywhere else. Selection is one-hot across the
+            # top-k axis, so the masked sum recovers exactly that weight.
+            gate = (weights * (expert_ids == expert_idx)).sum(dim=-1)
+            expert_out = expert(flat, mesh)
+            out += expert_out * gate.unsqueeze(-1).to(expert_out.dtype)
         return out.reshape(original_shape)

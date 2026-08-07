@@ -257,9 +257,9 @@ class _VisionModel(nn.Module):
         pixels: torch.Tensor,
         grid: torch.Tensor,
         *,
-        grid_hint: tuple[int, int] | None = None,
+        grid_shapes: tuple[tuple[int, int], ...] | None = None,
     ) -> torch.Tensor:
-        return self.embeddings(pixels, grid, grid_hint=grid_hint)
+        return self.embeddings(pixels, grid, grid_shapes=grid_shapes)
 
 
 class _SenseAttention(nn.Module):
@@ -887,14 +887,17 @@ class NEOChatModel(nn.Module):
         local_grids = context.mesh.dispatch(grids, "tower", _FLOW_COORDINATE)
         tower = self.fm_modules["vision_model_mot_gen"]
         feature_dtype = next(tower.parameters()).dtype
-        # All flow rows in one forward share an image size (CFG branches of one
-        # image), so the vision patch grid (height/patch, width/patch) is known
-        # on the host. Passing it lets the tower avoid reading the grid tensor
-        # back to the host, keeping the flow forward capturable in a CUDA graph.
+        # Each flow row's image patch grid (height/patch, width/patch) is known
+        # on the host from its registered image size. Passing the per-row grids
+        # lets the tower resolve the conv geometry without reading the grid
+        # tensor back, keeping the flow forward capturable in a CUDA graph.
         patch = self._patch_size
-        hints = {(int(row.image_height) // patch, int(row.image_width) // patch) for row in rows}
-        grid_hint = next(iter(hints)) if len(hints) == 1 else None
-        features = tower(local_pixels.to(dtype=feature_dtype), local_grids, grid_hint=grid_hint)
+        grid_shapes = tuple(
+            (int(row.image_height) // patch, int(row.image_width) // patch) for row in rows
+        )
+        features = tower(
+            local_pixels.to(dtype=feature_dtype), local_grids, grid_shapes=grid_shapes
+        )
         if not isinstance(features, torch.Tensor):
             raise TypeError("SenseNova flow vision tower must return a tensor")
         features = context.mesh.combine(
@@ -1153,7 +1156,8 @@ class NEOChatModel(nn.Module):
             tuple(cast(PatchInput, row.inputs).grid for row in rows),
             dim=0,
         )
-        features = self.vision_model(pixels, grids)
+        grid_shapes = tuple(cast(PatchInput, row.inputs).grid_shape for row in rows)
+        features = self.vision_model(pixels, grids, grid_shapes=grid_shapes)
         factor = max(
             1,
             int(round(1 / self._downsample_ratio)),

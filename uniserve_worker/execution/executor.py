@@ -187,7 +187,6 @@ from uniserve_worker.runtime.transfer import (
     Transport,
     decode_transfer_descriptor,
     encode_transfer_descriptor,
-    fetch_locator,
 )
 from uniserve_worker.spec import (
     DeploymentOverlay,
@@ -2516,7 +2515,7 @@ class ModelExecutor:
             route = self._routes[next(iter(model_routes))]
             row_kinds = frozenset(stage.row for stage in primary_stages)
             if not any(
-                row_kinds <= frozenset(combination) for combination in route.mixed_combinations
+                row_kinds == frozenset(combination) for combination in route.mixed_combinations
             ):
                 raise invalid_descriptor(
                     "tensorized mixed submission is outside the route capability proof"
@@ -6033,7 +6032,7 @@ class ModelExecutor:
     ) -> str:
         if self.transport is None:
             raise capability_mismatch("tensor publication requires a configured transport")
-        locator = self.transport.publish(value.detach().contiguous())
+        locator = self.transport.publish_async(value.detach().contiguous())
         metadata: dict[str, object] = {"payload_kind": payload_kind}
         if height > 0 and width > 0:
             metadata.update({"height": int(height), "width": int(width)})
@@ -6083,11 +6082,15 @@ class ModelExecutor:
                     "value_range": payload.value_range.value,
                 }
             if record.locator and self.transport is not None:
-                locator = Locator.from_wire_json(record.locator)
-                value = fetch_locator(self.transport, locator)
-                if not isinstance(value, torch.Tensor):
+                transfer = scope.prepared_transfers.get(reference)
+                if transfer is None or not transfer.ready():
+                    raise capability_mismatch(
+                        "cross-stage product transfer has no query-ready prepared ticket"
+                    )
+                tensors = transfer.tensors()
+                if not tensors or not isinstance(tensors[0], torch.Tensor):
                     raise invalid_descriptor("product transport returned a non-tensor value")
-                return value, locator.meta
+                return tensors[0], Locator.from_wire_json(record.locator).meta
         raise invalid_descriptor("transfer product is not resident or transport-addressable")
 
 

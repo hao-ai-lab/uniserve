@@ -19,7 +19,7 @@ from ..batch import (
     StorageClass,
     VersionRef,
 )
-from ..foundation.errors import invalid_descriptor
+from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.sizing import bucketed_page_count, ceil_div
 from .host_staging import (
     TensorStagingSlot,
@@ -1517,7 +1517,6 @@ class KvStore:
         expected_locators = 2 * self.pool.num_layers if suffix else 0
         if len(snapshot.locators) != expected_locators:
             raise invalid_descriptor("published KV locator count does not match cache layers")
-        from .transfer import Locator, fetch_locator
 
         with self._lock:
             resident = self.get(session_id)
@@ -1539,23 +1538,23 @@ class KvStore:
             if resident.scale_identity != snapshot.scale_identity:
                 raise invalid_descriptor("KV installation scale identity does not match base")
 
-        if transferred_tensors is not None and len(transferred_tensors) != len(snapshot.locators):
+        if transferred_tensors is None:
+            if getattr(transport, "blocking_fetch", False):
+                raise capability_mismatch(
+                    "installing a published KV over a blocking transport requires prepared "
+                    "transfer tensors"
+                )
+            from .transfer import Locator, fetch_locator
+
+            transferred_tensors = tuple(
+                fetch_locator(transport, Locator.from_wire_json(raw)) for raw in snapshot.locators
+            )
+        if len(transferred_tensors) != len(snapshot.locators):
             raise invalid_descriptor("prepared KV transfer tensor count does not match locators")
         tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in range(self.pool.num_layers):
-            key = (
-                fetch_locator(transport, Locator.from_wire_json(snapshot.locators[2 * layer]))
-                if transferred_tensors is None
-                else transferred_tensors[2 * layer]
-            )
-            value = (
-                fetch_locator(
-                    transport,
-                    Locator.from_wire_json(snapshot.locators[2 * layer + 1]),
-                )
-                if transferred_tensors is None
-                else transferred_tensors[2 * layer + 1]
-            )
+            key = transferred_tensors[2 * layer]
+            value = transferred_tensors[2 * layer + 1]
             expected = (suffix, self.pool.n_kv, self.pool.head_dim)
             if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
                 raise invalid_descriptor("published KV transport returned a non-tensor value")

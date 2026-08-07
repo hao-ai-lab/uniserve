@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from ..batch import SamplingOwnership
+from collections.abc import Sequence
+
+from ..batch import SamplingOwnership, WorkVariant
 from ..capabilities import (
     CreditVector,
     EngineCaps,
@@ -14,16 +16,97 @@ from ..capabilities import (
     RouteExecutionCapability,
     configured_work_variants,
 )
+from ..foundation.errors import invalid_descriptor
 from ..foundation.runtime_config import (
     graph_memory_budget_bytes,
     graph_padding_block_count,
 )
 from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
-from ..spec import DeploymentOverlay, ModelSpec, active_latent_capacity_tokens
+from ..spec import (
+    DeploymentOverlay,
+    ModelSpec,
+    OperationStagePurpose,
+    OperationStageSpec,
+    RouteRowKind,
+    active_latent_capacity_tokens,
+)
 from .latent_capacity import latent_store_capacity_bytes
 from .product_capacity import device_product_arena_bytes
 
-__all__ = ["resolve_capabilities"]
+# KV, latent, and scratch residency hold committed request state across the
+# operation boundary, so a route sharing them advances state in place and is not
+# safe to preempt.
+_STATEFUL_RESOURCE_CLASSES = frozenset({"kv_block", "image_latent", "scratch"})
+
+__all__ = ["prove_depth_one_lowering", "resolve_capabilities"]
+
+
+def prove_depth_one_lowering(
+    spec: ModelSpec,
+    supported_work: Sequence[WorkVariant],
+) -> dict[WorkVariant, OperationStageSpec | None]:
+    """Prove every advertised work variant lowers to one declared model route.
+
+    Each admitted variant resolves through the single primary stage of its
+    ``OperationSpec`` to one ``RouteSpec`` the model declares. A stage-less
+    system-only operation, and a materialization that carries no neural primary
+    stage, lower to no route — the same model-free frame lowering the executor
+    performs in ``_operation_stages_for`` — and map to ``None`` rather than
+    failing. Admission fails deterministically when a variant names no
+    operation, a variant declares
+    more than one primary stage (which would break one-variant-to-one-route), or
+    a primary stage names a route the model does not declare.
+    """
+
+    route_names = {route.name for route in spec.routes}
+    primary_by_variant: dict[WorkVariant, OperationStageSpec | None] = {}
+    for variant in supported_work:
+        operation = spec.operation(variant)
+        primaries = tuple(
+            stage
+            for stage in operation.stages
+            if stage.purpose is OperationStagePurpose.PRIMARY
+        )
+        if len(primaries) > 1:
+            raise invalid_descriptor(
+                f"work variant {variant.value!r} declares multiple primary stages, "
+                "breaking one-variant-to-one-route lowering"
+            )
+        if not primaries:
+            # A variant with no primary neural stage lowers onto no compute
+            # route: transfer and KV state-publication ops carry only STATE
+            # stages, a materialized frame is model-free, and system ops are
+            # stage-less. They map to no route rather than failing.
+            primary_by_variant[variant] = None
+            continue
+        stage = primaries[0]
+        if stage.route not in route_names:
+            raise invalid_descriptor(
+                f"work variant {variant.value!r} lowers onto undeclared route {stage.route!r}"
+            )
+        primary_by_variant[variant] = stage
+    return primary_by_variant
+
+
+def _route_tensorized_mixed(
+    spec: ModelSpec,
+    primary_by_variant: dict[WorkVariant, OperationStageSpec | None],
+) -> bool:
+    """Whether any declared route admits a mixed row combination reachable by the
+    admitted work: every row kind of a declared combination must be produced by a
+    primary stage the advertised variants lower onto."""
+
+    primary_rows: dict[str, set[RouteRowKind]] = {}
+    for stage in primary_by_variant.values():
+        if stage is not None:
+            primary_rows.setdefault(stage.route, set()).add(stage.row)
+    return any(
+        any(
+            set(combination) <= primary_rows.get(route.name, set())
+            for combination in route.mixed_combinations
+        )
+        for route in spec.routes
+    )
 
 
 def resolve_capabilities(
@@ -100,6 +183,20 @@ def resolve_capabilities(
     supported_work = configured_work_variants(
         operation.kind for operation in spec.operations
     )
+    # Startup lowering proof: every advertised variant must reduce to one
+    # declared route via its primary stage before the capability is published.
+    primary_by_variant = prove_depth_one_lowering(spec, supported_work)
+    # Speculative acceptance needs an advertised drafter; a serving route
+    # advertises none (DRAFT carries no depth-one route), so the declared
+    # acceptance window is a single verified point.
+    max_speculative_points = 2 if WorkVariant.DRAFT in supported_work else 1
+    tensorized_mixed = _route_tensorized_mixed(spec, primary_by_variant)
+    # A route holding paged KV, latent, or scratch residency advances committed
+    # request state in place and is not safe to preempt mid-operation.
+    preemptible = not _STATEFUL_RESOURCE_CLASSES.intersection(resources.classes())
+    # Sampling reduces full-vocabulary logits on one designated rank; no route
+    # declares a deterministically sharded sampler.
+    sampling_ownership = SamplingOwnership.DESIGNATED_RANK
     return EngineCaps(
         block_size=int(deployment.block_size),
         num_blocks=int(capacity.num_blocks),
@@ -112,7 +209,8 @@ def resolve_capabilities(
         supported_controls=tuple(controls),
         execution_constraints=ExecutionConstraints(
             max_batch_operations=int(deployment.max_batch_operations),
-            max_speculative_points=1,
+            max_speculative_points=max_speculative_points,
+            max_unresolved_window=int(credit_limits.per_request.registered_operations),
             device_sequence_lengths=True,
             device_append_offsets=True,
             incremental_kv_publication=True,
@@ -120,9 +218,9 @@ def resolve_capabilities(
                 RouteExecutionCapability(
                     route=0,
                     supported_work=supported_work,
-                    tensorized_mixed=any(bool(route.mixed_combinations) for route in spec.routes),
-                    sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
-                    preemptible=False,
+                    tensorized_mixed=tensorized_mixed,
+                    sampling_ownership=sampling_ownership,
+                    preemptible=preemptible,
                     credits=credit_limits,
                 ),
             ),

@@ -281,6 +281,7 @@ def test_route_capability_digest_matches_rust() -> None:
             sample["max_vision_feature_bytes"],
             sample["max_batch_operations"],
             sample["max_speculative_points"],
+            sample["max_unresolved_window"],
             sample["device_sequence_lengths"],
             sample["device_append_offsets"],
             sample["incremental_kv_publication"],

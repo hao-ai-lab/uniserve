@@ -478,6 +478,9 @@ class FlashInferAttentionBackend(_WrapperPool):
             cu_seqlens_q,
             kv_seqlens,
             int(k.shape[1]),
+            index_count=_indptr_last(
+                _cpu_paged_indptr(plan, int(kv_seqlens.shape[0]), int(k.shape[1]))
+            ),
         )
         self._plan_prefill_wrapper(
             wrapper_key,
@@ -606,6 +609,7 @@ class FlashInferAttentionBackend(_WrapperPool):
             cu_seqlens_q,
             kv_seqlens,
             int(page_size),
+            index_count=_indptr_last(_cpu_paged_indptr(plan, batch_size, int(page_size))),
         )
         self._plan_prefill_wrapper(
             wrapper_key,
@@ -970,6 +974,8 @@ class FlashInferAttentionBackend(_WrapperPool):
         cu_seqlens_q: torch.Tensor,
         kv_seqlens: torch.Tensor,
         page_size: int,
+        *,
+        index_count: int | None,
     ) -> _PrefillPlanTensors:
         batch_size = int(kv_seqlens.shape[0])
         max_indices = max(1, int(block_table.numel()))
@@ -986,7 +992,8 @@ class FlashInferAttentionBackend(_WrapperPool):
             int(page_size),
             workspace,
         ):
-            count = max(1, min(max_indices, int(workspace.kv_indptr[batch_size].item())))
+            count = int(index_count) if index_count is not None else max_indices
+            count = max(1, min(count, int(workspace.indices.numel())))
             return _PrefillPlanTensors(
                 workspace.qo_indptr[: batch_size + 1],
                 workspace.kv_indptr[: batch_size + 1],

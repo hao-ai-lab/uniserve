@@ -347,7 +347,11 @@ class _BagelGraph(nn.Module):
         packed_pos_ids = pos_ids.repeat(batch)
         vit_out = self.vit_model(
             patches,
-            {"position_ids": packed_pos_ids, "cu_seqlens": cu_seqlens},
+            {
+                "position_ids": packed_pos_ids,
+                "cu_seqlens": cu_seqlens,
+                "seq_lens": (tokens_per_image,) * batch,
+            },
             context,
         )
         emb = self.connector(vit_out) + self.vit_pos_embed(packed_pos_ids)

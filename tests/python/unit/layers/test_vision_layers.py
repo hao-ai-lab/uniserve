@@ -89,6 +89,12 @@ def test_vision_attention_uses_portable_fallback_when_selection_cannot_run(monke
     )
     tokens = torch.randn(3, 8)
 
-    output = attention(tokens, torch.tensor([0, 3], dtype=torch.int32), context)
+    output = attention(
+        tokens,
+        torch.tensor([0, 3], dtype=torch.int32),
+        context,
+        max_seqlen=3,
+        seq_lens=(3,),
+    )
 
     assert output.shape == tokens.shape

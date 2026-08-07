@@ -43,7 +43,7 @@ from .product_store import (
 )
 from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
-from .transfer import Locator, Transport, fetch_locator
+from .transfer import Locator, Transport, restore_durable_tensor
 
 SNAPSHOT_FORMAT_VERSION = 9
 _ASSET_PREFIX = "asset:"
@@ -249,7 +249,7 @@ class SnapshotProvider:
             if cached is not None:
                 return _ASSET_PREFIX + cached
             parsed = Locator.from_wire_json(raw)
-            value = fetch_locator(self.transport, parsed)
+            value = restore_durable_tensor(self.transport, parsed)
             if not isinstance(value, torch.Tensor):
                 raise invalid_descriptor("snapshot locator resolved to a non-tensor value")
             key = tensor(f"assets.{len(locator_assets)}", value)

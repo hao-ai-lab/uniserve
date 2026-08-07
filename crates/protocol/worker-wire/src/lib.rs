@@ -1835,6 +1835,10 @@ pub struct RouteExecutionCapability {
 pub struct ExecutionConstraints {
     pub max_batch_operations: u32,
     pub max_speculative_points: u32,
+    /// Upper bound on submitted-but-unresolved operations the worker admits per
+    /// request, making the previously implicit registration window an explicit
+    /// declared fact the scheduler bounds against.
+    pub max_unresolved_window: u32,
     pub device_sequence_lengths: bool,
     pub device_append_offsets: bool,
     pub incremental_kv_publication: bool,
@@ -1846,6 +1850,7 @@ impl Default for ExecutionConstraints {
         Self {
             max_batch_operations: 1,
             max_speculative_points: 1,
+            max_unresolved_window: 1,
             device_sequence_lengths: true,
             device_append_offsets: true,
             incremental_kv_publication: true,
@@ -1942,6 +1947,7 @@ impl EngineCaps {
         digest.u64(self.max_vision_feature_bytes);
         digest.u32(self.execution_constraints.max_batch_operations);
         digest.u32(self.execution_constraints.max_speculative_points);
+        digest.u32(self.execution_constraints.max_unresolved_window);
         digest.bool(self.execution_constraints.device_sequence_lengths);
         digest.bool(self.execution_constraints.device_append_offsets);
         digest.bool(self.execution_constraints.incremental_kv_publication);
@@ -1986,7 +1992,8 @@ impl EngineCaps {
         );
         anyhow::ensure!(
             self.execution_constraints.max_batch_operations > 0
-                && self.execution_constraints.max_speculative_points > 0,
+                && self.execution_constraints.max_speculative_points > 0
+                && self.execution_constraints.max_unresolved_window > 0,
             "worker execution constraints declare a zero bound"
         );
         anyhow::ensure!(

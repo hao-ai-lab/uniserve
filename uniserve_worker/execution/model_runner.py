@@ -466,7 +466,11 @@ def _stage_row(row: ForwardRow, device: torch.device) -> ForwardRow:
     if isinstance(row, EncodeRow):
         encode_inputs = row.inputs
         staged_encode = (
-            PatchInput(move(encode_inputs.pixels), move(encode_inputs.grid))
+            PatchInput(
+                move(encode_inputs.pixels),
+                move(encode_inputs.grid),
+                grid_shape=encode_inputs.grid_shape,
+            )
             if isinstance(encode_inputs, PatchInput)
             else TowerInput(move(encode_inputs.pixels))
         )

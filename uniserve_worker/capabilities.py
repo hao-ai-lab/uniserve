@@ -244,6 +244,7 @@ class RouteExecutionCapability:
 class ExecutionConstraints:
     max_batch_operations: int
     max_speculative_points: int
+    max_unresolved_window: int
     device_sequence_lengths: bool
     device_append_offsets: bool
     incremental_kv_publication: bool
@@ -254,6 +255,8 @@ class ExecutionConstraints:
             raise invalid_descriptor("max_batch_operations must be positive")
         if self.max_speculative_points < 1:
             raise invalid_descriptor("max_speculative_points must be positive")
+        if self.max_unresolved_window < 1:
+            raise invalid_descriptor("max_unresolved_window must be positive")
         if (
             tuple(sorted(self.route_capabilities, key=lambda capability: capability.route))
             != self.route_capabilities
@@ -374,6 +377,7 @@ class EngineCaps:
                 self.max_vision_feature_bytes,
                 self.execution_constraints.max_batch_operations,
                 self.execution_constraints.max_speculative_points,
+                self.execution_constraints.max_unresolved_window,
                 self.execution_constraints.device_sequence_lengths,
                 self.execution_constraints.device_append_offsets,
                 self.execution_constraints.incremental_kv_publication,
@@ -468,6 +472,12 @@ class EngineCaps:
                         "max_speculative_points"
                     ),
                     f"{where}.execution_constraints.max_speculative_points",
+                ),
+                max_unresolved_window=_uint(
+                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
+                        "max_unresolved_window"
+                    ),
+                    f"{where}.execution_constraints.max_unresolved_window",
                 ),
                 device_sequence_lengths=_bool(
                     _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
@@ -592,6 +602,7 @@ class EngineCaps:
             "execution_constraints": {
                 "max_batch_operations": self.execution_constraints.max_batch_operations,
                 "max_speculative_points": self.execution_constraints.max_speculative_points,
+                "max_unresolved_window": self.execution_constraints.max_unresolved_window,
                 "device_sequence_lengths": self.execution_constraints.device_sequence_lengths,
                 "device_append_offsets": self.execution_constraints.device_append_offsets,
                 "incremental_kv_publication": self.execution_constraints.incremental_kv_publication,

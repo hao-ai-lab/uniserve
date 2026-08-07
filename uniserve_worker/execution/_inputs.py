@@ -57,7 +57,11 @@ def prepare_image(
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
         return PreparedImage(
-            PatchInput(_stage(pixels, spec, device), grid.to(device=device, non_blocking=True)),
+            PatchInput(
+                _stage(pixels, spec, device),
+                grid.to(device=device, non_blocking=True),
+                grid_shape=(grid_height, grid_width),
+            ),
             height,
             width,
         )
@@ -115,7 +119,11 @@ def prepare_tensor_image(
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
         return PreparedImage(
-            PatchInput(_stage(pixels, spec, device), grid.to(device=device, non_blocking=True)),
+            PatchInput(
+                _stage(pixels, spec, device),
+                grid.to(device=device, non_blocking=True),
+                grid_shape=(grid_height, grid_width),
+            ),
             source_height,
             source_width,
         )

@@ -23,7 +23,6 @@ import json
 import pickle
 import queue
 import threading
-import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -48,6 +47,7 @@ __all__ = [
     "ShmTransport",
     "CudaIpcTransport",
     "fetch_locator",
+    "restore_durable_tensor",
     "make_transport",
     "TransportKind",
     "TRANSPORTS",
@@ -182,7 +182,24 @@ def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object], str]
 
 
 def fetch_locator(transport: "Transport", locator: Locator) -> "torch.Tensor":
-    """Resolve a live transport locator or its verified durable tensor fallback."""
+    """Resolve a live transport locator with no durable fallback.
+
+    Steady-state reads use this: they materialize the live region or surface the
+    transport's own error. The durable-snapshot fallback lives only in
+    :func:`restore_durable_tensor`, reachable only from the administrative
+    snapshot store.
+    """
+
+    return transport.fetch(locator)
+
+
+def restore_durable_tensor(transport: "Transport", locator: Locator) -> "torch.Tensor":
+    """Resolve a locator for the snapshot store, falling back to its durable copy.
+
+    The administrative snapshot/restore path uses this: it prefers the live
+    transport region and, once that region is gone, reconstructs the verified
+    durable tensor recorded in ``locator.meta['durable_snapshot']``.
+    """
 
     try:
         return transport.fetch(locator)
@@ -294,6 +311,10 @@ class Transport(ABC):
 
     name: str = "transport"
     supports_async_publication: bool = False
+    #: Whether a synchronous :meth:`fetch` observes producer completion by blocking
+    #: the calling thread. Request threads must never resolve such a transport
+    #: synchronously; they submit :meth:`fetch_async` tickets gated by :meth:`ready`.
+    blocking_fetch: bool = False
 
     def session(self) -> str:
         """This worker's transport session id (for the locator)."""
@@ -520,6 +541,37 @@ class LocalTransport(Transport):
             self._bytes.release(_nbytes(value))
 
 
+class _ShmReadTicket(TransferTicket):
+    """A shared-memory read whose readiness is query-only until the copy runs.
+
+    The consumer polls :meth:`ready`, which observes the producer's completion
+    header without waiting. Only once the region is readable — or terminally
+    unavailable — is the bounded byte copy submitted, so neither a request thread
+    nor a pool thread ever spins on a producer that has not yet completed.
+    """
+
+    def __init__(self, transport: "ShmTransport", locator: Locator) -> None:
+        self._transport = transport
+        self._locator = locator
+        self._inner: TransferTicket | None = None
+
+    def ready(self) -> bool:
+        if self._inner is None:
+            if not self._transport._read_gate(self._locator):
+                return False
+            self._inner = self._transport._reads.submit(
+                self._transport.fetch,
+                self._locator,
+                nbytes=self._locator.nbytes,
+            )
+        return self._inner.ready()
+
+    def result(self) -> "torch.Tensor":
+        if self._inner is None or not self._inner.ready():
+            raise RuntimeError("transfer ticket was observed before readiness")
+        return self._inner.result()
+
+
 class ShmTransport(Transport):
     """Same-node host transport over POSIX shared memory.
 
@@ -534,18 +586,21 @@ class ShmTransport(Transport):
 
     name = "shm"
     supports_async_publication = True
+    blocking_fetch = True
     _MAX_LIVE_SEGMENTS = 256
 
     def __init__(self, *, byte_capacity: int) -> None:
         from collections import OrderedDict
 
         self._segments: "OrderedDict[str, Any]" = OrderedDict()  # name -> SharedMemory (LRU)
-        self._pending: dict[str, tuple[Any, Any]] = {}
+        self._pending: dict[str, tuple[Any, Any, threading.Event]] = {}
         self._release_pending: set[str] = set()
         self._publication_bytes: dict[str, int] = {}
         self._lock = threading.Lock()
         self._bytes = _ByteCapacity(byte_capacity)
-        self._publication_queue: queue.Queue[tuple[str, Any, int, Any, Any] | None] = queue.Queue()
+        self._publication_queue: queue.Queue[
+            tuple[str, Any, int, Any, Any, threading.Event] | None
+        ] = queue.Queue()
         self._publication_worker = threading.Thread(
             target=self._complete_publications,
             name="uniserve-shm-publication",
@@ -562,7 +617,7 @@ class ShmTransport(Transport):
     def _complete_publications(self) -> None:
         import torch
 
-        pending: list[tuple[str, Any, int, Any, Any]] = []
+        pending: list[tuple[str, Any, int, Any, Any, threading.Event]] = []
         closing = False
         while pending or not closing:
             try:
@@ -573,8 +628,8 @@ class ShmTransport(Transport):
                     pending.append(item)
             except queue.Empty:
                 pass
-            deferred: list[tuple[str, Any, int, Any, Any]] = []
-            for name, shm, nbytes, host, event in pending:
+            deferred: list[tuple[str, Any, int, Any, Any, threading.Event]] = []
+            for name, shm, nbytes, host, event, completed in pending:
                 try:
                     ready = bool(event.query())
                 except BaseException:
@@ -583,7 +638,7 @@ class ShmTransport(Transport):
                 else:
                     succeeded = True
                 if not ready:
-                    deferred.append((name, shm, nbytes, host, event))
+                    deferred.append((name, shm, nbytes, host, event, completed))
                     continue
                 try:
                     if succeeded:
@@ -592,6 +647,7 @@ class ShmTransport(Transport):
                 except BaseException:
                     succeeded = False
                 shm.buf[0] = 1 if succeeded else 2
+                completed.set()
                 with self._lock:
                     self._pending.pop(name, None)
                     release = name in self._release_pending
@@ -674,6 +730,7 @@ class ShmTransport(Transport):
             shm.unlink()
             raise
 
+        completed = threading.Event()
         with self._lock:
             if len(self._segments) >= self._MAX_LIVE_SEGMENTS:
                 shm.close()
@@ -682,8 +739,8 @@ class ShmTransport(Transport):
                 raise resource_error("shared-memory transport publication capacity is exhausted")
             self._segments[shm.name] = shm
             self._publication_bytes[shm.name] = nbytes
-            self._pending[shm.name] = (host, event)
-        self._publication_queue.put((shm.name, shm, nbytes, host, event))
+            self._pending[shm.name] = (host, event, completed)
+        self._publication_queue.put((shm.name, shm, nbytes, host, event, completed))
         return Locator(
             transport="shm",
             session=self.name,
@@ -700,14 +757,15 @@ class ShmTransport(Transport):
 
         import torch
 
-        shm = shared_memory.SharedMemory(name=locator.handle.decode())
+        name = locator.handle.decode()
+        shm = shared_memory.SharedMemory(name=name)
         try:
             shm_buffer = shm.buf
             if shm_buffer is None:
                 raise RuntimeError("shared-memory segment has no readable buffer")
             header = int(locator.meta.get("ready_header_bytes", 0))
-            while header and shm_buffer[0] == 0:
-                time.sleep(0.0001)
+            if header and shm_buffer[0] == 0:
+                self._await_publication(name)
             if header and shm_buffer[0] != 1:
                 raise capability_mismatch("shared-memory publication did not complete")
             try:
@@ -741,8 +799,44 @@ class ShmTransport(Transport):
         finally:
             shm.close()
 
+    def _await_publication(self, name: str) -> None:
+        """Wait on the producer's completion event instead of a Python sleep loop.
+
+        A same-process consumer holds the publication's completion event and
+        blocks on it directly. A foreign-process consumer never arrives here: its
+        reads are gated by the query-only :meth:`_read_gate` before any byte copy,
+        so the header is already set by the time the copy runs.
+        """
+
+        with self._lock:
+            pending = self._pending.get(name)
+        if pending is not None:
+            pending[2].wait()
+
+    def _read_gate(self, locator: Locator) -> bool:
+        """Whether a consumer read may run now: producer complete or terminally gone.
+
+        This is the query-only readiness a consumer polls before submitting the
+        bounded byte copy. A missing segment is terminal (the copy will fail
+        deterministically), so it reports ready rather than stalling forever.
+        """
+
+        header = int(locator.meta.get("ready_header_bytes", 0))
+        if header == 0:
+            return True
+        from multiprocessing import shared_memory
+
+        try:
+            shm = shared_memory.SharedMemory(name=locator.handle.decode())
+        except FileNotFoundError:
+            return True
+        try:
+            return bool(shm.buf is not None and int(shm.buf[0]) != 0)
+        finally:
+            shm.close()
+
     def fetch_async(self, locator: Locator) -> TransferTicket:
-        return self._reads.submit(self.fetch, locator, nbytes=locator.nbytes)
+        return _ShmReadTicket(self, locator)
 
     def release(self, locator: Locator) -> None:
         name = locator.handle.decode()

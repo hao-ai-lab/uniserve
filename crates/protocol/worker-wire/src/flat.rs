@@ -712,6 +712,7 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
                 Ok(ExecutionConstraints {
                     max_batch_operations: constraints.max_batch_operations(),
                     max_speculative_points: constraints.max_speculative_points(),
+                    max_unresolved_window: constraints.max_unresolved_window(),
                     device_sequence_lengths: constraints.device_sequence_lengths(),
                     device_append_offsets: constraints.device_append_offsets(),
                     incremental_kv_publication: constraints.incremental_kv_publication(),
@@ -2191,6 +2192,7 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         execution_constraints: Some(Box::new(fbs::ExecutionConstraintsT {
             max_batch_operations: caps.execution_constraints.max_batch_operations,
             max_speculative_points: caps.execution_constraints.max_speculative_points,
+            max_unresolved_window: caps.execution_constraints.max_unresolved_window,
             device_sequence_lengths: caps.execution_constraints.device_sequence_lengths,
             device_append_offsets: caps.execution_constraints.device_append_offsets,
             incremental_kv_publication: caps.execution_constraints.incremental_kv_publication,
@@ -2288,6 +2290,7 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
                 Ok(ExecutionConstraints {
                     max_batch_operations: constraints.max_batch_operations,
                     max_speculative_points: constraints.max_speculative_points,
+                    max_unresolved_window: constraints.max_unresolved_window,
                     device_sequence_lengths: constraints.device_sequence_lengths,
                     device_append_offsets: constraints.device_append_offsets,
                     incremental_kv_publication: constraints.incremental_kv_publication,

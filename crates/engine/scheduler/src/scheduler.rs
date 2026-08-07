@@ -2287,6 +2287,7 @@ impl Scheduler {
             return false;
         };
         if queue.len() >= self.executor.pipeline_depth().max(1)
+            || queue.len() >= self.caps.execution_constraints.max_unresolved_window as usize
             || state.cancelled
             || self.pending_finishes.contains_key(&id)
             || self.custom_logits_processors > 0

@@ -1,6 +1,7 @@
 """Shared configurable vision encoder stack."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -16,7 +17,6 @@ from ..linear import LinearBase
 __all__ = [
     'VisionEncoderConfig',
     'VisionSelfAttention',
-    'max_seqlen_from_cu',
     'VisionEncoderLayer',
     'VisionEncoder',
 ]
@@ -51,15 +51,14 @@ class VisionSelfAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         context: ForwardContext,
         *,
-        max_seqlen: int | None = None,
+        max_seqlen: int,
+        seq_lens: Sequence[int],
     ) -> torch.Tensor:
         n_tokens = x.shape[0]
         q = self.q_proj(x).view(n_tokens, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(n_tokens, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(n_tokens, self.num_heads, self.head_dim)
         cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
-        if max_seqlen is None:
-            max_seqlen = max_seqlen_from_cu(cu, n_tokens)
         if ops.can_run_attention(
             q,
             k,
@@ -93,9 +92,12 @@ class VisionSelfAttention(nn.Module):
             )
             return self.out_proj(out.reshape(n_tokens, -1))
         # Portable fallback (e.g. CPU / SDPA-only backends without a varlen
-        # kernel): attend each packed image segment independently.
+        # kernel): attend each packed image segment independently, walking the
+        # host-known segment lengths so no offset is read back from the device.
         out = torch.empty_like(q)
-        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+        start = 0
+        for length in seq_lens:
+            end = start + int(length)
             q_block = q[start:end].permute(1, 0, 2).unsqueeze(0)
             k_block = k[start:end].permute(1, 0, 2).unsqueeze(0)
             v_block = v[start:end].permute(1, 0, 2).unsqueeze(0)
@@ -108,13 +110,8 @@ class VisionSelfAttention(nn.Module):
                 scale=self.scale,
             )
             out[start:end] = attended.squeeze(0).permute(1, 0, 2)
+            start = end
         return self.out_proj(out.reshape(n_tokens, -1))
-
-def max_seqlen_from_cu(cu_seqlens: torch.Tensor, n_tokens: int) -> int:
-    """Host-side max segment length from a cumulative-seqlen tensor (one sync)."""
-    if cu_seqlens.numel() > 1:
-        return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-    return n_tokens
 
 
 class VisionEncoderLayer(nn.Module):
@@ -139,13 +136,15 @@ class VisionEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         context: ForwardContext,
         *,
-        max_seqlen: int | None = None,
+        max_seqlen: int,
+        seq_lens: Sequence[int],
     ) -> torch.Tensor:
         x = x + self.self_attn(
             self.layer_norm1(x),
             cu_seqlens,
             context,
             max_seqlen=max_seqlen,
+            seq_lens=seq_lens,
         )
         return x + self.mlp(self.layer_norm2(x))
 
@@ -171,13 +170,19 @@ class VisionEncoder(nn.Module):
         x: torch.Tensor,
         context: ForwardContext,
         cu_seqlens: torch.Tensor | None = None,
+        *,
+        seq_lens: Sequence[int] | None = None,
     ) -> torch.Tensor:
         if cu_seqlens is None:
             cu_seqlens = torch.tensor([0, x.shape[0]], dtype=torch.int32, device=x.device)
-        max_seqlen = None
-        if self.layers:
-            cu = cu_seqlens.to(device=x.device, dtype=torch.int32)
-            max_seqlen = max_seqlen_from_cu(cu, x.shape[0])
+            if seq_lens is None:
+                seq_lens = (int(x.shape[0]),)
+        if seq_lens is None:
+            raise ValueError(
+                "VisionEncoder requires host-known seq_lens for a segmented packed batch"
+            )
+        seq_lens = tuple(int(length) for length in seq_lens)
+        max_seqlen = max(seq_lens) if seq_lens else int(x.shape[0])
         for layer in self.layers:
-            x = layer(x, cu_seqlens, context, max_seqlen=max_seqlen)
+            x = layer(x, cu_seqlens, context, max_seqlen=max_seqlen, seq_lens=seq_lens)
         return self.post_layernorm(x)

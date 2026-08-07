@@ -299,6 +299,7 @@ fn emit_digest_parity_fixture() {
             "max_vision_feature_bytes": caps.max_vision_feature_bytes,
             "max_batch_operations": caps.execution_constraints.max_batch_operations,
             "max_speculative_points": caps.execution_constraints.max_speculative_points,
+            "max_unresolved_window": caps.execution_constraints.max_unresolved_window,
             "device_sequence_lengths": caps.execution_constraints.device_sequence_lengths,
             "device_append_offsets": caps.execution_constraints.device_append_offsets,
             "incremental_kv_publication": caps.execution_constraints.incremental_kv_publication,

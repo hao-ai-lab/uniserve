@@ -9,10 +9,13 @@ import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL_SPEC
 from uniserve_worker.batch import WorkVariant
+from uniserve_worker.capabilities import configured_work_variants
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
+from uniserve_worker.runtime.capabilities import prove_depth_one_lowering
 from uniserve_worker.spec import (
     ModelSpec,
     OperationSpec,
+    OperationStagePurpose,
     OperationStageSpec,
     Rename,
     RoutePlacement,
@@ -123,6 +126,67 @@ def test_model_spec_rejects_ambiguous_or_invalid_operation_routes():
             ),
             flow=TEST_MODEL_SPEC.flow,
         )
+
+
+def test_depth_one_lowering_accepts_the_canonical_model_spec():
+    supported = configured_work_variants(
+        operation.kind for operation in TEST_MODEL_SPEC.operations
+    )
+    lowering = prove_depth_one_lowering(TEST_MODEL_SPEC, supported)
+    declared = {route.name for route in TEST_MODEL_SPEC.routes}
+
+    assert set(lowering) == set(supported)
+    for stage in lowering.values():
+        assert stage is None or stage.route in declared
+
+
+def test_depth_one_lowering_accepts_a_model_free_materialization_frame():
+    route = _route(row_kinds=(RouteRowKind.TOKEN,))
+    spec = _spec(
+        routes=(route,),
+        operations=(
+            OperationSpec(
+                WorkVariant.TOKEN_EXTEND,
+                (OperationStageSpec(route.name, RouteRowKind.TOKEN),),
+            ),
+            OperationSpec(WorkVariant.MATERIALIZE),
+        ),
+    )
+    supported = configured_work_variants(operation.kind for operation in spec.operations)
+
+    lowering = prove_depth_one_lowering(spec, supported)
+
+    assert lowering[WorkVariant.MATERIALIZE] is None
+    assert lowering[WorkVariant.TOKEN_EXTEND].route == route.name
+
+
+def test_depth_one_lowering_maps_a_state_only_transfer_variant_to_no_route():
+    # A KV state-publication op carries only STATE stages and lowers onto no
+    # compute route: the proof maps it to None rather than rejecting it, while a
+    # neural variant still resolves to its one declared primary route.
+    route = _route()
+    spec = _spec(
+        operations=(
+            OperationSpec(
+                WorkVariant.TOKEN_EXTEND,
+                (OperationStageSpec(route.name, RouteRowKind.TOKEN),),
+            ),
+            OperationSpec(
+                WorkVariant.TRANSFER_KV_PUBLISH,
+                (
+                    OperationStageSpec(
+                        route.name, RouteRowKind.TOKEN, OperationStagePurpose.STATE
+                    ),
+                ),
+            ),
+        )
+    )
+    supported = configured_work_variants(operation.kind for operation in spec.operations)
+
+    lowering = prove_depth_one_lowering(spec, supported)
+
+    assert lowering[WorkVariant.TRANSFER_KV_PUBLISH] is None
+    assert lowering[WorkVariant.TOKEN_EXTEND].route == route.name
 
 
 def test_flow_operation_requires_a_flow_spec():

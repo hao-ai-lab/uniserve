@@ -156,6 +156,7 @@ table RankInfo {
 table ExecutionConstraints {
   max_batch_operations:uint;
   max_speculative_points:uint;
+  max_unresolved_window:uint = 1;
   device_sequence_lengths:bool;
   device_append_offsets:bool;
   incremental_kv_publication:bool;

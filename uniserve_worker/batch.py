@@ -388,6 +388,7 @@ def route_capability_digest(
     max_vision_feature_bytes: int,
     max_batch_operations: int,
     max_speculative_points: int,
+    max_unresolved_window: int,
     device_sequence_lengths: bool,
     device_append_offsets: bool,
     incremental_kv_publication: bool,
@@ -424,6 +425,7 @@ def route_capability_digest(
     digest.u64(max_vision_feature_bytes)
     digest.u32(max_batch_operations)
     digest.u32(max_speculative_points)
+    digest.u32(max_unresolved_window)
     digest.boolean(device_sequence_lengths)
     digest.boolean(device_append_offsets)
     digest.boolean(incremental_kv_publication)

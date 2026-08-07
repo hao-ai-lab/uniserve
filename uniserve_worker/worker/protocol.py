@@ -188,6 +188,7 @@ def model_free_capabilities(
         execution_constraints=ExecutionConstraints(
             max_batch_operations=max_batch_operations,
             max_speculative_points=1,
+            max_unresolved_window=window,
             device_sequence_lengths=True,
             device_append_offsets=True,
             incremental_kv_publication=True,

@@ -247,6 +247,7 @@
     "max_vision_feature_bytes": 2097152,
     "max_batch_operations": 16,
     "max_speculative_points": 1,
+    "max_unresolved_window": 1,
     "device_sequence_lengths": true,
     "device_append_offsets": true,
     "incremental_kv_publication": true,
@@ -298,5 +299,5 @@
     "model_dtype": "bfloat16",
     "attention_backend": "flashinfer"
   },
-  "route_capability_digest": "d21754e177c62a2b0fd7caf38e31d26c37f0cd6a99abac285169b8e11f1806ad"
+  "route_capability_digest": "45a3ffb3fa96561884fd12535385287600a62f95c84bd71b72d0174ef8c1d12b"
 }

@@ -76,27 +76,36 @@ class SiglipNavitEncoder(nn.Module):
         grid: Any,
         context: ForwardContext,
     ) -> torch.Tensor:
-        packed, pos_ids, cu_seqlens = self._pack_inputs(pixels, grid)
+        packed, pos_ids, cu_seqlens, seq_lens = self._pack_inputs(pixels, grid)
         x = self.patch_embedding(packed) + self.position_embedding(pos_ids)
-        return self.encoder(x, context, cu_seqlens)
+        return self.encoder(x, context, cu_seqlens, seq_lens=seq_lens)
 
-    def _pack_inputs(self, pixels: torch.Tensor, grid: Any | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _pack_inputs(
+        self, pixels: torch.Tensor, grid: Any | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
         if isinstance(grid, dict):
             pos = grid.get("position_ids")
             if pos is None:
                 pos = grid.get("pos_ids")
             cu = grid.get("cu_seqlens")
+            seq_lens = grid.get("seq_lens")
             if pos is not None and cu is not None:
+                if seq_lens is None:
+                    raise ValueError(
+                        "SiglipNavitEncoder grid dict must carry host-known seq_lens "
+                        "alongside cu_seqlens"
+                    )
                 return (
                     pixels,
                     pos.to(device=pixels.device, dtype=torch.long),
                     cu.to(device=pixels.device, dtype=torch.int32),
+                    tuple(int(length) for length in seq_lens),
                 )
         if pixels.ndim == 2:
-            n = pixels.shape[0]
+            n = int(pixels.shape[0])
             pos = torch.arange(n, device=pixels.device, dtype=torch.long)
             cu = torch.tensor([0, n], device=pixels.device, dtype=torch.int32)
-            return pixels, pos, cu
+            return pixels, pos, cu, (n,)
         if pixels.ndim != 4:
             raise ValueError("SiglipNavitEncoder expects packed patches or NCHW pixels")
         patches = patchify_batch(pixels, self.patch_size).reshape(
@@ -112,4 +121,4 @@ class SiglipNavitEncoder(nn.Module):
             device=pixels.device,
         ).repeat(batch)
         cu = torch.arange(0, (batch + 1) * per_image, per_image, device=pixels.device, dtype=torch.int32)
-        return patches, pos, cu
+        return patches, pos, cu, (per_image,) * int(batch)

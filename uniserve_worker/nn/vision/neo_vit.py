@@ -63,7 +63,7 @@ class NeoVitEncoder(nn.Module):
         pixels: torch.Tensor,
         grid_hw: torch.Tensor,
         *,
-        grid_hint: tuple[int, int] | None = None,
+        grid_shapes: tuple[tuple[int, int], ...] | None = None,
     ) -> torch.Tensor:
         if pixels.ndim == 2:
             pixels = pixels.view(-1, self.num_channels, self.patch_size, self.patch_size)
@@ -78,7 +78,7 @@ class NeoVitEncoder(nn.Module):
             )
         patch_embeds = self.gelu(self.patch_embedding(pixels)).view(-1, self.patch_embedding.out_channels)
         patch_embeds = self._apply_2d_rope(patch_embeds.float(), grid_hw).to(dtype=patch_embeds.dtype)
-        return self._dense_downsample(patch_embeds, grid_hw, grid_hint=grid_hint)
+        return self._dense_downsample(patch_embeds, grid_shapes=grid_shapes)
 
     def _apply_2d_rope(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
         # ``patch_embeds.shape[0]`` is the total patch count as a static tensor
@@ -106,48 +106,36 @@ class NeoVitEncoder(nn.Module):
     def _dense_downsample(
         self,
         patch_embeds: torch.Tensor,
-        grid_hw: torch.Tensor,
         *,
-        grid_hint: tuple[int, int] | None = None,
+        grid_shapes: tuple[tuple[int, int], ...] | None,
     ) -> torch.Tensor:
-        if grid_hint is not None:
-            # Every image shares this (h, w) grid (the flow/CFG case). Using the
-            # host-supplied dims avoids reading ``grid_hw`` back to the host, so
-            # the batched conv stays inside a CUDA graph capture. Bit-identical
-            # to the equal-grid branch below.
-            h0, w0 = int(grid_hint[0]), int(grid_hint[1])
-            total = int(patch_embeds.shape[0])
-            if h0 < 1 or w0 < 1 or total % (h0 * w0) != 0:
-                raise ValueError("grid hint does not cover all NEO-ViT patch embeddings")
-            n = total // (h0 * w0)
-            image = patch_embeds.view(n, h0, w0, -1).permute(0, 3, 1, 2)
-            dense = self.dense_embedding(image).permute(0, 2, 3, 1)
-            return dense.reshape(-1, self.dense_embedding.out_channels)
-        shapes = grid_hw.tolist()
+        # Host-known per-image (h, w) grids drive the conv geometry, so the
+        # downsample never reads the device ``grid_hw`` tensor back to the host;
+        # ``grid_hw`` remains the device source of truth for 2D RoPE positions.
+        if grid_shapes is None:
+            raise ValueError("NeoVitEncoder requires host-known grid shapes for dense downsample")
+        shapes = [(int(h), int(w)) for h, w in grid_shapes]
         if not shapes:
             return patch_embeds.new_empty((0, self.dense_embedding.out_channels))
         # Conv2d acts independently per batch element, so when every image shares
         # the same (h, w) grid (the common batched-serving case) the per-image
-        # Python loop is equivalent to a single batched conv over (N, C, h, w).
-        # This collapses N kernel launches into one and is bit-identical to the
-        # per-image path; only the heterogeneous grid case keeps the loop.
-        h0, w0 = int(shapes[0][0]), int(shapes[0][1])
-        if all(int(h) == h0 and int(w) == w0 for h, w in shapes):
+        # Python loop is equivalent to a single batched conv over (N, C, h, w):
+        # it collapses N kernel launches into one and is bit-identical.
+        h0, w0 = shapes[0]
+        if all(h == h0 and w == w0 for h, w in shapes):
             n = len(shapes)
             if n * h0 * w0 != patch_embeds.shape[0]:
-                raise ValueError("grid_hw does not cover all NEO-ViT patch embeddings")
+                raise ValueError("grid shapes do not cover all NEO-ViT patch embeddings")
             image = patch_embeds.view(n, h0, w0, -1).permute(0, 3, 1, 2)
             dense = self.dense_embedding(image).permute(0, 2, 3, 1)
             return dense.reshape(-1, self.dense_embedding.out_channels)
         out = []
         cursor = 0
-        for h_raw, w_raw in shapes:
-            h = int(h_raw)
-            w = int(w_raw)
+        for h, w in shapes:
             image = patch_embeds[cursor:cursor + h * w].view(1, h, w, -1).permute(0, 3, 1, 2)
             dense = self.dense_embedding(image).permute(0, 2, 3, 1).reshape(-1, self.dense_embedding.out_channels)
             out.append(dense)
             cursor += h * w
         if cursor != patch_embeds.shape[0]:
-            raise ValueError("grid_hw does not cover all NEO-ViT patch embeddings")
+            raise ValueError("grid shapes do not cover all NEO-ViT patch embeddings")
         return torch.cat(out, dim=0) if out else patch_embeds.new_empty((0, self.dense_embedding.out_channels))

@@ -492,6 +492,10 @@ class EncodeKind(StrEnum):
 class PatchInput:
     pixels: torch.Tensor
     grid: torch.Tensor
+    # Host-known patch grid (grid_height, grid_width) for this one image, taken
+    # from the registration-time image transform. Lets the encoder resolve the
+    # per-image conv geometry without reading the device ``grid`` tensor back.
+    grid_shape: tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)

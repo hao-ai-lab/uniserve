@@ -170,12 +170,12 @@ class Fa4CuteAttentionBackend:
                 raise ValueError("current paged K/V must match q batch and each other")
             _write_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, k_blh, v_blh)
             live_seqlens += int(k_blh.shape[1])
-        max_seqlen_k = _metadata_context_len(
-            None if context is None else context.attention,
-            0,
-        )
+        max_seqlen_k = _metadata_context_len(None if context is None else context.attention)
         if max_seqlen_k <= 0:
-            max_seqlen_k = int(live_seqlens.max().item()) if live_seqlens.numel() else 0
+            raise ValueError(
+                "fa4_cute paged forward requires a positive host-known "
+                "plan.max_context_len; a plan without one is a scheduling bug"
+            )
 
         out = _fa4_output(
             _fa4_flash_attn_fwd(
@@ -396,10 +396,9 @@ def _write_paged_kv_cache(
     paged_kv_write(k_cache, v_cache, page_ids, offsets, k_current, v_current)
 
 
-def _metadata_context_len(plan: object | None, default: int) -> int:
+def _metadata_context_len(plan: object | None) -> int:
     value = getattr(plan, "max_context_len", 0)
     try:
-        parsed = int(value)
+        return max(0, int(value))
     except (TypeError, ValueError):
-        parsed = 0
-    return max(0, parsed if parsed > 0 else int(default))
+        return 0

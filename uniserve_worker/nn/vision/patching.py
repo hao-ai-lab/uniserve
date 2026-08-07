@@ -74,14 +74,13 @@ def build_abs_positions_from_grid_hw(
     grid_hw: torch.Tensor,
     *,
     device=None,
-    total: int | None = None,
+    total: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute per-patch x/y coordinates for one or more image grids.
 
-    ``total`` is the number of patches across all grids. When it is supplied
-    (the caller knows it from a static tensor shape), no value is read back from
-    ``grid_hw``, so the reduction stays capturable inside a CUDA graph; when it
-    is ``None`` the count is derived with a host sync for eager callers.
+    ``total`` is the number of patches across all grids. The caller takes it
+    from a static tensor shape, so no value is read back from ``grid_hw`` and
+    the reduction stays capturable inside a CUDA graph.
     """
 
     device = device or grid_hw.device
@@ -90,7 +89,7 @@ def build_abs_positions_from_grid_hw(
     heights = grid_hw[:, 0]
     widths = grid_hw[:, 1]
     counts = heights * widths
-    total = int(counts.sum().item()) if total is None else int(total)
+    total = int(total)
     patch_to_sample = torch.repeat_interleave(
         torch.arange(batch, device=device), counts, output_size=total
     )

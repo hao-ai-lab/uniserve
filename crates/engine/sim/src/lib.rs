@@ -307,6 +307,7 @@ impl SimEngine {
             execution_constraints: ExecutionConstraints {
                 max_batch_operations: 1024,
                 max_speculative_points: 1,
+                max_unresolved_window: 2,
                 route_capabilities: vec![uniserve_worker_wire::RouteExecutionCapability {
                     route: uniserve_worker_wire::RouteId(0),
                     supported_work: vec![
