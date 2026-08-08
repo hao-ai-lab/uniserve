@@ -96,7 +96,7 @@ def model_arena_capacity(
     device_product_bytes = device_product_arena_bytes(
         device_products,
         device_count,
-        max_speculative_points=1,
+        selected_points_per_operation=1,
         max_product_bytes=max_product_bytes,
     )
 

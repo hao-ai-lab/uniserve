@@ -6,7 +6,8 @@ use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError, WorkerLossError};
 use uniserve_worker_wire::{
-    Batch, CompletionRecord, CompletionReport, EngineCaps, Point, SamplingOwnership, SnapshotRef,
+    Batch, CompletionRecord, CompletionReport, Point, SamplingOwnership, SnapshotRef,
+    WorkerCapabilities,
 };
 
 use crate::WorkerLaunchConfig;
@@ -93,7 +94,7 @@ impl MultiprocSpawnSpec {
 pub struct MultiprocExecutor {
     workers: Vec<Box<dyn Executor>>,
     buffers: Vec<VecDeque<CompletionReport>>,
-    caps: EngineCaps,
+    caps: WorkerCapabilities,
     depth: usize,
     inflight: usize,
     next_call_id: u64,
@@ -672,7 +673,7 @@ fn report_partition_ids(report: &CompletionReport) -> Vec<u32> {
 /// semantic completion for each operation; only the per-rank product shards
 /// differ and are concatenated in rank order.
 fn merge_rank_report(
-    caps: &EngineCaps,
+    caps: &WorkerCapabilities,
     batch: &Batch,
     rank0: &mut CompletionReport,
     rankn: &CompletionReport,
@@ -698,17 +699,15 @@ fn merge_rank_report(
         .zip(&rankn.partitions)
         .enumerate()
     {
-        let planned = batch
-            .partitions
-            .iter()
-            .find(|partition| partition.partition_id == canonical_partition.partition_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "rank join received unplanned partition {} for step {step_id}",
-                    canonical_partition.partition_id
-                )
-            })?;
-        let ownership = route_sampling_ownership(caps, planned.route)?;
+        anyhow::ensure!(
+            batch
+                .partitions
+                .iter()
+                .any(|partition| partition.partition_id == canonical_partition.partition_id),
+            "rank join received unplanned partition {} for step {step_id}",
+            canonical_partition.partition_id
+        );
+        let ownership = caps.sampling_ownership;
         anyhow::ensure!(
             canonical_partition.partition_id == actual_partition.partition_id,
             "rank {rank} report for step {step_id} partition {partition_index} identity differs from rank 0"
@@ -750,18 +749,6 @@ fn merge_rank_report(
             .max();
     }
     Ok(())
-}
-
-fn route_sampling_ownership(
-    caps: &EngineCaps,
-    route: uniserve_worker_wire::RouteId,
-) -> anyhow::Result<SamplingOwnership> {
-    caps.execution_constraints
-        .route_capabilities
-        .iter()
-        .find(|capability| capability.route == route)
-        .map(|capability| capability.sampling_ownership)
-        .ok_or_else(|| anyhow::anyhow!("route {} has no sampling ownership capability", route.0))
 }
 
 fn validate_and_order_rank_report(
@@ -866,8 +853,8 @@ fn merge_completion_record(
 }
 
 fn validate_replacement_caps(
-    expected: &EngineCaps,
-    actual: &EngineCaps,
+    expected: &WorkerCapabilities,
+    actual: &WorkerCapabilities,
     rank: usize,
 ) -> anyhow::Result<()> {
     actual
@@ -922,7 +909,7 @@ fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
 }
 
 impl Executor for MultiprocExecutor {
-    fn caps(&self) -> EngineCaps {
+    fn caps(&self) -> WorkerCapabilities {
         self.caps.clone()
     }
 
@@ -1230,10 +1217,10 @@ mod tests {
     use uniserve_executor::{ControlAck, ControlOp, Executor};
     use uniserve_worker_wire::{
         AttentionRegime, Batch, BatchPartition, Bounds, CompletionRecord, CompletionReport, DType,
-        Domain, EngineCaps, ExecutionCapability, FinishFlags, LogicalLengths, OpId, OpStatus,
-        Operation, PartitionCompletion, PointRange, ProductKind, ProductPayload, ProductRef,
-        RegistrationAck, RequestKey, RouteId, SamplingOwnership, ShapeBound, SnapshotRef,
-        StorageClass, TimingCounters, TokenMode, TokenSpan, VersionRef, Work,
+        Domain, ExecutionCapability, FinishFlags, LogicalLengths, OpId, OpStatus, Operation,
+        PartitionCompletion, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck,
+        RequestKey, RouteId, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass,
+        TimingCounters, TokenMode, TokenSpan, VersionRef, Work, WorkerCapabilities,
     };
 
     #[test]
@@ -1422,8 +1409,7 @@ mod tests {
         // `product_generations` and the report-level `products` in rank order,
         // while the semantic completion is required to be identical per rank.
         let mut exec = fake_multiproc(2);
-        exec.caps.execution_constraints.route_capabilities[0].sampling_ownership =
-            SamplingOwnership::DeterministicSharded;
+        exec.caps.sampling_ownership = SamplingOwnership::DeterministicSharded;
         exec.inflight = 1;
         queue_pending(&mut exec, &[1]);
         exec.buffers[0].push_back(result_with_products(1, vec![10, 11], 100));
@@ -1441,8 +1427,7 @@ mod tests {
 
         // Identity / committed-token divergence across ranks is still rejected.
         let mut exec = fake_multiproc(2);
-        exec.caps.execution_constraints.route_capabilities[0].sampling_ownership =
-            SamplingOwnership::DeterministicSharded;
+        exec.caps.sampling_ownership = SamplingOwnership::DeterministicSharded;
         exec.inflight = 1;
         queue_pending(&mut exec, &[1]);
         exec.buffers[0].push_back(result_with_products(1, vec![10], 100));
@@ -1486,8 +1471,8 @@ mod tests {
         MultiprocExecutor::new(workers).unwrap()
     }
 
-    fn fake_caps(rank: usize, world_size: usize) -> EngineCaps {
-        let mut caps = EngineCaps::default();
+    fn fake_caps(rank: usize, world_size: usize) -> WorkerCapabilities {
+        let mut caps = WorkerCapabilities::default();
         caps.rank.tp_rank = rank as u32;
         caps.rank.tp_size = world_size as u32;
         caps.pipeline_depth = 2;
@@ -1686,12 +1671,12 @@ mod tests {
     }
 
     struct FakeExec {
-        caps: EngineCaps,
+        caps: WorkerCapabilities,
         queued: VecDeque<CompletionReport>,
     }
 
     impl Executor for FakeExec {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.caps.clone()
         }
 

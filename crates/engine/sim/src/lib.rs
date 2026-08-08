@@ -21,11 +21,11 @@ use uniserve_core::{
 };
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
-    Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, EngineCaps,
-    ErrorCode, ExecutionConstraints, FinishFlags, GenMode, LogicalLengths, OpStatus, Operation,
-    PartitionCompletion, Point, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-    RequestKind, SamplingState, TimingCounters, TokenMode, TokenSpan, TransferMode, Work,
-    WorkVariant, decode_sampling_state_bytes,
+    Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, ErrorCode,
+    FinishFlags, GenMode, LogicalLengths, OpStatus, Operation, PartitionCompletion, Point,
+    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, SamplingState,
+    TimingCounters, TokenMode, TokenSpan, TransferMode, Work, WorkVariant, WorkerCapabilities,
+    decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -42,7 +42,7 @@ enum Job {
 
 /// Runs a synchronous [`ModelEngine`] on a bounded asynchronous executor seam.
 pub struct SimExecutor {
-    caps: EngineCaps,
+    caps: WorkerCapabilities,
     depth: usize,
     to_worker: Sender<Job>,
     from_worker: Receiver<anyhow::Result<CompletionReport>>,
@@ -115,7 +115,7 @@ impl SimExecutor {
 }
 
 impl Executor for SimExecutor {
-    fn caps(&self) -> EngineCaps {
+    fn caps(&self) -> WorkerCapabilities {
         self.caps.clone()
     }
 
@@ -294,7 +294,7 @@ impl SimSession {
 
 /// Deterministic local model engine with protocol-faithful lifecycle state.
 pub struct SimEngine {
-    caps: EngineCaps,
+    caps: WorkerCapabilities,
     text_len: usize,
     fake_eos: u32,
     vocab: usize,
@@ -303,7 +303,7 @@ pub struct SimEngine {
 
 impl SimEngine {
     pub fn new() -> Self {
-        let caps = EngineCaps {
+        let caps = WorkerCapabilities {
             supported_work: vec![
                 WorkVariant::TokenExtend,
                 WorkVariant::TokenDecode,
@@ -328,42 +328,12 @@ impl SimEngine {
                 RequestKind::CopyKv,
                 RequestKind::ReleaseProducts,
             ],
-            execution_constraints: ExecutionConstraints {
-                max_batch_operations: 1024,
-                max_speculative_points: 1,
-                max_unresolved_window: 2,
-                route_capabilities: vec![uniserve_worker_wire::RouteExecutionCapability {
-                    route: uniserve_worker_wire::RouteId(0),
-                    supported_work: vec![
-                        WorkVariant::TokenExtend,
-                        WorkVariant::TokenDecode,
-                        WorkVariant::EncodeVision,
-                        WorkVariant::EncodeLatent,
-                        WorkVariant::GenTransition,
-                        WorkVariant::GenFlow,
-                        WorkVariant::Materialize,
-                        WorkVariant::TransferProduct,
-                        WorkVariant::TransferKvPublish,
-                        WorkVariant::TransferKvInstall,
-                    ],
-                    tensorized_mixed: true,
-                    sampling_ownership: uniserve_worker_wire::SamplingOwnership::DesignatedRank,
-                    preemptible: false,
-                    max_unresolved_window: 2,
-                    legal_feature_bitset: 0,
-                    sampler_processors: 0,
-                    processor_order_revision: 1,
-                    rng_layouts: 1,
-                    graph_eligible: false,
-                    gen_conditioning: 1,
-                    max_points_per_operation: 1,
-                    mixed_row_combinations: Vec::new(),
-                }],
-                ..ExecutionConstraints::default()
-            },
+            max_batch_operations: 1024,
+            max_unresolved_window: 2,
+            tensorized_mixed: true,
             model_spec_digest: "0".repeat(64),
             weight_digest: "1".repeat(64),
-            ..EngineCaps::default()
+            ..WorkerCapabilities::default()
         };
         Self {
             caps,
@@ -782,7 +752,7 @@ impl SimEngine {
         self.caps.block_size = size;
     }
 
-    pub fn mut_caps_for_test(&mut self) -> &mut EngineCaps {
+    pub fn mut_caps_for_test(&mut self) -> &mut WorkerCapabilities {
         &mut self.caps
     }
 }
@@ -862,7 +832,7 @@ impl Default for SimEngine {
 }
 
 impl ModelEngine for SimEngine {
-    fn caps(&self) -> EngineCaps {
+    fn caps(&self) -> WorkerCapabilities {
         self.caps.clone()
     }
 

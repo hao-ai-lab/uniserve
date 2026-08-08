@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ..capabilities import EngineCaps
+from ..capabilities import WorkerCapabilities
 from ..foundation.runtime_config import graph_padding_block_count
 from ..foundation.sizing import ceil_div
 from ..spec import ModelSpec, ResourcePlan
@@ -23,7 +23,7 @@ class ResidencyStore:
     def from_spec(
         cls,
         spec: ModelSpec,
-        capabilities: EngineCaps,
+        capabilities: WorkerCapabilities,
         resources: ResourcePlan,
         *,
         device: str,

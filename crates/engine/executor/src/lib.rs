@@ -5,13 +5,13 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::{BlockId, CommandWaker, RequestId};
 use uniserve_worker_wire::{
-    Batch, CompletionReport, EngineCaps, Operation, RequestKind, SnapshotRef, WorkVariant,
+    Batch, CompletionReport, Operation, RequestKind, SnapshotRef, WorkVariant, WorkerCapabilities,
     WorkerRequest,
 };
 
 /// Synchronous model-engine seam used by deterministic local implementations.
 pub trait ModelEngine: Send {
-    fn caps(&self) -> EngineCaps;
+    fn caps(&self) -> WorkerCapabilities;
     fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport>;
     fn drop_session(&mut self, id: RequestId) -> anyhow::Result<()>;
 }
@@ -394,7 +394,7 @@ impl std::error::Error for WorkerLossError {}
 
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
-    fn caps(&self) -> EngineCaps;
+    fn caps(&self) -> WorkerCapabilities;
     fn pipeline_depth(&self) -> usize;
     fn in_flight(&self) -> usize;
 

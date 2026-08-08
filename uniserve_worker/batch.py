@@ -191,7 +191,6 @@ _OP_STATUS_INDEX = {member: index for index, member in enumerate(OpStatus)}
 _DRAW_LAYOUT_INDEX = {member: index for index, member in enumerate(DrawLayout)}
 _DISPOSITION_INDEX = {member: index for index, member in enumerate(Disposition)}
 _CLOSE_REASON_INDEX = {member: index for index, member in enumerate(CloseReason)}
-_SAMPLING_OWNERSHIP_INDEX = {member: index for index, member in enumerate(SamplingOwnership)}
 
 # The native worker transport attaches this process-local token only after the
 # decoded Rust Batch has passed its complete wire validation. Direct Python
@@ -375,111 +374,6 @@ def protocol_layout_digest() -> str:
     digest.u64(len(logical_lengths))
     for name in logical_lengths:
         digest.string(name)
-    return digest.finish()
-
-
-def route_capability_digest(
-    supported_work: Sequence[WorkVariant],
-    max_cfg_branches: int,
-    max_latent_size: int,
-    max_vae_grid_tokens: int,
-    max_vit_grid_tokens: int,
-    max_latent_feature_bytes: int,
-    max_vision_feature_bytes: int,
-    max_batch_operations: int,
-    max_speculative_points: int,
-    max_unresolved_window: int,
-    device_sequence_lengths: bool,
-    device_append_offsets: bool,
-    incremental_kv_publication: bool,
-    route_capabilities: Sequence[
-        tuple[
-            int,
-            Sequence[WorkVariant],
-            bool,
-            SamplingOwnership,
-            bool,
-            int,
-            int,
-            int,
-            int,
-            int,
-            bool,
-            int,
-            int,
-            Sequence[int],
-        ]
-    ],
-    kv_dtype: str,
-    model_dtype: str,
-    attention_backend: str,
-) -> str:
-    """The route-capability digest: supported work, sampler and shape regime, and
-    mixed-submission capability. Mirrors the Rust
-    ``EngineCaps::compute_route_capability_digest`` byte-for-byte.
-    """
-
-    order = _WORK_VARIANT_MEMBERS
-    variants = sorted({order.index(WorkVariant(variant)) for variant in supported_work})
-    digest = _Digest(b"uniserve-route-capability\0")
-    digest.u64(len(variants))
-    for variant in variants:
-        digest.u8(variant)
-    digest.u32(max_cfg_branches)
-    digest.u32(max_latent_size)
-    digest.u32(max_vae_grid_tokens)
-    digest.u32(max_vit_grid_tokens)
-    digest.u64(max_latent_feature_bytes)
-    digest.u64(max_vision_feature_bytes)
-    digest.u32(max_batch_operations)
-    digest.u32(max_speculative_points)
-    digest.u32(max_unresolved_window)
-    digest.boolean(device_sequence_lengths)
-    digest.boolean(device_append_offsets)
-    digest.boolean(incremental_kv_publication)
-    ordered_capabilities = sorted(route_capabilities, key=lambda capability: capability[0])
-    digest.u64(len(ordered_capabilities))
-    for (
-        route,
-        supported_route_work,
-        tensorized_mixed,
-        sampling_ownership,
-        preemptible,
-        cap_max_unresolved_window,
-        legal_feature_bitset,
-        sampler_processors,
-        processor_order_revision,
-        rng_layouts,
-        graph_eligible,
-        gen_conditioning,
-        max_points_per_operation,
-        mixed_row_combinations,
-    ) in ordered_capabilities:
-        digest.u32(route)
-        variants = sorted(
-            {_WORK_VARIANT_MEMBERS.index(WorkVariant(variant)) for variant in supported_route_work}
-        )
-        digest.u64(len(variants))
-        for variant in variants:
-            digest.u8(variant)
-        digest.boolean(tensorized_mixed)
-        digest.u8(_SAMPLING_OWNERSHIP_INDEX[SamplingOwnership(sampling_ownership)])
-        digest.boolean(preemptible)
-        digest.u32(int(cap_max_unresolved_window))
-        digest.u32(int(legal_feature_bitset))
-        digest.u32(int(sampler_processors))
-        digest.u32(int(processor_order_revision))
-        digest.u32(int(rng_layouts))
-        digest.boolean(bool(graph_eligible))
-        digest.u8(int(gen_conditioning))
-        digest.u32(int(max_points_per_operation))
-        combinations = sorted({int(combination) for combination in mixed_row_combinations})
-        digest.u64(len(combinations))
-        for combination in combinations:
-            digest.u32(combination)
-    digest.string(kv_dtype)
-    digest.string(model_dtype)
-    digest.string(attention_backend)
     return digest.finish()
 
 

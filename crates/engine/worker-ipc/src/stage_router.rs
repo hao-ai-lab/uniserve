@@ -14,9 +14,9 @@ use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerKind};
 use uniserve_worker_wire::{
-    Admission, Batch, BatchPartition, CompletionReport, Control, EngineCaps, Operation,
-    ProductPayload, ProductRef, RequestKey, RouteExecutionCapability, RouteId,
-    TRANSFER_DESCRIPTOR_PREFIX, WorkVariant, is_transfer_descriptor,
+    Admission, Batch, BatchPartition, CompletionReport, Control, Operation, ProductPayload,
+    ProductRef, RequestKey, TRANSFER_DESCRIPTOR_PREFIX, WorkVariant, WorkerCapabilities,
+    is_transfer_descriptor,
 };
 
 struct PoolEntry {
@@ -86,7 +86,7 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, String)> {
 pub struct StageRouter {
     routing: HashMap<WorkVariant, usize>,
     pools: Vec<PoolEntry>,
-    caps: EngineCaps,
+    caps: WorkerCapabilities,
     depth: usize,
     pending: BTreeMap<u64, PendingStep>,
     ready: VecDeque<CompletionReport>,
@@ -173,7 +173,7 @@ impl StageRouter {
     fn merge_caps(
         pools: &[PoolEntry],
         routing: &HashMap<WorkVariant, usize>,
-    ) -> anyhow::Result<EngineCaps> {
+    ) -> anyhow::Result<WorkerCapabilities> {
         let routed_caps =
             |variant: WorkVariant| routing.get(&variant).map(|index| pools[*index].exec.caps());
         let mut kv_pool_indices = [
@@ -221,6 +221,8 @@ impl StageRouter {
                 );
                 anyhow::ensure!(
                     other.num_layers == first.num_layers
+                        && other.num_kv_heads == first.num_kv_heads
+                        && other.head_dim == first.head_dim
                         && other.kv_dtype == first.kv_dtype
                         && other.quantization == first.quantization
                         && other.groups == first.groups,
@@ -234,6 +236,8 @@ impl StageRouter {
                 .min()
                 .unwrap_or(first.num_blocks);
             merged.num_layers = first.num_layers;
+            merged.num_kv_heads = first.num_kv_heads;
+            merged.head_dim = first.head_dim;
             merged.groups = first.groups;
             merged.kv_dtype = first.kv_dtype;
             merged.quantization = first.quantization;
@@ -260,69 +264,31 @@ impl StageRouter {
             .map(|pool| pool.exec.caps().pipeline_depth.max(1))
             .min()
             .unwrap_or(1);
-        merged.execution_constraints.max_batch_operations = pools
+        merged.max_batch_operations = pools
             .iter()
-            .map(|pool| pool.exec.caps().execution_constraints.max_batch_operations)
+            .map(|pool| pool.exec.caps().max_batch_operations)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        merged.execution_constraints.max_speculative_points = pools
+        merged.max_unresolved_window = pools
             .iter()
-            .map(|pool| {
-                pool.exec
-                    .caps()
-                    .execution_constraints
-                    .max_speculative_points
-            })
+            .map(|pool| pool.exec.caps().max_unresolved_window)
+            .filter(|limit| *limit > 0)
             .min()
-            .unwrap_or(1);
-        merged.execution_constraints.device_sequence_lengths = pools.iter().all(|pool| {
-            pool.exec
-                .caps()
-                .execution_constraints
-                .device_sequence_lengths
-        });
-        merged.execution_constraints.device_append_offsets = pools
+            .unwrap_or(0);
+        merged.incremental_kv_publication = pools
             .iter()
-            .all(|pool| pool.exec.caps().execution_constraints.device_append_offsets);
-        merged.execution_constraints.incremental_kv_publication = pools.iter().all(|pool| {
-            pool.exec
-                .caps()
-                .execution_constraints
-                .incremental_kv_publication
-        });
-        let mut route_capabilities: HashMap<RouteId, RouteExecutionCapability> = HashMap::new();
-        for pool in pools {
-            for capability in pool.exec.caps().execution_constraints.route_capabilities {
-                match route_capabilities.get_mut(&capability.route) {
-                    Some(existing) => {
-                        anyhow::ensure!(
-                            existing.sampling_ownership == capability.sampling_ownership,
-                            "staged pools disagree on sampling ownership for route {}",
-                            capability.route.0
-                        );
-                        existing.tensorized_mixed &= capability.tensorized_mixed;
-                        existing.preemptible &= capability.preemptible;
-                        extend_unique(&mut existing.supported_work, capability.supported_work);
-                    }
-                    None => {
-                        route_capabilities.insert(capability.route, capability);
-                    }
-                }
-            }
-        }
-        for capability in route_capabilities.values_mut() {
-            let owning_pools = capability
-                .supported_work
+            .all(|pool| pool.exec.caps().incremental_kv_publication);
+        let sampling_ownership = pools[0].exec.caps().sampling_ownership;
+        anyhow::ensure!(
+            pools
                 .iter()
-                .filter_map(|variant| routing.get(variant).copied())
-                .collect::<HashSet<_>>();
-            capability.tensorized_mixed &= owning_pools.len() == 1;
-            capability.preemptible &= owning_pools.len() == 1;
-        }
-        let mut route_capabilities = route_capabilities.into_values().collect::<Vec<_>>();
-        route_capabilities.sort_unstable_by_key(|capability| capability.route.0);
-        merged.execution_constraints.route_capabilities = route_capabilities;
+                .all(|pool| pool.exec.caps().sampling_ownership == sampling_ownership),
+            "staged pools disagree on sampling ownership"
+        );
+        merged.sampling_ownership = sampling_ownership;
+        merged.tensorized_mixed = pools.iter().all(|pool| pool.exec.caps().tensorized_mixed)
+            && routing.values().copied().collect::<HashSet<_>>().len() == 1;
 
         let flow = routed_caps(WorkVariant::GenFlow);
         merged.max_latent_size = flow.as_ref().map_or(0, |caps| caps.max_latent_size);
@@ -641,7 +607,7 @@ impl StageRouter {
 }
 
 impl Executor for StageRouter {
-    fn caps(&self) -> EngineCaps {
+    fn caps(&self) -> WorkerCapabilities {
         self.caps.clone()
     }
 
@@ -984,18 +950,18 @@ mod tests {
     use super::*;
 
     struct RecordingExecutor {
-        caps: EngineCaps,
+        caps: WorkerCapabilities,
         submissions: Arc<Mutex<Vec<Batch>>>,
     }
 
     struct ReportingExecutor {
-        caps: EngineCaps,
+        caps: WorkerCapabilities,
         submissions: Arc<Mutex<Vec<Batch>>>,
         reports: Arc<Mutex<VecDeque<CompletionReport>>>,
     }
 
     impl Executor for ReportingExecutor {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.caps.clone()
         }
 
@@ -1036,7 +1002,7 @@ mod tests {
     }
 
     impl Executor for RecordingExecutor {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.caps.clone()
         }
 
@@ -1075,31 +1041,12 @@ mod tests {
         }
     }
 
-    fn caps(work: WorkVariant) -> EngineCaps {
-        EngineCaps {
+    fn caps(work: WorkVariant) -> WorkerCapabilities {
+        WorkerCapabilities {
             supported_work: vec![work],
-            execution_constraints: uniserve_worker_wire::ExecutionConstraints {
-                route_capabilities: vec![RouteExecutionCapability {
-                    route: RouteId(0),
-                    supported_work: vec![work],
-                    tensorized_mixed: false,
-                    sampling_ownership: uniserve_worker_wire::SamplingOwnership::DesignatedRank,
-                    preemptible: false,
-                    max_unresolved_window: 1,
-                    legal_feature_bitset: 0,
-                    sampler_processors: 0,
-                    processor_order_revision: 1,
-                    rng_layouts: 1,
-                    graph_eligible: false,
-                    gen_conditioning: 0,
-                    max_points_per_operation: 1,
-                    mixed_row_combinations: Vec::new(),
-                }],
-                ..Default::default()
-            },
             max_vit_grid_tokens: 64,
             max_vision_feature_bytes: 1 << 20,
-            ..EngineCaps::default()
+            ..WorkerCapabilities::default()
         }
     }
 

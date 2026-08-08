@@ -42,7 +42,7 @@ def test_warmup_is_a_safe_noop_off_cuda() -> None:
 
 def test_warmup_image_geometry_fits_the_declared_latent_capacity() -> None:
     worker = execution_worker()
-    caps = worker.contract.capabilities
+    caps = worker.capabilities
     if caps.max_latent_size <= 0:
         pytest.skip("stub declares no image latent capacity")
 
@@ -58,7 +58,7 @@ def test_warmup_image_geometry_fits_the_declared_latent_capacity() -> None:
 def test_warmup_sequence_qualifies_continuous_device_decode_and_cleans_up() -> None:
     model = _Observed()
     worker = execution_worker(model)
-    if WorkVariant.TOKEN_EXTEND not in worker.contract.effective_work_variants:
+    if WorkVariant.TOKEN_EXTEND not in worker.capabilities.supported_work:
         pytest.skip("stub does not support sequence extend")
 
     worker._execution = replace(
@@ -129,7 +129,7 @@ def test_warmup_sequence_qualifies_continuous_device_decode_and_cleans_up() -> N
 def test_warmup_flow_drives_a_real_forward_and_cleans_up() -> None:
     model = _Observed()
     worker = execution_worker(model)
-    if WorkVariant.GEN_TRANSITION not in worker.contract.effective_work_variants:
+    if WorkVariant.GEN_TRANSITION not in worker.capabilities.supported_work:
         pytest.skip("stub does not support flow")
 
     baseline = (worker.kv.resident_block_count(), worker.kv.scratch_token_count())

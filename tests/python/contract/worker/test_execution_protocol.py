@@ -31,7 +31,6 @@ from uniserve_worker.spec import (
     OperationStageSpec,
     RouteRowKind,
 )
-from uniserve_worker.worker.protocol import WorkerContract, model_free_capabilities
 
 pytestmark = pytest.mark.contract
 
@@ -62,37 +61,6 @@ def test_worker_response_variants_project_the_complete_typed_schema():
     assert capabilities["operations"] == []
     assert set(error) == _RESPONSE_FIELDS
     assert error["kind"] == "error"
-
-
-def test_worker_contract_separates_executable_and_advertised_work():
-    declared = model_free_capabilities(
-        block_size=64,
-        supported_work=(WorkVariant.TOKEN_EXTEND, WorkVariant.TOKEN_DECODE),
-        pipeline_depth=2,
-        completion_payload_bytes=1 << 20,
-    )
-    work = frozenset(
-        {
-            WorkVariant.TOKEN_EXTEND,
-            WorkVariant.TOKEN_DECODE,
-            WorkVariant.MATERIALIZE,
-        }
-    )
-
-    contract = WorkerContract.compile(
-        declared,
-        allowed_work_variants=work,
-        implemented_work_variants=work,
-        pipeline_depth=2,
-        owner="ExecutionWorker",
-    )
-
-    expected = (WorkVariant.TOKEN_EXTEND, WorkVariant.TOKEN_DECODE)
-    assert contract.capabilities.supported_work == expected
-    assert (
-        contract.capabilities.execution_constraints.route_capabilities[0].supported_work == expected
-    )
-    assert contract.effective_work_variants == work
 
 
 def _materialize_state_model() -> StubModel:

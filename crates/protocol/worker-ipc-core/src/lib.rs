@@ -33,7 +33,7 @@ pub use transfer_agent::{
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
 
 /// Wire protocol version this build emits on every [`Header`].
-pub const WIRE_VERSION: u16 = 6;
+pub const WIRE_VERSION: u16 = 7;
 
 /// Whether a peer-advertised wire `version` is one this build can decode.
 pub fn is_supported_wire_version(version: u16) -> bool {

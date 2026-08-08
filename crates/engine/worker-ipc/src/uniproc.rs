@@ -16,7 +16,7 @@ use uniserve_worker_ipc_core::{
     ClientEndpoint, Frame, Pending, event_driven_enabled, service_name,
 };
 use uniserve_worker_wire::{
-    Batch, CompletionReport, EngineCaps, ResponseKind, WorkerRequest, WorkerResponse,
+    Batch, CompletionReport, ResponseKind, WorkerCapabilities, WorkerRequest, WorkerResponse,
 };
 
 use crate::death_watch::DeathWatcher;
@@ -214,7 +214,7 @@ impl WorkerLaunchConfig {
 /// Single-process worker executor over iceoryx2 IPC.
 pub struct UniprocExecutor {
     client: ClientEndpoint,
-    caps: EngineCaps,
+    caps: WorkerCapabilities,
     child: Child,
     depth: usize,
     rank: u32,
@@ -486,7 +486,7 @@ impl UniprocExecutor {
             .and_then(|wake| DeathWatcher::spawn(child.id(), wake));
         Ok(Self {
             client,
-            caps: EngineCaps::default(),
+            caps: WorkerCapabilities::default(),
             child,
             depth,
             rank: tp_rank,
@@ -825,7 +825,7 @@ impl UniprocExecutor {
 }
 
 impl Executor for UniprocExecutor {
-    fn caps(&self) -> EngineCaps {
+    fn caps(&self) -> WorkerCapabilities {
         self.caps.clone()
     }
 

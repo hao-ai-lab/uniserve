@@ -1090,7 +1090,7 @@ def test_snapshot_restore_rebinds_the_exact_committed_latent_product(tmp_path) -
         snapshot_dir=snapshot_dir,
         restore_snapshots=True,
     )
-    assert restored.contract.capabilities.restored_snapshots == (reference,)
+    assert restored.capabilities.restored_snapshots == (reference,)
     session = restored.sessions.get(admission.request_key.session_id)
     assert session.latent_product == latent
     assert restored.latents.require(latent).step == 0

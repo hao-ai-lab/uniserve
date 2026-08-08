@@ -15,7 +15,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use uniserve_core::{BlockId, ImageParams, KvCacheGroupSpec, RankInfo, RequestId, SamplingParams};
+use uniserve_core::{
+    BlockId, GenerationRuntimeCapabilities, ImageParams, KvCacheGroupSpec, RankInfo, RequestId,
+    SamplingParams,
+};
 
 pub mod flat;
 pub mod resources;
@@ -1795,122 +1798,15 @@ impl CompletionReport {
 // Capabilities and startup agreement
 // ---------------------------------------------------------------------------
 
-/// Revision of the canonical sampler processor order a route applies. Bumped
-/// whenever the fixed processor order changes so a mismatched worker is rejected.
-pub const PROCESSOR_ORDER_REVISION: u32 = 1;
-
-/// Sampler processor bits a route may declare in `sampler_processors`.
-pub mod sampler_processor {
-    pub const TEMPERATURE: u32 = 1 << 0;
-    pub const TOP_K: u32 = 1 << 1;
-    pub const TOP_P: u32 = 1 << 2;
-    pub const MIN_P: u32 = 1 << 3;
-    pub const TYPICAL: u32 = 1 << 4;
-    pub const REPETITION_PENALTY: u32 = 1 << 5;
-    pub const FREQUENCY_PENALTY: u32 = 1 << 6;
-    pub const PRESENCE_PENALTY: u32 = 1 << 7;
-    pub const LOGIT_BIAS: u32 = 1 << 8;
-    pub const ALLOWED_TOKENS: u32 = 1 << 9;
-    pub const BAD_WORDS: u32 = 1 << 10;
-    pub const MIN_TOKENS: u32 = 1 << 11;
-    pub const FORCED_TOKENS: u32 = 1 << 12;
-    pub const LOGPROBS: u32 = 1 << 13;
-}
-
-/// RNG draw-layout bits a route may declare in `rng_layouts`.
-pub mod rng_layout {
-    pub const TARGET_SAMPLING: u32 = 1 << 0;
-    pub const SPECULATIVE_PROPOSAL: u32 = 1 << 1;
-    pub const FLOW_NOISE: u32 = 1 << 2;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteExecutionCapability {
-    pub route: RouteId,
-    pub supported_work: Vec<WorkVariant>,
-    pub tensorized_mixed: bool,
-    pub sampling_ownership: SamplingOwnership,
-    pub preemptible: bool,
-    /// Maximum unresolved successor depth the route admits.
-    #[serde(default)]
-    pub max_unresolved_window: u32,
-    /// Bitset of sampling features for which a depth beyond one is legal; an
-    /// operation whose sampling sets any feature outside this set is host-paced.
-    #[serde(default)]
-    pub legal_feature_bitset: u32,
-    /// Bitset of sampler processors the route's device sampler implements.
-    #[serde(default)]
-    pub sampler_processors: u32,
-    /// Revision of the canonical processor order the sampler applies.
-    #[serde(default)]
-    pub processor_order_revision: u32,
-    /// Bitset of RNG draw layouts the route addresses.
-    #[serde(default)]
-    pub rng_layouts: u32,
-    /// Whether the route lowers to a captured-graph execution.
-    #[serde(default)]
-    pub graph_eligible: bool,
-    /// Gen conditioning form; zero when the route establishes no Gen state.
-    #[serde(default)]
-    pub gen_conditioning: u8,
-    /// Maximum selected points one operation of the route may produce.
-    #[serde(default)]
-    pub max_points_per_operation: u32,
-    /// Exact tensorized mixed row combinations, each a bitset of row kinds.
-    #[serde(default)]
-    pub mixed_row_combinations: Vec<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionConstraints {
-    pub max_batch_operations: u32,
-    pub max_speculative_points: u32,
-    /// Upper bound on submitted-but-unresolved operations the worker admits per
-    /// request, making the previously implicit registration window an explicit
-    /// declared fact the scheduler bounds against.
-    pub max_unresolved_window: u32,
-    pub device_sequence_lengths: bool,
-    pub device_append_offsets: bool,
-    pub incremental_kv_publication: bool,
-    pub route_capabilities: Vec<RouteExecutionCapability>,
-}
-
-impl Default for ExecutionConstraints {
-    fn default() -> Self {
-        Self {
-            max_batch_operations: 1,
-            max_speculative_points: 1,
-            max_unresolved_window: 1,
-            device_sequence_lengths: true,
-            device_append_offsets: true,
-            incremental_kv_publication: true,
-            route_capabilities: vec![RouteExecutionCapability {
-                route: RouteId(0),
-                supported_work: vec![WorkVariant::TokenExtend, WorkVariant::TokenDecode],
-                tensorized_mixed: false,
-                sampling_ownership: SamplingOwnership::DesignatedRank,
-                preemptible: false,
-                max_unresolved_window: 1,
-                legal_feature_bitset: 0,
-                sampler_processors: 0,
-                processor_order_revision: PROCESSOR_ORDER_REVISION,
-                rng_layouts: rng_layout::TARGET_SAMPLING,
-                graph_eligible: false,
-                gen_conditioning: 0,
-                max_points_per_operation: 1,
-                mixed_row_combinations: Vec::new(),
-            }],
-        }
-    }
-}
-
 /// A worker's advertised capabilities. Admission requires every rank, worker,
 /// and frontend to agree on the protocol layout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EngineCaps {
+pub struct WorkerCapabilities {
     pub block_size: u32,
     pub num_blocks: u32,
     pub num_layers: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
     pub scratch_capacity_tokens: u64,
     pub supported_work: Vec<WorkVariant>,
     pub max_latent_size: u32,
@@ -1932,7 +1828,11 @@ pub struct EngineCaps {
     pub pipeline_depth: u32,
     pub encoder_cache_budget: u32,
     pub supported_controls: Vec<RequestKind>,
-    pub execution_constraints: ExecutionConstraints,
+    pub max_batch_operations: u32,
+    pub max_unresolved_window: u32,
+    pub incremental_kv_publication: bool,
+    pub tensorized_mixed: bool,
+    pub sampling_ownership: SamplingOwnership,
     pub resource_classes: Vec<ResourceClass>,
     pub model_spec_digest: Digest,
     pub weight_digest: Digest,
@@ -1940,56 +1840,52 @@ pub struct EngineCaps {
     pub restored_snapshots: Vec<SnapshotRef>,
 }
 
-impl EngineCaps {
+impl WorkerCapabilities {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.supported_work.is_empty(),
             "worker capabilities declare no work variants"
         );
         anyhow::ensure!(
-            self.execution_constraints.max_batch_operations > 0
-                && self.execution_constraints.max_speculative_points > 0
-                && self.execution_constraints.max_unresolved_window > 0,
-            "worker execution constraints declare a zero bound"
-        );
-        anyhow::ensure!(
-            !self.execution_constraints.route_capabilities.is_empty()
-                && self
-                    .execution_constraints
-                    .route_capabilities
-                    .iter()
-                    .map(|capability| capability.route)
-                    .collect::<HashSet<_>>()
-                    .len()
-                    == self.execution_constraints.route_capabilities.len(),
-            "worker execution constraints declare missing or repeated route capabilities"
-        );
-        let declared_work = self.supported_work.iter().copied().collect::<HashSet<_>>();
-        let routed_work = self
-            .execution_constraints
-            .route_capabilities
-            .iter()
-            .flat_map(|capability| capability.supported_work.iter().copied())
-            .collect::<HashSet<_>>();
-        anyhow::ensure!(
-            self.execution_constraints
-                .route_capabilities
+            self.supported_work
                 .iter()
-                .all(|capability| {
-                    !capability.supported_work.is_empty()
-                        && capability
-                            .supported_work
-                            .iter()
-                            .all(|variant| declared_work.contains(variant))
-                        && capability
-                            .supported_work
-                            .iter()
-                            .collect::<HashSet<_>>()
-                            .len()
-                            == capability.supported_work.len()
-                })
-                && routed_work == declared_work,
-            "worker route capabilities do not partition the declared work"
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                == self.supported_work.len(),
+            "worker capabilities repeat a work variant"
+        );
+        anyhow::ensure!(
+            self.supported_controls
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                == self.supported_controls.len(),
+            "worker capabilities repeat a control"
+        );
+        anyhow::ensure!(
+            self.resource_classes
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                == self.resource_classes.len(),
+            "worker capabilities repeat a resource class"
+        );
+        anyhow::ensure!(
+            self.max_batch_operations > 0 && self.max_unresolved_window > 0,
+            "worker capabilities declare a zero scheduling bound"
+        );
+        anyhow::ensure!(
+            self.block_size > 0
+                && self.num_blocks > 0
+                && self.num_layers > 0
+                && self.num_kv_heads > 0
+                && self.head_dim > 0
+                && self.pipeline_depth > 0
+                && self.bytes_per_token > 0,
+            "worker capabilities declare invalid cache geometry"
         );
         anyhow::ensure!(
             self.protocol_layout_digest == protocol_layout_digest(),
@@ -2016,14 +1912,45 @@ impl EngineCaps {
         );
         Ok(())
     }
+
+    pub fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
+        let supports = |variant: WorkVariant| self.supported_work.contains(&variant);
+        GenerationRuntimeCapabilities {
+            supports_understanding: supports(WorkVariant::TokenExtend)
+                && supports(WorkVariant::TokenDecode),
+            supports_vision_encode: supports(WorkVariant::EncodeVision),
+            supports_latent_encode: supports(WorkVariant::EncodeLatent),
+            supports_image_generation: supports(WorkVariant::GenFlow)
+                && supports(WorkVariant::Materialize)
+                && supports(WorkVariant::TransferKvPublish)
+                && self.incremental_kv_publication,
+            max_latent_units: u64::from(self.max_latent_size),
+            latent_downsample: self.latent_downsample,
+            max_vae_grid_tokens: if self.max_vae_grid_tokens > 0 {
+                self.max_vae_grid_tokens
+            } else {
+                self.max_latent_size
+            },
+            max_vit_grid_tokens: self.max_vit_grid_tokens,
+            max_latent_feature_bytes: self.max_latent_feature_bytes,
+            max_vision_feature_bytes: self.max_vision_feature_bytes,
+            commit_marker_tokens: self.commit_marker_tokens,
+            max_cfg_branches: self.max_cfg_branches,
+            scratch_capacity_tokens: self.scratch_capacity_tokens,
+            scratch_block_size: self.block_size,
+            encoder_cache_entries: self.encoder_cache_budget,
+        }
+    }
 }
 
-impl Default for EngineCaps {
+impl Default for WorkerCapabilities {
     fn default() -> Self {
         Self {
             block_size: 64,
             num_blocks: 4096,
             num_layers: 28,
+            num_kv_heads: 8,
+            head_dim: 128,
             scratch_capacity_tokens: 1 << 20,
             supported_work: vec![WorkVariant::TokenExtend, WorkVariant::TokenDecode],
             max_latent_size: 0,
@@ -2045,7 +1972,11 @@ impl Default for EngineCaps {
             pipeline_depth: 1,
             encoder_cache_budget: 0,
             supported_controls: Vec::new(),
-            execution_constraints: ExecutionConstraints::default(),
+            max_batch_operations: 1,
+            max_unresolved_window: 1,
+            incremental_kv_publication: true,
+            tensorized_mixed: false,
+            sampling_ownership: SamplingOwnership::DesignatedRank,
             resource_classes: Vec::new(),
             model_spec_digest: String::new(),
             weight_digest: String::new(),
@@ -2371,7 +2302,7 @@ pub struct ErrorOperationIdentity {
 pub struct WorkerResponse {
     pub kind: ResponseKind,
     pub call_id: Option<u64>,
-    pub capabilities: Option<EngineCaps>,
+    pub capabilities: Option<WorkerCapabilities>,
     pub completion_report: Option<CompletionReport>,
     pub metrics: Option<WorkerMetrics>,
     pub pressure: Option<Vec<ResourcePressure>>,
@@ -2405,7 +2336,7 @@ impl WorkerResponse {
         }
     }
 
-    pub fn capabilities(capabilities: EngineCaps) -> Self {
+    pub fn capabilities(capabilities: WorkerCapabilities) -> Self {
         Self {
             capabilities: Some(capabilities),
             ..Self::bare(ResponseKind::Capabilities)

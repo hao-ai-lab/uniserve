@@ -244,7 +244,7 @@ fn text_and_image_requests_complete() {
 fn scheduler_submits_mixed_op_kind_batches() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
-        Batch, CompletionReport, EngineCaps, ExecutionCapability, WorkVariant,
+        Batch, CompletionReport, ExecutionCapability, WorkVariant, WorkerCapabilities,
     };
 
     type PartitionLog = Arc<Mutex<Vec<Vec<(ExecutionCapability, u32, Vec<WorkVariant>)>>>>;
@@ -255,7 +255,7 @@ fn scheduler_submits_mixed_op_kind_batches() {
     }
 
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -407,7 +407,7 @@ fn scheduler_submits_mixed_op_kind_batches() {
 #[test]
 fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, WorkVariant};
+    use uniserve_worker_wire::{Batch, CompletionReport, WorkVariant, WorkerCapabilities};
 
     type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, WorkVariant)>>>>;
 
@@ -417,7 +417,7 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
     }
 
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -462,9 +462,7 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(2);
         sim.set_text_len(64);
-        sim.mut_caps_for_test()
-            .execution_constraints
-            .max_batch_operations = 1024;
+        sim.mut_caps_for_test().max_batch_operations = 1024;
         let batches = Arc::new(Mutex::new(Vec::new()));
         let exec = Recording {
             inner: SimExecutor::new(Box::new(sim)),
@@ -556,7 +554,9 @@ fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
 #[test]
 fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, ResourceClass, WorkVariant};
+    use uniserve_worker_wire::{
+        Batch, CompletionReport, ResourceClass, WorkVariant, WorkerCapabilities,
+    };
 
     struct Recording {
         inner: SimExecutor,
@@ -564,7 +564,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     }
 
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -609,9 +609,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     sim.mut_caps_for_test().resource_classes = vec![ResourceClass::ImageLatent];
     sim.mut_caps_for_test().max_latent_size = 1024;
     sim.mut_caps_for_test().latent_downsample = 16;
-    sim.mut_caps_for_test()
-        .execution_constraints
-        .max_batch_operations = 1024;
+    sim.mut_caps_for_test().max_batch_operations = 1024;
     let batches = Arc::new(Mutex::new(Vec::new()));
     let exec = Recording {
         inner: SimExecutor::new(Box::new(sim)),
@@ -677,7 +675,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
 #[test]
 fn flow_phase_plans_exactly_image_steps_then_commits() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, WorkVariant};
+    use uniserve_worker_wire::{Batch, CompletionReport, Control, WorkVariant, WorkerCapabilities};
 
     struct Recording {
         inner: SimExecutor,
@@ -685,7 +683,7 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
         public_event_limits: Arc<Mutex<Vec<u64>>>,
     }
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -809,9 +807,7 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
 #[test]
 fn scheduler_clamps_max_batch_to_worker_caps() {
     let mut sim = SimEngine::new();
-    sim.mut_caps_for_test()
-        .execution_constraints
-        .max_batch_operations = 3;
+    sim.mut_caps_for_test().max_batch_operations = 3;
     let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
@@ -918,7 +914,9 @@ fn operation_window_metrics_record_the_full_lifecycle() {
 #[test]
 fn stochastic_decode_relays_a_device_selected_successor_before_observation() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, OpId, Point, WorkVariant};
+    use uniserve_worker_wire::{
+        Batch, CompletionReport, OpId, Point, WorkVariant, WorkerCapabilities,
+    };
 
     // (op_id, variant, device_parent, in_flight_at_submit)
     type OpLog = Arc<Mutex<Vec<(OpId, WorkVariant, bool, usize)>>>;
@@ -929,7 +927,7 @@ fn stochastic_decode_relays_a_device_selected_successor_before_observation() {
     }
 
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -1061,7 +1059,7 @@ fn relay_run(
     Vec<(uniserve_worker_wire::WorkVariant, bool, usize)>,
 ) {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, Point, WorkVariant};
+    use uniserve_worker_wire::{Batch, CompletionReport, Point, WorkVariant, WorkerCapabilities};
 
     type Tape = Arc<Mutex<Vec<(WorkVariant, bool, usize)>>>;
 
@@ -1071,7 +1069,7 @@ fn relay_run(
     }
 
     impl Executor for Tap {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -1254,7 +1252,7 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
 fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
-        Batch, CompletionReport, Control, EngineCaps, OpId, Point, WorkVariant,
+        Batch, CompletionReport, Control, OpId, Point, WorkVariant, WorkerCapabilities,
     };
 
     type OperationLog = Arc<Mutex<Vec<(OpId, WorkVariant, Option<(OpId, u64)>, usize, bool)>>>;
@@ -1265,7 +1263,7 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
     }
 
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
 
@@ -1431,7 +1429,7 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
 #[test]
 fn staged_product_reachability_uses_a_fixed_handoff_then_same_pool_device_lineage() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps, Point, WorkVariant};
+    use uniserve_worker_wire::{Batch, CompletionReport, Point, WorkVariant, WorkerCapabilities};
 
     struct StagedReachability {
         inner: SimExecutor,
@@ -1439,7 +1437,7 @@ fn staged_product_reachability_uses_a_fixed_handoff_then_same_pool_device_lineag
     }
 
     impl Executor for StagedReachability {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
 
@@ -1640,7 +1638,9 @@ fn abort_and_cancel_are_distinct() {
 #[test]
 fn exact_prefix_controls_close_the_selected_semantic_versions() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, Point, VersionRef};
+    use uniserve_worker_wire::{
+        Batch, CompletionReport, Control, Point, VersionRef, WorkerCapabilities,
+    };
 
     struct Recording {
         inner: SimExecutor,
@@ -1648,7 +1648,7 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
     }
 
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -1916,7 +1916,9 @@ fn exact_prefix_controls_close_the_selected_semantic_versions() {
 #[test]
 fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests_continue() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, Control, EngineCaps, Point, WorkVariant};
+    use uniserve_worker_wire::{
+        Batch, CompletionReport, Control, Point, WorkVariant, WorkerCapabilities,
+    };
 
     // (request_id, variant, device_parent, in_flight_at_submit)
     type OpLog = Arc<Mutex<Vec<(u64, WorkVariant, bool, usize)>>>;
@@ -1928,7 +1930,7 @@ fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests
     }
 
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -2116,7 +2118,7 @@ fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests
     );
 }
 
-/// the EngineCaps hybrid-group handshake builds a multi-group block
+/// the WorkerCapabilities hybrid-group handshake builds a multi-group block
 /// manager and the scheduler still drives requests to completion.
 #[test]
 fn hybrid_groups_handshake_runs() {
@@ -3349,7 +3351,7 @@ fn fcfs_policy_completes_text() {
 #[test]
 fn sequence_admission_carries_the_prefix_reuse_boundary() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps};
+    use uniserve_worker_wire::{Batch, CompletionReport, WorkerCapabilities};
 
     #[derive(Default)]
     struct Log {
@@ -3361,7 +3363,7 @@ fn sequence_admission_carries_the_prefix_reuse_boundary() {
         log: Arc<Mutex<Log>>,
     }
     impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
         fn pipeline_depth(&self) -> usize {
@@ -3826,7 +3828,7 @@ fn kv_resources_return_after_completion() {
 #[test]
 fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, EngineCaps};
+    use uniserve_worker_wire::{Batch, CompletionReport, WorkerCapabilities};
 
     struct OwnershipChecking {
         inner: SimExecutor,
@@ -3834,7 +3836,7 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     }
 
     impl Executor for OwnershipChecking {
-        fn caps(&self) -> EngineCaps {
+        fn caps(&self) -> WorkerCapabilities {
             self.inner.caps()
         }
 

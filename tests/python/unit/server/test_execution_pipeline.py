@@ -40,7 +40,7 @@ class _Profiler:
 
 class _Worker:
     def __init__(self) -> None:
-        self.contract = SimpleNamespace(capabilities=SimpleNamespace(pipeline_depth=2))
+        self.capabilities = SimpleNamespace(pipeline_depth=2)
         self.execute_calls = 0
 
     def execute(self, _batch: object) -> CompletionReport:
@@ -219,12 +219,10 @@ class _DeferredPrepared:
 class _TransferWorker:
     def __init__(self, batches: tuple[Batch, ...], actions: list[str]) -> None:
         work = tuple(operation.work.variant for batch in batches for operation in batch.operations)
-        self.contract = SimpleNamespace(
-            capabilities=SimpleNamespace(
-                pipeline_depth=2,
-                supported_work=work,
-                supported_controls=(),
-            )
+        self.capabilities = SimpleNamespace(
+            pipeline_depth=2,
+            supported_work=work,
+            supported_controls=(),
         )
         self.actions = actions
         self.prepared = _DeferredPrepared(ready_after=3)

@@ -694,7 +694,7 @@ fn commit_control_requires_a_fixed_selected_version() {
 
 #[test]
 fn capabilities_round_trip_with_the_canonical_layout() {
-    let caps = EngineCaps::default();
+    let caps = WorkerCapabilities::default();
     assert_eq!(caps.protocol_layout_digest, protocol_layout_digest());
     let response = WorkerResponse::capabilities(caps.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
@@ -704,11 +704,53 @@ fn capabilities_round_trip_with_the_canonical_layout() {
 
 #[test]
 fn capabilities_with_a_disagreeing_layout_digest_are_rejected() {
-    let caps = EngineCaps {
+    let caps = WorkerCapabilities {
         protocol_layout_digest: digest_string(0x00),
         ..Default::default()
     };
     assert!(caps.validate().is_err());
+}
+
+#[test]
+fn capabilities_reject_duplicate_set_members() {
+    let caps = WorkerCapabilities {
+        supported_work: vec![
+            WorkVariant::TokenExtend,
+            WorkVariant::TokenDecode,
+            WorkVariant::TokenExtend,
+        ],
+        ..Default::default()
+    };
+    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+
+    let caps = WorkerCapabilities {
+        supported_controls: vec![RequestKind::Execute, RequestKind::Execute],
+        ..Default::default()
+    };
+    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+
+    let caps = WorkerCapabilities {
+        resource_classes: vec![ResourceClass::KvBlock, ResourceClass::KvBlock],
+        ..Default::default()
+    };
+    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+}
+
+#[test]
+fn image_generation_requires_incremental_kv_publication() {
+    let mut caps = full_caps();
+    caps.incremental_kv_publication = false;
+    assert!(
+        !caps
+            .generation_runtime_capabilities()
+            .supports_image_generation
+    );
+
+    caps.incremental_kv_publication = true;
+    assert!(
+        caps.generation_runtime_capabilities()
+            .supports_image_generation
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +760,7 @@ fn capabilities_with_a_disagreeing_layout_digest_are_rejected() {
 // payload bytes. Every scalar field carries a distinct value so a transposed
 // field mapping cannot cancel out. Each fixture is asserted to (1) round-trip
 // exactly through encode/decode and (2) decode byte-identically through the
-// retired unpack-based path and the accessor-based path.
+// object-API path and the accessor path.
 // ---------------------------------------------------------------------------
 
 fn session_key(session: u64) -> RequestKey {
@@ -984,8 +1026,8 @@ fn request_fixtures() -> Vec<WorkerRequest> {
     ]
 }
 
-fn full_caps() -> EngineCaps {
-    EngineCaps {
+fn full_caps() -> WorkerCapabilities {
+    WorkerCapabilities {
         supported_work: WorkVariant::ALL.to_vec(),
         quantization: Some("fp8".into()),
         groups: vec![
@@ -1016,26 +1058,10 @@ fn full_caps() -> EngineCaps {
         pipeline_depth: 2,
         encoder_cache_budget: 77,
         supported_controls: vec![RequestKind::Execute, RequestKind::DropSession],
-        execution_constraints: ExecutionConstraints {
-            max_batch_operations: 64,
-            route_capabilities: vec![RouteExecutionCapability {
-                route: RouteId(0),
-                supported_work: WorkVariant::ALL.to_vec(),
-                tensorized_mixed: true,
-                sampling_ownership: SamplingOwnership::DesignatedRank,
-                preemptible: false,
-                max_unresolved_window: 3,
-                legal_feature_bitset: 0b0001_1111,
-                sampler_processors: 0x3FFF,
-                processor_order_revision: PROCESSOR_ORDER_REVISION,
-                rng_layouts: 0b101,
-                graph_eligible: true,
-                gen_conditioning: 2,
-                max_points_per_operation: 17,
-                mixed_row_combinations: vec![0b011, 0b101],
-            }],
-            ..ExecutionConstraints::default()
-        },
+        max_batch_operations: 64,
+        max_unresolved_window: 3,
+        tensorized_mixed: true,
+        sampling_ownership: SamplingOwnership::DesignatedRank,
         resource_classes: vec![ResourceClass::KvBlock],
         model_spec_digest: digest_string(0x21),
         weight_digest: digest_string(0x22),
@@ -1051,7 +1077,7 @@ fn full_caps() -> EngineCaps {
                 locator: digest_string(0x26),
             },
         ],
-        ..EngineCaps::default()
+        ..WorkerCapabilities::default()
     }
 }
 
@@ -1221,7 +1247,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
         snapshot: None,
     };
     vec![
-        WorkerResponse::capabilities(EngineCaps::default()),
+        WorkerResponse::capabilities(WorkerCapabilities::default()),
         WorkerResponse::capabilities(full_caps()),
         WorkerResponse::completion_report(full_completion_report()),
         WorkerResponse::ok(),

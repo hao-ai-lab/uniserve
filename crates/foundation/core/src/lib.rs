@@ -570,7 +570,7 @@ impl KvLayout {
 /// A model with mixed attention (e.g. full + sliding-window) maps to multiple
 /// groups, each with its own logical block subspace. For BAGEL today there is a
 /// single `Full` group, so the generalization is a no-op until a hybrid model
-/// needs it — but the manager and the `EngineCaps` handshake are shaped for it.
+/// needs it — but the manager and worker-capability handshake are shaped for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KvGroupKind {

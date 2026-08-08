@@ -186,7 +186,7 @@ def _request_kind(request: Mapping[str, Any]) -> RequestKind:
 def _execute(worker: Worker, request: Mapping[str, Any], metrics: MetricsService) -> dict[str, Any]:
     raw_batch = _required(request, "batch", RequestKind.EXECUTE)
     batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_wire(raw_batch)
-    supported = frozenset(worker.contract.capabilities.supported_work)
+    supported = frozenset(worker.capabilities.supported_work)
     unsupported = tuple(
         operation.work.variant
         for operation in batch.operations
@@ -260,7 +260,7 @@ def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
 def _control(
     worker: Worker, kind: RequestKind, request: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    supported = frozenset(worker.contract.capabilities.supported_controls)
+    supported = frozenset(worker.capabilities.supported_controls)
     if kind not in supported:
         raise unsupported_control(kind.value)
     if kind is RequestKind.DROP_SESSION:
@@ -291,7 +291,7 @@ def dispatch(
     if kind is RequestKind.GET_CAPABILITIES:
         return _response(
             ResponseKind.CAPABILITIES,
-            capabilities=worker.contract.capabilities.to_wire(),
+            capabilities=worker.capabilities.to_wire(),
         )
     if kind is RequestKind.EXECUTE:
         return _execute(worker, request, service)
@@ -322,7 +322,7 @@ class WorkerServer:
         self.profiler = WorkerProfiler.from_env()
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
-        self.pipeline_depth = max(1, int(worker.contract.capabilities.pipeline_depth))
+        self.pipeline_depth = max(1, int(worker.capabilities.pipeline_depth))
         self._pending_completion_reports: dict[int, CompletionReport] = {}
 
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:

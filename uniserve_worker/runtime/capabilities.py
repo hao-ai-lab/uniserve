@@ -6,12 +6,10 @@ from collections.abc import Sequence
 
 from ..batch import SamplingOwnership, WorkVariant
 from ..capabilities import (
-    EngineCaps,
-    ExecutionConstraints,
     RankInfo,
     RequestKind,
     ResourceClass,
-    RouteExecutionCapability,
+    WorkerCapabilities,
     configured_work_variants,
 )
 from ..foundation.errors import invalid_descriptor
@@ -22,7 +20,6 @@ from ..foundation.runtime_config import (
 from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
 from ..spec import (
     DeploymentOverlay,
-    FlowConditioningKind,
     ModelSpec,
     OperationStagePurpose,
     OperationStageSpec,
@@ -30,18 +27,6 @@ from ..spec import (
     active_latent_capacity_tokens,
 )
 from .arena_capacity import operation_window
-
-# Sampler-processor, RNG-layout, and processor-order constants mirroring the
-# worker-wire capability constants byte-for-byte. The full sampler-processor set
-# is the fourteen bits of the canonical processor order; the legal-continuation
-# feature set is the device-representable subset (temperature, top-k, top-p,
-# min-p, typical) for which a successor may relay before host observation.
-PROCESSOR_ORDER_REVISION = 1
-_ALL_SAMPLER_PROCESSORS = (1 << 14) - 1
-_LEGAL_CONTINUATION_FEATURES = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
-_RNG_TARGET_SAMPLING = 1 << 0
-_RNG_FLOW_NOISE = 1 << 2
-_ROUTE_ROW_KIND_BIT = {kind: 1 << index for index, kind in enumerate(RouteRowKind)}
 
 __all__ = ["prove_depth_one_lowering", "resolve_capabilities"]
 
@@ -122,7 +107,7 @@ def resolve_capabilities(
     weight_digest: str | None = None,
     pipeline_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
-) -> EngineCaps:
+) -> WorkerCapabilities:
     """Build the complete capability snapshot without consulting model code."""
 
     resources = deployment.resources
@@ -185,72 +170,25 @@ def resolve_capabilities(
     # Startup lowering proof: every advertised variant must reduce to one
     # declared route via its primary stage before the capability is published.
     primary_by_variant = prove_depth_one_lowering(spec, supported_work)
-    # Speculative acceptance needs an advertised drafter; a serving route
-    # advertises none (DRAFT carries no depth-one route), so the declared
-    # acceptance window is a single verified point.
-    max_speculative_points = 2 if WorkVariant.DRAFT in supported_work else 1
     tensorized_mixed = _route_tensorized_mixed(spec, primary_by_variant)
-    # Preemption is not a configured serving capability: every route advertises
-    # a non-preemptible checkpoint scope, and the scheduler treats a resident
-    # request as non-preemptible. Snapshot export and restore are administrative
-    # operations outside steady-state request execution.
-    preemptible = False
-    # Sampling reduces full-vocabulary logits on one designated rank; no route
-    # declares a deterministically sharded sampler.
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
-    # DR-072 route facts derived from the model spec: captured-graph eligibility,
-    # the exact tensorized mixed row combinations (each a bitset of row kinds),
-    # the Gen conditioning form, and the RNG draw spaces the route addresses.
-    route_graph_eligible = all(route.graph_eligible for route in spec.routes)
-    mixed_row_combinations = tuple(
-        sorted(
-            {
-                sum(_ROUTE_ROW_KIND_BIT[kind] for kind in combination)
-                for route in spec.routes
-                for combination in route.mixed_combinations
-            }
-        )
-    )
-    gen_conditioning = (
-        list(FlowConditioningKind).index(flow.conditioning) if flow is not None else 0
-    )
-    rng_layouts = _RNG_TARGET_SAMPLING | (_RNG_FLOW_NOISE if flow is not None else 0)
-    return EngineCaps(
+    return WorkerCapabilities(
         block_size=int(deployment.block_size),
         num_blocks=int(capacity.num_blocks),
         num_layers=int(spec.cache.num_layers),
+        num_kv_heads=int(spec.cache.num_kv_heads),
+        head_dim=int(spec.cache.head_dim),
         scratch_capacity_tokens=scratch_capacity,
         supported_work=supported_work,
         max_latent_size=max_latent_size,
         latent_downsample=int(flow.latent_downsample) if flow is not None else 1,
         bytes_per_token=bytes_per_token,
         supported_controls=tuple(controls),
-        execution_constraints=ExecutionConstraints(
-            max_batch_operations=int(deployment.max_batch_operations),
-            max_speculative_points=max_speculative_points,
-            max_unresolved_window=unresolved_window,
-            device_sequence_lengths=True,
-            device_append_offsets=True,
-            incremental_kv_publication=True,
-            route_capabilities=(
-                RouteExecutionCapability(
-                    route=0,
-                    supported_work=supported_work,
-                    tensorized_mixed=tensorized_mixed,
-                    sampling_ownership=sampling_ownership,
-                    preemptible=preemptible,
-                    max_unresolved_window=unresolved_window,
-                    legal_feature_bitset=_LEGAL_CONTINUATION_FEATURES,
-                    sampler_processors=_ALL_SAMPLER_PROCESSORS,
-                    processor_order_revision=PROCESSOR_ORDER_REVISION,
-                    rng_layouts=rng_layouts,
-                    graph_eligible=route_graph_eligible,
-                    gen_conditioning=gen_conditioning,
-                    max_points_per_operation=max_speculative_points,
-                    mixed_row_combinations=mixed_row_combinations,
-                ),
-            ),
-        ),
+        max_batch_operations=int(deployment.max_batch_operations),
+        max_unresolved_window=unresolved_window,
+        incremental_kv_publication=True,
+        tensorized_mixed=tensorized_mixed,
+        sampling_ownership=sampling_ownership,
         resource_classes=tuple(ResourceClass(value) for value in resources.classes()),
         attention_backend=deployment.attention_backend or "auto",
         kv_dtype=_kv_dtype(spec, deployment),

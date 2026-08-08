@@ -5,11 +5,17 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 
-from ..batch import Batch, CompletionReport, SnapshotRef, WorkVariant
-from ..capabilities import RequestKind, ResourceClass, configured_work_variants
+from ..batch import Batch, CompletionReport, SamplingOwnership, SnapshotRef, WorkVariant
+from ..capabilities import (
+    RankInfo,
+    RequestKind,
+    ResourceClass,
+    WorkerCapabilities,
+    configured_work_variants,
+)
 from ..execution import ModelExecutor
-from ..foundation.errors import unsupported_control
-from ..runtime.arena_capacity import system_arena_capacity
+from ..foundation.errors import capability_mismatch, unsupported_control
+from ..runtime.arena_capacity import operation_window, system_arena_capacity
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.kv_store import KvStore
 from ..runtime.latent_store import LatentStore
@@ -19,7 +25,6 @@ from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.snapshot_store import SnapshotProvider
 from ..runtime.transfer import Locator
-from .protocol import WorkerContract, model_free_capabilities
 
 _MAX_OPERATIONS = 1024
 
@@ -42,6 +47,12 @@ class SystemWorker:
         supported = frozenset({WorkVariant.MATERIALIZE})
         if not allowed_work_variants <= supported:
             raise ValueError("system worker received a model-backed work variant")
+        if not allowed_work_variants:
+            raise capability_mismatch("SystemWorker implements none of the requested work variants")
+        if int(pipeline_depth) <= 0:
+            raise capability_mismatch("worker pipeline depth must be positive")
+        if int(completion_payload_bytes) < 1:
+            raise ValueError("model-free completion payload capacity must be positive")
         controls: tuple[RequestKind, ...] = (
             RequestKind.DROP_SESSION,
             RequestKind.RELEASE_PRODUCTS,
@@ -52,28 +63,50 @@ class SystemWorker:
                 RequestKind.SNAPSHOT_SESSION,
                 RequestKind.RESTORE_SESSION,
             )
-        declared = model_free_capabilities(
+        advertised_work = configured_work_variants(
+            tuple(value for value in WorkVariant if value in allowed_work_variants)
+        )
+        window = operation_window(int(pipeline_depth), _MAX_OPERATIONS)
+        self._capabilities = WorkerCapabilities(
             block_size=int(block_size),
-            supported_work=configured_work_variants(
-                tuple(value for value in WorkVariant if value in allowed_work_variants)
-            ),
+            num_blocks=1,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            scratch_capacity_tokens=0,
+            supported_work=advertised_work,
+            max_latent_size=0,
+            latent_downsample=1,
+            max_vae_grid_tokens=0,
+            max_vit_grid_tokens=0,
+            max_latent_feature_bytes=0,
+            max_vision_feature_bytes=0,
+            commit_marker_tokens=2,
+            gen_rope_advance=2,
+            max_cfg_branches=1,
+            bytes_per_token=1,
+            groups=(),
+            kv_dtype="bfloat16",
+            model_dtype="bfloat16",
+            attention_backend="auto",
+            quantization=None,
+            rank=RankInfo(),
+            pipeline_depth=int(pipeline_depth),
+            encoder_cache_budget=0,
             supported_controls=controls,
-            resource_classes=(ResourceClass.ENCODER_OUTPUT,),
             max_batch_operations=_MAX_OPERATIONS,
-            pipeline_depth=pipeline_depth,
-            completion_payload_bytes=completion_payload_bytes,
+            max_unresolved_window=window,
+            incremental_kv_publication=True,
+            tensorized_mixed=False,
+            sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
+            resource_classes=(ResourceClass.ENCODER_OUTPUT,),
+            model_spec_digest="",
+            weight_digest="",
         )
         arena = system_arena_capacity(
             pipeline_depth=int(pipeline_depth),
             max_operations=_MAX_OPERATIONS,
             completion_payload_bytes=int(completion_payload_bytes),
-        )
-        self._contract = WorkerContract.compile(
-            declared,
-            allowed_work_variants=allowed_work_variants,
-            implemented_work_variants=allowed_work_variants,
-            pipeline_depth=pipeline_depth,
-            owner=type(self).__name__,
         )
         self.sessions = SessionStore()
         self.kv = KvStore()
@@ -115,7 +148,7 @@ class SystemWorker:
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:
-            caps = self._contract.capabilities
+            caps = self._capabilities
             self.snapshot_provider = SnapshotProvider(
                 snapshot_dir,
                 model_spec_digest=self.trace.candidate_digest,
@@ -134,21 +167,16 @@ class SystemWorker:
                 transport=self.mover.transport,
             )
             restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
-            self._contract = replace(
-                self._contract,
-                capabilities=replace(
-                    self._contract.capabilities,
-                    restored_snapshots=tuple(
-                        sorted(
-                            restored, key=lambda reference: reference.version.request_key.session_id
-                        )
-                    ),
+            self._capabilities = replace(
+                self._capabilities,
+                restored_snapshots=tuple(
+                    sorted(restored, key=lambda reference: reference.version.request_key.session_id)
                 ),
             )
 
     @property
-    def contract(self) -> WorkerContract:
-        return self._contract
+    def capabilities(self) -> WorkerCapabilities:
+        return self._capabilities
 
     def warmup(self) -> None:
         self.executor.complete_startup()

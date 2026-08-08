@@ -12,7 +12,6 @@ from .batch import (
     SnapshotRef,
     WorkVariant,
     protocol_layout_digest,
-    route_capability_digest,
 )
 from .foundation.errors import invalid_descriptor
 
@@ -26,9 +25,8 @@ _UNCONFIGURED_WORK = frozenset({WorkVariant.TOKEN_VERIFY, WorkVariant.DRAFT})
 def configured_work_variants(variants: Iterable[WorkVariant]) -> tuple[WorkVariant, ...]:
     """The admitted work leaves among ``variants``.
 
-    The result excludes the unconfigured work and is ordered by the canonical
-    ``WorkVariant`` position, matching the order the route-capability digest
-    folds them in.
+    The result excludes the unconfigured work and follows canonical
+    ``WorkVariant`` order.
     """
 
     selected = set(variants)
@@ -147,72 +145,12 @@ class RankInfo:
 
 
 @dataclass(frozen=True, slots=True)
-class RouteExecutionCapability:
-    route: int
-    supported_work: tuple[WorkVariant, ...]
-    tensorized_mixed: bool
-    sampling_ownership: SamplingOwnership
-    preemptible: bool
-    max_unresolved_window: int = 1
-    legal_feature_bitset: int = 0
-    sampler_processors: int = 0
-    processor_order_revision: int = 0
-    rng_layouts: int = 0
-    graph_eligible: bool = False
-    gen_conditioning: int = 0
-    max_points_per_operation: int = 1
-    mixed_row_combinations: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.route < 0:
-            raise invalid_descriptor("route capability id must not be negative")
-        if not self.supported_work or len(set(self.supported_work)) != len(self.supported_work):
-            raise invalid_descriptor("route capability work must be non-empty and unique")
-        if self.max_unresolved_window < 1:
-            raise invalid_descriptor("route unresolved-window depth must be positive")
-        if self.max_points_per_operation < 1:
-            raise invalid_descriptor("route must admit at least one point per operation")
-        if self.legal_feature_bitset & ~self.sampler_processors:
-            raise invalid_descriptor(
-                "route legal-continuation features must be a subset of its sampler processors"
-            )
-        if len(self.mixed_row_combinations) != len(set(self.mixed_row_combinations)):
-            raise invalid_descriptor("route mixed row combinations must be unique")
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionConstraints:
-    max_batch_operations: int
-    max_speculative_points: int
-    max_unresolved_window: int
-    device_sequence_lengths: bool
-    device_append_offsets: bool
-    incremental_kv_publication: bool
-    route_capabilities: tuple[RouteExecutionCapability, ...]
-
-    def __post_init__(self) -> None:
-        if self.max_batch_operations < 1:
-            raise invalid_descriptor("max_batch_operations must be positive")
-        if self.max_speculative_points < 1:
-            raise invalid_descriptor("max_speculative_points must be positive")
-        if self.max_unresolved_window < 1:
-            raise invalid_descriptor("max_unresolved_window must be positive")
-        if (
-            tuple(sorted(self.route_capabilities, key=lambda capability: capability.route))
-            != self.route_capabilities
-        ):
-            raise invalid_descriptor("route capabilities must be canonical")
-        if len({capability.route for capability in self.route_capabilities}) != len(
-            self.route_capabilities
-        ):
-            raise invalid_descriptor("route capabilities repeat a route id")
-
-
-@dataclass(frozen=True, slots=True)
-class EngineCaps:
+class WorkerCapabilities:
     block_size: int
     num_blocks: int
     num_layers: int
+    num_kv_heads: int
+    head_dim: int
     scratch_capacity_tokens: int
     supported_work: tuple[WorkVariant, ...]
     max_latent_size: int
@@ -234,13 +172,16 @@ class EngineCaps:
     pipeline_depth: int
     encoder_cache_budget: int
     supported_controls: tuple[RequestKind, ...]
-    execution_constraints: ExecutionConstraints
+    max_batch_operations: int
+    max_unresolved_window: int
+    incremental_kv_publication: bool
+    tensorized_mixed: bool
+    sampling_ownership: SamplingOwnership
     resource_classes: tuple[ResourceClass, ...]
     model_spec_digest: str
     weight_digest: str
     restored_snapshots: tuple[SnapshotRef, ...] = ()
     protocol_layout_digest: str = ""
-    route_capability_digest: str = ""
 
     def __post_init__(self) -> None:
         if self.model_dtype not in {"float16", "bfloat16", "float32"}:
@@ -249,12 +190,16 @@ class EngineCaps:
             "block_size",
             "num_blocks",
             "num_layers",
+            "num_kv_heads",
+            "head_dim",
             "latent_downsample",
             "bytes_per_token",
             "pipeline_depth",
             "commit_marker_tokens",
             "gen_rope_advance",
             "max_cfg_branches",
+            "max_batch_operations",
+            "max_unresolved_window",
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"capabilities.{name} must be positive")
@@ -273,13 +218,6 @@ class EngineCaps:
             raise invalid_descriptor("capabilities must support a work variant")
         if len(set(self.supported_work)) != len(self.supported_work):
             raise invalid_descriptor("capabilities repeat a work variant")
-        routed_work = {
-            variant
-            for capability in self.execution_constraints.route_capabilities
-            for variant in capability.supported_work
-        }
-        if routed_work != set(self.supported_work):
-            raise invalid_descriptor("route capabilities do not cover the declared work")
         if len(set(self.supported_controls)) != len(self.supported_controls):
             raise invalid_descriptor("capabilities repeat a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
@@ -289,60 +227,17 @@ class EngineCaps:
         )
         if restored_session_ids != tuple(sorted(set(restored_session_ids))):
             raise invalid_descriptor("capabilities restored snapshots are not canonical")
-        # The two agreement digests are a pure function of this capability's own
-        # fields, so they are computed here at the authoritative construction
-        # point. Every construction path (declaration, wire decode, ``replace``)
-        # therefore reports the exact digests the handshake validates.
         object.__setattr__(self, "protocol_layout_digest", protocol_layout_digest())
-        object.__setattr__(
-            self,
-            "route_capability_digest",
-            route_capability_digest(
-                self.supported_work,
-                self.max_cfg_branches,
-                self.max_latent_size,
-                self.max_vae_grid_tokens,
-                self.max_vit_grid_tokens,
-                self.max_latent_feature_bytes,
-                self.max_vision_feature_bytes,
-                self.execution_constraints.max_batch_operations,
-                self.execution_constraints.max_speculative_points,
-                self.execution_constraints.max_unresolved_window,
-                self.execution_constraints.device_sequence_lengths,
-                self.execution_constraints.device_append_offsets,
-                self.execution_constraints.incremental_kv_publication,
-                tuple(
-                    (
-                        capability.route,
-                        capability.supported_work,
-                        capability.tensorized_mixed,
-                        capability.sampling_ownership,
-                        capability.preemptible,
-                        capability.max_unresolved_window,
-                        capability.legal_feature_bitset,
-                        capability.sampler_processors,
-                        capability.processor_order_revision,
-                        capability.rng_layouts,
-                        capability.graph_eligible,
-                        capability.gen_conditioning,
-                        capability.max_points_per_operation,
-                        capability.mixed_row_combinations,
-                    )
-                    for capability in self.execution_constraints.route_capabilities
-                ),
-                self.kv_dtype,
-                self.model_dtype,
-                self.attention_backend,
-            ),
-        )
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "capabilities") -> EngineCaps:
+    def from_wire(cls, value: object, where: str = "capabilities") -> WorkerCapabilities:
         data = _map(value, where)
         return cls(
             block_size=_uint(data.get("block_size"), f"{where}.block_size"),
             num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
             num_layers=_uint(data.get("num_layers"), f"{where}.num_layers"),
+            num_kv_heads=_uint(data.get("num_kv_heads"), f"{where}.num_kv_heads"),
+            head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
             scratch_capacity_tokens=_uint(
                 data.get("scratch_capacity_tokens"), f"{where}.scratch_capacity_tokens"
             ),
@@ -395,126 +290,18 @@ class EngineCaps:
                     _seq(data.get("supported_controls", ()), f"{where}.supported_controls")
                 )
             ),
-            execution_constraints=ExecutionConstraints(
-                max_batch_operations=_uint(
-                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
-                        "max_batch_operations"
-                    ),
-                    f"{where}.execution_constraints.max_batch_operations",
-                ),
-                max_speculative_points=_uint(
-                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
-                        "max_speculative_points"
-                    ),
-                    f"{where}.execution_constraints.max_speculative_points",
-                ),
-                max_unresolved_window=_uint(
-                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
-                        "max_unresolved_window"
-                    ),
-                    f"{where}.execution_constraints.max_unresolved_window",
-                ),
-                device_sequence_lengths=_bool(
-                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
-                        "device_sequence_lengths"
-                    ),
-                    f"{where}.execution_constraints.device_sequence_lengths",
-                ),
-                device_append_offsets=_bool(
-                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
-                        "device_append_offsets"
-                    ),
-                    f"{where}.execution_constraints.device_append_offsets",
-                ),
-                incremental_kv_publication=_bool(
-                    _map(data.get("execution_constraints"), f"{where}.execution_constraints").get(
-                        "incremental_kv_publication"
-                    ),
-                    f"{where}.execution_constraints.incremental_kv_publication",
-                ),
-                route_capabilities=tuple(
-                    RouteExecutionCapability(
-                        route=_uint(
-                            _map(
-                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
-                            ).get("route"),
-                            f"{where}.execution_constraints.route_capabilities[{index}].route",
-                        ),
-                        supported_work=tuple(
-                            _enum(
-                                WorkVariant,
-                                variant,
-                                f"{where}.execution_constraints.route_capabilities[{index}].supported_work[{variant_index}]",
-                            )
-                            for variant_index, variant in enumerate(
-                                _seq(
-                                    _map(
-                                        item,
-                                        f"{where}.execution_constraints.route_capabilities[{index}]",
-                                    ).get("supported_work", ()),
-                                    f"{where}.execution_constraints.route_capabilities[{index}].supported_work",
-                                )
-                            )
-                        ),
-                        tensorized_mixed=_bool(
-                            _map(
-                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
-                            ).get("tensorized_mixed"),
-                            f"{where}.execution_constraints.route_capabilities[{index}].tensorized_mixed",
-                        ),
-                        sampling_ownership=_enum(
-                            SamplingOwnership,
-                            _map(
-                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
-                            ).get("sampling_ownership"),
-                            f"{where}.execution_constraints.route_capabilities[{index}].sampling_ownership",
-                        ),
-                        preemptible=_bool(
-                            _map(
-                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
-                            ).get("preemptible"),
-                            f"{where}.execution_constraints.route_capabilities[{index}].preemptible",
-                        ),
-                        max_unresolved_window=int(
-                            _map(item, f"{where}.rc[{index}]").get("max_unresolved_window", 1)
-                        ),
-                        legal_feature_bitset=int(
-                            _map(item, f"{where}.rc[{index}]").get("legal_feature_bitset", 0)
-                        ),
-                        sampler_processors=int(
-                            _map(item, f"{where}.rc[{index}]").get("sampler_processors", 0)
-                        ),
-                        processor_order_revision=int(
-                            _map(item, f"{where}.rc[{index}]").get("processor_order_revision", 0)
-                        ),
-                        rng_layouts=int(
-                            _map(item, f"{where}.rc[{index}]").get("rng_layouts", 0)
-                        ),
-                        graph_eligible=bool(
-                            _map(item, f"{where}.rc[{index}]").get("graph_eligible", False)
-                        ),
-                        gen_conditioning=int(
-                            _map(item, f"{where}.rc[{index}]").get("gen_conditioning", 0)
-                        ),
-                        max_points_per_operation=int(
-                            _map(item, f"{where}.rc[{index}]").get("max_points_per_operation", 1)
-                        ),
-                        mixed_row_combinations=tuple(
-                            int(value)
-                            for value in _map(item, f"{where}.rc[{index}]").get(
-                                "mixed_row_combinations", ()
-                            )
-                        ),
-                    )
-                    for index, item in enumerate(
-                        _seq(
-                            _map(
-                                data.get("execution_constraints"), f"{where}.execution_constraints"
-                            ).get("route_capabilities", ()),
-                            f"{where}.execution_constraints.route_capabilities",
-                        )
-                    )
-                ),
+            max_batch_operations=_uint(
+                data.get("max_batch_operations"), f"{where}.max_batch_operations"
+            ),
+            max_unresolved_window=_uint(
+                data.get("max_unresolved_window"), f"{where}.max_unresolved_window"
+            ),
+            incremental_kv_publication=_bool(
+                data.get("incremental_kv_publication"), f"{where}.incremental_kv_publication"
+            ),
+            tensorized_mixed=_bool(data.get("tensorized_mixed"), f"{where}.tensorized_mixed"),
+            sampling_ownership=_enum(
+                SamplingOwnership, data.get("sampling_ownership"), f"{where}.sampling_ownership"
             ),
             resource_classes=tuple(
                 _enum(ResourceClass, item, f"{where}.resource_classes[{index}]")
@@ -537,6 +324,8 @@ class EngineCaps:
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
             "num_layers": self.num_layers,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
             "scratch_capacity_tokens": self.scratch_capacity_tokens,
             "supported_work": [value.value for value in self.supported_work],
             "max_latent_size": self.max_latent_size,
@@ -558,38 +347,15 @@ class EngineCaps:
             "pipeline_depth": self.pipeline_depth,
             "encoder_cache_budget": self.encoder_cache_budget,
             "supported_controls": [value.value for value in self.supported_controls],
-            "execution_constraints": {
-                "max_batch_operations": self.execution_constraints.max_batch_operations,
-                "max_speculative_points": self.execution_constraints.max_speculative_points,
-                "max_unresolved_window": self.execution_constraints.max_unresolved_window,
-                "device_sequence_lengths": self.execution_constraints.device_sequence_lengths,
-                "device_append_offsets": self.execution_constraints.device_append_offsets,
-                "incremental_kv_publication": self.execution_constraints.incremental_kv_publication,
-                "route_capabilities": [
-                    {
-                        "route": capability.route,
-                        "supported_work": [variant.value for variant in capability.supported_work],
-                        "tensorized_mixed": capability.tensorized_mixed,
-                        "sampling_ownership": capability.sampling_ownership.value,
-                        "preemptible": capability.preemptible,
-                        "max_unresolved_window": capability.max_unresolved_window,
-                        "legal_feature_bitset": capability.legal_feature_bitset,
-                        "sampler_processors": capability.sampler_processors,
-                        "processor_order_revision": capability.processor_order_revision,
-                        "rng_layouts": capability.rng_layouts,
-                        "graph_eligible": capability.graph_eligible,
-                        "gen_conditioning": capability.gen_conditioning,
-                        "max_points_per_operation": capability.max_points_per_operation,
-                        "mixed_row_combinations": list(capability.mixed_row_combinations),
-                    }
-                    for capability in self.execution_constraints.route_capabilities
-                ],
-            },
+            "max_batch_operations": self.max_batch_operations,
+            "max_unresolved_window": self.max_unresolved_window,
+            "incremental_kv_publication": self.incremental_kv_publication,
+            "tensorized_mixed": self.tensorized_mixed,
+            "sampling_ownership": self.sampling_ownership.value,
             "resource_classes": [value.value for value in self.resource_classes],
             "model_spec_digest": self.model_spec_digest,
             "weight_digest": self.weight_digest,
             "protocol_layout_digest": self.protocol_layout_digest,
-            "route_capability_digest": self.route_capability_digest,
             "restored_snapshots": [reference.to_wire() for reference in self.restored_snapshots],
         }
 

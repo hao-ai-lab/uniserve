@@ -17,7 +17,7 @@ use uniserve_scheduler::{
     Scheduler, SchedulingPolicy,
 };
 use uniserve_worker_ipc::{MultiprocExecutor, StageRouter, WorkerLaunchConfig};
-use uniserve_worker_wire::EngineCaps;
+use uniserve_worker_wire::WorkerCapabilities;
 
 /// Which forward-only worker the engine drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +157,7 @@ impl EngineCoreConfig {
 /// transport-free object.
 pub struct EngineCore {
     handle: EngineHandle,
-    caps: EngineCaps,
+    caps: WorkerCapabilities,
     stats: Arc<SchedStats>,
     model_name: String,
     model_dtype: ModelDtype,
@@ -409,38 +409,13 @@ impl EngineCore {
     }
 
     /// Worker-reported capabilities (the post-load truth).
-    pub fn caps(&self) -> &EngineCaps {
+    pub fn caps(&self) -> &WorkerCapabilities {
         &self.caps
     }
 
     /// Serving-facing projection of post-load worker limits.
     pub fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
-        use uniserve_worker_wire::WorkVariant;
-        let caps = &self.caps;
-        let supports = |variant: WorkVariant| caps.supported_work.contains(&variant);
-        GenerationRuntimeCapabilities {
-            supports_understanding: supports(WorkVariant::TokenExtend)
-                && supports(WorkVariant::TokenDecode),
-            supports_vision_encode: supports(WorkVariant::EncodeVision),
-            supports_latent_encode: supports(WorkVariant::EncodeLatent),
-            supports_image_generation: supports(WorkVariant::GenFlow)
-                && supports(WorkVariant::Materialize),
-            max_latent_units: u64::from(caps.max_latent_size),
-            latent_downsample: caps.latent_downsample,
-            max_vae_grid_tokens: if caps.max_vae_grid_tokens > 0 {
-                caps.max_vae_grid_tokens
-            } else {
-                caps.max_latent_size
-            },
-            max_vit_grid_tokens: caps.max_vit_grid_tokens,
-            max_latent_feature_bytes: caps.max_latent_feature_bytes,
-            max_vision_feature_bytes: caps.max_vision_feature_bytes,
-            commit_marker_tokens: caps.commit_marker_tokens,
-            max_cfg_branches: caps.max_cfg_branches,
-            scratch_capacity_tokens: caps.scratch_capacity_tokens,
-            scratch_block_size: caps.block_size,
-            encoder_cache_entries: caps.encoder_cache_budget,
-        }
+        self.caps.generation_runtime_capabilities()
     }
 
     /// Live scheduler stats, shared with the scheduler thread.

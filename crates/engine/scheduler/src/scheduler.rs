@@ -152,9 +152,9 @@ pub struct SchedStats {
 }
 
 use crossbeam_channel::Receiver;
+use uniserve_core::GenerationRequest;
 use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
-use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities};
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_engine_api::{
     Command, EventTx, FinishReason, GenEvent, GenerationSubmission, PublicCommit, PublicModality,
@@ -163,10 +163,10 @@ use uniserve_engine_api::{
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
-    CompletionReport, Control, Disposition, EngineCaps, ExecutionCapability, GenAdmission,
-    KvAdmission, KvReservation, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload,
-    ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
-    WorkerForwardStats,
+    CompletionReport, Control, Disposition, ExecutionCapability, GenAdmission, KvAdmission,
+    KvReservation, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef,
+    RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
+    WorkerCapabilities, WorkerForwardStats,
 };
 
 use crate::image_artifact::validate_png_artifact;
@@ -502,7 +502,7 @@ impl DerefMut for ReqState {
 
 pub struct Scheduler {
     executor: Box<dyn Executor>,
-    caps: EngineCaps,
+    caps: WorkerCapabilities,
     bm: BlockManager,
     ctrl: ControlTokens,
     config: SchedulerConfig,
@@ -887,7 +887,7 @@ impl Scheduler {
     ) -> Self {
         let caps = executor.caps();
         let cpu_waker = executor.command_waker();
-        let max_batch_ops = caps.execution_constraints.max_batch_operations as usize;
+        let max_batch_ops = caps.max_batch_operations as usize;
         let transfer_capacity = (caps.pipeline_depth as usize)
             .saturating_mul(max_batch_ops)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
@@ -946,7 +946,7 @@ impl Scheduler {
                     "block_size": caps.block_size,
                     "num_blocks": caps.num_blocks,
                     "supported_work": &caps.supported_work,
-                    "max_batch_operations": caps.execution_constraints.max_batch_operations,
+                    "max_batch_operations": caps.max_batch_operations,
                     "pipeline_depth": caps.pipeline_depth,
                     "max_latent_size": caps.max_latent_size,
                     "latent_downsample": caps.latent_downsample,
@@ -1060,7 +1060,7 @@ impl Scheduler {
     pub fn set_max_num_waiting(&mut self, n: usize) {
         self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
     }
-    pub fn caps(&self) -> &EngineCaps {
+    pub fn caps(&self) -> &WorkerCapabilities {
         &self.caps
     }
     pub fn stats_handle(&self) -> Arc<SchedStats> {
@@ -1165,7 +1165,7 @@ impl Scheduler {
                 .pipeline_depth()
                 .saturating_mul(self.config.max_batch),
             active_operations: self.inflight_ops.values().map(VecDeque::len).sum(),
-            max_unresolved_window: self.caps.execution_constraints.max_unresolved_window,
+            max_unresolved_window: self.caps.max_unresolved_window,
             peak_ops_in_batch: self.peak_ops_in_batch,
             phase_delays,
         }
@@ -1633,7 +1633,7 @@ impl Scheduler {
             });
             return;
         }
-        if let Err(error) = req.validate_resources(&self.generation_runtime_capabilities()) {
+        if let Err(error) = req.validate_resources(&self.caps.generation_runtime_capabilities()) {
             let _ = event_tx.send(GenEvent::Rejected {
                 message: format!("invalid generation resource declaration: {error}"),
             });
@@ -1751,31 +1751,6 @@ impl Scheduler {
         self.caps.commit_marker_tokens.max(1) as usize
     }
 
-    fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
-        let supports = |variant: WorkVariant| self.caps.supported_work.contains(&variant);
-        GenerationRuntimeCapabilities {
-            supports_understanding: supports(WorkVariant::TokenExtend)
-                && supports(WorkVariant::TokenDecode),
-            supports_vision_encode: supports(WorkVariant::EncodeVision),
-            supports_latent_encode: supports(WorkVariant::EncodeLatent),
-            supports_image_generation: supports(WorkVariant::GenFlow)
-                && supports(WorkVariant::Materialize)
-                && supports(WorkVariant::TransferKvPublish)
-                && self.caps.execution_constraints.incremental_kv_publication,
-            max_latent_units: u64::from(self.caps.max_latent_size),
-            latent_downsample: self.caps.latent_downsample,
-            max_vae_grid_tokens: self.cap_max_vae_grid_tokens() as u32,
-            max_vit_grid_tokens: self.caps.max_vit_grid_tokens,
-            max_latent_feature_bytes: self.caps.max_latent_feature_bytes,
-            max_vision_feature_bytes: self.caps.max_vision_feature_bytes,
-            commit_marker_tokens: self.caps.commit_marker_tokens,
-            max_cfg_branches: self.caps.max_cfg_branches,
-            scratch_capacity_tokens: self.caps.scratch_capacity_tokens,
-            scratch_block_size: self.caps.block_size,
-            encoder_cache_entries: self.caps.encoder_cache_budget,
-        }
-    }
-
     fn missing_required_capability(&self, request: &GenerationRequest) -> Option<&'static str> {
         let context_steps = request.context.iter().flat_map(|segment| match segment {
             uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
@@ -1784,7 +1759,10 @@ impl Scheduler {
         let needs = request
             .behavior
             .capability_needs(&request.policy, context_steps);
-        self.generation_runtime_capabilities().covers(&needs).err()
+        self.caps
+            .generation_runtime_capabilities()
+            .covers(&needs)
+            .err()
     }
 
     fn worker_tracks_image_latent(&self) -> bool {
@@ -2212,7 +2190,7 @@ impl Scheduler {
             return false;
         };
         if queue.len() >= self.executor.pipeline_depth().max(1)
-            || queue.len() >= self.caps.execution_constraints.max_unresolved_window as usize
+            || queue.len() >= self.caps.max_unresolved_window as usize
             || state.cancelled
             || self.pending_finishes.contains_key(&id)
             || self.custom_logits_processors > 0
@@ -2316,7 +2294,7 @@ impl Scheduler {
     /// frontend decision may run ahead by at most the unresolved-window depth,
     /// after which it waits for an acknowledgement so the horizon stays finite.
     fn pending_commit_horizon_open(&self, state: &ReqState) -> bool {
-        let horizon = self.caps.execution_constraints.max_unresolved_window.max(1) as usize;
+        let horizon = self.caps.max_unresolved_window.max(1) as usize;
         state.pending_commits.len() < horizon
     }
 
@@ -4283,12 +4261,7 @@ impl Scheduler {
         let mut next_partition_id = 1u32;
         let mut next_submission_group = 1u32;
         for (route, groups) in routes {
-            let mixed_capable = self
-                .caps
-                .execution_constraints
-                .route_capabilities
-                .iter()
-                .any(|capability| capability.route == route && capability.tensorized_mixed);
+            let mixed_capable = self.caps.tensorized_mixed;
             let mut mixed_candidates = Vec::new();
             let mut homogeneous = Vec::new();
             for (domain, operations) in groups {

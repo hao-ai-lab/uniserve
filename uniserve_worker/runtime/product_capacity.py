@@ -37,14 +37,14 @@ def device_product_arena_bytes(
     slot_capacity: int,
     device_count: int,
     *,
-    max_speculative_points: int,
+    selected_points_per_operation: int,
     max_product_bytes: int,
 ) -> int:
     """Backing bytes for every scalar arena and every bounded tensor slot."""
 
     slots = int(slot_capacity)
     devices = int(device_count)
-    points = int(max_speculative_points)
+    points = int(selected_points_per_operation)
     product_bytes = int(max_product_bytes)
     if slots < 1 or devices < 1 or points < 1 or product_bytes < 1:
         raise ValueError("device-product arena geometry must be positive")

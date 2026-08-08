@@ -161,7 +161,7 @@ async fn socket_mode_text_generation() {
         .await
         .expect("connect zmq client");
 
-    // The handshake delivered real post-load truth from EngineCaps.
+    // The handshake delivered real post-load truth from WorkerCapabilities.
     assert_eq!(client.engine_count(), 1);
     assert_eq!(client.ready_responses().len(), 1);
     assert!(client.total_num_gpu_blocks() > 0);

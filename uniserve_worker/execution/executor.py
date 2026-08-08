@@ -2526,7 +2526,7 @@ class ModelExecutor:
                 row_kinds == frozenset(combination) for combination in route.mixed_combinations
             ):
                 raise invalid_descriptor(
-                    "tensorized mixed submission is outside the route capability proof"
+                    "tensorized mixed submission exceeds worker mixed-execution capabilities"
                 )
         group_identities: list[tuple[int, str]] = []
         for submission_group, partitions in groups.items():

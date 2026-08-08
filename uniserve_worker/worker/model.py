@@ -27,7 +27,7 @@ from ..batch import (
     StorageClass,
     WorkVariant,
 )
-from ..capabilities import RequestKind
+from ..capabilities import RequestKind, WorkerCapabilities
 from ..execution import ModelExecutor, ModelRunner
 from ..execution.executor import completion_report_ready, finalize_completion_report
 from ..forward import AttentionSelection
@@ -55,7 +55,6 @@ from ..runtime.request_session import SessionStore
 from ..runtime.residency import ResidencyStore
 from ..runtime.snapshot_store import SnapshotProvider
 from ..spec import DeploymentOverlay, ModelSpec, RouteRowKind, resolved_digest
-from .protocol import WorkerContract
 
 logger = logging.getLogger(__name__)
 
@@ -224,16 +223,28 @@ class ModelWorker:
                     RequestKind.RESTORE_SESSION,
                 ),
             )
-        self._contract = WorkerContract.compile(
+        if int(pipeline_depth) <= 0:
+            raise capability_mismatch("worker pipeline depth must be positive")
+        implemented_work = frozenset(model_spec.operation_variants())
+        self._effective_work_variants = allowed_work_variants & implemented_work
+        if not self._effective_work_variants:
+            raise capability_mismatch(
+                f"{type(self).__name__} implements none of the requested work variants "
+                f"{sorted(value.value for value in allowed_work_variants)!r}"
+            )
+        advertised_work = self._effective_work_variants.intersection(declared.supported_work)
+        if not advertised_work:
+            raise capability_mismatch(f"{type(self).__name__} advertises no executable work")
+        self._capabilities = replace(
             declared,
-            allowed_work_variants=allowed_work_variants,
-            implemented_work_variants=frozenset(model_spec.operation_variants()),
-            pipeline_depth=pipeline_depth,
-            owner=type(self).__name__,
+            supported_work=tuple(
+                variant for variant in WorkVariant if variant in advertised_work
+            ),
+            pipeline_depth=int(pipeline_depth),
         )
         self.residency = ResidencyStore.from_spec(
             model_spec,
-            self._contract.capabilities,
+            self._capabilities,
             deployment.resources,
             device=deployment.device,
         )
@@ -281,7 +292,7 @@ class ModelWorker:
             tokenizer=tokenizer,
             model_spec_digest=self.model_spec_digest,
             weight_digest=self.weight_digest,
-            allowed_work_variants=frozenset(self._contract.effective_work_variants),
+            allowed_work_variants=self._effective_work_variants,
             trace=self.trace,
             pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
@@ -292,7 +303,7 @@ class ModelWorker:
         self._warmup_step_id = 0
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:
-            caps = self._contract.capabilities
+            caps = self._capabilities
             self.snapshot_provider = SnapshotProvider(
                 snapshot_dir,
                 model_spec_digest=self.model_spec_digest,
@@ -313,22 +324,17 @@ class ModelWorker:
                 transport=self.mover.transport,
             )
             restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
-            self._contract = replace(
-                self._contract,
-                capabilities=replace(
-                    self._contract.capabilities,
-                    restored_snapshots=tuple(
-                        sorted(
-                            restored, key=lambda reference: reference.version.request_key.session_id
-                        )
-                    ),
+            self._capabilities = replace(
+                self._capabilities,
+                restored_snapshots=tuple(
+                    sorted(restored, key=lambda reference: reference.version.request_key.session_id)
                 ),
             )
             logger.info("restored %d durable worker sessions", len(restored))
 
     @property
-    def contract(self) -> WorkerContract:
-        return self._contract
+    def capabilities(self) -> WorkerCapabilities:
+        return self._capabilities
 
     def _decode_context_blocks(self) -> int:
         pool = self.kv.pool
@@ -444,7 +450,7 @@ class ModelWorker:
 
         import math
 
-        caps = self._contract.capabilities
+        caps = self._capabilities
         downsample = max(1, int(caps.latent_downsample))
         capacity = int(caps.max_latent_size)
         if int(caps.max_vae_grid_tokens) > 0:
@@ -488,7 +494,7 @@ class ModelWorker:
             encode_token_product_bytes,
         )
 
-        variants = self._contract.effective_work_variants
+        variants = self._effective_work_variants
         if WorkVariant.TOKEN_EXTEND not in variants:
             return
         pool = self.kv.pool
@@ -788,7 +794,7 @@ class ModelWorker:
         )
 
         if (
-            WorkVariant.GEN_TRANSITION not in self._contract.effective_work_variants
+            WorkVariant.GEN_TRANSITION not in self._effective_work_variants
             or self.model_spec.flow is None
         ):
             return
@@ -950,7 +956,7 @@ class ModelWorker:
         self.snapshot_provider.restore(reference)
 
     def resource_pressure(self) -> list[dict[str, object]]:
-        caps = self._contract.capabilities
+        caps = self._capabilities
         counts = {
             "kv_block": self.kv.resident_block_count(),
             "scratch": self.kv.scratch_token_count(),

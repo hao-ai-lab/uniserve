@@ -9,14 +9,14 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 use crate::schema::uniserve::wire as fbs;
 use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
-    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, EngineCaps,
-    ErrorCode, ErrorOperationIdentity, ExecutionCapability, ExecutionConstraints, FinishFlags,
-    GenAdmission, KvAdmission, KvReservation, LogicalLengths, OpId, OpStatus, Operation,
-    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng,
-    RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass,
-    TimingCounters, TokenSpan, UndAdmission, VersionRef, Work, WorkVariant, WorkerForwardStats,
-    WorkerMetrics, WorkerRequest, WorkerResponse,
+    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
+    ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, KvAdmission,
+    KvReservation, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point,
+    PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
+    ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, SamplingOwnership, ShapeBound,
+    SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, Work,
+    WorkVariant, WorkerCapabilities, WorkerForwardStats, WorkerMetrics, WorkerRequest,
+    WorkerResponse,
 };
 
 pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -644,11 +644,15 @@ fn error_operation_from_table(
     })
 }
 
-fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCaps> {
-    let caps = EngineCaps {
+fn capabilities_from_table(
+    caps: fbs::WorkerCapabilities<'_>,
+) -> anyhow::Result<WorkerCapabilities> {
+    let caps = WorkerCapabilities {
         block_size: caps.block_size(),
         num_blocks: caps.num_blocks(),
         num_layers: caps.num_layers(),
+        num_kv_heads: caps.num_kv_heads(),
+        head_dim: caps.head_dim(),
         scratch_capacity_tokens: caps.scratch_capacity_tokens(),
         supported_work: caps
             .supported_work()
@@ -706,63 +710,11 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
             })
             .transpose()?
             .unwrap_or_default(),
-        execution_constraints: caps
-            .execution_constraints()
-            .map(|constraints| -> anyhow::Result<ExecutionConstraints> {
-                Ok(ExecutionConstraints {
-                    max_batch_operations: constraints.max_batch_operations(),
-                    max_speculative_points: constraints.max_speculative_points(),
-                    max_unresolved_window: constraints.max_unresolved_window(),
-                    device_sequence_lengths: constraints.device_sequence_lengths(),
-                    device_append_offsets: constraints.device_append_offsets(),
-                    incremental_kv_publication: constraints.incremental_kv_publication(),
-                    route_capabilities: constraints
-                        .route_capabilities()
-                        .map(|capabilities| {
-                            capabilities
-                                .iter()
-                                .map(|capability| {
-                                    Ok(RouteExecutionCapability {
-                                        route: RouteId(capability.route()),
-                                        supported_work: capability
-                                            .supported_work()
-                                            .map(|variants| {
-                                                variants
-                                                    .iter()
-                                                    .map(work_from_fb)
-                                                    .collect::<anyhow::Result<Vec<_>>>()
-                                            })
-                                            .transpose()?
-                                            .unwrap_or_default(),
-                                        tensorized_mixed: capability.tensorized_mixed(),
-                                        sampling_ownership: sampling_ownership_from_fb(
-                                            capability.sampling_ownership(),
-                                        )?,
-                                        preemptible: capability.preemptible(),
-                                        max_unresolved_window: capability.max_unresolved_window(),
-                                        legal_feature_bitset: capability.legal_feature_bitset(),
-                                        sampler_processors: capability.sampler_processors(),
-                                        processor_order_revision: capability
-                                            .processor_order_revision(),
-                                        rng_layouts: capability.rng_layouts(),
-                                        graph_eligible: capability.graph_eligible(),
-                                        gen_conditioning: capability.gen_conditioning(),
-                                        max_points_per_operation: capability
-                                            .max_points_per_operation(),
-                                        mixed_row_combinations: capability
-                                            .mixed_row_combinations()
-                                            .map(|items| items.iter().collect())
-                                            .unwrap_or_default(),
-                                    })
-                                })
-                                .collect::<anyhow::Result<Vec<_>>>()
-                        })
-                        .transpose()?
-                        .unwrap_or_default(),
-                })
-            })
-            .transpose()?
-            .context("capabilities have no execution constraints")?,
+        max_batch_operations: caps.max_batch_operations(),
+        max_unresolved_window: caps.max_unresolved_window(),
+        incremental_kv_publication: caps.incremental_kv_publication(),
+        tensorized_mixed: caps.tensorized_mixed(),
+        sampling_ownership: sampling_ownership_from_fb(caps.sampling_ownership())?,
         resource_classes: caps
             .resource_classes()
             .map(|items| {
@@ -2062,12 +2014,14 @@ fn error_operation_from_fb(
 // Capabilities
 // ---------------------------------------------------------------------------
 
-fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
+fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCapabilitiesT> {
     caps.validate()?;
-    Ok(fbs::EngineCapsT {
+    Ok(fbs::WorkerCapabilitiesT {
         block_size: caps.block_size,
         num_blocks: caps.num_blocks,
         num_layers: caps.num_layers,
+        num_kv_heads: caps.num_kv_heads,
+        head_dim: caps.head_dim,
         scratch_capacity_tokens: caps.scratch_capacity_tokens,
         supported_work: Some(
             caps.supported_work
@@ -2101,43 +2055,11 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
                 .map(request_kind_to_fb)
                 .collect(),
         ),
-        execution_constraints: Some(Box::new(fbs::ExecutionConstraintsT {
-            max_batch_operations: caps.execution_constraints.max_batch_operations,
-            max_speculative_points: caps.execution_constraints.max_speculative_points,
-            max_unresolved_window: caps.execution_constraints.max_unresolved_window,
-            device_sequence_lengths: caps.execution_constraints.device_sequence_lengths,
-            device_append_offsets: caps.execution_constraints.device_append_offsets,
-            incremental_kv_publication: caps.execution_constraints.incremental_kv_publication,
-            route_capabilities: Some(
-                caps.execution_constraints
-                    .route_capabilities
-                    .iter()
-                    .map(|capability| fbs::RouteExecutionCapabilityT {
-                        route: capability.route.0,
-                        supported_work: Some(
-                            capability
-                                .supported_work
-                                .iter()
-                                .copied()
-                                .map(work_to_fb)
-                                .collect(),
-                        ),
-                        tensorized_mixed: capability.tensorized_mixed,
-                        sampling_ownership: sampling_ownership_to_fb(capability.sampling_ownership),
-                        preemptible: capability.preemptible,
-                        max_unresolved_window: capability.max_unresolved_window,
-                        legal_feature_bitset: capability.legal_feature_bitset,
-                        sampler_processors: capability.sampler_processors,
-                        processor_order_revision: capability.processor_order_revision,
-                        rng_layouts: capability.rng_layouts,
-                        graph_eligible: capability.graph_eligible,
-                        gen_conditioning: capability.gen_conditioning,
-                        max_points_per_operation: capability.max_points_per_operation,
-                        mixed_row_combinations: Some(capability.mixed_row_combinations.clone()),
-                    })
-                    .collect(),
-            ),
-        })),
+        max_batch_operations: caps.max_batch_operations,
+        max_unresolved_window: caps.max_unresolved_window,
+        incremental_kv_publication: caps.incremental_kv_publication,
+        tensorized_mixed: caps.tensorized_mixed,
+        sampling_ownership: sampling_ownership_to_fb(caps.sampling_ownership),
         resource_classes: Some(
             caps.resource_classes
                 .iter()
@@ -2148,17 +2070,18 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         model_spec_digest: Some(caps.model_spec_digest.clone()),
         weight_digest: Some(caps.weight_digest.clone()),
         protocol_layout_digest: Some(caps.protocol_layout_digest.clone()),
-        route_capability_digest: Some(String::new()),
         restored_snapshots: Some(caps.restored_snapshots.iter().map(snapshot_to_fb).collect()),
     })
 }
 
 #[cfg(test)]
-fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
-    let caps = EngineCaps {
+fn capabilities_from_fb(caps: fbs::WorkerCapabilitiesT) -> anyhow::Result<WorkerCapabilities> {
+    let caps = WorkerCapabilities {
         block_size: caps.block_size,
         num_blocks: caps.num_blocks,
         num_layers: caps.num_layers,
+        num_kv_heads: caps.num_kv_heads,
+        head_dim: caps.head_dim,
         scratch_capacity_tokens: caps.scratch_capacity_tokens,
         supported_work: caps
             .supported_work
@@ -2204,52 +2127,11 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
             .into_iter()
             .map(request_kind_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        execution_constraints: caps
-            .execution_constraints
-            .map(|constraints| -> anyhow::Result<ExecutionConstraints> {
-                Ok(ExecutionConstraints {
-                    max_batch_operations: constraints.max_batch_operations,
-                    max_speculative_points: constraints.max_speculative_points,
-                    max_unresolved_window: constraints.max_unresolved_window,
-                    device_sequence_lengths: constraints.device_sequence_lengths,
-                    device_append_offsets: constraints.device_append_offsets,
-                    incremental_kv_publication: constraints.incremental_kv_publication,
-                    route_capabilities: constraints
-                        .route_capabilities
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|capability| {
-                            Ok(RouteExecutionCapability {
-                                route: RouteId(capability.route),
-                                supported_work: capability
-                                    .supported_work
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(work_from_fb)
-                                    .collect::<anyhow::Result<Vec<_>>>()?,
-                                tensorized_mixed: capability.tensorized_mixed,
-                                sampling_ownership: sampling_ownership_from_fb(
-                                    capability.sampling_ownership,
-                                )?,
-                                preemptible: capability.preemptible,
-                                max_unresolved_window: capability.max_unresolved_window,
-                                legal_feature_bitset: capability.legal_feature_bitset,
-                                sampler_processors: capability.sampler_processors,
-                                processor_order_revision: capability.processor_order_revision,
-                                rng_layouts: capability.rng_layouts,
-                                graph_eligible: capability.graph_eligible,
-                                gen_conditioning: capability.gen_conditioning,
-                                max_points_per_operation: capability.max_points_per_operation,
-                                mixed_row_combinations: capability
-                                    .mixed_row_combinations
-                                    .unwrap_or_default(),
-                            })
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?,
-                })
-            })
-            .transpose()?
-            .context("capabilities have no execution constraints")?,
+        max_batch_operations: caps.max_batch_operations,
+        max_unresolved_window: caps.max_unresolved_window,
+        incremental_kv_publication: caps.incremental_kv_publication,
+        tensorized_mixed: caps.tensorized_mixed,
+        sampling_ownership: sampling_ownership_from_fb(caps.sampling_ownership)?,
         resource_classes: caps
             .resource_classes
             .unwrap_or_default()
