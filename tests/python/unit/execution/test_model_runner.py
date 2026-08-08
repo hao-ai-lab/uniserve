@@ -594,7 +594,7 @@ def test_staging_byte_capacity_rejects_growth_without_mutating_usage() -> None:
     slot = stager.acquire("cpu")
     assert slot.int_buffer("tokens", 4, pin=False).numel() == 4
     assert stager.allocated_bytes == 16
-    with pytest.raises(ResourceError, match="byte credit"):
+    with pytest.raises(ResourceError, match="byte capacity"):
         slot.int_buffer("positions", 1, pin=False)
     assert stager.allocated_bytes == 16
 

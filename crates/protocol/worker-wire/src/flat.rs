@@ -9,14 +9,14 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 use crate::schema::uniserve::wire as fbs;
 use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
-    CompletionReport, Control, CreditVector, DType, DimBound, Disposition, Domain, DrawLayout,
-    EngineCaps, ErrorCode, ErrorOperationIdentity, ExecutionCapability, ExecutionConstraints,
-    FinishFlags, GenAdmission, KvAdmission, KvReservation, LogicalLengths, OpId, OpStatus,
-    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, EngineCaps,
+    ErrorCode, ErrorOperationIdentity, ExecutionCapability, ExecutionConstraints, FinishFlags,
+    GenAdmission, KvAdmission, KvReservation, LogicalLengths, OpId, OpStatus, Operation,
+    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
     RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng,
-    RouteCreditLimits, RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound,
-    SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, Work,
-    WorkVariant, WorkerForwardStats, WorkerMetrics, WorkerRequest, WorkerResponse,
+    RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass,
+    TimingCounters, TokenSpan, UndAdmission, VersionRef, Work, WorkVariant, WorkerForwardStats,
+    WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 
 pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -739,11 +739,6 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
                                             capability.sampling_ownership(),
                                         )?,
                                         preemptible: capability.preemptible(),
-                                        credits: route_credit_limits_from_table(
-                                            capability
-                                                .credits()
-                                                .context("route capability has no credit limits")?,
-                                        )?,
                                         max_unresolved_window: capability.max_unresolved_window(),
                                         legal_feature_bitset: capability.legal_feature_bitset(),
                                         sampler_processors: capability.sampler_processors(),
@@ -2067,104 +2062,6 @@ fn error_operation_from_fb(
 // Capabilities
 // ---------------------------------------------------------------------------
 
-fn credit_vector_from_table(value: fbs::CreditVector<'_>) -> CreditVector {
-    CreditVector {
-        registered_operations: value.registered_operations(),
-        execution_slots: value.execution_slots(),
-        completion_slots: value.completion_slots(),
-        device_products: value.device_products(),
-        kv_pages: value.kv_pages(),
-        rollback_deltas: value.rollback_deltas(),
-        latent_artifact_bytes: value.latent_artifact_bytes(),
-        pinned_completion_staging_bytes: value.pinned_completion_staging_bytes(),
-        transfer_bytes: value.transfer_bytes(),
-        transfer_tickets: value.transfer_tickets(),
-        cpu_tasks: value.cpu_tasks(),
-        output_journal_bytes: value.output_journal_bytes(),
-    }
-}
-
-fn route_credit_limits_from_table(
-    value: fbs::RouteCreditLimits<'_>,
-) -> anyhow::Result<RouteCreditLimits> {
-    let limits = RouteCreditLimits {
-        per_request: credit_vector_from_table(
-            value
-                .per_request()
-                .context("route credit limits have no per-request vector")?,
-        ),
-        worker: credit_vector_from_table(
-            value
-                .worker()
-                .context("route credit limits have no worker vector")?,
-        ),
-    };
-    limits.validate()?;
-    Ok(limits)
-}
-
-fn credit_vector_to_fb(value: CreditVector) -> fbs::CreditVectorT {
-    fbs::CreditVectorT {
-        registered_operations: value.registered_operations,
-        execution_slots: value.execution_slots,
-        completion_slots: value.completion_slots,
-        device_products: value.device_products,
-        kv_pages: value.kv_pages,
-        rollback_deltas: value.rollback_deltas,
-        latent_artifact_bytes: value.latent_artifact_bytes,
-        pinned_completion_staging_bytes: value.pinned_completion_staging_bytes,
-        transfer_bytes: value.transfer_bytes,
-        transfer_tickets: value.transfer_tickets,
-        cpu_tasks: value.cpu_tasks,
-        output_journal_bytes: value.output_journal_bytes,
-    }
-}
-
-fn route_credit_limits_to_fb(value: RouteCreditLimits) -> fbs::RouteCreditLimitsT {
-    fbs::RouteCreditLimitsT {
-        per_request: Some(Box::new(credit_vector_to_fb(value.per_request))),
-        worker: Some(Box::new(credit_vector_to_fb(value.worker))),
-    }
-}
-
-#[cfg(test)]
-fn credit_vector_from_fb(value: fbs::CreditVectorT) -> CreditVector {
-    CreditVector {
-        registered_operations: value.registered_operations,
-        execution_slots: value.execution_slots,
-        completion_slots: value.completion_slots,
-        device_products: value.device_products,
-        kv_pages: value.kv_pages,
-        rollback_deltas: value.rollback_deltas,
-        latent_artifact_bytes: value.latent_artifact_bytes,
-        pinned_completion_staging_bytes: value.pinned_completion_staging_bytes,
-        transfer_bytes: value.transfer_bytes,
-        transfer_tickets: value.transfer_tickets,
-        cpu_tasks: value.cpu_tasks,
-        output_journal_bytes: value.output_journal_bytes,
-    }
-}
-
-#[cfg(test)]
-fn route_credit_limits_from_fb(
-    value: fbs::RouteCreditLimitsT,
-) -> anyhow::Result<RouteCreditLimits> {
-    let limits = RouteCreditLimits {
-        per_request: credit_vector_from_fb(
-            *value
-                .per_request
-                .context("route credit limits have no per-request vector")?,
-        ),
-        worker: credit_vector_from_fb(
-            *value
-                .worker
-                .context("route credit limits have no worker vector")?,
-        ),
-    };
-    limits.validate()?;
-    Ok(limits)
-}
-
 fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
     caps.validate()?;
     Ok(fbs::EngineCapsT {
@@ -2228,7 +2125,6 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
                         tensorized_mixed: capability.tensorized_mixed,
                         sampling_ownership: sampling_ownership_to_fb(capability.sampling_ownership),
                         preemptible: capability.preemptible,
-                        credits: Some(Box::new(route_credit_limits_to_fb(capability.credits))),
                         max_unresolved_window: capability.max_unresolved_window,
                         legal_feature_bitset: capability.legal_feature_bitset,
                         sampler_processors: capability.sampler_processors,
@@ -2336,11 +2232,6 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
                                     capability.sampling_ownership,
                                 )?,
                                 preemptible: capability.preemptible,
-                                credits: route_credit_limits_from_fb(
-                                    *capability
-                                        .credits
-                                        .context("route capability has no credit limits")?,
-                                )?,
                                 max_unresolved_window: capability.max_unresolved_window,
                                 legal_feature_bitset: capability.legal_feature_bitset,
                                 sampler_processors: capability.sampler_processors,

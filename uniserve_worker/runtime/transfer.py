@@ -56,6 +56,7 @@ __all__ = [
     "encode_transfer_descriptor",
 ]
 
+
 class TransportKind(StrEnum):
     LOCAL = "local"
     SHM = "shm"
@@ -415,7 +416,7 @@ class _ByteCapacity:
             projected = self.used + value
             if projected > self.capacity:
                 raise resource_error(
-                    f"transfer byte credit is exhausted ({projected}>{self.capacity})"
+                    f"transfer byte capacity is exhausted ({projected}>{self.capacity})"
                 )
             self.used = projected
 
@@ -440,13 +441,15 @@ class _BoundedTransferPool:
             max_workers=workers,
             thread_name_prefix=name,
         )
-        self._credits = threading.BoundedSemaphore(capacity)
+        self._entries = threading.BoundedSemaphore(capacity)
         self._bytes = (
-            byte_capacity if isinstance(byte_capacity, _ByteCapacity) else _ByteCapacity(byte_capacity)
+            byte_capacity
+            if isinstance(byte_capacity, _ByteCapacity)
+            else _ByteCapacity(byte_capacity)
         )
 
     def submit(self, operation: Any, *args: Any, nbytes: int) -> TransferTicket:
-        if not self._credits.acquire(blocking=False):
+        if not self._entries.acquire(blocking=False):
             raise resource_error("asynchronous transfer ticket capacity is exhausted")
         bytes_acquired = False
         try:
@@ -456,11 +459,12 @@ class _BoundedTransferPool:
         except BaseException:
             if bytes_acquired:
                 self._bytes.release(nbytes)
-            self._credits.release()
+            self._entries.release()
             raise
+
         def release(_future: object) -> None:
             self._bytes.release(nbytes)
-            self._credits.release()
+            self._entries.release()
 
         future.add_done_callback(release)
         return _FutureTransferTicket(future)
@@ -590,7 +594,7 @@ class ShmTransport(Transport):
     blocking_fetch = True
     _MAX_LIVE_SEGMENTS = 256
 
-    def __init__(self, *, byte_capacity: int) -> None:
+    def __init__(self, *, byte_capacity: int, ticket_capacity: int) -> None:
         from collections import OrderedDict
 
         self._segments: "OrderedDict[str, Any]" = OrderedDict()  # name -> SharedMemory (LRU)
@@ -599,6 +603,9 @@ class ShmTransport(Transport):
         self._publication_bytes: dict[str, int] = {}
         self._lock = threading.Lock()
         self._bytes = _ByteCapacity(byte_capacity)
+        self._ticket_capacity = int(ticket_capacity)
+        if self._ticket_capacity < 1:
+            raise ValueError("shared-memory transfer ticket capacity must be positive")
         self._publication_queue: queue.Queue[
             tuple[str, Any, int, Any, Any, threading.Event] | None
         ] = queue.Queue()
@@ -610,7 +617,7 @@ class ShmTransport(Transport):
         self._publication_worker.start()
         self._reads = _BoundedTransferPool(
             workers=2,
-            capacity=self._MAX_LIVE_SEGMENTS,
+            capacity=self._ticket_capacity,
             byte_capacity=self._bytes,
             name="uniserve-shm-read",
         )
@@ -883,6 +890,7 @@ class CudaIpcTransport(Transport):
 
     name = "cuda_ipc"
     supports_async_publication = True
+    _MAX_LIVE_PUBLICATIONS = 256
 
     def __init__(self, *, byte_capacity: int) -> None:
         self._alive: dict[str, tuple["torch.Tensor", "torch.cuda.Event"]] = {}
@@ -908,7 +916,7 @@ class CudaIpcTransport(Transport):
         event.record(torch.cuda.current_stream(source.device))
         publication_id = uuid.uuid4().hex
         with self._lock:
-            if len(self._alive) >= 256:
+            if len(self._alive) >= self._MAX_LIVE_PUBLICATIONS:
                 self._bytes.release(nbytes)
                 raise resource_error("CUDA IPC publication capacity is exhausted")
             self._alive[publication_id] = (t, event)
@@ -986,7 +994,10 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
     if kind is TransportKind.LOCAL:
         return LocalTransport(byte_capacity=int(cfg["byte_capacity"]))
     if kind is TransportKind.SHM:
-        return ShmTransport(byte_capacity=int(cfg["byte_capacity"]))
+        return ShmTransport(
+            byte_capacity=int(cfg["byte_capacity"]),
+            ticket_capacity=int(cfg["ticket_capacity"]),
+        )
     if kind is TransportKind.CUDA_IPC:
         return CudaIpcTransport(byte_capacity=int(cfg["byte_capacity"]))
     raise AssertionError(f"unhandled transport kind {kind!r}")

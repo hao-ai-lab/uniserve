@@ -399,7 +399,6 @@ def route_capability_digest(
             bool,
             SamplingOwnership,
             bool,
-            tuple[Sequence[int], Sequence[int]],
             int,
             int,
             int,
@@ -446,7 +445,6 @@ def route_capability_digest(
         tensorized_mixed,
         sampling_ownership,
         preemptible,
-        credits,
         cap_max_unresolved_window,
         legal_feature_bitset,
         sampler_processors,
@@ -467,11 +465,6 @@ def route_capability_digest(
         digest.boolean(tensorized_mixed)
         digest.u8(_SAMPLING_OWNERSHIP_INDEX[SamplingOwnership(sampling_ownership)])
         digest.boolean(preemptible)
-        per_request, worker = credits
-        if len(per_request) != 12 or len(worker) != 12:
-            raise ValueError("route credit digest requires all twelve dimensions")
-        for value in (*per_request, *worker):
-            digest.u64(int(value))
         digest.u32(int(cap_max_unresolved_window))
         digest.u32(int(legal_feature_bitset))
         digest.u32(int(sampler_processors))

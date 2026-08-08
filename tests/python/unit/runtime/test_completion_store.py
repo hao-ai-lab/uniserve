@@ -91,7 +91,7 @@ def test_abandoned_query_ready_completion_returns_capacity() -> None:
     assert arena.reserve(1).generation != lease.generation
 
 
-def test_partition_leases_share_one_bounded_completion_byte_credit_pool() -> None:
+def test_partition_leases_share_one_bounded_completion_byte_pool() -> None:
     arena = CompletionArena(depth=3, token_capacity=4, total_token_capacity=4)
     first = arena.reserve(1, token_capacity=2)
     second = arena.reserve(1, token_capacity=2)

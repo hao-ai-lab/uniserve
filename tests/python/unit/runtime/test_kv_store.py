@@ -317,6 +317,33 @@ def test_incremental_publication_binds_logical_lease_and_exact_base() -> None:
         )
 
 
+def test_failed_publication_returns_all_transport_capacity() -> None:
+    store = KvStore(_pool(layers=2))
+    key = _register(store, 1, (0,))
+    _write(store, 1, (1.0, 2.0))
+    transport = LocalTransport(byte_capacity=24)
+
+    with pytest.raises(WorkerError, match="transfer byte capacity"):
+        store.publish(
+            1,
+            source_version=_version(key, 10, 1, "a"),
+            source_digest="a" * 64,
+            destination="generation",
+            expected_base=None,
+            product=_product(
+                key,
+                20,
+                kind=ProductKind.KV,
+                storage_class=StorageClass.PAGED_KV,
+            ),
+            transport=transport,
+        )
+
+    assert store.published_locator_count() == 0
+    probe = transport.publish(torch.ones(6, dtype=torch.float32))
+    transport.release(probe)
+
+
 def test_snapshot_install_uses_destination_physical_mapping() -> None:
     source = KvStore(_pool())
     key = _register(source, 1, (0, 1))

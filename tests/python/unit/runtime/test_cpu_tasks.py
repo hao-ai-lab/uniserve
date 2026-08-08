@@ -11,7 +11,7 @@ from uniserve_worker.runtime.cpu_tasks import BoundedCpuTaskPool
 pytestmark = pytest.mark.unit
 
 
-def test_cpu_task_credit_reclaims_after_the_registered_future_finishes() -> None:
+def test_cpu_task_slot_reclaims_after_the_registered_future_finishes() -> None:
     pool = BoundedCpuTaskPool(capacity=1, workers=1)
     started = Event()
     release = Event()
@@ -38,7 +38,7 @@ def test_cpu_task_credit_reclaims_after_the_registered_future_finishes() -> None
     pool.close()
 
 
-def test_abandoned_cpu_task_registration_reclaims_its_credit() -> None:
+def test_abandoned_cpu_task_registration_reclaims_its_slot() -> None:
     pool = BoundedCpuTaskPool(capacity=1, workers=1)
     reservation = pool.reserve()
     reservation.abandon()

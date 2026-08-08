@@ -1180,6 +1180,7 @@ class KvStore:
         if base_extent > entry.committed_len:
             raise invalid_descriptor("KV publication destination is ahead of its source")
         locators: list[str] = []
+        publications: list[Locator] = []
         suffix = entry.committed_len - base_extent
         if transport is not None and suffix:
             if self.pool is None:
@@ -1187,17 +1188,26 @@ class KvStore:
             if not bool(getattr(transport, "supports_async_publication", False)):
                 raise invalid_descriptor("KV publication transport is not asynchronous")
             publish = getattr(transport, "publish_async")
-            for layer in range(self.pool.num_layers):
-                key, value = self.pool.read(
-                    layer,
-                    entry.block_ids,
-                    start=base_extent,
-                    length=suffix,
-                )
-                if key is None or value is None:
-                    raise RuntimeError("published KV span is incomplete")
-                locators.append(publish(key.contiguous()).to_wire_json())
-                locators.append(publish(value.contiguous()).to_wire_json())
+            try:
+                for layer in range(self.pool.num_layers):
+                    key, value = self.pool.read(
+                        layer,
+                        entry.block_ids,
+                        start=base_extent,
+                        length=suffix,
+                    )
+                    if key is None or value is None:
+                        raise RuntimeError("published KV span is incomplete")
+                    for tensor in (key, value):
+                        locator = publish(tensor.contiguous())
+                        publications.append(locator)
+                        locators.append(locator.to_wire_json())
+            except BaseException:
+                release = getattr(transport, "release", None)
+                if callable(release):
+                    for locator in publications:
+                        release(locator)
+                raise
             self._retain_published(session_id, product, tuple(locators), transport)
         snapshot = KvSnapshot(
             locators=tuple(locators),

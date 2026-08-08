@@ -6,13 +6,11 @@ from collections.abc import Sequence
 
 from ..batch import SamplingOwnership, WorkVariant
 from ..capabilities import (
-    CreditVector,
     EngineCaps,
     ExecutionConstraints,
     RankInfo,
     RequestKind,
     ResourceClass,
-    RouteCreditLimits,
     RouteExecutionCapability,
     configured_work_variants,
 )
@@ -31,8 +29,7 @@ from ..spec import (
     RouteRowKind,
     active_latent_capacity_tokens,
 )
-from .latent_capacity import latent_store_capacity_bytes
-from .product_capacity import device_product_arena_bytes
+from .arena_capacity import operation_window
 
 # Sampler-processor, RNG-layout, and processor-order constants mirroring the
 # worker-wire capability constants byte-for-byte. The full sampler-processor set
@@ -171,17 +168,11 @@ def resolve_capabilities(
         num_blocks=int(capacity.num_blocks),
         max_latent_size=max_latent_size,
     )
-    credit_limits = _route_credit_limits(
-        spec,
-        deployment,
-        pipeline_depth=int(pipeline_depth),
-        completion_payload_bytes=int(completion_payload_bytes),
-        num_blocks=int(capacity.num_blocks),
-        scratch_capacity_tokens=int(scratch_capacity),
-        max_latent_size=int(max_latent_size),
-        max_latent_feature_bytes=int(max_latent_feature_bytes),
-        max_vision_feature_bytes=int(max_vision_feature_bytes),
-        bytes_per_token=int(bytes_per_token),
+    if int(completion_payload_bytes) < 1:
+        raise ValueError("completion payload capacity must be positive")
+    unresolved_window = operation_window(
+        int(pipeline_depth),
+        int(deployment.max_batch_operations),
     )
     controls = [
         RequestKind.DROP_SESSION,
@@ -237,7 +228,7 @@ def resolve_capabilities(
         execution_constraints=ExecutionConstraints(
             max_batch_operations=int(deployment.max_batch_operations),
             max_speculative_points=max_speculative_points,
-            max_unresolved_window=int(credit_limits.per_request.registered_operations),
+            max_unresolved_window=unresolved_window,
             device_sequence_lengths=True,
             device_append_offsets=True,
             incremental_kv_publication=True,
@@ -248,10 +239,7 @@ def resolve_capabilities(
                     tensorized_mixed=tensorized_mixed,
                     sampling_ownership=sampling_ownership,
                     preemptible=preemptible,
-                    credits=credit_limits,
-                    max_unresolved_window=int(
-                        credit_limits.per_request.registered_operations
-                    ),
+                    max_unresolved_window=unresolved_window,
                     legal_feature_bitset=_LEGAL_CONTINUATION_FEATURES,
                     sampler_processors=_ALL_SAMPLER_PROCESSORS,
                     processor_order_revision=PROCESSOR_ORDER_REVISION,
@@ -282,106 +270,6 @@ def resolve_capabilities(
         model_spec_digest=model_spec_digest or "",
         weight_digest=weight_digest or "",
     )
-
-
-def _route_credit_limits(
-    spec: ModelSpec,
-    deployment: DeploymentOverlay,
-    *,
-    pipeline_depth: int,
-    completion_payload_bytes: int,
-    num_blocks: int,
-    scratch_capacity_tokens: int,
-    max_latent_size: int,
-    max_latent_feature_bytes: int,
-    max_vision_feature_bytes: int,
-    bytes_per_token: int,
-) -> RouteCreditLimits:
-    if pipeline_depth < 1 or completion_payload_bytes < 1:
-        raise ValueError("credit sizing requires positive pipeline and payload bounds")
-    max_operations = int(deployment.max_batch_operations)
-    slots = pipeline_depth * max_operations
-    window = min(slots, max(2, pipeline_depth))
-    max_speculative_points = 1
-    products_per_operation = 5
-    transfer_tickets = min(slots, 256)
-    block_size = int(deployment.block_size)
-    scratch_pages = ceil_div(int(scratch_capacity_tokens), block_size)
-    kv_pages = int(num_blocks) + scratch_pages
-    max_route_tokens = max(
-        (int(route.shape.max_tokens_per_row) for route in spec.routes), default=1
-    )
-    max_transfer_per_operation = max(
-        int(num_blocks) * block_size * int(bytes_per_token),
-        int(max_latent_feature_bytes),
-        int(max_vision_feature_bytes),
-        1,
-    )
-    flow = spec.flow
-    latent_capacity_bytes = 0
-    artifact_bytes = 0
-    if flow is not None:
-        latent_capacity_bytes = latent_store_capacity_bytes(
-            int(max_latent_size),
-            int(flow.latent_channels),
-            int(flow.latent_patch_size),
-        )
-        raw_image_bytes = int(flow.max_vae_grid_tokens) * int(flow.latent_downsample) ** 2 * 3
-        artifact_bytes = ((2 * raw_image_bytes + (1 << 20) + 2) // 3) * 4
-    product_bytes = max(1, artifact_bytes, max_latent_feature_bytes, max_vision_feature_bytes)
-    latent_artifact_bytes = latent_capacity_bytes + products_per_operation * window * product_bytes
-    device_product_slots = products_per_operation * slots
-    device_count = len(
-        {
-            str(deployment.device),
-            str(deployment.generation_device or deployment.device),
-        }
-    )
-    worker_product_bytes = device_product_arena_bytes(
-        device_product_slots,
-        device_count,
-        max_speculative_points=max_speculative_points,
-        max_product_bytes=product_bytes,
-    )
-    max_event_bytes = max(4096, artifact_bytes)
-    output_journal_bytes = 64 * max_event_bytes
-    per_operation_staging = (
-        int(completion_payload_bytes) + max_route_tokens * 32 + kv_pages * 8 + 256
-    )
-    completion_words = 4 * max_operations + (int(completion_payload_bytes) + 3) // 4
-    completion_arena_bytes = pipeline_depth * completion_words * 8
-    per_request = CreditVector(
-        registered_operations=window,
-        execution_slots=window,
-        completion_slots=window,
-        device_products=products_per_operation * window,
-        kv_pages=kv_pages,
-        rollback_deltas=max_speculative_points * window,
-        latent_artifact_bytes=latent_artifact_bytes,
-        pinned_completion_staging_bytes=per_operation_staging * window,
-        transfer_bytes=max_transfer_per_operation * window,
-        transfer_tickets=min(window, transfer_tickets),
-        cpu_tasks=2,
-        output_journal_bytes=output_journal_bytes,
-    )
-    worker = CreditVector(
-        registered_operations=slots,
-        execution_slots=slots,
-        completion_slots=slots,
-        device_products=products_per_operation * slots,
-        kv_pages=kv_pages,
-        rollback_deltas=max_speculative_points * slots,
-        latent_artifact_bytes=latent_capacity_bytes + worker_product_bytes,
-        pinned_completion_staging_bytes=max(
-            completion_arena_bytes,
-            per_operation_staging * window,
-        ),
-        transfer_bytes=max_transfer_per_operation * transfer_tickets,
-        transfer_tickets=transfer_tickets,
-        cpu_tasks=256,
-        output_journal_bytes=output_journal_bytes * max_operations,
-    )
-    return RouteCreditLimits(per_request=per_request, worker=worker)
 
 
 def _kv_dtype(spec: ModelSpec, deployment: DeploymentOverlay) -> str:

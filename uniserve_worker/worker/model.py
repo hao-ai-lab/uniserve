@@ -41,11 +41,11 @@ from ..foundation.sync_detector import (
 )
 from ..loader.weight_set import WeightSet
 from ..nn.mesh import DeviceMesh
+from ..runtime.arena_capacity import model_arena_capacity
 from ..runtime.capabilities import resolve_capabilities
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.graph_store import GraphStore
 from ..runtime.kv_store import KvStore
-from ..runtime.latent_capacity import latent_store_capacity_bytes
 from ..runtime.latent_store import LatentStore
 from ..runtime.mesh_store import MeshStore
 from ..runtime.mover import Mover
@@ -58,8 +58,6 @@ from ..spec import DeploymentOverlay, ModelSpec, RouteRowKind, resolved_digest
 from .protocol import WorkerContract
 
 logger = logging.getLogger(__name__)
-
-_TOKEN_DEVICE_PRODUCT_COUNT = 5
 
 
 def _warmup_batch(
@@ -205,6 +203,18 @@ class ModelWorker:
             pipeline_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
         )
+        arena = model_arena_capacity(
+            model_spec,
+            deployment,
+            pipeline_depth=int(pipeline_depth),
+            completion_payload_bytes=int(completion_payload_bytes),
+            num_blocks=int(declared.num_blocks),
+            scratch_capacity_tokens=int(declared.scratch_capacity_tokens),
+            max_latent_size=int(declared.max_latent_size),
+            max_latent_feature_bytes=int(declared.max_latent_feature_bytes),
+            max_vision_feature_bytes=int(declared.max_vision_feature_bytes),
+            bytes_per_token=int(declared.bytes_per_token),
+        )
         if snapshot_dir is not None:
             declared = replace(
                 declared,
@@ -229,38 +239,17 @@ class ModelWorker:
         )
         self.kv = KvStore(self.residency.kv)
         self.sessions = SessionStore()
-        latent_capacity_bytes = (
-            0
-            if model_spec.flow is None
-            else latent_store_capacity_bytes(
-                int(self._contract.capabilities.max_latent_size),
-                int(model_spec.flow.latent_channels),
-                int(model_spec.flow.latent_patch_size),
-            )
-        )
-        self.latents = LatentStore(capacity_bytes=latent_capacity_bytes)
+        self.latents = LatentStore(capacity_bytes=arena.latent_bytes)
         self.products = ProductStore(
             encoder_cache_budget=model_spec.inputs.encoder_cache_budget,
-            device_product_capacity=max(
-                _TOKEN_DEVICE_PRODUCT_COUNT,
-                _TOKEN_DEVICE_PRODUCT_COUNT
-                * int(pipeline_depth)
-                * int(deployment.max_batch_operations),
-            ),
-            device_product_byte_capacity=max(
-                1,
-                self._contract.capabilities.execution_constraints.route_capabilities[
-                    0
-                ].credits.worker.latent_artifact_bytes
-                - latent_capacity_bytes,
-            ),
+            device_product_capacity=arena.device_products,
+            device_product_byte_capacity=arena.device_product_bytes,
         )
         self.replay = ReplayStore()
         self.mover = Mover(
             transfer_backend=transfer_backend,
-            transfer_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
-                0
-            ].credits.worker.transfer_bytes,
+            transfer_byte_capacity=arena.transfer_bytes,
+            transfer_ticket_capacity=arena.transfer_tickets,
             cross_process=bool(cross_process),
         )
         self.graphs = GraphStore(
@@ -297,16 +286,8 @@ class ModelWorker:
             pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
             completion_payload_bytes=completion_payload_bytes,
-            cpu_task_capacity=int(
-                self._contract.capabilities.execution_constraints.route_capabilities[
-                    0
-                ].credits.worker.cpu_tasks
-            ),
-            pinned_staging_capacity=int(
-                self._contract.capabilities.execution_constraints.route_capabilities[
-                    0
-                ].credits.worker.pinned_completion_staging_bytes
-            ),
+            cpu_task_capacity=arena.cpu_tasks,
+            pinned_staging_capacity=arena.pinned_staging_bytes,
         )
         self._warmup_step_id = 0
         self.snapshot_provider: SnapshotProvider | None = None

@@ -245,7 +245,7 @@ class DeviceProductTable:
     def _require_byte_capacity_locked(self, projected: int) -> None:
         if projected > self.byte_capacity:
             raise resource_error(
-                f"device-product byte credit is exhausted ({projected}>{self.byte_capacity})"
+                f"device-product byte capacity is exhausted ({projected}>{self.byte_capacity})"
             )
 
     def bind_outputs(

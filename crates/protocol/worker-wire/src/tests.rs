@@ -1024,7 +1024,6 @@ fn full_caps() -> EngineCaps {
                 tensorized_mixed: true,
                 sampling_ownership: SamplingOwnership::DesignatedRank,
                 preemptible: false,
-                credits: ExecutionConstraints::default().route_capabilities[0].credits,
                 max_unresolved_window: 3,
                 legal_feature_bitset: 0b0001_1111,
                 sampler_processors: 0x3FFF,

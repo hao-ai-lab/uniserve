@@ -380,7 +380,7 @@ class CompletionArena:
             slot.host_tokens = self._host_tokens[token_offset : token_offset + token_count]
             self._cursor = (index + 1) % self.depth
             return CompletionLease(self, index, owner, generation, count)
-        raise resource_error("completion arena has no query-ready slot and byte credit")
+        raise resource_error("completion arena has no query-ready slot and byte capacity")
 
     def _allocate_tokens(self, count: int) -> tuple[int, int] | None:
         for index, (offset, available) in enumerate(self._free_token_ranges):

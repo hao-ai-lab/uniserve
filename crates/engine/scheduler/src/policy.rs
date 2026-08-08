@@ -19,7 +19,6 @@ pub struct PolicySnapshot {
     pub free_blocks: usize,
     pub total_blocks: usize,
     pub reserved_blocks: usize,
-    pub active_credit_requests: usize,
     // cache facts
     pub cached_blocks: usize,
     pub prefix_hit_rate: f32,

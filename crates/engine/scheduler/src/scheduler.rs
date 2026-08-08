@@ -49,6 +49,7 @@ pub const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
 pub const DEFAULT_MAX_NUM_WAITING: usize = 4096;
 pub const MAX_NUM_WAITING: usize = 65_536;
 pub const MAX_NUM_SEQS: usize = 65_536;
+const MAX_INFLIGHT_TRANSFERS: usize = 256;
 
 /// General loop counters that do not belong to a more specific group.
 #[derive(Default)]
@@ -84,14 +85,6 @@ pub struct EncoderStats {
     pub cache_queries: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cached: AtomicUsize,
-}
-
-/// Resource-plane observability: active per-request leases (0 when idle) and
-/// any resource-invariant violations (leases retained after a request left).
-#[derive(Default)]
-pub struct ResourceStats {
-    pub active: AtomicUsize,
-    pub invariant_violations: AtomicU64,
 }
 
 /// Batch-timing and queueing/admission latency counters.
@@ -154,7 +147,6 @@ pub struct SchedStats {
     pub kv_cache: KvCacheStats,
     pub prefix: PrefixStats,
     pub encoder: EncoderStats,
-    pub resources: ResourceStats,
     pub timing: TimingStats,
     pub worker: WorkerStats,
 }
@@ -171,10 +163,10 @@ use uniserve_engine_api::{
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
-    CompletionReport, Control, CreditVector, Disposition, EngineCaps, ExecutionCapability,
-    GenAdmission, KvAdmission, KvReservation, OpId, OpStatus, Operation, Point, ProductKind,
-    ProductPayload, ProductRef, RequestKey, ResourceClass, RouteCreditLimits, SamplingState,
-    StorageClass, UndAdmission, VersionRef, WorkVariant, WorkerForwardStats,
+    CompletionReport, Control, Disposition, EngineCaps, ExecutionCapability, GenAdmission,
+    KvAdmission, KvReservation, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload,
+    ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
+    WorkerForwardStats,
 };
 
 use crate::image_artifact::validate_png_artifact;
@@ -542,6 +534,8 @@ pub struct Scheduler {
     /// keeps the scheduler hot path independent of the number of active requests.
     cpu_deadlines: HashMap<CpuTaskKey, Instant>,
     reserved_blocks: usize,
+    transfer_capacity: usize,
+    inflight_transfers: usize,
     step_id: u64,
     /// Ordered submitted-but-unresolved operations for each request. The front
     /// owns the committed lease; later entries are bounded projected successors
@@ -568,11 +562,6 @@ pub struct Scheduler {
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
-    /// Atomic per-request finite-credit ownership.
-    ledger: crate::resources::CreditLedger,
-    /// Device-product credit retained until a successor completion makes the
-    /// producer's reader-safe release observable.
-    product_credits: HashMap<ProductRef, CreditVector>,
     /// Explainable policy decisions and per-op latency history.
     decisions: crate::policy::DecisionLog,
     latency: crate::policy::LatencyHistory,
@@ -608,8 +597,6 @@ pub struct HealthSnapshot {
     pub free_blocks: usize,
     pub total_blocks: usize,
     pub reserved_blocks: usize,
-    pub active_credit_requests: usize,
-    pub resource_invariant_violations: u64,
     pub completed_traces: usize,
     pub last_worker_exec_us: u64,
     pub queue_wait_count: u64,
@@ -618,14 +605,6 @@ pub struct HealthSnapshot {
     pub fatal: bool,
     pub supported_work: Vec<WorkVariant>,
     pub op_latency_us: Vec<(String, u64)>,
-}
-
-/// One credit dimension's negotiated capacity and current reservation.
-#[derive(Debug, Clone)]
-pub struct CreditDimensionMetric {
-    pub dimension: uniserve_worker_wire::CreditDimension,
-    pub capacity: u64,
-    pub used: u64,
 }
 
 /// Aggregate delay across one lifecycle phase span over completed operations.
@@ -638,17 +617,11 @@ pub struct PhaseSpanDelay {
     pub max_us: u64,
 }
 
-/// The resource and window observability surface keyed to the credit ledger and
-/// the operation lifecycle. Credit acquisitions and releases conserve: when no
-/// request is active every dimension's `used` is zero and `acquisitions` equals
-/// `releases`.
+/// The bounded operation-window and lifecycle observability surface.
 #[derive(Debug, Clone)]
 pub struct ResourceWindowMetrics {
-    pub credits: Vec<CreditDimensionMetric>,
-    pub acquisitions: u64,
-    pub releases: u64,
-    pub would_block: u64,
-    pub invariant_violations: u64,
+    pub max_operations: usize,
+    pub active_operations: usize,
     pub max_unresolved_window: u32,
     pub peak_ops_in_batch: usize,
     pub phase_delays: Vec<PhaseSpanDelay>,
@@ -913,14 +886,11 @@ impl Scheduler {
         mut config: SchedulerConfig,
     ) -> Self {
         let caps = executor.caps();
-        let credit_capacity = caps
-            .execution_constraints
-            .route_capabilities
-            .first()
-            .map(|capability| capability.credits.worker)
-            .expect("validated worker capabilities have a route credit vector");
         let cpu_waker = executor.command_waker();
         let max_batch_ops = caps.execution_constraints.max_batch_operations as usize;
+        let transfer_capacity = (caps.pipeline_depth as usize)
+            .saturating_mul(max_batch_ops)
+            .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
         config.max_num_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
         if max_batch_ops > 0 {
@@ -1010,6 +980,8 @@ impl Scheduler {
             cpu_task_timeout: Duration::from_secs(30),
             cpu_deadlines: HashMap::new(),
             reserved_blocks: 0,
+            transfer_capacity,
+            inflight_transfers: 0,
             step_id: 0,
             inflight_ops: HashMap::new(),
             pending_completions: HashMap::new(),
@@ -1018,8 +990,6 @@ impl Scheduler {
             denoise_step_burst,
             flow_exclusive_batch,
             fatal: false,
-            ledger: crate::resources::CreditLedger::new(credit_capacity),
-            product_credits: HashMap::new(),
             decisions: crate::policy::DecisionLog::default(),
             latency: crate::policy::LatencyHistory::new(),
             planner: GenerationPlanner::new(),
@@ -1129,7 +1099,6 @@ impl Scheduler {
             free_blocks: self.bm.free_blocks(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
-            active_credit_requests: self.ledger.active_requests(),
             cached_blocks: self.bm.cached_blocks(),
             prefix_hit_rate: if pq > 0 { ph as f32 / pq as f32 } else { 0.0 },
             mm_cache_hit_rate: if mq > 0 { mh as f32 / mq as f32 } else { 0.0 },
@@ -1158,22 +1127,10 @@ impl Scheduler {
         self.completed_traces.drain(..).collect()
     }
 
-    /// The resource and window observability surface: per-credit-dimension
-    /// capacity and reservation, ledger conservation counters, the unresolved
-    /// window bound and observed peak, and aggregate lifecycle-phase delays over
-    /// completed operations.
+    /// The operation-window bounds, current occupancy, observed peak, and
+    /// aggregate lifecycle-phase delays over completed operations.
     pub fn resource_window_metrics(&self) -> ResourceWindowMetrics {
         use crate::trace::LifecyclePhase as P;
-        let capacity = self.ledger.capacity();
-        let used = self.ledger.used();
-        let credits = uniserve_worker_wire::CreditDimension::ALL
-            .into_iter()
-            .map(|dimension| CreditDimensionMetric {
-                dimension,
-                capacity: capacity.get(dimension),
-                used: used.get(dimension),
-            })
-            .collect();
         let spans = [
             (P::Submitted, P::CompletionObserved),
             (P::CompletionObserved, P::SemanticallyCommitted),
@@ -1203,11 +1160,11 @@ impl Scheduler {
             }
         }
         ResourceWindowMetrics {
-            credits,
-            acquisitions: self.ledger.stats.acquisitions,
-            releases: self.ledger.stats.releases,
-            would_block: self.ledger.stats.would_block,
-            invariant_violations: self.ledger.stats.invariant_violations,
+            max_operations: self
+                .executor
+                .pipeline_depth()
+                .saturating_mul(self.config.max_batch),
+            active_operations: self.inflight_ops.values().map(VecDeque::len).sum(),
             max_unresolved_window: self.caps.execution_constraints.max_unresolved_window,
             peak_ops_in_batch: self.peak_ops_in_batch,
             phase_delays,
@@ -1224,8 +1181,6 @@ impl Scheduler {
             free_blocks: self.bm.free_blocks(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
-            active_credit_requests: self.ledger.active_requests(),
-            resource_invariant_violations: self.ledger.stats.invariant_violations,
             completed_traces: self.completed_traces.len(),
             last_worker_exec_us: self
                 .stats
@@ -1784,88 +1739,6 @@ impl Scheduler {
         )
     }
 
-    fn route_credit_limits(&self, route: uniserve_worker_wire::RouteId) -> RouteCreditLimits {
-        self.caps
-            .execution_constraints
-            .route_capabilities
-            .iter()
-            .find(|capability| capability.route == route)
-            .map(|capability| capability.credits)
-            .expect("planned route has a negotiated credit declaration")
-    }
-
-    fn request_base_credits(&self, state: &ReqState) -> CreditVector {
-        CreditVector {
-            kv_pages: state.resources.worstcase_blocks as u64,
-            cpu_tasks: u64::from(self.cpu_continuation_required(state)),
-            output_journal_bytes: request_output_journal_bytes(&state.req),
-            ..CreditVector::ZERO
-        }
-    }
-
-    fn operation_credits(transition: &PlannedTransition) -> CreditVector {
-        let device_products = transition
-            .outputs
-            .iter()
-            .filter(|output| {
-                output.storage_class == StorageClass::DeviceTensor
-                    || output.storage_class == StorageClass::LatentArena
-            })
-            .count() as u64;
-        let latent_artifact_bytes = transition
-            .outputs
-            .iter()
-            .filter(|output| output.storage_class == StorageClass::LatentArena)
-            .map(ProductRef::max_bytes)
-            .fold(0_u64, u64::saturating_add);
-        let staging_bytes = transition
-            .bounds
-            .max_completion_bytes
-            .saturating_add(u64::from(transition.bounds.max_tokens).saturating_mul(32))
-            .saturating_add(u64::from(transition.bounds.max_kv_pages).saturating_mul(8))
-            .saturating_add(256);
-        CreditVector {
-            registered_operations: 1,
-            execution_slots: 1,
-            completion_slots: 1,
-            device_products,
-            rollback_deltas: u64::from(transition.bounds.max_points),
-            latent_artifact_bytes,
-            pinned_completion_staging_bytes: staging_bytes,
-            transfer_bytes: transition.bounds.max_transfer_bytes,
-            transfer_tickets: u64::from(transition.bounds.max_transfer_bytes > 0),
-            cpu_tasks: u64::from(transition.work.variant() == WorkVariant::Materialize),
-            ..CreditVector::ZERO
-        }
-    }
-
-    fn transition_persistent_credits(&self, transition: &PlannedTransition) -> CreditVector {
-        let Some(state) = self.running.get(&transition.request_id) else {
-            return CreditVector::ZERO;
-        };
-        let latent_artifact_bytes =
-            if transition.resources.latent_units > 0 && state.resources.latent_credit_bytes == 0 {
-                transition.bounds.max_latent_bytes
-            } else {
-                0
-            };
-        let kv_pages = if transition.resources.host_scratch_tokens > 0
-            && state.resources.scratch_credit_pages == 0
-        {
-            transition
-                .resources
-                .host_scratch_tokens
-                .div_ceil(u64::from(self.caps.block_size).max(1))
-        } else {
-            0
-        };
-        CreditVector {
-            kv_pages,
-            latent_artifact_bytes,
-            ..CreditVector::ZERO
-        }
-    }
-
     fn cap_max_vae_grid_tokens(&self) -> usize {
         if self.caps.max_vae_grid_tokens > 0 {
             self.caps.max_vae_grid_tokens as usize
@@ -1985,17 +1858,8 @@ impl Scheduler {
         {
             return false;
         }
-        let operation_credits = Self::operation_credits(transition);
-        let persistent_credits = self.transition_persistent_credits(transition);
-        let Some(reservation) = operation_credits.checked_add(persistent_credits) else {
-            return false;
-        };
-        let limits = self.route_credit_limits(transition.route);
-        if self
-            .ledger
-            .try_acquire(id, reservation, limits.per_request)
-            .is_err()
-        {
+        let uses_transfer = transition.bounds.max_transfer_bytes > 0;
+        if uses_transfer && self.inflight_transfers >= self.transfer_capacity {
             return false;
         }
         let needs_host_scratch = self
@@ -2004,10 +1868,11 @@ impl Scheduler {
             .is_some_and(|st| st.resources.host_scratch_tokens == 0)
             && resources.host_scratch_tokens > 0;
         if needs_host_scratch && !self.bm.reserve_scratch(id, resources.host_scratch_tokens) {
-            let _ = self.ledger.release(id, reservation);
             return false;
         }
-        transition.reserved_credits = operation_credits;
+        if uses_transfer {
+            self.inflight_transfers += 1;
+        }
         transition.reserved_us = uniserve_core::now_monotonic_us();
         if let Some(st) = self.running.get_mut(&id) {
             st.resources.worker_image_latent_units = st
@@ -2018,14 +1883,6 @@ impl Scheduler {
                 .resources
                 .host_scratch_tokens
                 .max(resources.host_scratch_tokens);
-            st.resources.latent_credit_bytes = st
-                .resources
-                .latent_credit_bytes
-                .max(persistent_credits.latent_artifact_bytes);
-            st.resources.scratch_credit_pages = st
-                .resources
-                .scratch_credit_pages
-                .max(persistent_credits.kv_pages);
         }
         true
     }
@@ -2035,25 +1892,13 @@ impl Scheduler {
             match class {
                 uniserve_worker_wire::ResourceClass::ImageLatent => {
                     if let Some(st) = self.running.get_mut(&id) {
-                        let credit = CreditVector {
-                            latent_artifact_bytes: st.resources.latent_credit_bytes,
-                            ..CreditVector::ZERO
-                        };
-                        let _ = self.ledger.release(id, credit);
                         st.resources.worker_image_latent_units = 0;
-                        st.resources.latent_credit_bytes = 0;
                     }
                 }
                 uniserve_worker_wire::ResourceClass::Scratch => {
                     self.bm.release_scratch(id);
                     if let Some(st) = self.running.get_mut(&id) {
-                        let credit = CreditVector {
-                            kv_pages: st.resources.scratch_credit_pages,
-                            ..CreditVector::ZERO
-                        };
-                        let _ = self.ledger.release(id, credit);
                         st.resources.host_scratch_tokens = 0;
-                        st.resources.scratch_credit_pages = 0;
                     }
                 }
                 _ => {}
@@ -2074,25 +1919,25 @@ impl Scheduler {
     /// One loop iteration of the schedule-ahead loop. Returns true if any work
     /// was submitted or any result resolved.
     pub fn step(&mut self) -> bool {
-        let mut progressed = self.step_nonblocking();
-        if !progressed && self.executor.in_flight() > 0 {
-            match self.executor.next_result() {
-                Ok(r) => {
-                    self.apply_result(r);
-                    progressed = true;
-                }
-                Err(e) => {
-                    self.on_executor_error(e);
-                    progressed = true;
-                }
-            }
-            self.stats
-                .general
-                .in_flight
-                .store(self.executor.in_flight(), Ordering::Relaxed);
-            self.publish_cache_stats();
+        let progressed = self.step_nonblocking();
+        if progressed || self.executor.in_flight() == 0 {
+            return progressed;
         }
-        progressed
+        match self.executor.next_result() {
+            Ok(result) => {
+                self.apply_result(result);
+                self.step_nonblocking();
+            }
+            Err(error) => {
+                self.on_executor_error(error);
+                self.stats
+                    .general
+                    .in_flight
+                    .store(self.executor.in_flight(), Ordering::Relaxed);
+                self.publish_cache_stats();
+            }
+        }
+        true
     }
 
     /// Nonblocking schedule-ahead tick used by the owner-thread reactor. It
@@ -2191,16 +2036,6 @@ impl Scheduler {
             .encoder
             .cached
             .store(self.enc_cache.len(), Ordering::Relaxed);
-        // resource-plane observability — active leases (0 when idle) and
-        // any retained-after-release invariant violations.
-        self.stats
-            .resources
-            .active
-            .store(self.ledger.active_requests(), Ordering::Relaxed);
-        self.stats
-            .resources
-            .invariant_violations
-            .store(self.ledger.stats.invariant_violations, Ordering::Relaxed);
     }
 
     /// Resolve at most one ready result so assembly can refill the freed slot
@@ -2286,7 +2121,7 @@ impl Scheduler {
             state.public_event_limit.max(
                 state
                     .public_event_seq
-                    .saturating_add(apply.output_credit_bound as u64),
+                    .saturating_add(apply.output_event_bound as u64),
             )
         })
     }
@@ -2346,10 +2181,6 @@ impl Scheduler {
                     Ok(_) => {
                         self.retiring_sessions.remove(&id);
                         self.bm.release(id);
-                        self.product_credits
-                            .retain(|product, _| product.request_key.session_id != id);
-                        self.ledger.release_request(id);
-                        self.ledger.assert_released(id);
                     }
                     Err(error) => {
                         tracing::error!(
@@ -2470,7 +2301,7 @@ impl Scheduler {
 
     fn can_schedule_next(&self, id: RequestId) -> bool {
         !self.pending_finishes.contains_key(&id)
-            && self.output_credit_ready(id)
+            && self.output_window_ready(id)
             && self.cpu_continuation_ready(id)
             && self
                 .running
@@ -2626,7 +2457,7 @@ impl Scheduler {
         !failed.is_empty()
     }
 
-    fn output_credit_ready(&self, id: RequestId) -> bool {
+    fn output_window_ready(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
         };
@@ -2642,7 +2473,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|operation| operation.apply.output_credit_bound)
+            .map(|operation| operation.apply.output_event_bound)
             .sum::<usize>();
         available
             .saturating_sub(reserved)
@@ -2758,56 +2589,22 @@ impl Scheduler {
         let inflight = queue.pop_front().expect("front checked above");
         let empty = queue.is_empty();
         let parent_op_id = inflight.operation.parent.producer_op_id.0;
-        let product_credits = inflight
-            .operation
-            .outputs
-            .iter()
-            .filter(|output| {
-                matches!(
-                    output.storage_class,
-                    StorageClass::DeviceTensor | StorageClass::LatentArena
-                )
-            })
-            .map(|output| {
-                let credit = CreditVector {
-                    device_products: 1,
-                    latent_artifact_bytes: if !inflight.apply.request_latent_credit
-                        && output.storage_class == StorageClass::LatentArena
-                    {
-                        output.max_bytes()
-                    } else {
-                        0
-                    },
-                    ..CreditVector::ZERO
-                };
-                (output.clone(), credit)
-            })
-            .collect::<Vec<_>>();
-        let product_credit = product_credits
-            .iter()
-            .try_fold(CreditVector::ZERO, |total, (_, credit)| {
-                total.checked_add(*credit)
-            })
-            .expect("bounded operation product credits fit one vector");
-        let transient_credit = inflight
-            .apply
-            .reserved_credits
-            .checked_sub(product_credit)
-            .expect("product credit is a sub-vector of operation credit");
+        if inflight.operation.bounds.max_transfer_bytes > 0 {
+            self.inflight_transfers = self
+                .inflight_transfers
+                .checked_sub(1)
+                .expect("completed transfer operation owns one reservation");
+        }
         if empty {
             self.inflight_ops.remove(&id);
         }
-        let _ = self.ledger.release(id, transient_credit);
-        for (product, credit) in product_credits {
-            self.product_credits.insert(product, credit);
-        }
         if parent_op_id > 0 {
-            self.release_operation_product_credits(id, parent_op_id);
+            self.mark_operation_reclaimed(id, parent_op_id);
         }
         Some((inflight.operation, inflight.apply, inflight.started))
     }
 
-    fn release_operation_product_credits(&mut self, id: RequestId, op_id: u64) {
+    fn mark_operation_reclaimed(&mut self, id: RequestId, op_id: u64) {
         if let Some(st) = self.running.get_mut(&id) {
             st.trace.stamp_existing(
                 uniserve_worker_wire::OpId(op_id),
@@ -2815,15 +2612,6 @@ impl Scheduler {
                 uniserve_core::now_monotonic_us(),
             );
         }
-        let products = self
-            .product_credits
-            .keys()
-            .filter(|product| {
-                product.request_key.session_id == id && product.producer_op_id.0 == op_id
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        self.release_product_credits(products);
         // The operation's device products are now freed under event-safe
         // reclamation; record the terminal lifecycle phase.
         if let Some(st) = self.running.get_mut(&id) {
@@ -2835,19 +2623,10 @@ impl Scheduler {
         }
     }
 
-    fn release_product_credits(&mut self, products: Vec<ProductRef>) {
-        for product in products {
-            if let Some(credit) = self.product_credits.remove(&product) {
-                let _ = self.ledger.release(product.request_key.session_id, credit);
-            }
-        }
-    }
-
     fn release_products(&mut self, products: Vec<ProductRef>) {
         if products.is_empty() {
             return;
         }
-        self.release_product_credits(products.clone());
         let mut handles = products
             .into_iter()
             .map(|product| u64::from(product.generation))
@@ -3526,6 +3305,7 @@ impl Scheduler {
     fn fail_all_inflight(&mut self, msg: &str) {
         let ids: Vec<RequestId> = self.inflight_ops.keys().copied().collect();
         self.inflight_ops.clear();
+        self.inflight_transfers = 0;
         self.pending_completions.clear();
         // the submitted batches whose results will now never return are
         // failed here, so drop their pending submit-timestamps too — otherwise
@@ -3547,6 +3327,7 @@ impl Scheduler {
 
     fn fail_all_running(&mut self, message: &str) {
         self.inflight_ops.clear();
+        self.inflight_transfers = 0;
         self.pending_completions.clear();
         self.batch_started.clear();
         self.batch_partitions.clear();
@@ -3597,29 +3378,6 @@ impl Scheduler {
             let Some(head) = self.pending.peek_request() else {
                 break;
             };
-            let request_id = head.req.request_id;
-            let admission_credits = self.request_base_credits(head);
-            let credit_limits = self.route_credit_limits(uniserve_worker_wire::RouteId(0));
-            if !credit_limits.per_request.contains(admission_credits) {
-                let st = self.pending.pop_request().expect("queue head was present");
-                self.record_decision(
-                    request_id,
-                    crate::policy::PolicyReason::RejectedTooLarge,
-                    st.resources.worstcase_blocks,
-                );
-                let _ = st.event_tx.send(GenEvent::Rejected {
-                    message: "request exceeds the route credit declaration".into(),
-                });
-                continue;
-            }
-            if self
-                .ledger
-                .can_acquire(request_id, admission_credits, credit_limits.per_request)
-                .is_err()
-            {
-                break;
-            }
-
             if head.resources.reserve_worstcase {
                 let need = head.resources.worstcase_blocks;
                 let encoder_entries = head.req.resources.encoder_cache_keys.len();
@@ -3725,11 +3483,6 @@ impl Scheduler {
 
     fn admit_running(&mut self, mut st: ReqState) {
         let id = st.req.request_id;
-        let credits = self.request_base_credits(&st);
-        let limits = self.route_credit_limits(uniserve_worker_wire::RouteId(0));
-        self.ledger
-            .try_acquire(id, credits, limits.per_request)
-            .expect("admission credit was preflighted against an unchanged ledger");
         let q = st.queued_at;
         let scheduled_at = now();
         let queue_wait_us = ((scheduled_at - q).max(0.0) * 1_000_000.0) as u64;
@@ -3969,7 +3722,7 @@ impl Scheduler {
                     self.return_unsent_blocks(id, &op);
                     tracing::debug!(
                         request_id = id.0,
-                        "operation registration is paused by finite-credit pressure"
+                        "operation registration is paused by physical resource pressure"
                     );
                     continue;
                 }
@@ -4301,7 +4054,7 @@ impl Scheduler {
             } else {
                 transition.new_blocks.clone()
             };
-            let output_credit_bound = transition_output_bound(&transition);
+            let output_event_bound = transition_output_bound(&transition);
             let planned_us = transition.planned_us;
             let reserved_us = transition.reserved_us;
             let registered = transition.register(
@@ -4309,7 +4062,7 @@ impl Scheduler {
                 OpId(oid),
                 parent,
                 &mut self.next_product_generation,
-                output_credit_bound,
+                output_event_bound,
             );
             let (operation, apply, payloads) = match registered {
                 Ok(registered) => registered,
@@ -4340,9 +4093,7 @@ impl Scheduler {
                     "operation": operation_trace(&operation, &apply),
                     "transition": apply.delta.as_str(),
                     "resources": {
-                        "reserved_credits": apply.reserved_credits,
                         "release_on_apply": apply.release_on_apply,
-                        "request_latent_credit": apply.request_latent_credit,
                         "replayability_after_apply": apply.replayability_after_apply.as_str(),
                     },
                     "visibility": {
@@ -6272,10 +6023,6 @@ impl Scheduler {
         }
         if !awaits_close {
             self.bm.release(id);
-            self.product_credits
-                .retain(|product, _| product.request_key.session_id != id);
-            self.ledger.release_request(id);
-            self.ledger.assert_released(id);
         }
     }
 }
@@ -6392,35 +6139,6 @@ fn transition_output_bound(transition: &PlannedTransition) -> usize {
     }
 }
 
-fn request_output_journal_bytes(request: &GenerationRequest) -> u64 {
-    let event_slots = OUTPUT_JOURNAL_CAPACITY as u64;
-    let text_event_bytes = 4096_u64
-        .saturating_add(u64::from(request.sampling.n_logprobs).saturating_mul(16))
-        .saturating_add(u64::from(request.sampling.n_prompt_logprobs).saturating_mul(16));
-    let image_slots = if request.behavior.gen_output {
-        u64::from(request.image.max_images).min(event_slots)
-    } else {
-        0
-    };
-    let image_event_bytes = if image_slots > 0 {
-        let raw = u64::from(request.image.height).saturating_mul(
-            u64::from(request.image.width)
-                .saturating_mul(3)
-                .saturating_add(1),
-        );
-        raw.saturating_mul(2)
-            .saturating_add(1 << 20)
-            .div_ceil(3)
-            .saturating_mul(4)
-            .max(text_event_bytes)
-    } else {
-        0
-    };
-    image_event_bytes
-        .saturating_mul(image_slots)
-        .saturating_add(text_event_bytes.saturating_mul(event_slots.saturating_sub(image_slots)))
-}
-
 /// Flush as many ordered journal entries as the immediate consumer can accept.
 /// Returns true when the consumer has closed.
 fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenEvent>) -> bool {
@@ -6463,7 +6181,7 @@ fn enqueue_public_event(
     }
     assert!(
         journal.len() <= OUTPUT_JOURNAL_CAPACITY,
-        "scheduler output-credit invariant exceeded the bounded public journal"
+        "scheduler exceeded the bounded public output journal"
     );
     false
 }
@@ -6482,7 +6200,7 @@ fn operation_trace(operation: &Operation, apply: &SchedulerApply) -> serde_json:
         "outputs": operation.outputs.len(),
         "max_tokens": operation.bounds.max_tokens,
         "max_kv_pages": operation.bounds.max_kv_pages,
-        "output_credit_bound": apply.output_credit_bound,
+        "output_event_bound": apply.output_event_bound,
     })
 }
 
@@ -6564,36 +6282,6 @@ mod tests {
         assert_eq!(stops, vec![4_242, 151_643, 151_645]);
     }
 
-    #[test]
-    fn output_journal_credit_counts_each_bounded_image_artifact_once() {
-        let mut req = request(1, 8);
-        req.constraint = GenerationConstraint::GenOnly;
-        req.behavior = GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
-        req.behavior.gen_output = true;
-        req.image.width = 2048;
-        req.image.height = 1152;
-        req.image.max_images = 1;
-
-        let text_event_bytes = 4096_u64;
-        let raw_image_bytes = u64::from(req.image.height).saturating_mul(
-            u64::from(req.image.width)
-                .saturating_mul(3)
-                .saturating_add(1),
-        );
-        let image_event_bytes = raw_image_bytes
-            .saturating_mul(2)
-            .saturating_add(1 << 20)
-            .div_ceil(3)
-            .saturating_mul(4);
-
-        assert_eq!(
-            request_output_journal_bytes(&req),
-            image_event_bytes.saturating_add(
-                text_event_bytes.saturating_mul((OUTPUT_JOURNAL_CAPACITY - 1) as u64)
-            )
-        );
-    }
-
     fn cursor(phase: Phase, pos: u32) -> CursorProjection {
         CursorProjection {
             phase,
@@ -6657,60 +6345,5 @@ mod tests {
             },
         );
         assert_eq!(planned_op_token_cost(&verify), 4);
-    }
-
-    #[test]
-    fn materialization_reserves_one_bounded_cpu_continuation() {
-        let req = request(1, 1);
-        let mut materialize = plan(
-            &req,
-            cursor(Phase::Prefill, 0),
-            TransitionIntent::IngestText {
-                segment_index: 0,
-                prompt_start: 0,
-                token_ids: vec![7],
-                new_blocks: Vec::new(),
-                sampling_state: SamplingState::default(),
-            },
-        );
-        materialize.work = uniserve_worker_wire::Work::Materialize;
-        materialize.operation_variant = WorkVariant::Materialize;
-
-        assert_eq!(Scheduler::operation_credits(&materialize).cpu_tasks, 1);
-    }
-
-    #[test]
-    fn latent_successor_reserves_atomic_publication_bytes() {
-        let req = request(1, 1);
-        let mut transition = plan(
-            &req,
-            cursor(Phase::Prefill, 0),
-            TransitionIntent::IngestText {
-                segment_index: 0,
-                prompt_start: 0,
-                token_ids: vec![7],
-                new_blocks: Vec::new(),
-                sampling_state: SamplingState::default(),
-            },
-        );
-        transition.resources.latent_units = 8;
-        transition.outputs = vec![ProductRef {
-            request_key: RequestKey::new(1, RequestId(1), 1),
-            producer_op_id: OpId(0),
-            output_index: 0,
-            generation: 1,
-            kind: ProductKind::Latent,
-            storage_class: StorageClass::LatentArena,
-            dtype: uniserve_worker_wire::DType::BF16,
-            shape_bound: uniserve_worker_wire::ShapeBound {
-                dims: vec![uniserve_worker_wire::DimBound::Device { max: 64 }],
-            },
-            point_range: uniserve_worker_wire::PointRange::default(),
-        }];
-
-        assert_eq!(
-            Scheduler::operation_credits(&transition).latent_artifact_bytes,
-            128
-        );
     }
 }

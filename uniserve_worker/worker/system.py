@@ -9,6 +9,7 @@ from ..batch import Batch, CompletionReport, SnapshotRef, WorkVariant
 from ..capabilities import RequestKind, ResourceClass, configured_work_variants
 from ..execution import ModelExecutor
 from ..foundation.errors import unsupported_control
+from ..runtime.arena_capacity import system_arena_capacity
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.kv_store import KvStore
 from ..runtime.latent_store import LatentStore
@@ -19,6 +20,8 @@ from ..runtime.request_session import SessionStore
 from ..runtime.snapshot_store import SnapshotProvider
 from ..runtime.transfer import Locator
 from .protocol import WorkerContract, model_free_capabilities
+
+_MAX_OPERATIONS = 1024
 
 
 class SystemWorker:
@@ -56,8 +59,14 @@ class SystemWorker:
             ),
             supported_controls=controls,
             resource_classes=(ResourceClass.ENCODER_OUTPUT,),
+            max_batch_operations=_MAX_OPERATIONS,
             pipeline_depth=pipeline_depth,
             completion_payload_bytes=completion_payload_bytes,
+        )
+        arena = system_arena_capacity(
+            pipeline_depth=int(pipeline_depth),
+            max_operations=_MAX_OPERATIONS,
+            completion_payload_bytes=int(completion_payload_bytes),
         )
         self._contract = WorkerContract.compile(
             declared,
@@ -70,16 +79,14 @@ class SystemWorker:
         self.kv = KvStore()
         self.latents = LatentStore()
         self.products = ProductStore(
-            device_product_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
-                0
-            ].credits.worker.latent_artifact_bytes,
+            device_product_capacity=arena.device_products,
+            device_product_byte_capacity=arena.device_product_bytes,
         )
         self.replay = ReplayStore()
         self.mover = Mover(
             transfer_backend=transfer_backend,
-            transfer_byte_capacity=self._contract.capabilities.execution_constraints.route_capabilities[
-                0
-            ].credits.worker.transfer_bytes,
+            transfer_byte_capacity=arena.transfer_bytes,
+            transfer_ticket_capacity=arena.transfer_tickets,
             cross_process=True,
         )
         self.trace = ExecutionTrace(hashlib.sha256(b"uniserve-system-worker").hexdigest())
@@ -103,16 +110,8 @@ class SystemWorker:
             trace=self.trace,
             pipeline_depth=pipeline_depth,
             completion_payload_bytes=completion_payload_bytes,
-            cpu_task_capacity=int(
-                self._contract.capabilities.execution_constraints.route_capabilities[
-                    0
-                ].credits.worker.cpu_tasks
-            ),
-            pinned_staging_capacity=int(
-                self._contract.capabilities.execution_constraints.route_capabilities[
-                    0
-                ].credits.worker.pinned_completion_staging_bytes
-            ),
+            cpu_task_capacity=arena.cpu_tasks,
+            pinned_staging_capacity=arena.pinned_staging_bytes,
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:

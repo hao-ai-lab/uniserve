@@ -42,16 +42,18 @@ def test_transfer_descriptor_rejects_noncanonical_or_unbounded_frames() -> None:
     with pytest.raises(WorkerError, match="descriptor bound"):
         decode_transfer_descriptor(oversized)
     with pytest.raises(WorkerError, match="descriptor bound"):
-        encode_transfer_descriptor("tensor", {"payload": "x" * MAX_TRANSFER_DESCRIPTOR_BYTES}, digest)
+        encode_transfer_descriptor(
+            "tensor", {"payload": "x" * MAX_TRANSFER_DESCRIPTOR_BYTES}, digest
+        )
 
 
-def test_transfer_ticket_credit_exhaustion_is_nonblocking_and_reclaimable() -> None:
+def test_transfer_entry_capacity_is_nonblocking_and_reclaimable() -> None:
     release = Event()
     pool = _BoundedTransferPool(
         workers=1,
         capacity=2,
         byte_capacity=16,
-        name="transfer-credit-test",
+        name="transfer-entry-test",
     )
 
     def blocked(value: int) -> torch.Tensor:
@@ -81,7 +83,7 @@ def test_transfer_ticket_credit_exhaustion_is_nonblocking_and_reclaimable() -> N
         pool.close()
 
 
-def test_transfer_byte_credit_is_atomic_and_reclaimable() -> None:
+def test_transfer_byte_capacity_is_atomic_and_reclaimable() -> None:
     release = Event()
     pool = _BoundedTransferPool(
         workers=1,
@@ -96,7 +98,7 @@ def test_transfer_byte_credit_is_atomic_and_reclaimable() -> None:
 
     try:
         first = pool.submit(blocked, nbytes=12)
-        with pytest.raises(ResourceError, match="byte credit"):
+        with pytest.raises(ResourceError, match="byte capacity"):
             pool.submit(blocked, nbytes=8)
         release.set()
         deadline = time.monotonic() + 5.0
@@ -114,7 +116,7 @@ def test_transfer_byte_credit_is_atomic_and_reclaimable() -> None:
 
 
 def test_shm_async_publication_round_trips_cpu_storage() -> None:
-    transport = ShmTransport(byte_capacity=1 << 20)
+    transport = ShmTransport(byte_capacity=1 << 20, ticket_capacity=256)
     source = torch.arange(32, dtype=torch.float32).reshape(4, 8)
     try:
         locator = transport.publish_async(source)
@@ -127,7 +129,7 @@ def test_shm_async_publication_round_trips_cpu_storage() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_shm_async_publication_exposes_an_inflight_ticket_and_exact_snapshot() -> None:
-    transport = ShmTransport(byte_capacity=1 << 20)
+    transport = ShmTransport(byte_capacity=1 << 20, ticket_capacity=256)
     source = torch.zeros((1024,), dtype=torch.float32, device="cuda")
     torch.cuda._sleep(500_000_000)
     source.add_(1)

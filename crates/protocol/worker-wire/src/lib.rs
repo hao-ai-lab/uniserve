@@ -24,9 +24,7 @@ pub mod schema {
     include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
 }
 
-pub use resources::{
-    CreditDimension, CreditVector, ResourceClass, ResourcePressure, RouteCreditLimits,
-};
+pub use resources::{ResourceClass, ResourcePressure};
 
 /// A lowercase 64-character SHA-256 digest string. Both protocol digests and
 /// the model and route identities use this canonical form.
@@ -1833,7 +1831,6 @@ pub struct RouteExecutionCapability {
     pub tensorized_mixed: bool,
     pub sampling_ownership: SamplingOwnership,
     pub preemptible: bool,
-    pub credits: RouteCreditLimits,
     /// Maximum unresolved successor depth the route admits.
     #[serde(default)]
     pub max_unresolved_window: u32,
@@ -1893,20 +1890,6 @@ impl Default for ExecutionConstraints {
                 tensorized_mixed: false,
                 sampling_ownership: SamplingOwnership::DesignatedRank,
                 preemptible: false,
-                credits: RouteCreditLimits {
-                    per_request: CreditVector {
-                        registered_operations: 1,
-                        execution_slots: 1,
-                        completion_slots: 1,
-                        ..CreditVector::ZERO
-                    },
-                    worker: CreditVector {
-                        registered_operations: 1,
-                        execution_slots: 1,
-                        completion_slots: 1,
-                        ..CreditVector::ZERO
-                    },
-                },
                 max_unresolved_window: 1,
                 legal_feature_bitset: 0,
                 sampler_processors: 0,
@@ -2004,23 +1987,9 @@ impl EngineCaps {
                             .collect::<HashSet<_>>()
                             .len()
                             == capability.supported_work.len()
-                        && capability.credits.validate().is_ok()
-                        && capability.credits.per_request.registered_operations > 0
-                        && capability.credits.per_request.execution_slots > 0
-                        && capability.credits.per_request.completion_slots > 0
                 })
                 && routed_work == declared_work,
             "worker route capabilities do not partition the declared work"
-        );
-        let shared_worker_credits = self.execution_constraints.route_capabilities[0]
-            .credits
-            .worker;
-        anyhow::ensure!(
-            self.execution_constraints
-                .route_capabilities
-                .iter()
-                .all(|capability| capability.credits.worker == shared_worker_credits),
-            "worker routes disagree on the shared worker-wide credit vector"
         );
         anyhow::ensure!(
             self.protocol_layout_digest == protocol_layout_digest(),

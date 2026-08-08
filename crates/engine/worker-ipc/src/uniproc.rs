@@ -623,7 +623,7 @@ impl UniprocExecutor {
                 anyhow::anyhow!("pending record {call_id} disappeared while routing response")
             })?;
             // Consuming a partial execute response ends this physical IPC
-            // request. Release its iceoryx active-request credit before routing
+            // request. Release its iceoryx active-request slot before routing
             // can submit the continuation poll for the remaining partitions.
             let kind = release_consumed_request(record);
             self.route(call_id, kind, frame)?;
@@ -1101,9 +1101,9 @@ mod tests {
     }
 
     #[test]
-    fn consumed_response_releases_its_physical_request_credit() {
+    fn consumed_response_releases_its_physical_request_slot() {
         let service = format!(
-            "uniserve/worker/credit_{}_{}",
+            "uniserve/worker/request_slot_{}_{}",
             std::process::id(),
             nano_id()
         );

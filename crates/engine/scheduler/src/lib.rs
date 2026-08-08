@@ -9,7 +9,6 @@ pub mod logits;
 pub mod policy;
 pub(crate) mod prefix_cache;
 pub mod queue;
-pub mod resources;
 pub mod scheduler;
 pub mod stats_report;
 pub mod trace;
@@ -17,9 +16,8 @@ pub mod trace;
 pub use logits::{LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration};
 pub use policy::{DecisionLog, LatencyHistory, PolicyDecision, PolicyReason, PolicySnapshot};
 pub use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
-pub use resources::{CreditExhausted, CreditLedger, LedgerStats};
 pub use scheduler::{
-    ControlTokens, CreditDimensionMetric, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
     HealthSnapshot, PhaseSpanDelay, ResourceWindowMetrics, SchedStats, Scheduler, SchedulerConfig,
     SchedulingPolicy,

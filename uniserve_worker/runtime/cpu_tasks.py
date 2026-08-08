@@ -16,7 +16,7 @@ _T = TypeVar("_T")
 
 
 class BoundedCpuTaskPool:
-    """A fixed worker set whose queue entries require prior registration credit."""
+    """A fixed worker set with bounded registered tasks."""
 
     def __init__(self, *, capacity: int, workers: int) -> None:
         self.capacity = int(capacity)
@@ -40,7 +40,7 @@ class BoundedCpuTaskPool:
     def reserve(self) -> CpuTaskReservation:
         with self._lock:
             if self._reserved >= self.capacity:
-                raise resource_error("worker CPU task credit is exhausted")
+                raise resource_error("worker CPU task capacity is exhausted")
             self._reserved += 1
         return CpuTaskReservation(self)
 
@@ -72,14 +72,14 @@ class BoundedCpuTaskPool:
             reservation._released = True
             self._reserved -= 1
             if self._reserved < 0:
-                raise RuntimeError("worker CPU task credit underflow")
+                raise RuntimeError("worker CPU task reservation underflow")
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=False)
 
 
 class CpuTaskReservation:
-    """One registration-visible CPU task credit with idempotent release."""
+    """One registration-visible CPU task slot with idempotent release."""
 
     __slots__ = ("_pool", "_submitted", "_released")
 

@@ -304,11 +304,6 @@ impl StageRouter {
                         existing.tensorized_mixed &= capability.tensorized_mixed;
                         existing.preemptible &= capability.preemptible;
                         extend_unique(&mut existing.supported_work, capability.supported_work);
-                        existing.credits.per_request = existing
-                            .credits
-                            .per_request
-                            .checked_add(capability.credits.per_request)
-                            .context("staged route per-request credit sum overflowed")?;
                     }
                     None => {
                         route_capabilities.insert(capability.route, capability);
@@ -316,22 +311,6 @@ impl StageRouter {
                 }
             }
         }
-        let aggregate_worker_credits =
-            pools
-                .iter()
-                .try_fold(uniserve_worker_wire::CreditVector::ZERO, |total, pool| {
-                    let capacity = pool
-                        .exec
-                        .caps()
-                        .execution_constraints
-                        .route_capabilities
-                        .first()
-                        .map(|capability| capability.credits.worker)
-                        .context("staged pool has no route credit capacity")?;
-                    total
-                        .checked_add(capacity)
-                        .context("staged worker credit sum overflowed")
-                })?;
         for capability in route_capabilities.values_mut() {
             let owning_pools = capability
                 .supported_work
@@ -340,7 +319,6 @@ impl StageRouter {
                 .collect::<HashSet<_>>();
             capability.tensorized_mixed &= owning_pools.len() == 1;
             capability.preemptible &= owning_pools.len() == 1;
-            capability.credits.worker = aggregate_worker_credits;
         }
         let mut route_capabilities = route_capabilities.into_values().collect::<Vec<_>>();
         route_capabilities.sort_unstable_by_key(|capability| capability.route.0);
@@ -1107,9 +1085,6 @@ mod tests {
                     tensorized_mixed: false,
                     sampling_ownership: uniserve_worker_wire::SamplingOwnership::DesignatedRank,
                     preemptible: false,
-                    credits: uniserve_worker_wire::ExecutionConstraints::default()
-                        .route_capabilities[0]
-                        .credits,
                     max_unresolved_window: 1,
                     legal_feature_bitset: 0,
                     sampler_processors: 0,

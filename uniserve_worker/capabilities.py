@@ -147,83 +147,12 @@ class RankInfo:
 
 
 @dataclass(frozen=True, slots=True)
-class CreditVector:
-    registered_operations: int = 0
-    execution_slots: int = 0
-    completion_slots: int = 0
-    device_products: int = 0
-    kv_pages: int = 0
-    rollback_deltas: int = 0
-    latent_artifact_bytes: int = 0
-    pinned_completion_staging_bytes: int = 0
-    transfer_bytes: int = 0
-    transfer_tickets: int = 0
-    cpu_tasks: int = 0
-    output_journal_bytes: int = 0
-
-    _FIELDS = (
-        "registered_operations",
-        "execution_slots",
-        "completion_slots",
-        "device_products",
-        "kv_pages",
-        "rollback_deltas",
-        "latent_artifact_bytes",
-        "pinned_completion_staging_bytes",
-        "transfer_bytes",
-        "transfer_tickets",
-        "cpu_tasks",
-        "output_journal_bytes",
-    )
-
-    def __post_init__(self) -> None:
-        if any(int(getattr(self, name)) < 0 for name in self._FIELDS):
-            raise invalid_descriptor("credit vector values must not be negative")
-
-    def contains(self, requested: CreditVector) -> bool:
-        return all(getattr(requested, name) <= getattr(self, name) for name in self._FIELDS)
-
-    def digest_values(self) -> tuple[int, ...]:
-        return tuple(int(getattr(self, name)) for name in self._FIELDS)
-
-    @classmethod
-    def from_wire(cls, value: object, where: str) -> CreditVector:
-        data = _map(value, where)
-        return cls(**{name: _uint(data.get(name), f"{where}.{name}") for name in cls._FIELDS})
-
-    def to_wire(self) -> dict[str, int]:
-        return {name: int(getattr(self, name)) for name in self._FIELDS}
-
-
-@dataclass(frozen=True, slots=True)
-class RouteCreditLimits:
-    per_request: CreditVector
-    worker: CreditVector
-
-    def __post_init__(self) -> None:
-        if not self.worker.contains(self.per_request):
-            raise invalid_descriptor("route per-request credits exceed worker-wide credits")
-
-    @classmethod
-    def from_wire(cls, value: object, where: str) -> RouteCreditLimits:
-        data = _map(value, where)
-        return cls(
-            per_request=CreditVector.from_wire(data.get("per_request"), f"{where}.per_request"),
-            worker=CreditVector.from_wire(data.get("worker"), f"{where}.worker"),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {"per_request": self.per_request.to_wire(), "worker": self.worker.to_wire()}
-
-
-@dataclass(frozen=True, slots=True)
 class RouteExecutionCapability:
     route: int
     supported_work: tuple[WorkVariant, ...]
     tensorized_mixed: bool
     sampling_ownership: SamplingOwnership
     preemptible: bool
-    credits: RouteCreditLimits
     max_unresolved_window: int = 1
     legal_feature_bitset: int = 0
     sampler_processors: int = 0
@@ -239,14 +168,6 @@ class RouteExecutionCapability:
             raise invalid_descriptor("route capability id must not be negative")
         if not self.supported_work or len(set(self.supported_work)) != len(self.supported_work):
             raise invalid_descriptor("route capability work must be non-empty and unique")
-        if (
-            self.credits.per_request.registered_operations < 1
-            or self.credits.per_request.execution_slots < 1
-            or self.credits.per_request.completion_slots < 1
-        ):
-            raise invalid_descriptor(
-                "route request credits must include registration and execution"
-            )
         if self.max_unresolved_window < 1:
             raise invalid_descriptor("route unresolved-window depth must be positive")
         if self.max_points_per_operation < 1:
@@ -359,16 +280,6 @@ class EngineCaps:
         }
         if routed_work != set(self.supported_work):
             raise invalid_descriptor("route capabilities do not cover the declared work")
-        if (
-            len(
-                {
-                    capability.credits.worker
-                    for capability in self.execution_constraints.route_capabilities
-                }
-            )
-            != 1
-        ):
-            raise invalid_descriptor("worker routes disagree on worker-wide credits")
         if len(set(self.supported_controls)) != len(self.supported_controls):
             raise invalid_descriptor("capabilities repeat a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
@@ -407,10 +318,6 @@ class EngineCaps:
                         capability.tensorized_mixed,
                         capability.sampling_ownership,
                         capability.preemptible,
-                        (
-                            capability.credits.per_request.digest_values(),
-                            capability.credits.worker.digest_values(),
-                        ),
                         capability.max_unresolved_window,
                         capability.legal_feature_bitset,
                         capability.sampler_processors,
@@ -568,12 +475,6 @@ class EngineCaps:
                             ).get("preemptible"),
                             f"{where}.execution_constraints.route_capabilities[{index}].preemptible",
                         ),
-                        credits=RouteCreditLimits.from_wire(
-                            _map(
-                                item, f"{where}.execution_constraints.route_capabilities[{index}]"
-                            ).get("credits"),
-                            f"{where}.execution_constraints.route_capabilities[{index}].credits",
-                        ),
                         max_unresolved_window=int(
                             _map(item, f"{where}.rc[{index}]").get("max_unresolved_window", 1)
                         ),
@@ -671,7 +572,6 @@ class EngineCaps:
                         "tensorized_mixed": capability.tensorized_mixed,
                         "sampling_ownership": capability.sampling_ownership.value,
                         "preemptible": capability.preemptible,
-                        "credits": capability.credits.to_wire(),
                         "max_unresolved_window": capability.max_unresolved_window,
                         "legal_feature_bitset": capability.legal_feature_bitset,
                         "sampler_processors": capability.sampler_processors,

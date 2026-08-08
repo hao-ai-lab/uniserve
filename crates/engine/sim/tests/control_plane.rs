@@ -841,7 +841,7 @@ fn pipeline_depth_is_token_identical() {
 }
 
 #[test]
-fn resource_metrics_conserve_credits_and_record_the_full_lifecycle() {
+fn operation_window_metrics_record_the_full_lifecycle() {
     use uniserve_scheduler::LifecyclePhase;
 
     let mut sim = SimEngine::new();
@@ -875,16 +875,8 @@ fn resource_metrics_conserve_credits_and_record_the_full_lifecycle() {
     }
 
     let metrics = scheduler.resource_window_metrics();
-    assert_eq!(
-        metrics.credits.len(),
-        12,
-        "every credit dimension is reported"
-    );
-    assert_eq!(metrics.invariant_violations, 0);
-    assert!(
-        metrics.credits.iter().all(|dimension| dimension.used == 0),
-        "credits conserve: no dimension leaks after completion"
-    );
+    assert!(metrics.max_operations >= metrics.active_operations);
+    assert_eq!(metrics.active_operations, 0);
     assert!(metrics.max_unresolved_window >= 1);
     let roundtrip = metrics
         .phase_delays
@@ -2698,11 +2690,6 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
         sim.set_pipeline_depth(pipeline_depth);
-        let caps = sim.mut_caps_for_test();
-        caps.execution_constraints.route_capabilities[0]
-            .credits
-            .per_request
-            .device_products = 6;
         let executor = Box::new(SimExecutor::new(Box::new(sim)));
         let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -3110,11 +3097,6 @@ fn und_only_round_close_trigger_cannot_open_gen() {
 fn gen_branch_model_image_starts_spend_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let caps = sim.mut_caps_for_test();
-    caps.execution_constraints.route_capabilities[0]
-        .credits
-        .per_request
-        .device_products = 10;
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
     let trig = ControlTokens {
         ..ControlTokens::default()
@@ -3793,12 +3775,9 @@ fn image_budget_suppresses_biased_image_start() {
     );
 }
 
-///: the resource ledger proves consistency — every
-/// per-request lease (KV residency, denoise latents, scratch) is released after
-/// the request completes, so the ledger drains to zero when the engine is idle.
+/// Every logical KV reservation returns to the block manager after completion.
 #[test]
-fn resource_leases_drain_to_zero_after_completion() {
-    use std::sync::atomic::Ordering;
+fn kv_resources_return_after_completion() {
     let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
 
@@ -3826,11 +3805,9 @@ fn resource_leases_drain_to_zero_after_completion() {
         keep_alive.push(sched.submit_for_test(req));
     }
 
-    let mut max_active = 0usize;
     let mut idle_steps = 0;
     for _ in 0..5000 {
         let progressed = sched.step();
-        max_active = max_active.max(sched.stats.resources.active.load(Ordering::Relaxed));
         // converged when several consecutive steps make no progress.
         idle_steps = if progressed { 0 } else { idle_steps + 1 };
         if idle_steps >= 3 {
@@ -3838,29 +3815,10 @@ fn resource_leases_drain_to_zero_after_completion() {
         }
     }
 
-    assert!(
-        max_active > 0,
-        "leases must actually be issued during the run"
-    );
-    assert_eq!(
-        sched.stats.resources.active.load(Ordering::Relaxed),
-        0,
-        "every per-request lease must be released after completion (no leak)",
-    );
-    assert_eq!(
-        sched.stats.general.running.load(Ordering::Relaxed),
-        0,
-        "running request gauge must be refreshed after the final request finishes",
-    );
-    assert_eq!(
-        sched
-            .stats
-            .resources
-            .invariant_violations
-            .load(Ordering::Relaxed),
-        0,
-        "no resource-invariant violations",
-    );
+    let health = sched.health_snapshot();
+    assert_eq!(health.running, 0);
+    assert_eq!(health.in_flight, 0);
+    assert_eq!(health.free_blocks, health.total_blocks);
 }
 
 /// Logical KV leases remain bound to their request until the exact close
@@ -3979,16 +3937,12 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
                 }
             }
         }
-        if finished.len() == receivers.len()
-            && scheduler.health_snapshot().in_flight == 0
-            && scheduler.health_snapshot().active_credit_requests == 0
-        {
+        if finished.len() == receivers.len() && scheduler.health_snapshot().in_flight == 0 {
             break;
         }
     }
 
     assert_eq!(finished.len(), receivers.len());
-    assert_eq!(scheduler.health_snapshot().active_credit_requests, 0);
     assert_eq!(scheduler.health_snapshot().free_blocks, 2);
     assert!(owners.lock().unwrap().is_empty());
 }
@@ -4082,11 +4036,9 @@ fn lifecycle_trace_and_health_snapshot() {
         }
     }
 
-    // Health snapshot: idle, leak-free, alive (read before draining traces).
+    // Health snapshot: idle and alive (read before draining traces).
     let h = sched.health_snapshot();
     assert_eq!(h.running, 0);
-    assert_eq!(h.active_credit_requests, 0);
-    assert_eq!(h.resource_invariant_violations, 0);
     assert!(!h.fatal);
     assert!(h.completed_traces >= 1);
     assert!(!h.supported_work.is_empty());
@@ -4311,7 +4263,7 @@ fn cpu_continuation_timeout_closes_only_its_request_lineage() {
 }
 
 #[test]
-fn cancellation_storm_reclaims_every_request_credit() {
+fn cancellation_storm_retires_every_request() {
     let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
     let mut scheduler = Scheduler::new(executor, ctrl(), 32);
     let receivers = (1..=128)
@@ -4341,12 +4293,10 @@ fn cancellation_storm_reclaims_every_request_credit() {
     assert_eq!(health.running, 0);
     assert_eq!(health.pending, 0);
     assert_eq!(health.in_flight, 0);
-    assert_eq!(health.active_credit_requests, 0);
-    assert_eq!(health.resource_invariant_violations, 0);
 }
 
 #[test]
-fn cpu_failure_storm_is_request_local_and_reclaims_every_credit() {
+fn cpu_failure_storm_is_request_local_and_retires_every_request() {
     use uniserve_scheduler::{LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration};
 
     struct BoundViolatingProcessor;
@@ -4417,12 +4367,10 @@ fn cpu_failure_storm_is_request_local_and_reclaims_every_credit() {
     assert_eq!(health.running, 0);
     assert_eq!(health.pending, 0);
     assert_eq!(health.in_flight, 0);
-    assert_eq!(health.active_credit_requests, 0);
-    assert_eq!(health.resource_invariant_violations, 0);
 }
 
 #[test]
-fn slow_client_releases_execution_credits_before_output_capacity_returns() {
+fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -4462,19 +4410,18 @@ fn slow_client_releases_execution_credits_before_output_capacity_returns() {
     let health = scheduler.health_snapshot();
     assert_eq!(
         health.in_flight, 0,
-        "an output-credit-stalled request cannot retain an execution slot"
+        "an output-stalled request cannot retain an execution slot"
     );
     assert_eq!(health.running, 1);
 
     drop(slow_events);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline
-        && (scheduler.health_snapshot().running > 0
-            || scheduler.health_snapshot().active_credit_requests > 0)
+        && (scheduler.health_snapshot().running > 0 || scheduler.health_snapshot().in_flight > 0)
     {
         scheduler.step();
     }
     let health = scheduler.health_snapshot();
     assert_eq!(health.running, 0);
-    assert_eq!(health.active_credit_requests, 0);
+    assert_eq!(health.in_flight, 0);
 }

@@ -188,7 +188,7 @@ impl EventTx {
 }
 
 /// Bounded engine-to-caller event receiver. Releasing one channel slot wakes
-/// the scheduler so an output-credit-stalled lineage becomes runnable without
+/// the scheduler so an output-capacity-stalled lineage becomes runnable without
 /// polling.
 pub struct EventRx {
     inner: mpsc::Receiver<GenEvent>,

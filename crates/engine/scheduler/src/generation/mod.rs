@@ -6,11 +6,10 @@ use uniserve_core::{
     ImageKvEffect, RequestId, SamplingParams, SegmentPlacement, UndTokenAction,
 };
 use uniserve_worker_wire::{
-    Bounds, CompletionRecord, CreditVector, DType, DimBound, Domain, DrawLayout, EncodeMode,
-    GenMode, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    RequestKey, ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode,
-    TransferMode, VersionRef, Work, WorkVariant, encode_sampling_state_bytes,
-    encode_token_product_bytes,
+    Bounds, CompletionRecord, DType, DimBound, Domain, DrawLayout, EncodeMode, GenMode, OpId,
+    OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
+    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode, TransferMode,
+    VersionRef, Work, WorkVariant, encode_sampling_state_bytes, encode_token_product_bytes,
 };
 
 use crate::image_artifact::png_artifact_dims_b64;
@@ -494,8 +493,6 @@ impl GenerationCursor {
                 worstcase_blocks,
                 worker_image_latent_units: 0,
                 host_scratch_tokens: 0,
-                latent_credit_bytes: 0,
-                scratch_credit_pages: 0,
             },
             replay: ReplayCursor {
                 block_hashes: Vec::new(),
@@ -790,8 +787,6 @@ pub struct ResourceCursor {
     pub(crate) worstcase_blocks: usize,
     pub(crate) worker_image_latent_units: u64,
     pub(crate) host_scratch_tokens: u64,
-    pub(crate) latent_credit_bytes: u64,
-    pub(crate) scratch_credit_pages: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1774,7 +1769,6 @@ impl GenerationPlanner {
             predicate: None,
             rng,
             control_seq: 0,
-            reserved_credits: CreditVector::ZERO,
             operation_variant,
             request_id: request.request_id,
             planned_us: uniserve_core::now_monotonic_us(),
@@ -1952,8 +1946,6 @@ pub(crate) struct PlannedTransition {
     pub(crate) predicate: Option<ProductRef>,
     pub(crate) rng: Option<Rng>,
     pub(crate) control_seq: u64,
-    /// Exact operation-scoped vector acquired before registration.
-    pub(crate) reserved_credits: CreditVector,
     pub(crate) operation_variant: WorkVariant,
     pub(crate) request_id: RequestId,
     /// Monotonic microsecond stamps for the two pre-registration lifecycle
@@ -1990,9 +1982,7 @@ pub(crate) struct SchedulerApply {
     pub(crate) visibility: OutputVisibilityPlan,
     pub(crate) replayability_after_apply: Replayability,
     pub(crate) release_on_apply: Vec<ResourceClass>,
-    pub(crate) request_latent_credit: bool,
-    pub(crate) reserved_credits: CreditVector,
-    pub(crate) output_credit_bound: usize,
+    pub(crate) output_event_bound: usize,
     pub(crate) device_parent_point: Option<u32>,
 }
 
@@ -2005,7 +1995,7 @@ impl PlannedTransition {
         op_id: OpId,
         parent: VersionRef,
         next_product_generation: &mut u64,
-        output_credit_bound: usize,
+        output_event_bound: usize,
     ) -> Result<(Operation, SchedulerApply, Vec<ProductPayload>), PlanningError> {
         let required_generations = self
             .outputs
@@ -2123,9 +2113,7 @@ impl PlannedTransition {
             visibility: self.visibility,
             replayability_after_apply: self.resources.replayability_after_apply,
             release_on_apply: self.resources.release_on_apply,
-            request_latent_credit: self.resources.latent_units > 0,
-            reserved_credits: self.reserved_credits,
-            output_credit_bound,
+            output_event_bound,
             device_parent_point: self.device_parent_point,
         };
         Ok((operation, apply, input_products))

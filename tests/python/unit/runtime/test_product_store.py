@@ -246,7 +246,7 @@ def test_device_product_byte_exhaustion_preserves_capacity_and_reclaims_slots() 
     table = DeviceProductTable(capacity=2, byte_capacity=16)
     oversized = _device_ref(op_id=41, generation=12, elements=3)
 
-    with pytest.raises(Exception, match="device-product byte credit is exhausted"):
+    with pytest.raises(Exception, match="device-product byte capacity is exhausted"):
         table.bind_outputs(((oversized, "ab" * 32, "cpu"),))
 
     assert table.allocated_bytes == 0

@@ -7,16 +7,15 @@ from typing import Protocol, runtime_checkable
 
 from ..batch import Batch, CompletionReport, SamplingOwnership, SnapshotRef, WorkVariant
 from ..capabilities import (
-    CreditVector,
     EngineCaps,
     ExecutionConstraints,
     RankInfo,
     RequestKind,
     ResourceClass,
-    RouteCreditLimits,
     RouteExecutionCapability,
 )
 from ..foundation.errors import capability_mismatch
+from ..runtime.arena_capacity import operation_window
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,43 +121,9 @@ def model_free_capabilities(
 ) -> EngineCaps:
     if int(completion_payload_bytes) < 1:
         raise ValueError("model-free completion payload capacity must be positive")
-    slots = int(pipeline_depth) * int(max_batch_operations)
-    window = min(slots, max(2, int(pipeline_depth)))
-    per_operation_staging = int(completion_payload_bytes) + 256
-    completion_words = 4 * int(max_batch_operations) + (int(completion_payload_bytes) + 3) // 4
-    completion_arena_bytes = int(pipeline_depth) * completion_words * 8
-    route_credits = RouteCreditLimits(
-        per_request=CreditVector(
-            registered_operations=window,
-            execution_slots=window,
-            completion_slots=window,
-            device_products=5 * window,
-            kv_pages=int(num_blocks),
-            rollback_deltas=window,
-            latent_artifact_bytes=(1 << 20) * 5 * window,
-            pinned_completion_staging_bytes=per_operation_staging * window,
-            transfer_bytes=(1 << 20) * window,
-            transfer_tickets=window,
-            cpu_tasks=2,
-            output_journal_bytes=1 << 30,
-        ),
-        worker=CreditVector(
-            registered_operations=slots,
-            execution_slots=slots,
-            completion_slots=slots,
-            device_products=5 * slots,
-            kv_pages=int(num_blocks),
-            rollback_deltas=slots,
-            latent_artifact_bytes=(1 << 20) * 5 * slots,
-            pinned_completion_staging_bytes=max(
-                completion_arena_bytes,
-                per_operation_staging * window,
-            ),
-            transfer_bytes=(1 << 20) * slots,
-            transfer_tickets=slots,
-            cpu_tasks=256,
-            output_journal_bytes=(1 << 30) * max_batch_operations,
-        ),
+    window = operation_window(
+        int(pipeline_depth),
+        int(max_batch_operations),
     )
     return EngineCaps(
         block_size=block_size,
@@ -199,7 +164,7 @@ def model_free_capabilities(
                     tensorized_mixed=False,
                     sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
                     preemptible=False,
-                    credits=route_credits,
+                    max_unresolved_window=window,
                 ),
             ),
         ),

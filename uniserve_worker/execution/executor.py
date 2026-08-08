@@ -6059,7 +6059,7 @@ class ModelExecutor:
         identity = _operation_identity(operation)
         reservation = scope.cpu_tasks.get(identity)
         if reservation is None:
-            raise RuntimeError("materialization has no registered CPU task credit")
+            raise RuntimeError("materialization has no registered CPU task slot")
         session_id = operation.request_key.session_id
         epoch = int(operation.request_key.epoch)
         handle = _stable_handle(session_id, operation.request_key.epoch, 0, "frames")

@@ -22,20 +22,6 @@ def _is_digest(value: object) -> bool:
 
 
 def _recompute_route_digest(wire: dict) -> str:
-    credit_fields = (
-        "registered_operations",
-        "execution_slots",
-        "completion_slots",
-        "device_products",
-        "kv_pages",
-        "rollback_deltas",
-        "latent_artifact_bytes",
-        "pinned_completion_staging_bytes",
-        "transfer_bytes",
-        "transfer_tickets",
-        "cpu_tasks",
-        "output_journal_bytes",
-    )
     return batch.route_capability_digest(
         tuple(WorkVariant(value) for value in wire["supported_work"]),
         wire["max_cfg_branches"],
@@ -57,10 +43,6 @@ def _recompute_route_digest(wire: dict) -> str:
                 capability["tensorized_mixed"],
                 batch.SamplingOwnership(capability["sampling_ownership"]),
                 capability["preemptible"],
-                (
-                    tuple(capability["credits"]["per_request"][name] for name in credit_fields),
-                    tuple(capability["credits"]["worker"][name] for name in credit_fields),
-                ),
                 capability["max_unresolved_window"],
                 capability["legal_feature_bitset"],
                 capability["sampler_processors"],

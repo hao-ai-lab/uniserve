@@ -80,7 +80,7 @@ class TensorStager:
         projected = self._allocated_bytes - prior + current
         if projected > self.byte_capacity:
             raise resource_error(
-                f"staging byte credit is exhausted ({projected}>{self.byte_capacity})"
+                f"staging byte capacity is exhausted ({projected}>{self.byte_capacity})"
             )
         slot[key] = buffer
         self._allocated_bytes = projected

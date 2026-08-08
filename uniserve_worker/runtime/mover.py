@@ -16,6 +16,7 @@ class Mover:
         *,
         transfer_backend: str,
         transfer_byte_capacity: int,
+        transfer_ticket_capacity: int,
         cross_process: bool = False,
     ) -> None:
         backend = str(transfer_backend)
@@ -27,6 +28,9 @@ class Mover:
         self._transfer_byte_capacity = int(transfer_byte_capacity)
         if self._transfer_byte_capacity < 1:
             raise capability_mismatch("transfer byte capacity must be positive")
+        self._transfer_ticket_capacity = int(transfer_ticket_capacity)
+        if self._transfer_ticket_capacity < 1:
+            raise capability_mismatch("transfer ticket capacity must be positive")
         self._transport: Transport | None = None
 
     @property
@@ -35,6 +39,7 @@ class Mover:
             self._transport = make_transport(
                 self._backend,
                 byte_capacity=self._transfer_byte_capacity,
+                ticket_capacity=self._transfer_ticket_capacity,
             )
         return self._transport
 
