@@ -303,7 +303,7 @@ pub struct SimEngine {
 
 impl SimEngine {
     pub fn new() -> Self {
-        let mut caps = EngineCaps {
+        let caps = EngineCaps {
             supported_work: vec![
                 WorkVariant::TokenExtend,
                 WorkVariant::TokenDecode,
@@ -395,7 +395,6 @@ impl SimEngine {
             weight_digest: "1".repeat(64),
             ..EngineCaps::default()
         };
-        caps.route_capability_digest = caps.compute_route_capability_digest();
         Self {
             caps,
             text_len: DEFAULT_TEXT_LEN,

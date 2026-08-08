@@ -790,10 +790,6 @@ fn capabilities_from_table(caps: fbs::EngineCaps<'_>) -> anyhow::Result<EngineCa
             .protocol_layout_digest()
             .map(str::to_string)
             .context("capabilities.protocol_layout_digest is missing")?,
-        route_capability_digest: caps
-            .route_capability_digest()
-            .map(str::to_string)
-            .context("capabilities.route_capability_digest is missing")?,
         restored_snapshots: caps
             .restored_snapshots()
             .map(|items| items.iter().map(snapshot_from_table).collect())
@@ -2256,7 +2252,7 @@ fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         model_spec_digest: Some(caps.model_spec_digest.clone()),
         weight_digest: Some(caps.weight_digest.clone()),
         protocol_layout_digest: Some(caps.protocol_layout_digest.clone()),
-        route_capability_digest: Some(caps.route_capability_digest.clone()),
+        route_capability_digest: Some(String::new()),
         restored_snapshots: Some(caps.restored_snapshots.iter().map(snapshot_to_fb).collect()),
     })
 }
@@ -2378,9 +2374,6 @@ fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
         protocol_layout_digest: caps
             .protocol_layout_digest
             .context("capabilities.protocol_layout_digest is missing")?,
-        route_capability_digest: caps
-            .route_capability_digest
-            .context("capabilities.route_capability_digest is missing")?,
         restored_snapshots: caps
             .restored_snapshots
             .unwrap_or_default()

@@ -693,14 +693,13 @@ fn commit_control_requires_a_fixed_selected_version() {
 }
 
 #[test]
-fn capabilities_round_trip_and_carry_the_layout_agreement() {
+fn capabilities_round_trip_with_the_canonical_layout() {
     let caps = EngineCaps::default();
     assert_eq!(caps.protocol_layout_digest, protocol_layout_digest());
     let response = WorkerResponse::capabilities(caps.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
     let decoded = decoded.capabilities.unwrap();
     assert_eq!(decoded, caps);
-    assert!(caps.agrees_with(&decoded));
 }
 
 #[test]
@@ -986,7 +985,7 @@ fn request_fixtures() -> Vec<WorkerRequest> {
 }
 
 fn full_caps() -> EngineCaps {
-    let mut caps = EngineCaps {
+    EngineCaps {
         supported_work: WorkVariant::ALL.to_vec(),
         quantization: Some("fp8".into()),
         groups: vec![
@@ -1054,9 +1053,7 @@ fn full_caps() -> EngineCaps {
             },
         ],
         ..EngineCaps::default()
-    };
-    caps.route_capability_digest = caps.compute_route_capability_digest();
-    caps
+    }
 }
 
 fn full_forward_stats() -> WorkerForwardStats {

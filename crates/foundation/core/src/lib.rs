@@ -9,10 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod generation;
 pub mod philox;
 pub mod product_blob;
-pub mod program;
-pub mod program_cursor;
 pub mod sampling;
-pub mod semantic;
 pub use generation::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,

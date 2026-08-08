@@ -1424,7 +1424,6 @@ mod tests {
         let mut exec = fake_multiproc(2);
         exec.caps.execution_constraints.route_capabilities[0].sampling_ownership =
             SamplingOwnership::DeterministicSharded;
-        exec.caps.route_capability_digest = exec.caps.compute_route_capability_digest();
         exec.inflight = 1;
         queue_pending(&mut exec, &[1]);
         exec.buffers[0].push_back(result_with_products(1, vec![10, 11], 100));
@@ -1444,7 +1443,6 @@ mod tests {
         let mut exec = fake_multiproc(2);
         exec.caps.execution_constraints.route_capabilities[0].sampling_ownership =
             SamplingOwnership::DeterministicSharded;
-        exec.caps.route_capability_digest = exec.caps.compute_route_capability_digest();
         exec.inflight = 1;
         queue_pending(&mut exec, &[1]);
         exec.buffers[0].push_back(result_with_products(1, vec![10], 100));

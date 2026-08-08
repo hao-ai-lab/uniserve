@@ -11,11 +11,10 @@ use std::path::PathBuf;
 
 use uniserve_core::RequestId;
 use uniserve_worker_wire::{
-    Bounds, CompletionRecord, CreditDimension, CreditVector, DType, DimBound, Domain, DrawLayout,
-    EngineCaps, ExecutionConstraints, FinishFlags, LogicalLengths, OpId, OpStatus, Operation,
-    Point, PointRange, ProductKind, ProductRef, RequestKey, Rng, RouteCreditLimits,
-    RouteExecutionCapability, RouteId, SamplingOwnership, ShapeBound, StorageClass, TimingCounters,
-    TokenMode, TokenSpan, VersionRef, Work, WorkVariant, protocol_layout_digest,
+    Bounds, CompletionRecord, DType, DimBound, Domain, DrawLayout, FinishFlags, LogicalLengths,
+    OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductRef, RequestKey, Rng,
+    RouteId, ShapeBound, StorageClass, TimingCounters, TokenMode, TokenSpan, VersionRef, Work,
+    protocol_layout_digest,
 };
 
 fn digest_string(seed: u8) -> String {
@@ -207,85 +206,6 @@ fn emit_digest_parity_fixture() {
         .validate()
         .expect("canonical completion is valid");
 
-    // A fixed sample capability tuple for the cross-language route-capability
-    // agreement. The supported-work list carries a duplicate to exercise the
-    // sort-and-dedup step.
-    let sample_work = [
-        WorkVariant::TokenDecode,
-        WorkVariant::TokenExtend,
-        WorkVariant::GenFlow,
-        WorkVariant::EncodeVision,
-        WorkVariant::TokenDecode,
-    ];
-    let caps = EngineCaps {
-        supported_work: sample_work.to_vec(),
-        max_cfg_branches: 3,
-        max_latent_size: 4096,
-        max_vae_grid_tokens: 64,
-        max_vit_grid_tokens: 64,
-        max_latent_feature_bytes: 1 << 20,
-        max_vision_feature_bytes: 1 << 21,
-        execution_constraints: ExecutionConstraints {
-            max_batch_operations: 16,
-            route_capabilities: vec![RouteExecutionCapability {
-                route: RouteId(0),
-                supported_work: vec![
-                    WorkVariant::TokenDecode,
-                    WorkVariant::TokenExtend,
-                    WorkVariant::GenFlow,
-                    WorkVariant::EncodeVision,
-                ],
-                tensorized_mixed: true,
-                sampling_ownership: SamplingOwnership::DesignatedRank,
-                preemptible: false,
-                credits: RouteCreditLimits {
-                    per_request: CreditVector {
-                        registered_operations: 2,
-                        execution_slots: 2,
-                        completion_slots: 2,
-                        device_products: 10,
-                        kv_pages: 64,
-                        rollback_deltas: 34,
-                        latent_artifact_bytes: 1 << 20,
-                        pinned_completion_staging_bytes: 1 << 21,
-                        transfer_bytes: 1 << 20,
-                        transfer_tickets: 2,
-                        cpu_tasks: 1,
-                        output_journal_bytes: 1 << 24,
-                    },
-                    worker: CreditVector {
-                        registered_operations: 16,
-                        execution_slots: 16,
-                        completion_slots: 16,
-                        device_products: 80,
-                        kv_pages: 256,
-                        rollback_deltas: 272,
-                        latent_artifact_bytes: 1 << 24,
-                        pinned_completion_staging_bytes: 1 << 25,
-                        transfer_bytes: 1 << 24,
-                        transfer_tickets: 16,
-                        cpu_tasks: 16,
-                        output_journal_bytes: 1 << 28,
-                    },
-                },
-                max_unresolved_window: 4,
-                legal_feature_bitset: 0b0001_1111,
-                sampler_processors: 0x3FFF,
-                processor_order_revision: 1,
-                rng_layouts: 0b101,
-                graph_eligible: true,
-                gen_conditioning: 2,
-                max_points_per_operation: 17,
-                mixed_row_combinations: vec![0b011, 0b101],
-            }],
-            ..ExecutionConstraints::default()
-        },
-        kv_dtype: "bfloat16".into(),
-        model_dtype: "bfloat16".into(),
-        attention_backend: "flashinfer".into(),
-        ..Default::default()
-    };
-    let route_capability_digest = caps.compute_route_capability_digest();
     let layout_digest = protocol_layout_digest();
 
     let fixture = serde_json::json!({
@@ -295,51 +215,6 @@ fn emit_digest_parity_fixture() {
         "plan_digest": plan_digest,
         "semantic_digest": semantic_digest,
         "protocol_layout_digest": layout_digest,
-        "route_capability_sample": {
-            "supported_work": sample_work
-                .iter()
-                .map(|variant| variant.as_wire_str())
-                .collect::<Vec<_>>(),
-            "max_cfg_branches": caps.max_cfg_branches,
-            "max_latent_size": caps.max_latent_size,
-            "max_vae_grid_tokens": caps.max_vae_grid_tokens,
-            "max_vit_grid_tokens": caps.max_vit_grid_tokens,
-            "max_latent_feature_bytes": caps.max_latent_feature_bytes,
-            "max_vision_feature_bytes": caps.max_vision_feature_bytes,
-            "max_batch_operations": caps.execution_constraints.max_batch_operations,
-            "max_speculative_points": caps.execution_constraints.max_speculative_points,
-            "max_unresolved_window": caps.execution_constraints.max_unresolved_window,
-            "device_sequence_lengths": caps.execution_constraints.device_sequence_lengths,
-            "device_append_offsets": caps.execution_constraints.device_append_offsets,
-            "incremental_kv_publication": caps.execution_constraints.incremental_kv_publication,
-            "route_capabilities": caps.execution_constraints.route_capabilities.iter().map(|capability| serde_json::json!({
-                "route": capability.route.0,
-                "supported_work": capability.supported_work.iter().map(|variant| variant.as_wire_str()).collect::<Vec<_>>(),
-                "tensorized_mixed": capability.tensorized_mixed,
-                "sampling_ownership": match capability.sampling_ownership {
-                    SamplingOwnership::DesignatedRank => "designated_rank",
-                    SamplingOwnership::DeterministicSharded => "deterministic_sharded",
-                },
-                "preemptible": capability.preemptible,
-                "credits": {
-                    "per_request": CreditDimension::ALL.map(|dimension| capability.credits.per_request.get(dimension)),
-                    "worker": CreditDimension::ALL.map(|dimension| capability.credits.worker.get(dimension)),
-                },
-                "max_unresolved_window": capability.max_unresolved_window,
-                "legal_feature_bitset": capability.legal_feature_bitset,
-                "sampler_processors": capability.sampler_processors,
-                "processor_order_revision": capability.processor_order_revision,
-                "rng_layouts": capability.rng_layouts,
-                "graph_eligible": capability.graph_eligible,
-                "gen_conditioning": capability.gen_conditioning,
-                "max_points_per_operation": capability.max_points_per_operation,
-                "mixed_row_combinations": capability.mixed_row_combinations,
-            })).collect::<Vec<_>>(),
-            "kv_dtype": caps.kv_dtype,
-            "model_dtype": caps.model_dtype,
-            "attention_backend": caps.attention_backend,
-        },
-        "route_capability_digest": route_capability_digest,
     });
 
     let path = fixture_path();

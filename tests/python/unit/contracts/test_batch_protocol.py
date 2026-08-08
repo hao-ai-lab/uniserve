@@ -50,7 +50,6 @@ from uniserve_worker.batch import (
     Release,
     RequestKey,
     Rng,
-    SamplingOwnership,
     SamplingState,
     ShapeBound,
     StaticDim,
@@ -62,7 +61,6 @@ from uniserve_worker.batch import (
     VersionRef,
     Work,
     WorkerForwardStats,
-    WorkVariant,
     control_content_digest,
     control_from_wire,
     control_to_wire,
@@ -71,7 +69,6 @@ from uniserve_worker.batch import (
     encode_sampling_state_bytes,
     encode_token_product_bytes,
     protocol_layout_digest,
-    route_capability_digest,
 )
 from uniserve_worker.foundation.errors import WorkerError
 
@@ -265,55 +262,6 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
 def test_protocol_layout_digest_matches_rust() -> None:
     fixture = _fixture()
     assert protocol_layout_digest() == fixture["protocol_layout_digest"]
-
-
-def test_route_capability_digest_matches_rust() -> None:
-    fixture = _fixture()
-    sample = fixture["route_capability_sample"]
-    assert (
-        route_capability_digest(
-            [WorkVariant(name) for name in sample["supported_work"]],
-            sample["max_cfg_branches"],
-            sample["max_latent_size"],
-            sample["max_vae_grid_tokens"],
-            sample["max_vit_grid_tokens"],
-            sample["max_latent_feature_bytes"],
-            sample["max_vision_feature_bytes"],
-            sample["max_batch_operations"],
-            sample["max_speculative_points"],
-            sample["max_unresolved_window"],
-            sample["device_sequence_lengths"],
-            sample["device_append_offsets"],
-            sample["incremental_kv_publication"],
-            tuple(
-                (
-                    capability["route"],
-                    tuple(WorkVariant(variant) for variant in capability["supported_work"]),
-                    capability["tensorized_mixed"],
-                    SamplingOwnership(capability["sampling_ownership"]),
-                    capability["preemptible"],
-                    (
-                        tuple(capability["credits"]["per_request"]),
-                        tuple(capability["credits"]["worker"]),
-                    ),
-                    capability["max_unresolved_window"],
-                    capability["legal_feature_bitset"],
-                    capability["sampler_processors"],
-                    capability["processor_order_revision"],
-                    capability["rng_layouts"],
-                    capability["graph_eligible"],
-                    capability["gen_conditioning"],
-                    capability["max_points_per_operation"],
-                    tuple(capability["mixed_row_combinations"]),
-                )
-                for capability in sample["route_capabilities"]
-            ),
-            sample["kv_dtype"],
-            sample["model_dtype"],
-            sample["attention_backend"],
-        )
-        == fixture["route_capability_digest"]
-    )
 
 
 # --- Round-trip and validation ---------------------------------------------

@@ -374,7 +374,6 @@ impl StageRouter {
             .min()
             .unwrap_or(0);
         merged.restored_snapshots.clear();
-        merged.route_capability_digest = merged.compute_route_capability_digest();
         merged.validate()?;
         Ok(merged)
     }
@@ -1099,7 +1098,7 @@ mod tests {
     }
 
     fn caps(work: WorkVariant) -> EngineCaps {
-        let mut caps = EngineCaps {
+        EngineCaps {
             supported_work: vec![work],
             execution_constraints: uniserve_worker_wire::ExecutionConstraints {
                 route_capabilities: vec![RouteExecutionCapability {
@@ -1126,9 +1125,7 @@ mod tests {
             max_vit_grid_tokens: 64,
             max_vision_feature_bytes: 1 << 20,
             ..EngineCaps::default()
-        };
-        caps.route_capability_digest = caps.compute_route_capability_digest();
-        caps
+        }
     }
 
     fn request_key(session_id: u64) -> RequestKey {

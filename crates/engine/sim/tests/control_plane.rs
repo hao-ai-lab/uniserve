@@ -2703,7 +2703,6 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
             .credits
             .per_request
             .device_products = 6;
-        caps.route_capability_digest = caps.compute_route_capability_digest();
         let executor = Box::new(SimExecutor::new(Box::new(sim)));
         let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -3116,7 +3115,6 @@ fn gen_branch_model_image_starts_spend_budget() {
         .credits
         .per_request
         .device_products = 10;
-    caps.route_capability_digest = caps.compute_route_capability_digest();
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
     let trig = ControlTokens {
         ..ControlTokens::default()

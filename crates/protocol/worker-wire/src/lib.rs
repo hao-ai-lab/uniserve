@@ -1922,8 +1922,7 @@ impl Default for ExecutionConstraints {
 }
 
 /// A worker's advertised capabilities. Admission requires every rank, worker,
-/// and frontend to agree on both the protocol-layout and route-capability
-/// digests.
+/// and frontend to agree on the protocol layout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineCaps {
     pub block_size: u32,
@@ -1955,93 +1954,10 @@ pub struct EngineCaps {
     pub model_spec_digest: Digest,
     pub weight_digest: Digest,
     pub protocol_layout_digest: Digest,
-    pub route_capability_digest: Digest,
     pub restored_snapshots: Vec<SnapshotRef>,
 }
 
 impl EngineCaps {
-    /// The canonical protocol-layout digest: a disagreement means a peer reads a
-    /// different record layout and must not be admitted.
-    pub fn canonical_protocol_layout_digest() -> Digest {
-        protocol_layout_digest()
-    }
-
-    /// The route-capability digest: per-route supported work, sampler and shape
-    /// regime, and mixed-submission capability summarized for the agreement.
-    pub fn compute_route_capability_digest(&self) -> Digest {
-        let mut digest = CanonicalDigest::new(b"uniserve-route-capability\0");
-        let mut variants: Vec<u8> = self
-            .supported_work
-            .iter()
-            .map(|variant| *variant as u8)
-            .collect();
-        variants.sort_unstable();
-        variants.dedup();
-        digest.u64(variants.len() as u64);
-        for variant in variants {
-            digest.u8(variant);
-        }
-        digest.u32(self.max_cfg_branches);
-        digest.u32(self.max_latent_size);
-        digest.u32(self.max_vae_grid_tokens);
-        digest.u32(self.max_vit_grid_tokens);
-        digest.u64(self.max_latent_feature_bytes);
-        digest.u64(self.max_vision_feature_bytes);
-        digest.u32(self.execution_constraints.max_batch_operations);
-        digest.u32(self.execution_constraints.max_speculative_points);
-        digest.u32(self.execution_constraints.max_unresolved_window);
-        digest.bool(self.execution_constraints.device_sequence_lengths);
-        digest.bool(self.execution_constraints.device_append_offsets);
-        digest.bool(self.execution_constraints.incremental_kv_publication);
-        let mut route_capabilities = self.execution_constraints.route_capabilities.to_vec();
-        route_capabilities.sort_unstable_by_key(|capability| capability.route.0);
-        digest.u64(route_capabilities.len() as u64);
-        for capability in route_capabilities {
-            digest.u32(capability.route.0);
-            let mut supported_work = capability
-                .supported_work
-                .iter()
-                .map(|variant| *variant as u8)
-                .collect::<Vec<_>>();
-            supported_work.sort_unstable();
-            supported_work.dedup();
-            digest.u64(supported_work.len() as u64);
-            for variant in supported_work {
-                digest.u8(variant);
-            }
-            digest.bool(capability.tensorized_mixed);
-            digest.u8(capability.sampling_ownership as u8);
-            digest.bool(capability.preemptible);
-            digest.credit_vector(capability.credits.per_request);
-            digest.credit_vector(capability.credits.worker);
-            digest.u32(capability.max_unresolved_window);
-            digest.u32(capability.legal_feature_bitset);
-            digest.u32(capability.sampler_processors);
-            digest.u32(capability.processor_order_revision);
-            digest.u32(capability.rng_layouts);
-            digest.bool(capability.graph_eligible);
-            digest.u8(capability.gen_conditioning);
-            digest.u32(capability.max_points_per_operation);
-            let mut combinations = capability.mixed_row_combinations.clone();
-            combinations.sort_unstable();
-            combinations.dedup();
-            digest.u64(combinations.len() as u64);
-            for combination in combinations {
-                digest.u32(combination);
-            }
-        }
-        digest.string(&self.kv_dtype);
-        digest.string(&self.model_dtype);
-        digest.string(&self.attention_backend);
-        digest.finish()
-    }
-
-    /// Whether this process may be admitted alongside `other`.
-    pub fn agrees_with(&self, other: &Self) -> bool {
-        self.protocol_layout_digest == other.protocol_layout_digest
-            && self.route_capability_digest == other.route_capability_digest
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.supported_work.is_empty(),
@@ -2111,10 +2027,6 @@ impl EngineCaps {
             "worker capabilities carry a disagreeing protocol-layout digest"
         );
         anyhow::ensure!(
-            self.route_capability_digest == self.compute_route_capability_digest(),
-            "worker capabilities carry an inconsistent route-capability digest"
-        );
-        anyhow::ensure!(
             (self.model_spec_digest.is_empty() && self.weight_digest.is_empty())
                 || (is_digest(&self.model_spec_digest) && is_digest(&self.weight_digest)),
             "worker capability model and weight identities are incomplete"
@@ -2139,7 +2051,7 @@ impl EngineCaps {
 
 impl Default for EngineCaps {
     fn default() -> Self {
-        let mut caps = Self {
+        Self {
             block_size: 64,
             num_blocks: 4096,
             num_layers: 28,
@@ -2169,11 +2081,8 @@ impl Default for EngineCaps {
             model_spec_digest: String::new(),
             weight_digest: String::new(),
             protocol_layout_digest: protocol_layout_digest(),
-            route_capability_digest: String::new(),
             restored_snapshots: Vec::new(),
-        };
-        caps.route_capability_digest = caps.compute_route_capability_digest();
-        caps
+        }
     }
 }
 
@@ -2692,12 +2601,6 @@ impl CanonicalDigest {
         self.u64(value.max_latent_bytes);
         self.u64(value.max_completion_bytes);
         self.u64(value.max_transfer_bytes);
-    }
-
-    fn credit_vector(&mut self, value: CreditVector) {
-        for dimension in CreditDimension::ALL {
-            self.u64(value.get(dimension));
-        }
     }
 
     fn rng(&mut self, value: &Rng) {
