@@ -142,28 +142,25 @@ struct Group {
 /// request's blocks, segment table, scratch reservation, and trim offsets can
 /// never drift out of sync across parallel maps.
 #[derive(Debug, Default)]
-struct RequestKvState {
+struct RequestGroupState {
     blocks: Vec<BlockId>,
+    block_tok_starts: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Default)]
+struct RequestKvState {
+    groups: Vec<RequestGroupState>,
     // `None` means no segment table is materialized; `Some` retains an explicit
     // table even when it is empty.
     segments: Option<SegmentTable>,
     scratch_res: u64,
-    // true token-start offset of each *currently-retained* block, parallel
-    // to `blocks`. Sliding-window trimming removes interior blocks, so after the
-    // first trim the surviving blocks are no longer token-contiguous-from-0 and
-    // positional `idx*block_size` would mis-map. This table preserves each
-    // survivor's real offset so repeated trims stay correct. `None` => the block
-    // list is still contiguous from 0 (the post-allocate / prefix-cache-hit
-    // baseline), so positional offsets are valid.
-    block_tok_starts: Option<Vec<usize>>,
 }
 
 impl RequestKvState {
     fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.groups.iter().all(|group| group.blocks.is_empty())
             && self.segments.is_none()
             && self.scratch_res == 0
-            && self.block_tok_starts.is_none()
     }
 }
 
@@ -290,17 +287,22 @@ impl BlockManager {
             events: VecDeque::new(),
             events_cap: 4096,
             stats: BlockManagerStats {
-                total: num_blocks,
+                total: num_blocks.saturating_sub(1),
                 free: 0,
                 allocations: 0,
                 evictions: 0,
                 blocks_stored: 0,
             },
         };
-        // Seed each group's free queue in ascending logical-id order.
+        // Physical page zero is the permanent graph-padding sentinel.
         for (gid, (_, first, count)) in group_specs.iter().enumerate() {
             for b in *first..(*first + *count) {
-                mgr.fq_push_back(gid, BlockId(b));
+                if b != 0 {
+                    mgr.fq_push_back(gid, BlockId(b));
+                }
+            }
+            if *first == 0 {
+                mgr.groups[gid].total = mgr.groups[gid].total.saturating_sub(1);
             }
         }
         mgr.stats.free = mgr.total_free();
@@ -368,13 +370,20 @@ impl BlockManager {
         self.events.push_back(ev);
     }
 
-    // ---- public API (unchanged single-group semantics) ----
+    // ---- public API ----
 
     pub fn free_blocks(&self) -> usize {
         self.total_free()
     }
     pub fn free_blocks_in_group(&self, gid: usize) -> usize {
         self.groups.get(gid).map(|g| g.free_count).unwrap_or(0)
+    }
+    pub fn free_request_pages(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|group| group.free_count)
+            .min()
+            .unwrap_or(0)
     }
     pub fn num_groups(&self) -> usize {
         self.groups.len()
@@ -386,10 +395,29 @@ impl BlockManager {
     pub fn group_capacity(&self, gid: usize) -> usize {
         self.groups.get(gid).map(|g| g.total).unwrap_or(0)
     }
+    pub fn request_page_capacity(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|group| group.total)
+            .min()
+            .unwrap_or(0)
+    }
 
     pub fn blocks_needed(&self, num_tokens: usize) -> usize {
         num_tokens.div_ceil(self.block_size)
     }
+
+    fn request_state_mut(&mut self, req: RequestId) -> &mut RequestKvState {
+        let group_count = self.groups.len();
+        let state = self.requests.entry(req).or_default();
+        if state.groups.is_empty() {
+            state
+                .groups
+                .resize_with(group_count, RequestGroupState::default);
+        }
+        state
+    }
+
     /// All-or-nothing allocation from group 0.
     pub fn allocate(&mut self, req: RequestId, n: usize) -> Option<Vec<BlockId>> {
         self.allocate_in(req, 0, n)
@@ -417,35 +445,50 @@ impl BlockManager {
             self.meta[b.0 as usize].ref_cnt = 1;
             got.push(b);
         }
-        let rec = self.requests.entry(req).or_default();
-        rec.blocks.extend(got.iter().copied());
-        // Growing the block list re-establishes positional layout reasoning;
-        // discard any stale per-block trim offsets.
-        rec.block_tok_starts = None;
+        let rec = self.request_state_mut(req);
+        let group = &mut rec.groups[gid];
+        group.blocks.extend(got.iter().copied());
+        group.block_tok_starts = None;
         rec.segments.get_or_insert_with(SegmentTable::default);
         self.stats.allocations += 1;
         self.stats.free = self.total_free();
         Some(got)
     }
 
-    /// Grow the request's block list (group 0) to cover `total_tokens`.
+    /// Atomically grow every KV group to cover `total_tokens`.
     pub fn ensure_capacity(&mut self, req: RequestId, total_tokens: usize) -> bool {
-        let have = self.requests.get(&req).map(|r| r.blocks.len()).unwrap_or(0);
         let need = self.blocks_needed(total_tokens);
-        if need <= have {
-            return true;
+        let additions = (0..self.groups.len())
+            .map(|gid| {
+                let have = self
+                    .requests
+                    .get(&req)
+                    .and_then(|state| state.groups.get(gid))
+                    .map_or(0, |group| group.blocks.len());
+                need.saturating_sub(have)
+            })
+            .collect::<Vec<_>>();
+        if additions
+            .iter()
+            .enumerate()
+            .any(|(gid, additional)| *additional > self.groups[gid].free_count)
+        {
+            return false;
         }
-        self.allocate(req, need - have).is_some()
-    }
-
-    pub fn grow(&mut self, req: RequestId) -> Option<BlockId> {
-        self.allocate(req, 1).map(|v| v[0])
+        additions
+            .into_iter()
+            .enumerate()
+            .all(|(gid, additional)| self.allocate_in(req, gid, additional).is_some())
     }
 
     /// First write moves Reserved -> Active.
     pub fn activate(&mut self, req: RequestId) {
         if let Some(rec) = self.requests.get(&req) {
-            let blocks = rec.blocks.clone();
+            let blocks = rec
+                .groups
+                .iter()
+                .flat_map(|group| group.blocks.iter().copied())
+                .collect::<Vec<_>>();
             for b in blocks {
                 if let BlockState::Reserved { .. } = self.meta[b.0 as usize].state {
                     self.meta[b.0 as usize].state = BlockState::Active { owner: req };
@@ -454,10 +497,11 @@ impl BlockManager {
         }
     }
 
-    pub fn blocks_for(&self, req: RequestId) -> &[BlockId] {
+    pub fn blocks_for_group(&self, req: RequestId, gid: usize) -> &[BlockId] {
         self.requests
             .get(&req)
-            .map(|r| r.blocks.as_slice())
+            .and_then(|state| state.groups.get(gid))
+            .map(|group| group.blocks.as_slice())
             .unwrap_or(&[])
     }
 
@@ -577,7 +621,8 @@ impl BlockManager {
         if self
             .requests
             .get(&req)
-            .is_some_and(|r| r.blocks.contains(&b))
+            .and_then(|state| state.groups.first())
+            .is_some_and(|group| group.blocks.contains(&b))
         {
             return false;
         }
@@ -585,11 +630,9 @@ impl BlockManager {
         let m = &mut self.meta[b.0 as usize];
         m.ref_cnt = m.ref_cnt.saturating_add(1);
         m.state = BlockState::Active { owner: req };
-        let rec = self.requests.entry(req).or_default();
-        rec.blocks.push(b);
-        // Growing the block list re-establishes positional layout reasoning;
-        // discard any stale per-block trim offsets.
-        rec.block_tok_starts = None;
+        let rec = self.request_state_mut(req);
+        rec.groups[0].blocks.push(b);
+        rec.groups[0].block_tok_starts = None;
         rec.segments.get_or_insert_with(SegmentTable::default);
         self.stats.free = self.total_free();
         true
@@ -615,54 +658,48 @@ impl BlockManager {
     /// (Today there is no live caller; sliding-window groups are not yet wired
     /// into the scheduler step loop.)
     pub fn trim_sliding_window(&mut self, req: RequestId, pos_tokens: usize) {
-        let (blocks, prior_starts) = match self.requests.get(&req) {
-            Some(r) => (r.blocks.clone(), r.block_tok_starts.clone()),
-            None => return,
-        };
         let bs = self.block_size;
-        // True token-start of each block: the recorded offsets if this request
-        // has already been trimmed (so its block list is no longer contiguous),
-        // else positional `idx*block_size` for the contiguous baseline.
-        let prior_starts = prior_starts.as_ref();
-        let mut keep: Vec<BlockId> = Vec::with_capacity(blocks.len());
-        let mut keep_starts: Vec<usize> = Vec::with_capacity(blocks.len());
-        let mut trimmed: Vec<BlockId> = Vec::new();
-        for (idx, b) in blocks.iter().enumerate() {
-            let gid = self.block_group[b.0 as usize] as usize;
-            let kind = self.groups[gid].kind;
-            let block_tok_start = prior_starts
-                .and_then(|s| s.get(idx).copied())
-                .unwrap_or(idx * bs);
-            let block_tok_end = block_tok_start + bs;
-            let keep_it = match kind {
-                KvGroupKind::Full => true,
-                KvGroupKind::SlidingWindow { window, sink } => {
-                    let sink = sink as usize;
-                    let window = window as usize;
-                    let in_sink = block_tok_start < sink;
-                    let window_start = pos_tokens.saturating_sub(window);
-                    let in_window = block_tok_end > window_start;
-                    in_sink || in_window
+        for gid in 0..self.groups.len() {
+            let (blocks, prior_starts) = match self.requests.get(&req) {
+                Some(state) => {
+                    let group = &state.groups[gid];
+                    (group.blocks.clone(), group.block_tok_starts.clone())
                 }
+                None => return,
             };
-            if keep_it {
-                keep.push(*b);
-                keep_starts.push(block_tok_start);
-            } else {
-                trimmed.push(*b);
+            let mut keep = Vec::with_capacity(blocks.len());
+            let mut keep_starts = Vec::with_capacity(blocks.len());
+            let mut trimmed = Vec::new();
+            for (idx, b) in blocks.iter().enumerate() {
+                let block_tok_start = prior_starts
+                    .as_ref()
+                    .and_then(|starts| starts.get(idx).copied())
+                    .unwrap_or(idx * bs);
+                let block_tok_end = block_tok_start + bs;
+                let keep_it = match self.groups[gid].kind {
+                    KvGroupKind::Full => true,
+                    KvGroupKind::SlidingWindow { window, sink } => {
+                        block_tok_start < sink as usize
+                            || block_tok_end > pos_tokens.saturating_sub(window as usize)
+                    }
+                };
+                if keep_it {
+                    keep.push(*b);
+                    keep_starts.push(block_tok_start);
+                } else {
+                    trimmed.push(*b);
+                }
             }
+            if trimmed.is_empty() {
+                continue;
+            }
+            for b in trimmed {
+                self.deref_block(b);
+            }
+            let rec = self.request_state_mut(req);
+            rec.groups[gid].blocks = keep;
+            rec.groups[gid].block_tok_starts = Some(keep_starts);
         }
-        if trimmed.is_empty() {
-            return;
-        }
-        for b in &trimmed {
-            self.deref_block(*b);
-        }
-        let rec = self.requests.entry(req).or_default();
-        rec.blocks = keep;
-        // Record the survivors' real offsets so a subsequent trim does not
-        // mis-map them via positional index.
-        rec.block_tok_starts = Some(keep_starts);
         self.stats.free = self.total_free();
     }
 
@@ -691,7 +728,11 @@ impl BlockManager {
     /// Release all of a request's blocks (deref → free queue) and its scratch.
     pub fn release(&mut self, req: RequestId) {
         if let Some(rec) = self.requests.remove(&req) {
-            for b in rec.blocks {
+            for b in rec
+                .groups
+                .into_iter()
+                .flat_map(|group| group.blocks.into_iter())
+            {
                 // a request holds exactly one ref per block; deref returns it to
                 // the free queue (Cached if it has a hash, else Free).
                 self.deref_block(b);
@@ -732,15 +773,15 @@ mod tests {
     #[test]
     fn single_group_allocate_release_roundtrip() {
         let mut bm = BlockManager::new(8, 4, 0);
-        assert_eq!(bm.free_blocks(), 8);
+        assert_eq!(bm.free_blocks(), 7);
         let blocks = bm.allocate(rid(1), 3).unwrap();
         assert_eq!(blocks.len(), 3);
-        assert_eq!(bm.free_blocks(), 5);
+        assert_eq!(bm.free_blocks(), 4);
         for b in &blocks {
             assert_eq!(bm.ref_count(*b), 1);
         }
         bm.release(rid(1));
-        assert_eq!(bm.free_blocks(), 8);
+        assert_eq!(bm.free_blocks(), 7);
     }
 
     #[test]
@@ -774,7 +815,7 @@ mod tests {
         bm.cache_block(blk, 0xABCD, toks);
         // request still holds it (ref_cnt=1): cannot be reused even under pressure.
         // Exhaust the other free blocks.
-        let _ = bm.allocate(rid(2), 3).unwrap();
+        let _ = bm.allocate(rid(2), 2).unwrap();
         assert_eq!(bm.free_blocks(), 0);
         assert!(
             bm.allocate(rid(3), 1).is_none(),
@@ -859,11 +900,11 @@ mod tests {
         );
         // allocate 5 blocks covering tokens [0,20)
         let _ = bm.allocate(rid(1), 5).unwrap();
-        let before = bm.blocks_for(rid(1)).len();
+        let before = bm.blocks_for_group(rid(1), 0).len();
         assert_eq!(before, 5);
         // at pos=20: keep sink block (tokens 0..4) + window blocks covering [12,20)
         bm.trim_sliding_window(rid(1), 20);
-        let after = bm.blocks_for(rid(1)).len();
+        let after = bm.blocks_for_group(rid(1), 0).len();
         assert!(after < before, "expected trimming, {after} !< {before}");
         // sink block (idx 0) retained; some middle blocks freed back.
         assert!(bm.free_blocks() > 16 - 5);
@@ -909,11 +950,11 @@ mod tests {
         // request 1 still owns it (Active, ref_cnt 1); request 2 shares it.
         assert!(bm.acquire_cached(rid(2), blk, 77, toks));
         assert_eq!(bm.ref_count(blk), 2);
-        assert_eq!(bm.blocks_for(rid(2)), [blk].as_slice());
+        assert_eq!(bm.blocks_for_group(rid(2), 0), [blk].as_slice());
         // a second acquire by request 2 is refused (no self double-list).
         assert!(!bm.acquire_cached(rid(2), blk, 77, toks));
         assert_eq!(bm.ref_count(blk), 2);
-        assert_eq!(bm.blocks_for(rid(2)).len(), 1);
+        assert_eq!(bm.blocks_for_group(rid(2), 0).len(), 1);
         // wrong hash is a miss.
         assert!(!bm.acquire_cached(rid(3), blk, 0xDEAD, toks));
         // a matching hash but mismatched tokens (a digest collision) is
@@ -939,17 +980,43 @@ mod tests {
     }
 
     #[test]
+    fn request_capacity_is_atomic_across_complete_group_tables() {
+        let mut bm = BlockManager::with_groups(
+            8,
+            4,
+            0,
+            &[(KvGroupKind::Full, 0, 4), (KvGroupKind::Full, 4, 4)],
+        );
+        assert_eq!(bm.request_page_capacity(), 3);
+        assert!(bm.ensure_capacity(rid(1), 12));
+        assert_eq!(
+            bm.blocks_for_group(rid(1), 0),
+            [BlockId(1), BlockId(2), BlockId(3)]
+        );
+        assert_eq!(
+            bm.blocks_for_group(rid(1), 1),
+            [BlockId(4), BlockId(5), BlockId(6)]
+        );
+        assert!(!bm.ensure_capacity(rid(2), 16));
+        assert!(bm.blocks_for_group(rid(2), 0).is_empty());
+        assert!(bm.blocks_for_group(rid(2), 1).is_empty());
+        bm.release(rid(1));
+        assert_eq!(bm.free_request_pages(), 3);
+    }
+
+    #[test]
     #[should_panic(expected = "invalid KV-cache group specs")]
     fn with_groups_panics_on_out_of_range_spec() {
         let _ = BlockManager::with_groups(8, 4, 0, &[(KvGroupKind::Full, 0, 20)]);
     }
 
     #[test]
-    fn logical_capacity_includes_block_zero() {
+    fn block_zero_is_reserved_for_graph_padding() {
         let mut bm = BlockManager::new(4, 4, 0);
-        assert_eq!(bm.free_blocks(), 4);
-        let all = bm.allocate(rid(1), 4).unwrap();
-        assert_eq!(all, vec![BlockId(0), BlockId(1), BlockId(2), BlockId(3)]);
+        assert_eq!(bm.free_blocks(), 3);
+        let all = bm.allocate(rid(1), 3).unwrap();
+        assert_eq!(all, vec![BlockId(1), BlockId(2), BlockId(3)]);
+        assert!(!all.contains(&BlockId(0)));
         assert_eq!(bm.free_blocks(), 0);
     }
 
@@ -971,7 +1038,7 @@ mod tests {
         // exceeds window_start=12 -> idx3 (tokens [12,16)) and idx4 (tokens [16,20)).
         bm.trim_sliding_window(rid(1), 20);
         assert_eq!(
-            bm.blocks_for(rid(1)),
+            bm.blocks_for_group(rid(1), 0),
             [blks[0], blks[3], blks[4]].as_slice(),
             "first trim keeps sink + in-window blocks"
         );
@@ -981,7 +1048,7 @@ mod tests {
         // indices 0,1,2 -> starts 0,4,8) would instead drop blk4 too.
         bm.trim_sliding_window(rid(1), 24);
         assert_eq!(
-            bm.blocks_for(rid(1)),
+            bm.blocks_for_group(rid(1), 0),
             [blks[0], blks[4]].as_slice(),
             "second trim must keep blk4 (in window) and drop blk3 (out of window)"
         );
@@ -995,6 +1062,6 @@ mod tests {
         let mut bm = BlockManager::new(16, 4, 0);
         let _ = bm.allocate(rid(1), 5).unwrap();
         bm.trim_sliding_window(rid(1), 20);
-        assert_eq!(bm.blocks_for(rid(1)).len(), 5);
+        assert_eq!(bm.blocks_for_group(rid(1), 0).len(), 5);
     }
 }

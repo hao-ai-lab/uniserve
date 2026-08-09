@@ -30,7 +30,7 @@ use crate::cpu_continuation::{CpuContinuationPool, CpuMasks, CpuTask, CpuTaskKey
 use crate::generation::{
     CursorApplyError, CursorProjection, EncoderCachePin, GenerationCursor,
     GenerationPhase as Phase, GenerationPlanner, PlannedTransition, SchedulerApply,
-    SchedulerContext, TransitionIntent, TransitionValidationError,
+    SchedulerContext, TransitionDelta, TransitionIntent, TransitionValidationError,
 };
 
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -164,8 +164,8 @@ use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
     CompletionReport, Control, Disposition, ExecutionCapability, GenAdmission, KvAdmission,
-    KvPlacement, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef,
-    RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
+    KvPlacement, LatentPlacement, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload,
+    ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
     WorkerCapabilities, WorkerForwardStats,
 };
 
@@ -443,6 +443,86 @@ struct RequestSlotPool {
     live: Vec<bool>,
 }
 
+struct LatentPagePool {
+    page_units: u32,
+    free: Vec<u32>,
+    owners: Vec<Option<RequestId>>,
+    allocations: HashMap<RequestId, Vec<u32>>,
+}
+
+impl LatentPagePool {
+    fn new(num_pages: u32, page_units: u32) -> Self {
+        Self {
+            page_units,
+            free: (1..num_pages).rev().collect(),
+            owners: vec![None; num_pages as usize],
+            allocations: HashMap::new(),
+        }
+    }
+
+    fn pages_needed(&self, units: u64) -> Option<usize> {
+        if units == 0 {
+            return Some(0);
+        }
+        let page_units = u64::from(self.page_units);
+        if page_units == 0 {
+            return None;
+        }
+        usize::try_from(units.div_ceil(page_units)).ok()
+    }
+
+    fn can_reserve(&self, request_id: RequestId, units: u64) -> bool {
+        let Some(needed) = self.pages_needed(units) else {
+            return false;
+        };
+        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
+        needed.saturating_sub(held) <= self.free.len()
+    }
+
+    fn reserve(&mut self, request_id: RequestId, units: u64) -> bool {
+        if !self.can_reserve(request_id, units) {
+            return false;
+        }
+        let needed = self.pages_needed(units).unwrap_or_default();
+        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
+        let mut pages = Vec::with_capacity(needed.saturating_sub(held));
+        for _ in held..needed {
+            let page = self.free.pop().expect("latent free-page invariant");
+            self.owners[page as usize] = Some(request_id);
+            pages.push(page);
+        }
+        self.allocations
+            .entry(request_id)
+            .or_default()
+            .extend(pages);
+        true
+    }
+
+    fn pages_for(&self, request_id: RequestId) -> &[u32] {
+        self.allocations
+            .get(&request_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn release(&mut self, request_id: RequestId) {
+        if let Some(pages) = self.allocations.remove(&request_id) {
+            for page in pages.into_iter().rev() {
+                self.owners[page as usize] = None;
+                self.free.push(page);
+            }
+        }
+    }
+
+    fn used_pages(&self) -> usize {
+        self.owners
+            .iter()
+            .skip(1)
+            .filter(|owner| owner.is_some())
+            .count()
+    }
+}
+
 impl RequestSlotPool {
     fn new(capacity: usize) -> Self {
         let capacity = capacity.clamp(1, u32::MAX as usize);
@@ -570,6 +650,7 @@ pub struct Scheduler {
     /// Encoder-cache entries reserved by admitted image requests.
     reserved_encoder_entries: usize,
     request_slots: RequestSlotPool,
+    latent_pages: LatentPagePool,
     running: HashMap<RequestId, ReqState>,
     /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
@@ -969,14 +1050,15 @@ impl Scheduler {
                 &specs,
             )
         };
-        let usable_blocks = bm.free_blocks();
+        let usable_blocks = bm.request_page_capacity();
         let stats = Arc::new(SchedStats::default());
         stats
             .kv_cache
             .num_blocks
-            .store(caps.num_blocks as usize, Ordering::Relaxed);
+            .store(usable_blocks, Ordering::Relaxed);
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
         let request_slots = RequestSlotPool::new(config.max_num_seqs);
+        let latent_pages = LatentPagePool::new(caps.num_latent_pages, caps.latent_page_units);
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
@@ -1001,7 +1083,10 @@ impl Scheduler {
                     "supported_work": &caps.supported_work,
                     "max_batch_operations": caps.max_batch_operations,
                     "pipeline_depth": caps.pipeline_depth,
-                    "max_latent_size": caps.max_latent_size,
+                    "latent_page_units": caps.latent_page_units,
+                    "num_latent_pages": caps.num_latent_pages,
+                    "latent_width": caps.latent_width,
+                    "latent_dtype": &caps.latent_dtype,
                     "latent_downsample": caps.latent_downsample,
                     "max_vae_grid_tokens": caps.max_vae_grid_tokens,
                     "max_vit_grid_tokens": caps.max_vit_grid_tokens,
@@ -1026,6 +1111,7 @@ impl Scheduler {
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
             request_slots,
+            latent_pages,
             running: HashMap::new(),
             completed_outputs: HashMap::new(),
             retiring_sessions: HashMap::new(),
@@ -1129,7 +1215,7 @@ impl Scheduler {
         reason: crate::policy::PolicyReason,
         needed_blocks: usize,
     ) {
-        let free_blocks = self.bm.free_blocks();
+        let free_blocks = self.bm.free_request_pages();
         self.decisions.record(crate::policy::PolicyDecision {
             request,
             reason,
@@ -1150,7 +1236,7 @@ impl Scheduler {
             waiting: self.pending.len(),
             running: self.running.len(),
             in_flight: self.executor.in_flight(),
-            free_blocks: self.bm.free_blocks(),
+            free_blocks: self.bm.free_request_pages(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
             cached_blocks: self.bm.cached_blocks(),
@@ -1232,7 +1318,7 @@ impl Scheduler {
             running: self.running.len(),
             pending: self.pending.len(),
             in_flight: self.executor.in_flight(),
-            free_blocks: self.bm.free_blocks(),
+            free_blocks: self.bm.free_request_pages(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
             completed_traces: self.completed_traces.len(),
@@ -1798,7 +1884,7 @@ impl Scheduler {
         if self.caps.max_vae_grid_tokens > 0 {
             self.caps.max_vae_grid_tokens as usize
         } else {
-            self.caps.max_latent_size as usize
+            self.caps.latent_capacity_units().min(usize::MAX as u64) as usize
         }
     }
 
@@ -1821,7 +1907,8 @@ impl Scheduler {
     }
 
     fn worker_tracks_image_latent(&self) -> bool {
-        self.caps.max_latent_size > 0
+        self.caps.latent_page_units > 0
+            && self.caps.num_latent_pages > 1
             && self
                 .caps
                 .resource_classes
@@ -1829,10 +1916,8 @@ impl Scheduler {
     }
 
     fn worker_image_latent_used(&self) -> u64 {
-        self.running
-            .values()
-            .map(|st| st.resources.worker_image_latent_units)
-            .sum()
+        (self.latent_pages.used_pages() as u64)
+            .saturating_mul(u64::from(self.caps.latent_page_units))
     }
 
     fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
@@ -1842,30 +1927,14 @@ impl Scheduler {
             * ceil_div_u64((width as u64).max(1), downsample)
     }
 
-    fn worker_image_latent_additional(&self, id: RequestId, requested_units: u64) -> Option<u64> {
-        if !self.worker_tracks_image_latent() {
-            return Some(0);
-        }
-        let st = self.running.get(&id)?;
-        if st.resources.worker_image_latent_units > 0 {
-            Some(0)
-        } else {
-            Some(requested_units)
-        }
-    }
-
     fn can_schedule_denoise(&self, id: RequestId) -> bool {
         let requested_units = self
             .running
             .get(&id)
             .map(|st| self.worker_image_latent_units_for(st).max(1))
             .unwrap_or(0);
-        let Some(additional) = self.worker_image_latent_additional(id, requested_units) else {
-            return false;
-        };
-        let worker_capacity_ok = additional == 0
-            || self.worker_image_latent_used().saturating_add(additional)
-                <= self.caps.max_latent_size as u64;
+        let worker_capacity_ok = !self.worker_tracks_image_latent()
+            || self.latent_pages.can_reserve(id, requested_units);
         let host_scratch_ok = self.running.get(&id).is_some_and(|st| {
             st.resources.host_scratch_tokens > 0
                 || self
@@ -1878,16 +1947,9 @@ impl Scheduler {
     fn reserve_transition_resources(&mut self, transition: &mut PlannedTransition) -> bool {
         let id = transition.request_id;
         let resources = &transition.resources;
-        let Some(additional_latent_units) =
-            self.worker_image_latent_additional(id, resources.latent_units)
-        else {
-            return false;
-        };
-        if additional_latent_units > 0
-            && self
-                .worker_image_latent_used()
-                .saturating_add(additional_latent_units)
-                > self.caps.max_latent_size as u64
+        if resources.latent_units > 0
+            && self.worker_tracks_image_latent()
+            && !self.latent_pages.can_reserve(id, resources.latent_units)
         {
             return false;
         }
@@ -1903,15 +1965,20 @@ impl Scheduler {
         if needs_host_scratch && !self.bm.reserve_scratch(id, resources.host_scratch_tokens) {
             return false;
         }
+        if resources.latent_units > 0
+            && self.worker_tracks_image_latent()
+            && !self.latent_pages.reserve(id, resources.latent_units)
+        {
+            if needs_host_scratch {
+                self.bm.release_scratch(id);
+            }
+            return false;
+        }
         if uses_transfer {
             self.inflight_transfers += 1;
         }
         transition.reserved_us = uniserve_core::now_monotonic_us();
         if let Some(st) = self.running.get_mut(&id) {
-            st.resources.worker_image_latent_units = st
-                .resources
-                .worker_image_latent_units
-                .max(resources.latent_units);
             st.resources.host_scratch_tokens = st
                 .resources
                 .host_scratch_tokens
@@ -1924,9 +1991,7 @@ impl Scheduler {
         for class in &apply.release_on_apply {
             match class {
                 uniserve_worker_wire::ResourceClass::ImageLatent => {
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.resources.worker_image_latent_units = 0;
-                    }
+                    self.latent_pages.release(id);
                 }
                 uniserve_worker_wire::ResourceClass::Scratch => {
                     self.bm.release_scratch(id);
@@ -2037,7 +2102,7 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.bm.free_blocks(), Ordering::Relaxed);
+            .store(self.bm.free_request_pages(), Ordering::Relaxed);
         self.stats
             .general
             .in_flight
@@ -2223,6 +2288,7 @@ impl Scheduler {
                     Ok(_) => {
                         self.retiring_sessions.remove(&id);
                         self.bm.release(id);
+                        self.latent_pages.release(id);
                         if let Err(error) = self.request_slots.release(retiring.request_pool_idx) {
                             tracing::error!(
                                 request_id = id.0,
@@ -3458,7 +3524,7 @@ impl Scheduler {
                     });
                     continue;
                 }
-                if self.bm.free_blocks() >= need && encoder_ok {
+                if self.bm.free_request_pages() >= need && encoder_ok {
                     let st = self.pending.pop_request().unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
@@ -3589,7 +3655,7 @@ impl Scheduler {
             "worstcase_blocks": worstcase_blocks,
             "running": self.running.len(),
             "pending": self.pending.len(),
-            "free_blocks": self.bm.free_blocks(),
+            "free_blocks": self.bm.free_request_pages(),
             "reserved_blocks": self.reserved_blocks,
             "reserved_encoder_entries": self.reserved_encoder_entries,
         }));
@@ -3989,6 +4055,7 @@ impl Scheduler {
             .map(|admission| admission.request_key)
             .collect::<HashSet<_>>();
         let mut kv_placements = HashMap::with_capacity(transitions.len());
+        let mut latent_placements = HashMap::with_capacity(transitions.len());
         for mut transition in transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
@@ -4098,29 +4165,66 @@ impl Scheduler {
                 .running
                 .get(&request_id)
                 .map_or(0, |state| state.control_seq);
-            transition.kv_capacity_pages =
-                self.bm.blocks_for(request_id).len().min(u32::MAX as usize) as u32;
-            let block_table = self
-                .bm
-                .blocks_for(request_id)
-                .iter()
-                .take(transition.kv_capacity_pages as usize)
-                .copied()
-                .collect::<Vec<_>>();
-            let pages_to_zero = if admitted_request_keys.contains(&request_key) {
-                let prefix_pages = self
-                    .running
-                    .get(&request_id)
-                    .map(|state| {
-                        (state.ingest.prompt_cursor as usize)
-                            .div_ceil(self.caps.block_size as usize)
-                    })
-                    .unwrap_or_default()
-                    .min(block_table.len());
-                block_table[prefix_pages..].to_vec()
-            } else {
-                transition.new_blocks.clone()
-            };
+            let kv_lengths =
+                transition_kv_lengths(&transition.delta, self.running.get(&request_id));
+            let new_page_count = transition.new_blocks.len();
+            transition.kv_capacity_pages = kv_lengths.map_or(0, |_| {
+                self.bm
+                    .blocks_for_group(request_id, 0)
+                    .len()
+                    .min(u32::MAX as usize) as u32
+            });
+            let mut operation_kv_placements = Vec::new();
+            if let Some(lengths) = kv_lengths {
+                for group_id in 0..self.bm.num_groups() {
+                    let block_table = self
+                        .bm
+                        .blocks_for_group(request_id, group_id)
+                        .iter()
+                        .take(transition.kv_capacity_pages as usize)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if block_table.len() != transition.kv_capacity_pages as usize {
+                        tracing::error!(
+                            request_id = request_id.0,
+                            group_id,
+                            expected_pages = transition.kv_capacity_pages,
+                            actual_pages = block_table.len(),
+                            "KV groups disagree on request capacity"
+                        );
+                        self.fatal = true;
+                        return;
+                    }
+                    let pages_to_zero = if admitted_request_keys.contains(&request_key) {
+                        let retained_pages = if group_id == 0 {
+                            self.running
+                                .get(&request_id)
+                                .map(|state| {
+                                    (state.ingest.prompt_cursor as usize)
+                                        .div_ceil(self.caps.block_size as usize)
+                                })
+                                .unwrap_or_default()
+                                .min(block_table.len())
+                        } else {
+                            0
+                        };
+                        block_table[retained_pages..].to_vec()
+                    } else {
+                        block_table[block_table.len().saturating_sub(new_page_count)..].to_vec()
+                    };
+                    operation_kv_placements.push(KvPlacement {
+                        request_key,
+                        op_id: OpId(oid),
+                        group_id: group_id as u32,
+                        block_table,
+                        pages_to_zero,
+                        prefix_length: lengths.prefix,
+                        input_length: lengths.input,
+                        visible_length: lengths.visible,
+                        resulting_length: lengths.resulting,
+                    });
+                }
+            }
             let output_event_bound = transition_output_bound(&transition);
             let planned_us = transition.planned_us;
             let reserved_us = transition.reserved_us;
@@ -4144,16 +4248,46 @@ impl Scheduler {
                     return;
                 }
             };
-            kv_placements.insert(
-                (operation.request_key, operation.op_id),
-                KvPlacement {
-                    request_key: operation.request_key,
-                    op_id: operation.op_id,
-                    group_id: 0,
-                    block_table,
-                    pages_to_zero,
-                },
-            );
+            if !operation_kv_placements.is_empty() {
+                kv_placements.insert(
+                    (operation.request_key, operation.op_id),
+                    operation_kv_placements,
+                );
+            }
+            if matches!(
+                operation.work.variant(),
+                WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
+            ) {
+                let Some(state) = self.running.get(&request_id) else {
+                    self.fatal = true;
+                    return;
+                };
+                let page_table = self.latent_pages.pages_for(request_id).to_vec();
+                let latent_units = self.worker_image_latent_units_for(state).max(1);
+                let (start_step, step_count) = match &apply.delta {
+                    TransitionDelta::DenoiseGen {
+                        start_step,
+                        step_count,
+                        ..
+                    } => (u32::from(*start_step), u32::from(*step_count)),
+                    TransitionDelta::TransitionGen { .. } => (0, 0),
+                    TransitionDelta::CommitGen { .. } => (u32::from(state.image_gen.steps_done), 0),
+                    _ => unreachable!("latent work has latent scheduler metadata"),
+                };
+                latent_placements.insert(
+                    (operation.request_key, operation.op_id),
+                    LatentPlacement {
+                        request_key: operation.request_key,
+                        op_id: operation.op_id,
+                        page_table,
+                        latent_units: latent_units.min(u64::from(u32::MAX)) as u32,
+                        height: state.req.image.height,
+                        width: state.req.image.width,
+                        start_step,
+                        step_count,
+                    },
+                );
+            }
             let operation_variant = operation.work.variant().as_wire_str();
             if let Some(trace_ops) = trace_ops.as_mut() {
                 let phase = self
@@ -4231,7 +4365,7 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.bm.free_blocks(), Ordering::Relaxed);
+            .store(self.bm.free_request_pages(), Ordering::Relaxed);
         let mixed = wire_ops.first().is_some_and(|first| {
             wire_ops
                 .iter()
@@ -4269,10 +4403,10 @@ impl Scheduler {
                 "running": self.running.len(),
                 "pending": self.pending.len(),
                 "in_flight_before_submit": self.executor.in_flight(),
-                "free_blocks": self.bm.free_blocks(),
+                "free_blocks": self.bm.free_request_pages(),
                 "reserved_blocks": self.reserved_blocks,
                 "worker_image_latent_active": self.worker_image_latent_used(),
-                "worker_image_latent_capacity": self.caps.max_latent_size,
+                "worker_image_latent_capacity": self.caps.latent_capacity_units(),
             }));
         }
         if mixed {
@@ -4300,7 +4434,7 @@ impl Scheduler {
             })
             .collect::<Vec<_>>();
         controls.extend(releases);
-        let partitions = self.partition_batch(wire_ops, &kv_placements);
+        let partitions = self.partition_batch(wire_ops, &kv_placements, &latent_placements);
         let partition_ids = partitions
             .iter()
             .map(|partition| partition.partition_id)
@@ -4331,7 +4465,8 @@ impl Scheduler {
     fn partition_batch(
         &mut self,
         operations: Vec<Operation>,
-        kv_placements: &HashMap<(RequestKey, OpId), KvPlacement>,
+        kv_placements: &HashMap<(RequestKey, OpId), Vec<KvPlacement>>,
+        latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     ) -> Vec<BatchPartition> {
         let mut routes: RouteDomainOperations = Vec::new();
         for operation in operations {
@@ -4411,6 +4546,7 @@ impl Scheduler {
                 for (domain, operations) in mixed_candidates {
                     let request_pool_indices = self.request_pool_indices(&operations);
                     let kv_placements = self.kv_placements(&operations, kv_placements);
+                    let latent_placements = self.latent_placements(&operations, latent_placements);
                     partitions.push(BatchPartition {
                         partition_id: next_partition_id,
                         submission_group: next_submission_group,
@@ -4423,6 +4559,7 @@ impl Scheduler {
                         operations,
                         request_pool_indices,
                         kv_placements,
+                        latent_placements,
                     });
                     next_partition_id = next_partition_id.saturating_add(1);
                 }
@@ -4436,6 +4573,7 @@ impl Scheduler {
                 };
                 let request_pool_indices = self.request_pool_indices(&operations);
                 let kv_placements = self.kv_placements(&operations, kv_placements);
+                let latent_placements = self.latent_placements(&operations, latent_placements);
                 partitions.push(BatchPartition {
                     partition_id: next_partition_id,
                     submission_group: next_submission_group,
@@ -4448,6 +4586,7 @@ impl Scheduler {
                     operations,
                     request_pool_indices,
                     kv_placements,
+                    latent_placements,
                 });
                 next_partition_id = next_partition_id.saturating_add(1);
                 next_submission_group = next_submission_group.saturating_add(1);
@@ -4471,16 +4610,34 @@ impl Scheduler {
     fn kv_placements(
         &self,
         operations: &[Operation],
-        placements: &HashMap<(RequestKey, OpId), KvPlacement>,
+        placements: &HashMap<(RequestKey, OpId), Vec<KvPlacement>>,
     ) -> Vec<KvPlacement> {
         operations
             .iter()
             .filter(|operation| operation.kv_capacity_pages > 0)
-            .map(|operation| {
+            .flat_map(|operation| {
+                placements
+                    .get(&(operation.request_key, operation.op_id))
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .collect()
+    }
+
+    fn latent_placements(
+        &self,
+        operations: &[Operation],
+        placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
+    ) -> Vec<LatentPlacement> {
+        operations
+            .iter()
+            .filter_map(|operation| {
                 placements
                     .get(&(operation.request_key, operation.op_id))
                     .cloned()
-                    .expect("registered operation has a KV placement")
             })
             .collect()
     }
@@ -4528,7 +4685,7 @@ impl Scheduler {
     /// The block-id delta since the last op for this request (the stateful-diff
     /// contract): everything `blocks_for` holds beyond what already crossed.
     fn take_new_blocks(&mut self, id: RequestId) -> Vec<BlockId> {
-        let all = self.bm.blocks_for(id);
+        let all = self.bm.blocks_for_group(id, 0);
         let Some(st) = self.running.get_mut(&id) else {
             return Vec::new();
         };
@@ -5689,7 +5846,7 @@ impl Scheduler {
         }) else {
             return false;
         };
-        let allocated_blocks = self.bm.blocks_for(id).len();
+        let allocated_blocks = self.bm.blocks_for_group(id, 0).len();
         if !reserves_envelope || allocated_blocks < required_blocks {
             self.trace_record(json!({
                 "event": "gen_branch_reservation_rejected",
@@ -5710,7 +5867,7 @@ impl Scheduler {
             "request_id": id.0,
             "required_blocks": required_blocks,
             "allocated_blocks": allocated_blocks,
-            "free_blocks": self.bm.free_blocks(),
+            "free_blocks": self.bm.free_request_pages(),
             "reserved_blocks": self.reserved_blocks,
         }));
         true
@@ -6115,6 +6272,7 @@ impl Scheduler {
         }
         if !awaits_close {
             self.bm.release(id);
+            self.latent_pages.release(id);
             if let Some(index) = request_pool_idx
                 && let Err(error) = self.request_slots.release(index)
             {
@@ -6128,6 +6286,60 @@ impl Scheduler {
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct KvLengths {
+    prefix: u32,
+    input: u32,
+    visible: u32,
+    resulting: u32,
+}
+
+fn transition_kv_lengths(delta: &TransitionDelta, state: Option<&ReqState>) -> Option<KvLengths> {
+    let (prefix, input) = match delta {
+        TransitionDelta::IngestText {
+            start,
+            end,
+            physical_start,
+            ..
+        } => (*physical_start, end.saturating_sub(*start)),
+        TransitionDelta::IngestImageState {
+            physical_start,
+            physical_kv_tokens,
+            ..
+        }
+        | TransitionDelta::FeedbackState {
+            physical_start,
+            physical_kv_tokens,
+            ..
+        } => {
+            let input = match physical_kv_tokens {
+                uniserve_core::ImageKvEffect::Exact { tokens } => *tokens,
+                uniserve_core::ImageKvEffect::Bounded { max_tokens } => *max_tokens,
+                uniserve_core::ImageKvEffect::WorkerDefined => return None,
+            };
+            (*physical_start, input)
+        }
+        TransitionDelta::DecodeUnd {
+            physical_position, ..
+        }
+        | TransitionDelta::CloseKv {
+            physical_position, ..
+        } => (*physical_position, 1),
+        TransitionDelta::PublishKv { .. } => (state?.und.physical_kv_len, 0),
+        TransitionDelta::EncodeImageStep { .. }
+        | TransitionDelta::TransitionGen { .. }
+        | TransitionDelta::DenoiseGen { .. }
+        | TransitionDelta::CommitGen { .. }
+        | TransitionDelta::EncodeFeedbackStep { .. } => return None,
+    };
+    Some(KvLengths {
+        prefix,
+        input,
+        visible: prefix,
+        resulting: prefix.saturating_add(input),
+    })
 }
 
 fn worker_forward_stats_trace(stats: &WorkerForwardStats) -> serde_json::Value {

@@ -148,6 +148,10 @@ def _partition(*operations: Operation) -> BatchPartition:
                 group_id=0,
                 block_table=(7,),
                 pages_to_zero=(7,),
+                prefix_length=0,
+                input_length=1,
+                visible_length=0,
+                resulting_length=1,
             )
             for operation in operations
         ),
@@ -213,6 +217,10 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
                 group_id=0,
                 block_table=(placements[position],),
                 pages_to_zero=(placements[position],),
+                prefix_length=0,
+                input_length=1,
+                visible_length=0,
+                resulting_length=1,
             )
             for position, item in enumerate(ordered)
         )

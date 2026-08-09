@@ -325,7 +325,27 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
     ("prefix_len", "group_id"),
     ("sampling", "negative_token_ids", "finish_token_ids", "kv"),
     ("request_key", "request_pool_idx", "digest", "und", "gen_admission"),
-    ("request_key", "op_id", "group_id", "block_table", "pages_to_zero"),
+    (
+        "request_key",
+        "op_id",
+        "group_id",
+        "block_table",
+        "pages_to_zero",
+        "prefix_length",
+        "input_length",
+        "visible_length",
+        "resulting_length",
+    ),
+    (
+        "request_key",
+        "op_id",
+        "page_table",
+        "latent_units",
+        "height",
+        "width",
+        "start_step",
+        "step_count",
+    ),
     (
         "partition_id",
         "submission_group",
@@ -338,6 +358,48 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "operations",
         "request_pool_indices",
         "kv_placements",
+        "latent_placements",
+    ),
+    (
+        "block_size",
+        "num_blocks",
+        "num_layers",
+        "num_kv_heads",
+        "head_dim",
+        "scratch_capacity_tokens",
+        "supported_work",
+        "latent_page_units",
+        "num_latent_pages",
+        "latent_width",
+        "latent_dtype",
+        "latent_downsample",
+        "max_vae_grid_tokens",
+        "max_vit_grid_tokens",
+        "max_latent_feature_bytes",
+        "max_vision_feature_bytes",
+        "commit_marker_tokens",
+        "gen_rope_advance",
+        "max_cfg_branches",
+        "bytes_per_token",
+        "groups",
+        "kv_dtype",
+        "model_dtype",
+        "attention_backend",
+        "quantization",
+        "rank",
+        "pipeline_depth",
+        "encoder_cache_budget",
+        "supported_controls",
+        "max_batch_operations",
+        "max_unresolved_window",
+        "incremental_kv_publication",
+        "tensorized_mixed",
+        "sampling_ownership",
+        "resource_classes",
+        "model_identity",
+        "weight_digest",
+        "protocol_layout_digest",
+        "restored_snapshots",
     ),
 )
 
@@ -1841,18 +1903,30 @@ class KvPlacement:
     group_id: int
     block_table: tuple[int, ...]
     pages_to_zero: tuple[int, ...]
+    prefix_length: int
+    input_length: int
+    visible_length: int
+    resulting_length: int
 
     def __post_init__(self) -> None:
         if self.op_id < 1:
             raise invalid_descriptor("KV placement operation id must be positive")
-        if self.group_id < 0 or any(value < 0 for value in self.block_table):
-            raise invalid_descriptor("KV placement contains a negative identifier")
+        if self.group_id < 0 or any(value < 1 for value in self.block_table):
+            raise invalid_descriptor("KV placement contains an invalid group or reserved page zero")
+        if any(value < 1 for value in self.pages_to_zero):
+            raise invalid_descriptor("KV placement carries the reserved page zero")
         if len(set(self.block_table)) != len(self.block_table):
             raise invalid_descriptor("KV placement repeats a page in its block table")
         if len(set(self.pages_to_zero)) != len(self.pages_to_zero):
             raise invalid_descriptor("KV placement repeats a page-to-zero")
         if not set(self.pages_to_zero).issubset(self.block_table):
             raise invalid_descriptor("KV placement zeroes a page outside its block table")
+        if (
+            self.visible_length < self.prefix_length
+            or self.resulting_length < self.visible_length
+            or self.prefix_length + self.input_length != self.resulting_length
+        ):
+            raise invalid_descriptor("KV placement lengths are inconsistent")
 
     @classmethod
     def from_wire(cls, value: object, where: str = "KV placement") -> KvPlacement:
@@ -1863,6 +1937,10 @@ class KvPlacement:
             group_id=_uint(data.get("group_id"), f"{where}.group_id"),
             block_table=_uints(data.get("block_table", ()), f"{where}.block_table"),
             pages_to_zero=_uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero"),
+            prefix_length=_uint(data.get("prefix_length"), f"{where}.prefix_length"),
+            input_length=_uint(data.get("input_length"), f"{where}.input_length"),
+            visible_length=_uint(data.get("visible_length"), f"{where}.visible_length"),
+            resulting_length=_uint(data.get("resulting_length"), f"{where}.resulting_length"),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1872,6 +1950,62 @@ class KvPlacement:
             "group_id": self.group_id,
             "block_table": list(self.block_table),
             "pages_to_zero": list(self.pages_to_zero),
+            "prefix_length": self.prefix_length,
+            "input_length": self.input_length,
+            "visible_length": self.visible_length,
+            "resulting_length": self.resulting_length,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LatentPlacement:
+    request_key: RequestKey
+    op_id: int
+    page_table: tuple[int, ...]
+    latent_units: int
+    height: int
+    width: int
+    start_step: int
+    step_count: int
+
+    def __post_init__(self) -> None:
+        if self.op_id < 1:
+            raise invalid_descriptor("latent placement operation id must be positive")
+        if min(self.latent_units, self.height, self.width) < 1:
+            raise invalid_descriptor("latent placement geometry must be positive")
+        if (
+            not self.page_table
+            or any(page < 1 for page in self.page_table)
+            or len(set(self.page_table)) != len(self.page_table)
+        ):
+            raise invalid_descriptor(
+                "latent placement page table is empty, repeats a page, or carries page zero"
+            )
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "latent placement") -> LatentPlacement:
+        data = _map(value, where)
+        return cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
+            page_table=_uints(data.get("page_table", ()), f"{where}.page_table"),
+            latent_units=_uint(data.get("latent_units"), f"{where}.latent_units"),
+            height=_uint(data.get("height"), f"{where}.height"),
+            width=_uint(data.get("width"), f"{where}.width"),
+            start_step=_uint(data.get("start_step"), f"{where}.start_step"),
+            step_count=_uint(data.get("step_count"), f"{where}.step_count"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_key": self.request_key.to_wire(),
+            "op_id": self.op_id,
+            "page_table": list(self.page_table),
+            "latent_units": self.latent_units,
+            "height": self.height,
+            "width": self.width,
+            "start_step": self.start_step,
+            "step_count": self.step_count,
         }
 
 
@@ -1888,6 +2022,7 @@ class BatchPartition:
     operations: tuple[Operation, ...]
     request_pool_indices: tuple[int, ...]
     kv_placements: tuple[KvPlacement, ...] = ()
+    latent_placements: tuple[LatentPlacement, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -1917,23 +2052,56 @@ class BatchPartition:
         operations = {
             (operation.request_key, operation.op_id): operation for operation in self.operations
         }
-        placements: set[tuple[RequestKey, int]] = set()
-        for placement in self.kv_placements:
-            identity = (placement.request_key, placement.op_id)
-            if identity in placements:
+        placements: set[tuple[RequestKey, int, int]] = set()
+        for kv_placement in self.kv_placements:
+            kv_identity = (
+                kv_placement.request_key,
+                kv_placement.op_id,
+                kv_placement.group_id,
+            )
+            if kv_identity in placements:
                 raise invalid_descriptor("batch partition repeats a KV placement identity")
-            placements.add(identity)
-            operation = operations.get(identity)
+            placements.add(kv_identity)
+            operation = operations.get(kv_identity[:2])
             if operation is None:
                 raise invalid_descriptor("KV placement does not name a partition operation")
-            if len(placement.block_table) != operation.kv_capacity_pages:
+            if len(kv_placement.block_table) != operation.kv_capacity_pages:
                 raise invalid_descriptor("KV placement does not establish operation capacity")
         if any(
             operation.kv_capacity_pages > 0
-            and (operation.request_key, operation.op_id) not in placements
+            and not any(
+                request_key == operation.request_key and op_id == operation.op_id
+                for request_key, op_id, _group_id in placements
+            )
             for operation in self.operations
         ):
             raise invalid_descriptor("operation with logical KV capacity has no placement")
+        latent_ids: set[tuple[RequestKey, int]] = set()
+        latent_variants = {
+            WorkVariant.GEN_TRANSITION,
+            WorkVariant.GEN_FLOW,
+            WorkVariant.MATERIALIZE,
+        }
+        for latent_placement in self.latent_placements:
+            latent_identity = (latent_placement.request_key, latent_placement.op_id)
+            if latent_identity in latent_ids:
+                raise invalid_descriptor("batch partition repeats a latent placement identity")
+            latent_ids.add(latent_identity)
+            operation = operations.get(latent_identity)
+            if operation is None:
+                raise invalid_descriptor("latent placement does not name a partition operation")
+            if operation.work.variant not in latent_variants:
+                raise invalid_descriptor(
+                    "latent placement names an operation that does not address a trajectory"
+                )
+        if any(
+            operation.work.variant in latent_variants
+            and (operation.request_key, operation.op_id) not in latent_ids
+            for operation in self.operations
+        ):
+            raise invalid_descriptor(
+                "operation that addresses a trajectory has no latent placement"
+            )
 
     @classmethod
     def from_wire(
@@ -1972,6 +2140,12 @@ class BatchPartition:
                     _seq(data.get("kv_placements", ()), f"{where}.kv_placements")
                 )
             ),
+            latent_placements=tuple(
+                LatentPlacement.from_wire(item, f"{where}.latent_placements[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("latent_placements", ()), f"{where}.latent_placements")
+                )
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1987,6 +2161,7 @@ class BatchPartition:
             "operations": [operation.to_wire() for operation in self.operations],
             "request_pool_indices": list(self.request_pool_indices),
             "kv_placements": [placement.to_wire() for placement in self.kv_placements],
+            "latent_placements": [placement.to_wire() for placement in self.latent_placements],
         }
 
 

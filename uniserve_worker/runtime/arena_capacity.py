@@ -43,7 +43,7 @@ def model_arena_capacity(
     completion_payload_bytes: int,
     num_blocks: int,
     scratch_capacity_tokens: int,
-    max_latent_size: int,
+    latent_capacity_units: int,
     max_latent_feature_bytes: int,
     max_vision_feature_bytes: int,
     bytes_per_token: int,
@@ -79,7 +79,7 @@ def model_arena_capacity(
     artifact_bytes = 0
     if flow is not None:
         latent_bytes = latent_store_capacity_bytes(
-            int(max_latent_size),
+            int(latent_capacity_units),
             int(flow.latent_channels),
             int(flow.latent_patch_size),
         )

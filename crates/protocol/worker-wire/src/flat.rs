@@ -11,11 +11,11 @@ use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
     CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
     ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, KvAdmission,
-    KvPlacement, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange,
-    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
-    ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, SamplingOwnership, ShapeBound,
-    SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, Work,
-    WorkVariant, WorkerCapabilities, WorkerForwardStats, WorkerMetrics, WorkerRequest,
+    KvPlacement, LatentPlacement, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion,
+    Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
+    RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, SamplingOwnership,
+    ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
+    Work, WorkVariant, WorkerCapabilities, WorkerForwardStats, WorkerMetrics, WorkerRequest,
     WorkerResponse,
 };
 
@@ -214,6 +214,16 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<Ba
             })
             .transpose()?
             .unwrap_or_default(),
+        latent_placements: partition
+            .latent_placements()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(latent_placement_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
     };
     partition.validate()?;
     Ok(partition)
@@ -283,6 +293,31 @@ fn kv_placement_from_table(placement: fbs::KvPlacement<'_>) -> anyhow::Result<Kv
             .pages_to_zero()
             .map(|items| items.iter().map(BlockId).collect())
             .unwrap_or_default(),
+        prefix_length: placement.prefix_length(),
+        input_length: placement.input_length(),
+        visible_length: placement.visible_length(),
+        resulting_length: placement.resulting_length(),
+    })
+}
+
+fn latent_placement_from_table(
+    placement: fbs::LatentPlacement<'_>,
+) -> anyhow::Result<LatentPlacement> {
+    Ok(LatentPlacement {
+        request_key: request_key_from_table(
+            placement.request_key(),
+            "latent placement.request_key",
+        )?,
+        op_id: OpId(placement.op_id()),
+        page_table: placement
+            .page_table()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        latent_units: placement.latent_units(),
+        height: placement.height(),
+        width: placement.width(),
+        start_step: placement.start_step(),
+        step_count: placement.step_count(),
     })
 }
 
@@ -671,7 +706,10 @@ fn capabilities_from_table(
             })
             .transpose()?
             .unwrap_or_default(),
-        max_latent_size: caps.max_latent_size(),
+        latent_page_units: caps.latent_page_units(),
+        num_latent_pages: caps.num_latent_pages(),
+        latent_width: caps.latent_width(),
+        latent_dtype: caps.latent_dtype().unwrap_or_default().to_string(),
         latent_downsample: caps.latent_downsample(),
         bytes_per_token: caps.bytes_per_token(),
         max_vae_grid_tokens: caps.max_vae_grid_tokens(),
@@ -1287,6 +1325,13 @@ fn partition_to_fb(partition: &BatchPartition) -> anyhow::Result<fbs::BatchParti
                 .map(kv_placement_to_fb)
                 .collect(),
         ),
+        latent_placements: Some(
+            partition
+                .latent_placements
+                .iter()
+                .map(latent_placement_to_fb)
+                .collect(),
+        ),
     })
 }
 
@@ -1346,6 +1391,12 @@ fn partition_from_fb(partition: fbs::BatchPartitionT) -> anyhow::Result<BatchPar
             .unwrap_or_default()
             .into_iter()
             .map(kv_placement_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        latent_placements: partition
+            .latent_placements
+            .unwrap_or_default()
+            .into_iter()
+            .map(latent_placement_from_fb)
             .collect::<anyhow::Result<_>>()?,
     };
     partition.validate()?;
@@ -1455,6 +1506,10 @@ fn kv_placement_to_fb(placement: &KvPlacement) -> fbs::KvPlacementT {
                 .map(|block| block.0)
                 .collect(),
         ),
+        prefix_length: placement.prefix_length,
+        input_length: placement.input_length,
+        visible_length: placement.visible_length,
+        resulting_length: placement.resulting_length,
     }
 }
 
@@ -1476,6 +1531,37 @@ fn kv_placement_from_fb(placement: fbs::KvPlacementT) -> anyhow::Result<KvPlacem
             .into_iter()
             .map(BlockId)
             .collect(),
+        prefix_length: placement.prefix_length,
+        input_length: placement.input_length,
+        visible_length: placement.visible_length,
+        resulting_length: placement.resulting_length,
+    })
+}
+
+fn latent_placement_to_fb(placement: &LatentPlacement) -> fbs::LatentPlacementT {
+    fbs::LatentPlacementT {
+        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
+        op_id: placement.op_id.0,
+        page_table: Some(placement.page_table.clone()),
+        latent_units: placement.latent_units,
+        height: placement.height,
+        width: placement.width,
+        start_step: placement.start_step,
+        step_count: placement.step_count,
+    }
+}
+
+#[cfg(test)]
+fn latent_placement_from_fb(placement: fbs::LatentPlacementT) -> anyhow::Result<LatentPlacement> {
+    Ok(LatentPlacement {
+        request_key: request_key_from_fb(placement.request_key, "latent placement.request_key")?,
+        op_id: OpId(placement.op_id),
+        page_table: placement.page_table.unwrap_or_default(),
+        latent_units: placement.latent_units,
+        height: placement.height,
+        width: placement.width,
+        start_step: placement.start_step,
+        step_count: placement.step_count,
     })
 }
 
@@ -2050,7 +2136,10 @@ fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCa
                 .map(work_to_fb)
                 .collect(),
         ),
-        max_latent_size: caps.max_latent_size,
+        latent_page_units: caps.latent_page_units,
+        num_latent_pages: caps.num_latent_pages,
+        latent_width: caps.latent_width,
+        latent_dtype: Some(caps.latent_dtype.clone()),
         latent_downsample: caps.latent_downsample,
         bytes_per_token: caps.bytes_per_token,
         max_vae_grid_tokens: caps.max_vae_grid_tokens,
@@ -2109,7 +2198,10 @@ fn capabilities_from_fb(caps: fbs::WorkerCapabilitiesT) -> anyhow::Result<Worker
             .into_iter()
             .map(work_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        max_latent_size: caps.max_latent_size,
+        latent_page_units: caps.latent_page_units,
+        num_latent_pages: caps.num_latent_pages,
+        latent_width: caps.latent_width,
+        latent_dtype: caps.latent_dtype.unwrap_or_default(),
         latent_downsample: caps.latent_downsample,
         bytes_per_token: caps.bytes_per_token,
         max_vae_grid_tokens: caps.max_vae_grid_tokens,

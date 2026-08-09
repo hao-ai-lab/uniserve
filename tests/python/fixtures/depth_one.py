@@ -29,6 +29,7 @@ from uniserve_worker.batch import (
     ImageParams,
     KvAdmission,
     KvPlacement,
+    LatentPlacement,
     Operation,
     PointRange,
     ProductKind,
@@ -45,6 +46,7 @@ from uniserve_worker.batch import (
     UndAdmission,
     VersionRef,
     Work,
+    WorkVariant,
     encode_token_product_bytes,
 )
 
@@ -52,6 +54,31 @@ AUTHORITY = 0
 _BLOCK_TABLES: dict[RequestKey, list[int]] = {}
 _PAGES_TO_ZERO: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
 _UNBOUND_PAGES: dict[RequestKey, list[int]] = {}
+_IMAGE_PARAMS: dict[RequestKey, ImageParams] = {}
+
+
+def _kv_page(value: int) -> int:
+    return int(value) + 1
+
+
+def _latent_placement(operation: Operation) -> LatentPlacement:
+    image = _IMAGE_PARAMS[operation.request_key]
+    latent_units = max(1, (int(image.height) // 16) * (int(image.width) // 16))
+    page_count = (latent_units + 15) // 16
+    return LatentPlacement(
+        request_key=operation.request_key,
+        op_id=operation.op_id,
+        page_table=tuple(range(1, page_count + 1)),
+        latent_units=latent_units,
+        height=int(image.height),
+        width=int(image.width),
+        start_step=0,
+        step_count=(
+            int(operation.bounds.max_tokens)
+            if operation.work.variant is WorkVariant.GEN_FLOW
+            else 0
+        ),
+    )
 
 
 def execution_batch(
@@ -64,6 +91,9 @@ def execution_batch(
 ) -> Batch:
     """Build the explicit physical partitions used by executor behavior tests."""
 
+    for admission in admissions:
+        if admission.gen_admission is not None:
+            _IMAGE_PARAMS[admission.request_key] = admission.gen_admission.image
     by_route: dict[int, list[Operation]] = {}
     for operation in operations:
         by_route.setdefault(int(operation.route), []).append(operation)
@@ -130,9 +160,23 @@ def execution_batch(
                             pages_to_zero=_PAGES_TO_ZERO.get(
                                 (operation.request_key, operation.op_id), ()
                             ),
+                            prefix_length=0,
+                            input_length=operation.bounds.max_tokens,
+                            visible_length=0,
+                            resulting_length=operation.bounds.max_tokens,
                         )
                         for operation in domain_operations
                         if operation.kv_capacity_pages > 0
+                    ),
+                    latent_placements=tuple(
+                        _latent_placement(operation)
+                        for operation in domain_operations
+                        if operation.work.variant
+                        in {
+                            WorkVariant.GEN_TRANSITION,
+                            WorkVariant.GEN_FLOW,
+                            WorkVariant.MATERIALIZE,
+                        }
                     ),
                 )
             )
@@ -159,8 +203,8 @@ def und_admission(
     sampling: SamplingParams | None = None,
 ) -> Admission:
     rk = request_key(session_id, epoch)
-    _BLOCK_TABLES[rk] = [int(value) for value in block_ids]
-    _UNBOUND_PAGES[rk] = [int(value) for value in block_ids]
+    _BLOCK_TABLES[rk] = [_kv_page(value) for value in block_ids]
+    _UNBOUND_PAGES[rk] = list(_BLOCK_TABLES[rk])
     return Admission.create(
         rk,
         request_pool_idx=session_id + 1,
@@ -176,8 +220,10 @@ def und_admission(
 
 
 def gen_admission(session_id: int, image: ImageParams, *, epoch: int = 1) -> Admission:
+    rk = request_key(session_id, epoch)
+    _IMAGE_PARAMS[rk] = image
     return Admission.create(
-        request_key(session_id, epoch),
+        rk,
         request_pool_idx=session_id + 1,
         gen_admission=GenAdmission(image=image),
     )
@@ -233,7 +279,7 @@ def token_operation(
     """A token operation plus the input token product the worker decodes for it."""
 
     block_table = _BLOCK_TABLES.setdefault(rk, [])
-    added = [int(value) for value in block_table_delta]
+    added = [_kv_page(value) for value in block_table_delta]
     if set(added) & set(block_table):
         raise ValueError("KV block-table delta repeats an existing page")
     block_table.extend(added)

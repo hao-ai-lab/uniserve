@@ -40,14 +40,14 @@ def test_warmup_is_a_safe_noop_off_cuda() -> None:
 def test_warmup_image_geometry_fits_the_declared_latent_capacity() -> None:
     worker = execution_worker()
     caps = worker.capabilities
-    if caps.max_latent_size <= 0:
+    if caps.latent_capacity_units <= 0:
         pytest.skip("stub declares no image latent capacity")
 
     height, width = worker._warmup_image_geometry()
 
     downsample = caps.latent_downsample
     latent_tokens = (height // downsample) * (width // downsample)
-    assert latent_tokens <= caps.max_latent_size
+    assert latent_tokens <= caps.latent_capacity_units
     if caps.max_vae_grid_tokens > 0:
         assert latent_tokens <= caps.max_vae_grid_tokens
 

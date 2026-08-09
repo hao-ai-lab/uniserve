@@ -224,8 +224,33 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                     request_key: operation.request_key,
                     op_id: operation.op_id,
                     group_id: 0,
-                    block_table: (0..operation.kv_capacity_pages).map(BlockId).collect(),
-                    pages_to_zero: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+                    block_table: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
+                    pages_to_zero: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
+                    prefix_length: 0,
+                    input_length: 0,
+                    visible_length: 0,
+                    resulting_length: 0,
+                })
+                .collect();
+            let latent_placements = operations
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation.work.variant(),
+                        WorkVariant::GenTransition
+                            | WorkVariant::GenFlow
+                            | WorkVariant::Materialize
+                    )
+                })
+                .map(|operation| LatentPlacement {
+                    request_key: operation.request_key,
+                    op_id: operation.op_id,
+                    page_table: vec![1],
+                    latent_units: 1,
+                    height: 1,
+                    width: 1,
+                    start_step: 0,
+                    step_count: u32::from(operation.work.variant() == WorkVariant::GenFlow),
                 })
                 .collect();
             BatchPartition {
@@ -240,6 +265,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 operations,
                 request_pool_indices,
                 kv_placements,
+                latent_placements,
             }
         })
         .collect()
@@ -348,7 +374,7 @@ fn logical_capacity_and_placement_round_trip_independently() {
     assert_eq!(batch.operations().next().unwrap(), &base);
     assert_eq!(
         batch.partitions[0].kv_placements[0].block_table,
-        vec![BlockId(0)]
+        vec![BlockId(1)]
     );
     let mut relocated = batch.clone();
     relocated.partitions[0].kv_placements[0].block_table = vec![BlockId(17)];

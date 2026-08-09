@@ -39,9 +39,7 @@ def prove_depth_one_lowering(
 
     primary_by_variant: dict[WorkVariant, LoweredStage | None] = {}
     for variant in supported_work:
-        primaries = tuple(
-            stage for stage in model.lower(variant) if not stage.publishes_state
-        )
+        primaries = tuple(stage for stage in model.lower(variant) if not stage.publishes_state)
         if len(primaries) > 1:
             raise invalid_descriptor(
                 f"work variant {variant.value!r} declares multiple primary stages, "
@@ -86,7 +84,7 @@ def resolve_capabilities(
     flow = model.generation
     if flow is not None and not isinstance(flow, GenerationPipeline):
         raise invalid_descriptor("model generation behavior has an invalid type")
-    max_latent_size = (
+    latent_capacity_units = (
         active_latent_capacity_tokens(
             int(flow.max_latent_tokens),
             deployment.kv_token_capacity,
@@ -112,7 +110,7 @@ def resolve_capabilities(
     resident_copies, co_resident_blocks = _kv_residency_shape(
         deployment,
         resources,
-        max_latent_size=max_latent_size,
+        latent_capacity_units=latent_capacity_units,
         bytes_per_token=bytes_per_token,
     )
     capacity = derive_runtime_kv_capacity(
@@ -128,7 +126,7 @@ def resolve_capabilities(
         deployment,
         resources,
         num_blocks=int(capacity.num_blocks),
-        max_latent_size=max_latent_size,
+        latent_capacity_units=latent_capacity_units,
     )
     if int(completion_payload_bytes) < 1:
         raise ValueError("completion payload capacity must be positive")
@@ -153,7 +151,16 @@ def resolve_capabilities(
         head_dim=int(cache.head_dim),
         scratch_capacity_tokens=scratch_capacity,
         supported_work=supported_work,
-        max_latent_size=max_latent_size,
+        latent_page_units=(int(deployment.block_size) if flow is not None else 0),
+        num_latent_pages=(
+            latent_capacity_units // int(deployment.block_size) + 1 if flow is not None else 0
+        ),
+        latent_width=(
+            int(flow.latent_channels) * int(flow.latent_patch_size) * int(flow.latent_patch_size)
+            if flow is not None
+            else 0
+        ),
+        latent_dtype=deployment.model_dtype if flow is not None else "",
         latent_downsample=int(flow.latent_downsample) if flow is not None else 1,
         bytes_per_token=bytes_per_token,
         supported_controls=tuple(controls),
@@ -208,7 +215,7 @@ def _kv_residency_shape(
     deployment: WorkerDeployment,
     resources: object,
     *,
-    max_latent_size: int,
+    latent_capacity_units: int,
     bytes_per_token: int,
 ) -> tuple[int, int]:
     """Describe every KV pool that shares the deployment memory budget.
@@ -232,7 +239,7 @@ def _kv_residency_shape(
     if scratch is None:
         return 1, padding_blocks + graph_blocks
     fixed_blocks = ceil_div(int(scratch.fixed_tokens), block_size)
-    latent_blocks = ceil_div(max_latent_size * int(scratch.latent_copies), block_size)
+    latent_blocks = ceil_div(latent_capacity_units * int(scratch.latent_copies), block_size)
     return (
         2 if scratch.mirror_kv else 1,
         2 * padding_blocks
@@ -246,7 +253,7 @@ def _scratch_capacity_tokens(
     resources: object,
     *,
     num_blocks: int,
-    max_latent_size: int,
+    latent_capacity_units: int,
 ) -> int:
     scratch = getattr(resources, "scratch", None)
     if scratch is None:
@@ -256,6 +263,6 @@ def _scratch_capacity_tokens(
         int(scratch.minimum_blocks),
         ceil_div(int(scratch.fixed_tokens), block_size)
         + (num_blocks if scratch.mirror_kv else 0)
-        + ceil_div(max_latent_size * int(scratch.latent_copies), block_size),
+        + ceil_div(latent_capacity_units * int(scratch.latent_copies), block_size),
     )
     return int(blocks * block_size)

@@ -27,11 +27,11 @@ use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
     CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, EncodeMode,
     ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, GenMode,
-    KvAdmission, KvPlacement, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion,
-    Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
-    RequestKind, ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
-    TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats,
-    WorkerRequest, WorkerResponse,
+    KvAdmission, KvPlacement, LatentPlacement, LogicalLengths, OpId, OpStatus, Operation,
+    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    RegistrationAck, RequestKey, RequestKind, ResponseKind, Rng, ShapeBound, SnapshotRef,
+    StorageClass, TimingCounters, TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef,
+    Work, WorkerForwardStats, WorkerRequest, WorkerResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -150,6 +150,12 @@ fn batch_partition_to_py<'py>(
             kv_placement_to_py(py, placement, context)
         })?,
     )?;
+    dict.set_item(
+        intern!(py, "latent_placements"),
+        dict_list(py, &partition.latent_placements, |placement| {
+            latent_placement_to_py(py, placement, context)
+        })?,
+    )?;
     Ok(dict)
 }
 
@@ -173,6 +179,33 @@ fn kv_placement_to_py<'py>(
         intern!(py, "pages_to_zero"),
         PyList::new(py, placement.pages_to_zero.iter().map(|block| block.0))?,
     )?;
+    dict.set_item(intern!(py, "prefix_length"), placement.prefix_length)?;
+    dict.set_item(intern!(py, "input_length"), placement.input_length)?;
+    dict.set_item(intern!(py, "visible_length"), placement.visible_length)?;
+    dict.set_item(intern!(py, "resulting_length"), placement.resulting_length)?;
+    Ok(dict)
+}
+
+fn latent_placement_to_py<'py>(
+    py: Python<'py>,
+    placement: &LatentPlacement,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        intern!(py, "request_key"),
+        context.request_key(placement.request_key)?,
+    )?;
+    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
+    dict.set_item(
+        intern!(py, "page_table"),
+        u32_list(py, &placement.page_table)?,
+    )?;
+    dict.set_item(intern!(py, "latent_units"), placement.latent_units)?;
+    dict.set_item(intern!(py, "height"), placement.height)?;
+    dict.set_item(intern!(py, "width"), placement.width)?;
+    dict.set_item(intern!(py, "start_step"), placement.start_step)?;
+    dict.set_item(intern!(py, "step_count"), placement.step_count)?;
     Ok(dict)
 }
 
@@ -1525,8 +1558,31 @@ mod tests {
                 request_key: operation.request_key,
                 op_id: operation.op_id,
                 group_id: 0,
-                block_table: (0..operation.kv_capacity_pages).map(BlockId).collect(),
-                pages_to_zero: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+                block_table: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
+                pages_to_zero: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
+                prefix_length: 0,
+                input_length: 0,
+                visible_length: 0,
+                resulting_length: 0,
+            })
+            .collect();
+        let latent_placements = operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.work.variant(),
+                    WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
+                )
+            })
+            .map(|operation| uniserve_worker_wire::LatentPlacement {
+                request_key: operation.request_key,
+                op_id: operation.op_id,
+                page_table: vec![1],
+                latent_units: 1,
+                height: 1,
+                width: 1,
+                start_step: 0,
+                step_count: u32::from(operation.work.variant() == WorkVariant::GenFlow),
             })
             .collect();
         BatchPartition {
@@ -1544,6 +1600,7 @@ mod tests {
                 .collect(),
             operations,
             kv_placements,
+            latent_placements,
         }
     }
 

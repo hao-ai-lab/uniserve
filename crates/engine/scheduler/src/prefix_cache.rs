@@ -194,7 +194,7 @@ impl PrefixCacheCoordinator {
         let hashes = st.replay.block_hashes.clone();
         let prompt = st.effective_prompt().to_vec();
         let bs = block_size;
-        let blocks = bm.blocks_for(id).to_vec();
+        let blocks = bm.blocks_for_group(id, 0).to_vec();
         for (i, h) in hashes.iter().enumerate() {
             // store the block's own tokens with its hash so later hits can
             // verify content. Block i was hashed from prompt[i*bs..(i+1)*bs] (the

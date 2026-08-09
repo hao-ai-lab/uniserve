@@ -19,6 +19,7 @@ from ..batch import (
     Domain,
     ExecutionCapability,
     KvPlacement,
+    LatentPlacement,
     Operation,
     OpStatus,
     ProductPayload,
@@ -69,6 +70,7 @@ def _warmup_batch(
     operations: tuple[Operation, ...],
     request_pool_indices: dict[RequestKey, int],
     kv_placements: dict[tuple[RequestKey, int], KvPlacement],
+    latent_placements: dict[tuple[RequestKey, int], LatentPlacement],
     input_products: tuple[ProductPayload, ...] = (),
 ) -> Batch:
     groups: list[tuple[Domain, int, list[Operation]]] = []
@@ -103,6 +105,16 @@ def _warmup_batch(
                 kv_placements[(operation.request_key, operation.op_id)]
                 for operation in members
                 if operation.kv_capacity_pages > 0
+            ),
+            latent_placements=tuple(
+                latent_placements[(operation.request_key, operation.op_id)]
+                for operation in members
+                if operation.work.variant
+                in {
+                    WorkVariant.GEN_TRANSITION,
+                    WorkVariant.GEN_FLOW,
+                    WorkVariant.MATERIALIZE,
+                }
             ),
         )
         for index, (domain, route, members) in enumerate(groups, start=1)
@@ -201,7 +213,7 @@ class ModelWorker:
             completion_payload_bytes=int(completion_payload_bytes),
             num_blocks=int(declared.num_blocks),
             scratch_capacity_tokens=int(declared.scratch_capacity_tokens),
-            max_latent_size=int(declared.max_latent_size),
+            latent_capacity_units=int(declared.latent_capacity_units),
             max_latent_feature_bytes=int(declared.max_latent_feature_bytes),
             max_vision_feature_bytes=int(declared.max_vision_feature_bytes),
             bytes_per_token=int(declared.bytes_per_token),
@@ -420,6 +432,7 @@ class ModelWorker:
         }
         request_pool_indices: dict[RequestKey, int] = {}
         kv_placements: dict[tuple[RequestKey, int], KvPlacement] = {}
+        latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
         pool = self.kv.pool
         if pool is None:
             raise RuntimeError("worker warmup requires a resident KV pool")
@@ -451,7 +464,7 @@ class ModelWorker:
                 raise invalid_descriptor("warmup operation regresses its KV capacity")
             allocated = tuple(
                 candidate
-                for candidate in range(pool.leasable_num_blocks)
+                for candidate in range(1, pool.leasable_num_blocks)
                 if candidate not in occupied_blocks
             )[:missing]
             if len(allocated) != missing:
@@ -464,6 +477,42 @@ class ModelWorker:
                 group_id=group_id,
                 block_table=tuple(block_table),
                 pages_to_zero=allocated,
+                prefix_length=(0 if session is None else int(entry.visible_len)),
+                input_length=int(operation.bounds.max_tokens),
+                visible_length=(0 if session is None else int(entry.visible_len)),
+                resulting_length=(
+                    (0 if session is None else int(entry.visible_len))
+                    + int(operation.bounds.max_tokens)
+                ),
+            )
+        height, width = self._warmup_image_geometry()
+        latent_units = max(
+            1,
+            (height // max(1, int(self._capabilities.latent_downsample)))
+            * (width // max(1, int(self._capabilities.latent_downsample))),
+        )
+        page_units = int(self._capabilities.latent_page_units)
+        latent_page_count = (latent_units + page_units - 1) // page_units if page_units > 0 else 0
+        for operation in operations:
+            if operation.work.variant not in {
+                WorkVariant.GEN_TRANSITION,
+                WorkVariant.GEN_FLOW,
+                WorkVariant.MATERIALIZE,
+            }:
+                continue
+            latent_placements[(operation.request_key, operation.op_id)] = LatentPlacement(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                page_table=tuple(range(1, latent_page_count + 1)),
+                latent_units=latent_units,
+                height=height,
+                width=width,
+                start_step=0,
+                step_count=(
+                    int(operation.bounds.max_tokens)
+                    if operation.work.variant is WorkVariant.GEN_FLOW
+                    else 0
+                ),
             )
         return _warmup_batch(
             step_id=self._warmup_step_id,
@@ -471,6 +520,7 @@ class ModelWorker:
             operations=operations,
             request_pool_indices=request_pool_indices,
             kv_placements=kv_placements,
+            latent_placements=latent_placements,
             input_products=input_products,
         )
 
@@ -498,7 +548,7 @@ class ModelWorker:
 
         caps = self._capabilities
         downsample = max(1, int(caps.latent_downsample))
-        capacity = int(caps.max_latent_size)
+        capacity = int(caps.latent_capacity_units)
         if int(caps.max_vae_grid_tokens) > 0:
             capacity = min(capacity, int(caps.max_vae_grid_tokens))
         side = max(1, math.isqrt(max(1, capacity)))

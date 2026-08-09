@@ -491,7 +491,6 @@ impl GenerationCursor {
                 blocks_sent: 0,
                 reserve_worstcase,
                 worstcase_blocks,
-                worker_image_latent_units: 0,
                 host_scratch_tokens: 0,
             },
             replay: ReplayCursor {
@@ -785,7 +784,6 @@ pub struct ResourceCursor {
     pub(crate) blocks_sent: usize,
     pub(crate) reserve_worstcase: bool,
     pub(crate) worstcase_blocks: usize,
-    pub(crate) worker_image_latent_units: u64,
     pub(crate) host_scratch_tokens: u64,
 }
 
@@ -1241,7 +1239,11 @@ impl GenerationPlanner {
                         position,
                         physical_start: cursor.physical_kv_len,
                         logical_positions,
-                        physical_kv_tokens,
+                        physical_kv_tokens: bounded_worker_kv(
+                            physical_kv_tokens,
+                            request.resources.max_kv_tokens,
+                            cursor.physical_kv_len,
+                        ),
                     },
                     Vec::new(),
                     cursor.replayability,
@@ -1595,7 +1597,11 @@ impl GenerationPlanner {
                         position,
                         physical_start: cursor.physical_kv_len,
                         logical_positions,
-                        physical_kv_tokens,
+                        physical_kv_tokens: bounded_worker_kv(
+                            physical_kv_tokens,
+                            request.resources.max_kv_tokens,
+                            cursor.physical_kv_len,
+                        ),
                     },
                     Vec::new(),
                     Replayability::NotReplayable,

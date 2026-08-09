@@ -291,7 +291,12 @@ impl StageRouter {
             && routing.values().copied().collect::<HashSet<_>>().len() == 1;
 
         let flow = routed_caps(WorkVariant::GenFlow);
-        merged.max_latent_size = flow.as_ref().map_or(0, |caps| caps.max_latent_size);
+        merged.latent_page_units = flow.as_ref().map_or(0, |caps| caps.latent_page_units);
+        merged.num_latent_pages = flow.as_ref().map_or(0, |caps| caps.num_latent_pages);
+        merged.latent_width = flow.as_ref().map_or(0, |caps| caps.latent_width);
+        merged.latent_dtype = flow
+            .as_ref()
+            .map_or_else(String::new, |caps| caps.latent_dtype.clone());
         merged.latent_downsample = flow.as_ref().map_or(0, |caps| caps.latent_downsample);
         merged.max_cfg_branches = flow.as_ref().map_or(0, |caps| caps.max_cfg_branches);
         merged.scratch_capacity_tokens =
@@ -1261,6 +1266,7 @@ mod tests {
                                 u32::try_from(encode_key.session_id.0).unwrap().max(1),
                             ],
                             kv_placements: Vec::new(),
+                            latent_placements: Vec::new(),
                         },
                         BatchPartition {
                             partition_id: 2,
@@ -1276,6 +1282,7 @@ mod tests {
                                 u32::try_from(prefill_key.session_id.0).unwrap().max(1),
                             ],
                             kv_placements: Vec::new(),
+                            latent_placements: Vec::new(),
                         },
                     ],
                 )
@@ -1400,6 +1407,7 @@ mod tests {
                         operations: vec![encode],
                         request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
                         kv_placements: Vec::new(),
+                        latent_placements: Vec::new(),
                     }],
                 )
                 .with_input_products(vec![ProductPayload {
@@ -1442,6 +1450,7 @@ mod tests {
                 operations: vec![consume],
                 request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
                 kv_placements: Vec::new(),
+                latent_placements: Vec::new(),
             }],
         );
         let pending_error = router
@@ -1523,6 +1532,7 @@ mod tests {
                         operations: vec![encode],
                         request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
                         kv_placements: Vec::new(),
+                        latent_placements: Vec::new(),
                     }],
                 )
                 .with_input_products(vec![ProductPayload {

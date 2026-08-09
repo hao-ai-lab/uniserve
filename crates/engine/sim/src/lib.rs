@@ -23,9 +23,9 @@ use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
     Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, ErrorCode,
     FinishFlags, GenMode, LogicalLengths, OpStatus, Operation, PartitionCompletion, Point,
-    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, SamplingState,
-    TimingCounters, TokenMode, TokenSpan, TransferMode, Work, WorkVariant, WorkerCapabilities,
-    decode_sampling_state_bytes,
+    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, ResourceClass,
+    SamplingState, TimingCounters, TokenMode, TokenSpan, TransferMode, Work, WorkVariant,
+    WorkerCapabilities, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -316,7 +316,10 @@ impl SimEngine {
                 WorkVariant::TransferKvPublish,
                 WorkVariant::TransferKvInstall,
             ],
-            max_latent_size: 65_536,
+            latent_page_units: 64,
+            num_latent_pages: 1_025,
+            latent_width: 16,
+            latent_dtype: "bfloat16".into(),
             latent_downsample: 16,
             max_vae_grid_tokens: 1_024,
             max_vit_grid_tokens: 64,
@@ -331,6 +334,7 @@ impl SimEngine {
             max_batch_operations: 1024,
             max_unresolved_window: 2,
             tensorized_mixed: true,
+            resource_classes: vec![ResourceClass::ImageLatent, ResourceClass::Scratch],
             model_identity: "0".repeat(64),
             weight_digest: "1".repeat(64),
             ..WorkerCapabilities::default()
@@ -1101,6 +1105,7 @@ mod tests {
                 operations: vec![operation],
                 request_pool_indices: vec![1],
                 kv_placements: Vec::new(),
+                latent_placements: Vec::new(),
             }],
         )
     }
@@ -1130,6 +1135,6 @@ mod tests {
     fn default_capabilities_admit_public_image_geometry() {
         let caps = SimEngine::new().caps();
         let latent_units = (2_048 / caps.latent_downsample) * (1_152 / caps.latent_downsample);
-        assert!(latent_units <= caps.max_latent_size);
+        assert!(u64::from(latent_units) <= caps.latent_capacity_units());
     }
 }

@@ -1537,6 +1537,7 @@ mod tests {
                 operations: vec![operation],
                 request_pool_indices: vec![1],
                 kv_placements: Vec::new(),
+                latent_placements: Vec::new(),
             }],
         )
     }
@@ -1575,6 +1576,7 @@ mod tests {
             operations: vec![operation],
             request_pool_indices: vec![2],
             kv_placements: Vec::new(),
+            latent_placements: Vec::new(),
         });
         batch
     }

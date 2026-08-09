@@ -153,7 +153,10 @@ class WorkerCapabilities:
     head_dim: int
     scratch_capacity_tokens: int
     supported_work: tuple[WorkVariant, ...]
-    max_latent_size: int
+    latent_page_units: int
+    num_latent_pages: int
+    latent_width: int
+    latent_dtype: str
     latent_downsample: int
     max_vae_grid_tokens: int
     max_vit_grid_tokens: int
@@ -183,6 +186,10 @@ class WorkerCapabilities:
     restored_snapshots: tuple[SnapshotRef, ...] = ()
     protocol_layout_digest: str = ""
 
+    @property
+    def latent_capacity_units(self) -> int:
+        return max(0, self.num_latent_pages - 1) * self.latent_page_units
+
     def __post_init__(self) -> None:
         if self.model_dtype not in {"float16", "bfloat16", "float32"}:
             raise invalid_descriptor("model_dtype must use the canonical runtime vocabulary")
@@ -205,7 +212,9 @@ class WorkerCapabilities:
                 raise invalid_descriptor(f"capabilities.{name} must be positive")
         for name in (
             "scratch_capacity_tokens",
-            "max_latent_size",
+            "latent_page_units",
+            "num_latent_pages",
+            "latent_width",
             "max_vae_grid_tokens",
             "max_vit_grid_tokens",
             "max_latent_feature_bytes",
@@ -222,12 +231,42 @@ class WorkerCapabilities:
             raise invalid_descriptor("capabilities repeat a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
             raise invalid_descriptor("capabilities repeat a resource class")
+        has_latent_geometry = bool(
+            self.latent_page_units
+            or self.num_latent_pages
+            or self.latent_width
+            or self.latent_dtype
+        )
+        if has_latent_geometry or ResourceClass.IMAGE_LATENT in self.resource_classes:
+            if (
+                self.latent_page_units < 1
+                or self.num_latent_pages < 2
+                or self.latent_width < 1
+                or self.latent_dtype not in {"float16", "bfloat16", "float32"}
+            ):
+                raise invalid_descriptor(
+                    "worker capabilities declare incomplete latent pool geometry"
+                )
+        addresses_latent = any(
+            variant
+            in {
+                WorkVariant.GEN_TRANSITION,
+                WorkVariant.GEN_FLOW,
+            }
+            for variant in self.supported_work
+        )
+        if addresses_latent and ResourceClass.IMAGE_LATENT not in self.resource_classes:
+            raise invalid_descriptor(
+                "worker capabilities advertise latent work without a latent page pool"
+            )
         identities = (self.model_identity, self.weight_digest)
         if any(identities) and any(
             len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
             for value in identities
         ):
-            raise invalid_descriptor("capability model identities must be lowercase SHA-256 digests")
+            raise invalid_descriptor(
+                "capability model identities must be lowercase SHA-256 digests"
+            )
         restored_session_ids = tuple(
             reference.version.request_key.session_id for reference in self.restored_snapshots
         )
@@ -253,7 +292,10 @@ class WorkerCapabilities:
                     _seq(data.get("supported_work"), f"{where}.supported_work")
                 )
             ),
-            max_latent_size=_uint(data.get("max_latent_size"), f"{where}.max_latent_size"),
+            latent_page_units=_uint(data.get("latent_page_units"), f"{where}.latent_page_units"),
+            num_latent_pages=_uint(data.get("num_latent_pages"), f"{where}.num_latent_pages"),
+            latent_width=_uint(data.get("latent_width"), f"{where}.latent_width"),
+            latent_dtype=_str(data.get("latent_dtype", ""), f"{where}.latent_dtype"),
             latent_downsample=_uint(data.get("latent_downsample"), f"{where}.latent_downsample"),
             max_vae_grid_tokens=_uint(
                 data.get("max_vae_grid_tokens"), f"{where}.max_vae_grid_tokens"
@@ -334,7 +376,10 @@ class WorkerCapabilities:
             "head_dim": self.head_dim,
             "scratch_capacity_tokens": self.scratch_capacity_tokens,
             "supported_work": [value.value for value in self.supported_work],
-            "max_latent_size": self.max_latent_size,
+            "latent_page_units": self.latent_page_units,
+            "num_latent_pages": self.num_latent_pages,
+            "latent_width": self.latent_width,
+            "latent_dtype": self.latent_dtype,
             "latent_downsample": self.latent_downsample,
             "max_vae_grid_tokens": self.max_vae_grid_tokens,
             "max_vit_grid_tokens": self.max_vit_grid_tokens,

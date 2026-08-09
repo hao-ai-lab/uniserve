@@ -560,7 +560,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
 
     struct Recording {
         inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Vec<WorkVariant>>>>,
+        batches: Arc<Mutex<Vec<Batch>>>,
     }
 
     impl Executor for Recording {
@@ -577,11 +577,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
             self.inner.can_submit()
         }
         fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
-            self.batches.lock().unwrap().push(
-                b.operations()
-                    .map(|operation| operation.work.variant())
-                    .collect(),
-            );
+            self.batches.lock().unwrap().push(b.clone());
             self.inner.submit(b)
         }
         fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
@@ -607,7 +603,8 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
 
     let mut sim = SimEngine::new();
     sim.mut_caps_for_test().resource_classes = vec![ResourceClass::ImageLatent];
-    sim.mut_caps_for_test().max_latent_size = 1024;
+    sim.mut_caps_for_test().latent_page_units = 64;
+    sim.mut_caps_for_test().num_latent_pages = 17;
     sim.mut_caps_for_test().latent_downsample = 16;
     sim.mut_caps_for_test().max_batch_operations = 1024;
     let batches = Arc::new(Mutex::new(Vec::new()));
@@ -659,12 +656,41 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     );
     let batches = batches.lock().unwrap();
     assert!(
-        batches.iter().all(|kinds| {
+        batches.iter().all(|batch| {
+            let kinds = batch
+                .operations()
+                .map(|operation| operation.work.variant())
+                .collect::<Vec<_>>();
             [WorkVariant::GenTransition, WorkVariant::GenFlow]
                 .into_iter()
                 .all(|target| kinds.iter().filter(|kind| **kind == target).count() <= 1)
         }),
         "expected every latent-producing batch to respect one-image capacity, got {batches:?}",
+    );
+    let placements = batches
+        .iter()
+        .flat_map(|batch| &batch.partitions)
+        .flat_map(|partition| &partition.latent_placements)
+        .collect::<Vec<_>>();
+    assert!(!placements.is_empty());
+    assert!(placements.iter().all(|placement| {
+        placement.page_table.iter().all(|page| *page > 0)
+            && placement.page_table.len() == (placement.latent_units as usize).div_ceil(64)
+    }));
+    let pages_by_request = placements.iter().fold(
+        HashMap::<RequestId, Vec<u32>>::new(),
+        |mut pages, placement| {
+            pages
+                .entry(placement.request_key.session_id)
+                .or_insert_with(|| placement.page_table.clone());
+            pages
+        },
+    );
+    assert_eq!(pages_by_request.len(), 3);
+    assert_eq!(
+        pages_by_request.values().collect::<HashSet<_>>().len(),
+        1,
+        "retired trajectory pages should be reusable by the next request"
     );
 }
 
@@ -3835,6 +3861,7 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
         owners: Arc<Mutex<HashMap<u32, RequestId>>>,
         slot_owners: Arc<Mutex<HashMap<u32, RequestId>>>,
         observed_slots: Arc<Mutex<HashMap<RequestId, u32>>>,
+        observed_groups: Arc<Mutex<Vec<HashSet<u32>>>>,
     }
 
     impl Executor for OwnershipChecking {
@@ -3900,6 +3927,22 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
                             owners.insert(block.0, session_id);
                         }
                     }
+                    for operation in &partition.operations {
+                        if operation.kv_capacity_pages == 0 {
+                            continue;
+                        }
+                        self.observed_groups.lock().unwrap().push(
+                            partition
+                                .kv_placements
+                                .iter()
+                                .filter(|placement| {
+                                    placement.request_key == operation.request_key
+                                        && placement.op_id == operation.op_id
+                                })
+                                .map(|placement| placement.group_id)
+                                .collect(),
+                        );
+                    }
                 }
             }
             self.inner.submit(batch)
@@ -3945,17 +3988,33 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     }
 
     let mut sim = SimEngine::new();
-    sim.set_num_blocks(2);
+    sim.set_num_blocks(8);
+    sim.mut_caps_for_test().groups = vec![
+        uniserve_core::KvCacheGroupSpec {
+            group_id: 0,
+            block_offset: 0,
+            num_blocks: 4,
+            kind: uniserve_core::KvGroupKind::Full,
+        },
+        uniserve_core::KvCacheGroupSpec {
+            group_id: 1,
+            block_offset: 4,
+            num_blocks: 4,
+            kind: uniserve_core::KvGroupKind::Full,
+        },
+    ];
     sim.set_pipeline_depth(2);
     sim.set_text_len(1);
     let owners = Arc::new(Mutex::new(HashMap::new()));
     let slot_owners = Arc::new(Mutex::new(HashMap::new()));
     let observed_slots = Arc::new(Mutex::new(HashMap::new()));
+    let observed_groups = Arc::new(Mutex::new(Vec::new()));
     let executor = OwnershipChecking {
         inner: SimExecutor::new(Box::new(sim)),
         owners: Arc::clone(&owners),
         slot_owners: Arc::clone(&slot_owners),
         observed_slots: Arc::clone(&observed_slots),
+        observed_groups: Arc::clone(&observed_groups),
     };
     let mut scheduler = Scheduler::with_config(
         Box::new(executor),
@@ -3995,8 +4054,15 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     }
 
     assert_eq!(finished.len(), receivers.len());
-    assert_eq!(scheduler.health_snapshot().free_blocks, 2);
+    assert_eq!(scheduler.health_snapshot().free_blocks, 3);
     assert!(owners.lock().unwrap().is_empty());
+    assert!(
+        observed_groups
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|groups| groups == &HashSet::from([0, 1]))
+    );
     assert!(slot_owners.lock().unwrap().is_empty());
     assert_eq!(
         *observed_slots.lock().unwrap(),

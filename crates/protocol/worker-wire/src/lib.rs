@@ -558,8 +558,8 @@ pub struct Operation {
     pub bounds: Bounds,
     pub inputs: Vec<ProductRef>,
     pub outputs: Vec<ProductRef>,
-    /// Exact logical KV capacity visible after registration. Physical pages are
-    /// selected by the worker from the partition's logical lease reservation.
+    /// Exact per-group KV capacity established by the scheduler-authored
+    /// placement tables carried alongside this operation.
     pub kv_capacity_pages: u32,
     pub predicate: Option<ProductRef>,
     pub rng: Option<Rng>,
@@ -1163,6 +1163,9 @@ pub struct BatchPartition {
     pub request_pool_indices: Vec<u32>,
     /// Complete scheduler-owned KV mappings for operations that address KV.
     pub kv_placements: Vec<KvPlacement>,
+    /// Complete scheduler-owned latent mappings for operations that address a
+    /// generation trajectory.
+    pub latent_placements: Vec<LatentPlacement>,
 }
 
 /// One operation's complete scheduler-owned KV placement.
@@ -1173,6 +1176,10 @@ pub struct KvPlacement {
     pub group_id: u32,
     pub block_table: Vec<BlockId>,
     pub pages_to_zero: Vec<BlockId>,
+    pub prefix_length: u32,
+    pub input_length: u32,
+    pub visible_length: u32,
+    pub resulting_length: u32,
 }
 
 impl KvPlacement {
@@ -1193,6 +1200,50 @@ impl KvPlacement {
         anyhow::ensure!(
             self.pages_to_zero.iter().all(|page| pages.contains(page)),
             "KV placement zeroes a page outside its block table"
+        );
+        anyhow::ensure!(
+            self.block_table.iter().all(|page| page.0 > 0)
+                && self.pages_to_zero.iter().all(|page| page.0 > 0),
+            "KV placement carries the reserved page zero"
+        );
+        anyhow::ensure!(
+            self.visible_length >= self.prefix_length
+                && self.resulting_length >= self.visible_length
+                && self.prefix_length.saturating_add(self.input_length) == self.resulting_length,
+            "KV placement lengths are inconsistent"
+        );
+        Ok(())
+    }
+}
+
+/// One operation's complete scheduler-owned latent trajectory placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatentPlacement {
+    pub request_key: RequestKey,
+    pub op_id: OpId,
+    pub page_table: Vec<u32>,
+    pub latent_units: u32,
+    pub height: u32,
+    pub width: u32,
+    pub start_step: u32,
+    pub step_count: u32,
+}
+
+impl LatentPlacement {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.op_id.0 > 0,
+            "latent placement operation id must be positive"
+        );
+        anyhow::ensure!(
+            self.latent_units > 0 && self.height > 0 && self.width > 0,
+            "latent placement geometry must be positive"
+        );
+        anyhow::ensure!(
+            !self.page_table.is_empty()
+                && self.page_table.iter().all(|page| *page > 0)
+                && self.page_table.iter().collect::<HashSet<_>>().len() == self.page_table.len(),
+            "latent placement page table is empty, repeats a page, or carries page zero"
         );
         Ok(())
     }
@@ -1236,12 +1287,13 @@ impl BatchPartition {
         let mut placement_ids = HashSet::with_capacity(self.kv_placements.len());
         for placement in &self.kv_placements {
             placement.validate()?;
-            let identity = (placement.request_key, placement.op_id);
+            let identity = (placement.request_key, placement.op_id, placement.group_id);
             anyhow::ensure!(
                 placement_ids.insert(identity),
                 "batch partition repeats a KV placement identity"
             );
-            let operation = operations.get(&identity).ok_or_else(|| {
+            let operation_identity = (placement.request_key, placement.op_id);
+            let operation = operations.get(&operation_identity).ok_or_else(|| {
                 anyhow::anyhow!("KV placement does not name a partition operation")
             })?;
             anyhow::ensure!(
@@ -1252,8 +1304,40 @@ impl BatchPartition {
         for operation in &self.operations {
             anyhow::ensure!(
                 operation.kv_capacity_pages == 0
-                    || placement_ids.contains(&(operation.request_key, operation.op_id)),
+                    || placement_ids
+                        .iter()
+                        .any(|identity| identity.0 == operation.request_key
+                            && identity.1 == operation.op_id),
                 "operation with logical KV capacity has no placement"
+            );
+        }
+        let mut latent_ids = HashSet::with_capacity(self.latent_placements.len());
+        for placement in &self.latent_placements {
+            placement.validate()?;
+            let identity = (placement.request_key, placement.op_id);
+            anyhow::ensure!(
+                latent_ids.insert(identity),
+                "batch partition repeats a latent placement identity"
+            );
+            let operation = operations.get(&identity).ok_or_else(|| {
+                anyhow::anyhow!("latent placement does not name a partition operation")
+            })?;
+            anyhow::ensure!(
+                matches!(
+                    operation.work.variant(),
+                    WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
+                ),
+                "latent placement names an operation that does not address a trajectory"
+            );
+        }
+        for operation in &self.operations {
+            let needs_latent = matches!(
+                operation.work.variant(),
+                WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
+            );
+            anyhow::ensure!(
+                !needs_latent || latent_ids.contains(&(operation.request_key, operation.op_id)),
+                "operation that addresses a trajectory has no latent placement"
             );
         }
         Ok(())
@@ -1854,7 +1938,10 @@ pub struct WorkerCapabilities {
     pub head_dim: u32,
     pub scratch_capacity_tokens: u64,
     pub supported_work: Vec<WorkVariant>,
-    pub max_latent_size: u32,
+    pub latent_page_units: u32,
+    pub num_latent_pages: u32,
+    pub latent_width: u32,
+    pub latent_dtype: String,
     pub latent_downsample: u32,
     pub max_vae_grid_tokens: u32,
     pub max_vit_grid_tokens: u32,
@@ -1886,6 +1973,11 @@ pub struct WorkerCapabilities {
 }
 
 impl WorkerCapabilities {
+    pub fn latent_capacity_units(&self) -> u64 {
+        u64::from(self.num_latent_pages.saturating_sub(1))
+            .saturating_mul(u64::from(self.latent_page_units))
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.supported_work.is_empty(),
@@ -1924,13 +2016,37 @@ impl WorkerCapabilities {
         );
         anyhow::ensure!(
             self.block_size > 0
-                && self.num_blocks > 0
+                && self.num_blocks > 1
                 && self.num_layers > 0
                 && self.num_kv_heads > 0
                 && self.head_dim > 0
                 && self.pipeline_depth > 0
                 && self.bytes_per_token > 0,
             "worker capabilities declare invalid cache geometry"
+        );
+        let has_latent_geometry = self.latent_page_units > 0
+            || self.num_latent_pages > 0
+            || self.latent_width > 0
+            || !self.latent_dtype.is_empty();
+        if has_latent_geometry || self.resource_classes.contains(&ResourceClass::ImageLatent) {
+            anyhow::ensure!(
+                self.latent_page_units > 0
+                    && self.num_latent_pages > 1
+                    && self.latent_width > 0
+                    && matches!(
+                        self.latent_dtype.as_str(),
+                        "float16" | "bfloat16" | "float32"
+                    ),
+                "worker capabilities declare incomplete latent pool geometry"
+            );
+        }
+        let addresses_latent = self
+            .supported_work
+            .iter()
+            .any(|variant| matches!(variant, WorkVariant::GenTransition | WorkVariant::GenFlow));
+        anyhow::ensure!(
+            !addresses_latent || self.resource_classes.contains(&ResourceClass::ImageLatent),
+            "worker capabilities advertise latent work without a latent page pool"
         );
         anyhow::ensure!(
             self.protocol_layout_digest == protocol_layout_digest(),
@@ -1969,12 +2085,12 @@ impl WorkerCapabilities {
                 && supports(WorkVariant::Materialize)
                 && supports(WorkVariant::TransferKvPublish)
                 && self.incremental_kv_publication,
-            max_latent_units: u64::from(self.max_latent_size),
+            max_latent_units: self.latent_capacity_units(),
             latent_downsample: self.latent_downsample,
             max_vae_grid_tokens: if self.max_vae_grid_tokens > 0 {
                 self.max_vae_grid_tokens
             } else {
-                self.max_latent_size
+                self.latent_capacity_units().min(u64::from(u32::MAX)) as u32
             },
             max_vit_grid_tokens: self.max_vit_grid_tokens,
             max_latent_feature_bytes: self.max_latent_feature_bytes,
@@ -1998,7 +2114,10 @@ impl Default for WorkerCapabilities {
             head_dim: 128,
             scratch_capacity_tokens: 1 << 20,
             supported_work: vec![WorkVariant::TokenExtend, WorkVariant::TokenDecode],
-            max_latent_size: 0,
+            latent_page_units: 0,
+            num_latent_pages: 0,
+            latent_width: 0,
+            latent_dtype: String::new(),
             latent_downsample: 1,
             max_vae_grid_tokens: 0,
             max_vit_grid_tokens: 0,
@@ -2063,7 +2182,7 @@ pub fn protocol_layout_digest() -> Digest {
         digest.string(control);
     }
     // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 10] = [
+    let record_layouts: [&[&str]; 12] = [
         &[
             "request_key",
             "op_id",
@@ -2124,6 +2243,20 @@ pub fn protocol_layout_digest() -> Digest {
             "group_id",
             "block_table",
             "pages_to_zero",
+            "prefix_length",
+            "input_length",
+            "visible_length",
+            "resulting_length",
+        ],
+        &[
+            "request_key",
+            "op_id",
+            "page_table",
+            "latent_units",
+            "height",
+            "width",
+            "start_step",
+            "step_count",
         ],
         &[
             "partition_id",
@@ -2137,6 +2270,48 @@ pub fn protocol_layout_digest() -> Digest {
             "operations",
             "request_pool_indices",
             "kv_placements",
+            "latent_placements",
+        ],
+        &[
+            "block_size",
+            "num_blocks",
+            "num_layers",
+            "num_kv_heads",
+            "head_dim",
+            "scratch_capacity_tokens",
+            "supported_work",
+            "latent_page_units",
+            "num_latent_pages",
+            "latent_width",
+            "latent_dtype",
+            "latent_downsample",
+            "max_vae_grid_tokens",
+            "max_vit_grid_tokens",
+            "max_latent_feature_bytes",
+            "max_vision_feature_bytes",
+            "commit_marker_tokens",
+            "gen_rope_advance",
+            "max_cfg_branches",
+            "bytes_per_token",
+            "groups",
+            "kv_dtype",
+            "model_dtype",
+            "attention_backend",
+            "quantization",
+            "rank",
+            "pipeline_depth",
+            "encoder_cache_budget",
+            "supported_controls",
+            "max_batch_operations",
+            "max_unresolved_window",
+            "incremental_kv_publication",
+            "tensorized_mixed",
+            "sampling_ownership",
+            "resource_classes",
+            "model_identity",
+            "weight_digest",
+            "protocol_layout_digest",
+            "restored_snapshots",
         ],
     ];
     for record in record_layouts {

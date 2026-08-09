@@ -171,7 +171,10 @@ table WorkerCapabilities {
   head_dim:uint;
   scratch_capacity_tokens:ulong;
   supported_work:[WorkVariant];
-  max_latent_size:uint;
+  latent_page_units:uint;
+  num_latent_pages:uint;
+  latent_width:uint;
+  latent_dtype:string;
   latent_downsample:uint;
   bytes_per_token:ulong;
   max_vae_grid_tokens:uint;
@@ -294,6 +297,21 @@ table KvPlacement {
   group_id:uint;
   block_table:[uint];
   pages_to_zero:[uint];
+  prefix_length:uint;
+  input_length:uint;
+  visible_length:uint;
+  resulting_length:uint;
+}
+
+table LatentPlacement {
+  request_key:RequestKey;
+  op_id:ulong;
+  page_table:[uint];
+  latent_units:uint;
+  height:uint;
+  width:uint;
+  start_step:uint;
+  step_count:uint;
 }
 
 table LogicalLengths {
@@ -401,6 +419,7 @@ table BatchPartition {
   operations:[Operation];
   request_pool_indices:[uint];
   kv_placements:[KvPlacement];
+  latent_placements:[LatentPlacement];
 }
 
 table Batch {
