@@ -1,16 +1,15 @@
-"""Catalog resolution and declarative checkpoint loading conformance."""
+"""Catalog resolution and checkpoint loading conformance."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import pytest
 import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from tests.python.fixtures.model_execution import TEST_MODEL_SPEC
 from uniserve_worker.bootstrap.catalog import (
     CatalogEntry,
     CheckpointFormat,
@@ -23,6 +22,20 @@ from uniserve_worker.bootstrap.model_loader import (
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.runtime_config import ExecutionConfig
 from uniserve_worker.loader import Loader
+from uniserve_worker.loader.schema import (
+    ModelLoadScope,
+    Quantize,
+    Rename,
+    Reshape,
+    Shard,
+    Sidecar,
+    Slice,
+    Split,
+    Stack,
+    Tie,
+    Transpose,
+    WeightSpec,
+)
 from uniserve_worker.loader.transformers import (
     dtype_from_name,
 )
@@ -35,22 +48,6 @@ from uniserve_worker.nn.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
     zero_vocab_padding,
-)
-from uniserve_worker.spec import (
-    ModelLoadScope,
-    Quantize,
-    Rename,
-    Reshape,
-    ResourcePlan,
-    Shard,
-    Sidecar,
-    Slice,
-    Split,
-    Stack,
-    Tie,
-    Transpose,
-    WeightSpec,
-    resolved_digest,
 )
 
 pytestmark = pytest.mark.integration
@@ -103,7 +100,7 @@ def test_transformer_dtype_parser_rejects_aliases(alias: str):
         dtype_from_name(alias)
 
 
-def test_qwen_checkpoint_load_resolves_immutable_weight_and_spec_identity(tmp_path):
+def test_qwen_checkpoint_load_resolves_architecture_and_weight_identity(tmp_path):
     config = _qwen_config()
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     reference = Qwen3ForCausalLM(
@@ -145,12 +142,12 @@ def test_qwen_checkpoint_load_resolves_immutable_weight_and_spec_identity(tmp_pa
     loaded = load_worker_model(request)
 
     assert type(loaded.model) is Qwen3ForCausalLM
-    assert loaded.spec.architecture == "Qwen3ForCausalLM"
-    assert loaded.spec.revision == loaded.weight_digest
-    assert loaded.resolved_digest == resolved_digest(loaded.spec, loaded.overlay)
+    assert loaded.identity.architecture == "Qwen3ForCausalLM"
+    assert len(loaded.identity.architecture_digest) == 64
+    assert len(loaded.identity.weight_digest) == 64
     assert loaded.tokenizer is None
-    assert loaded.spec.inputs.requires_worker_tokenizer is False
-    assert loaded.spec.weights.targets
+    assert loaded.model.image_processor is None
+    assert loaded.model.weight_spec.targets
     for name, parameter in loaded.model.named_parameters():
         torch.testing.assert_close(parameter, checkpoint[name].to(torch.bfloat16))
 
@@ -159,7 +156,7 @@ def test_qwen_checkpoint_load_resolves_immutable_weight_and_spec_identity(tmp_pa
     changed[first] = changed[first].clone()
     changed[first].view(-1)[0] += 1
     save_file(changed, tmp_path / "model.safetensors")
-    assert load_worker_model(request).weight_digest != loaded.weight_digest
+    assert load_worker_model(request).identity.weight_digest != loaded.identity.weight_digest
 
 
 def test_partial_scope_is_rejected_before_model_materialization(tmp_path):
@@ -213,11 +210,6 @@ class _CompositeRoot(nn.Module):
         super().__init__()
         del config, layer_spec
         self.graph = graph
-        self.spec = replace(
-            TEST_MODEL_SPEC,
-            architecture="CompositeConformanceModel",
-            weights=self.weight_spec,
-        )
 
     def forward(self, batch):
         raise AssertionError(f"loader conformance does not execute {batch!r}")
@@ -232,7 +224,6 @@ def test_composite_loader_streams_root_and_sidecar_before_ready(tmp_path):
         architecture="CompositeConformanceModel",
         model_class=_CompositeRoot,
         checkpoint=CheckpointFormat.COMPOSITE,
-        resources=ResourcePlan(),
         config_class=_CompositeConfig,
         graph_class=_CompositeGraph,
         serving_dtype="float32",
@@ -251,7 +242,7 @@ def test_composite_loader_streams_root_and_sidecar_before_ready(tmp_path):
 
     torch.testing.assert_close(loaded.model.graph.core.weight, core)
     torch.testing.assert_close(loaded.model.graph.vae.weight, vae)
-    assert tuple(target.name for target in loaded.model.spec.weights.targets) == (
+    assert tuple(target.name for target in loaded.model.weight_spec.targets) == (
         "graph.core.weight",
         "graph.vae.weight",
     )
@@ -277,11 +268,6 @@ class _StackRoot(nn.Module):
             spec=layer_spec,
             bias=False,
         )
-        self.spec = replace(
-            TEST_MODEL_SPEC,
-            architecture="StackConformanceModel",
-            weights=self.weight_spec,
-        )
 
 
 def test_stream_loader_stacks_declared_checkpoint_parts(tmp_path):
@@ -300,7 +286,6 @@ def test_stream_loader_stacks_declared_checkpoint_parts(tmp_path):
         architecture="StackConformanceModel",
         model_class=_StackRoot,
         checkpoint=CheckpointFormat.STREAM,
-        resources=ResourcePlan(),
     )
 
     loaded = Loader().load(
@@ -370,11 +355,6 @@ class _AlgebraRoot(nn.Module):
         self.sharded = ColumnParallelLinear(4, 4, spec=layer_spec, bias=False)
         self.tied_source = nn.Parameter(torch.empty(2))
         self.tied_target = nn.Parameter(torch.empty(2))
-        self.spec = replace(
-            TEST_MODEL_SPEC,
-            architecture="WeightAlgebraConformanceModel",
-            weights=self.weight_spec,
-        )
 
 
 def test_stream_loader_applies_tensor_algebra_sharding_and_ties(tmp_path):
@@ -391,7 +371,6 @@ def test_stream_loader_applies_tensor_algebra_sharding_and_ties(tmp_path):
         architecture="WeightAlgebraConformanceModel",
         model_class=_AlgebraRoot,
         checkpoint=CheckpointFormat.STREAM,
-        resources=ResourcePlan(),
     )
 
     loaded = (
@@ -426,11 +405,6 @@ class _QuantizedRoot(nn.Module):
         super().__init__()
         del config
         self.projection = LinearBase(2, 2, spec=layer_spec, bias=False)
-        self.spec = replace(
-            TEST_MODEL_SPEC,
-            architecture="QuantizedWeightConformanceModel",
-            weights=self.weight_spec,
-        )
 
 
 def test_stream_loader_applies_declared_quantization(tmp_path):
@@ -440,7 +414,6 @@ def test_stream_loader_applies_declared_quantization(tmp_path):
         architecture="QuantizedWeightConformanceModel",
         model_class=_QuantizedRoot,
         checkpoint=CheckpointFormat.STREAM,
-        resources=ResourcePlan(),
     )
 
     loaded = (

@@ -11,20 +11,20 @@ from pathlib import Path
 from types import TracebackType
 from typing import IO, Self
 
-from .profiles import ROOT, ServerProfile
+from .profiles import ServerLaunch, ServerProfile
 
 
 class ManagedServer:
     def __init__(
         self,
         profile: ServerProfile,
-        command: tuple[str, ...],
+        launch: ServerLaunch,
         log_path: Path,
         *,
         timeout_s: float,
     ) -> None:
         self.profile = profile
-        self.command = command
+        self.launch = launch
         self.log_path = log_path
         self.timeout_s = timeout_s
         self.process: subprocess.Popen[str] | None = None
@@ -34,10 +34,10 @@ class ManagedServer:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = self.log_path.open("w", encoding="utf-8")
         environment = dict(os.environ)
-        environment.update(self.profile.environment)
+        environment.update(self.launch.environment)
         self.process = subprocess.Popen(
-            self.command,
-            cwd=ROOT,
+            self.launch.command,
+            cwd=self.launch.working_directory,
             env=environment,
             stdout=self.log,
             stderr=subprocess.STDOUT,

@@ -178,7 +178,7 @@ class WorkerCapabilities:
     tensorized_mixed: bool
     sampling_ownership: SamplingOwnership
     resource_classes: tuple[ResourceClass, ...]
-    model_spec_digest: str
+    model_identity: str
     weight_digest: str
     restored_snapshots: tuple[SnapshotRef, ...] = ()
     protocol_layout_digest: str = ""
@@ -222,6 +222,12 @@ class WorkerCapabilities:
             raise invalid_descriptor("capabilities repeat a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
             raise invalid_descriptor("capabilities repeat a resource class")
+        identities = (self.model_identity, self.weight_digest)
+        if any(identities) and any(
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+            for value in identities
+        ):
+            raise invalid_descriptor("capability model identities must be lowercase SHA-256 digests")
         restored_session_ids = tuple(
             reference.version.request_key.session_id for reference in self.restored_snapshots
         )
@@ -309,7 +315,7 @@ class WorkerCapabilities:
                     _seq(data.get("resource_classes", ()), f"{where}.resource_classes")
                 )
             ),
-            model_spec_digest=_str(data.get("model_spec_digest", ""), f"{where}.model_spec_digest"),
+            model_identity=_str(data.get("model_identity", ""), f"{where}.model_identity"),
             weight_digest=_str(data.get("weight_digest", ""), f"{where}.weight_digest"),
             restored_snapshots=tuple(
                 SnapshotRef.from_wire(item, f"{where}.restored_snapshots[{index}]")
@@ -353,7 +359,7 @@ class WorkerCapabilities:
             "tensorized_mixed": self.tensorized_mixed,
             "sampling_ownership": self.sampling_ownership.value,
             "resource_classes": [value.value for value in self.resource_classes],
-            "model_spec_digest": self.model_spec_digest,
+            "model_identity": self.model_identity,
             "weight_digest": self.weight_digest,
             "protocol_layout_digest": self.protocol_layout_digest,
             "restored_snapshots": [reference.to_wire() for reference in self.restored_snapshots],

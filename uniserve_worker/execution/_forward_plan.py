@@ -39,8 +39,8 @@ class ForwardBinding:
 
 @dataclass(frozen=True, slots=True)
 class GraphKey:
-    model_revision: str
-    spec_digest: str
+    architecture_digest: str
+    weight_digest: str
     route: RouteId
     shape: tuple[int, ...]
     dtype: str
@@ -48,7 +48,7 @@ class GraphKey:
     topology: str
 
     def __post_init__(self) -> None:
-        if not self.model_revision or not self.spec_digest or not self.dtype:
+        if not self.architecture_digest or not self.weight_digest or not self.dtype:
             raise ValueError("graph key identities and dtype must be present")
         if any(dimension < 0 for dimension in self.shape):
             raise ValueError("graph key shape dimensions must be non-negative")

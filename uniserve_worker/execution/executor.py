@@ -111,17 +111,28 @@ from uniserve_worker.foundation.errors import (
 from uniserve_worker.foundation.sizing import bucketed_length
 from uniserve_worker.foundation.triton_compat import triton_device_supported
 from uniserve_worker.loader.weight_set import WeightSet
-from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
+from uniserve_worker.models.generation import (
+    BranchSource,
+    GenerationPipeline,
+    LatentLayout,
+    Materialization,
+)
+from uniserve_worker.models.inputs import FeatureLayout, ImageProcessor, PatchTransform
+from uniserve_worker.models.runtime import (
+    DeviceRole,
+    ExecutionModel,
+    LoweredStage,
+    PositionLayout,
+    RowKind,
+    WorkerDeployment,
+)
+from uniserve_worker.nn.diffusion.cfg import Branch, build_flow_cfg_plan
 from uniserve_worker.nn.diffusion.integrator import euler_step
 from uniserve_worker.nn.diffusion.schedule import (
-    FlowMatchSchedule,
-    ScheduleDirection,
-    ScheduleShiftDomain,
     x_pred_to_velocity,
 )
 from uniserve_worker.nn.mesh import BroadcastTransport
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
-from uniserve_worker.nn.vision.patching import patchify_batch, unpatchify_batch
 from uniserve_worker.runtime.completion_store import (
     CompletionArena,
     CompletionByteCapture,
@@ -189,34 +200,18 @@ from uniserve_worker.runtime.transfer import (
     decode_transfer_descriptor,
     encode_transfer_descriptor,
 )
-from uniserve_worker.spec import (
-    DeploymentOverlay,
-    FeatureLayout,
-    FlowBranchSource,
-    FlowConditioningKind,
-    FlowSpec,
-    ImagePatchSpec,
-    LatentLayout,
-    MaterializationKind,
-    ModelSpec,
-    NoiseScaleMode,
-    OperationStageCondition,
-    OperationStagePurpose,
-    OperationStageSpec,
-    PositionLayout,
-    RoutePlacement,
-    RouteRowKind,
-    RouteShapeGrouping,
-    RouteSpec,
-    resolved_digest,
-)
 
 from ._forward_plan import (
     ForwardBinding,
     ForwardPlan,
     GraphKey,
 )
-from ._inputs import PreparedImage, patch_grid_shape, prepare_image, prepare_tensor_image
+from ._inputs import (
+    PreparedImage,
+    patch_grid_shape,
+    prepare_image,
+    prepare_tensor_image,
+)
 from .model_runner import ModelRunner, RunObservation, RunPath
 
 logger = logging.getLogger(__name__)
@@ -231,8 +226,8 @@ class _ForwardTask:
     operation: Operation
     session: RequestSession
     weights: WeightSet
-    stage: OperationStageSpec
-    route: RouteSpec
+    stage: LoweredStage
+    route: RouteId
     row: ForwardRow
     entry: KvEntry | None = None
     scratch: bool = False
@@ -250,14 +245,14 @@ class _ForwardTask:
         return 0
 
     @property
-    def row_kind(self) -> RouteRowKind:
+    def row_kind(self) -> RowKind:
         if isinstance(self.row, TokenRow):
-            return RouteRowKind.TOKEN
+            return RowKind.TOKEN
         if isinstance(self.row, FlowRow):
-            return RouteRowKind.FLOW
+            return RowKind.FLOW
         if isinstance(self.row, EncodeRow):
-            return RouteRowKind.ENCODE
-        return RouteRowKind.DECODE
+            return RowKind.ENCODE
+        return RowKind.DECODE
 
 
 @dataclass(frozen=True, slots=True)
@@ -1526,8 +1521,8 @@ class ModelExecutor:
     def __init__(
         self,
         *,
-        spec: ModelSpec | None,
-        deployment: DeploymentOverlay | None,
+        model: ExecutionModel | None,
+        deployment: WorkerDeployment | None,
         runner: ModelRunner | None,
         attention: AttentionSelection | None,
         sessions: SessionStore,
@@ -1539,7 +1534,7 @@ class ModelExecutor:
         mesh: MeshStore | None,
         transport: Transport | None,
         tokenizer: Any | None,
-        model_spec_digest: str | None,
+        architecture_digest: str | None,
         weight_digest: str | None,
         allowed_work_variants: frozenset[WorkVariant],
         trace: ExecutionTrace,
@@ -1551,30 +1546,27 @@ class ModelExecutor:
     ) -> None:
         if not allowed_work_variants:
             raise ValueError("executor must accept at least one work variant")
-        if (spec is None) != (deployment is None):
-            raise ValueError("model spec and deployment overlay must be present together")
-        if runner is not None and (spec is None or weights is None):
-            raise ValueError("model execution requires declarations and base weights")
+        if (model is None) != (deployment is None):
+            raise ValueError("model and worker deployment must be present together")
+        if runner is not None and (model is None or weights is None):
+            raise ValueError("model execution requires a model and base weights")
         if (runner is None) != (attention is None):
             raise ValueError("model runner and attention selection must be provisioned together")
-        if spec is not None:
-            declared_digest = resolved_digest(spec, cast(DeploymentOverlay, deployment))
-            if model_spec_digest is None or declared_digest != model_spec_digest:
-                raise capability_mismatch(
-                    "executor model-spec identity does not match its declarations"
-                )
+        if model is not None:
+            if architecture_digest is None or len(architecture_digest) != 64:
+                raise capability_mismatch("executor model identity is invalid")
             if weight_digest is None or weights is None or weights.digest != weight_digest:
                 raise capability_mismatch(
                     "executor base-weight identity does not match its weight set"
                 )
-            unsupported = allowed_work_variants - spec.operation_variants()
+            unsupported = allowed_work_variants - model.supported_work
             system_only = frozenset({WorkVariant.MATERIALIZE})
             if unsupported - system_only:
                 raise capability_mismatch(
-                    "executor work set exceeds the model declaration: "
+                    "executor work set exceeds the model implementation: "
                     f"{sorted(value.value for value in unsupported - system_only)!r}"
                 )
-        self.spec = spec
+        self.model = model
         self.deployment = deployment
         self.runner = runner
         self.attention = attention
@@ -1587,7 +1579,7 @@ class ModelExecutor:
         self.mesh = mesh
         self.transport = transport
         self.tokenizer = tokenizer
-        self.model_spec_digest = model_spec_digest
+        self.architecture_digest = architecture_digest
         self.weight_digest = weight_digest
         self.allowed_work_variants = allowed_work_variants
         self.trace = trace
@@ -1626,22 +1618,6 @@ class ModelExecutor:
             capacity=int(cpu_task_capacity),
             workers=min(4, int(cpu_task_capacity)),
         )
-        self._routes = {} if spec is None else {route.name: route for route in spec.routes}
-        self._operation_stages = (
-            {}
-            if spec is None
-            else {operation.kind: operation.stages for operation in spec.operations}
-        )
-        self._primary_stages = {
-            variant: primary[0]
-            for variant, stages in self._operation_stages.items()
-            if len(
-                primary := tuple(
-                    stage for stage in stages if stage.purpose is OperationStagePurpose.PRIMARY
-                )
-            )
-            == 1
-        }
         self._collective_history: OrderedDict[int, str] = OrderedDict()
         self._transport_publications: dict[_OperationIdentity, tuple[Locator, ...]] = {}
 
@@ -2508,8 +2484,8 @@ class ModelExecutor:
             first = partitions[0]
             if first.execution is not ExecutionCapability.TENSORIZED_MIXED:
                 continue
-            if self.spec is None:
-                raise invalid_descriptor("tensorized mixed submission has no declared model route")
+            if self.model is None:
+                raise invalid_descriptor("tensorized mixed submission has no model route")
             primary_stages = tuple(
                 self._primary_stage(operation.work.variant)
                 for partition in partitions
@@ -2520,11 +2496,8 @@ class ModelExecutor:
                 raise invalid_descriptor(
                     "tensorized mixed submission spans distinct model runner routes"
                 )
-            route = self._routes[next(iter(model_routes))]
             row_kinds = frozenset(stage.row for stage in primary_stages)
-            if not any(
-                row_kinds == frozenset(combination) for combination in route.mixed_combinations
-            ):
+            if not self.model.allows_mixed(next(iter(model_routes)), row_kinds):
                 raise invalid_descriptor(
                     "tensorized mixed submission exceeds worker mixed-execution capabilities"
                 )
@@ -3292,9 +3265,7 @@ class ModelExecutor:
         for candidates in grouped.values():
             kinds = frozenset(task.row_kind for _index, task, _scope in candidates)
             route = candidates[0][1].route
-            legal_mixed = any(
-                kinds <= frozenset(combination) for combination in route.mixed_combinations
-            )
+            legal_mixed = self._model().allows_mixed(route, kinds)
             if len(kinds) > 1 and not legal_mixed:
                 raise invalid_descriptor(
                     "tensorized mixed submission is outside the model runner capability"
@@ -3372,11 +3343,10 @@ class ModelExecutor:
         for candidates in grouped.values():
             kinds = frozenset(task.row_kind for _index, task in candidates)
             route = candidates[0][1].route
-            legal_mixed = any(
-                kinds <= frozenset(combination) for combination in route.mixed_combinations
-            )
+            model = self._model()
+            legal_mixed = model.allows_mixed(route, kinds)
             if len(kinds) > 1 and not legal_mixed:
-                by_kind: dict[RouteRowKind, list[tuple[int, _ForwardTask]]] = defaultdict(list)
+                by_kind: dict[RowKind, list[tuple[int, _ForwardTask]]] = defaultdict(list)
                 for item in candidates:
                     by_kind[item[1].row_kind].append(item)
                 groups.extend(by_kind.values())
@@ -3406,10 +3376,10 @@ class ModelExecutor:
 
     def _group_key(self, task: _ForwardTask) -> tuple[object, ...]:
         return (
-            task.route.name,
+            task.route,
             self._route_device(task.route),
-            task.route.dtype,
-            task.route.topology_axes,
+            self._model().route_dtype(task.route),
+            self._model().route_topology(task.route),
             task.weights.digest,
             task.weights.version,
             self._hard_shape_key(task.route, task.row),
@@ -3449,7 +3419,11 @@ class ModelExecutor:
             else:
                 kv_view = EmptyKvView()
                 attention = NoAttention(backends=self._attention_selection())
-            mesh = EmptyMeshView() if self.mesh is None else self.mesh.view(route.topology_axes)
+            mesh = (
+                EmptyMeshView()
+                if self.mesh is None
+                else self.mesh.view(self._model().route_topology(route))
+            )
             context = ForwardContext(
                 kv=kv_view,
                 latent=EmptyLatentView(),
@@ -3459,11 +3433,11 @@ class ModelExecutor:
             )
             graph_shape = self._hard_shape_key(route, tasks[0].row)
             graph_key = GraphKey(
-                model_revision=cast(ModelSpec, self.spec).revision or cast(str, self.weight_digest),
-                spec_digest=cast(str, self.model_spec_digest),
-                route=RouteId(route.name),
+                architecture_digest=cast(str, self.architecture_digest),
+                weight_digest=cast(str, self.weight_digest),
+                route=route,
                 shape=graph_shape,
-                dtype=route.dtype,
+                dtype=self._model().route_dtype(route),
                 backend=self._attention_selection().identity,
                 topology=self._topology_key(route),
             )
@@ -3472,9 +3446,9 @@ class ModelExecutor:
                     row_id=task.row.row_id,
                     slot=task.row.output_slot,
                     output_dtype=(
-                        cast(FlowSpec, cast(ModelSpec, self.spec).flow).prediction_dtype
+                        self._generation().prediction_dtype
                         if isinstance(task.row, FlowRow)
-                        else route.dtype
+                        else self._model().route_dtype(route)
                     ),
                     session_id=task.operation.request_key.session_id,
                     epoch=task.operation.request_key.epoch,
@@ -3484,12 +3458,12 @@ class ModelExecutor:
                 for task in tasks
             )
             plan = ForwardPlan(
-                route=RouteId(route.name),
+                route=route,
                 rows=tuple(task.row for task in tasks),
                 context=context,
                 bindings=bindings,
                 graph_key=graph_key,
-                graph_eligible=route.graph_eligible,
+                graph_eligible=self._model().route_graph_eligible(route),
                 device=device,
                 weights=weights,
                 staging_slot=staging_slot,
@@ -3501,7 +3475,7 @@ class ModelExecutor:
             self.trace.emit(
                 ExecutionPhase.PLAN_CREATION,
                 _trace_envelopes(tuple(task.operation for task in tasks)),
-                route=route.name,
+                route=str(route),
                 row_kind_counts=row_counts,
             )
             return plan
@@ -3520,7 +3494,7 @@ class ModelExecutor:
         pure_token_decode = all(
             isinstance(task.row, TokenRow) and task.query_tokens == 1 for task in tasks
         )
-        if RouteRowKind.FLOW in route.row_kinds and not pure_token_decode:
+        if self._model().route_uses_packed_attention(route) and not pure_token_decode:
             return self._packed_attention_plan(tasks, scope, device, staging_slot)
         query_lens = tuple(task.query_tokens for task in tasks)
         if any(task.entry is None for task in tasks):
@@ -3724,23 +3698,41 @@ class ModelExecutor:
             raise RuntimeError("model route has no immutable weight authority")
         return self.weights
 
-    def _route(self, stage: OperationStageSpec) -> RouteSpec:
-        try:
-            return self._routes[stage.route]
-        except KeyError:
-            raise invalid_descriptor(
-                f"operation stage references unknown route {stage.route!r}"
-            ) from None
+    def _model(self) -> ExecutionModel:
+        if self.model is None:
+            raise capability_mismatch("system-only executor received a neural operation")
+        return self.model
 
-    def _stages(self, variant: WorkVariant) -> tuple[OperationStageSpec, ...]:
-        stages = self._operation_stages.get(variant)
-        if stages is None:
-            if self.spec is None:
-                return ()
-            raise invalid_descriptor(f"model does not declare operation {variant.value!r}")
+    def _generation(self) -> GenerationPipeline:
+        value = self._model().generation
+        if not isinstance(value, GenerationPipeline):
+            raise invalid_descriptor("operation requires model generation behavior")
+        return value
+
+    def _image_processor(self) -> ImageProcessor:
+        value = self._model().image_processor
+        if not isinstance(value, ImageProcessor):
+            raise invalid_descriptor("operation requires model image processing")
+        return value
+
+    @staticmethod
+    def _route(stage: LoweredStage) -> RouteId:
+        return stage.route
+
+    def _stages(
+        self,
+        variant: WorkVariant,
+        *,
+        retain_image: bool = False,
+    ) -> tuple[LoweredStage, ...]:
+        if self.model is None:
+            return ()
+        stages = self.model.lower(variant, retain_image=retain_image)
+        if not stages and variant not in self.model.supported_work:
+            raise invalid_descriptor(f"model does not implement operation {variant.value!r}")
         return stages
 
-    def _operation_stages_for(self, operation: Operation) -> tuple[OperationStageSpec, ...]:
+    def _operation_stages_for(self, operation: Operation) -> tuple[LoweredStage, ...]:
         """The model stages one registered operation lowers to.
 
         Materialization is polymorphic on its input: a latent input drives the
@@ -3754,30 +3746,20 @@ class ModelExecutor:
             return ()
         return self._stages(operation.work.variant)
 
-    def _primary_stage(self, variant: WorkVariant) -> OperationStageSpec:
-        stage = self._primary_stages.get(variant)
-        if stage is None:
-            raise invalid_descriptor(
-                f"operation {variant.value!r} requires exactly one primary neural stage"
-            )
-        return stage
+    def _primary_stage(self, variant: WorkVariant) -> LoweredStage:
+        return self._model().primary_stage(variant)
 
     def _state_stages(
         self,
         variant: WorkVariant,
         *,
         retain_image: bool,
-    ) -> tuple[OperationStageSpec, ...]:
-        return tuple(
-            stage
-            for stage in self._stages(variant)
-            if stage.purpose is OperationStagePurpose.STATE
-            and (stage.condition is OperationStageCondition.ALWAYS or retain_image)
-        )
+    ) -> tuple[LoweredStage, ...]:
+        return self._model().state_stages(variant, retain_image=retain_image)
 
-    def _route_device(self, route: RouteSpec) -> str:
-        deployment = cast(DeploymentOverlay, self.deployment)
-        if route.placement is RoutePlacement.GENERATION:
+    def _route_device(self, route: RouteId) -> str:
+        deployment = cast(WorkerDeployment, self.deployment)
+        if self._model().route_device_role(route) is DeviceRole.GENERATION:
             return deployment.generation_device or deployment.device
         return deployment.device
 
@@ -3786,21 +3768,12 @@ class ModelExecutor:
             raise RuntimeError("model route has no attention selection")
         return self.attention
 
-    def _topology_key(self, route: RouteSpec) -> str:
-        deployment = cast(DeploymentOverlay, self.deployment)
-        return f"{','.join(route.topology_axes)}:{deployment.tp_rank}/{deployment.tp_size}"
+    def _topology_key(self, route: RouteId) -> str:
+        deployment = cast(WorkerDeployment, self.deployment)
+        return f"{','.join(self._model().route_topology(route))}:{deployment.tp_rank}/{deployment.tp_size}"
 
-    def _hard_shape_key(self, route: RouteSpec, row: ForwardRow) -> tuple[int, ...]:
-        if route.shape.grouping is RouteShapeGrouping.FLEXIBLE:
-            return ()
-        if route.shape.grouping is RouteShapeGrouping.IMAGE_GEOMETRY:
-            if isinstance(row, (FlowRow, DecodeRow)):
-                return row.image_height, row.image_width
-            if isinstance(row, EncodeRow):
-                pixels = row.inputs.pixels
-                return tuple(int(value) for value in pixels.shape[-2:])
-            return (_token_input_length(row),)
-        return _row_tensor_shape(row)
+    def _hard_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
+        return self._model().route_shape_key(route, row)
 
     def _release_locators(self, locators: Iterable[Locator]) -> None:
         if self.transport is None:
@@ -4031,7 +4004,7 @@ class ModelExecutor:
                 retain_image=True,
             )
         if closes_feedback:
-            flow = cast(ModelSpec, self.spec).flow
+            flow = self.model.generation if self.model is not None else None
             session.logical_position = position + max(
                 1,
                 1 if flow is None else int(flow.rope_advance),
@@ -4226,7 +4199,7 @@ class ModelExecutor:
         weights: WeightSet | None = None,
     ) -> _ForwardTask:
         stage = self._primary_stage(operation.work.variant)
-        if stage.row is not RouteRowKind.TOKEN:
+        if stage.row is not RowKind.TOKEN:
             raise invalid_descriptor("sequence operation primary stage is not a token row")
         if len(token_ids) != len(positions) or not token_ids:
             raise invalid_descriptor("token task ids and positions must align")
@@ -4705,9 +4678,7 @@ class ModelExecutor:
     ) -> _Driver:
         if False:  # pragma: no cover - keeps the driver protocol uniform
             yield ()
-        spec = cast(ModelSpec, self.spec)
-        if spec.flow is None:
-            raise invalid_descriptor("generation transition requires a declared FlowSpec")
+        self._generation()
         session_id = operation.request_key.session_id
         conditioning = tuple(
             reference for reference in operation.inputs if reference.kind is ProductKind.KV
@@ -4779,10 +4750,7 @@ class ModelExecutor:
         operation: Operation,
         scope: _ExecutionScope,
     ) -> _Driver:
-        spec = cast(ModelSpec, self.spec)
-        flow = spec.flow
-        if flow is None:
-            raise invalid_descriptor("flow operation requires a declared FlowSpec")
+        flow = self._generation()
         session_id = operation.request_key.session_id
         conditioning = tuple(
             reference for reference in operation.inputs if reference.kind is ProductKind.KV
@@ -4844,14 +4812,7 @@ class ModelExecutor:
         # owner instead of rebuilding them for every denoise step.
         scope.kv.rebind_scratch_owner(latent_input, latent_output)
 
-        schedule = FlowMatchSchedule(
-            num_steps=int(image.steps),
-            shift=float(
-                image.timestep_shift if image.timestep_shift > 0 else flow.timestep_shift or 1.0
-            ),
-            direction=ScheduleDirection(flow.schedule_direction),
-            shift_domain=ScheduleShiftDomain(flow.schedule_shift_domain),
-        )
+        schedule = flow.schedule(int(image.steps), float(image.timestep_shift))
         current = latent_read.tensor
         for step in range(start_step, start_step + step_count):
             t, t_next = schedule.pair(
@@ -4864,7 +4825,7 @@ class ModelExecutor:
             guide = build_flow_cfg_plan(
                 cfg_text_scale=float(image.cfg_text_scale),
                 cfg_img_scale=float(image.cfg_img_scale),
-                recipe=CfgRecipe.coerce(flow.cfg_recipe),
+                recipe=flow.cfg_recipe,
                 renorm=image.cfg_renorm_type,
                 renorm_min=float(image.cfg_renorm_min),
                 use_cfg=use_cfg,
@@ -4981,95 +4942,39 @@ class ModelExecutor:
         width: int,
         session: RequestSession,
     ) -> torch.Tensor:
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
+        flow = self._generation()
         route = self._route(self._primary_stage(operation.work.variant))
         device = torch.device(self._route_device(route))
-        dtype = _torch_dtype(route.dtype)
+        dtype = _torch_dtype(self._model().route_dtype(route))
         rng = operation.rng
         assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
         seed = flow_noise_seed(int(rng.seed), int(rng.semantic_index_base))
-        scale = self._noise_scale(height, width)
-        shape: tuple[int, ...]
-        if flow.latent_layout is LatentLayout.PATCH_TOKENS:
-            token_height = height // int(flow.latent_downsample)
-            token_width = width // int(flow.latent_downsample)
-            feature_width = int(flow.latent_patch_size) ** 2 * int(flow.latent_channels)
-            shape = (token_height * token_width, feature_width)
-        else:
-            shape = (1, int(flow.latent_channels), int(height), int(width))
-        return normal_noise(shape, seed=seed, device=device, dtype=dtype) * float(scale)
+        return normal_noise(
+            flow.latent_shape(height, width),
+            seed=seed,
+            device=device,
+            dtype=dtype,
+        ) * flow.noise_scale(height, width)
 
     def _noise_scale(self, height: int, width: int) -> float:
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
-        declared = flow.noise_scale
-        image_tokens = (height // int(flow.latent_downsample)) * (
-            width // int(flow.latent_downsample)
-        )
-        value = float(declared.value)
-        if declared.mode in {
-            NoiseScaleMode.RESOLUTION,
-            NoiseScaleMode.DYNAMIC,
-            NoiseScaleMode.DYNAMIC_SQRT,
-        }:
-            value *= math.sqrt(float(image_tokens) / float(declared.base_image_tokens))
-        if declared.mode is NoiseScaleMode.DYNAMIC_SQRT:
-            value = math.sqrt(value)
-        return min(value, float(declared.maximum))
+        return self._generation().noise_scale(height, width)
 
-    def _branch_source(self, branch: Branch) -> FlowBranchSource:
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
-        if branch is Branch.COND:
-            return FlowBranchSource.CONDITIONING
-        if branch is Branch.TEXT_UNCOND:
-            return flow.text_unconditional
-        return flow.image_unconditional
+    def _branch_source(self, branch: Branch) -> BranchSource:
+        return self._generation().branch_source(branch)
 
     def _flow_prefix(
         self,
-        source: FlowBranchSource,
+        source: BranchSource,
         image_prompt: str,
         session: RequestSession,
     ) -> tuple[tuple[int, ...], bool]:
-        if source is FlowBranchSource.CONDITIONING and not image_prompt.strip():
-            return (), True
-        if source is FlowBranchSource.NEGATIVE_OR_START and session.negative_token_ids:
-            return session.negative_token_ids, False
-        prompt = cast(ModelSpec, self.spec).inputs.flow_prompt
-        if prompt is None:
-            if source is FlowBranchSource.CONDITIONING:
-                raise invalid_descriptor(
-                    "flow image-prompt override requires declared prompt framing"
-                )
-            return (), False
-        if self.tokenizer is None:
-            raise capability_mismatch("declared flow prompt framing requires a tokenizer")
-        if source is FlowBranchSource.CONDITIONING:
-            text = image_prompt.strip()
-            append = prompt.conditioned_append
-        elif source is FlowBranchSource.NEGATIVE_OR_START:
-            text = _require_image(session).negative_prompt.strip()
-            append = prompt.unconditional_append
-        else:
-            text = ""
-            append = prompt.unconditional_append
-        framed = (
-            prompt.system_prefix
-            + prompt.system_message
-            + prompt.system_suffix
-            + prompt.user_prefix
-            + text
-            + prompt.user_suffix
-            + prompt.assistant_suffix
-            + append
+        return self._generation().prefix(
+            source,
+            image_prompt=image_prompt,
+            negative_prompt=_require_image(session).negative_prompt,
+            negative_token_ids=session.negative_token_ids,
+            tokenizer=self.tokenizer,
         )
-        encoded = self.tokenizer.encode(
-            framed,
-            add_special_tokens=prompt.add_special_tokens,
-        )
-        return tuple(int(value) for value in encoded), False
 
     def _flow_prefix_task(
         self,
@@ -5082,9 +4987,7 @@ class ModelExecutor:
         session = self.sessions.get(operation.request_key.session_id)
         primary = self._primary_stage(operation.work.variant)
         route = self._route(primary)
-        if RouteRowKind.TOKEN not in route.row_kinds:
-            raise invalid_descriptor("flow prefix route does not accept token rows")
-        stage = OperationStageSpec(route.name, RouteRowKind.TOKEN)
+        stage = LoweredStage(route, RowKind.TOKEN)
         row_id = scope.row_id()
         positions = torch.arange(entry.length, entry.length + len(tokens), dtype=torch.long)
         row = TokenRow(
@@ -5123,10 +5026,9 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> _ForwardTask:
         session = self.sessions.get(operation.request_key.session_id)
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
+        flow = self._generation()
         stage = self._primary_stage(operation.work.variant)
-        if stage.row is not RouteRowKind.FLOW:
+        if stage.row is not RowKind.FLOW:
             raise invalid_descriptor("flow operation primary stage is not a flow row")
         row_id = scope.row_id()
         neural_latent = self._flow_neural_latent(latent, height, width)
@@ -5199,19 +5101,10 @@ class ModelExecutor:
 
     def _flow_query_tokens(self, latent: torch.Tensor, height: int, width: int) -> int:
         del latent
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
-        return (height // int(flow.latent_downsample)) * (width // int(flow.latent_downsample))
+        return self._generation().image_tokens(height, width)
 
     def _flow_physical_tokens(self, height: int, width: int) -> int:
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
-        image_tokens = (height // int(flow.latent_downsample)) * (
-            width // int(flow.latent_downsample)
-        )
-        if flow.latent_layout is LatentLayout.PATCH_TOKENS:
-            return image_tokens + int(flow.commit_marker_tokens)
-        return image_tokens
+        return self._generation().physical_tokens(height, width)
 
     def _flow_neural_latent(
         self,
@@ -5219,11 +5112,7 @@ class ModelExecutor:
         height: int,
         width: int,
     ) -> torch.Tensor:
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
-        if flow.latent_layout is LatentLayout.PATCH_TOKENS:
-            return latent
-        return patchify_batch(latent, int(flow.latent_patch_size))
+        return self._generation().neural_latent(latent)
 
     def _flow_store_latent(
         self,
@@ -5231,17 +5120,7 @@ class ModelExecutor:
         height: int,
         width: int,
     ) -> torch.Tensor:
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
-        if flow.latent_layout is LatentLayout.PATCH_TOKENS:
-            return latent
-        return unpatchify_batch(
-            latent,
-            int(flow.latent_patch_size),
-            height=height,
-            width=width,
-            channels=int(flow.latent_channels),
-        )
+        return self._generation().stored_latent(latent, height, width)
 
     def _flow_conditioning(
         self,
@@ -5249,30 +5128,19 @@ class ModelExecutor:
         height: int,
         width: int,
     ) -> FlowPatches:
-        flow = cast(ModelSpec, self.spec).flow
-        assert flow is not None
-        if flow.conditioning is not FlowConditioningKind.IMAGE_PATCHES:
-            raise invalid_descriptor(
-                "image latent layout requires declared image-patch conditioning"
-            )
-        images = cast(ModelSpec, self.spec).inputs.images
-        transform = None if images is None else images.vit
-        if not isinstance(transform, ImagePatchSpec):
-            raise invalid_descriptor("flow image patches require a declared patch transform")
-        patch = int(transform.patch_size)
-        pixels = patchify_batch(latent, patch, channel_first=True).reshape(
-            -1,
-            patch * patch * int(latent.shape[1]),
-        )
-        grid = torch.tensor(
-            [[height // patch, width // patch]],
-            dtype=torch.long,
-            device=latent.device,
-        )
-        return FlowPatches(
-            pixels=pixels,
-            grid=grid,
-            noise_scale=latent.new_tensor([self._noise_scale(height, width)]),
+        transform = self._image_processor().vit
+        return cast(
+            FlowPatches,
+            self._generation().conditioning(
+                latent,
+                height,
+                width,
+                patch_size=(
+                    int(transform.patch_size)
+                    if isinstance(transform, PatchTransform)
+                    else None
+                ),
+            ),
         )
 
     @staticmethod
@@ -5350,10 +5218,7 @@ class ModelExecutor:
         operation: Operation,
         scope: _ExecutionScope,
     ) -> _Driver:
-        spec = cast(ModelSpec, self.spec)
-        image_spec = spec.inputs.images
-        if image_spec is None:
-            raise invalid_descriptor("encode operation requires declared image transforms")
+        image_spec = self._image_processor()
         selected_type = operation.work.variant
         mode = EncodeMode(cast(str, operation.work.mode))
         session_id = operation.request_key.session_id
@@ -5372,7 +5237,7 @@ class ModelExecutor:
         payload: VisionFeatureProduct | LatentFeatureProduct
         source = self._encode_source(operation, scope)
         stage = self._primary_stage(selected_type)
-        if stage.row is not RouteRowKind.ENCODE:
+        if stage.row is not RowKind.ENCODE:
             raise invalid_descriptor("encode primary stage is not an encode row")
         target_device = torch.device(self._route_device(self._route(stage)))
         if isinstance(source, ImageTensorProduct):
@@ -5482,10 +5347,7 @@ class ModelExecutor:
             device=self._operation_device(operation),
         )
         scope.device_reads.append(latent_read)
-        spec = cast(ModelSpec, self.spec)
-        flow = spec.flow
-        if flow is None:
-            raise invalid_descriptor("image materialization requires a declared FlowSpec")
+        flow = self._generation()
         latent_record = scope.latents.read(latent_input)
         if latent_record is None or latent_record.reference.request_key.session_id != session_id:
             raise invalid_descriptor("materialization latent is not resident for this session")
@@ -5495,9 +5357,9 @@ class ModelExecutor:
         if latent_record.step != image_params.steps:
             raise invalid_descriptor("image materialization requires a completed latent trajectory")
 
-        if flow.materialization is MaterializationKind.DECODE_ROUTE:
+        if flow.materialization is Materialization.DECODE_ROUTE:
             stage = self._primary_stage(operation.work.variant)
-            if stage.row is not RouteRowKind.DECODE:
+            if stage.row is not RowKind.DECODE:
                 raise invalid_descriptor("decode materialization requires a decode primary stage")
             row_id = scope.row_id()
             task = _ForwardTask(
@@ -5517,9 +5379,9 @@ class ModelExecutor:
             outputs = yield (task,)
             image_tensor = _decoded_tensor(outputs[0]).detach()
             image_range = ImageRange.UNIT
-        elif flow.materialization is MaterializationKind.RGB_LATENT:
+        elif flow.materialization is Materialization.RGB_LATENT:
             if any(
-                stage.purpose is OperationStagePurpose.PRIMARY
+                not stage.publishes_state
                 for stage in self._operation_stages_for(operation)
             ):
                 raise invalid_descriptor(
@@ -5698,7 +5560,7 @@ class ModelExecutor:
         operation: Operation,
         mode: EncodeMode,
         prepared: PreparedImage,
-        stage: OperationStageSpec,
+        stage: LoweredStage,
         scope: _ExecutionScope,
     ) -> _ForwardTask:
         session = self.sessions.get(operation.request_key.session_id)
@@ -5741,12 +5603,10 @@ class ModelExecutor:
         products: tuple[ProductPayload, ...] = ()
         state_query_tokens = 0
         for stage in self._state_stages(variant, retain_image=retain_image):
-            if stage.row is RouteRowKind.ENCODE:
+            if stage.row is RowKind.ENCODE:
                 if image is None:
                     raise invalid_descriptor("image state encode stage has no image tensor")
-                images = cast(ModelSpec, self.spec).inputs.images
-                if images is None:
-                    raise invalid_descriptor("image state encode stage has no declared transform")
+                images = self._image_processor()
                 prepared = prepare_tensor_image(
                     images,
                     EncodeMode.VISION,
@@ -5758,7 +5618,7 @@ class ModelExecutor:
                 outputs = yield (task,)
                 features = _encode_features(outputs[0]).detach()
                 continue
-            if stage.row is RouteRowKind.TOKEN:
+            if stage.row is RowKind.TOKEN:
                 if features is None:
                     raise invalid_descriptor("token state stage has no vision features")
                 task = self._vision_state_task(
@@ -5786,7 +5646,7 @@ class ModelExecutor:
                     ):
                         raise invalid_descriptor("image state token stage did not return logits")
                     session = self.sessions.get(operation.request_key.session_id)
-                    flow_spec = cast(ModelSpec, self.spec).flow
+                    flow_spec = self.model.generation if self.model is not None else None
                     sample_task = self._sample_task(
                         operation,
                         value[-1],
@@ -5806,7 +5666,7 @@ class ModelExecutor:
                     committed_tokens = (sampled.token_id,)
                     products = _sample_product_payloads(operation, sampled)
                 continue
-            if stage.row is RouteRowKind.FLOW:
+            if stage.row is RowKind.FLOW:
                 if latent is None:
                     raise invalid_descriptor("flow state stage has no latent tensor")
                 task = self._latent_state_task(
@@ -5833,7 +5693,7 @@ class ModelExecutor:
     def _vision_state_task(
         self,
         operation: Operation,
-        stage: OperationStageSpec,
+        stage: LoweredStage,
         features: torch.Tensor,
         height: int,
         width: int,
@@ -5844,8 +5704,7 @@ class ModelExecutor:
         logits: bool,
     ) -> _ForwardTask:
         session = self.sessions.get(operation.request_key.session_id)
-        images = cast(ModelSpec, self.spec).inputs.images
-        injection = None if images is None else images.feature_injection
+        injection = self._image_processor().feature_injection
         if injection is None:
             raise invalid_descriptor("vision state stage requires declared feature injection")
         embeddings = (
@@ -5931,9 +5790,8 @@ class ModelExecutor:
         query = int(leading) + feature_tokens + int(trailing)
         if layout is PositionLayout.TEMPORAL:
             return torch.full((query,), int(conditioning_position), dtype=torch.long)
-        images = cast(ModelSpec, self.spec).inputs.images
-        transform = None if images is None else images.vit
-        if not isinstance(transform, ImagePatchSpec):
+        transform = self._image_processor().vit
+        if not isinstance(transform, PatchTransform):
             raise invalid_descriptor(
                 "temporal-spatial feature injection requires a patch image transform"
             )
@@ -5964,7 +5822,7 @@ class ModelExecutor:
     def _latent_state_task(
         self,
         operation: Operation,
-        stage: OperationStageSpec,
+        stage: LoweredStage,
         latent: torch.Tensor,
         height: int,
         width: int,
@@ -5972,8 +5830,8 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> _ForwardTask:
         session = self.sessions.get(operation.request_key.session_id)
-        flow = cast(ModelSpec, self.spec).flow
-        if flow is None or flow.latent_layout is not LatentLayout.PATCH_TOKENS:
+        flow = self._generation()
+        if flow.latent_layout is not LatentLayout.PATCH_TOKENS:
             raise invalid_descriptor("flow state publication requires patch-token latents")
         image_tokens = (height // int(flow.latent_downsample)) * (
             width // int(flow.latent_downsample)
@@ -6238,7 +6096,7 @@ def _cumulative(
 def _binding_identity(tasks: Sequence[_ForwardTask]) -> int:
     digest = hashlib.sha256(b"uniserve-forward-binding\0")
     for task in tasks:
-        digest.update(task.route.name.encode("utf-8"))
+        digest.update(str(task.route).encode("utf-8"))
         digest.update(task.row_kind.value.encode("ascii"))
         digest.update(task.query_tokens.to_bytes(8, "little"))
     return int.from_bytes(digest.digest()[:8], "little")

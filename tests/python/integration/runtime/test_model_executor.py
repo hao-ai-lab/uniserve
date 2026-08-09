@@ -11,7 +11,6 @@ from dataclasses import replace
 import pytest
 import torch
 from PIL import Image
-from torch import nn
 
 from tests.python.fixtures.depth_one import (
     commit_resolved,
@@ -58,32 +57,20 @@ from uniserve_worker.forward import (
 )
 from uniserve_worker.foundation.errors import ErrorCode as HostErrorCode
 from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.models.inputs import FeatureInjection, FeatureLayout
+from uniserve_worker.models.runtime import LoweredStage, PositionLayout, RowKind
 from uniserve_worker.runtime.completion_store import CompletionArena
 from uniserve_worker.runtime.transfer import TRANSFER_DESCRIPTOR_PREFIX
-from uniserve_worker.server.stub import _next_token
-from uniserve_worker.spec import (
-    FeatureInjectionSpec,
-    FeatureLayout,
-    OperationSpec,
-    OperationStageCondition,
-    OperationStagePurpose,
-    OperationStageSpec,
-    PositionLayout,
-    RouteRowKind,
-)
+from uniserve_worker.server.stub import StubModel, _next_token
 
 pytestmark = pytest.mark.integration
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-class _ObservedModel(nn.Module):
+class _ObservedModel(StubModel):
     def __init__(self) -> None:
         super().__init__()
-        from uniserve_worker.server.stub import StubModel
-
-        self.neural = StubModel()
-        self.spec = self.neural.spec
         self.calls: list[tuple[str, tuple[str, ...]]] = []
         self.flow_inputs: list[torch.Tensor] = []
         self.token_positions: list[tuple[int, ...]] = []
@@ -101,7 +88,7 @@ class _ObservedModel(nn.Module):
             for row in batch.rows
             if isinstance(row, TokenRow)
         )
-        output = self.neural(batch)
+        output = super().forward(batch)
         if self.fault == "raise":
             raise RuntimeError("injected neural failure")
         if self.fault == "misaligned":
@@ -112,63 +99,37 @@ class _ObservedModel(nn.Module):
 class _RetainedImageStateModel(_ObservedModel):
     def __init__(self) -> None:
         super().__init__()
-        images = self.spec.inputs.images
-        assert images is not None
-        inputs = replace(
-            self.spec.inputs,
-            images=replace(
-                images,
-                feature_injection=FeatureInjectionSpec(
-                    layout=FeatureLayout.DIRECT,
-                    positions=PositionLayout.TEMPORAL_SPATIAL,
-                    end_token_id=1007,
-                ),
+        assert self.image_processor is not None
+        self.image_processor = replace(
+            self.image_processor,
+            feature_injection=FeatureInjection(
+                layout=FeatureLayout.DIRECT,
+                positions=PositionLayout.TEMPORAL_SPATIAL,
+                end_token_id=1007,
             ),
         )
-        operations = tuple(
-            OperationSpec(
-                WorkVariant.ENCODE_VISION,
-                (
-                    OperationStageSpec(
-                        "encode",
-                        RouteRowKind.ENCODE,
-                        OperationStagePurpose.PRIMARY,
-                    ),
-                    OperationStageSpec(
-                        "stub",
-                        RouteRowKind.TOKEN,
-                        OperationStagePurpose.STATE,
-                        OperationStageCondition.RETAIN_IMAGE,
-                    ),
-                ),
-            )
-            if operation.kind is WorkVariant.ENCODE_VISION
-            else operation
-            for operation in self.spec.operations
-        )
-        self.spec = replace(self.spec, operations=operations, inputs=inputs)
+
+    def lower(
+        self,
+        variant: WorkVariant,
+        *,
+        retain_image: bool = False,
+    ) -> tuple[LoweredStage, ...]:
+        stages = super().lower(variant, retain_image=retain_image)
+        if variant is WorkVariant.ENCODE_VISION and retain_image:
+            return (*stages, LoweredStage("stub", RowKind.TOKEN, publishes_state=True))
+        return stages
 
 
 class _SupersetMixedModel(_ObservedModel):
-    """Declares its token/flow route mixing a strict superset of the admitted
-    row kinds, so a plain token+flow submission is a subset that is not itself a
-    declared combination."""
+    """Accepts a three-row-kind mix while rejecting its two-kind subsets."""
 
     def __init__(self) -> None:
         super().__init__()
-        routes = tuple(
-            replace(
-                route,
-                row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW, RouteRowKind.ENCODE),
-                mixed_combinations=(
-                    (RouteRowKind.TOKEN, RouteRowKind.FLOW, RouteRowKind.ENCODE),
-                ),
-            )
-            if route.name == "stub"
-            else route
-            for route in self.spec.routes
-        )
-        self.spec = replace(self.spec, routes=routes)
+
+    def allows_mixed(self, route, rows: frozenset[RowKind]) -> bool:
+        self._require_route(route)
+        return route == "stub" and rows == {RowKind.TOKEN, RowKind.FLOW, RowKind.ENCODE}
 
 
 def _publish_conditioning(worker: object, admission: Admission, *, op_id: int, step_id: int):
@@ -392,7 +353,7 @@ def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
     assert len(split_model.calls) == 2
 
 
-def test_undeclared_tensorized_mixed_combination_is_rejected():
+def test_unsupported_tensorized_mixed_combination_is_rejected():
     worker = execution_worker(_SupersetMixedModel())
     token_admission = und_admission(1, block_ids=(0,))
     flow_admission = gen_admission(2, ImageParams(steps=1, height=16, width=16, seed=29))

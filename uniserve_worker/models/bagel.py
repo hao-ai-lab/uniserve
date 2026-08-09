@@ -20,8 +20,10 @@ from ..forward import (
     ForwardBatch,
     ForwardContext,
     ForwardOutput,
+    ForwardRow,
     NoFlowConditioning,
     PagedDecodePlan,
+    RouteId,
     TokenEmbeddings,
     TokenHidden,
     TokenIds,
@@ -32,6 +34,13 @@ from ..forward import (
     TokenSelection,
     TowerInput,
     packed_token_positions,
+)
+from ..loader.schema import (
+    Rename,
+    Sidecar,
+    Stack,
+    UnmatchedWeightPolicy,
+    WeightSpec,
 )
 from ..nn import (
     LayerSpec,
@@ -56,36 +65,28 @@ from ..nn.vision import (
     get_flattened_position_ids_extrapolate,
     patchify_batch,
 )
-from ..spec import (
-    CacheSpec,
-    FeatureInjectionSpec,
-    FeatureLayout,
-    FlowBranchSource,
-    FlowConditioningKind,
-    FlowSpec,
-    ImageInputSpec,
-    ImageTowerSpec,
-    InputSpec,
+from .generation import (
+    BranchSource,
+    GenerationPipeline,
     LatentLayout,
-    MaterializationKind,
-    ModelSpec,
-    NoiseScaleSpec,
-    OperationSpec,
-    OperationStageCondition,
-    OperationStagePurpose,
-    OperationStageSpec,
+    Materialization,
+)
+from .inputs import (
+    FeatureInjection,
+    FeatureLayout,
+    ImageProcessor,
+    StrideResize,
+    TowerTransform,
+)
+from .runtime import (
+    CacheGeometry,
+    DeviceRole,
+    ExecutionModel,
+    LoweredStage,
     PositionLayout,
-    Rename,
-    RoutePlacement,
-    RouteRowKind,
-    RouteShape,
-    RouteShapeGrouping,
-    RouteSpec,
-    Sidecar,
-    Stack,
-    StrideResizeSpec,
-    UnmatchedWeightPolicy,
-    WeightSpec,
+    ResourceGeometry,
+    RowKind,
+    ScratchGeometry,
 )
 
 __all__ = [
@@ -173,7 +174,7 @@ class BagelConfig:
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "BagelConfig":
-        """Construct the immutable declaration from loader-resolved config data."""
+        """Construct model configuration from loader-resolved checkpoint data."""
 
         llm_raw = raw["llm_config"]
         llm = LLMConfig(
@@ -455,7 +456,7 @@ _BAGEL_STACKED = (
 )
 
 
-class BagelForConditionalGeneration(nn.Module):
+class BagelForConditionalGeneration(ExecutionModel):
     """Stateless BAGEL neural graph for the declared MoT, ViT, and VAE routes."""
 
     weight_spec = WeightSpec(
@@ -478,16 +479,14 @@ class BagelForConditionalGeneration(nn.Module):
         self.cfg = config
         self._parallel = layer_spec.parallel
         self.model = graph if graph is not None else _BagelGraph(config, layer_spec=layer_spec)
-        self.spec = self._build_spec()
-
-    def _build_spec(self) -> ModelSpec:
         llm = self.cfg.llm
-        flow = FlowSpec(
+        self.architecture = "BagelForConditionalGeneration"
+        self.generation = GenerationPipeline(
             latent_downsample=int(self.cfg.latent_downsample),
             prediction="velocity",
             prediction_dtype="bfloat16",
-            schedule_direction=ScheduleDirection.DESCENDING.value,
-            schedule_shift_domain=ScheduleShiftDomain.TIME.value,
+            schedule_direction=ScheduleDirection.DESCENDING,
+            schedule_shift_domain=ScheduleShiftDomain.TIME,
             max_latent_tokens=int(self.cfg.latent_token_capacity),
             max_vae_grid_tokens=(int(self.cfg.latent_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS),
             commit_marker_tokens=_BAGEL_IMAGE_MARKER_TOKENS,
@@ -497,166 +496,160 @@ class BagelForConditionalGeneration(nn.Module):
             latent_channels=int(self.cfg.latent_channel),
             latent_patch_size=int(self.cfg.latent_patch_size),
             positions=PositionLayout.TEMPORAL,
-            conditioning=FlowConditioningKind.NONE,
-            materialization=MaterializationKind.DECODE_ROUTE,
-            noise_scale=NoiseScaleSpec(),
-            text_unconditional=FlowBranchSource.NEGATIVE_OR_START,
-            image_unconditional=FlowBranchSource.CONDITIONING,
-            cfg_recipe=CfgRecipe.IMAGE_OVER_TEXT.value,
+            materialization=Materialization.DECODE_ROUTE,
+            text_unconditional=BranchSource.NEGATIVE_OR_START,
+            image_unconditional=BranchSource.CONDITIONING,
+            cfg_recipe=CfgRecipe.IMAGE_OVER_TEXT,
             timestep_shift=float(self.cfg.timestep_shift),
         )
-        return ModelSpec(
-            architecture="BagelForConditionalGeneration",
-            routes=(
-                # Token and flow rows share the MoT backbone in one forward.
-                RouteSpec(
-                    name="mot",
-                    row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW),
-                    mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.PRIMARY,
-                    # The MoT backbone stages every sublayer on the tower axis.
-                    topology_axes=("tp", "tower"),
-                    shape=RouteShape(
-                        max_tokens_per_row=max(
-                            int(llm.max_position_embeddings),
-                            int(self.cfg.latent_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS,
-                        ),
-                        token_multiple=1,
-                    ),
-                    graph_eligible=True,
-                ),
-                RouteSpec(
-                    name="vae",
-                    row_kinds=(RouteRowKind.ENCODE, RouteRowKind.DECODE),
-                    mixed_combinations=(),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.GENERATION,
-                    topology_axes=("tp",),
-                    shape=RouteShape(
-                        max_tokens_per_row=int(self.cfg.latent_token_capacity),
-                        token_multiple=1,
-                        grouping=RouteShapeGrouping.IMAGE_GEOMETRY,
-                    ),
-                    graph_eligible=False,
-                ),
-                RouteSpec(
-                    name="vit",
-                    row_kinds=(RouteRowKind.ENCODE,),
-                    mixed_combinations=(),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.PRIMARY,
-                    topology_axes=("tp",),
-                    shape=RouteShape(
-                        max_tokens_per_row=int(self.cfg.vit_token_capacity),
-                        token_multiple=1,
-                        grouping=RouteShapeGrouping.INPUT_SHAPE,
-                    ),
-                    graph_eligible=False,
+        self.image_processor = ImageProcessor(
+            vit=TowerTransform(
+                resize=StrideResize(
+                    max_size=int(self.cfg.vit_image_size),
+                    min_size=_BAGEL_VIT_MIN_SIZE,
+                    stride=int(self.cfg.vit_patch_size),
+                    max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
                 ),
             ),
-            operations=(
-                OperationSpec(
-                    WorkVariant.TOKEN_EXTEND, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
-                ),
-                OperationSpec(
-                    WorkVariant.TOKEN_DECODE, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
-                ),
-                OperationSpec(
-                    WorkVariant.TOKEN_VERIFY, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
-                ),
-                OperationSpec(
-                    WorkVariant.GEN_TRANSITION, (OperationStageSpec("mot", RouteRowKind.FLOW),)
-                ),
-                OperationSpec(
-                    WorkVariant.GEN_FLOW, (OperationStageSpec("mot", RouteRowKind.FLOW),)
-                ),
-                OperationSpec(
-                    WorkVariant.ENCODE_VISION,
-                    (
-                        OperationStageSpec("vit", RouteRowKind.ENCODE),
-                        OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
-                    ),
-                ),
-                OperationSpec(
-                    WorkVariant.ENCODE_LATENT,
-                    (
-                        OperationStageSpec("vae", RouteRowKind.ENCODE),
-                        OperationStageSpec("mot", RouteRowKind.FLOW, OperationStagePurpose.STATE),
-                    ),
-                ),
-                OperationSpec(
-                    WorkVariant.MATERIALIZE,
-                    (
-                        OperationStageSpec("vae", RouteRowKind.DECODE),
-                        OperationStageSpec(
-                            "mot",
-                            RouteRowKind.FLOW,
-                            OperationStagePurpose.STATE,
-                            OperationStageCondition.RETAIN_IMAGE,
-                        ),
-                    ),
-                ),
-                OperationSpec(WorkVariant.TRANSFER_PRODUCT),
-                OperationSpec(
-                    WorkVariant.TRANSFER_KV_PUBLISH,
-                    (OperationStageSpec("mot", RouteRowKind.FLOW),),
-                ),
-                OperationSpec(
-                    WorkVariant.TRANSFER_KV_INSTALL,
-                    (OperationStageSpec("mot", RouteRowKind.FLOW),),
+            vae=TowerTransform(
+                resize=StrideResize(
+                    max_size=_BAGEL_VAE_MAX_SIZE,
+                    min_size=_BAGEL_VAE_MIN_SIZE,
+                    stride=_BAGEL_VAE_STRIDE,
+                    max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
                 ),
             ),
-            weights=self.weight_spec,
-            # The host tokenizes for BAGEL; the worker holds no tokenizer.
-            inputs=InputSpec(
-                requires_worker_tokenizer=False,
-                images=ImageInputSpec(
-                    vit=ImageTowerSpec(
-                        resize=StrideResizeSpec(
-                            max_size=int(self.cfg.vit_image_size),
-                            min_size=_BAGEL_VIT_MIN_SIZE,
-                            stride=int(self.cfg.vit_patch_size),
-                            max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
-                        ),
-                        normalization="signed_unit",
-                    ),
-                    vae=ImageTowerSpec(
-                        resize=StrideResizeSpec(
-                            max_size=_BAGEL_VAE_MAX_SIZE,
-                            min_size=_BAGEL_VAE_MIN_SIZE,
-                            stride=_BAGEL_VAE_STRIDE,
-                            max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
-                        ),
-                        normalization="signed_unit",
-                    ),
-                    feature_injection=FeatureInjectionSpec(
-                        layout=FeatureLayout.FRAMED,
-                        positions=PositionLayout.TEMPORAL,
-                        start_token_id=int(self.cfg.start_of_image_id),
-                        end_token_id=int(self.cfg.end_of_image_id),
-                    ),
-                ),
-                encoder_cache_budget=256,
-                max_vit_grid_tokens=(int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS),
+            feature_injection=FeatureInjection(
+                layout=FeatureLayout.FRAMED,
+                positions=PositionLayout.TEMPORAL,
+                start_token_id=int(self.cfg.start_of_image_id),
+                end_token_id=int(self.cfg.end_of_image_id),
             ),
-            cache=CacheSpec(
-                num_layers=int(llm.num_hidden_layers),
-                num_attention_heads=local_attention_head_count(
-                    int(llm.num_attention_heads),
-                    parallel=self._parallel,
-                ),
-                num_kv_heads=local_kv_head_count(
-                    int(llm.num_key_value_heads),
-                    parallel=self._parallel,
-                ),
-                head_dim=int(llm.head_dim),
-                dtype="bfloat16",
-                store_dtype="bfloat16",
-                position_layout=PositionLayout.TEMPORAL,
-            ),
-            flow=flow,
         )
+        self.cache_geometry = CacheGeometry(
+            num_layers=int(llm.num_hidden_layers),
+            num_attention_heads=local_attention_head_count(
+                int(llm.num_attention_heads), parallel=self._parallel
+            ),
+            num_kv_heads=local_kv_head_count(
+                int(llm.num_key_value_heads), parallel=self._parallel
+            ),
+            head_dim=int(llm.head_dim),
+            dtype="bfloat16",
+            store_dtype="bfloat16",
+        )
+        self.resource_geometry = ResourceGeometry(
+            encoder_cache_entries=256,
+            latent_downsample=int(self.cfg.latent_downsample),
+            scratch=ScratchGeometry(fixed_tokens=65536, mirror_kv=True),
+        )
+        self.supported_work = frozenset(
+            {
+                WorkVariant.TOKEN_EXTEND,
+                WorkVariant.TOKEN_DECODE,
+                WorkVariant.TOKEN_VERIFY,
+                WorkVariant.GEN_TRANSITION,
+                WorkVariant.GEN_FLOW,
+                WorkVariant.ENCODE_VISION,
+                WorkVariant.ENCODE_LATENT,
+                WorkVariant.MATERIALIZE,
+                WorkVariant.TRANSFER_PRODUCT,
+                WorkVariant.TRANSFER_KV_PUBLISH,
+                WorkVariant.TRANSFER_KV_INSTALL,
+            }
+        )
+        self.max_vit_grid_tokens = int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS
+        self._route_token_bounds = {
+            RouteId("mot"): max(
+                int(llm.max_position_embeddings),
+                int(self.cfg.latent_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS,
+            ),
+            RouteId("vae"): int(self.cfg.latent_token_capacity),
+            RouteId("vit"): int(self.cfg.vit_token_capacity),
+        }
+
+    def lower(
+        self,
+        variant: WorkVariant,
+        *,
+        retain_image: bool = False,
+    ) -> tuple[LoweredStage, ...]:
+        if variant in {
+            WorkVariant.TOKEN_EXTEND,
+            WorkVariant.TOKEN_DECODE,
+            WorkVariant.TOKEN_VERIFY,
+        }:
+            return (LoweredStage(RouteId("mot"), RowKind.TOKEN),)
+        if variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}:
+            return (LoweredStage(RouteId("mot"), RowKind.FLOW),)
+        if variant is WorkVariant.ENCODE_VISION:
+            return (
+                LoweredStage(RouteId("vit"), RowKind.ENCODE),
+                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
+            )
+        if variant is WorkVariant.ENCODE_LATENT:
+            return (
+                LoweredStage(RouteId("vae"), RowKind.ENCODE),
+                LoweredStage(RouteId("mot"), RowKind.FLOW, publishes_state=True),
+            )
+        if variant is WorkVariant.MATERIALIZE:
+            stages = [LoweredStage(RouteId("vae"), RowKind.DECODE)]
+            if retain_image:
+                stages.append(LoweredStage(RouteId("mot"), RowKind.FLOW, publishes_state=True))
+            return tuple(stages)
+        if variant is WorkVariant.TRANSFER_PRODUCT:
+            return ()
+        if variant in {WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL}:
+            return (LoweredStage(RouteId("mot"), RowKind.FLOW),)
+        return ()
+
+    def route_dtype(self, route: RouteId) -> str:
+        self._require_route(route)
+        return "bfloat16"
+
+    def route_device_role(self, route: RouteId) -> DeviceRole:
+        self._require_route(route)
+        return DeviceRole.GENERATION if route == "vae" else DeviceRole.PRIMARY
+
+    def route_topology(self, route: RouteId) -> tuple[str, ...]:
+        self._require_route(route)
+        return ("tp", "tower") if route == "mot" else ("tp",)
+
+    def route_graph_eligible(self, route: RouteId) -> bool:
+        self._require_route(route)
+        return route == "mot"
+
+    def route_max_tokens(self, route: RouteId) -> int:
+        try:
+            return self._route_token_bounds[route]
+        except KeyError:
+            raise ValueError(f"BAGEL received unknown route {route!s}") from None
+
+    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
+        self._require_route(route)
+        if route == "mot":
+            return ()
+        if route == "vae":
+            if isinstance(row, (FlowRow, DecodeRow)):
+                return row.image_height, row.image_width
+            if isinstance(row, EncodeRow):
+                return tuple(int(value) for value in row.inputs.pixels.shape[-2:])
+        if isinstance(row, EncodeRow):
+            return tuple(int(value) for value in row.inputs.pixels.shape)
+        raise TypeError(f"BAGEL route {route!s} received an incompatible row")
+
+    def route_uses_packed_attention(self, route: RouteId) -> bool:
+        self._require_route(route)
+        return route == "mot"
+
+    def allows_mixed(self, route: RouteId, rows: frozenset[RowKind]) -> bool:
+        self._require_route(route)
+        return route == "mot" and rows <= {RowKind.TOKEN, RowKind.FLOW}
+
+    @staticmethod
+    def _require_route(route: RouteId) -> None:
+        if route not in {"mot", "vit", "vae"}:
+            raise ValueError(f"BAGEL received unknown route {route!s}")
 
     @torch.inference_mode()
     def forward(self, batch: ForwardBatch) -> ForwardOutput:

@@ -5,8 +5,7 @@ embeds tokens, runs the decoder stack (single-axis RoPE via
 ``RotaryEmbedding.cos_sin_1d``, full ``head_dim`` QK-norm, the fused
 QK-norm+RoPE kernel), and calls :class:`RadixAttention` per layer. It owns **no**
 KV pool, builds **no** attention metadata, captures **no** CUDA graphs, and never
-advances KV length. The executor, runner, and stores own those behaviors, while
-the immutable model spec declares KV geometry.
+advances KV length. The executor, runner, and stores own those behaviors.
 """
 
 from __future__ import annotations
@@ -22,7 +21,9 @@ from ..forward import (
     ForwardBatch,
     ForwardContext,
     ForwardOutput,
+    ForwardRow,
     PagedVarlenPlan,
+    RouteId,
     TokenEmbeddings,
     TokenHidden,
     TokenIds,
@@ -47,6 +48,7 @@ __all__ = [
 import torch.nn as nn
 
 from ..batch import WorkVariant
+from ..loader.schema import Stack, WeightSpec
 from ..nn import (
     FusedMoE,
     LayerSpec,
@@ -64,18 +66,13 @@ from ..nn import (
 )
 from ..nn.decoder import Qwen3MLP
 from ..nn.logits import LogitsProcessor
-from ..spec import (
-    CacheSpec,
-    InputSpec,
-    ModelSpec,
-    OperationSpec,
-    OperationStageSpec,
-    RoutePlacement,
-    RouteRowKind,
-    RouteShape,
-    RouteSpec,
-    Stack,
-    WeightSpec,
+from .runtime import (
+    CacheGeometry,
+    DeviceRole,
+    ExecutionModel,
+    LoweredStage,
+    ResourceGeometry,
+    RowKind,
 )
 
 
@@ -480,7 +477,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class Qwen3ForCausalLM(ExecutionModel):
     """Qwen3 serving model with a thin tensor-level text core."""
 
     weight_spec = WeightSpec(
@@ -511,50 +508,70 @@ class Qwen3ForCausalLM(nn.Module):
         self.logits = LogitsProcessor()
         self.num_layers = cfg.num_hidden_layers
         self.head_dim = cfg.head_dim
-        self.spec = self._build_spec(cfg)
-
-    def _build_spec(self, cfg: _QwenConfig) -> ModelSpec:
-        return ModelSpec(
-            architecture="Qwen3ForCausalLM",
-            routes=(
-                RouteSpec(
-                    name="text",
-                    row_kinds=(RouteRowKind.TOKEN,),
-                    mixed_combinations=(),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.PRIMARY,
-                    topology_axes=("tp",),
-                    shape=RouteShape(
-                        max_tokens_per_row=cfg.max_position_embeddings,
-                        token_multiple=1,
-                    ),
-                    graph_eligible=True,
-                ),
-            ),
-            operations=tuple(
-                OperationSpec(kind, (OperationStageSpec("text", RouteRowKind.TOKEN),))
-                for kind in (
-                    WorkVariant.TOKEN_EXTEND,
-                    WorkVariant.TOKEN_DECODE,
-                    WorkVariant.TOKEN_VERIFY,
-                )
-            ),
-            weights=self.weight_spec,
-            inputs=InputSpec(),
-            cache=CacheSpec(
-                num_layers=int(self.num_layers),
-                num_attention_heads=local_attention_head_count(
-                    cfg.num_attention_heads,
-                    parallel=self._parallel,
-                ),
-                num_kv_heads=local_kv_head_count(
-                    cfg.num_key_value_heads,
-                    parallel=self._parallel,
-                ),
-                head_dim=cfg.head_dim,
-                dtype="bfloat16",
-            ),
+        self.architecture = "Qwen3ForCausalLM"
+        self.supported_work = frozenset(
+            {
+                WorkVariant.TOKEN_EXTEND,
+                WorkVariant.TOKEN_DECODE,
+                WorkVariant.TOKEN_VERIFY,
+            }
         )
+        self.cache_geometry = CacheGeometry(
+            num_layers=int(self.num_layers),
+            num_attention_heads=local_attention_head_count(
+                cfg.num_attention_heads,
+                parallel=self._parallel,
+            ),
+            num_kv_heads=local_kv_head_count(
+                cfg.num_key_value_heads,
+                parallel=self._parallel,
+            ),
+            head_dim=cfg.head_dim,
+            dtype="bfloat16",
+        )
+        self.resource_geometry = ResourceGeometry()
+        self._max_sequence_tokens = int(cfg.max_position_embeddings)
+
+    def lower(
+        self,
+        variant: WorkVariant,
+        *,
+        retain_image: bool = False,
+    ) -> tuple[LoweredStage, ...]:
+        del retain_image
+        if variant in self.supported_work:
+            return (LoweredStage(RouteId("text"), RowKind.TOKEN),)
+        return ()
+
+    def route_dtype(self, route: RouteId) -> str:
+        self._require_text_route(route)
+        return "bfloat16"
+
+    def route_device_role(self, route: RouteId) -> DeviceRole:
+        self._require_text_route(route)
+        return DeviceRole.PRIMARY
+
+    def route_topology(self, route: RouteId) -> tuple[str, ...]:
+        self._require_text_route(route)
+        return ("tp",)
+
+    def route_graph_eligible(self, route: RouteId) -> bool:
+        self._require_text_route(route)
+        return True
+
+    def route_max_tokens(self, route: RouteId) -> int:
+        self._require_text_route(route)
+        return self._max_sequence_tokens
+
+    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
+        del row
+        self._require_text_route(route)
+        return ()
+
+    @staticmethod
+    def _require_text_route(route: RouteId) -> None:
+        if route != "text":
+            raise ValueError(f"Qwen3 received unknown route {route!s}")
 
     @torch.inference_mode()
     def forward(self, batch: ForwardBatch) -> ForwardOutput:

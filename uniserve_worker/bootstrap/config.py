@@ -9,8 +9,8 @@ from ..foundation.runtime_config import (
     ExecutionConfig,
     execution_config_from_namespace,
 )
+from ..loader.schema import ModelLoadScope
 from ..server.worker_kind import WorkerKind
-from ..spec import ModelLoadScope
 from .plan import WorkerImplementation, resolve_worker_plan
 
 

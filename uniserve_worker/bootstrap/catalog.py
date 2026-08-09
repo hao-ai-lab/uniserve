@@ -9,18 +9,11 @@ from typing import Any
 from torch import nn
 
 from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..loader.schema import ModelLoadScope
 from ..models.bagel import BagelConfig, BagelForConditionalGeneration, _BagelGraph
 from ..models.qwen3 import Qwen3ForCausalLM
 from ..models.sensenova.config import NeoChatConfig
 from ..models.sensenova.model import _MODEL_CODE_VERSION, NEOChatModel
-from ..spec import (
-    EncoderResourcePolicy,
-    KvBlockResourcePolicy,
-    LatentTokens,
-    ModelLoadScope,
-    PerBranch,
-    ResourcePlan,
-)
 
 __all__ = ["CatalogEntry", "CheckpointFormat", "resolve_catalog_entry"]
 
@@ -55,7 +48,6 @@ class CatalogEntry:
     architecture: str
     model_class: type[nn.Module]
     checkpoint: CheckpointFormat
-    resources: ResourcePlan
     config_class: type[Any] | None = None
     graph_class: type[nn.Module] | None = None
     minimum_code_version_key: str | None = None
@@ -89,18 +81,11 @@ QWEN3_ENTRY = CatalogEntry(
     architecture="Qwen3ForCausalLM",
     model_class=Qwen3ForCausalLM,
     checkpoint=CheckpointFormat.STREAM,
-    resources=ResourcePlan(kv_block=KvBlockResourcePolicy.PER_BLOCK),
 )
 BAGEL_ENTRY = CatalogEntry(
     architecture="BagelForConditionalGeneration",
     model_class=BagelForConditionalGeneration,
     checkpoint=CheckpointFormat.COMPOSITE,
-    resources=ResourcePlan(
-        kv_block=KvBlockResourcePolicy.PER_BLOCK,
-        encoder_output=EncoderResourcePolicy.PER_HANDLE,
-        image_latent=LatentTokens(downsample=16),
-        scratch=PerBranch(fixed_tokens=65536, mirror_kv=True),
-    ),
     config_class=BagelConfig,
     graph_class=_BagelGraph,
     config_files=(
@@ -121,17 +106,6 @@ SENSENOVA_ENTRY = CatalogEntry(
     architecture="NEOChatModel",
     model_class=NEOChatModel,
     checkpoint=CheckpointFormat.NATIVE,
-    resources=ResourcePlan(
-        kv_block=KvBlockResourcePolicy.PER_BLOCK,
-        encoder_output=EncoderResourcePolicy.PER_HANDLE,
-        image_latent=LatentTokens(downsample=16),
-        scratch=PerBranch(
-            minimum_blocks=8,
-            mirror_kv=True,
-            latent_copies=4,
-            tower_copy=True,
-        ),
-    ),
     scopes=(
         ModelLoadScope.WHOLE,
         ModelLoadScope.UNDERSTANDING,

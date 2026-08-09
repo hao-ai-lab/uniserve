@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from contextlib import nullcontext
 from dataclasses import replace
@@ -40,6 +41,9 @@ from ..foundation.sync_detector import (
     sync_detector,
 )
 from ..loader.weight_set import WeightSet
+from ..models.generation import GenerationPipeline
+from ..models.identity import ModelIdentity, architecture_identity
+from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import DeviceMesh
 from ..runtime.arena_capacity import model_arena_capacity
 from ..runtime.capabilities import resolve_capabilities
@@ -54,7 +58,6 @@ from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.residency import ResidencyStore
 from ..runtime.snapshot_store import SnapshotProvider
-from ..spec import DeploymentOverlay, ModelSpec, RouteRowKind, resolved_digest
 
 logger = logging.getLogger(__name__)
 
@@ -163,11 +166,10 @@ class ModelWorker:
 
     def __init__(
         self,
-        model: nn.Module,
+        model: ExecutionModel,
         *,
         mesh: DeviceMesh,
-        model_spec: ModelSpec,
-        deployment: DeploymentOverlay,
+        deployment: WorkerDeployment,
         attention: AttentionSelection,
         execution: ExecutionConfig,
         tokenizer: object | None,
@@ -175,35 +177,37 @@ class ModelWorker:
         defer_sampling: bool = False,
         transfer_backend: str = "local",
         cross_process: bool = False,
-        model_spec_digest: str | None = None,
+        architecture_digest: str | None = None,
         weight_digest: str | None = None,
         pipeline_depth: int,
         completion_payload_bytes: int,
         snapshot_dir: str | None = None,
         restore_snapshots: bool = False,
     ) -> None:
-        if not isinstance(model, nn.Module) or type(model).forward is nn.Module.forward:
+        if not isinstance(model, ExecutionModel) or type(model).forward is nn.Module.forward:
             raise capability_mismatch("model worker requires nn.Module.forward(ForwardBatch)")
-        if not isinstance(model_spec, ModelSpec) or not isinstance(deployment, DeploymentOverlay):
-            raise capability_mismatch("model worker requires canonical model and deployment specs")
+        if not isinstance(deployment, WorkerDeployment):
+            raise capability_mismatch("model worker requires a worker deployment")
         self.model = model
-        self.model_spec = model_spec
         self.deployment = deployment
         self.weights = WeightSet.from_module(model, digest=weight_digest)
         self.weight_digest = self.weights.digest
-        self.model_spec_digest = model_spec_digest or resolved_digest(model_spec, deployment)
-        if self.model_spec_digest != resolved_digest(model_spec, deployment):
-            raise capability_mismatch("loaded model-spec digest does not match its declarations")
+        self.identity = ModelIdentity(
+            architecture=model.architecture,
+            architecture_digest=architecture_digest
+            or architecture_identity(model.architecture, {"architecture": model.architecture}),
+            weight_digest=self.weight_digest,
+        )
         declared = resolve_capabilities(
-            model_spec,
+            model,
             deployment,
-            model_spec_digest=self.model_spec_digest,
+            architecture_digest=self.identity.architecture_digest,
             weight_digest=self.weight_digest,
             pipeline_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
         )
         arena = model_arena_capacity(
-            model_spec,
+            model,
             deployment,
             pipeline_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
@@ -225,7 +229,7 @@ class ModelWorker:
             )
         if int(pipeline_depth) <= 0:
             raise capability_mismatch("worker pipeline depth must be positive")
-        implemented_work = frozenset(model_spec.operation_variants())
+        implemented_work = model.supported_work
         self._effective_work_variants = allowed_work_variants & implemented_work
         if not self._effective_work_variants:
             raise capability_mismatch(
@@ -242,17 +246,17 @@ class ModelWorker:
             ),
             pipeline_depth=int(pipeline_depth),
         )
-        self.residency = ResidencyStore.from_spec(
-            model_spec,
+        self.residency = ResidencyStore.from_model(
+            model,
             self._capabilities,
-            deployment.resources,
+            model.resource_geometry,
             device=deployment.device,
         )
         self.kv = KvStore(self.residency.kv)
         self.sessions = SessionStore()
         self.latents = LatentStore(capacity_bytes=arena.latent_bytes)
         self.products = ProductStore(
-            encoder_cache_budget=model_spec.inputs.encoder_cache_budget,
+            encoder_cache_budget=model.resource_geometry.encoder_cache_entries,
             device_product_capacity=arena.device_products,
             device_product_byte_capacity=arena.device_product_bytes,
         )
@@ -266,18 +270,18 @@ class ModelWorker:
         self.graphs = GraphStore(
             enabled=execution.cuda_graph,
             prefill_enabled=execution.prefill_cuda_graph,
-            cache=model_spec.cache,
+            cache=model.cache_geometry,
             block_size=deployment.block_size,
-            spec_digest=self.model_spec_digest,
+            weight_digest=self.weight_digest,
             memory_budget_bytes=graph_memory_budget_bytes(device_total_bytes(deployment.device)),
             decode_batch_sizes=execution.cuda_graph_warmup_batches,
             decode_context_blocks=self._decode_context_blocks(),
             prefill_token_sizes=execution.prefill_cuda_graph_warmup_tokens,
         )
         self._execution = execution
-        self.trace = ExecutionTrace(self.model_spec_digest)
+        self.trace = ExecutionTrace(self.identity.architecture_digest)
         self.executor = ModelExecutor(
-            spec=model_spec,
+            model=model,
             deployment=deployment,
             runner=ModelRunner(model, self.graphs, self.trace),
             attention=attention,
@@ -290,7 +294,7 @@ class ModelWorker:
             mesh=MeshStore(mesh),
             transport=self.mover.transport,
             tokenizer=tokenizer,
-            model_spec_digest=self.model_spec_digest,
+            architecture_digest=self.identity.architecture_digest,
             weight_digest=self.weight_digest,
             allowed_work_variants=self._effective_work_variants,
             trace=self.trace,
@@ -306,7 +310,7 @@ class ModelWorker:
             caps = self._capabilities
             self.snapshot_provider = SnapshotProvider(
                 snapshot_dir,
-                model_spec_digest=self.model_spec_digest,
+                model_identity=self.identity.architecture_digest,
                 weight_digest=self.weight_digest,
                 topology={
                     "rank": caps.rank.to_wire(),
@@ -342,9 +346,10 @@ class ModelWorker:
             return 0
         max_tokens = max(
             (
-                int(route.shape.max_tokens_per_row)
-                for route in self.model_spec.routes
-                if RouteRowKind.TOKEN in route.row_kinds
+                self.model.route_max_tokens(stage.route)
+                for variant in self.model.supported_work
+                for stage in self.model.lower(variant)
+                if stage.row.value == "token"
             ),
             default=0,
         )
@@ -687,9 +692,10 @@ class ModelWorker:
             return
         max_route_tokens = max(
             (
-                int(route.shape.max_tokens_per_row)
-                for route in self.model_spec.routes
-                if RouteRowKind.TOKEN in route.row_kinds
+                self.model.route_max_tokens(stage.route)
+                for variant in self.model.supported_work
+                for stage in self.model.lower(variant)
+                if stage.row.value == "token"
             ),
             default=0,
         )
@@ -795,7 +801,7 @@ class ModelWorker:
 
         if (
             WorkVariant.GEN_TRANSITION not in self._effective_work_variants
-            or self.model_spec.flow is None
+            or not isinstance(self.model.generation, GenerationPipeline)
         ):
             return
         if self.sessions.session_ids():
@@ -837,10 +843,7 @@ class ModelWorker:
             )
             max_latent_elements = max(
                 1,
-                (height // int(self.model_spec.flow.latent_downsample))
-                * (width // int(self.model_spec.flow.latent_downsample))
-                * int(self.model_spec.flow.latent_channels)
-                * int(self.model_spec.flow.latent_patch_size) ** 2,
+                math.prod(self.model.generation.latent_shape(height, width)),
             )
             initial_latent = ProductRef(
                 request_key=rk,

@@ -1,4 +1,4 @@
-"""Private ``InputSpec`` implementation used by the model executor."""
+"""Image decoding and staging for model-owned processing policy."""
 
 from __future__ import annotations
 
@@ -17,7 +17,11 @@ from torchvision.transforms import functional as vision
 from uniserve_worker.batch import EncodeMode
 from uniserve_worker.forward import PatchInput, TowerInput
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.spec import ImageInputSpec, ImagePatchSpec, StrideResizeSpec
+from uniserve_worker.models.inputs import (
+    ImageProcessor,
+    PatchTransform,
+    StrideResize,
+)
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -31,7 +35,7 @@ class PreparedImage:
 
 
 def prepare_image(
-    spec: ImageInputSpec,
+    spec: ImageProcessor,
     kind: EncodeMode,
     encoded: str,
     *,
@@ -42,7 +46,7 @@ def prepare_image(
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 
-    if isinstance(transform, ImagePatchSpec):
+    if isinstance(transform, PatchTransform):
         height, width = image.height, image.width
         resized = _resize_patch_image(image, transform)
         normalized = _normalize(resized, transform.normalization)
@@ -76,7 +80,7 @@ def prepare_image(
 
 
 def prepare_tensor_image(
-    spec: ImageInputSpec,
+    spec: ImageProcessor,
     kind: EncodeMode,
     image: torch.Tensor,
     *,
@@ -100,7 +104,7 @@ def prepare_tensor_image(
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 
-    if isinstance(transform, ImagePatchSpec):
+    if isinstance(transform, PatchTransform):
         resized_height, resized_width = _patch_image_shape(
             transform,
             source_height,
@@ -179,7 +183,7 @@ def _decode_rgb(encoded: str) -> Image.Image:
     return image.convert("RGB")
 
 
-def _resize_patch_image(image: Image.Image, spec: ImagePatchSpec) -> Image.Image:
+def _resize_patch_image(image: Image.Image, spec: PatchTransform) -> Image.Image:
     height, width = _patch_image_shape(spec, image.height, image.width)
     return vision.resize(
         image,
@@ -190,7 +194,7 @@ def _resize_patch_image(image: Image.Image, spec: ImagePatchSpec) -> Image.Image
 
 
 def patch_grid_shape(
-    spec: ImagePatchSpec,
+    spec: PatchTransform,
     source_height: int,
     source_width: int,
 ) -> tuple[int, int]:
@@ -202,7 +206,7 @@ def patch_grid_shape(
 
 
 def _patch_image_shape(
-    spec: ImagePatchSpec,
+    spec: PatchTransform,
     source_height: int,
     source_width: int,
 ) -> tuple[int, int]:
@@ -241,7 +245,7 @@ def _bounded_grid_shape(
     return result_height, result_width
 
 
-def _resize_stride(image: Image.Image, spec: StrideResizeSpec) -> Image.Image:
+def _resize_stride(image: Image.Image, spec: StrideResize) -> Image.Image:
     width, height = image.size
     scale = min(int(spec.max_size) / max(width, height), 1.0)
     scale = max(scale, int(spec.min_size) / min(width, height))
@@ -292,11 +296,16 @@ def _resize_tensor(value: torch.Tensor, height: int, width: int) -> torch.Tensor
     )[0]
 
 
-def _stage(value: torch.Tensor, spec: ImageInputSpec, device: torch.device) -> torch.Tensor:
+def _stage(value: torch.Tensor, spec: ImageProcessor, device: torch.device) -> torch.Tensor:
     dtype = None if spec.staging_dtype is None else getattr(torch, spec.staging_dtype, None)
     if spec.staging_dtype is not None and not isinstance(dtype, torch.dtype):
         raise invalid_descriptor(f"unknown image staging dtype {spec.staging_dtype!r}")
     return value.to(device=device, dtype=dtype, non_blocking=True)
 
 
-__all__: list[str] = []
+__all__ = [
+    "PreparedImage",
+    "patch_grid_shape",
+    "prepare_image",
+    "prepare_tensor_image",
+]

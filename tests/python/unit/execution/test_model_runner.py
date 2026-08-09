@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.python.fixtures.model_execution import TEST_MODEL_SPEC
+from tests.python.fixtures.model_execution import TEST_MODEL
 from uniserve_worker.execution._forward_plan import (
     ForwardBinding,
     ForwardPlan,
@@ -166,8 +166,8 @@ def _plan(
             ),
         ),
         graph_key=GraphKey(
-            model_revision="revision",
-            spec_digest="d" * 64,
+            architecture_digest="a" * 64,
+            weight_digest="d" * 64,
             route=RouteId("mixed"),
             shape=(1, 1, 2, 1),
             dtype="float32",
@@ -199,9 +199,9 @@ def _graph_store(*, enabled: bool, memory_budget_bytes: int = 1 << 34) -> GraphS
     return GraphStore(
         enabled=enabled,
         prefill_enabled=False,
-        cache=TEST_MODEL_SPEC.cache,
+        cache=TEST_MODEL.cache_geometry,
         block_size=16,
-        spec_digest="d" * 64,
+        weight_digest="d" * 64,
         memory_budget_bytes=memory_budget_bytes,
     )
 
@@ -318,9 +318,9 @@ def test_graph_store_executes_decode_in_smallest_reserved_bucket(monkeypatch):
     graph = GraphStore(
         enabled=True,
         prefill_enabled=False,
-        cache=TEST_MODEL_SPEC.cache,
+        cache=TEST_MODEL.cache_geometry,
         block_size=4,
-        spec_digest="d" * 64,
+        weight_digest="d" * 64,
         memory_budget_bytes=1 << 30,
         decode_batch_sizes=(1, 2, 4, 8),
         decode_context_blocks=6,
@@ -422,9 +422,9 @@ def test_graph_store_executes_unqualified_full_logits_prefill_eagerly(monkeypatc
     graph = GraphStore(
         enabled=True,
         prefill_enabled=True,
-        cache=TEST_MODEL_SPEC.cache,
+        cache=TEST_MODEL.cache_geometry,
         block_size=4,
-        spec_digest="d" * 64,
+        weight_digest="d" * 64,
         memory_budget_bytes=1 << 30,
         prefill_token_sizes=(8, 16),
     )
@@ -463,9 +463,9 @@ def test_graph_store_reuses_prefill_token_bucket_across_ragged_shapes(monkeypatc
     graph = GraphStore(
         enabled=True,
         prefill_enabled=True,
-        cache=TEST_MODEL_SPEC.cache,
+        cache=TEST_MODEL.cache_geometry,
         block_size=4,
-        spec_digest="d" * 64,
+        weight_digest="d" * 64,
         memory_budget_bytes=1 << 30,
         prefill_token_sizes=(8, 16),
     )

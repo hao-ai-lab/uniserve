@@ -24,7 +24,7 @@ from .profiles import (
     DEFAULT_CONFIG,
     load_config,
     require_resolved,
-    server_command,
+    server_launch,
 )
 
 
@@ -50,12 +50,13 @@ def plan(args: argparse.Namespace) -> None:
     rendered = []
     for point in points:
         server = config.servers[point.server]
-        command = server_command(server, args.executable)
+        launch = server_launch(server, args.executable)
         rendered.append(
             {
                 "benchmark": point.name,
                 "task": point.task.value,
-                "server_command": list(command),
+                "server_command": list(launch.command),
+                "server_working_directory": str(launch.working_directory),
                 "base_url": server.base_url,
                 "dataset": point.dataset,
                 "num_prompts": point.num_prompts,
@@ -75,14 +76,18 @@ def run(args: argparse.Namespace) -> None:
     with _host_lock():
         for point in points:
             server = config.servers[point.server]
-            command = server_command(server, args.executable)
-            require_resolved(command, context=f"server {server.name}")
+            launch = server_launch(server, args.executable)
+            require_resolved(launch.command, context=f"server {server.name}")
             require_resolved(point.workload_dict(), context=f"benchmark {point.name}")
             point_dir = output_root / point.name
             log_path = output_root / "server-logs" / f"{point.name}.log"
-            provenance = collect_provenance(command, server.environment)
-            with _environment(server.environment):
-                with ManagedServer(server, command, log_path, timeout_s=args.launch_timeout_s):
+            provenance = collect_provenance(
+                launch.command,
+                launch.working_directory,
+                launch.environment,
+            )
+            with _environment(launch.environment):
+                with ManagedServer(server, launch, log_path, timeout_s=args.launch_timeout_s):
                     result = asyncio.run(
                         BenchmarkRunner(
                             server.base_url,
@@ -125,9 +130,7 @@ def compare(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
         (args.output_dir / "comparison.md").write_text(markdown, encoding="utf-8")
-    if report["valid"] is not True or (
-        max_regression is not None and report["passed"] is not True
-    ):
+    if report["valid"] is not True or (max_regression is not None and report["passed"] is not True):
         raise SystemExit(2)
 
 

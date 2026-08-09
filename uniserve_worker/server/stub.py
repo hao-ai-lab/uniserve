@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-from torch import nn
 
 from ..batch import WorkVariant
 from ..forward import (
@@ -14,9 +13,11 @@ from ..forward import (
     FlowRow,
     ForwardBatch,
     ForwardOutput,
+    ForwardRow,
     PackedAttentionPlan,
     PagedDecodePlan,
     PatchInput,
+    RouteId,
     TokenEmbeddings,
     TokenHidden,
     TokenIds,
@@ -28,36 +29,27 @@ from ..forward import (
     TowerInput,
 )
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
-from ..spec import (
-    CacheSpec,
-    DeploymentOverlay,
-    EncoderResourcePolicy,
-    FlowBranchSource,
-    FlowConditioningKind,
-    FlowSpec,
-    ImageInputSpec,
-    ImagePatchSpec,
-    ImageTowerSpec,
-    InputSpec,
-    KvBlockResourcePolicy,
-    LatentLayout,
-    LatentTokens,
-    MaterializationKind,
-    ModelSpec,
-    NoiseScaleSpec,
-    OperationSpec,
-    OperationStageSpec,
-    PerBranch,
-    PositionLayout,
-    ResourcePlan,
-    RoutePlacement,
-    RouteRowKind,
-    RouteShape,
-    RouteShapeGrouping,
-    RouteSpec,
-    StrideResizeSpec,
-    WeightSpec,
+from ..loader.schema import WeightSpec
+from ..models.generation import BranchSource, GenerationPipeline, LatentLayout, Materialization
+from ..models.inputs import (
+    ImageProcessor,
+    PatchTransform,
+    StrideResize,
+    TowerTransform,
 )
+from ..models.runtime import (
+    CacheGeometry,
+    DeviceRole,
+    ExecutionModel,
+    LoweredStage,
+    PositionLayout,
+    ResourceGeometry,
+    RowKind,
+    ScratchGeometry,
+    WorkerDeployment,
+)
+from ..nn.diffusion.cfg import CfgRecipe
+from ..nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
 
 STUB_EOS_TOKEN_ID = 151645
 STUB_IMG_START_TOKEN_ID = 151670
@@ -78,8 +70,8 @@ __all__ = [
 ]
 
 
-def stub_deployment(block_size: int = DEFAULT_BLOCK_SIZE) -> DeploymentOverlay:
-    return DeploymentOverlay(
+def stub_deployment(block_size: int = DEFAULT_BLOCK_SIZE) -> WorkerDeployment:
+    return WorkerDeployment(
         device="cpu",
         model_scope="whole",
         tp_rank=0,
@@ -91,145 +83,129 @@ def stub_deployment(block_size: int = DEFAULT_BLOCK_SIZE) -> DeploymentOverlay:
         model_dtype="bfloat16",
         kv_cache_dtype=None,
         kv_memory_fraction=1.0,
-        resources=ResourcePlan(
-            kv_block=KvBlockResourcePolicy.PER_BLOCK,
-            encoder_output=EncoderResourcePolicy.PER_HANDLE,
-            image_latent=LatentTokens(downsample=STUB_LATENT_DOWNSAMPLE),
-            scratch=PerBranch(fixed_tokens=STUB_SCRATCH_TOKENS),
-        ),
         max_batch_operations=DEFAULT_MAX_BATCH_OPS,
         generation_device=None,
     )
 
 
-class StubModel(nn.Module):
+class StubModel(ExecutionModel):
     """Stateless neural test double that obeys the canonical model boundary."""
 
     architectures = ("UniServeStubForUnifiedGeneration",)
 
     def __init__(self) -> None:
         super().__init__()
-        self.spec = self._build_spec()
-
-    @staticmethod
-    def _build_spec() -> ModelSpec:
-        image_resize = StrideResizeSpec(
+        self.architecture = "UniServeStubForUnifiedGeneration"
+        image_resize = StrideResize(
             max_size=512,
             min_size=16,
             stride=16,
             max_pixels=512 * 512,
         )
-        return ModelSpec(
-            architecture="UniServeStubForUnifiedGeneration",
-            revision="stub-v3",
-            routes=(
-                RouteSpec(
-                    name="stub",
-                    row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW),
-                    mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.PRIMARY,
-                    topology_axes=("tp",),
-                    shape=RouteShape(max_tokens_per_row=STUB_MAX_LATENT_SIZE, token_multiple=1),
-                    graph_eligible=False,
-                ),
-                RouteSpec(
-                    name="encode",
-                    row_kinds=(RouteRowKind.ENCODE,),
-                    mixed_combinations=(),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.PRIMARY,
-                    topology_axes=("tp",),
-                    shape=RouteShape(
-                        max_tokens_per_row=STUB_MAX_LATENT_SIZE,
-                        token_multiple=1,
-                        grouping=RouteShapeGrouping.INPUT_SHAPE,
-                    ),
-                    graph_eligible=False,
-                ),
+        self.weight_spec = WeightSpec()
+        self.image_processor = ImageProcessor(
+            vit=PatchTransform(
+                patch_size=16,
+                downsample_ratio=1.0,
+                min_pixels=16 * 16,
+                max_pixels=512 * 512,
+                multi_image_pixel_budget=512 * 512,
+                normalization="signed_unit",
             ),
-            operations=(
-                OperationSpec(
-                    WorkVariant.TOKEN_EXTEND,
-                    (OperationStageSpec("stub", RouteRowKind.TOKEN),),
-                ),
-                OperationSpec(
-                    WorkVariant.TOKEN_DECODE,
-                    (OperationStageSpec("stub", RouteRowKind.TOKEN),),
-                ),
-                OperationSpec(
-                    WorkVariant.TOKEN_VERIFY,
-                    (OperationStageSpec("stub", RouteRowKind.TOKEN),),
-                ),
-                OperationSpec(
-                    WorkVariant.GEN_TRANSITION,
-                    (OperationStageSpec("stub", RouteRowKind.FLOW),),
-                ),
-                OperationSpec(
-                    WorkVariant.GEN_FLOW,
-                    (OperationStageSpec("stub", RouteRowKind.FLOW),),
-                ),
-                OperationSpec(
-                    WorkVariant.ENCODE_VISION,
-                    (OperationStageSpec("encode", RouteRowKind.ENCODE),),
-                ),
-                OperationSpec(
-                    WorkVariant.ENCODE_LATENT,
-                    (OperationStageSpec("encode", RouteRowKind.ENCODE),),
-                ),
-                OperationSpec(WorkVariant.MATERIALIZE),
-                OperationSpec(WorkVariant.TRANSFER_PRODUCT),
-                OperationSpec(WorkVariant.TRANSFER_KV_PUBLISH),
-                OperationSpec(WorkVariant.TRANSFER_KV_INSTALL),
-            ),
-            weights=WeightSpec(),
-            inputs=InputSpec(
-                images=ImageInputSpec(
-                    vit=ImagePatchSpec(
-                        patch_size=16,
-                        downsample_ratio=1.0,
-                        min_pixels=16 * 16,
-                        max_pixels=512 * 512,
-                        multi_image_pixel_budget=512 * 512,
-                        normalization="signed_unit",
-                    ),
-                    vae=ImageTowerSpec(image_resize, normalization="signed_unit"),
-                    staging_dtype="bfloat16",
-                ),
-                encoder_cache_budget=1024,
-                max_vit_grid_tokens=STUB_MAX_LATENT_SIZE,
-            ),
-            cache=CacheSpec(
-                num_layers=STUB_NUM_LAYERS,
-                num_attention_heads=1,
-                num_kv_heads=1,
-                head_dim=1,
-                dtype="bfloat16",
-                store_dtype="bfloat16",
-                position_layout=PositionLayout.TEMPORAL_SPATIAL,
-            ),
-            flow=FlowSpec(
-                latent_downsample=STUB_LATENT_DOWNSAMPLE,
-                prediction="velocity",
-                prediction_dtype="bfloat16",
-                schedule_direction="ascending",
-                schedule_shift_domain="time",
-                max_latent_tokens=STUB_MAX_LATENT_SIZE,
-                max_vae_grid_tokens=STUB_MAX_LATENT_SIZE,
-                commit_marker_tokens=2,
-                rope_advance=2,
-                max_cfg_branches=3,
-                latent_layout=LatentLayout.IMAGE_NCHW,
-                latent_channels=3,
-                latent_patch_size=STUB_LATENT_DOWNSAMPLE,
-                positions=PositionLayout.TEMPORAL_SPATIAL,
-                conditioning=FlowConditioningKind.IMAGE_PATCHES,
-                materialization=MaterializationKind.RGB_LATENT,
-                noise_scale=NoiseScaleSpec(),
-                text_unconditional=FlowBranchSource.START,
-                image_unconditional=FlowBranchSource.START,
-            ),
+            vae=TowerTransform(image_resize),
+            staging_dtype="bfloat16",
         )
+        self.cache_geometry = CacheGeometry(
+            num_layers=STUB_NUM_LAYERS,
+            num_attention_heads=1,
+            num_kv_heads=1,
+            head_dim=1,
+            dtype="bfloat16",
+            store_dtype="bfloat16",
+        )
+        self.generation = GenerationPipeline(
+            latent_downsample=STUB_LATENT_DOWNSAMPLE,
+            prediction="velocity",
+            prediction_dtype="bfloat16",
+            schedule_direction=ScheduleDirection.ASCENDING,
+            schedule_shift_domain=ScheduleShiftDomain.TIME,
+            max_latent_tokens=STUB_MAX_LATENT_SIZE,
+            max_vae_grid_tokens=STUB_MAX_LATENT_SIZE,
+            commit_marker_tokens=2,
+            rope_advance=2,
+            max_cfg_branches=3,
+            latent_layout=LatentLayout.IMAGE_NCHW,
+            latent_channels=3,
+            latent_patch_size=STUB_LATENT_DOWNSAMPLE,
+            positions=PositionLayout.TEMPORAL_SPATIAL,
+            materialization=Materialization.RGB_LATENT,
+            text_unconditional=BranchSource.START,
+            image_unconditional=BranchSource.START,
+            cfg_recipe=CfgRecipe.ADDITIVE_DELTAS,
+        )
+        self.resource_geometry = ResourceGeometry(
+            encoder_cache_entries=1024,
+            latent_downsample=STUB_LATENT_DOWNSAMPLE,
+            scratch=ScratchGeometry(fixed_tokens=STUB_SCRATCH_TOKENS),
+        )
+        self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
+        self.supported_work = frozenset(WorkVariant)
+
+    def lower(
+        self,
+        variant: WorkVariant,
+        *,
+        retain_image: bool = False,
+    ) -> tuple[LoweredStage, ...]:
+        del retain_image
+        if variant in {WorkVariant.TOKEN_EXTEND, WorkVariant.TOKEN_DECODE, WorkVariant.TOKEN_VERIFY}:
+            return (LoweredStage(RouteId("stub"), RowKind.TOKEN),)
+        if variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}:
+            return (LoweredStage(RouteId("stub"), RowKind.FLOW),)
+        if variant in {WorkVariant.ENCODE_VISION, WorkVariant.ENCODE_LATENT}:
+            return (LoweredStage(RouteId("encode"), RowKind.ENCODE),)
+        return ()
+
+    def route_dtype(self, route: RouteId) -> str:
+        self._require_route(route)
+        return "bfloat16"
+
+    def route_device_role(self, route: RouteId) -> DeviceRole:
+        self._require_route(route)
+        return DeviceRole.PRIMARY
+
+    def route_topology(self, route: RouteId) -> tuple[str, ...]:
+        self._require_route(route)
+        return ("tp",)
+
+    def route_graph_eligible(self, route: RouteId) -> bool:
+        self._require_route(route)
+        return False
+
+    def route_max_tokens(self, route: RouteId) -> int:
+        self._require_route(route)
+        return STUB_MAX_LATENT_SIZE
+
+    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
+        self._require_route(route)
+        if route == "stub":
+            return ()
+        if isinstance(row, EncodeRow):
+            return tuple(int(value) for value in row.inputs.pixels.shape)
+        raise TypeError("stub encode route requires an encode row")
+
+    def route_uses_packed_attention(self, route: RouteId) -> bool:
+        self._require_route(route)
+        return route == "stub"
+
+    def allows_mixed(self, route: RouteId, rows: frozenset[RowKind]) -> bool:
+        self._require_route(route)
+        return route == "stub" and rows <= {RowKind.TOKEN, RowKind.FLOW}
+
+    @staticmethod
+    def _require_route(route: RouteId) -> None:
+        if route not in {"stub", "encode"}:
+            raise ValueError(f"stub model received unknown route {route!s}")
 
     @torch.inference_mode()
     def forward(self, batch: ForwardBatch) -> ForwardOutput:

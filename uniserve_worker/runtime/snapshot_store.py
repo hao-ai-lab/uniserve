@@ -45,7 +45,7 @@ from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
 from .transfer import Locator, Transport, restore_durable_tensor
 
-SNAPSHOT_FORMAT_VERSION = 9
+SNAPSHOT_FORMAT_VERSION = 10
 _ASSET_PREFIX = "asset:"
 
 
@@ -66,7 +66,7 @@ class SnapshotProvider:
         self,
         root: str | Path,
         *,
-        model_spec_digest: str,
+        model_identity: str,
         weight_digest: str,
         topology: Mapping[str, object],
         device: str | torch.device,
@@ -80,7 +80,7 @@ class SnapshotProvider:
         self.root = Path(root).expanduser().resolve()
         self.objects = self.root / "objects"
         self.catalog_path = self.root / "catalog.json"
-        self.model_spec_digest = str(model_spec_digest)
+        self.model_identity = str(model_identity)
         self.weight_digest = str(weight_digest)
         self.topology = dict(topology)
         self.device = torch.device(device)
@@ -260,7 +260,7 @@ class SnapshotProvider:
 
         manifest: dict[str, object] = {
             "format_version": SNAPSHOT_FORMAT_VERSION,
-            "model_spec_digest": self.model_spec_digest,
+            "model_identity": self.model_identity,
             "weight_digest": self.weight_digest,
             "topology": self.topology,
             "assets": [],
@@ -499,10 +499,10 @@ class SnapshotProvider:
         ):
             raise invalid_descriptor("snapshot format version is unsupported")
         if (
-            _string(manifest.get("model_spec_digest"), "snapshot.model_spec_digest")
-            != self.model_spec_digest
+            _string(manifest.get("model_identity"), "snapshot.model_identity")
+            != self.model_identity
         ):
-            raise invalid_descriptor("snapshot model spec digest does not match this worker")
+            raise invalid_descriptor("snapshot model identity does not match this worker")
         if _string(manifest.get("weight_digest"), "snapshot.weight_digest") != self.weight_digest:
             raise invalid_descriptor("snapshot weight digest does not match this worker")
         if dict(_mapping(manifest.get("topology"), "snapshot.topology")) != self.topology:

@@ -30,6 +30,13 @@ class ServerProfile:
 
 
 @dataclass(frozen=True)
+class ServerLaunch:
+    command: tuple[str, ...]
+    working_directory: Path
+    environment: dict[str, str]
+
+
+@dataclass(frozen=True)
 class SuiteProfile:
     name: str
     points: tuple[str, ...]
@@ -57,10 +64,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
     with Path(path).open("rb") as handle:
         raw = tomllib.load(handle)
 
-    servers = {
-        name: _server_profile(name, value)
-        for name, value in _table(raw, "servers").items()
-    }
+    servers = {name: _server_profile(name, value) for name, value in _table(raw, "servers").items()}
     benchmarks = {
         name: _benchmark_spec(name, value, servers)
         for name, value in _table(raw, "benchmarks").items()
@@ -109,11 +113,33 @@ def require_resolved(value: Any, *, context: str) -> None:
         raise ValueError(f"{context} has unresolved environment variables: {', '.join(names)}")
 
 
-def server_command(server: ServerProfile, executable: Path | None = None) -> tuple[str, ...]:
+def server_launch(server: ServerProfile, executable: Path | None = None) -> ServerLaunch:
     command = list(server.command)
-    if executable is not None:
-        command[0] = str(executable)
-    return tuple(command)
+    selected_executable = executable if executable is not None else Path(command[0])
+    if not selected_executable.is_absolute():
+        selected_executable = ROOT / selected_executable
+    selected_executable = selected_executable.absolute()
+    command[0] = str(selected_executable)
+
+    working_directory = ROOT
+    runtime_root = selected_executable.parent.parent
+    if (runtime_root / "uniserve_worker").is_dir():
+        working_directory = runtime_root
+
+    _resolve_command_path(command, "--worker-python", ROOT)
+    return ServerLaunch(tuple(command), working_directory, dict(server.environment))
+
+
+def _resolve_command_path(command: list[str], option: str, base: Path) -> None:
+    try:
+        value_index = command.index(option) + 1
+    except ValueError:
+        return
+    if value_index >= len(command):
+        raise ValueError(f"{option} requires a path")
+    path = Path(command[value_index])
+    if not path.is_absolute():
+        command[value_index] = str((base / path).absolute())
 
 
 def _server_profile(name: str, raw: Any) -> ServerProfile:
@@ -121,7 +147,11 @@ def _server_profile(name: str, raw: Any) -> ServerProfile:
     allowed = {"command", "host", "port", "environment"}
     _reject_unknown(value, allowed, f"servers.{name}")
     command = value.get("command")
-    if not isinstance(command, list) or not command or not all(isinstance(item, str) for item in command):
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(item, str) for item in command)
+    ):
         raise ValueError(f"servers.{name}.command must be a non-empty string array")
     host = value.get("host", "127.0.0.1")
     port = value.get("port")
@@ -174,7 +204,11 @@ def _suite_profile(
     value = _mapping(raw, f"suites.{name}")
     _reject_unknown(value, {"points", "max_regression"}, f"suites.{name}")
     points = value.get("points")
-    if not isinstance(points, list) or not points or not all(isinstance(item, str) for item in points):
+    if (
+        not isinstance(points, list)
+        or not points
+        or not all(isinstance(item, str) for item in points)
+    ):
         raise ValueError(f"suites.{name}.points must be a non-empty string array")
     if len(set(points)) != len(points):
         raise ValueError(f"suites.{name}.points must be unique")

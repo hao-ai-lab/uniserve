@@ -1834,7 +1834,7 @@ pub struct WorkerCapabilities {
     pub tensorized_mixed: bool,
     pub sampling_ownership: SamplingOwnership,
     pub resource_classes: Vec<ResourceClass>,
-    pub model_spec_digest: Digest,
+    pub model_identity: Digest,
     pub weight_digest: Digest,
     pub protocol_layout_digest: Digest,
     pub restored_snapshots: Vec<SnapshotRef>,
@@ -1892,8 +1892,8 @@ impl WorkerCapabilities {
             "worker capabilities carry a disagreeing protocol-layout digest"
         );
         anyhow::ensure!(
-            (self.model_spec_digest.is_empty() && self.weight_digest.is_empty())
-                || (is_digest(&self.model_spec_digest) && is_digest(&self.weight_digest)),
+            (self.model_identity.is_empty() && self.weight_digest.is_empty())
+                || (is_digest(&self.model_identity) && is_digest(&self.weight_digest)),
             "worker capability model and weight identities are incomplete"
         );
         let restored_session_ids = self
@@ -1978,7 +1978,7 @@ impl Default for WorkerCapabilities {
             tensorized_mixed: false,
             sampling_ownership: SamplingOwnership::DesignatedRank,
             resource_classes: Vec::new(),
-            model_spec_digest: String::new(),
+            model_identity: String::new(),
             weight_digest: String::new(),
             protocol_layout_digest: protocol_layout_digest(),
             restored_snapshots: Vec::new(),

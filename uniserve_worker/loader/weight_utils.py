@@ -22,7 +22,7 @@ from ..nn.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     zero_vocab_padding,
 )
-from ..spec import (
+from .schema import (
     Cast,
     Quantize,
     Rename,

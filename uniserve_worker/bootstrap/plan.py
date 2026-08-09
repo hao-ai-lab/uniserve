@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from ..batch import WorkVariant
+from ..loader.schema import ModelLoadScope
 from ..server.worker_kind import WorkerKind
-from ..spec import ModelLoadScope
 
 
 class WorkerImplementation(StrEnum):

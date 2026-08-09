@@ -195,8 +195,8 @@ impl StageRouter {
         let identities = pools
             .iter()
             .map(|pool| pool.exec.caps())
-            .filter(|caps| !caps.model_spec_digest.is_empty() || !caps.weight_digest.is_empty())
-            .map(|caps| (caps.model_spec_digest, caps.weight_digest))
+            .filter(|caps| !caps.model_identity.is_empty() || !caps.weight_digest.is_empty())
+            .map(|caps| (caps.model_identity, caps.weight_digest))
             .collect::<Vec<_>>();
         if let Some(identity) = identities.first() {
             anyhow::ensure!(
@@ -207,7 +207,7 @@ impl StageRouter {
                 identities.iter().all(|candidate| candidate == identity),
                 "staged model workers expose different model or weight identities"
             );
-            merged.model_spec_digest = identity.0.clone();
+            merged.model_identity = identity.0.clone();
             merged.weight_digest = identity.1.clone();
         }
 

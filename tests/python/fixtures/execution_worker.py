@@ -4,17 +4,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from torch import nn
-
 from uniserve_worker.backends.attention import resolve_attention_selection
 from uniserve_worker.foundation.runtime_config import ExecutionConfig, FlashInferTuningConfig
+from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.server.stub import StubModel, stub_deployment
 from uniserve_worker.worker.model import ModelWorker
 
 
 def execution_worker(
-    model: nn.Module | None = None,
+    model: ExecutionModel | None = None,
     *,
     defer_sampling: bool = False,
     block_size: int = 16,
@@ -29,7 +28,6 @@ def execution_worker(
     return ModelWorker(
         ready,
         mesh=DeviceMesh.trivial(device),
-        model_spec=ready.spec,
         deployment=deployment,
         attention=resolve_attention_selection(
             "torch_sdpa",
@@ -38,7 +36,7 @@ def execution_worker(
         ),
         execution=ExecutionConfig(cuda_graph=False, prefill_cuda_graph=False),
         tokenizer=None,
-        allowed_work_variants=ready.spec.operation_variants(),
+        allowed_work_variants=ready.supported_work,
         defer_sampling=defer_sampling,
         transfer_backend=transfer_backend,
         pipeline_depth=pipeline_depth,

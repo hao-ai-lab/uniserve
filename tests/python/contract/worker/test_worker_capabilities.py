@@ -38,9 +38,9 @@ def test_worker_capability_wire_reports_schedulable_work_and_bounds() -> None:
         WorkVariant.GEN_FLOW.value,
         WorkVariant.MATERIALIZE.value,
     ]
-    assert wire["num_layers"] == worker.model_spec.cache.num_layers
-    assert wire["num_kv_heads"] == worker.model_spec.cache.num_kv_heads
-    assert wire["head_dim"] == worker.model_spec.cache.head_dim
+    assert wire["num_layers"] == worker.model.cache_geometry.num_layers
+    assert wire["num_kv_heads"] == worker.model.cache_geometry.num_kv_heads
+    assert wire["head_dim"] == worker.model.cache_geometry.head_dim
     assert wire["max_batch_operations"] == worker.deployment.max_batch_operations
     assert wire["max_unresolved_window"] == operation_window(
         wire["pipeline_depth"], wire["max_batch_operations"]

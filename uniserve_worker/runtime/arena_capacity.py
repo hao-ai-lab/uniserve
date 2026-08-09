@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..foundation.sizing import ceil_div
-from ..spec import DeploymentOverlay, ModelSpec
+from ..models.generation import GenerationPipeline
+from ..models.runtime import ExecutionModel, WorkerDeployment
 from .latent_capacity import latent_store_capacity_bytes
 from .product_capacity import device_product_arena_bytes
 
@@ -35,8 +36,8 @@ def operation_window(pipeline_depth: int, max_operations: int) -> int:
 
 
 def model_arena_capacity(
-    spec: ModelSpec,
-    deployment: DeploymentOverlay,
+    model: ExecutionModel,
+    deployment: WorkerDeployment,
     *,
     pipeline_depth: int,
     completion_payload_bytes: int,
@@ -58,10 +59,12 @@ def model_arena_capacity(
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(deployment.block_size)
     kv_pages = int(num_blocks) + ceil_div(int(scratch_capacity_tokens), block_size)
-    max_route_tokens = max(
-        (int(route.shape.max_tokens_per_row) for route in spec.routes),
-        default=1,
-    )
+    routes = {
+        stage.route
+        for variant in model.supported_work
+        for stage in model.lower(variant, retain_image=True)
+    }
+    max_route_tokens = max((model.route_max_tokens(route) for route in routes), default=1)
     max_transfer_bytes = max(
         int(num_blocks) * block_size * int(bytes_per_token),
         int(max_latent_feature_bytes),
@@ -69,7 +72,9 @@ def model_arena_capacity(
         1,
     )
 
-    flow = spec.flow
+    flow = model.generation
+    if flow is not None and not isinstance(flow, GenerationPipeline):
+        raise ValueError("model generation behavior has an invalid type")
     latent_bytes = 0
     artifact_bytes = 0
     if flow is not None:

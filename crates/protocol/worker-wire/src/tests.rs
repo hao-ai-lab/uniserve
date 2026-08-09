@@ -1063,7 +1063,7 @@ fn full_caps() -> WorkerCapabilities {
         tensorized_mixed: true,
         sampling_ownership: SamplingOwnership::DesignatedRank,
         resource_classes: vec![ResourceClass::KvBlock],
-        model_spec_digest: digest_string(0x21),
+        model_identity: digest_string(0x21),
         weight_digest: digest_string(0x22),
         restored_snapshots: vec![
             SnapshotRef {

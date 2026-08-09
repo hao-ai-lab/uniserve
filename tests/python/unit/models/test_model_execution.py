@@ -1,4 +1,4 @@
-"""Canonical declarations exposed by every concrete model root."""
+"""Observable execution behavior exposed by concrete model roots."""
 
 from __future__ import annotations
 
@@ -26,12 +26,13 @@ from uniserve_worker.forward import (
 )
 from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
+from uniserve_worker.models.runtime import RowKind
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
+from uniserve_worker.nn.diffusion.schedule import ScheduleDirection
 from uniserve_worker.nn.layer import LayerSpec
 from uniserve_worker.nn.mesh import TensorParallelSpec
 from uniserve_worker.server.stub import StubModel
-from uniserve_worker.spec import RouteRowKind
 
 pytestmark = pytest.mark.unit
 
@@ -187,16 +188,16 @@ def test_sensenova_composition_resolves_top_level_token_ids():
     assert config.llm_config.pad_token_id == 23
 
 
-def test_qwen_projects_loader_data_into_a_stable_declaration():
+def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
     config = _qwen_config()
     model = Qwen3ForCausalLM(config, layer_spec=_layer_spec())
     config["num_hidden_layers"] = 7
     config["max_position_embeddings"] = 4096
 
-    assert model.spec.architecture == "Qwen3ForCausalLM"
-    assert model.spec.cache.num_layers == 1
-    assert model.spec.routes[0].shape.max_tokens_per_row == 128
-    assert model.spec.operation_variants() == {
+    assert model.architecture == "Qwen3ForCausalLM"
+    assert model.cache_geometry.num_layers == 1
+    assert model.route_max_tokens("text") == 128
+    assert model.supported_work == {
         WorkVariant.TOKEN_EXTEND,
         WorkVariant.TOKEN_DECODE,
         WorkVariant.TOKEN_VERIFY,
@@ -338,7 +339,7 @@ def test_qwen_rejects_incomplete_or_untyped_configuration():
         Qwen3ForCausalLM(object(), layer_spec=_layer_spec())  # type: ignore[arg-type]
 
 
-def test_bagel_declares_configured_mixed_mot_route():
+def test_bagel_exposes_configured_generation_behavior():
     config = _bagel_config()
     model = BagelForConditionalGeneration(
         config,
@@ -346,30 +347,25 @@ def test_bagel_declares_configured_mixed_mot_route():
         graph=_LoadedBagelGraph(config),  # type: ignore[arg-type]
     )
 
-    routes = {route.name: route for route in model.spec.routes}
-    assert set(routes) == {"mot", "vae", "vit"}
-    assert routes["mot"].mixed_combinations == ((RouteRowKind.TOKEN, RouteRowKind.FLOW),)
-    assert model.spec.flow is not None
-    assert model.spec.flow.schedule_direction == "descending"
-    assert model.spec.cache.num_layers == 1
+    assert model.allows_mixed("mot", frozenset({RowKind.TOKEN, RowKind.FLOW}))
+    assert model.generation.schedule_direction is ScheduleDirection.DESCENDING
+    assert model.cache_geometry.num_layers == 1
+    assert model.route_max_tokens("vit") == config.vit_token_capacity
 
 
-def test_sensenova_resolves_mutable_checkpoint_config_at_construction():
+def test_sensenova_freezes_runtime_behavior_at_construction():
     config = _sensenova_config()
     model = NEOChatModel(config, layer_spec=_layer_spec())
     config.downsample_ratio = 0.25
     config.max_image_seq_len = 2048
 
-    routes = {route.name: route for route in model.spec.routes}
-    assert set(routes) == {"mot", "vit"}
-    assert routes["mot"].mixed_combinations == ((RouteRowKind.TOKEN, RouteRowKind.FLOW),)
-    assert model.spec.flow is not None
-    assert model.spec.flow.latent_downsample == 4
-    assert model.spec.flow.max_latent_tokens == 16
-    assert model.spec.flow.schedule_direction == "ascending"
+    assert model.allows_mixed("mot", frozenset({RowKind.TOKEN, RowKind.FLOW}))
+    assert model.generation.latent_downsample == 4
+    assert model.generation.max_latent_tokens == 16
+    assert model.generation.schedule_direction is ScheduleDirection.ASCENDING
 
 
-def test_simulation_model_declares_the_configured_mixed_route():
+def test_simulation_model_executes_the_configured_mixed_route():
     model = StubModel()
 
-    assert model.spec.routes[0].mixed_combinations == ((RouteRowKind.TOKEN, RouteRowKind.FLOW),)
+    assert model.allows_mixed("stub", frozenset({RowKind.TOKEN, RowKind.FLOW}))

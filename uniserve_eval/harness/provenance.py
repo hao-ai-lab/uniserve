@@ -19,12 +19,14 @@ PERFORMANCE_ENVIRONMENT = (
 
 def collect_provenance(
     command: Sequence[str],
+    working_directory: Path,
     environment: dict[str, str],
 ) -> dict[str, Any]:
     head = _command(["git", "rev-parse", "HEAD"])
     status = _command(["git", "status", "--short"])
     return {
         "server_command": list(command),
+        "server_working_directory": str(working_directory),
         "git_head": head or None,
         "dirty": bool(status),
         "gpu": _gpu(environment.get("CUDA_VISIBLE_DEVICES")),

@@ -39,7 +39,7 @@ from uniserve_worker.forward import (
     packed_token_positions,
 )
 from uniserve_worker.foundation.sizing import bucketed_length
-from uniserve_worker.spec import CacheSpec
+from uniserve_worker.models.runtime import CacheGeometry
 
 __all__ = ["GraphExecutionError", "GraphRun", "GraphStore"]
 
@@ -130,17 +130,17 @@ class GraphStore:
         *,
         enabled: bool,
         prefill_enabled: bool,
-        cache: CacheSpec,
+        cache: CacheGeometry,
         block_size: int,
-        spec_digest: str,
+        weight_digest: str,
         memory_budget_bytes: int,
         decode_batch_sizes: tuple[int, ...] = (),
         decode_context_blocks: int = 0,
         prefill_token_sizes: tuple[int, ...] = (),
         prefill_row_bucket: int = 8,
     ) -> None:
-        if not spec_digest:
-            raise ValueError("graph store requires a resolved spec digest")
+        if not weight_digest:
+            raise ValueError("graph store requires a weight identity")
         if int(block_size) < 1:
             raise ValueError("graph store block size must be positive")
         if int(memory_budget_bytes) < 0:
@@ -149,7 +149,7 @@ class GraphStore:
         self.prefill_enabled = bool(prefill_enabled)
         self.cache = cache
         self.block_size = int(block_size)
-        self.spec_digest = str(spec_digest)
+        self.weight_digest = str(weight_digest)
         self.memory_budget_bytes = int(memory_budget_bytes)
         self.decode_batch_sizes = tuple(
             sorted({int(value) for value in decode_batch_sizes if int(value) > 0})

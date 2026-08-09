@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from uniserve_eval.profiles import load_config
+from uniserve_eval.profiles import ROOT, load_config
 
 pytestmark = pytest.mark.unit
 
@@ -48,3 +51,52 @@ output_throughput = "higher"
     )
     with pytest.raises(ValueError, match="unexpected"):
         load_config(config)
+
+
+def test_runtime_artifact_launch_uses_its_python_package(tmp_path: Path) -> None:
+    config_path = tmp_path / "profiles.toml"
+    config_path.write_text(
+        """
+[servers.local]
+port = 8000
+command = ["target/release/uniserve", "serve", "model", "--worker-python", ".venv/bin/python"]
+
+[benchmarks.point]
+server = "local"
+task = "text"
+model = "model"
+
+[benchmarks.point.metrics]
+output_throughput = "higher"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    runtime_root = tmp_path / "runtime"
+    executable = runtime_root / "bin" / "uniserve"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    (runtime_root / "uniserve_worker").mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "uniserve_eval.cli",
+            "--config",
+            str(config_path),
+            "plan",
+            "point",
+            "--executable",
+            str(executable),
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    plan = json.loads(result.stdout)[0]
+
+    assert plan["server_command"][0] == str(executable.absolute())
+    worker_python = plan["server_command"].index("--worker-python") + 1
+    assert plan["server_command"][worker_python] == str((ROOT / ".venv/bin/python").absolute())
+    assert plan["server_working_directory"] == str(runtime_root)

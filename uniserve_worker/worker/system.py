@@ -100,7 +100,7 @@ class SystemWorker:
             tensorized_mixed=False,
             sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
             resource_classes=(ResourceClass.ENCODER_OUTPUT,),
-            model_spec_digest="",
+            model_identity="",
             weight_digest="",
         )
         arena = system_arena_capacity(
@@ -124,7 +124,7 @@ class SystemWorker:
         )
         self.trace = ExecutionTrace(hashlib.sha256(b"uniserve-system-worker").hexdigest())
         self.executor = ModelExecutor(
-            spec=None,
+            model=None,
             deployment=None,
             runner=None,
             attention=None,
@@ -137,7 +137,7 @@ class SystemWorker:
             mesh=None,
             transport=self.mover.transport,
             tokenizer=None,
-            model_spec_digest=None,
+            architecture_digest=None,
             weight_digest=None,
             allowed_work_variants=allowed_work_variants,
             trace=self.trace,
@@ -151,7 +151,7 @@ class SystemWorker:
             caps = self._capabilities
             self.snapshot_provider = SnapshotProvider(
                 snapshot_dir,
-                model_spec_digest=self.trace.candidate_digest,
+                model_identity=self.trace.candidate_digest,
                 weight_digest="",
                 topology={
                     "rank": caps.rank.to_wire(),

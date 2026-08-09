@@ -16,9 +16,11 @@ from ..foundation.runtime_config import ExecutionConfig
 from ..foundation.sizing import DEFAULT_MAX_BATCH_OPS
 from ..loader import Loader
 from ..loader.paths import read_config, resolve_model_path
+from ..loader.schema import ModelLoadScope
+from ..models.identity import ModelIdentity, architecture_identity
+from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import TensorParallelSpec
 from ..runtime.compile import TorchCompileConfig, compile_model_pieces
-from ..spec import DeploymentOverlay, ModelLoadScope, ModelSpec, resolved_digest
 from .catalog import CatalogEntry, resolve_catalog_entry
 
 logger = logging.getLogger(__name__)
@@ -40,15 +42,13 @@ class WorkerModelLoadRequest:
 
 @dataclass(frozen=True)
 class LoadedWorkerModel:
-    model: nn.Module
+    model: ExecutionModel
     tokenizer: Any | None
     entry: CatalogEntry
     model_path: str
     scope: ModelLoadScope
-    spec: ModelSpec
-    overlay: DeploymentOverlay
-    weight_digest: str
-    resolved_digest: str
+    deployment: WorkerDeployment
+    identity: ModelIdentity
 
 
 def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
@@ -67,21 +67,22 @@ def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
         execution=request.execution,
         parallel=request.parallel,
     )
-    model = loaded.model
+    model = _check_model_conformance(loaded.model)
 
     _compile_model(model, request.execution)
-    _check_model_conformance(model)
     weight_digest = _checkpoint_weight_digest(model_path, config)
-    spec = _resolve_model_spec(model, weight_digest=weight_digest)
-    spec = _resolve_input_tokens(spec, loaded.tokenizer)
-    setattr(model, "spec", spec)
-    overlay = _deployment_overlay(request, entry)
-    digest = resolved_digest(spec, overlay)
+    _resolve_input_tokens(model, loaded.tokenizer)
+    deployment = _deployment(request)
+    identity = ModelIdentity(
+        architecture=model.architecture,
+        architecture_digest=architecture_identity(entry.architecture, config),
+        weight_digest=weight_digest,
+    )
     logger.info(
-        "resolved model spec architecture=%s revision=%s digest=%s",
-        spec.architecture,
-        spec.revision,
-        digest,
+        "loaded model architecture=%s architecture_digest=%s weight_digest=%s",
+        identity.architecture,
+        identity.architecture_digest,
+        identity.weight_digest,
     )
     return LoadedWorkerModel(
         model=model,
@@ -89,29 +90,16 @@ def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
         entry=entry,
         model_path=model_path,
         scope=request.scope,
-        spec=spec,
-        overlay=overlay,
-        weight_digest=weight_digest,
-        resolved_digest=digest,
+        deployment=deployment,
+        identity=identity,
     )
 
 
-def _resolve_model_spec(
-    model: nn.Module,
-    *,
-    weight_digest: str,
-) -> ModelSpec:
-    spec = model.spec
-    if not isinstance(spec, ModelSpec):
-        raise capability_mismatch(f"{type(model).__name__}.spec must be a ModelSpec")
-    return replace(spec, revision=weight_digest)
-
-
-def _resolve_input_tokens(spec: ModelSpec, tokenizer: Any | None) -> ModelSpec:
-    images = spec.inputs.images
-    if images is None or images.feature_injection is None:
-        return spec
-    injection = images.feature_injection
+def _resolve_input_tokens(model: ExecutionModel, tokenizer: Any | None) -> None:
+    processor = model.image_processor
+    injection = getattr(processor, "feature_injection", None)
+    if processor is None or injection is None:
+        return
     updates: dict[str, int] = {}
     for token_field, id_field in (("start_token", "start_token_id"), ("end_token", "end_token_id")):
         token = getattr(injection, token_field)
@@ -127,14 +115,13 @@ def _resolve_input_tokens(spec: ModelSpec, tokenizer: Any | None) -> ModelSpec:
             raise capability_mismatch(f"tokenizer does not define declared token {token!r}")
         updates[id_field] = int(resolved)
     if not updates:
-        return spec
+        return
     resolved_injection = replace(
         injection,
         start_token_id=updates.get("start_token_id", injection.start_token_id),
         end_token_id=updates.get("end_token_id", injection.end_token_id),
     )
-    resolved_images = replace(images, feature_injection=resolved_injection)
-    return replace(spec, inputs=replace(spec.inputs, images=resolved_images))
+    model.image_processor = replace(processor, feature_injection=resolved_injection)
 
 
 def _checkpoint_weight_digest(model_path: str, config: Mapping[str, Any]) -> str:
@@ -168,12 +155,9 @@ def _checkpoint_weight_digest(model_path: str, config: Mapping[str, Any]) -> str
     return digest.hexdigest()
 
 
-def _deployment_overlay(
-    request: WorkerModelLoadRequest,
-    entry: CatalogEntry,
-) -> DeploymentOverlay:
+def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
     execution = request.execution
-    return DeploymentOverlay(
+    return WorkerDeployment(
         device=request.device,
         model_scope=request.scope.value,
         tp_rank=request.parallel.rank,
@@ -185,7 +169,6 @@ def _deployment_overlay(
         model_dtype=execution.model_dtype,
         kv_cache_dtype=execution.kv_cache_dtype,
         kv_memory_fraction=execution.kv_memory_fraction,
-        resources=entry.resources,
         max_batch_operations=DEFAULT_MAX_BATCH_OPS,
         generation_device=request.generation_device,
     )
@@ -198,9 +181,10 @@ def _require_supported_scope(entry: CatalogEntry, scope: ModelLoadScope) -> None
         )
 
 
-def _check_model_conformance(model: nn.Module) -> None:
-    if not isinstance(model, nn.Module):
-        raise capability_mismatch(f"{type(model).__name__} must inherit torch.nn.Module")
+def _check_model_conformance(model: nn.Module) -> ExecutionModel:
+    if not isinstance(model, ExecutionModel):
+        raise capability_mismatch(f"{type(model).__name__} must implement ExecutionModel")
+    return model
 
 
 def _compile_model(model: nn.Module, execution: ExecutionConfig) -> None:

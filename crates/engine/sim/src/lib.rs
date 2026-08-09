@@ -331,7 +331,7 @@ impl SimEngine {
             max_batch_operations: 1024,
             max_unresolved_window: 2,
             tensorized_mixed: true,
-            model_spec_digest: "0".repeat(64),
+            model_identity: "0".repeat(64),
             weight_digest: "1".repeat(64),
             ..WorkerCapabilities::default()
         };

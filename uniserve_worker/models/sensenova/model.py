@@ -1,4 +1,4 @@
-"""SenseNova-U1 immutable declarations and neural equations."""
+"""SenseNova-U1 execution behavior and neural equations."""
 
 from __future__ import annotations
 
@@ -22,9 +22,11 @@ from ...forward import (
     ForwardBatch,
     ForwardContext,
     ForwardOutput,
+    ForwardRow,
     PackedAttentionPlan,
     PagedDecodePlan,
     PatchInput,
+    RouteId,
     TokenEmbeddings,
     TokenHidden,
     TokenIds,
@@ -35,6 +37,7 @@ from ...forward import (
     TokenSelection,
     packed_token_positions,
 )
+from ...loader.schema import Stack, TowerSplit, WeightSpec
 from ...nn.attention import RadixAttention
 from ...nn.decoder.qwen import Qwen3MLP
 from ...nn.diffusion import (
@@ -58,35 +61,29 @@ from ...nn.placement import WeightMode, set_tower_coord
 from ...nn.rope import HFRotaryEmbedding, RotaryEmbedding, get_rope, qk_norm_rope
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
 from ...nn.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from ...spec import (
-    CacheSpec,
-    FeatureInjectionSpec,
-    FeatureLayout,
-    FlowBranchSource,
-    FlowConditioningKind,
-    FlowPromptSpec,
-    FlowSpec,
-    ImageInputSpec,
-    ImagePatchSpec,
-    InputSpec,
+from ..generation import (
+    BranchSource,
+    FlowPrompt,
+    GenerationPipeline,
     LatentLayout,
-    MaterializationKind,
-    ModelSpec,
+    Materialization,
     NoiseScaleMode,
-    NoiseScaleSpec,
-    OperationSpec,
-    OperationStageCondition,
-    OperationStagePurpose,
-    OperationStageSpec,
+)
+from ..inputs import (
+    FeatureInjection,
+    FeatureLayout,
+    ImageProcessor,
+    PatchTransform,
+)
+from ..runtime import (
+    CacheGeometry,
+    DeviceRole,
+    ExecutionModel,
+    LoweredStage,
     PositionLayout,
-    RoutePlacement,
-    RouteRowKind,
-    RouteShape,
-    RouteShapeGrouping,
-    RouteSpec,
-    Stack,
-    TowerSplit,
-    WeightSpec,
+    ResourceGeometry,
+    RowKind,
+    ScratchGeometry,
 )
 from .config import NeoChatConfig, NeoLlmConfig, NeoVisionConfig
 
@@ -627,7 +624,7 @@ class _LanguageModel(nn.Module):
         )
 
 
-class NEOChatModel(nn.Module):
+class NEOChatModel(ExecutionModel):
     """Concrete stateless SenseNova model for mixed text, flow, and vision rows."""
 
     weight_spec = WeightSpec(
@@ -660,7 +657,7 @@ class NEOChatModel(nn.Module):
         if self._add_noise_embedding:
             self.fm_modules["noise_scale_embedder"] = TimestepEmbedder(hidden)
         set_tower_coord(self.fm_modules, _FLOW_COORDINATE)
-        self.spec = self._build_spec(config)
+        self._configure_runtime(config)
 
     @staticmethod
     def _flow_head(
@@ -685,18 +682,19 @@ class NEOChatModel(nn.Module):
             LinearBase(4096, output_dim, spec=layer_spec, bias=True),
         )
 
-    def _build_spec(self, config: NeoChatConfig) -> ModelSpec:
+    def _configure_runtime(self, config: NeoChatConfig) -> None:
         llm = config.llm_config
         vision = config.vision_config
         max_text = int(getattr(llm, "max_position_embeddings", 32768))
         max_image = max(1, int(getattr(config, "max_image_seq_len", 4096)))
         latent_downsample = int(int(vision.patch_size) * round(1 / float(config.downsample_ratio)))
-        flow = FlowSpec(
+        self.architecture = "NEOChatModel"
+        self.generation = GenerationPipeline(
             latent_downsample=latent_downsample,
             prediction="velocity",
             prediction_dtype="float32",
-            schedule_direction=ScheduleDirection.ASCENDING.value,
-            schedule_shift_domain=ScheduleShiftDomain.SIGMA.value,
+            schedule_direction=ScheduleDirection.ASCENDING,
+            schedule_shift_domain=ScheduleShiftDomain.SIGMA,
             max_latent_tokens=max_image,
             max_vae_grid_tokens=max_image,
             commit_marker_tokens=2,
@@ -706,163 +704,165 @@ class NEOChatModel(nn.Module):
             latent_channels=3,
             latent_patch_size=latent_downsample,
             positions=PositionLayout.TEMPORAL_SPATIAL,
-            conditioning=FlowConditioningKind.IMAGE_PATCHES,
-            materialization=MaterializationKind.RGB_LATENT,
-            noise_scale=NoiseScaleSpec(
-                value=float(getattr(config, "noise_scale", 1.0)),
-                mode=NoiseScaleMode(
-                    str(
-                        getattr(
-                            getattr(config, "noise_scale_mode", "constant"),
-                            "value",
-                            getattr(config, "noise_scale_mode", "constant"),
-                        )
+            materialization=Materialization.RGB_LATENT,
+            noise_scale=float(getattr(config, "noise_scale", 1.0)),
+            noise_scale_mode=NoiseScaleMode(
+                str(
+                    getattr(
+                        getattr(config, "noise_scale_mode", "constant"),
+                        "value",
+                        getattr(config, "noise_scale_mode", "constant"),
                     )
-                ),
-                base_image_tokens=float(getattr(config, "noise_scale_base_image_seq_len", 1.0)),
-                maximum=float(getattr(config, "noise_scale_max_value", 1.0)),
+                )
             ),
-            text_unconditional=FlowBranchSource.NEGATIVE_OR_START,
-            image_unconditional=FlowBranchSource.START,
-            cfg_recipe=CfgRecipe.ADDITIVE_DELTAS.value,
+            noise_scale_base_tokens=float(
+                getattr(config, "noise_scale_base_image_seq_len", 1.0)
+            ),
+            noise_scale_maximum=float(getattr(config, "noise_scale_max_value", 1.0)),
+            text_unconditional=BranchSource.NEGATIVE_OR_START,
+            image_unconditional=BranchSource.START,
+            cfg_recipe=CfgRecipe.ADDITIVE_DELTAS,
+            prompt=FlowPrompt(
+                user_prefix="<|im_start|>user\n",
+                user_suffix="<|im_end|>\n",
+                assistant_suffix="<|im_start|>assistant\n",
+                conditioned_append="<think>\n\n</think>\n\n<img>",
+                unconditional_append="<img>",
+                system_prefix="<|im_start|>system\n",
+                system_message=_FLOW_SYSTEM_MESSAGE,
+                system_suffix="<|im_end|>\n",
+            ),
         )
-        return ModelSpec(
-            architecture="NEOChatModel",
-            routes=(
-                RouteSpec(
-                    name="mot",
-                    row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW),
-                    mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.MESH,
-                    topology_axes=("tp", "tower"),
-                    shape=RouteShape(
-                        max_tokens_per_row=max(max_text, max_image),
-                        token_multiple=1,
-                    ),
-                    graph_eligible=True,
-                ),
-                RouteSpec(
-                    name="vit",
-                    row_kinds=(RouteRowKind.ENCODE,),
-                    mixed_combinations=(),
-                    dtype="bfloat16",
-                    placement=RoutePlacement.PRIMARY,
-                    topology_axes=("tp",),
-                    shape=RouteShape(
-                        max_tokens_per_row=_MAX_VISION_TOKENS,
-                        token_multiple=1,
-                        grouping=RouteShapeGrouping.INPUT_SHAPE,
-                    ),
-                    graph_eligible=False,
-                ),
+        self.image_processor = ImageProcessor(
+            vit=PatchTransform(
+                patch_size=int(vision.patch_size),
+                downsample_ratio=float(vision.downsample_ratio),
+                min_pixels=512 * 512,
+                max_pixels=2048 * 2048,
+                multi_image_pixel_budget=4096 * 4096,
             ),
-            operations=(
-                OperationSpec(
-                    WorkVariant.TOKEN_EXTEND, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
-                ),
-                OperationSpec(
-                    WorkVariant.TOKEN_DECODE, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
-                ),
-                OperationSpec(
-                    WorkVariant.TOKEN_VERIFY, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
-                ),
-                OperationSpec(
-                    WorkVariant.GEN_TRANSITION, (OperationStageSpec("mot", RouteRowKind.FLOW),)
-                ),
-                OperationSpec(
-                    WorkVariant.GEN_FLOW, (OperationStageSpec("mot", RouteRowKind.FLOW),)
-                ),
-                OperationSpec(
-                    WorkVariant.ENCODE_VISION,
-                    (
-                        OperationStageSpec("vit", RouteRowKind.ENCODE),
-                        OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
-                    ),
-                ),
-                OperationSpec(
-                    WorkVariant.MATERIALIZE,
-                    (
-                        OperationStageSpec(
-                            "vit",
-                            RouteRowKind.ENCODE,
-                            OperationStagePurpose.STATE,
-                            OperationStageCondition.RETAIN_IMAGE,
-                        ),
-                        OperationStageSpec(
-                            "mot",
-                            RouteRowKind.TOKEN,
-                            OperationStagePurpose.STATE,
-                            OperationStageCondition.RETAIN_IMAGE,
-                        ),
-                    ),
-                ),
-                OperationSpec(WorkVariant.TRANSFER_PRODUCT),
-                OperationSpec(
-                    WorkVariant.TRANSFER_KV_PUBLISH,
-                    (
-                        OperationStageSpec("vit", RouteRowKind.ENCODE, OperationStagePurpose.STATE),
-                        OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
-                    ),
-                ),
-                OperationSpec(
-                    WorkVariant.TRANSFER_KV_INSTALL,
-                    (
-                        OperationStageSpec("vit", RouteRowKind.ENCODE, OperationStagePurpose.STATE),
-                        OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
-                    ),
-                ),
+            staging_dtype="bfloat16",
+            feature_injection=FeatureInjection(
+                layout=FeatureLayout.DIRECT,
+                positions=PositionLayout.TEMPORAL_SPATIAL,
+                start_token="<img>",
+                end_token="</img>",
             ),
-            weights=self.weight_spec,
-            inputs=InputSpec(
-                requires_worker_tokenizer=True,
-                flow_prompt=FlowPromptSpec(
-                    user_prefix="<|im_start|>user\n",
-                    user_suffix="<|im_end|>\n",
-                    assistant_suffix="<|im_start|>assistant\n",
-                    conditioned_append="<think>\n\n</think>\n\n<img>",
-                    unconditional_append="<img>",
-                    system_prefix="<|im_start|>system\n",
-                    system_message=_FLOW_SYSTEM_MESSAGE,
-                    system_suffix="<|im_end|>\n",
-                ),
-                images=ImageInputSpec(
-                    vit=ImagePatchSpec(
-                        patch_size=int(vision.patch_size),
-                        downsample_ratio=float(vision.downsample_ratio),
-                        min_pixels=512 * 512,
-                        max_pixels=2048 * 2048,
-                        multi_image_pixel_budget=4096 * 4096,
-                        normalization="imagenet",
-                    ),
-                    staging_dtype="bfloat16",
-                    feature_injection=FeatureInjectionSpec(
-                        layout=FeatureLayout.DIRECT,
-                        positions=PositionLayout.TEMPORAL_SPATIAL,
-                        start_token="<img>",
-                        end_token="</img>",
-                    ),
-                ),
-                encoder_cache_budget=256,
-                max_vit_grid_tokens=_MAX_VISION_TOKENS,
-            ),
-            cache=CacheSpec(
-                num_layers=int(llm.num_hidden_layers),
-                num_attention_heads=local_attention_head_count(
-                    int(llm.num_attention_heads),
-                    parallel=self._parallel,
-                ),
-                num_kv_heads=local_kv_head_count(
-                    int(llm.num_key_value_heads),
-                    parallel=self._parallel,
-                ),
-                head_dim=int(llm.head_dim),
-                dtype="bfloat16",
-                store_dtype="bfloat16",
-                position_layout=PositionLayout.TEMPORAL_SPATIAL,
-            ),
-            flow=flow,
         )
+        self.cache_geometry = CacheGeometry(
+            num_layers=int(llm.num_hidden_layers),
+            num_attention_heads=local_attention_head_count(
+                int(llm.num_attention_heads), parallel=self._parallel
+            ),
+            num_kv_heads=local_kv_head_count(
+                int(llm.num_key_value_heads), parallel=self._parallel
+            ),
+            head_dim=int(llm.head_dim),
+            dtype="bfloat16",
+            store_dtype="bfloat16",
+        )
+        self.resource_geometry = ResourceGeometry(
+            encoder_cache_entries=256,
+            latent_downsample=latent_downsample,
+            scratch=ScratchGeometry(minimum_blocks=8, mirror_kv=True, latent_copies=4),
+        )
+        self.supported_work = frozenset(
+            {
+                WorkVariant.TOKEN_EXTEND,
+                WorkVariant.TOKEN_DECODE,
+                WorkVariant.TOKEN_VERIFY,
+                WorkVariant.GEN_TRANSITION,
+                WorkVariant.GEN_FLOW,
+                WorkVariant.ENCODE_VISION,
+                WorkVariant.MATERIALIZE,
+                WorkVariant.TRANSFER_PRODUCT,
+                WorkVariant.TRANSFER_KV_PUBLISH,
+                WorkVariant.TRANSFER_KV_INSTALL,
+            }
+        )
+        self.max_vit_grid_tokens = _MAX_VISION_TOKENS
+        self._route_token_bounds = {
+            RouteId("mot"): max(max_text, max_image),
+            RouteId("vit"): _MAX_VISION_TOKENS,
+        }
+
+    def lower(
+        self,
+        variant: WorkVariant,
+        *,
+        retain_image: bool = False,
+    ) -> tuple[LoweredStage, ...]:
+        if variant in {
+            WorkVariant.TOKEN_EXTEND,
+            WorkVariant.TOKEN_DECODE,
+            WorkVariant.TOKEN_VERIFY,
+        }:
+            return (LoweredStage(RouteId("mot"), RowKind.TOKEN),)
+        if variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}:
+            return (LoweredStage(RouteId("mot"), RowKind.FLOW),)
+        if variant is WorkVariant.ENCODE_VISION:
+            return (
+                LoweredStage(RouteId("vit"), RowKind.ENCODE),
+                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
+            )
+        if variant is WorkVariant.MATERIALIZE:
+            if not retain_image:
+                return ()
+            return (
+                LoweredStage(RouteId("vit"), RowKind.ENCODE, publishes_state=True),
+                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
+            )
+        if variant is WorkVariant.TRANSFER_PRODUCT:
+            return ()
+        if variant in {WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL}:
+            return (
+                LoweredStage(RouteId("vit"), RowKind.ENCODE, publishes_state=True),
+                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
+            )
+        return ()
+
+    def route_dtype(self, route: RouteId) -> str:
+        self._require_route(route)
+        return "bfloat16"
+
+    def route_device_role(self, route: RouteId) -> DeviceRole:
+        self._require_route(route)
+        return DeviceRole.PRIMARY
+
+    def route_topology(self, route: RouteId) -> tuple[str, ...]:
+        self._require_route(route)
+        return ("tp", "tower") if route == "mot" else ("tp",)
+
+    def route_graph_eligible(self, route: RouteId) -> bool:
+        self._require_route(route)
+        return route == "mot"
+
+    def route_max_tokens(self, route: RouteId) -> int:
+        try:
+            return self._route_token_bounds[route]
+        except KeyError:
+            raise ValueError(f"SenseNova received unknown route {route!s}") from None
+
+    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
+        self._require_route(route)
+        if route == "mot":
+            return ()
+        if isinstance(row, EncodeRow):
+            return tuple(int(value) for value in row.inputs.pixels.shape)
+        raise TypeError(f"SenseNova route {route!s} received an incompatible row")
+
+    def route_uses_packed_attention(self, route: RouteId) -> bool:
+        self._require_route(route)
+        return route == "mot"
+
+    def allows_mixed(self, route: RouteId, rows: frozenset[RowKind]) -> bool:
+        self._require_route(route)
+        return route == "mot" and rows <= {RowKind.TOKEN, RowKind.FLOW}
+
+    @staticmethod
+    def _require_route(route: RouteId) -> None:
+        if route not in {"mot", "vit"}:
+            raise ValueError(f"SenseNova received unknown route {route!s}")
 
     def forward(self, batch: ForwardBatch) -> ForwardOutput:
         if batch.route == "mot":

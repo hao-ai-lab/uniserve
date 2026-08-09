@@ -1,4 +1,4 @@
-"""System-owned physical KV residency provisioned from immutable specs."""
+"""System-owned physical KV residency provisioned from model geometry."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import torch
 from ..capabilities import WorkerCapabilities
 from ..foundation.runtime_config import graph_padding_block_count
 from ..foundation.sizing import ceil_div
-from ..spec import ModelSpec, ResourcePlan
+from ..models.runtime import ExecutionModel, ResourceGeometry
 from .kv_pool import PagedKVPool
 
 __all__ = ["ResidencyStore"]
@@ -20,24 +20,24 @@ class ResidencyStore:
         self.kv = kv
 
     @classmethod
-    def from_spec(
+    def from_model(
         cls,
-        spec: ModelSpec,
+        model: ExecutionModel,
         capabilities: WorkerCapabilities,
-        resources: ResourcePlan,
+        resources: ResourceGeometry,
         *,
         device: str,
     ) -> ResidencyStore:
-        """Provision all physical KV storage from resolved declarations.
+        """Provision all physical KV storage from resolved model geometry.
 
         Leased capacity and transaction-branch capacity are ranges of one
         storage tensor, so any batch can attend over both at once.
         """
 
-        if resources.kv_block is None and resources.scratch is None:
+        if not resources.kv and resources.scratch is None:
             return cls(kv=None)
 
-        cache = spec.cache
+        cache = model.cache_geometry
         block_size = int(capabilities.block_size)
         reserved = graph_padding_block_count(block_size)
         branch_blocks = 0

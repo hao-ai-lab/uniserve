@@ -18,12 +18,8 @@ from ..nn.mesh import TensorParallelSpec
 from ..nn.quant import QuantizationConfig
 from ..nn.quant.base import process_quantized_modules
 from ..nn.quant.load_state import is_optional_checkpoint
-from ..spec import (
-    Sidecar,
-    WeightSpec,
-    WeightTarget,
-)
 from .paths import read_config
+from .schema import Sidecar, WeightSpec, WeightTarget
 from .transformers import dtype_from_name, load_native_transformers_checkpoint
 from .weight_utils import (
     apply_weight_ties,
@@ -98,10 +94,10 @@ class Loader:
             )
         else:
             raise capability_mismatch(f"unknown catalog checkpoint format {kind!r}")
-        spec = getattr(loaded.model, "spec", None)
-        if spec is None or not isinstance(getattr(spec, "weights", None), WeightSpec):
+        spec = getattr(loaded.model, "weight_spec", None)
+        if not isinstance(spec, WeightSpec):
             raise capability_mismatch("a loaded model must declare a WeightSpec before ready")
-        loaded.model.spec = replace(spec, weights=_declare_targets(spec.weights, loaded.model))
+        cast(Any, loaded.model).weight_spec = _declare_targets(spec, loaded.model)
         return loaded
 
     def _stream(
@@ -251,7 +247,7 @@ def _declared_config(entry: Any, model_path: str) -> dict[str, Any]:
 
 
 def _weight_spec(model: nn.Module) -> WeightSpec:
-    spec = getattr(getattr(model, "spec", None), "weights", None)
+    spec = getattr(model, "weight_spec", None)
     if not isinstance(spec, WeightSpec):
         raise capability_mismatch(f"{type(model).__name__} must declare a WeightSpec")
     return spec
@@ -270,11 +266,7 @@ def _require_loaded_parameters(model: nn.Module, loaded: set[str]) -> None:
 
 
 def _prepare_serving_dtype(model: nn.Module) -> None:
-    routes = tuple(getattr(getattr(model, "spec", None), "routes", ()))
-    names = {str(route.dtype).removeprefix("torch.") for route in routes}
-    if len(names) != 1:
-        return
-    dtype = getattr(torch, names.pop(), None)
+    dtype = getattr(torch, str(getattr(model, "serving_dtype", "")).removeprefix("torch."), None)
     if not isinstance(dtype, torch.dtype):
         return
     quantized = any(

@@ -20,8 +20,8 @@ from ..nn.quant.load_state import (
     restore_tensor_policy,
     skip_serving_cast,
 )
-from ..spec import Tie, TowerSplit, WeightSpec
 from .paths import read_config
+from .schema import Tie, TowerSplit, WeightSpec
 from .weight_utils import (
     apply_weight_ties,
     iter_weights,

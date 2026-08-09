@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-from torch import nn
 
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import DevicePoint, ProductKind, TokenMode, WorkVariant
@@ -15,11 +14,9 @@ from uniserve_worker.server.stub import StubModel
 pytestmark = pytest.mark.integration
 
 
-class _Observed(nn.Module):
+class _Observed(StubModel):
     def __init__(self) -> None:
         super().__init__()
-        self.neural = StubModel()
-        self.spec = self.neural.spec
         self.calls: list[tuple[str, tuple[str, ...], str]] = []
 
     def forward(self, batch: ForwardBatch) -> ForwardOutput:
@@ -30,7 +27,7 @@ class _Observed(nn.Module):
                 type(batch.context.attention).__name__,
             )
         )
-        return self.neural(batch)
+        return super().forward(batch)
 
 
 def test_warmup_is_a_safe_noop_off_cuda() -> None:

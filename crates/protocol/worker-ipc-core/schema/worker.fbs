@@ -196,7 +196,7 @@ table WorkerCapabilities {
   tensorized_mixed:bool;
   sampling_ownership:SamplingOwnership;
   resource_classes:[ResourceClass];
-  model_spec_digest:string;
+  model_identity:string;
   weight_digest:string;
   protocol_layout_digest:string;
   restored_snapshots:[SnapshotRef];

@@ -1,4 +1,4 @@
-"""Resolve scheduler capabilities from immutable model and deployment specs."""
+"""Resolve scheduler capabilities from one loaded model and worker geometry."""
 
 from __future__ import annotations
 
@@ -18,12 +18,12 @@ from ..foundation.runtime_config import (
     graph_padding_block_count,
 )
 from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
-from ..spec import (
-    DeploymentOverlay,
-    ModelSpec,
-    OperationStagePurpose,
-    OperationStageSpec,
-    RouteRowKind,
+from ..models.generation import GenerationPipeline
+from ..models.runtime import (
+    ExecutionModel,
+    LoweredStage,
+    RowKind,
+    WorkerDeployment,
     active_latent_capacity_tokens,
 )
 from .arena_capacity import operation_window
@@ -32,30 +32,15 @@ __all__ = ["prove_depth_one_lowering", "resolve_capabilities"]
 
 
 def prove_depth_one_lowering(
-    spec: ModelSpec,
+    model: ExecutionModel,
     supported_work: Sequence[WorkVariant],
-) -> dict[WorkVariant, OperationStageSpec | None]:
-    """Prove every advertised work variant lowers to one declared model route.
+) -> dict[WorkVariant, LoweredStage | None]:
+    """Prove that each advertised leaf lowers to at most one neural primary."""
 
-    Each admitted variant resolves through the single primary stage of its
-    ``OperationSpec`` to one ``RouteSpec`` the model declares. A stage-less
-    system-only operation, and a materialization that carries no neural primary
-    stage, lower to no route — the same model-free frame lowering the executor
-    performs in ``_operation_stages_for`` — and map to ``None`` rather than
-    failing. Admission fails deterministically when a variant names no
-    operation, a variant declares
-    more than one primary stage (which would break one-variant-to-one-route), or
-    a primary stage names a route the model does not declare.
-    """
-
-    route_names = {route.name for route in spec.routes}
-    primary_by_variant: dict[WorkVariant, OperationStageSpec | None] = {}
+    primary_by_variant: dict[WorkVariant, LoweredStage | None] = {}
     for variant in supported_work:
-        operation = spec.operation(variant)
         primaries = tuple(
-            stage
-            for stage in operation.stages
-            if stage.purpose is OperationStagePurpose.PRIMARY
+            stage for stage in model.lower(variant) if not stage.publishes_state
         )
         if len(primaries) > 1:
             raise invalid_descriptor(
@@ -63,56 +48,44 @@ def prove_depth_one_lowering(
                 "breaking one-variant-to-one-route lowering"
             )
         if not primaries:
-            # A variant with no primary neural stage lowers onto no compute
-            # route: transfer and KV state-publication ops carry only STATE
-            # stages, a materialized frame is model-free, and system ops are
-            # stage-less. They map to no route rather than failing.
             primary_by_variant[variant] = None
             continue
-        stage = primaries[0]
-        if stage.route not in route_names:
-            raise invalid_descriptor(
-                f"work variant {variant.value!r} lowers onto undeclared route {stage.route!r}"
-            )
-        primary_by_variant[variant] = stage
+        primary_by_variant[variant] = primaries[0]
     return primary_by_variant
 
 
 def _route_tensorized_mixed(
-    spec: ModelSpec,
-    primary_by_variant: dict[WorkVariant, OperationStageSpec | None],
+    model: ExecutionModel,
+    primary_by_variant: dict[WorkVariant, LoweredStage | None],
 ) -> bool:
-    """Whether any declared route admits a mixed row combination reachable by the
-    admitted work: every row kind of a declared combination must be produced by a
-    primary stage the advertised variants lower onto."""
-
-    primary_rows: dict[str, set[RouteRowKind]] = {}
+    primary_rows: dict[str, set[RowKind]] = {}
     for stage in primary_by_variant.values():
         if stage is not None:
             primary_rows.setdefault(stage.route, set()).add(stage.row)
     return any(
-        any(
-            set(combination) <= primary_rows.get(route.name, set())
-            for combination in route.mixed_combinations
-        )
-        for route in spec.routes
+        len(rows) > 1 and model.allows_mixed(stage.route, frozenset(rows))
+        for stage in primary_by_variant.values()
+        if stage is not None
+        for rows in (primary_rows[stage.route],)
     )
 
 
 def resolve_capabilities(
-    spec: ModelSpec,
-    deployment: DeploymentOverlay,
+    model: ExecutionModel,
+    deployment: WorkerDeployment,
     *,
-    model_spec_digest: str | None = None,
+    architecture_digest: str | None = None,
     weight_digest: str | None = None,
     pipeline_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
 ) -> WorkerCapabilities:
-    """Build the complete capability snapshot without consulting model code."""
+    """Build the complete capability snapshot from model-owned behavior."""
 
-    resources = deployment.resources
-    bytes_per_token = _kv_bytes_per_token(spec, deployment)
-    flow = spec.flow
+    resources = model.resource_geometry
+    bytes_per_token = _kv_bytes_per_token(model, deployment)
+    flow = model.generation
+    if flow is not None and not isinstance(flow, GenerationPipeline):
+        raise invalid_descriptor("model generation behavior has an invalid type")
     max_latent_size = (
         active_latent_capacity_tokens(
             int(flow.max_latent_tokens),
@@ -121,8 +94,10 @@ def resolve_capabilities(
         if flow is not None
         else 0
     )
-    hidden_elements = int(spec.cache.num_attention_heads) * int(spec.cache.head_dim)
-    max_vision_feature_bytes = int(spec.inputs.max_vit_grid_tokens) * hidden_elements * 2
+    cache = model.cache_geometry
+    max_vit_grid_tokens = int(getattr(model, "max_vit_grid_tokens", 0))
+    hidden_elements = int(cache.num_attention_heads) * int(cache.head_dim)
+    max_vision_feature_bytes = max_vit_grid_tokens * hidden_elements * 2
     max_latent_feature_bytes = (
         0
         if flow is None
@@ -136,6 +111,7 @@ def resolve_capabilities(
     )
     resident_copies, co_resident_blocks = _kv_residency_shape(
         deployment,
+        resources,
         max_latent_size=max_latent_size,
         bytes_per_token=bytes_per_token,
     )
@@ -150,6 +126,7 @@ def resolve_capabilities(
     )
     scratch_capacity = _scratch_capacity_tokens(
         deployment,
+        resources,
         num_blocks=int(capacity.num_blocks),
         max_latent_size=max_latent_size,
     )
@@ -164,20 +141,16 @@ def resolve_capabilities(
         RequestKind.COPY_KV,
         RequestKind.RELEASE_PRODUCTS,
     ]
-    supported_work = configured_work_variants(
-        operation.kind for operation in spec.operations
-    )
-    # Startup lowering proof: every advertised variant must reduce to one
-    # declared route via its primary stage before the capability is published.
-    primary_by_variant = prove_depth_one_lowering(spec, supported_work)
-    tensorized_mixed = _route_tensorized_mixed(spec, primary_by_variant)
+    supported_work = configured_work_variants(model.supported_work)
+    primary_by_variant = prove_depth_one_lowering(model, supported_work)
+    tensorized_mixed = _route_tensorized_mixed(model, primary_by_variant)
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
     return WorkerCapabilities(
         block_size=int(deployment.block_size),
         num_blocks=int(capacity.num_blocks),
-        num_layers=int(spec.cache.num_layers),
-        num_kv_heads=int(spec.cache.num_kv_heads),
-        head_dim=int(spec.cache.head_dim),
+        num_layers=int(cache.num_layers),
+        num_kv_heads=int(cache.num_kv_heads),
+        head_dim=int(cache.head_dim),
         scratch_capacity_tokens=scratch_capacity,
         supported_work=supported_work,
         max_latent_size=max_latent_size,
@@ -191,11 +164,11 @@ def resolve_capabilities(
         sampling_ownership=sampling_ownership,
         resource_classes=tuple(ResourceClass(value) for value in resources.classes()),
         attention_backend=deployment.attention_backend or "auto",
-        kv_dtype=_kv_dtype(spec, deployment),
+        kv_dtype=_kv_dtype(model, deployment),
         model_dtype=deployment.model_dtype,
-        encoder_cache_budget=int(spec.inputs.encoder_cache_budget),
+        encoder_cache_budget=int(resources.encoder_cache_entries),
         max_vae_grid_tokens=int(flow.max_vae_grid_tokens) if flow is not None else 0,
-        max_vit_grid_tokens=int(spec.inputs.max_vit_grid_tokens),
+        max_vit_grid_tokens=max_vit_grid_tokens,
         max_latent_feature_bytes=max_latent_feature_bytes,
         max_vision_feature_bytes=max_vision_feature_bytes,
         commit_marker_tokens=int(flow.commit_marker_tokens) if flow is not None else 2,
@@ -205,33 +178,35 @@ def resolve_capabilities(
         pipeline_depth=int(pipeline_depth),
         groups=(),
         quantization=None,
-        model_spec_digest=model_spec_digest or "",
+        model_identity=architecture_digest or "",
         weight_digest=weight_digest or "",
     )
 
 
-def _kv_dtype(spec: ModelSpec, deployment: DeploymentOverlay) -> str:
+def _kv_dtype(model: ExecutionModel, deployment: WorkerDeployment) -> str:
     override = deployment.kv_cache_dtype
     if override is None:
-        return str(spec.cache.store_dtype or spec.cache.dtype).removeprefix("torch.")
+        cache = model.cache_geometry
+        return str(cache.store_dtype or cache.dtype).removeprefix("torch.")
     return str(override).removeprefix("torch.")
 
 
-def _kv_bytes_per_token(spec: ModelSpec, deployment: DeploymentOverlay) -> int:
+def _kv_bytes_per_token(model: ExecutionModel, deployment: WorkerDeployment) -> int:
     width = {
         "float8_e4m3fn": 1,
         "float16": 2,
         "bfloat16": 2,
         "float32": 4,
-    }.get(_kv_dtype(spec, deployment).lower())
+    }.get(_kv_dtype(model, deployment).lower())
     if width is None:
-        raise ValueError(f"unsupported KV dtype {_kv_dtype(spec, deployment)!r}")
-    cache = spec.cache
+        raise ValueError(f"unsupported KV dtype {_kv_dtype(model, deployment)!r}")
+    cache = model.cache_geometry
     return 2 * int(width) * int(cache.num_layers) * int(cache.num_kv_heads) * int(cache.head_dim)
 
 
 def _kv_residency_shape(
-    deployment: DeploymentOverlay,
+    deployment: WorkerDeployment,
+    resources: object,
     *,
     max_latent_size: int,
     bytes_per_token: int,
@@ -253,7 +228,7 @@ def _kv_residency_shape(
         graph_memory_budget_bytes(device_total_bytes(deployment.device)),
         block_size * max(1, int(bytes_per_token)),
     )
-    scratch = deployment.resources.scratch
+    scratch = getattr(resources, "scratch", None)
     if scratch is None:
         return 1, padding_blocks + graph_blocks
     fixed_blocks = ceil_div(int(scratch.fixed_tokens), block_size)
@@ -267,12 +242,13 @@ def _kv_residency_shape(
 
 
 def _scratch_capacity_tokens(
-    deployment: DeploymentOverlay,
+    deployment: WorkerDeployment,
+    resources: object,
     *,
     num_blocks: int,
     max_latent_size: int,
 ) -> int:
-    scratch = deployment.resources.scratch
+    scratch = getattr(resources, "scratch", None)
     if scratch is None:
         return 0
     block_size = int(deployment.block_size)

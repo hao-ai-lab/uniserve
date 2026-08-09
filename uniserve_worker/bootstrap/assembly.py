@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
-from torch import nn
-
-from ..spec import ModelSpec
+from ..models.identity import architecture_identity
+from ..models.runtime import ExecutionModel
 from .config import WorkerLaunchConfig
 from .plan import WorkerImplementation, resolve_worker_plan
 
@@ -54,8 +53,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         from ..server.stub import StubModel, stub_deployment
 
         stub = StubModel()
-        model: nn.Module = stub
-        model_spec: ModelSpec = stub.spec
+        model: ExecutionModel = stub
         deployment = replace(
             stub_deployment(config.resources.block_size),
             device=config.placement.device,
@@ -74,7 +72,10 @@ def assemble_worker(config: WorkerLaunchConfig):
             ),
         )
         tokenizer = None
-        model_spec_digest = None
+        architecture_digest = architecture_identity(
+            stub.architecture,
+            {"architecture": stub.architecture},
+        )
         weight_digest = None
     else:
         from .model_loader import WorkerModelLoadRequest, load_worker_model
@@ -100,11 +101,10 @@ def assemble_worker(config: WorkerLaunchConfig):
             )
         )
         model = loaded.model
-        model_spec = loaded.spec
-        deployment = loaded.overlay
+        deployment = loaded.deployment
         tokenizer = loaded.tokenizer
-        model_spec_digest = loaded.resolved_digest
-        weight_digest = loaded.weight_digest
+        architecture_digest = loaded.identity.architecture_digest
+        weight_digest = loaded.identity.weight_digest
 
     place_towers(model, mesh)
 
@@ -119,7 +119,6 @@ def assemble_worker(config: WorkerLaunchConfig):
     return ModelWorker(
         model,
         mesh=mesh,
-        model_spec=model_spec,
         deployment=deployment,
         attention=attention,
         execution=config.execution,
@@ -128,7 +127,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         defer_sampling=config.data_plane.defer_sampling,
         transfer_backend=config.data_plane.backend,
         cross_process=config.worker_kind.value != "full",
-        model_spec_digest=model_spec_digest,
+        architecture_digest=architecture_digest,
         weight_digest=weight_digest,
         pipeline_depth=config.ipc.pipeline_depth,
         completion_payload_bytes=config.ipc.max_payload_bytes,

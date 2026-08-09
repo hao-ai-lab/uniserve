@@ -725,10 +725,10 @@ fn capabilities_from_table(
             })
             .transpose()?
             .unwrap_or_default(),
-        model_spec_digest: caps
-            .model_spec_digest()
+        model_identity: caps
+            .model_identity()
             .map(str::to_string)
-            .context("capabilities.model_spec_digest is missing")?,
+            .context("capabilities.model_identity is missing")?,
         weight_digest: caps
             .weight_digest()
             .map(str::to_string)
@@ -2067,7 +2067,7 @@ fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCa
                 .map(resource_class_to_fb)
                 .collect(),
         ),
-        model_spec_digest: Some(caps.model_spec_digest.clone()),
+        model_identity: Some(caps.model_identity.clone()),
         weight_digest: Some(caps.weight_digest.clone()),
         protocol_layout_digest: Some(caps.protocol_layout_digest.clone()),
         restored_snapshots: Some(caps.restored_snapshots.iter().map(snapshot_to_fb).collect()),
@@ -2138,9 +2138,9 @@ fn capabilities_from_fb(caps: fbs::WorkerCapabilitiesT) -> anyhow::Result<Worker
             .into_iter()
             .map(resource_class_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        model_spec_digest: caps
-            .model_spec_digest
-            .context("capabilities.model_spec_digest is missing")?,
+        model_identity: caps
+            .model_identity
+            .context("capabilities.model_identity is missing")?,
         weight_digest: caps
             .weight_digest
             .context("capabilities.weight_digest is missing")?,
