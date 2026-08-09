@@ -42,7 +42,10 @@ pub use input::{
     ModelEventIdentity, OutputContract, OutputProcessorPolicy, PromptInput, SamplingConfig,
     SchedulingBounds, StopConfig, SubmissionMetadata, TokenizedGenerateReqInput,
 };
-pub use model::{BagelDesc, Qwen3Desc, ResolvedModel, SenseNovaDesc};
+pub use model::{
+    BagelDesc, Qwen3Desc, ResolvedModel, SenseNovaDesc, ServedEndpoint, ServedFeature,
+    ServedModality, ServedModelCapabilities, ServedSamplingControl,
+};
 
 use crate::chat::{AssistantBlockKind, AssistantContentBlock, ChatEvent, Qwen3ChatOutputProcessor};
 use crate::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
@@ -927,6 +930,23 @@ pub struct RuntimeMetricsSnapshot {
     pub cancelled: u64,
     pub aborted: u64,
     pub failed: u64,
+}
+
+impl RuntimeMetricsSnapshot {
+    /// Stable lifecycle state names and values exported by the public metrics
+    /// route.
+    pub const fn state_counts(self) -> [(&'static str, u64); 8] {
+        [
+            ("active", self.active),
+            ("accepted", self.accepted),
+            ("scheduled", self.scheduled),
+            ("finished", self.finished),
+            ("rejected", self.rejected),
+            ("cancelled", self.cancelled),
+            ("aborted", self.aborted),
+            ("failed", self.failed),
+        ]
+    }
 }
 
 struct LifecycleGuard {

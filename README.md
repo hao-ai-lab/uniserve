@@ -64,6 +64,10 @@ List the configured model:
 curl -s http://127.0.0.1:8000/v1/models
 ```
 
+Model discovery returns exactly one entry. Its top-level `id` is the configured served-model name; `identity` contains the load-bound description, profile, and configuration fingerprint; and `capabilities` contains only admitted endpoints, input/output modalities, features, and sampling controls. All three descriptions expose streaming, usage, logprobs, and the configured sampler controls. Qwen3 additionally exposes reasoning and tool calling. SenseNova exposes reasoning and repeated interleave. SenseNova and Bagel expose image input, image output, and the image-generation endpoint.
+
+The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requests`, labeled by served-model name, profile, description, and state. `active` is the instantaneous in-flight count; `accepted`, `scheduled`, `finished`, `rejected`, `cancelled`, `aborted`, and `failed` are cumulative for the running serving runtime. Scheduler, worker, cache, request-latency, and HTTP metrics share the same OpenMetrics response.
+
 Submit a chat completion:
 
 ```bash

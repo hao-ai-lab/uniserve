@@ -38,6 +38,14 @@ fn resolved_model(
     description: ModelDescription,
     model_type: &str,
 ) -> (tempfile::TempDir, DynTokenizer, ResolvedModel) {
+    try_resolved_model(description, model_type, runtime_capabilities()).unwrap()
+}
+
+fn try_resolved_model(
+    description: ModelDescription,
+    model_type: &str,
+    capabilities: GenerationRuntimeCapabilities,
+) -> uniserve_serving::Result<(tempfile::TempDir, DynTokenizer, ResolvedModel)> {
     let directory = tempdir().unwrap();
     let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
     for codepoint in 1_u32..=127 {
@@ -104,7 +112,18 @@ fn resolved_model(
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
-    let capabilities = GenerationRuntimeCapabilities {
+    let model = ResolvedModel::resolve(
+        profile,
+        Arc::clone(&tokenizer),
+        renderer,
+        capabilities,
+        4096,
+    )?;
+    Ok((directory, tokenizer, model))
+}
+
+fn runtime_capabilities() -> GenerationRuntimeCapabilities {
+    GenerationRuntimeCapabilities {
         supports_understanding: true,
         supports_vision_encode: true,
         supports_latent_encode: true,
@@ -120,16 +139,7 @@ fn resolved_model(
         scratch_capacity_tokens: 1_000_000,
         scratch_block_size: 32,
         encoder_cache_entries: 32,
-    };
-    let model = ResolvedModel::resolve(
-        profile,
-        Arc::clone(&tokenizer),
-        renderer,
-        capabilities,
-        4096,
-    )
-    .unwrap();
-    (directory, tokenizer, model)
+    }
 }
 
 fn image_chat_request() -> GenerateReqInput {
@@ -141,6 +151,60 @@ fn image_chat_request() -> GenerateReqInput {
             ChatContentPart::text(" after"),
         ])],
     )
+}
+
+#[test]
+fn model_resolution_requires_every_configured_runtime_branch() {
+    type RemoveCapability = fn(&mut GenerationRuntimeCapabilities);
+    let cases: [(
+        ModelDescription,
+        &'static str,
+        &'static str,
+        RemoveCapability,
+    ); 4] = [
+        (
+            ModelDescription::Qwen3,
+            "qwen3",
+            "runtime_und_execution",
+            |capabilities: &mut GenerationRuntimeCapabilities| {
+                capabilities.supports_understanding = false;
+            },
+        ),
+        (
+            ModelDescription::SenseNova,
+            "neo_chat",
+            "runtime_vit_encode",
+            |capabilities: &mut GenerationRuntimeCapabilities| {
+                capabilities.supports_vision_encode = false;
+            },
+        ),
+        (
+            ModelDescription::Bagel,
+            "bagel",
+            "runtime_vae_encode",
+            |capabilities: &mut GenerationRuntimeCapabilities| {
+                capabilities.supports_latent_encode = false;
+            },
+        ),
+        (
+            ModelDescription::SenseNova,
+            "neo_chat",
+            "runtime_gen_denoise",
+            |capabilities: &mut GenerationRuntimeCapabilities| {
+                capabilities.supports_image_generation = false;
+            },
+        ),
+    ];
+
+    for (description, model_type, required, remove) in cases {
+        let mut capabilities = runtime_capabilities();
+        remove(&mut capabilities);
+        let error = match try_resolved_model(description, model_type, capabilities) {
+            Ok(_) => panic!("incomplete worker capabilities must fail model resolution"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(required), "got: {error}");
+    }
 }
 
 #[test]

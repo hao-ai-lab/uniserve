@@ -29,6 +29,84 @@ use crate::input::{
 use crate::text::{SamplingHints, TextDecodeOptions, resolve_max_tokens};
 use crate::{CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key};
 
+/// Public endpoint admitted by one resolved model description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ServedEndpoint {
+    ChatCompletions,
+    ImageGenerations,
+}
+
+/// Public input or output modality admitted by one resolved description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ServedModality {
+    Text,
+    Image,
+}
+
+/// Public behavior whose semantics are owned by the resolved description and
+/// the shared response path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ServedFeature {
+    Streaming,
+    Usage,
+    Logprobs,
+    Reasoning,
+    ToolCalling,
+    RepeatedInterleave,
+}
+
+/// Sampling control admitted by every configured sampler route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ServedSamplingControl {
+    Greedy,
+    Temperature,
+    TopK,
+    TopP,
+    MinP,
+    RepetitionPenalty,
+    FrequencyPenalty,
+    PresencePenalty,
+    LogitBias,
+    AllowedTokenIds,
+    BadWords,
+    MinTokens,
+    Logprobs,
+    StopTokenIds,
+    Eos,
+    StopStrings,
+}
+
+impl ServedSamplingControl {
+    pub const ALL: [Self; 16] = [
+        Self::Greedy,
+        Self::Temperature,
+        Self::TopK,
+        Self::TopP,
+        Self::MinP,
+        Self::RepetitionPenalty,
+        Self::FrequencyPenalty,
+        Self::PresencePenalty,
+        Self::LogitBias,
+        Self::AllowedTokenIds,
+        Self::BadWords,
+        Self::MinTokens,
+        Self::Logprobs,
+        Self::StopTokenIds,
+        Self::Eos,
+        Self::StopStrings,
+    ];
+}
+
+/// Exact public route declaration for one load-bound model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedModelCapabilities {
+    pub endpoints: Vec<ServedEndpoint>,
+    pub input_modalities: Vec<ServedModality>,
+    pub output_modalities: Vec<ServedModality>,
+    pub features: Vec<ServedFeature>,
+    pub sampling_controls: Vec<ServedSamplingControl>,
+}
+
 /// The closed load-bound model owner.
 pub enum ResolvedModel {
     Qwen3(Qwen3Desc),
@@ -84,6 +162,14 @@ impl ResolvedModel {
     ) -> Result<Self> {
         match profile {
             ModelProfile::Qwen3(profile) => {
+                validate_runtime_capabilities(
+                    &profile.common.identity,
+                    &capabilities,
+                    GenerationCapabilityNeeds {
+                        understanding: true,
+                        ..GenerationCapabilityNeeds::default()
+                    },
+                )?;
                 let hints = sampling_hints(&profile.common, max_model_tokens);
                 Ok(Self::Qwen3(Qwen3Desc {
                     identity: profile.common.identity,
@@ -95,6 +181,14 @@ impl ResolvedModel {
                 }))
             }
             ModelProfile::SenseNova(profile) => {
+                validate_runtime_capabilities(
+                    &profile.common.identity,
+                    &capabilities,
+                    configured_omni_needs(
+                        &profile.preprocessing.generation_policy,
+                        &profile.preprocessing.image_ingest,
+                    ),
+                )?;
                 let default_max_output_tokens = profile
                     .common
                     .context_limits
@@ -111,6 +205,14 @@ impl ResolvedModel {
                 }))
             }
             ModelProfile::Bagel(profile) => {
+                validate_runtime_capabilities(
+                    &profile.common.identity,
+                    &capabilities,
+                    configured_omni_needs(
+                        &profile.preprocessing.generation_policy,
+                        &profile.preprocessing.image_ingest,
+                    ),
+                )?;
                 let default_max_output_tokens = profile
                     .common
                     .context_limits
@@ -171,6 +273,44 @@ impl ResolvedModel {
         !matches!(self, Self::Qwen3(_))
     }
 
+    /// Exact route capabilities exposed by model discovery and enforced by
+    /// request admission.
+    pub fn served_capabilities(&self) -> ServedModelCapabilities {
+        let mut endpoints = vec![ServedEndpoint::ChatCompletions];
+        let mut input_modalities = vec![ServedModality::Text];
+        let mut output_modalities = vec![ServedModality::Text];
+        let mut features = vec![
+            ServedFeature::Streaming,
+            ServedFeature::Usage,
+            ServedFeature::Logprobs,
+        ];
+        match self {
+            Self::Qwen3(_) => {
+                features.push(ServedFeature::Reasoning);
+                features.push(ServedFeature::ToolCalling);
+            }
+            Self::SenseNova(_) => {
+                endpoints.push(ServedEndpoint::ImageGenerations);
+                input_modalities.push(ServedModality::Image);
+                output_modalities.push(ServedModality::Image);
+                features.push(ServedFeature::Reasoning);
+                features.push(ServedFeature::RepeatedInterleave);
+            }
+            Self::Bagel(_) => {
+                endpoints.push(ServedEndpoint::ImageGenerations);
+                input_modalities.push(ServedModality::Image);
+                output_modalities.push(ServedModality::Image);
+            }
+        }
+        ServedModelCapabilities {
+            endpoints,
+            input_modalities,
+            output_modalities,
+            features,
+            sampling_controls: ServedSamplingControl::ALL.to_vec(),
+        }
+    }
+
     /// Deterministic capability admission or rejection from the resolved route.
     pub fn validate_request(&self, request: &GenerateReqInput) -> Result<()> {
         let reject = |capability: &'static str| ServeError::UnsupportedCapability {
@@ -186,6 +326,13 @@ impl ResolvedModel {
         }
         if !request.modalities.output_text && !request.modalities.output_image {
             return Err(reject("no_output_modality"));
+        }
+        let declared = self.served_capabilities();
+        if request.uses_tools() && !declared.features.contains(&ServedFeature::ToolCalling) {
+            return Err(reject("tool_calling"));
+        }
+        if request.requests_reasoning() && !declared.features.contains(&ServedFeature::Reasoning) {
+            return Err(reject("reasoning"));
         }
         let (capabilities, needs) = match self {
             Self::Qwen3(d) => (
@@ -245,6 +392,27 @@ impl ResolvedModel {
             ),
         }
     }
+}
+
+fn configured_omni_needs(
+    policy: &GenerationPolicyDescriptor,
+    image_ingest: &uniserve_core::ImageIngestRecipe,
+) -> GenerationCapabilityNeeds {
+    GenerationBehaviorDescriptor::resolve(GenerationConstraint::Default, policy)
+        .capability_needs(policy, image_ingest.steps.iter().copied())
+}
+
+fn validate_runtime_capabilities(
+    identity: &ModelIdentity,
+    capabilities: &GenerationRuntimeCapabilities,
+    needs: GenerationCapabilityNeeds,
+) -> Result<()> {
+    capabilities.covers(&needs).map_err(|capability| {
+        ServeError::ModelResolution(format!(
+            "configured model description `{}` requires worker capability `{capability}`",
+            identity.description_id
+        ))
+    })
 }
 
 fn omni_capability_needs(

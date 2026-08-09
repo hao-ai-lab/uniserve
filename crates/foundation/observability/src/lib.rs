@@ -13,10 +13,12 @@ use prometheus_client::registry::Registry;
 mod api_server;
 mod request;
 mod scheduler;
+mod serving;
 
 pub use api_server::*;
 pub use request::*;
 pub use scheduler::*;
+pub use serving::*;
 
 // Note: `prometheus-client` appends the `_total` suffix automatically when
 // encoding counters, so all counter family registration names in this crate
@@ -32,6 +34,7 @@ pub struct Metrics {
     pub scheduler: SchedulerMetrics,
     pub request: RequestMetrics,
     pub api_server: ApiServerMetrics,
+    pub serving: ServingMetrics,
 }
 
 impl Metrics {
@@ -41,12 +44,14 @@ impl Metrics {
         let scheduler = SchedulerMetrics::register(&mut registry);
         let request = RequestMetrics::register(&mut registry);
         let api_server = ApiServerMetrics::register(&mut registry);
+        let serving = ServingMetrics::register(&mut registry);
 
         Self {
             registry,
             scheduler,
             request,
             api_server,
+            serving,
         }
     }
 

@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use uniserve_core::GenerationRequest;
 
-use crate::chat::{ChatMessage, ChatRequest, ChatTool, ChatToolChoice, ReasoningEffort};
+use crate::chat::{
+    AssistantMessageExt, ChatMessage, ChatRequest, ChatTool, ChatToolChoice, ReasoningEffort,
+};
 use crate::text::TextDecodeOptions;
 use crate::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
@@ -200,6 +202,38 @@ impl GenerateReqInput {
     pub fn has_input_image(&self) -> bool {
         !self.images.is_empty()
             || matches!(&self.prompt, PromptInput::Chat { messages, .. } if messages.iter().any(ChatMessage::has_multimodal))
+    }
+
+    /// True when the request uses the function-tool protocol in either the
+    /// current turn or its chat history.
+    pub fn uses_tools(&self) -> bool {
+        let PromptInput::Chat {
+            messages, tools, ..
+        } = &self.prompt
+        else {
+            return false;
+        };
+        !tools.is_empty()
+            || messages.iter().any(|message| match message {
+                ChatMessage::Developer { tools, .. } => {
+                    tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                }
+                ChatMessage::Assistant { content } => content.has_tool_calls(),
+                ChatMessage::ToolResponse { .. } => true,
+                ChatMessage::System { .. } | ChatMessage::User { .. } => false,
+            })
+    }
+
+    /// True when the request asks the model's chat template to select a
+    /// reasoning effort.
+    pub fn requests_reasoning(&self) -> bool {
+        matches!(
+            &self.prompt,
+            PromptInput::Chat {
+                reasoning_effort: Some(_),
+                ..
+            }
+        )
     }
 }
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -26,6 +27,24 @@ MODEL_ENV = "UNISERVE_SENSENOVA_MODEL"
 QWEN_MODEL_ENV = "UNISERVE_QWEN3_MODEL"
 BAGEL_MODEL_ENV = "UNISERVE_BAGEL_MODEL"
 CONTROL_TOKENS = ("<img>", "</img>")
+SAMPLING_CONTROLS = [
+    "greedy",
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "repetition_penalty",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "allowed_token_ids",
+    "bad_words",
+    "min_tokens",
+    "logprobs",
+    "stop_token_ids",
+    "eos",
+    "stop_strings",
+]
 
 
 def active_model(environment_variable: str) -> Path:
@@ -40,6 +59,50 @@ def active_model(environment_variable: str) -> Path:
 
 def active_sensenova_model() -> Path:
     return active_model(MODEL_ENV)
+
+
+def assert_model_discovery(
+    base_url: str,
+    *,
+    model_id: str,
+    description_id: str,
+    endpoints: list[str],
+    input_modalities: list[str],
+    output_modalities: list[str],
+    features: list[str],
+) -> None:
+    response = httpx.get(f"{base_url}/v1/models", timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert len(payload["data"]) == 1
+    model = payload["data"][0]
+    assert model["id"] == model_id
+    assert model["object"] == "model"
+    assert model["created"] > 0
+    assert model["owned_by"] == "uniserve"
+    identity = model["identity"]
+    assert identity["description_id"] == description_id
+    assert identity["profile_id"].startswith(f"{description_id}:")
+    assert re.fullmatch(r"[0-9a-f]{64}", identity["config_fingerprint"])
+    assert model["capabilities"] == {
+        "endpoints": endpoints,
+        "input_modalities": input_modalities,
+        "output_modalities": output_modalities,
+        "features": features,
+        "sampling_controls": SAMPLING_CONTROLS,
+    }
+
+
+def serving_lifecycle_metrics(text: str) -> dict[str, float]:
+    states: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line.startswith("uniserve:serving_requests{"):
+            continue
+        match = re.search(r'state="([^"]+)"', line)
+        assert match is not None
+        states[match.group(1)] = float(line.rsplit(" ", 1)[1])
+    return states
 
 
 def _control_ids_from_tokenizer_json(model: Path) -> dict[str, int]:
@@ -224,11 +287,31 @@ def test_qwen3_public_chat_funnel(tmp_path: Path):
         description="qwen3",
         served_model_name="Qwen3-32B",
     ) as base_url:
+        assert_model_discovery(
+            base_url,
+            model_id="Qwen3-32B",
+            description_id="qwen3",
+            endpoints=["chat_completions"],
+            input_modalities=["text"],
+            output_modalities=["text"],
+            features=["streaming", "usage", "logprobs", "reasoning", "tool_calling"],
+        )
         response = httpx.post(
             f"{base_url}/v1/chat/completions",
             json={
                 "model": "Qwen3-32B",
                 "messages": [{"role": "user", "content": "Say hello."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "Look up a value.",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "tool_choice": "auto",
                 "max_completion_tokens": 8,
             },
             timeout=60,
@@ -239,6 +322,38 @@ def test_qwen3_public_chat_funnel(tmp_path: Path):
         assert payload["choices"][0]["message"]["content"]
         assert payload["choices"][0]["finish_reason"] in {"stop", "length"}
 
+        unsupported_image_output = httpx.post(
+            f"{base_url}/v1/images/generations",
+            json={"model": "Qwen3-32B", "prompt": "Draw a square."},
+            timeout=60,
+        )
+        assert unsupported_image_output.status_code == 400
+        assert "image_output" in unsupported_image_output.json()["error"]["message"]
+
+        unsupported_image_input = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "Qwen3-32B",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this."},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{tiny_input_png_b64()}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+            timeout=60,
+        )
+        assert unsupported_image_input.status_code == 400
+        assert "image_input" in unsupported_image_input.json()["error"]["message"]
+
 
 def test_bagel_public_funnels(tmp_path: Path):
     with configured_sim_server(
@@ -247,6 +362,47 @@ def test_bagel_public_funnels(tmp_path: Path):
         description="bagel",
         served_model_name="BAGEL",
     ) as base_url:
+        assert_model_discovery(
+            base_url,
+            model_id="BAGEL",
+            description_id="bagel",
+            endpoints=["chat_completions", "image_generations"],
+            input_modalities=["text", "image"],
+            output_modalities=["text", "image"],
+            features=["streaming", "usage", "logprobs"],
+        )
+        unsupported_tools = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "BAGEL",
+                "messages": [{"role": "user", "content": "Use a tool."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            },
+            timeout=60,
+        )
+        assert unsupported_tools.status_code == 400
+        assert "tool_calling" in unsupported_tools.json()["error"]["message"]
+
+        unsupported_reasoning = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "BAGEL",
+                "messages": [{"role": "user", "content": "Reason about this."}],
+                "reasoning_effort": "high",
+            },
+            timeout=60,
+        )
+        assert unsupported_reasoning.status_code == 400
+        assert "reasoning" in unsupported_reasoning.json()["error"]["message"]
+
         image_to_text = httpx.post(
             f"{base_url}/v1/chat/completions",
             json={
@@ -312,9 +468,21 @@ def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
         version_response.raise_for_status()
         assert version_response.json()["version"]
 
-        models_response = httpx.get(f"{base_url}/v1/models", timeout=30)
-        models_response.raise_for_status()
-        assert [model["id"] for model in models_response.json()["data"]] == ["SenseNova-U1"]
+        assert_model_discovery(
+            base_url,
+            model_id="SenseNova-U1",
+            description_id="sensenova",
+            endpoints=["chat_completions", "image_generations"],
+            input_modalities=["text", "image"],
+            output_modalities=["text", "image"],
+            features=[
+                "streaming",
+                "usage",
+                "logprobs",
+                "reasoning",
+                "repeated_interleave",
+            ],
+        )
 
         unknown_chat_control = httpx.post(
             f"{base_url}/v1/chat/completions",
@@ -455,6 +623,24 @@ def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
         )
         i2i_response.raise_for_status()
         assert i2i_response.json()["choices"][0]["message"]["images"]
+
+        final_metrics_response = httpx.get(f"{base_url}/metrics", timeout=30)
+        final_metrics_response.raise_for_status()
+        lifecycle = serving_lifecycle_metrics(final_metrics_response.text)
+        assert set(lifecycle) == {
+            "active",
+            "accepted",
+            "scheduled",
+            "finished",
+            "rejected",
+            "cancelled",
+            "aborted",
+            "failed",
+        }
+        assert lifecycle["active"] == 0
+        assert lifecycle["accepted"] > 0
+        assert lifecycle["scheduled"] > 0
+        assert lifecycle["finished"] > 0
 
         trace_path = tmp_path / "trace.jsonl"
         trace_path.write_text(

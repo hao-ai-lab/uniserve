@@ -364,16 +364,82 @@ pub struct ErrorDetail {
 // ============================================================================
 
 /// A single model entry in the `/v1/models` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelObject {
     pub id: String,
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    pub identity: ServedModelIdentity,
+    pub capabilities: ModelCapabilities,
+}
+
+/// Load-bound identity of the configured model description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedModelIdentity {
+    pub profile_id: String,
+    pub description_id: String,
+    pub config_fingerprint: String,
+}
+
+/// Typed public capabilities for the configured model route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    pub endpoints: Vec<ModelEndpoint>,
+    pub input_modalities: Vec<ModelModality>,
+    pub output_modalities: Vec<ModelModality>,
+    pub features: Vec<ModelFeature>,
+    pub sampling_controls: Vec<ModelSamplingControl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelEndpoint {
+    ChatCompletions,
+    ImageGenerations,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelModality {
+    Text,
+    Image,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFeature {
+    Streaming,
+    Usage,
+    Logprobs,
+    Reasoning,
+    ToolCalling,
+    RepeatedInterleave,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSamplingControl {
+    Greedy,
+    Temperature,
+    TopK,
+    TopP,
+    MinP,
+    RepetitionPenalty,
+    FrequencyPenalty,
+    PresencePenalty,
+    LogitBias,
+    AllowedTokenIds,
+    BadWords,
+    MinTokens,
+    Logprobs,
+    StopTokenIds,
+    Eos,
+    StopStrings,
 }
 
 /// Response body for `GET /v1/models`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListModelsResponse {
     pub object: String,
     pub data: Vec<ModelObject>,
