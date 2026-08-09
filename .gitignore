@@ -44,10 +44,5 @@ artifacts/
 target/
 refs/
 specs/*
-!specs/decode-runtime.md
-!specs/decode-runtime-construction.md
-!specs/decode-runtime-handoff.md
-!specs/benchmark-validation.md
-!specs/serving-surface.md
 
 AGENTS.md
