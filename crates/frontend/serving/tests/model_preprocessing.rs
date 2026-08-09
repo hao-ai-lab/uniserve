@@ -77,7 +77,7 @@ fn resolved_model(
     let generation_config_path = directory.path().join("generation_config.json");
     fs::write(
         &generation_config_path,
-        r#"{"eos_token_id":[2,3],"temperature":0.37,"top_p":0.73,"top_k":17,"min_p":0.11,"repetition_penalty":1.2,"max_new_tokens":128}"#,
+        r#"{"eos_token_id":2,"max_new_tokens":128}"#,
     )
     .unwrap();
     let files = ResolvedModelFiles {
@@ -141,89 +141,6 @@ fn image_chat_request() -> GenerateReqInput {
             ChatContentPart::text(" after"),
         ])],
     )
-}
-
-fn configured_descriptions() -> [(ModelDescription, &'static str); 3] {
-    [
-        (ModelDescription::Qwen3, "qwen3"),
-        (ModelDescription::SenseNova, "neo_chat"),
-        (ModelDescription::Bagel, "bagel"),
-    ]
-}
-
-#[test]
-fn configured_descriptions_share_canonical_sampling_lowering() {
-    let mut expected = None;
-    for (description, model_type) in configured_descriptions() {
-        let (_directory, _tokenizer, model) = resolved_model(description, model_type);
-        let mut request = if description == ModelDescription::Qwen3 {
-            GenerateReqInput::text(description.id(), "sample this")
-        } else {
-            let mut request = image_chat_request();
-            request.request_id = description.id().into();
-            request
-        };
-        request.sampling.seed = Some(23);
-        request.sampling.min_tokens = Some(7);
-        request.sampling.frequency_penalty = Some(0.4);
-        request.sampling.presence_penalty = Some(-0.2);
-        request.stop.stop_token_ids = vec![9, 3, 9];
-        request.stop.bad_words = vec!["blocked".to_string(), "blocked".to_string()];
-        request.stop.allowed_token_ids = Some(vec![12, 10, 12]);
-        request.stop.logprobs = Some(-1);
-        request.stop.prompt_logprobs = Some(2);
-        request.stop.logprob_token_ids = Some(vec![8, 6, 8]);
-        request.stop.logit_bias = Some(HashMap::from([(7, 0.5), (4, -0.25)]));
-
-        let tokenized = model.tokenize(request).unwrap();
-        let sampling = &tokenized.request.sampling;
-        assert_eq!(sampling.temperature, 0.37);
-        assert_eq!(sampling.top_p, 0.73);
-        assert_eq!(sampling.top_k, 17);
-        assert_eq!(sampling.min_p, 0.11);
-        assert_eq!(sampling.repetition_penalty, 1.2);
-        assert_eq!(sampling.seed, Some(23));
-        assert_eq!(sampling.min_tokens, 7);
-        assert_eq!(sampling.frequency_penalty, 0.4);
-        assert_eq!(sampling.presence_penalty, -0.2);
-        assert_eq!(sampling.allowed_token_ids, Some(vec![10, 12]));
-        assert_eq!(sampling.logprob_token_ids, vec![6, 8]);
-        assert_eq!(sampling.logit_bias, vec![(4, -0.25), (7, 0.5)]);
-        assert_eq!(sampling.n_logprobs, u32::MAX);
-        assert_eq!(sampling.n_prompt_logprobs, 2);
-        assert_eq!(tokenized.request.stop_token_ids, vec![2, 3, 9]);
-        assert_eq!(tokenized.request.max_und_tokens, 128);
-
-        if let Some(expected) = &expected {
-            assert_eq!(sampling, expected);
-        } else {
-            expected = Some(sampling.clone());
-        }
-    }
-}
-
-#[test]
-fn configured_descriptions_reject_invalid_sampling_before_submission() {
-    for (description, model_type) in configured_descriptions() {
-        let (_directory, _tokenizer, model) = resolved_model(description, model_type);
-        let mut request = GenerateReqInput::text(description.id(), "sample this");
-        request.sampling.seed = Some(-1);
-        let error = model.tokenize(request).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("seed must be a non-negative integer")
-        );
-
-        let mut request = GenerateReqInput::text(description.id(), "sample this");
-        request.stop.prompt_logprobs = Some(-2);
-        let error = model.tokenize(request).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("prompt_logprobs must be non-negative or -1")
-        );
-    }
 }
 
 #[test]

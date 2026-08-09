@@ -9,7 +9,8 @@ use uniserve_core::{
     ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
     GenerationCachePolicyDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
     GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
-    ImageParams, ImageSegment as CoreImageSegment, RequestId, SegmentPlacement, UndVisibility,
+    ImageParams, ImageSegment as CoreImageSegment, RequestId,
+    SamplingParams as EngineSamplingParams, SegmentPlacement, UndVisibility,
 };
 use uniserve_model_profile::omni::bagel::{BagelProfile, CONTEXT_SYSTEM_PROMPT};
 use uniserve_model_profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
@@ -22,7 +23,6 @@ use crate::input::{
     GenerateReqInput, ModelEventIdentity, OutputProcessorPolicy, PromptInput, SubmissionMetadata,
     TokenizedGenerateReqInput,
 };
-use crate::sampling::{SamplingDefaults, lower_sampling};
 use crate::text::TextDecodeOptions;
 use crate::text::tokenizer::DynTokenizer;
 use crate::{CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key};
@@ -30,6 +30,9 @@ use crate::{CacheAccounting, ResourceAccounting, Result, ServeError, cache_isola
 pub(crate) use output::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 
 const DEFAULT_STEPS: u16 = 50;
+const DEFAULT_TEMPERATURE: f32 = 0.0;
+const DEFAULT_TOP_P: f32 = 1.0;
+const DEFAULT_TOP_K: u32 = 0;
 
 mod context_image_defaults {
     pub(super) const CFG_TEXT_SCALE: f32 = 4.0;
@@ -44,7 +47,8 @@ struct RuntimeBinding<'a> {
     tokenizer: DynTokenizer,
     capabilities: &'a GenerationRuntimeCapabilities,
     policy: &'a GenerationPolicyDescriptor,
-    sampling: &'a SamplingDefaults,
+    default_max_output_tokens: Option<u32>,
+    max_model_tokens: u32,
     identity: ModelEventIdentity,
 }
 
@@ -52,9 +56,11 @@ struct RuntimeBinding<'a> {
 struct LoweredInput {
     prompt_ids: Vec<u32>,
     negative_prompt_ids: Vec<u32>,
+    sampling: EngineSamplingParams,
     image: ImageParams,
     constraint: GenerationConstraint,
     images: Vec<RenderedImage>,
+    stop_token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +80,8 @@ pub(crate) fn tokenize_sensenova(
     tokenizer: DynTokenizer,
     renderer: &HfChatRenderer,
     capabilities: &GenerationRuntimeCapabilities,
-    sampling: &SamplingDefaults,
+    default_max_output_tokens: Option<u32>,
+    max_model_tokens: u32,
     identity: ModelEventIdentity,
     request: GenerateReqInput,
 ) -> Result<TokenizedGenerateReqInput> {
@@ -83,7 +90,8 @@ pub(crate) fn tokenize_sensenova(
         tokenizer,
         capabilities,
         policy: &profile.generation_policy,
-        sampling,
+        default_max_output_tokens,
+        max_model_tokens,
         identity,
     };
     let result = (|| {
@@ -108,7 +116,8 @@ pub(crate) fn tokenize_bagel(
     tokenizer: DynTokenizer,
     renderer: &HfChatRenderer,
     capabilities: &GenerationRuntimeCapabilities,
-    sampling: &SamplingDefaults,
+    default_max_output_tokens: Option<u32>,
+    max_model_tokens: u32,
     identity: ModelEventIdentity,
     request: GenerateReqInput,
 ) -> Result<TokenizedGenerateReqInput> {
@@ -117,7 +126,8 @@ pub(crate) fn tokenize_bagel(
         tokenizer,
         capabilities,
         policy: &profile.generation_policy,
-        sampling,
+        default_max_output_tokens,
+        max_model_tokens,
         identity,
     };
     let result = (|| {
@@ -152,6 +162,7 @@ fn lower_sensenova(
     Ok(LoweredInput {
         prompt_ids,
         negative_prompt_ids,
+        sampling: resolve_sampling(request)?,
         image: resolve_image_params(
             &profile.image_defaults,
             &profile.resolution_policy,
@@ -160,6 +171,7 @@ fn lower_sensenova(
         )?,
         constraint,
         images,
+        stop_token_ids: request.stop.stop_token_ids.clone(),
     })
 }
 
@@ -193,9 +205,11 @@ fn lower_bagel(
     Ok(LoweredInput {
         prompt_ids,
         negative_prompt_ids,
+        sampling: resolve_sampling(request)?,
         image,
         constraint,
         images,
+        stop_token_ids: request.stop.stop_token_ids.clone(),
     })
 }
 
@@ -435,19 +449,18 @@ fn tokenize_bagel_with_slots(
 fn finish_tokenized(
     binding: &RuntimeBinding<'_>,
     request: GenerateReqInput,
-    lowered: LoweredInput,
+    mut lowered: LoweredInput,
     mut context: Vec<CoreContextSegment>,
     output_processor: OutputProcessorPolicy,
 ) -> std::result::Result<TokenizedGenerateReqInput, String> {
     let prompt_tokens = u32::try_from(lowered.prompt_ids.len())
         .map_err(|_| "generation prompt exceeds the supported token count".to_string())?;
-    let sampling = lower_sampling(binding.tokenizer.as_ref(), &request, binding.sampling)?;
     let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, binding.policy);
     let mut max_tokens = if behavior.und_decode {
         crate::text::resolve_max_tokens(
             request.sampling.max_tokens,
-            binding.sampling.max_tokens,
-            Some(binding.sampling.max_model_tokens),
+            binding.default_max_output_tokens,
+            Some(binding.max_model_tokens),
             prompt_tokens,
         )
         .map_err(|error| error.to_string())? as usize
@@ -455,8 +468,9 @@ fn finish_tokenized(
         0
     };
 
-    let prompt_logprobs_requested = sampling.params.prompt_logprobs_requested();
-    let generated_logprobs_requested = sampling.params.generated_logprobs_requested();
+    apply_request_sampling(&binding.tokenizer, &request, &mut lowered.sampling)?;
+    let prompt_logprobs_requested = lowered.sampling.prompt_logprobs_requested();
+    let generated_logprobs_requested = lowered.sampling.generated_logprobs_requested();
     let cache = GenerationCachePolicyDescriptor {
         read: !request.cache.bypass_read && !prompt_logprobs_requested,
         write: !request.cache.no_store,
@@ -488,8 +502,8 @@ fn finish_tokenized(
         binding.capabilities,
     )
     .map_err(|error| error.to_string())?;
-    if resources.max_kv_tokens > binding.sampling.max_model_tokens as usize && behavior.und_decode {
-        let excess = resources.max_kv_tokens - binding.sampling.max_model_tokens as usize;
+    if resources.max_kv_tokens > binding.max_model_tokens as usize && behavior.und_decode {
+        let excess = resources.max_kv_tokens - binding.max_model_tokens as usize;
         max_tokens = max_tokens
             .checked_sub(excess)
             .filter(|value| *value > 0)
@@ -497,7 +511,7 @@ fn finish_tokenized(
                 format!(
                     "generation context requires at least {} KV tokens, exceeding the {}-token runtime limit",
                     resources.max_kv_tokens.saturating_sub(max_tokens),
-                    binding.sampling.max_model_tokens
+                    binding.max_model_tokens
                 )
             })?;
         resources = GenerationResourceBounds::conservative(
@@ -512,16 +526,10 @@ fn finish_tokenized(
         )
         .map_err(|error| error.to_string())?;
     }
-    if resources.max_kv_tokens > binding.sampling.max_model_tokens as usize {
+    if resources.max_kv_tokens > binding.max_model_tokens as usize {
         return Err(format!(
             "generation requires {} KV tokens, exceeding the {}-token runtime limit",
-            resources.max_kv_tokens, binding.sampling.max_model_tokens
-        ));
-    }
-    if sampling.params.min_tokens > max_tokens {
-        return Err(format!(
-            "min_tokens ({}) exceeds max_tokens ({max_tokens})",
-            sampling.params.min_tokens
+            resources.max_kv_tokens, binding.max_model_tokens
         ));
     }
 
@@ -544,11 +552,11 @@ fn finish_tokenized(
         negative_context,
         constraint: lowered.constraint,
         behavior,
-        sampling: sampling.params,
+        sampling: lowered.sampling,
         image: lowered.image,
         max_und_tokens: max_tokens,
         stop_strings: request.stop.stop_strings.clone(),
-        stop_token_ids: sampling.stop_token_ids,
+        stop_token_ids: lowered.stop_token_ids,
         priority: request.scheduling.priority,
         cache,
         policy: binding.policy.clone(),
@@ -582,6 +590,85 @@ fn finish_tokenized(
         identity: binding.identity.clone(),
         cache: cache_accounting,
         resources: resource_accounting,
+    })
+}
+
+fn apply_request_sampling(
+    tokenizer: &DynTokenizer,
+    request: &GenerateReqInput,
+    sampling: &mut EngineSamplingParams,
+) -> std::result::Result<(), String> {
+    sampling.ignore_eos = request.sampling.ignore_eos;
+    sampling.min_tokens = request.sampling.min_tokens.unwrap_or(0) as usize;
+    sampling.min_p = request.sampling.min_p.unwrap_or(0.0);
+    sampling.frequency_penalty = request.sampling.frequency_penalty.unwrap_or(0.0);
+    sampling.presence_penalty = request.sampling.presence_penalty.unwrap_or(0.0);
+    sampling.repetition_penalty = request.sampling.repetition_penalty.unwrap_or(1.0);
+    if let Some(request_bias) = &request.stop.logit_bias {
+        let mut merged = std::collections::BTreeMap::new();
+        for (token_id, bias) in sampling.logit_bias.drain(..) {
+            merged.insert(token_id, bias);
+        }
+        for (&token_id, &bias) in request_bias {
+            *merged.entry(token_id).or_insert(0.0) += bias;
+        }
+        sampling.logit_bias = merged.into_iter().collect();
+    }
+    sampling.return_logprobs =
+        request.stop.logprobs.is_some() || request.stop.logprob_token_ids.is_some();
+    sampling.n_logprobs = request
+        .stop
+        .logprobs
+        .map_or(0, |count| if count < 0 { u32::MAX } else { count as u32 });
+    sampling.return_prompt_logprobs = request.stop.prompt_logprobs.is_some();
+    sampling.n_prompt_logprobs = request
+        .stop
+        .prompt_logprobs
+        .map_or(0, |count| if count < 0 { u32::MAX } else { count as u32 });
+    sampling.logprob_token_ids = request.stop.logprob_token_ids.clone().unwrap_or_default();
+    sampling.allowed_token_ids = request.stop.allowed_token_ids.clone();
+    sampling.bad_words_ids = request
+        .stop
+        .bad_words
+        .iter()
+        .map(|word| {
+            tokenizer
+                .encode(word, false)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(())
+}
+
+fn resolve_sampling(
+    request: &GenerateReqInput,
+) -> std::result::Result<EngineSamplingParams, String> {
+    let temperature = finite(
+        request.sampling.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        "temperature",
+    )?;
+    if temperature < 0.0 {
+        return Err("temperature must be non-negative".to_string());
+    }
+    let top_p = finite(request.sampling.top_p.unwrap_or(DEFAULT_TOP_P), "top_p")?;
+    if !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
+        return Err("top_p must be in (0, 1]".to_string());
+    }
+    Ok(EngineSamplingParams {
+        temperature,
+        top_p,
+        top_k: request.sampling.top_k.unwrap_or(DEFAULT_TOP_K),
+        seed: request
+            .image_gen
+            .as_ref()
+            .and_then(|image| image.seed)
+            .or_else(|| {
+                request
+                    .sampling
+                    .seed
+                    .and_then(|value| value.try_into().ok())
+            }),
+        ..EngineSamplingParams::default()
     })
 }
 

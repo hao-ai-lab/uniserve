@@ -12,7 +12,6 @@ pub mod chat;
 mod input;
 mod model;
 mod omni;
-mod sampling;
 #[cfg(test)]
 mod test_support;
 pub mod text;
