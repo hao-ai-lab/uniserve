@@ -37,7 +37,7 @@ from uniserve_worker.batch import (
     ExecutionCapability,
     FinishFlags,
     FixedPoint,
-    KvReservation,
+    KvPlacement,
     LogicalLengths,
     Operation,
     OpStatus,
@@ -140,11 +140,14 @@ def _partition(*operations: Operation) -> BatchPartition:
         attention=AttentionRegime.CAUSAL,
         shape_class=0,
         operations=operations,
-        kv_reservations=tuple(
-            KvReservation(
+        request_pool_indices=(8,) * len(operations),
+        kv_placements=tuple(
+            KvPlacement(
                 request_key=operation.request_key,
                 op_id=operation.op_id,
-                logical_page_delta=(7,),
+                group_id=0,
+                block_table=(7,),
+                pages_to_zero=(7,),
             )
             for operation in operations
         ),
@@ -203,11 +206,13 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
         ),
         start=1,
     ):
-        reservations = tuple(
-            KvReservation(
+        kv_placements = tuple(
+            KvPlacement(
                 request_key=item.request_key,
                 op_id=item.op_id,
-                logical_page_delta=(placements[position],),
+                group_id=0,
+                block_table=(placements[position],),
+                pages_to_zero=(placements[position],),
             )
             for position, item in enumerate(ordered)
         )
@@ -224,7 +229,10 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
                     attention=AttentionRegime.CAUSAL,
                     shape_class=index,
                     operations=ordered,
-                    kv_reservations=reservations,
+                    request_pool_indices=tuple(
+                        int(item.request_key.session_id) + index for item in ordered
+                    ),
+                    kv_placements=kv_placements,
                 ),
             ),
         )
@@ -400,7 +408,7 @@ def test_batch_rejects_conflicting_control_identity() -> None:
             disposition=Disposition.PUBLISH,
         )
 
-    admission = Admission.create(_request_key(), und=UndAdmission())
+    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
     with pytest.raises(WorkerError):
         Batch(
             step_id=1,
@@ -419,7 +427,7 @@ def test_batch_allows_duplicate_identical_control() -> None:
         public_event_limit=1,
         disposition=Disposition.PUBLISH,
     )
-    admission = Admission.create(_request_key(), und=UndAdmission())
+    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
     batch = Batch(
         step_id=1,
         admissions=(admission,),
@@ -461,8 +469,10 @@ def test_operation_accepts_shared_encoder_features_but_not_foreign_lineage_state
 
 
 def test_admission_round_trips_and_binds_digest() -> None:
-    admission = Admission.create(_request_key(), und=UndAdmission())
+    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
     assert Admission.from_wire(admission.to_wire()) == admission
+    relocated = replace(admission, request_pool_idx=19)
+    assert relocated.payload_digest() == admission.digest
 
 
 def test_token_product_bytes_round_trip() -> None:
@@ -510,7 +520,7 @@ def test_batch_carries_host_supplied_input_products() -> None:
         point_range=PointRange(base_point=0, max_points=1),
     )
     payload = ProductPayload(product=token_input, payload=encode_token_product_bytes([7, 8, 9]))
-    admission = Admission.create(_request_key(), und=UndAdmission())
+    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
     batch = Batch(
         step_id=1,
         admissions=(admission,),

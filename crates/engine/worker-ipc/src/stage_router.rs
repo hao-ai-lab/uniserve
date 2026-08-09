@@ -1057,6 +1057,7 @@ mod tests {
     fn admission(request_key: RequestKey) -> Admission {
         Admission::new(
             request_key,
+            u32::try_from(request_key.session_id.0).unwrap().max(1),
             Some(UndAdmission {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
@@ -1256,7 +1257,10 @@ mod tests {
                             attention: AttentionRegime::None,
                             shape_class: 0,
                             operations: vec![encode],
-                            kv_reservations: Vec::new(),
+                            request_pool_indices: vec![
+                                u32::try_from(encode_key.session_id.0).unwrap().max(1),
+                            ],
+                            kv_placements: Vec::new(),
                         },
                         BatchPartition {
                             partition_id: 2,
@@ -1268,7 +1272,10 @@ mod tests {
                             attention: AttentionRegime::Causal,
                             shape_class: 0,
                             operations: vec![prefill],
-                            kv_reservations: Vec::new(),
+                            request_pool_indices: vec![
+                                u32::try_from(prefill_key.session_id.0).unwrap().max(1),
+                            ],
+                            kv_placements: Vec::new(),
                         },
                     ],
                 )
@@ -1391,7 +1398,8 @@ mod tests {
                         attention: AttentionRegime::None,
                         shape_class: 0,
                         operations: vec![encode],
-                        kv_reservations: Vec::new(),
+                        request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
+                        kv_placements: Vec::new(),
                     }],
                 )
                 .with_input_products(vec![ProductPayload {
@@ -1432,7 +1440,8 @@ mod tests {
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![consume],
-                kv_reservations: Vec::new(),
+                request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
+                kv_placements: Vec::new(),
             }],
         );
         let pending_error = router
@@ -1512,7 +1521,8 @@ mod tests {
                         attention: AttentionRegime::None,
                         shape_class: 0,
                         operations: vec![encode],
-                        kv_reservations: Vec::new(),
+                        request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
+                        kv_placements: Vec::new(),
                     }],
                 )
                 .with_input_products(vec![ProductPayload {

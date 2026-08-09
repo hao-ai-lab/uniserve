@@ -28,7 +28,7 @@ from uniserve_worker.batch import (
     GenAdmission,
     ImageParams,
     KvAdmission,
-    KvReservation,
+    KvPlacement,
     Operation,
     PointRange,
     ProductKind,
@@ -49,9 +49,9 @@ from uniserve_worker.batch import (
 )
 
 AUTHORITY = 0
-_LOGICAL_LEASES: dict[RequestKey, list[int]] = {}
-_LOGICAL_PAGE_DELTAS: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
-_UNBOUND_LOGICAL_PAGES: dict[RequestKey, list[int]] = {}
+_BLOCK_TABLES: dict[RequestKey, list[int]] = {}
+_PAGES_TO_ZERO: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
+_UNBOUND_PAGES: dict[RequestKey, list[int]] = {}
 
 
 def execution_batch(
@@ -64,7 +64,6 @@ def execution_batch(
 ) -> Batch:
     """Build the explicit physical partitions used by executor behavior tests."""
 
-    admitted = {admission.request_key for admission in admissions}
     by_route: dict[int, list[Operation]] = {}
     for operation in operations:
         by_route.setdefault(int(operation.route), []).append(operation)
@@ -107,20 +106,29 @@ def execution_batch(
                     attention=attention,
                     shape_class=0,
                     operations=domain_operations,
-                    kv_reservations=tuple(
-                        KvReservation(
+                    request_pool_indices=tuple(
+                        next(
+                            (
+                                admission.request_pool_idx
+                                for admission in admissions
+                                if admission.request_key == operation.request_key
+                            ),
+                            int(operation.request_key.session_id) + 1,
+                        )
+                        for operation in domain_operations
+                    ),
+                    kv_placements=tuple(
+                        KvPlacement(
                             request_key=operation.request_key,
                             op_id=operation.op_id,
-                            logical_page_delta=(
-                                tuple(
-                                    _LOGICAL_LEASES.get(operation.request_key, ())[
-                                        : operation.kv_capacity_pages
-                                    ]
-                                )
-                                if operation.request_key in admitted
-                                else _LOGICAL_PAGE_DELTAS.get(
-                                    (operation.request_key, operation.op_id), ()
-                                )
+                            group_id=0,
+                            block_table=tuple(
+                                _BLOCK_TABLES.get(operation.request_key, ())[
+                                    : operation.kv_capacity_pages
+                                ]
+                            ),
+                            pages_to_zero=_PAGES_TO_ZERO.get(
+                                (operation.request_key, operation.op_id), ()
                             ),
                         )
                         for operation in domain_operations
@@ -151,10 +159,11 @@ def und_admission(
     sampling: SamplingParams | None = None,
 ) -> Admission:
     rk = request_key(session_id, epoch)
-    _LOGICAL_LEASES[rk] = [int(value) for value in block_ids]
-    _UNBOUND_LOGICAL_PAGES[rk] = [int(value) for value in block_ids]
+    _BLOCK_TABLES[rk] = [int(value) for value in block_ids]
+    _UNBOUND_PAGES[rk] = [int(value) for value in block_ids]
     return Admission.create(
         rk,
+        request_pool_idx=session_id + 1,
         und=UndAdmission(
             sampling=(
                 sampling
@@ -167,7 +176,11 @@ def und_admission(
 
 
 def gen_admission(session_id: int, image: ImageParams, *, epoch: int = 1) -> Admission:
-    return Admission.create(request_key(session_id, epoch), gen_admission=GenAdmission(image=image))
+    return Admission.create(
+        request_key(session_id, epoch),
+        request_pool_idx=session_id + 1,
+        gen_admission=GenAdmission(image=image),
+    )
 
 
 def root_parent(admission: Admission) -> VersionRef:
@@ -210,7 +223,7 @@ def token_operation(
     parent: VersionRef,
     mode: TokenMode,
     tokens: Sequence[int],
-    logical_block_delta: Sequence[int] = (),
+    block_table_delta: Sequence[int] = (),
     predicate: ProductRef | None = None,
     produces_finish_candidate: bool = True,
     logprobs: bool = False,
@@ -219,15 +232,14 @@ def token_operation(
 ) -> tuple[Operation, ProductPayload]:
     """A token operation plus the input token product the worker decodes for it."""
 
-    lease = _LOGICAL_LEASES.setdefault(rk, [])
-    added = [int(value) for value in logical_block_delta]
-    if set(added) & set(lease):
-        raise ValueError("logical KV lease delta repeats an existing block")
-    lease.extend(added)
-    pending = _UNBOUND_LOGICAL_PAGES.setdefault(rk, [])
+    block_table = _BLOCK_TABLES.setdefault(rk, [])
+    added = [int(value) for value in block_table_delta]
+    if set(added) & set(block_table):
+        raise ValueError("KV block-table delta repeats an existing page")
+    block_table.extend(added)
+    pending = _UNBOUND_PAGES.setdefault(rk, [])
     pending.extend(added)
-    registration_delta = tuple(pending)
-    _LOGICAL_PAGE_DELTAS[(rk, op_id)] = registration_delta
+    _PAGES_TO_ZERO[(rk, op_id)] = tuple(pending)
     pending.clear()
 
     reference = _token_input_ref(rk, op_id, len(tokens))
@@ -324,7 +336,7 @@ def token_operation(
         ),
         inputs=(reference,),
         outputs=tuple(outputs),
-        kv_capacity_pages=len(lease),
+        kv_capacity_pages=len(block_table),
         predicate=predicate,
         rng=rng,
         control_seq=control_seq,

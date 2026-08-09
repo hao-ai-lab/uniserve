@@ -179,6 +179,7 @@ fn completion_record() -> CompletionRecord {
 fn admission() -> Admission {
     Admission::new(
         request_key(),
+        u32::try_from(request_key().session_id.0).unwrap(),
         Some(UndAdmission {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
@@ -212,13 +213,19 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
         .into_iter()
         .enumerate()
         .map(|(index, (domain, route, operations))| {
-            let kv_reservations = operations
+            let request_pool_indices = operations
+                .iter()
+                .map(|operation| u32::try_from(operation.request_key.session_id.0).unwrap())
+                .collect();
+            let kv_placements = operations
                 .iter()
                 .filter(|operation| operation.kv_capacity_pages > 0)
-                .map(|operation| KvReservation {
+                .map(|operation| KvPlacement {
                     request_key: operation.request_key,
                     op_id: operation.op_id,
-                    logical_page_delta: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+                    group_id: 0,
+                    block_table: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+                    pages_to_zero: (0..operation.kv_capacity_pages).map(BlockId).collect(),
                 })
                 .collect();
             BatchPartition {
@@ -231,7 +238,8 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 attention: AttentionRegime::Hybrid,
                 shape_class: 0,
                 operations,
-                kv_reservations,
+                request_pool_indices,
+                kv_placements,
             }
         })
         .collect()
@@ -333,17 +341,18 @@ fn version_ref_device_point_round_trips() {
 }
 
 #[test]
-fn logical_capacity_and_reservation_round_trip_independently() {
+fn logical_capacity_and_placement_round_trip_independently() {
     let base = token_decode_operation();
     assert_eq!(base.kv_capacity_pages, 1);
     let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
     assert_eq!(batch.operations().next().unwrap(), &base);
     assert_eq!(
-        batch.partitions[0].kv_reservations[0].logical_page_delta,
+        batch.partitions[0].kv_placements[0].block_table,
         vec![BlockId(0)]
     );
     let mut relocated = batch.clone();
-    relocated.partitions[0].kv_reservations[0].logical_page_delta = vec![BlockId(17)];
+    relocated.partitions[0].kv_placements[0].block_table = vec![BlockId(17)];
+    relocated.partitions[0].kv_placements[0].pages_to_zero = vec![BlockId(17)];
     assert_eq!(
         relocated.operations().next().unwrap().plan_digest,
         base.plan_digest
@@ -453,6 +462,9 @@ fn admission_round_trips_and_binds_its_operation() {
         vec![token_decode_operation()],
     ));
     assert_eq!(batch.admissions[0], admission());
+    let mut relocated = admission();
+    relocated.request_pool_idx = 19;
+    assert_eq!(relocated.payload_digest(), admission().digest);
 }
 
 #[test]
@@ -927,6 +939,7 @@ fn comprehensive_batch() -> Batch {
     }
     let und_admission = Admission::new(
         session_key(100),
+        100,
         Some(UndAdmission {
             sampling: full_sampling(),
             negative_token_ids: vec![100, 101],
@@ -941,6 +954,7 @@ fn comprehensive_batch() -> Batch {
     .unwrap();
     let gen_admission = Admission::new(
         session_key(110),
+        110,
         None,
         Some(GenAdmission {
             image: full_image(),

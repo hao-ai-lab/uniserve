@@ -324,8 +324,8 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
     ("version", "digest", "locator"),
     ("prefix_len", "group_id"),
     ("sampling", "negative_token_ids", "finish_token_ids", "kv"),
-    ("request_key", "digest", "und", "gen_admission"),
-    ("request_key", "op_id", "logical_page_delta"),
+    ("request_key", "request_pool_idx", "digest", "und", "gen_admission"),
+    ("request_key", "op_id", "group_id", "block_table", "pages_to_zero"),
     (
         "partition_id",
         "submission_group",
@@ -336,7 +336,8 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "attention",
         "shape_class",
         "operations",
-        "kv_reservations",
+        "request_pool_indices",
+        "kv_placements",
     ),
 )
 
@@ -482,9 +483,7 @@ class SamplingParams:
                 else _uints(data["allowed_token_ids"], f"{where}.allowed_token_ids")
             ),
             typical_p=_float(data.get("typical_p", 1.0), f"{where}.typical_p"),
-            forced_token_ids=_uints(
-                data.get("forced_token_ids", ()), f"{where}.forced_token_ids"
-            ),
+            forced_token_ids=_uints(data.get("forced_token_ids", ()), f"{where}.forced_token_ids"),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1766,11 +1765,14 @@ class GenAdmission:
 @dataclass(frozen=True, slots=True)
 class Admission:
     request_key: RequestKey
+    request_pool_idx: int
     digest: str
     und: UndAdmission | None
     gen_admission: GenAdmission | None
 
     def __post_init__(self) -> None:
+        if self.request_pool_idx < 1:
+            raise invalid_descriptor("request-pool index must be positive")
         if self.und is None and self.gen_admission is None:
             raise invalid_descriptor("admission must declare an understanding or generation branch")
 
@@ -1779,10 +1781,11 @@ class Admission:
         cls,
         request_key: RequestKey,
         *,
+        request_pool_idx: int,
         und: UndAdmission | None = None,
         gen_admission: GenAdmission | None = None,
     ) -> Admission:
-        value = cls(request_key, "", und, gen_admission)
+        value = cls(request_key, request_pool_idx, "", und, gen_admission)
         return replace(value, digest=value.payload_digest())
 
     @classmethod
@@ -1790,6 +1793,7 @@ class Admission:
         data = _map(value, where)
         admission = cls(
             request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_pool_idx=_uint(data.get("request_pool_idx"), f"{where}.request_pool_idx"),
             digest=_str(data.get("digest"), f"{where}.digest"),
             und=(
                 None
@@ -1823,6 +1827,7 @@ class Admission:
     def to_wire(self) -> dict[str, object]:
         return {
             "request_key": self.request_key.to_wire(),
+            "request_pool_idx": self.request_pool_idx,
             "digest": self.digest,
             "und": None if self.und is None else self.und.to_wire(),
             "gen_admission": None if self.gen_admission is None else self.gen_admission.to_wire(),
@@ -1830,35 +1835,43 @@ class Admission:
 
 
 @dataclass(frozen=True, slots=True)
-class KvReservation:
+class KvPlacement:
     request_key: RequestKey
     op_id: int
-    logical_page_delta: tuple[int, ...]
+    group_id: int
+    block_table: tuple[int, ...]
+    pages_to_zero: tuple[int, ...]
 
     def __post_init__(self) -> None:
         if self.op_id < 1:
-            raise invalid_descriptor("KV reservation operation id must be positive")
-        if any(value < 0 for value in self.logical_page_delta):
-            raise invalid_descriptor("KV reservation contains a negative logical page")
-        if len(set(self.logical_page_delta)) != len(self.logical_page_delta):
-            raise invalid_descriptor("KV reservation repeats a logical page")
+            raise invalid_descriptor("KV placement operation id must be positive")
+        if self.group_id < 0 or any(value < 0 for value in self.block_table):
+            raise invalid_descriptor("KV placement contains a negative identifier")
+        if len(set(self.block_table)) != len(self.block_table):
+            raise invalid_descriptor("KV placement repeats a page in its block table")
+        if len(set(self.pages_to_zero)) != len(self.pages_to_zero):
+            raise invalid_descriptor("KV placement repeats a page-to-zero")
+        if not set(self.pages_to_zero).issubset(self.block_table):
+            raise invalid_descriptor("KV placement zeroes a page outside its block table")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "KV reservation") -> KvReservation:
+    def from_wire(cls, value: object, where: str = "KV placement") -> KvPlacement:
         data = _map(value, where)
         return cls(
             request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
             op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            logical_page_delta=_uints(
-                data.get("logical_page_delta", ()), f"{where}.logical_page_delta"
-            ),
+            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
+            block_table=_uints(data.get("block_table", ()), f"{where}.block_table"),
+            pages_to_zero=_uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero"),
         )
 
     def to_wire(self) -> dict[str, object]:
         return {
             "request_key": self.request_key.to_wire(),
             "op_id": self.op_id,
-            "logical_page_delta": list(self.logical_page_delta),
+            "group_id": self.group_id,
+            "block_table": list(self.block_table),
+            "pages_to_zero": list(self.pages_to_zero),
         }
 
 
@@ -1873,7 +1886,8 @@ class BatchPartition:
     attention: AttentionRegime
     shape_class: int
     operations: tuple[Operation, ...]
-    kv_reservations: tuple[KvReservation, ...] = ()
+    request_pool_indices: tuple[int, ...]
+    kv_placements: tuple[KvPlacement, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -1889,6 +1903,12 @@ class BatchPartition:
             raise invalid_descriptor("batch partition route and shape class must be unsigned")
         if not self.operations:
             raise invalid_descriptor("batch partition must carry at least one operation")
+        if len(self.request_pool_indices) != len(self.operations):
+            raise invalid_descriptor(
+                "batch partition request-pool indices are not aligned with operations"
+            )
+        if any(index < 1 for index in self.request_pool_indices):
+            raise invalid_descriptor("batch partition carries request-pool index zero")
         if any(
             operation.domain is not self.domain or operation.route != self.route
             for operation in self.operations
@@ -1897,23 +1917,23 @@ class BatchPartition:
         operations = {
             (operation.request_key, operation.op_id): operation for operation in self.operations
         }
-        reservations: set[tuple[RequestKey, int]] = set()
-        for reservation in self.kv_reservations:
-            identity = (reservation.request_key, reservation.op_id)
-            if identity in reservations:
-                raise invalid_descriptor("batch partition repeats a KV reservation identity")
-            reservations.add(identity)
+        placements: set[tuple[RequestKey, int]] = set()
+        for placement in self.kv_placements:
+            identity = (placement.request_key, placement.op_id)
+            if identity in placements:
+                raise invalid_descriptor("batch partition repeats a KV placement identity")
+            placements.add(identity)
             operation = operations.get(identity)
             if operation is None:
-                raise invalid_descriptor("KV reservation does not name a partition operation")
-            if len(reservation.logical_page_delta) > operation.kv_capacity_pages:
-                raise invalid_descriptor("KV reservation exceeds operation logical capacity")
+                raise invalid_descriptor("KV placement does not name a partition operation")
+            if len(placement.block_table) != operation.kv_capacity_pages:
+                raise invalid_descriptor("KV placement does not establish operation capacity")
         if any(
             operation.kv_capacity_pages > 0
-            and (operation.request_key, operation.op_id) not in reservations
+            and (operation.request_key, operation.op_id) not in placements
             for operation in self.operations
         ):
-            raise invalid_descriptor("operation with logical KV capacity has no reservation")
+            raise invalid_descriptor("operation with logical KV capacity has no placement")
 
     @classmethod
     def from_wire(
@@ -1943,10 +1963,13 @@ class BatchPartition:
                     _seq(data.get("operations", ()), f"{where}.operations")
                 )
             ),
-            kv_reservations=tuple(
-                KvReservation.from_wire(item, f"{where}.kv_reservations[{index}]")
+            request_pool_indices=_uints(
+                data.get("request_pool_indices", ()), f"{where}.request_pool_indices"
+            ),
+            kv_placements=tuple(
+                KvPlacement.from_wire(item, f"{where}.kv_placements[{index}]")
                 for index, item in enumerate(
-                    _seq(data.get("kv_reservations", ()), f"{where}.kv_reservations")
+                    _seq(data.get("kv_placements", ()), f"{where}.kv_placements")
                 )
             ),
         )
@@ -1962,7 +1985,8 @@ class BatchPartition:
             "attention": self.attention.value,
             "shape_class": self.shape_class,
             "operations": [operation.to_wire() for operation in self.operations],
-            "kv_reservations": [reservation.to_wire() for reservation in self.kv_reservations],
+            "request_pool_indices": list(self.request_pool_indices),
+            "kv_placements": [placement.to_wire() for placement in self.kv_placements],
         }
 
 
@@ -2030,6 +2054,19 @@ class Batch:
             raise invalid_descriptor(
                 "a submission batch carries multiple operations for one request"
             )
+        request_slots = {
+            operation.request_key: request_pool_idx
+            for partition in self.partitions
+            for operation, request_pool_idx in zip(
+                partition.operations,
+                partition.request_pool_indices,
+                strict=True,
+            )
+        }
+        if len(set(request_slots.values())) != len(request_slots):
+            raise invalid_descriptor(
+                "a submission batch assigns one request-pool index to multiple requests"
+            )
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
             raise invalid_descriptor("a submission batch carries a duplicate admission")
@@ -2037,6 +2074,10 @@ class Batch:
             admission.validate()
             if admission.request_key not in request_keys:
                 raise invalid_descriptor("a submission batch admits a request without an operation")
+            if request_slots[admission.request_key] != admission.request_pool_idx:
+                raise invalid_descriptor(
+                    "an admission disagrees with its operation request-pool index"
+                )
         identities: dict[tuple[RequestKey, int | None, int], Control] = {}
         for control in self.controls:
             seq = control.control_seq if isinstance(control, (Commit, Close)) else None

@@ -2033,7 +2033,11 @@ class ModelExecutor:
         try:
             for admission in admissions:
                 self.sessions.admit(admission)
-            self.sessions.validate_operations(operations, admissions)
+            self.sessions.validate_operations(
+                operations,
+                admissions,
+                partition.request_pool_indices,
+            )
             self._reserve_cpu_tasks(operations, scope)
             for admission in admissions:
                 self.kv.admit(admission)
@@ -2836,17 +2840,19 @@ class ModelExecutor:
         partition: BatchPartition,
         scope: _ExecutionScope,
     ) -> None:
-        """Atomically bind logical leases to worker-selected physical pages."""
+        """Validate complete scheduler mappings before binding physical pages."""
 
         operations = {
             (operation.request_key, operation.op_id): operation
             for operation in partition.operations
         }
-        for reservation in partition.kv_reservations:
-            operation = operations[(reservation.request_key, reservation.op_id)]
-            scope.kv.reserve_logical_page_delta(
-                reservation.request_key,
-                reservation.logical_page_delta,
+        for placement in partition.kv_placements:
+            operation = operations[(placement.request_key, placement.op_id)]
+            scope.kv.apply_placement(
+                placement.request_key,
+                group_id=placement.group_id,
+                block_table=placement.block_table,
+                pages_to_zero=placement.pages_to_zero,
                 expected_capacity_pages=operation.kv_capacity_pages,
             )
 
@@ -4596,11 +4602,7 @@ class ModelExecutor:
                     suppress=state.suppressed_token_ids,
                     finish_token_ids=finish_token_ids,
                     force_finish=state.force_finish,
-                    draw=(
-                        sampling_uniform(draw_key, int(position))
-                        if stochastic
-                        else 0.0
-                    ),
+                    draw=(sampling_uniform(draw_key, int(position)) if stochastic else 0.0),
                     n_logprobs=int(sampling.n_logprobs),
                 )
             )
@@ -5136,9 +5138,7 @@ class ModelExecutor:
                 height,
                 width,
                 patch_size=(
-                    int(transform.patch_size)
-                    if isinstance(transform, PatchTransform)
-                    else None
+                    int(transform.patch_size) if isinstance(transform, PatchTransform) else None
                 ),
             ),
         )
@@ -5380,10 +5380,7 @@ class ModelExecutor:
             image_tensor = _decoded_tensor(outputs[0]).detach()
             image_range = ImageRange.UNIT
         elif flow.materialization is Materialization.RGB_LATENT:
-            if any(
-                not stage.publishes_state
-                for stage in self._operation_stages_for(operation)
-            ):
+            if any(not stage.publishes_state for stage in self._operation_stages_for(operation)):
                 raise invalid_descriptor(
                     "RGB-latent materialization must not declare a decode route"
                 )

@@ -31,6 +31,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
     base = und_admission(51, block_ids=(0,))
     admission = Admission.create(
         base.request_key,
+        request_pool_idx=base.request_pool_idx,
         und=replace(base.und, finish_token_ids=(_next_token(4),)),
     )
     parent, parent_input = token_operation(

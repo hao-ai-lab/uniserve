@@ -45,7 +45,7 @@ from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
 from .transfer import Locator, Transport, restore_durable_tensor
 
-SNAPSHOT_FORMAT_VERSION = 10
+SNAPSHOT_FORMAT_VERSION = 11
 _ASSET_PREFIX = "asset:"
 
 
@@ -624,6 +624,7 @@ class SnapshotProvider:
             "authority_id": session.request_key.authority_id,
             "session_id": session.session_id,
             "epoch": session.epoch,
+            "request_pool_idx": session.request_pool_idx,
             "version": session.version,
             "resolved_op_id": session.resolved_op_id,
             "resolved_digest": str(session.resolved_digest),
@@ -780,6 +781,9 @@ class SnapshotProvider:
         )
         session = RequestSession(
             request_key=request_key,
+            request_pool_idx=_uint(
+                data.get("request_pool_idx"), "snapshot session.request_pool_idx"
+            ),
             admission_digest=_digest(
                 data.get("admission_digest"), "snapshot session.admission_digest"
             ),

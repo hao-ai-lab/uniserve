@@ -1027,6 +1027,7 @@ mod tests {
     fn admission() -> Admission {
         Admission::new(
             request_key(),
+            1,
             Some(UndAdmission {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
@@ -1098,7 +1099,8 @@ mod tests {
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![operation],
-                kv_reservations: Vec::new(),
+                request_pool_indices: vec![1],
+                kv_placements: Vec::new(),
             }],
         )
     }

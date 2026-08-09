@@ -27,7 +27,7 @@ use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
     CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, EncodeMode,
     ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, GenMode,
-    KvAdmission, KvReservation, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion,
+    KvAdmission, KvPlacement, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion,
     Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
     RequestKind, ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
     TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats,
@@ -141,31 +141,37 @@ fn batch_partition_to_py<'py>(
         })?,
     )?;
     dict.set_item(
-        intern!(py, "kv_reservations"),
-        dict_list(py, &partition.kv_reservations, |reservation| {
-            kv_reservation_to_py(py, reservation, context)
+        intern!(py, "request_pool_indices"),
+        u32_list(py, &partition.request_pool_indices)?,
+    )?;
+    dict.set_item(
+        intern!(py, "kv_placements"),
+        dict_list(py, &partition.kv_placements, |placement| {
+            kv_placement_to_py(py, placement, context)
         })?,
     )?;
     Ok(dict)
 }
 
-fn kv_reservation_to_py<'py>(
+fn kv_placement_to_py<'py>(
     py: Python<'py>,
-    reservation: &KvReservation,
+    placement: &KvPlacement,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
-        context.request_key(reservation.request_key)?,
+        context.request_key(placement.request_key)?,
     )?;
-    dict.set_item(intern!(py, "op_id"), reservation.op_id.0)?;
+    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
+    dict.set_item(intern!(py, "group_id"), placement.group_id)?;
     dict.set_item(
-        intern!(py, "logical_page_delta"),
-        PyList::new(
-            py,
-            reservation.logical_page_delta.iter().map(|block| block.0),
-        )?,
+        intern!(py, "block_table"),
+        PyList::new(py, placement.block_table.iter().map(|block| block.0))?,
+    )?;
+    dict.set_item(
+        intern!(py, "pages_to_zero"),
+        PyList::new(py, placement.pages_to_zero.iter().map(|block| block.0))?,
     )?;
     Ok(dict)
 }
@@ -247,6 +253,7 @@ fn admission_to_py<'py>(
         intern!(py, "request_key"),
         context.request_key(admission.request_key)?,
     )?;
+    dict.set_item(intern!(py, "request_pool_idx"), admission.request_pool_idx)?;
     dict.set_item(intern!(py, "digest"), admission.digest.as_str())?;
     dict.set_item(
         intern!(py, "und"),
@@ -1344,6 +1351,10 @@ mod tests {
         RequestKey::new(1_000 + seed, RequestId(2_000 + seed), seed % 3)
     }
 
+    fn request_pool_idx(request_key: RequestKey) -> u32 {
+        u32::try_from(request_key.session_id.0 - 1_999).unwrap()
+    }
+
     fn product_ref(seed: u64) -> ProductRef {
         let dims = match seed % 3 {
             0 => vec![
@@ -1508,12 +1519,14 @@ mod tests {
 
     fn partition(operations: Vec<Operation>) -> BatchPartition {
         let first = operations.first().expect("partition needs operations");
-        let kv_reservations = operations
+        let kv_placements = operations
             .iter()
-            .map(|operation| uniserve_worker_wire::KvReservation {
+            .map(|operation| uniserve_worker_wire::KvPlacement {
                 request_key: operation.request_key,
                 op_id: operation.op_id,
-                logical_page_delta: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+                group_id: 0,
+                block_table: (0..operation.kv_capacity_pages).map(BlockId).collect(),
+                pages_to_zero: (0..operation.kv_capacity_pages).map(BlockId).collect(),
             })
             .collect();
         BatchPartition {
@@ -1525,8 +1538,12 @@ mod tests {
             execution: ExecutionCapability::DomainHomogeneous,
             attention: AttentionRegime::Hybrid,
             shape_class: 0,
+            request_pool_indices: operations
+                .iter()
+                .map(|operation| request_pool_idx(operation.request_key))
+                .collect(),
             operations,
-            kv_reservations,
+            kv_placements,
         }
     }
 
@@ -1538,6 +1555,7 @@ mod tests {
         let admissions = vec![
             Admission::new(
                 request_key(0),
+                request_pool_idx(request_key(0)),
                 Some(UndAdmission {
                     sampling: full_sampling(),
                     negative_token_ids: vec![100, 200],
@@ -1552,6 +1570,7 @@ mod tests {
             .unwrap(),
             Admission::new(
                 request_key(1),
+                request_pool_idx(request_key(1)),
                 None,
                 Some(GenAdmission {
                     image: full_image(),
@@ -1560,6 +1579,7 @@ mod tests {
             .unwrap(),
             Admission::new(
                 request_key(2),
+                request_pool_idx(request_key(2)),
                 Some(UndAdmission {
                     sampling: SamplingParams::default(),
                     negative_token_ids: Vec::new(),

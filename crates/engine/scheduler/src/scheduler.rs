@@ -164,7 +164,7 @@ use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
     CompletionReport, Control, Disposition, ExecutionCapability, GenAdmission, KvAdmission,
-    KvReservation, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef,
+    KvPlacement, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef,
     RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
     WorkerCapabilities, WorkerForwardStats,
 };
@@ -380,6 +380,10 @@ impl Default for SchedulerConfig {
 
 pub struct ReqState {
     pub req: GenerationRequest,
+    /// Stable scheduler-assigned row used by every worker-side request-indexed
+    /// state owner for this request epoch. Zero denotes a pending request that
+    /// has not entered the running set.
+    pub(crate) request_pool_idx: u32,
     /// Scheduler-owned lifecycle generation and latest host-resolved worker version.
     pub(crate) epoch: u64,
     pub(crate) version: u64,
@@ -432,6 +436,53 @@ pub struct ReqState {
     pub(crate) cpu_generation: u64,
     /// This request's lifecycle trace.
     pub(crate) trace: crate::trace::RequestTrace,
+}
+
+struct RequestSlotPool {
+    free: Vec<u32>,
+    live: Vec<bool>,
+}
+
+impl RequestSlotPool {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.clamp(1, u32::MAX as usize);
+        Self {
+            free: (1..=capacity as u32).rev().collect(),
+            live: vec![false; capacity + 1],
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.live.len().saturating_sub(1)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.free.is_empty()
+    }
+
+    fn acquire(&mut self) -> Option<u32> {
+        let index = self.free.pop()?;
+        self.live[index as usize] = true;
+        Some(index)
+    }
+
+    fn release(&mut self, index: u32) -> Result<(), &'static str> {
+        let Some(live) = self.live.get_mut(index as usize) else {
+            return Err("request-pool index is outside scheduler capacity");
+        };
+        if index == 0 || !*live {
+            return Err("request-pool index is not live");
+        }
+        *live = false;
+        self.free.push(index);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RetiringSession {
+    request_key: RequestKey,
+    request_pool_idx: u32,
 }
 
 #[derive(Clone)]
@@ -518,6 +569,7 @@ pub struct Scheduler {
     enc_cache: EncoderCacheManager,
     /// Encoder-cache entries reserved by admitted image requests.
     reserved_encoder_entries: usize,
+    request_slots: RequestSlotPool,
     running: HashMap<RequestId, ReqState>,
     /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
@@ -525,7 +577,7 @@ pub struct Scheduler {
     /// not yet acknowledged. Their worker page holdings and logical leases remain
     /// owned until the close report establishes the worker-side retirement
     /// ordering point.
-    retiring_sessions: HashMap<RequestId, RequestKey>,
+    retiring_sessions: HashMap<RequestId, RetiringSession>,
     order: Vec<RequestId>, // stable iteration order
     pending: Box<dyn RequestQueue>,
     cpu_continuations: CpuContinuationPool,
@@ -924,6 +976,7 @@ impl Scheduler {
             .num_blocks
             .store(caps.num_blocks as usize, Ordering::Relaxed);
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
+        let request_slots = RequestSlotPool::new(config.max_num_seqs);
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
@@ -972,6 +1025,7 @@ impl Scheduler {
             custom_logits_processors: 0,
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
+            request_slots,
             running: HashMap::new(),
             completed_outputs: HashMap::new(),
             retiring_sessions: HashMap::new(),
@@ -1054,7 +1108,7 @@ impl Scheduler {
         self.config.long_prefill_threshold = n.max(1);
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
-        self.config.max_num_seqs = n.clamp(1, MAX_NUM_SEQS);
+        self.config.max_num_seqs = n.clamp(1, self.request_slots.capacity());
     }
     /// Cap waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
@@ -1687,6 +1741,7 @@ impl Scheduler {
             uniserve_core::TraceId(req.request_id.0),
         );
         let st = ReqState {
+            request_pool_idx: 0,
             epoch: self.next_epoch,
             version: 0,
             admission_digest: None,
@@ -2146,7 +2201,16 @@ impl Scheduler {
         for control in controls {
             if let Control::Close { request_key, .. } = control {
                 let id = request_key.session_id;
-                if self.retiring_sessions.get(&id) != Some(request_key) {
+                let Some(retiring) = self.retiring_sessions.get(&id).copied() else {
+                    tracing::error!(
+                        request_id = id.0,
+                        epoch = request_key.epoch,
+                        "close acknowledgement does not match a retiring session"
+                    );
+                    self.fatal = true;
+                    continue;
+                };
+                if retiring.request_key != *request_key {
                     tracing::error!(
                         request_id = id.0,
                         epoch = request_key.epoch,
@@ -2155,16 +2219,25 @@ impl Scheduler {
                     self.fatal = true;
                     continue;
                 }
-                match self.executor.control(ControlOp::DropSession(id)) {
+                match self.executor.control_wait(ControlOp::DropSession(id), None) {
                     Ok(_) => {
                         self.retiring_sessions.remove(&id);
                         self.bm.release(id);
+                        if let Err(error) = self.request_slots.release(retiring.request_pool_idx) {
+                            tracing::error!(
+                                request_id = id.0,
+                                request_pool_idx = retiring.request_pool_idx,
+                                error,
+                                "failed to release scheduler request slot"
+                            );
+                            self.fatal = true;
+                        }
                     }
                     Err(error) => {
                         tracing::error!(
                             request_id = id.0,
                             %error,
-                            "failed to enqueue worker session retirement"
+                            "worker session retirement did not complete"
                         );
                         self.fatal = true;
                     }
@@ -3350,7 +3423,7 @@ impl Scheduler {
     fn admit(&mut self) {
         let bs = self.caps.block_size as usize;
         loop {
-            if self.running.len() >= self.config.max_num_seqs {
+            if self.running.len() >= self.config.max_num_seqs || self.request_slots.is_empty() {
                 break;
             }
             let Some(head) = self.pending.peek_request() else {
@@ -3460,6 +3533,10 @@ impl Scheduler {
     }
 
     fn admit_running(&mut self, mut st: ReqState) {
+        st.request_pool_idx = self
+            .request_slots
+            .acquire()
+            .expect("admission checked request-slot capacity");
         let id = st.req.request_id;
         let q = st.queued_at;
         let scheduled_at = now();
@@ -3716,6 +3793,7 @@ impl Scheduler {
                     let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                     let admission = Admission::new(
                         request_key,
+                        st.request_pool_idx,
                         Some(UndAdmission {
                             sampling: st.req.sampling.clone(),
                             negative_token_ids: st.context.negative_prompt_ids.clone(),
@@ -3910,7 +3988,7 @@ impl Scheduler {
             .iter()
             .map(|admission| admission.request_key)
             .collect::<HashSet<_>>();
-        let mut logical_page_deltas = HashMap::with_capacity(transitions.len());
+        let mut kv_placements = HashMap::with_capacity(transitions.len());
         for mut transition in transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
@@ -4022,13 +4100,24 @@ impl Scheduler {
                 .map_or(0, |state| state.control_seq);
             transition.kv_capacity_pages =
                 self.bm.blocks_for(request_id).len().min(u32::MAX as usize) as u32;
-            let logical_page_delta = if admitted_request_keys.contains(&request_key) {
-                self.bm
-                    .blocks_for(request_id)
-                    .iter()
-                    .take(transition.kv_capacity_pages as usize)
-                    .copied()
-                    .collect()
+            let block_table = self
+                .bm
+                .blocks_for(request_id)
+                .iter()
+                .take(transition.kv_capacity_pages as usize)
+                .copied()
+                .collect::<Vec<_>>();
+            let pages_to_zero = if admitted_request_keys.contains(&request_key) {
+                let prefix_pages = self
+                    .running
+                    .get(&request_id)
+                    .map(|state| {
+                        (state.ingest.prompt_cursor as usize)
+                            .div_ceil(self.caps.block_size as usize)
+                    })
+                    .unwrap_or_default()
+                    .min(block_table.len());
+                block_table[prefix_pages..].to_vec()
             } else {
                 transition.new_blocks.clone()
             };
@@ -4055,8 +4144,16 @@ impl Scheduler {
                     return;
                 }
             };
-            logical_page_deltas
-                .insert((operation.request_key, operation.op_id), logical_page_delta);
+            kv_placements.insert(
+                (operation.request_key, operation.op_id),
+                KvPlacement {
+                    request_key: operation.request_key,
+                    op_id: operation.op_id,
+                    group_id: 0,
+                    block_table,
+                    pages_to_zero,
+                },
+            );
             let operation_variant = operation.work.variant().as_wire_str();
             if let Some(trace_ops) = trace_ops.as_mut() {
                 let phase = self
@@ -4203,7 +4300,7 @@ impl Scheduler {
             })
             .collect::<Vec<_>>();
         controls.extend(releases);
-        let partitions = self.partition_batch(wire_ops, &logical_page_deltas);
+        let partitions = self.partition_batch(wire_ops, &kv_placements);
         let partition_ids = partitions
             .iter()
             .map(|partition| partition.partition_id)
@@ -4234,7 +4331,7 @@ impl Scheduler {
     fn partition_batch(
         &mut self,
         operations: Vec<Operation>,
-        logical_page_deltas: &HashMap<(RequestKey, OpId), Vec<BlockId>>,
+        kv_placements: &HashMap<(RequestKey, OpId), KvPlacement>,
     ) -> Vec<BatchPartition> {
         let mut routes: RouteDomainOperations = Vec::new();
         for operation in operations {
@@ -4312,7 +4409,8 @@ impl Scheduler {
                         .collect::<Vec<_>>(),
                 );
                 for (domain, operations) in mixed_candidates {
-                    let kv_reservations = self.kv_reservations(&operations, logical_page_deltas);
+                    let request_pool_indices = self.request_pool_indices(&operations);
+                    let kv_placements = self.kv_placements(&operations, kv_placements);
                     partitions.push(BatchPartition {
                         partition_id: next_partition_id,
                         submission_group: next_submission_group,
@@ -4323,7 +4421,8 @@ impl Scheduler {
                         attention,
                         shape_class: 0,
                         operations,
-                        kv_reservations,
+                        request_pool_indices,
+                        kv_placements,
                     });
                     next_partition_id = next_partition_id.saturating_add(1);
                 }
@@ -4335,7 +4434,8 @@ impl Scheduler {
                     self.next_collective_seq = value.saturating_add(1);
                     value
                 };
-                let kv_reservations = self.kv_reservations(&operations, logical_page_deltas);
+                let request_pool_indices = self.request_pool_indices(&operations);
+                let kv_placements = self.kv_placements(&operations, kv_placements);
                 partitions.push(BatchPartition {
                     partition_id: next_partition_id,
                     submission_group: next_submission_group,
@@ -4346,7 +4446,8 @@ impl Scheduler {
                     attention: partition_attention(&operations),
                     shape_class: 0,
                     operations,
-                    kv_reservations,
+                    request_pool_indices,
+                    kv_placements,
                 });
                 next_partition_id = next_partition_id.saturating_add(1);
                 next_submission_group = next_submission_group.saturating_add(1);
@@ -4355,21 +4456,31 @@ impl Scheduler {
         partitions
     }
 
-    fn kv_reservations(
+    fn request_pool_indices(&self, operations: &[Operation]) -> Vec<u32> {
+        operations
+            .iter()
+            .map(|operation| {
+                self.running
+                    .get(&operation.request_key.session_id)
+                    .map(|state| state.request_pool_idx)
+                    .expect("registered operation has a live request slot")
+            })
+            .collect()
+    }
+
+    fn kv_placements(
         &self,
         operations: &[Operation],
-        logical_page_deltas: &HashMap<(RequestKey, OpId), Vec<BlockId>>,
-    ) -> Vec<KvReservation> {
+        placements: &HashMap<(RequestKey, OpId), KvPlacement>,
+    ) -> Vec<KvPlacement> {
         operations
             .iter()
             .filter(|operation| operation.kv_capacity_pages > 0)
-            .map(|operation| KvReservation {
-                request_key: operation.request_key,
-                op_id: operation.op_id,
-                logical_page_delta: logical_page_deltas
+            .map(|operation| {
+                placements
                     .get(&(operation.request_key, operation.op_id))
                     .cloned()
-                    .expect("registered operation has a logical-page delta"),
+                    .expect("registered operation has a KV placement")
             })
             .collect()
     }
@@ -5914,7 +6025,9 @@ impl Scheduler {
             );
         }
         let mut awaits_close = false;
+        let mut request_pool_idx = None;
         if let Some(mut st) = self.running.remove(&id) {
+            request_pool_idx = Some(st.request_pool_idx);
             if let Some(key) = st.cpu_pending.take() {
                 self.cpu_deadlines.remove(&key);
             }
@@ -5935,7 +6048,13 @@ impl Scheduler {
                     cutoff,
                     reason: close_reason(&reason),
                 });
-                self.retiring_sessions.insert(id, request_key);
+                self.retiring_sessions.insert(
+                    id,
+                    RetiringSession {
+                        request_key,
+                        request_pool_idx: st.request_pool_idx,
+                    },
+                );
                 awaits_close = true;
             }
             self.order.retain(|x| *x != id);
@@ -5996,6 +6115,17 @@ impl Scheduler {
         }
         if !awaits_close {
             self.bm.release(id);
+            if let Some(index) = request_pool_idx
+                && let Err(error) = self.request_slots.release(index)
+            {
+                tracing::error!(
+                    request_id = id.0,
+                    request_pool_idx = index,
+                    error,
+                    "failed to release scheduler request slot"
+                );
+                self.fatal = true;
+            }
         }
     }
 }

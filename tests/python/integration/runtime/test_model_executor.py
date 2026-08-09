@@ -464,6 +464,7 @@ def test_image_capability_preserves_the_pure_token_decode_plan():
     understanding = und_admission(43, block_ids=(0,))
     admission = Admission.create(
         understanding.request_key,
+        request_pool_idx=understanding.request_pool_idx,
         und=understanding.und,
         gen_admission=GenAdmission(ImageParams(steps=1, height=16, width=16, seed=29)),
     )
@@ -868,7 +869,7 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
             parent=commit.selected,
             mode=TokenMode.DECODE,
             tokens=(committed[-1],),
-            logical_block_delta=logical_delta,
+            block_table_delta=logical_delta,
             control_seq=commit.control_seq,
         )
         report = worker.execute(
@@ -1188,6 +1189,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     understanding = und_admission(6, block_ids=(0,))
     admission = Admission.create(
         understanding.request_key,
+        request_pool_idx=understanding.request_pool_idx,
         und=understanding.und,
         gen_admission=GenAdmission(
             ImageParams(steps=2, height=16, width=16, seed=29, retain_images=True)

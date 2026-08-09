@@ -24,7 +24,11 @@ from uniserve_worker.runtime.snapshot_store import SnapshotProvider
 
 
 def _admit(sessions: SessionStore, session_id: int = 7) -> tuple[Admission, object]:
-    admission = Admission.create(RequestKey(0, session_id, 3), und=UndAdmission())
+    admission = Admission.create(
+        RequestKey(0, session_id, 3),
+        request_pool_idx=session_id + 1,
+        und=UndAdmission(),
+    )
     return admission, sessions.admit(admission)
 
 
@@ -162,6 +166,7 @@ def test_close_retracts_to_one_exact_resolved_prefix() -> None:
     assert tuple(session.resolved_runtime.values()) == (_runtime(1),)
 
     restored = SnapshotProvider._session_from_json(SnapshotProvider._session_to_json(session))
+    assert restored.request_pool_idx == admission.request_pool_idx
     assert restored.committed_version() == cutoff
     assert restored.resolved_version() == cutoff
     assert restored.terminal_cutoff == cutoff
@@ -215,6 +220,30 @@ def test_operation_with_stale_epoch_is_rejected_before_registration() -> None:
 
     with pytest.raises(WorkerError, match="stale epoch"):
         sessions.validate_operations((stale,), ())
+
+
+def test_request_pool_binding_rejects_slot_drift_and_reuses_released_capacity() -> None:
+    sessions = SessionStore()
+    admission, session = _admit(sessions)
+    operation = _verify_operation(admission.request_key, session.committed_version())
+
+    with pytest.raises(WorkerError, match="session index"):
+        sessions.validate_operations(
+            (operation,),
+            (),
+            (admission.request_pool_idx + 1,),
+        )
+
+    colliding = Admission.create(
+        RequestKey(0, 8, 3),
+        request_pool_idx=admission.request_pool_idx,
+        und=UndAdmission(),
+    )
+    with pytest.raises(WorkerError, match="is occupied"):
+        sessions.admit(colliding)
+
+    sessions.drop(admission.request_key.session_id)
+    assert sessions.admit(colliding).request_pool_idx == admission.request_pool_idx
 
 
 def test_control_sequence_gap_cannot_advance_or_close_the_lineage() -> None:

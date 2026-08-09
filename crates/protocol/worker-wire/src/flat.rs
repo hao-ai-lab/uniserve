@@ -11,8 +11,8 @@ use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
     CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
     ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, KvAdmission,
-    KvReservation, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point,
-    PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
+    KvPlacement, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange,
+    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
     ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, SamplingOwnership, ShapeBound,
     SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, Work,
     WorkVariant, WorkerCapabilities, WorkerForwardStats, WorkerMetrics, WorkerRequest,
@@ -200,12 +200,16 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<Ba
             })
             .transpose()?
             .unwrap_or_default(),
-        kv_reservations: partition
-            .kv_reservations()
+        request_pool_indices: partition
+            .request_pool_indices()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        kv_placements: partition
+            .kv_placements()
             .map(|items| {
                 items
                     .iter()
-                    .map(kv_reservation_from_table)
+                    .map(kv_placement_from_table)
                     .collect::<anyhow::Result<_>>()
             })
             .transpose()?
@@ -218,6 +222,7 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<Ba
 fn admission_from_table(admission: fbs::Admission<'_>) -> anyhow::Result<Admission> {
     let admission = Admission {
         request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
+        request_pool_idx: admission.request_pool_idx(),
         digest: required_str(admission.digest(), "admission.digest")?,
         und: admission.und().map(und_admission_from_table).transpose()?,
         gen_admission: admission
@@ -265,15 +270,17 @@ fn kv_admission_from_table(admission: fbs::KvAdmission<'_>) -> KvAdmission {
     }
 }
 
-fn kv_reservation_from_table(reservation: fbs::KvReservation<'_>) -> anyhow::Result<KvReservation> {
-    Ok(KvReservation {
-        request_key: request_key_from_table(
-            reservation.request_key(),
-            "KV reservation.request_key",
-        )?,
-        op_id: OpId(reservation.op_id()),
-        logical_page_delta: reservation
-            .logical_page_delta()
+fn kv_placement_from_table(placement: fbs::KvPlacement<'_>) -> anyhow::Result<KvPlacement> {
+    Ok(KvPlacement {
+        request_key: request_key_from_table(placement.request_key(), "KV placement.request_key")?,
+        op_id: OpId(placement.op_id()),
+        group_id: placement.group_id(),
+        block_table: placement
+            .block_table()
+            .map(|items| items.iter().map(BlockId).collect())
+            .unwrap_or_default(),
+        pages_to_zero: placement
+            .pages_to_zero()
             .map(|items| items.iter().map(BlockId).collect())
             .unwrap_or_default(),
     })
@@ -1272,11 +1279,12 @@ fn partition_to_fb(partition: &BatchPartition) -> anyhow::Result<fbs::BatchParti
                 .map(operation_to_fb)
                 .collect::<anyhow::Result<_>>()?,
         ),
-        kv_reservations: Some(
+        request_pool_indices: Some(partition.request_pool_indices.clone()),
+        kv_placements: Some(
             partition
-                .kv_reservations
+                .kv_placements
                 .iter()
-                .map(kv_reservation_to_fb)
+                .map(kv_placement_to_fb)
                 .collect(),
         ),
     })
@@ -1332,11 +1340,12 @@ fn partition_from_fb(partition: fbs::BatchPartitionT) -> anyhow::Result<BatchPar
             .into_iter()
             .map(operation_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        kv_reservations: partition
-            .kv_reservations
+        request_pool_indices: partition.request_pool_indices.unwrap_or_default(),
+        kv_placements: partition
+            .kv_placements
             .unwrap_or_default()
             .into_iter()
-            .map(kv_reservation_from_fb)
+            .map(kv_placement_from_fb)
             .collect::<anyhow::Result<_>>()?,
     };
     partition.validate()?;
@@ -1347,6 +1356,7 @@ fn admission_to_fb(admission: &Admission) -> anyhow::Result<fbs::AdmissionT> {
     admission.validate()?;
     Ok(fbs::AdmissionT {
         request_key: Some(Box::new(request_key_to_fb(admission.request_key))),
+        request_pool_idx: admission.request_pool_idx,
         digest: Some(admission.digest.clone()),
         und: admission
             .und
@@ -1366,6 +1376,7 @@ fn admission_to_fb(admission: &Admission) -> anyhow::Result<fbs::AdmissionT> {
 fn admission_from_fb(admission: fbs::AdmissionT) -> anyhow::Result<Admission> {
     let admission = Admission {
         request_key: request_key_from_fb(admission.request_key, "admission.request_key")?,
+        request_pool_idx: admission.request_pool_idx,
         digest: required_string(admission.digest, "admission.digest")?,
         und: admission
             .und
@@ -1431,13 +1442,15 @@ fn kv_admission_from_fb(admission: fbs::KvAdmissionT) -> KvAdmission {
     }
 }
 
-fn kv_reservation_to_fb(reservation: &KvReservation) -> fbs::KvReservationT {
-    fbs::KvReservationT {
-        request_key: Some(Box::new(request_key_to_fb(reservation.request_key))),
-        op_id: reservation.op_id.0,
-        logical_page_delta: Some(
-            reservation
-                .logical_page_delta
+fn kv_placement_to_fb(placement: &KvPlacement) -> fbs::KvPlacementT {
+    fbs::KvPlacementT {
+        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
+        op_id: placement.op_id.0,
+        group_id: placement.group_id,
+        block_table: Some(placement.block_table.iter().map(|block| block.0).collect()),
+        pages_to_zero: Some(
+            placement
+                .pages_to_zero
                 .iter()
                 .map(|block| block.0)
                 .collect(),
@@ -1446,12 +1459,19 @@ fn kv_reservation_to_fb(reservation: &KvReservation) -> fbs::KvReservationT {
 }
 
 #[cfg(test)]
-fn kv_reservation_from_fb(reservation: fbs::KvReservationT) -> anyhow::Result<KvReservation> {
-    Ok(KvReservation {
-        request_key: request_key_from_fb(reservation.request_key, "KV reservation.request_key")?,
-        op_id: OpId(reservation.op_id),
-        logical_page_delta: reservation
-            .logical_page_delta
+fn kv_placement_from_fb(placement: fbs::KvPlacementT) -> anyhow::Result<KvPlacement> {
+    Ok(KvPlacement {
+        request_key: request_key_from_fb(placement.request_key, "KV placement.request_key")?,
+        op_id: OpId(placement.op_id),
+        group_id: placement.group_id,
+        block_table: placement
+            .block_table
+            .unwrap_or_default()
+            .into_iter()
+            .map(BlockId)
+            .collect(),
+        pages_to_zero: placement
+            .pages_to_zero
             .unwrap_or_default()
             .into_iter()
             .map(BlockId)

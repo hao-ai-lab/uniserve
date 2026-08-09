@@ -1059,6 +1059,9 @@ pub struct GenAdmission {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Admission {
     pub request_key: RequestKey,
+    /// Scheduler-assigned stable request-state row. Index zero is reserved for
+    /// inactive graph padding and never identifies a live request.
+    pub request_pool_idx: u32,
     pub digest: Digest,
     pub und: Option<UndAdmission>,
     pub gen_admission: Option<GenAdmission>,
@@ -1067,15 +1070,18 @@ pub struct Admission {
 impl Admission {
     pub fn new(
         request_key: RequestKey,
+        request_pool_idx: u32,
         und: Option<UndAdmission>,
         gen_admission: Option<GenAdmission>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(request_pool_idx > 0, "request-pool index must be positive");
         anyhow::ensure!(
             und.is_some() || gen_admission.is_some(),
             "admission must declare an understanding or generation branch"
         );
         let mut admission = Self {
             request_key,
+            request_pool_idx,
             digest: String::new(),
             und,
             gen_admission,
@@ -1101,6 +1107,10 @@ impl Admission {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.request_pool_idx > 0,
+            "request-pool index must be positive"
+        );
         anyhow::ensure!(
             self.und.is_some() || self.gen_admission.is_some(),
             "admission must declare an understanding or generation branch"
@@ -1149,30 +1159,40 @@ pub struct BatchPartition {
     pub attention: AttentionRegime,
     pub shape_class: u64,
     pub operations: Vec<Operation>,
-    /// Logical page deltas bound atomically while this partition is registered.
-    /// Logical identity preserves prefix sharing; worker-local mappings determine
-    /// every physical page address.
-    pub kv_reservations: Vec<KvReservation>,
+    /// Scheduler-assigned stable request-state rows aligned with `operations`.
+    pub request_pool_indices: Vec<u32>,
+    /// Complete scheduler-owned KV mappings for operations that address KV.
+    pub kv_placements: Vec<KvPlacement>,
 }
 
-/// One operation's logical KV page growth at registration.
+/// One operation's complete scheduler-owned KV placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvReservation {
+pub struct KvPlacement {
     pub request_key: RequestKey,
     pub op_id: OpId,
-    pub logical_page_delta: Vec<BlockId>,
+    pub group_id: u32,
+    pub block_table: Vec<BlockId>,
+    pub pages_to_zero: Vec<BlockId>,
 }
 
-impl KvReservation {
+impl KvPlacement {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.op_id.0 > 0,
-            "KV reservation operation id must be positive"
+            "KV placement operation id must be positive"
         );
         anyhow::ensure!(
-            self.logical_page_delta.iter().collect::<HashSet<_>>().len()
-                == self.logical_page_delta.len(),
-            "KV reservation repeats a logical page"
+            self.block_table.iter().collect::<HashSet<_>>().len() == self.block_table.len(),
+            "KV placement repeats a page in its block table"
+        );
+        anyhow::ensure!(
+            self.pages_to_zero.iter().collect::<HashSet<_>>().len() == self.pages_to_zero.len(),
+            "KV placement repeats a page-to-zero"
+        );
+        let pages = self.block_table.iter().collect::<HashSet<_>>();
+        anyhow::ensure!(
+            self.pages_to_zero.iter().all(|page| pages.contains(page)),
+            "KV placement zeroes a page outside its block table"
         );
         Ok(())
     }
@@ -1200,32 +1220,40 @@ impl BatchPartition {
                 "batch partition operation disagrees with its domain or route"
             );
         }
+        anyhow::ensure!(
+            self.request_pool_indices.len() == self.operations.len(),
+            "batch partition request-pool indices are not aligned with operations"
+        );
+        anyhow::ensure!(
+            self.request_pool_indices.iter().all(|index| *index > 0),
+            "batch partition carries the reserved request-pool index zero"
+        );
         let operations = self
             .operations
             .iter()
             .map(|operation| ((operation.request_key, operation.op_id), operation))
             .collect::<HashMap<_, _>>();
-        let mut reservation_ids = HashSet::with_capacity(self.kv_reservations.len());
-        for reservation in &self.kv_reservations {
-            reservation.validate()?;
-            let identity = (reservation.request_key, reservation.op_id);
+        let mut placement_ids = HashSet::with_capacity(self.kv_placements.len());
+        for placement in &self.kv_placements {
+            placement.validate()?;
+            let identity = (placement.request_key, placement.op_id);
             anyhow::ensure!(
-                reservation_ids.insert(identity),
-                "batch partition repeats a KV reservation identity"
+                placement_ids.insert(identity),
+                "batch partition repeats a KV placement identity"
             );
             let operation = operations.get(&identity).ok_or_else(|| {
-                anyhow::anyhow!("KV reservation does not name a partition operation")
+                anyhow::anyhow!("KV placement does not name a partition operation")
             })?;
             anyhow::ensure!(
-                reservation.logical_page_delta.len() <= operation.kv_capacity_pages as usize,
-                "KV reservation exceeds operation logical capacity"
+                placement.block_table.len() == operation.kv_capacity_pages as usize,
+                "KV placement does not establish the operation capacity"
             );
         }
         for operation in &self.operations {
             anyhow::ensure!(
                 operation.kv_capacity_pages == 0
-                    || reservation_ids.contains(&(operation.request_key, operation.op_id)),
-                "operation with logical KV capacity has no reservation"
+                    || placement_ids.contains(&(operation.request_key, operation.op_id)),
+                "operation with logical KV capacity has no placement"
             );
         }
         Ok(())
@@ -1344,11 +1372,24 @@ impl Batch {
         }
         // Depth one: at most one runnable operation per request per batch.
         let mut request_keys = HashSet::with_capacity(self.operation_count());
-        for operation in self.operations() {
-            anyhow::ensure!(
-                request_keys.insert(operation.request_key),
-                "a submission batch carries multiple operations for one request"
-            );
+        let mut request_slots = HashMap::with_capacity(self.operation_count());
+        let mut assigned_slots = HashSet::with_capacity(self.operation_count());
+        for partition in &self.partitions {
+            for (operation, request_pool_idx) in partition
+                .operations
+                .iter()
+                .zip(&partition.request_pool_indices)
+            {
+                anyhow::ensure!(
+                    request_keys.insert(operation.request_key),
+                    "a submission batch carries multiple operations for one request"
+                );
+                anyhow::ensure!(
+                    assigned_slots.insert(*request_pool_idx),
+                    "a submission batch assigns one request-pool index to multiple requests"
+                );
+                request_slots.insert(operation.request_key, *request_pool_idx);
+            }
         }
         let mut admitted = HashSet::with_capacity(self.admissions.len());
         for admission in &self.admissions {
@@ -1361,6 +1402,10 @@ impl Batch {
                 self.operations()
                     .any(|operation| operation.request_key == admission.request_key),
                 "a submission batch admits a request without an operation"
+            );
+            anyhow::ensure!(
+                request_slots.get(&admission.request_key) == Some(&admission.request_pool_idx),
+                "an admission disagrees with its operation request-pool index"
             );
         }
         // Idempotency identity: (request_key, control_seq, variant, content).
@@ -2066,8 +2111,20 @@ pub fn protocol_layout_digest() -> Digest {
         &["version", "digest", "locator"],
         &["prefix_len", "group_id"],
         &["sampling", "negative_token_ids", "finish_token_ids", "kv"],
-        &["request_key", "digest", "und", "gen_admission"],
-        &["request_key", "op_id", "logical_page_delta"],
+        &[
+            "request_key",
+            "request_pool_idx",
+            "digest",
+            "und",
+            "gen_admission",
+        ],
+        &[
+            "request_key",
+            "op_id",
+            "group_id",
+            "block_table",
+            "pages_to_zero",
+        ],
         &[
             "partition_id",
             "submission_group",
@@ -2078,7 +2135,8 @@ pub fn protocol_layout_digest() -> Digest {
             "attention",
             "shape_class",
             "operations",
-            "kv_reservations",
+            "request_pool_indices",
+            "kv_placements",
         ],
     ];
     for record in record_layouts {

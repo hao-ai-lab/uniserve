@@ -18,7 +18,7 @@ from ..batch import (
     CompletionReport,
     Domain,
     ExecutionCapability,
-    KvReservation,
+    KvPlacement,
     Operation,
     OpStatus,
     ProductPayload,
@@ -67,21 +67,10 @@ def _warmup_batch(
     step_id: int,
     admissions: tuple[Admission, ...],
     operations: tuple[Operation, ...],
+    request_pool_indices: dict[RequestKey, int],
+    kv_placements: dict[tuple[RequestKey, int], KvPlacement],
     input_products: tuple[ProductPayload, ...] = (),
 ) -> Batch:
-    logical_leases: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
-    admitted_request_keys = {admission.request_key for admission in admissions}
-    next_logical_block = 0
-    for operation in operations:
-        capacity = (
-            int(operation.kv_capacity_pages)
-            if operation.request_key in admitted_request_keys
-            else 0
-        )
-        logical_leases[(operation.request_key, operation.op_id)] = tuple(
-            range(next_logical_block, next_logical_block + capacity)
-        )
-        next_logical_block += capacity
     groups: list[tuple[Domain, int, list[Operation]]] = []
     for operation in operations:
         existing = next(
@@ -107,12 +96,11 @@ def _warmup_batch(
             attention=AttentionRegime.HYBRID,
             shape_class=0,
             operations=tuple(members),
-            kv_reservations=tuple(
-                KvReservation(
-                    request_key=operation.request_key,
-                    op_id=operation.op_id,
-                    logical_page_delta=logical_leases[(operation.request_key, operation.op_id)],
-                )
+            request_pool_indices=tuple(
+                request_pool_indices[operation.request_key] for operation in members
+            ),
+            kv_placements=tuple(
+                kv_placements[(operation.request_key, operation.op_id)]
                 for operation in members
                 if operation.kv_capacity_pages > 0
             ),
@@ -241,9 +229,7 @@ class ModelWorker:
             raise capability_mismatch(f"{type(self).__name__} advertises no executable work")
         self._capabilities = replace(
             declared,
-            supported_work=tuple(
-                variant for variant in WorkVariant if variant in advertised_work
-            ),
+            supported_work=tuple(variant for variant in WorkVariant if variant in advertised_work),
             pipeline_depth=int(pipeline_depth),
         )
         self.residency = ResidencyStore.from_model(
@@ -426,10 +412,65 @@ class ModelWorker:
         input_products: tuple[ProductPayload, ...] = (),
     ) -> Batch:
         self._warmup_step_id += 1
+        admissions_by_key = {admission.request_key: admission for admission in admissions}
+        occupied_blocks = {
+            block
+            for session_id in self.sessions.session_ids()
+            for block in self.kv.get(session_id).logical_blocks
+        }
+        request_pool_indices: dict[RequestKey, int] = {}
+        kv_placements: dict[tuple[RequestKey, int], KvPlacement] = {}
+        pool = self.kv.pool
+        if pool is None:
+            raise RuntimeError("worker warmup requires a resident KV pool")
+        for operation in operations:
+            session = self.sessions.peek(int(operation.request_key.session_id))
+            admission = admissions_by_key.get(operation.request_key)
+            if session is None and admission is None:
+                raise invalid_descriptor("warmup operation has no request-pool binding")
+            if session is None:
+                assert admission is not None
+                request_pool_indices[operation.request_key] = admission.request_pool_idx
+            else:
+                request_pool_indices[operation.request_key] = session.request_pool_idx
+            if operation.kv_capacity_pages == 0:
+                continue
+            if session is None:
+                if admission is None:
+                    raise invalid_descriptor("warmup operation has no KV admission")
+                if admission.und is None or admission.und.kv.prefix_len != 0:
+                    raise invalid_descriptor("warmup KV admission requires an empty prefix")
+                block_table: list[int] = []
+                group_id = admission.und.kv.group_id
+            else:
+                entry = self.kv.get(int(operation.request_key.session_id))
+                block_table = list(entry.logical_blocks)
+                group_id = entry.group_id
+            missing = int(operation.kv_capacity_pages) - len(block_table)
+            if missing < 0:
+                raise invalid_descriptor("warmup operation regresses its KV capacity")
+            allocated = tuple(
+                candidate
+                for candidate in range(pool.leasable_num_blocks)
+                if candidate not in occupied_blocks
+            )[:missing]
+            if len(allocated) != missing:
+                raise invalid_descriptor("warmup KV placement exceeds resident capacity")
+            block_table.extend(allocated)
+            occupied_blocks.update(allocated)
+            kv_placements[(operation.request_key, operation.op_id)] = KvPlacement(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                group_id=group_id,
+                block_table=tuple(block_table),
+                pages_to_zero=allocated,
+            )
         return _warmup_batch(
             step_id=self._warmup_step_id,
             admissions=admissions,
             operations=operations,
+            request_pool_indices=request_pool_indices,
+            kv_placements=kv_placements,
             input_products=input_products,
         )
 
@@ -537,6 +578,7 @@ class ModelWorker:
         admissions = {
             sid: Admission.create(
                 keys[sid],
+                request_pool_idx=sid,
                 und=UndAdmission(
                     sampling=SamplingParams(temperature=0.0, ignore_eos=True),
                     kv=KvAdmission(),
@@ -728,6 +770,7 @@ class ModelWorker:
                 rk = RequestKey(0, session_id, 1)
                 admission = Admission.create(
                     rk,
+                    request_pool_idx=session_id,
                     und=UndAdmission(
                         sampling=SamplingParams(temperature=0.0, ignore_eos=True),
                         kv=KvAdmission(),
@@ -799,9 +842,8 @@ class ModelWorker:
             Work,
         )
 
-        if (
-            WorkVariant.GEN_TRANSITION not in self._effective_work_variants
-            or not isinstance(self.model.generation, GenerationPipeline)
+        if WorkVariant.GEN_TRANSITION not in self._effective_work_variants or not isinstance(
+            self.model.generation, GenerationPipeline
         ):
             return
         if self.sessions.session_ids():
@@ -811,6 +853,7 @@ class ModelWorker:
         height, width = self._warmup_image_geometry()
         admission = Admission.create(
             rk,
+            request_pool_idx=session_id,
             gen_admission=GenAdmission(
                 image=ImageParams(steps=1, height=height, width=width, seed=0)
             ),

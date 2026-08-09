@@ -119,6 +119,7 @@ class RequestSession:
     """
 
     request_key: RequestKey
+    request_pool_idx: int
     admission_digest: str
     sampling: SamplingParams | None
     image: ImageParams | None
@@ -153,6 +154,10 @@ class RequestSession:
     # any host token history. Allocated lazily on the first penalty-bearing
     # operation; ``None`` while the request uses no penalties.
     penalty_counts: "torch.Tensor | None" = None
+
+    def __post_init__(self) -> None:
+        if self.request_pool_idx < 1:
+            raise invalid_descriptor("request session has an invalid request-pool index")
 
     @property
     def session_id(self) -> int:
@@ -214,6 +219,7 @@ class SessionStore:
 
     def __init__(self) -> None:
         self._sessions: dict[int, RequestSession] = {}
+        self._request_slots: dict[int, int] = {}
         self._locks: dict[int, RLock] = {}
         self._index_lock = RLock()
 
@@ -244,7 +250,15 @@ class SessionStore:
         try:
             for admission in batch.admissions:
                 self.admit(admission)
-            self.validate_operations(batch.operations, batch.admissions)
+            self.validate_operations(
+                batch.operations,
+                batch.admissions,
+                tuple(
+                    index
+                    for partition in batch.partitions
+                    for index in partition.request_pool_indices
+                ),
+            )
         finally:
             for lock in reversed(locks):
                 lock.release()
@@ -253,9 +267,15 @@ class SessionStore:
         self,
         operations: Sequence[Operation],
         admissions: Sequence[Admission],
+        request_pool_indices: Sequence[int] | None = None,
     ) -> None:
+        if request_pool_indices is not None and len(request_pool_indices) != len(operations):
+            raise invalid_descriptor("request-pool indices are not aligned with operations")
         admitted = {value.request_key.session_id: value for value in admissions}
-        for operation in operations:
+        aligned_indices: Sequence[int | None] = (
+            (None,) * len(operations) if request_pool_indices is None else request_pool_indices
+        )
+        for operation, request_pool_idx in zip(operations, aligned_indices, strict=True):
             session_id = operation.request_key.session_id
             session = self.peek(session_id)
             admission = admitted.get(session_id)
@@ -265,6 +285,11 @@ class SessionStore:
                         f"operation {operation.op_id} references an unknown session"
                     )
                 continue
+            if request_pool_idx is not None and int(request_pool_idx) != session.request_pool_idx:
+                raise invalid_descriptor(
+                    f"operation {operation.op_id} names request-pool index {request_pool_idx}; "
+                    f"session index is {session.request_pool_idx}"
+                )
             if admission is not None and admission.digest != session.admission_digest:
                 raise invalid_descriptor(
                     f"session {session_id} admission conflicts with committed state"
@@ -304,43 +329,58 @@ class SessionStore:
 
     def admit(self, admission: Admission) -> RequestSession:
         session_id = admission.request_key.session_id
-        existing = self.peek(session_id)
-        if existing is not None:
-            if existing.admission_digest != admission.digest:
+        with self._index_lock:
+            existing = self.peek(session_id)
+            if existing is not None:
+                if existing.admission_digest != admission.digest:
+                    raise invalid_descriptor(
+                        f"session {session_id} admission conflicts with committed state"
+                    )
+                if existing.request_pool_idx != admission.request_pool_idx:
+                    raise invalid_descriptor(
+                        f"session {session_id} admission changes its request-pool index"
+                    )
+                return existing
+            occupying_session = self._request_slots.get(admission.request_pool_idx)
+            if occupying_session is not None:
                 raise invalid_descriptor(
-                    f"session {session_id} admission conflicts with committed state"
+                    f"request-pool index {admission.request_pool_idx} is occupied by "
+                    f"session {occupying_session}"
                 )
-            return existing
-        prefix_len = 0 if admission.und is None else int(admission.und.kv.prefix_len)
-        session = RequestSession(
-            request_key=admission.request_key,
-            admission_digest=admission.digest,
-            sampling=None if admission.und is None else admission.und.sampling,
-            image=None if admission.gen_admission is None else admission.gen_admission.image,
-            negative_token_ids=(() if admission.und is None else admission.und.negative_token_ids),
-            finish_token_ids=(() if admission.und is None else admission.und.finish_token_ids),
-            resolved_digest=admission.digest,
-            committed_digest=admission.digest,
-            logical_position=prefix_len,
-        )
-        root = session.committed_version()
-        root_key = session.point_key(root)
-        session.resolved_versions[root_key] = root
-        session.resolved_operations[0] = root
-        session.resolved_parents[0] = root
-        session.resolved_runtime[root_key] = ResolvedRuntimeState(
-            logical_position=session.logical_position,
-            rng_counter=session.rng_counter,
-            latent_product=None,
-            flow_step=0,
-            kv_reserved_len=prefix_len,
-            kv_initialized_len=prefix_len,
-            kv_visible_len=prefix_len,
-            kv_committed_len=prefix_len,
-            kv_published_len=0,
-        )
-        self._sessions[session_id] = session
-        return session
+            prefix_len = 0 if admission.und is None else int(admission.und.kv.prefix_len)
+            session = RequestSession(
+                request_key=admission.request_key,
+                request_pool_idx=admission.request_pool_idx,
+                admission_digest=admission.digest,
+                sampling=None if admission.und is None else admission.und.sampling,
+                image=None if admission.gen_admission is None else admission.gen_admission.image,
+                negative_token_ids=(
+                    () if admission.und is None else admission.und.negative_token_ids
+                ),
+                finish_token_ids=(() if admission.und is None else admission.und.finish_token_ids),
+                resolved_digest=admission.digest,
+                committed_digest=admission.digest,
+                logical_position=prefix_len,
+            )
+            root = session.committed_version()
+            root_key = session.point_key(root)
+            session.resolved_versions[root_key] = root
+            session.resolved_operations[0] = root
+            session.resolved_parents[0] = root
+            session.resolved_runtime[root_key] = ResolvedRuntimeState(
+                logical_position=session.logical_position,
+                rng_counter=session.rng_counter,
+                latent_product=None,
+                flow_step=0,
+                kv_reserved_len=prefix_len,
+                kv_initialized_len=prefix_len,
+                kv_visible_len=prefix_len,
+                kv_committed_len=prefix_len,
+                kv_published_len=0,
+            )
+            self._sessions[session_id] = session
+            self._request_slots[session.request_pool_idx] = session_id
+            return session
 
     def apply_controls(self, controls: Sequence[Control]) -> tuple[KvControlUpdate, ...]:
         """Apply ordered semantic controls before registering new operations."""
@@ -564,7 +604,7 @@ class SessionStore:
     def drop(self, session_id: int) -> None:
         session_id = int(session_id)
         with self._index_lock:
-            self._sessions.pop(session_id, None)
+            self._discard_session(session_id)
             self._locks.pop(session_id, None)
 
     def snapshot_committed(self, session_ids: set[int]) -> tuple[RequestSession, ...]:
@@ -625,8 +665,23 @@ class SessionStore:
         for lock in locks:
             lock.acquire()
         try:
+            retained_slots = {
+                session.request_pool_idx: existing_id
+                for existing_id, session in self._sessions.items()
+                if existing_id not in requested
+            }
+            for session_id, session in staged.items():
+                if session.request_pool_idx < 1:
+                    raise invalid_descriptor("session snapshot request-pool index is invalid")
+                occupying_session = retained_slots.get(session.request_pool_idx)
+                if occupying_session is not None:
+                    raise invalid_descriptor(
+                        f"session snapshot request-pool index {session.request_pool_idx} "
+                        f"is occupied by session {occupying_session}"
+                    )
+                retained_slots[session.request_pool_idx] = session_id
             for session_id in requested - set(staged):
-                self._sessions.pop(session_id, None)
+                self._discard_session(session_id)
             for session_id, session in staged.items():
                 if session.epoch < 0 or session.version < 0 or session.committed_point < 0:
                     raise invalid_descriptor("session snapshot version is invalid")
@@ -641,7 +696,9 @@ class SessionStore:
                     or session.runtime_for(session.committed_version()) is None
                 ):
                     raise invalid_descriptor("session snapshot lineage state is incomplete")
+                self._discard_session(session_id)
                 self._sessions[session_id] = session
+                self._request_slots[session.request_pool_idx] = session_id
         finally:
             for lock in reversed(locks):
                 lock.release()
@@ -666,6 +723,16 @@ class SessionStore:
     def _lock(self, session_id: int) -> RLock:
         with self._index_lock:
             return self._locks.setdefault(int(session_id), RLock())
+
+    def _discard_session(self, session_id: int) -> None:
+        with self._index_lock:
+            session_id = int(session_id)
+            session = self._sessions.pop(session_id, None)
+            if (
+                session is not None
+                and self._request_slots.get(session.request_pool_idx) == session_id
+            ):
+                self._request_slots.pop(session.request_pool_idx, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -900,7 +967,7 @@ class StepTxn:
                     mapping.pop(key, None)
             for session_id, session_snapshot in self._snapshots.items():
                 if not session_snapshot.existed:
-                    self.sessions._sessions.pop(session_id, None)
+                    self.sessions._discard_session(session_id)
                 elif session_snapshot.values is not None:
                     session = self.sessions.get(session_id)
                     (

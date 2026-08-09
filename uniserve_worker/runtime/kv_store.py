@@ -2571,6 +2571,41 @@ class KvTxn:
             )
         )
 
+    def apply_placement(
+        self,
+        request_key: RequestKey,
+        *,
+        group_id: int,
+        block_table: Sequence[int],
+        pages_to_zero: Sequence[int],
+        expected_capacity_pages: int,
+    ) -> None:
+        self._require_open()
+        if int(request_key.session_id) not in self._session_ids:
+            raise RuntimeError("KV placement targets a session outside this step")
+        entry = self._store.get(int(request_key.session_id))
+        existing = tuple(entry.logical_blocks)
+        complete = tuple(int(value) for value in block_table)
+        zero = tuple(int(value) for value in pages_to_zero)
+        if int(entry.group_id) != int(group_id):
+            raise invalid_descriptor("KV placement disagrees with the admitted cache group")
+        if complete[: len(existing)] != existing:
+            raise invalid_descriptor("KV placement changes the existing scheduler block table")
+        delta = complete[len(existing) :]
+        if not set(zero).issubset(delta):
+            raise invalid_descriptor("KV placement zero set is outside newly assigned pages")
+        self.reserve_logical_page_delta(
+            request_key,
+            delta,
+            expected_capacity_pages=expected_capacity_pages,
+        )
+        pool = self._store.pool
+        if pool is None:
+            raise RuntimeError("KV placement requires a physical pool")
+        placed = self._store.get(int(request_key.session_id))
+        physical = dict(zip(placed.logical_blocks, placed.block_ids, strict=True))
+        pool.zero_session_blocks(physical[page] for page in zero)
+
     def import_snapshot(
         self,
         session_id: int,

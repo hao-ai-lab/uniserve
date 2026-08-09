@@ -143,6 +143,22 @@ class PagedKVPool:
             raise invalid_descriptor("session KV page is outside this pool's session range")
         self._session_free.release(values)
 
+    def zero_session_blocks(self, block_ids: Iterable[int]) -> None:
+        values = tuple(dict.fromkeys(int(value) for value in block_ids))
+        if any(value < 0 or value >= self.leasable_num_blocks for value in values):
+            raise invalid_descriptor("session KV page is outside this pool's session range")
+        if not values:
+            return
+        indices = torch.tensor(values, dtype=torch.long, device=self.k.device)
+        self.k.index_fill_(1, indices, 0)
+        self.v.index_fill_(1, indices, 0)
+        if self.k_scale is not None and self.v_scale is not None:
+            self.k_scale.index_fill_(1, indices, 1)
+            self.v_scale.index_fill_(1, indices, 1)
+        if self.k_scale_set is not None and self.v_scale_set is not None:
+            self.k_scale_set.index_fill_(1, indices, False)
+            self.v_scale_set.index_fill_(1, indices, False)
+
     def allocate_branch_blocks(self, count: int) -> list[int]:
         """Take ``count`` transaction-branch blocks from this pool's own range."""
 

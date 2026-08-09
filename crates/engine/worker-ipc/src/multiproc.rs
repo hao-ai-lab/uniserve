@@ -1535,7 +1535,8 @@ mod tests {
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![operation],
-                kv_reservations: Vec::new(),
+                request_pool_indices: vec![1],
+                kv_placements: Vec::new(),
             }],
         )
     }
@@ -1572,7 +1573,8 @@ mod tests {
             attention: AttentionRegime::Causal,
             shape_class: 0,
             operations: vec![operation],
-            kv_reservations: Vec::new(),
+            request_pool_indices: vec![2],
+            kv_placements: Vec::new(),
         });
         batch
     }

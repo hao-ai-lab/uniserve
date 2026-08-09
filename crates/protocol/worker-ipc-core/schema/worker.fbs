@@ -288,10 +288,12 @@ table Operation {
   plan_digest:string;
 }
 
-table KvReservation {
+table KvPlacement {
   request_key:RequestKey;
   op_id:ulong;
-  logical_page_delta:[uint];
+  group_id:uint;
+  block_table:[uint];
+  pages_to_zero:[uint];
 }
 
 table LogicalLengths {
@@ -381,6 +383,7 @@ table GenAdmission { image:ImageParams; }
 
 table Admission {
   request_key:RequestKey;
+  request_pool_idx:uint;
   digest:string;
   und:UndAdmission;
   gen_admission:GenAdmission;
@@ -396,7 +399,8 @@ table BatchPartition {
   attention:AttentionRegime;
   shape_class:ulong;
   operations:[Operation];
-  kv_reservations:[KvReservation];
+  request_pool_indices:[uint];
+  kv_placements:[KvPlacement];
 }
 
 table Batch {

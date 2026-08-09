@@ -3833,6 +3833,8 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     struct OwnershipChecking {
         inner: SimExecutor,
         owners: Arc<Mutex<HashMap<u32, RequestId>>>,
+        slot_owners: Arc<Mutex<HashMap<u32, RequestId>>>,
+        observed_slots: Arc<Mutex<HashMap<RequestId, u32>>>,
     }
 
     impl Executor for OwnershipChecking {
@@ -3856,9 +3858,37 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
             {
                 let mut owners = self.owners.lock().unwrap();
                 for partition in &batch.partitions {
-                    for reservation in &partition.kv_reservations {
-                        let session_id = reservation.request_key.session_id;
-                        for block in &reservation.logical_page_delta {
+                    for (operation, request_pool_idx) in partition
+                        .operations
+                        .iter()
+                        .zip(&partition.request_pool_indices)
+                    {
+                        let session_id = operation.request_key.session_id;
+                        if let Some(owner) = self.slot_owners.lock().unwrap().get(request_pool_idx)
+                        {
+                            anyhow::ensure!(
+                                *owner == session_id,
+                                "request slot {} remains owned by session {}",
+                                request_pool_idx,
+                                owner.0
+                            );
+                        }
+                        self.slot_owners
+                            .lock()
+                            .unwrap()
+                            .insert(*request_pool_idx, session_id);
+                        let mut observed = self.observed_slots.lock().unwrap();
+                        if let Some(expected) = observed.get(&session_id) {
+                            anyhow::ensure!(
+                                *expected == *request_pool_idx,
+                                "request slot changed within one session epoch"
+                            );
+                        }
+                        observed.insert(session_id, *request_pool_idx);
+                    }
+                    for placement in &partition.kv_placements {
+                        let session_id = placement.request_key.session_id;
+                        for block in &placement.block_table {
                             if let Some(owner) = owners.get(&block.0) {
                                 anyhow::ensure!(
                                     *owner == session_id,
@@ -3886,6 +3916,10 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
         fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
             if let ControlOp::DropSession(id) = &operation {
                 self.owners.lock().unwrap().retain(|_, owner| owner != id);
+                self.slot_owners
+                    .lock()
+                    .unwrap()
+                    .retain(|_, owner| owner != id);
             }
             self.inner.control(operation)
         }
@@ -3897,6 +3931,10 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
         ) -> anyhow::Result<Vec<ControlAck>> {
             if let ControlOp::DropSession(id) = &operation {
                 self.owners.lock().unwrap().retain(|_, owner| owner != id);
+                self.slot_owners
+                    .lock()
+                    .unwrap()
+                    .retain(|_, owner| owner != id);
             }
             self.inner.control_wait(operation, targets)
         }
@@ -3911,12 +3949,24 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     sim.set_pipeline_depth(2);
     sim.set_text_len(1);
     let owners = Arc::new(Mutex::new(HashMap::new()));
+    let slot_owners = Arc::new(Mutex::new(HashMap::new()));
+    let observed_slots = Arc::new(Mutex::new(HashMap::new()));
     let executor = OwnershipChecking {
         inner: SimExecutor::new(Box::new(sim)),
         owners: Arc::clone(&owners),
+        slot_owners: Arc::clone(&slot_owners),
+        observed_slots: Arc::clone(&observed_slots),
     };
-    let mut scheduler =
-        Scheduler::with_policy(Box::new(executor), ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut scheduler = Scheduler::with_config(
+        Box::new(executor),
+        ctrl(),
+        SchedulerConfig {
+            max_batch: 32,
+            max_num_seqs: 1,
+            policy: SchedulingPolicy::Fcfs,
+            ..SchedulerConfig::default()
+        },
+    );
     let mut receivers = (1..=2)
         .map(|request_id| {
             scheduler.submit_for_test(generation_request(
@@ -3947,6 +3997,11 @@ fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
     assert_eq!(finished.len(), receivers.len());
     assert_eq!(scheduler.health_snapshot().free_blocks, 2);
     assert!(owners.lock().unwrap().is_empty());
+    assert!(slot_owners.lock().unwrap().is_empty());
+    assert_eq!(
+        *observed_slots.lock().unwrap(),
+        HashMap::from([(RequestId(1), 1), (RequestId(2), 1)])
+    );
 }
 
 /// The scheduler exposes structured facts, explainable decisions, and latency history.

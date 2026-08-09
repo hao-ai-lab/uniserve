@@ -241,6 +241,7 @@ def test_admission_finish_policy_drives_the_device_finish_product() -> None:
     assert base.und is not None
     admission = Admission.create(
         base.request_key,
+        request_pool_idx=base.request_pool_idx,
         und=replace(base.und, finish_token_ids=(expected,)),
     )
     operation, token_input = token_operation(
@@ -277,6 +278,7 @@ def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:
     assert second_base.und is not None
     second = Admission.create(
         second_base.request_key,
+        request_pool_idx=second_base.request_pool_idx,
         und=replace(second_base.und, finish_token_ids=(expected,)),
     )
     first_op, first_input = token_operation(
@@ -446,6 +448,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
     base = und_admission(6, block_ids=(5,))
     admission = Admission.create(
         base.request_key,
+        request_pool_idx=base.request_pool_idx,
         und=replace(cast(UndAdmission, base.und), finish_token_ids=(1001,)),
     )
     extend, extend_input = token_operation(

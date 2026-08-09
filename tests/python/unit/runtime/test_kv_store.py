@@ -42,6 +42,7 @@ def _pool(*, blocks: int = 8, layers: int = 1, branch_blocks: int = 0) -> PagedK
 def _admission(session_id: int, *, prefix_len: int = 0, group_id: int = 0) -> Admission:
     return Admission.create(
         RequestKey(0, session_id, 1),
+        request_pool_idx=session_id + 1,
         und=UndAdmission(kv=KvAdmission(prefix_len=prefix_len, group_id=group_id)),
     )
 
@@ -165,6 +166,40 @@ def test_reused_logical_prefix_retains_its_worker_page_contents() -> None:
     assert key is not None and value is not None
     torch.testing.assert_close(key.flatten(), torch.tensor((3.0, 4.0)))
     torch.testing.assert_close(value.flatten(), torch.tensor((-3.0, -4.0)))
+
+
+def test_scheduler_zero_set_clears_reassigned_page_contents() -> None:
+    pool = _pool(blocks=1)
+    store = KvStore(pool)
+    first = _admission(1)
+    first_transaction = store.begin_step({1})
+    store.admit(first)
+    first_transaction.apply_placement(
+        first.request_key,
+        group_id=0,
+        block_table=(0,),
+        pages_to_zero=(0,),
+        expected_capacity_pages=1,
+    )
+    first_transaction.finalize()
+    _write(store, 1, (3.0, 4.0))
+    store.drop(1)
+
+    second = _admission(2)
+    second_transaction = store.begin_step({2})
+    store.admit(second)
+    second_transaction.apply_placement(
+        second.request_key,
+        group_id=0,
+        block_table=(0,),
+        pages_to_zero=(0,),
+        expected_capacity_pages=1,
+    )
+    second_transaction.finalize()
+
+    page = store.get(2).block_ids[0]
+    assert torch.count_nonzero(pool.k[:, page]).item() == 0
+    assert torch.count_nonzero(pool.v[:, page]).item() == 0
 
 
 def test_registration_exhaustion_rolls_back_pages_and_session_atomically() -> None:
