@@ -1,13 +1,9 @@
-"""Shared host->device staging primitives for integer sidecar tensors.
+"""Shared host-to-device staging primitives for integer sidecar tensors.
 
-Both H2D staging seams — token/position staging and the `KvStore` block-table
-and sequence-length staging — need the same four
-mechanics: canonical CUDA device resolution, pinned-host buffer acquisition
-(optionally recycled through a stager slot), a bulk CPU fill that avoids
-per-element ATen ``__setitem__`` calls, and a device copy that reuses a slot's
-device buffer when one is available. These are dtype-parameterized here so the
-two seams share one implementation instead of drifting copies.
+Token, position, length, and scheduler block-table staging use canonical device
+resolution, bounded pinned buffers, bulk CPU fill, and reusable device slots.
 """
+
 from __future__ import annotations
 
 from collections import deque
@@ -325,9 +321,7 @@ def pack_integer_tensors(
     if dtype not in _NUMPY_DTYPES or any(value.dtype != dtype for value in flattened):
         raise ValueError("packed staging requires one integer dtype")
     unsupported = tuple(
-        value.device
-        for value in flattened
-        if value.device.type != "cpu" and value.device != target
+        value.device for value in flattened if value.device.type != "cpu" and value.device != target
     )
     if unsupported:
         raise ValueError(f"cannot stage tensors from {unsupported[0]} to {target}")

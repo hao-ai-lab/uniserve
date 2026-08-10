@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from tests.python.fixtures.depth_one import (
     execution_batch,
+    record_kv_result,
     root_parent,
     token_operation,
     und_admission,
@@ -70,6 +71,12 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
             input_products=(successor_input,),
         )
     )
+    successor_report = finalize_completion_report(successor_report)
+    record_kv_result(
+        admission.request_key,
+        successor.op_id,
+        successor_report.completions[0].logical_lengths.kv_visible_len,
+    )
     successor_continuation = next(
         output for output in successor.outputs if output.kind is ProductKind.TOKEN
     )
@@ -95,8 +102,6 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
             )
         )
     )
-    successor_report = finalize_completion_report(successor_report)
-
     completion = successor_report.completions[0]
     completion.validate()
     assert completion.status is OpStatus.PREDICATED
@@ -120,7 +125,6 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
     assert descendant_completion.logical_lengths == completion.logical_lengths
     assert session.logical_position == parent_runtime.logical_position
     assert session.rng_counter == parent_runtime.rng_counter
-    assert worker.kv.get(51).length == parent_runtime.kv_visible_len
 
     selected = VersionRef(
         admission.request_key,
@@ -202,4 +206,3 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
     assert session.resolved_version() == commit.selected
     assert session.logical_position == parent_runtime.logical_position
     assert session.rng_counter == parent_runtime.rng_counter
-    assert worker.kv.get(51).length == parent_runtime.kv_length

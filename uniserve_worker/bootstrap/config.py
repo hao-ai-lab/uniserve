@@ -62,7 +62,6 @@ class WorkerLaunchConfig:
     execution: ExecutionConfig
     use_stub_model: bool
     snapshot_dir: str | None
-    restore_snapshots: bool
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerLaunchConfig":
@@ -88,8 +87,6 @@ class WorkerLaunchConfig:
             raise ValueError("--no-model cannot emulate partial model materialization")
         if plan.requires_model and not use_stub_model and not model_path:
             raise ValueError(f"--model is required for worker kind {worker_kind.value!r}")
-        if bool(namespace.restore_snapshots) and not _optional_text(namespace.snapshot_dir):
-            raise ValueError("--restore-snapshots requires --snapshot-dir")
         _validate_data_plane(
             worker_kind,
             backend=backend,
@@ -136,7 +133,6 @@ class WorkerLaunchConfig:
             execution=execution_config_from_namespace(namespace),
             use_stub_model=use_stub_model,
             snapshot_dir=_optional_text(namespace.snapshot_dir),
-            restore_snapshots=bool(namespace.restore_snapshots),
         )
 
 
@@ -171,9 +167,7 @@ def _validate_data_plane(
     if backend not in {"local", "shm", "cuda_ipc"}:
         raise ValueError(f"unknown --transfer-backend {backend!r}")
     if worker_kind in {WorkerKind.UND, WorkerKind.GEN} and backend != "cuda_ipc":
-        raise ValueError(
-            f"{worker_kind.value!r} requires same-node CUDA IPC transport"
-        )
+        raise ValueError(f"{worker_kind.value!r} requires same-node CUDA IPC transport")
     if (worker_kind is WorkerKind.SAMPLER or defer_sampling) and backend == "local":
         raise ValueError(f"{worker_kind.value!r} requires a cross-process logits transport")
 

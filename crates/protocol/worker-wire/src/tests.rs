@@ -265,6 +265,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 operations,
                 request_pool_indices,
                 kv_placements,
+                kv_branch_placements: Vec::new(),
                 latent_placements,
             }
         })
@@ -775,6 +776,21 @@ fn capabilities_reject_duplicate_set_members() {
 }
 
 #[test]
+fn capabilities_require_a_canonical_physical_group_partition() {
+    let mut caps = full_caps();
+    caps.groups[1].block_offset = 1024;
+    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+
+    let mut caps = full_caps();
+    caps.groups[1].group_id = 0;
+    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+
+    let mut caps = full_caps();
+    caps.groups[1].num_blocks = 2047;
+    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+}
+
+#[test]
 fn image_generation_requires_incremental_kv_publication() {
     let mut caps = full_caps();
     caps.incremental_kv_publication = false;
@@ -1047,6 +1063,18 @@ fn snapshot_fixture() -> SnapshotRef {
     }
 }
 
+fn recovery_placement_fixture() -> RecoveryPlacement {
+    RecoveryPlacement {
+        request_key: RequestKey::new(1, RequestId(9), 3),
+        request_pool_idx: 4,
+        cache_groups: vec![CacheGroupPlacement {
+            group_id: 0,
+            page_ids: vec![BlockId(5), BlockId(6)],
+            length: 17,
+        }],
+    }
+}
+
 /// One fixture per `RequestKind`, plus call-id coverage on the execute frame.
 fn request_fixtures() -> Vec<WorkerRequest> {
     let mut execute = WorkerRequest::execute(comprehensive_batch());
@@ -1057,12 +1085,23 @@ fn request_fixtures() -> Vec<WorkerRequest> {
         WorkerRequest::poll_completions(42),
         WorkerRequest::drop_session(RequestId(42)),
         WorkerRequest::shutdown(),
-        WorkerRequest::copy_kv(vec![(BlockId(1), BlockId(2)), (BlockId(3), BlockId(4))]),
+        WorkerRequest::copy_kv(vec![
+            CacheCopy {
+                group_id: 0,
+                source_page: BlockId(1),
+                destination_page: BlockId(2),
+            },
+            CacheCopy {
+                group_id: 1,
+                source_page: BlockId(3),
+                destination_page: BlockId(4),
+            },
+        ]),
         WorkerRequest::release_products(vec![1, 2, 3]),
         WorkerRequest::get_metrics(),
         WorkerRequest::get_pressure(),
-        WorkerRequest::snapshot_session(RequestId(9)),
-        WorkerRequest::restore_session(snapshot_fixture()),
+        WorkerRequest::snapshot_session(recovery_placement_fixture()),
+        WorkerRequest::restore_session(snapshot_fixture(), recovery_placement_fixture()),
     ]
 }
 
@@ -1080,7 +1119,7 @@ fn full_caps() -> WorkerCapabilities {
             KvCacheGroupSpec {
                 group_id: 1,
                 block_offset: 2048,
-                num_blocks: 1024,
+                num_blocks: 2048,
                 kind: KvGroupKind::SlidingWindow {
                     window: 4096,
                     sink: 64,
@@ -1102,21 +1141,13 @@ fn full_caps() -> WorkerCapabilities {
         max_unresolved_window: 3,
         tensorized_mixed: true,
         sampling_ownership: SamplingOwnership::DesignatedRank,
-        resource_classes: vec![ResourceClass::KvBlock],
+        resource_classes: vec![ResourceClass::KvBlock, ResourceClass::ImageLatent],
+        latent_page_units: 64,
+        num_latent_pages: 17,
+        latent_width: 16,
+        latent_dtype: "bfloat16".into(),
         model_identity: digest_string(0x21),
         weight_digest: digest_string(0x22),
-        restored_snapshots: vec![
-            SnapshotRef {
-                version: VersionRef::admission_root(session_key(5), OpId(1), digest_string(0x23)),
-                digest: digest_string(0x24),
-                locator: digest_string(0x24),
-            },
-            SnapshotRef {
-                version: VersionRef::admission_root(session_key(6), OpId(1), digest_string(0x25)),
-                digest: digest_string(0x26),
-                locator: digest_string(0x26),
-            },
-        ],
         ..WorkerCapabilities::default()
     }
 }

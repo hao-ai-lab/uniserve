@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from ..batch import Batch, CompletionReport, SnapshotRef
+from ..batch import Batch, CacheCopy, CompletionReport, RecoveryPlacement, SnapshotRef
 from ..capabilities import WorkerCapabilities
 
 
@@ -19,13 +19,19 @@ class Worker(Protocol):
 
     def drop_session(self, session_id: int) -> None: ...
 
-    def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None: ...
+    def copy_kv(self, copies: tuple[CacheCopy, ...]) -> None: ...
 
     def release_products(self, handles: tuple[int, ...]) -> None: ...
 
     def resource_pressure(self) -> list[dict[str, object]]: ...
 
-    def snapshot_session(self, session_id: int) -> SnapshotRef: ...
+    def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef: ...
 
-    def restore_session(self, reference: SnapshotRef) -> None: ...
+    def restore_session(
+        self,
+        reference: SnapshotRef,
+        placement: RecoveryPlacement,
+    ) -> None: ...
+
+
 __all__ = ["Worker"]

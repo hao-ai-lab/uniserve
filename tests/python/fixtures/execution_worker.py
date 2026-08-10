@@ -20,12 +20,11 @@ def execution_worker(
     device: str = "cpu",
     pipeline_depth: int = 1,
     snapshot_dir: str | None = None,
-    restore_snapshots: bool = False,
     transfer_backend: str = "local",
 ) -> ModelWorker:
     ready = StubModel() if model is None else model
     deployment = replace(stub_deployment(block_size), device=device)
-    return ModelWorker(
+    worker = ModelWorker(
         ready,
         mesh=DeviceMesh.trivial(device),
         deployment=deployment,
@@ -42,8 +41,15 @@ def execution_worker(
         pipeline_depth=pipeline_depth,
         completion_payload_bytes=1 << 16,
         snapshot_dir=snapshot_dir,
-        restore_snapshots=restore_snapshots,
     )
+    from .depth_one import configure_physical_pool
+
+    configure_physical_pool(
+        request_pages=worker.cache_pool.request_pages,
+        scratch_pages=worker.cache_pool.scratch_pages,
+        max_cfg_branches=worker.capabilities.max_cfg_branches,
+    )
+    return worker
 
 
 __all__ = ["execution_worker"]

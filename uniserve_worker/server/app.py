@@ -7,7 +7,14 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from ..batch import Batch, CompletionReport, PartitionCompletion, SnapshotRef
+from ..batch import (
+    Batch,
+    CacheCopy,
+    CompletionReport,
+    PartitionCompletion,
+    RecoveryPlacement,
+    SnapshotRef,
+)
 from ..capabilities import RequestKind, ResponseKind
 from ..execution.executor import finalize_completion_report, partition_completion_ready
 from ..foundation.env import env_int
@@ -134,33 +141,6 @@ def _string(request: Mapping[str, Any], field: str, kind: RequestKind) -> str:
     return value
 
 
-def _integer_pairs(
-    request: Mapping[str, Any], field: str, kind: RequestKind
-) -> tuple[tuple[int, int], ...]:
-    value = _required(request, field, kind)
-    if not isinstance(value, (list, tuple)):
-        raise invalid_descriptor(
-            f"request {kind.value!r} field {field!r} must be a list",
-            op_kind=kind.value,
-        )
-    pairs: list[tuple[int, int]] = []
-    for index, item in enumerate(value):
-        if (
-            not isinstance(item, (list, tuple))
-            or len(item) != 2
-            or any(
-                not isinstance(member, int) or isinstance(member, bool) or member < 0
-                for member in item
-            )
-        ):
-            raise invalid_descriptor(
-                f"request {kind.value!r} field {field}[{index}] must contain two non-negative integers",
-                op_kind=kind.value,
-            )
-        pairs.append((int(item[0]), int(item[1])))
-    return tuple(pairs)
-
-
 def _integers(request: Mapping[str, Any], field: str, kind: RequestKind) -> tuple[int, ...]:
     value = _required(request, field, kind)
     if not isinstance(value, (list, tuple)) or any(
@@ -266,14 +246,27 @@ def _control(
     if kind is RequestKind.DROP_SESSION:
         worker.drop_session(_integer(request, "session_id", kind))
     elif kind is RequestKind.COPY_KV:
-        worker.copy_kv(_integer_pairs(request, "copies", kind))
+        raw_copies = _required(request, "copies", kind)
+        if not isinstance(raw_copies, list):
+            raise invalid_descriptor("copy_kv copies must be a list")
+        worker.copy_kv(
+            tuple(
+                CacheCopy.from_wire(value, f"copy_kv copies[{index}]")
+                for index, value in enumerate(raw_copies)
+            )
+        )
     elif kind is RequestKind.RELEASE_PRODUCTS:
         worker.release_products(_integers(request, "product_handles", kind))
     elif kind is RequestKind.SNAPSHOT_SESSION:
-        reference = worker.snapshot_session(_integer(request, "session_id", kind))
+        reference = worker.snapshot_session(
+            RecoveryPlacement.from_wire(_required(request, "recovery_placement", kind))
+        )
         return _response(ResponseKind.SNAPSHOT, snapshot=reference.to_wire())
     elif kind is RequestKind.RESTORE_SESSION:
-        worker.restore_session(SnapshotRef.from_wire(_required(request, "snapshot", kind)))
+        worker.restore_session(
+            SnapshotRef.from_wire(_required(request, "snapshot", kind)),
+            RecoveryPlacement.from_wire(_required(request, "recovery_placement", kind)),
+        )
     else:
         raise unsupported_control(kind.value)
     return None

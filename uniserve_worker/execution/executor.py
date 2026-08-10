@@ -133,6 +133,7 @@ from uniserve_worker.nn.diffusion.schedule import (
 )
 from uniserve_worker.nn.mesh import BroadcastTransport
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
+from uniserve_worker.runtime.cache_pool import CacheBatchView, CachePool, CacheRow
 from uniserve_worker.runtime.completion_store import (
     CompletionArena,
     CompletionByteCapture,
@@ -158,7 +159,6 @@ from uniserve_worker.runtime.image_utils import (
     quantize_image_hwc,
     uint8_image_to_png_base64_bytes,
 )
-from uniserve_worker.runtime.kv_store import KvEntry, KvSnapshot, KvStore, KvTxn
 from uniserve_worker.runtime.latent_store import LatentRecord, LatentStore, LatentTxn
 from uniserve_worker.runtime.mesh_store import MeshStore
 from uniserve_worker.runtime.product_store import (
@@ -200,6 +200,7 @@ from uniserve_worker.runtime.transfer import (
     decode_transfer_descriptor,
     encode_transfer_descriptor,
 )
+from uniserve_worker.transfer.cache import CachePublication, CachePublications
 
 from ._forward_plan import (
     ForwardBinding,
@@ -229,7 +230,7 @@ class _ForwardTask:
     stage: LoweredStage
     route: RouteId
     row: ForwardRow
-    entry: KvEntry | None = None
+    entry: CacheRow | None = None
     scratch: bool = False
     write_kv: bool = False
     causal: bool = True
@@ -919,7 +920,7 @@ class _PreparedTransferInput:
     payload_kind: ProductKind | None
     height: int | None
     width: int | None
-    snapshot: KvSnapshot | None
+    snapshot: CachePublication | None
 
     def ready(self) -> bool:
         return all(ticket.ready() for ticket in self.tickets)
@@ -1154,11 +1155,60 @@ class _PendingDigest:
             lease.discard(self._row, self._generation)
 
 
+class _PendingErrorDigest:
+    """An error digest causally chained to an unobserved parent completion."""
+
+    __slots__ = ("_parent", "_plan_digest", "_record", "_value")
+
+    def __init__(
+        self,
+        parent: _PendingDigest | _PendingErrorDigest,
+        record: CompletionRecord,
+        plan_digest: str,
+    ) -> None:
+        self._parent = parent
+        self._record = record
+        self._plan_digest = plan_digest
+        self._value: str | None = None
+
+    def ready(self) -> bool:
+        return self._value is not None or self._parent.ready()
+
+    def resolve(self) -> str:
+        if self._value is None:
+            if not self.ready():
+                raise RuntimeError("error digest was resolved before its parent was query-ready")
+            self._value = self._record.compute_semantic_digest(
+                self._parent.resolve(),
+                self._plan_digest,
+            )
+        return self._value
+
+    def __str__(self) -> str:
+        return self.resolve()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (_PendingDigest, _PendingErrorDigest)):
+            return self.resolve() == other.resolve()
+        if isinstance(other, str):
+            return self.resolve() == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.resolve())
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _PendingErrorDigest:
+        memo[id(self)] = self
+        return self
+
+
 def _record_ready(record: CompletionRecord) -> bool:
     """Whether a completion's deferred token copy and digest chain have landed."""
 
     digest = record.semantic_digest
     if isinstance(digest, _PendingDigest):
+        return digest.ready()
+    if isinstance(digest, _PendingErrorDigest):
         return digest.ready()
     for value in cast(tuple[object, ...], record.committed_tokens):
         if isinstance(value, _CompletionToken) and not value.ready():
@@ -1168,6 +1218,8 @@ def _record_ready(record: CompletionRecord) -> bool:
 
 def _finalized_record(record: CompletionRecord) -> CompletionRecord:
     digest = record.semantic_digest
+    if isinstance(digest, _PendingErrorDigest):
+        return replace(record, semantic_digest=digest.resolve())
     if isinstance(digest, _PendingDigest):
         resolved = digest.resolve()
         copy_us, host_us = digest.completion_timing()
@@ -1406,7 +1458,7 @@ class _RowIdentity:
 class _PartitionLayout:
     operations: tuple[Operation, ...]
     sessions: tuple[RequestSession, ...]
-    kv_entries: tuple[KvEntry, ...]
+    cache_rows: tuple[CacheRow | None, ...]
     weights: tuple[WeightSet, ...]
     identities: tuple[_OperationIdentity, ...]
 
@@ -1416,7 +1468,7 @@ class _PartitionLayout:
             len(values) == width
             for values in (
                 self.sessions,
-                self.kv_entries,
+                self.cache_rows,
                 self.weights,
                 self.identities,
             )
@@ -1430,12 +1482,18 @@ class _ExecutionScope:
     started_ns: int
     transaction: StepTxn
     completion: CompletionLease
-    kv: KvTxn
     latents: LatentTxn
     products: ProductTxn
     product_view: ProductView
+    cache_rows: dict[tuple[RequestKey, int, int], CacheRow] = field(default_factory=dict)
+    branch_rows: dict[tuple[RequestKey, int, int, int], CacheRow] = field(default_factory=dict)
     layout: _PartitionLayout | None = None
     prepared_transfers: dict[ProductRef, _PreparedTransferInput] = field(default_factory=dict)
+    cache_publication_inputs: dict[ProductRef, CachePublication] = field(default_factory=dict)
+    cache_publications: list[tuple[ProductRef, CachePublication]] = field(default_factory=list)
+    cache_installations: list[tuple[ProductRef, ProductRef, CachePublication]] = field(
+        default_factory=list
+    )
     stage_publications: dict[_OperationIdentity, tuple[Locator, ...]] = field(default_factory=dict)
     published: list[Locator] = field(default_factory=list)
     observations: list[RunObservation] = field(default_factory=list)
@@ -1526,7 +1584,7 @@ class ModelExecutor:
         runner: ModelRunner | None,
         attention: AttentionSelection | None,
         sessions: SessionStore,
-        kv: KvStore,
+        cache_pool: CachePool,
         latents: LatentStore,
         products: ProductStore,
         replay: ReplayStore,
@@ -1571,7 +1629,8 @@ class ModelExecutor:
         self.runner = runner
         self.attention = attention
         self.sessions = sessions
-        self.kv = kv
+        self.cache_pool = cache_pool
+        self.cache_publications = CachePublications(cache_pool)
         self.latents = latents
         self.products = products
         self.replay = replay
@@ -1620,6 +1679,7 @@ class ModelExecutor:
         )
         self._collective_history: OrderedDict[int, str] = OrderedDict()
         self._transport_publications: dict[_OperationIdentity, tuple[Locator, ...]] = {}
+        self._branch_cache_rows: dict[tuple[RequestKey, int, int], CacheRow] = {}
 
     def close(self) -> None:
         self._cpu_tasks.close()
@@ -1644,7 +1704,7 @@ class ModelExecutor:
             payload_kind: ProductKind | None = None
             height: int | None = None
             width: int | None = None
-            snapshot: KvSnapshot | None = None
+            snapshot: CachePublication | None = None
             if kind == "tensor":
                 if set(value) != {
                     "height",
@@ -1681,7 +1741,7 @@ class ModelExecutor:
             else:
                 if set(value) != {"snapshot"}:
                     raise invalid_descriptor("KV transfer entry has an invalid shape")
-                snapshot = KvSnapshot.from_wire(value["snapshot"])
+                snapshot = CachePublication.from_wire(value["snapshot"])
                 if entry.product.kind is not ProductKind.KV:
                     raise invalid_descriptor("KV transfer entry names a non-KV product")
                 locators = tuple(Locator.from_wire_json(raw) for raw in snapshot.locators)
@@ -1754,10 +1814,7 @@ class ModelExecutor:
             operations,
             duration_us=(time.perf_counter_ns() - validation_started) // 1000,
         )
-        for update in self.sessions.apply_controls(batch.controls):
-            if update.rewind:
-                self.kv.rewind(update.session_id, update.visible_len)
-            self.kv.commit(update.session_id, update.committed_len)
+        self.sessions.apply_controls(batch.controls)
         if not batch.operations:
             self._apply_release_controls(batch)
             return CompletionReport(
@@ -1989,7 +2046,7 @@ class ModelExecutor:
             transaction = self.sessions.begin_step(
                 batch.step_id,
                 operations,
-                (self.kv, self.latents, self.products),
+                (self.latents, self.products),
             )
         except BaseException as error:
             completion.abandon()
@@ -2005,7 +2062,6 @@ class ModelExecutor:
             started_ns=started,
             transaction=transaction,
             completion=completion,
-            kv=cast(KvTxn, transaction.store_transaction(self.kv)),
             latents=cast(LatentTxn, transaction.store_transaction(self.latents)),
             products=cast(ProductTxn, transaction.store_transaction(self.products)),
             product_view=cast(ProductTxn, transaction.store_transaction(self.products)).view(),
@@ -2039,15 +2095,14 @@ class ModelExecutor:
                 partition.request_pool_indices,
             )
             self._reserve_cpu_tasks(operations, scope)
-            for admission in admissions:
-                self.kv.admit(admission)
-            self._reserve_kv_pages(partition, scope)
+            self._bind_cache_rows(partition, scope)
             aligned_sessions = transaction.aligned_sessions()
             scope.layout = _PartitionLayout(
                 operations=operations,
                 sessions=aligned_sessions,
-                kv_entries=scope.kv.entries(
-                    tuple(operation.request_key.session_id for operation in operations)
+                cache_rows=tuple(
+                    scope.cache_rows.get((operation.request_key, operation.op_id, 0))
+                    for operation in operations
                 ),
                 weights=tuple(self._weights() for _ in aligned_sessions),
                 identities=tuple(_operation_identity(operation) for operation in operations),
@@ -2145,11 +2200,10 @@ class ModelExecutor:
         layout = scope.layout
         if layout is None or layout.operations != operations:
             raise RuntimeError("partition commit lost its aligned transaction layout")
-        for row, (operation, session, entry, outcome) in enumerate(
+        for row, (operation, session, outcome) in enumerate(
             zip(
                 operations,
                 layout.sessions,
-                layout.kv_entries,
                 outcomes,
                 strict=True,
             )
@@ -2195,17 +2249,16 @@ class ModelExecutor:
                     point=FixedPoint(cast(int, outcome.selected_point), cast(str, pending)),
                 )
                 pending_by_session[operation.request_key.session_id] = pending
-                extents = entry.extents()
                 resolved_runtime[operation.request_key.session_id] = ResolvedRuntimeState(
                     logical_position=session.logical_position,
                     rng_counter=session.rng_counter,
                     latent_product=session.latent_product,
                     flow_step=session.flow_step,
-                    kv_reserved_len=extents.reserved,
-                    kv_initialized_len=extents.initialized,
+                    kv_reserved_len=outcome.logical_lengths.kv_reserved_len,
+                    kv_initialized_len=outcome.logical_lengths.kv_initialized_len,
                     kv_visible_len=outcome.logical_lengths.kv_visible_len,
-                    kv_committed_len=extents.committed,
-                    kv_published_len=extents.published,
+                    kv_committed_len=outcome.logical_lengths.kv_committed_len,
+                    kv_published_len=outcome.logical_lengths.kv_published_len,
                 )
             else:
                 committed[operation.request_key.session_id] = operation.parent
@@ -2218,6 +2271,11 @@ class ModelExecutor:
             forward_stats=_forward_stats(scope.observations, scope.component_us),
         )
         report = CompletionReport(step_id=step_id, partitions=(partition_report,))
+        cache_commit = self.cache_publications.prepare_commit(
+            scope.cache_publications,
+            scope.cache_installations,
+            self.transport,
+        )
         self.replay.commit_atomic(
             operations,
             report,
@@ -2227,6 +2285,7 @@ class ModelExecutor:
                 publish=publish,
             ),
         )
+        self.cache_publications.apply_commit(cache_commit)
         for identity, locators in scope.stage_publications.items():
             existing = self._transport_publications.get(identity)
             if existing is not None and existing != locators:
@@ -2334,26 +2393,18 @@ class ModelExecutor:
                 if session is None
                 else session.version
             )
-            parent_semantic = (
+            parent_semantic: object = (
                 point.semantic_digest
                 if isinstance(point, FixedPoint)
                 else "0" * 64
                 if session is None
                 else session.resolved_digest
             )
-            lengths = LogicalLengths()
-            if session is not None:
-                entry = self.kv.get(operation.request_key.session_id)
-                extents = entry.extents()
-                lengths = LogicalLengths(
-                    token_len=session.logical_position,
-                    kv_visible_len=extents.visible,
-                    latent_len=session.flow_step,
-                    kv_reserved_len=extents.reserved,
-                    kv_initialized_len=extents.initialized,
-                    kv_committed_len=extents.committed,
-                    kv_published_len=extents.published,
-                )
+            lengths = (
+                LogicalLengths()
+                if session is None
+                else self._logical_lengths(operation, session, None)
+            )
             placeholder = CompletionRecord(
                 request_key=operation.request_key,
                 op_id=operation.op_id,
@@ -2369,13 +2420,22 @@ class ModelExecutor:
                 error_code=protocol_code,
                 timing_counters=TimingCounters(),
             )
+            semantic_digest: object
+            if isinstance(parent_semantic, (_PendingDigest, _PendingErrorDigest)):
+                semantic_digest = _PendingErrorDigest(
+                    parent_semantic,
+                    placeholder,
+                    operation.plan_digest,
+                )
+            else:
+                semantic_digest = placeholder.compute_semantic_digest(
+                    cast(str, parent_semantic),
+                    operation.plan_digest,
+                )
             records.append(
                 replace(
                     placeholder,
-                    semantic_digest=placeholder.compute_semantic_digest(
-                        parent_semantic,
-                        operation.plan_digest,
-                    ),
+                    semantic_digest=cast(str, semantic_digest),
                 )
             )
         return PartitionCompletion(
@@ -2390,13 +2450,11 @@ class ModelExecutor:
         self,
         operation: Operation,
     ) -> tuple[VersionRef, ResolvedRuntimeState]:
-        selected, runtime, latest = self.sessions.finalize_predicated(
+        selected, runtime, _latest = self.sessions.finalize_predicated(
             operation.request_key.session_id,
             operation.op_id,
             operation.parent,
         )
-        if latest:
-            self.kv.select(operation.request_key.session_id, runtime.kv_visible_len)
         return selected, runtime
 
     def _finalize_speculative_runtime(
@@ -2417,10 +2475,11 @@ class ModelExecutor:
             or int(record.selected_point) != expected_point
         ):
             raise RuntimeError("speculative completion selection is inconsistent")
-        entry = self.kv.get(operation.request_key.session_id)
-        extents = entry.extents()
         selected_kv = selection.base_kv_visible + selected_point
-        if extents.initialized != selection.initialized_kv or selected_kv > extents.initialized:
+        if (
+            record.logical_lengths.kv_initialized_len != selection.initialized_kv
+            or selected_kv > record.logical_lengths.kv_initialized_len
+        ):
             raise RuntimeError("speculative KV selection is outside initialized state")
         prefixes: list[tuple[VersionRef, ResolvedRuntimeState]] = []
         for point_index in range(1, selected_point + 1):
@@ -2444,11 +2503,11 @@ class ModelExecutor:
                 rng_counter=selection.base_rng_counter + point_index,
                 latent_product=self.sessions.get(operation.request_key.session_id).latent_product,
                 flow_step=self.sessions.get(operation.request_key.session_id).flow_step,
-                kv_reserved_len=extents.reserved,
-                kv_initialized_len=extents.initialized,
+                kv_reserved_len=record.logical_lengths.kv_reserved_len,
+                kv_initialized_len=record.logical_lengths.kv_initialized_len,
                 kv_visible_len=selection.base_kv_visible + point_index,
-                kv_committed_len=extents.committed,
-                kv_published_len=extents.published,
+                kv_committed_len=record.logical_lengths.kv_committed_len,
+                kv_published_len=record.logical_lengths.kv_published_len,
             )
             prefixes.append(
                 (
@@ -2464,7 +2523,6 @@ class ModelExecutor:
         point = cast(FixedPoint, selected.point)
         if point.semantic_digest != selected_digest:
             raise RuntimeError("selected speculative prefix digest is inconsistent")
-        self.kv.select(operation.request_key.session_id, selected_kv)
         self.sessions.finalize_prefixes(
             operation.request_key.session_id,
             operation.op_id,
@@ -2817,7 +2875,7 @@ class ModelExecutor:
         )
         self.products.device_products.release_operations(releases)
         self.latents.release_operations(releases)
-        self.kv.release_operations(releases)
+        self.cache_publications.release_operations(releases)
         if self.transport is not None:
             for identity in releases:
                 self._release_locators(self._transport_publications.pop(identity, ()))
@@ -2825,6 +2883,14 @@ class ModelExecutor:
     def drop_session(self, session_id: int) -> None:
         """Release stage publications owned by one dropped request."""
 
+        self.cache_publications.drop(session_id)
+        branch_rows = tuple(
+            identity
+            for identity in self._branch_cache_rows
+            if int(identity[0].session_id) == int(session_id)
+        )
+        for branch_identity in branch_rows:
+            del self._branch_cache_rows[branch_identity]
         if self.transport is None:
             return
         selected = tuple(
@@ -2835,26 +2901,197 @@ class ModelExecutor:
         for identity in selected:
             self._release_locators(self._transport_publications.pop(identity))
 
-    def _reserve_kv_pages(
+    def _bind_cache_rows(
         self,
         partition: BatchPartition,
         scope: _ExecutionScope,
     ) -> None:
-        """Validate complete scheduler mappings before binding physical pages."""
+        """Validate scheduler placement and zero exactly its declared fresh pages."""
 
         operations = {
             (operation.request_key, operation.op_id): operation
             for operation in partition.operations
         }
+        cache_rows: list[tuple[tuple[RequestKey, int, int], CacheRow, tuple[int, ...]]] = []
         for placement in partition.kv_placements:
-            operation = operations[(placement.request_key, placement.op_id)]
-            scope.kv.apply_placement(
-                placement.request_key,
-                group_id=placement.group_id,
-                block_table=placement.block_table,
-                pages_to_zero=placement.pages_to_zero,
-                expected_capacity_pages=operation.kv_capacity_pages,
+            operation = operations.get((placement.request_key, placement.op_id))
+            if operation is None:
+                raise invalid_descriptor("KV placement names an operation outside its partition")
+            session = self.sessions.get(placement.request_key.session_id)
+            parent_runtime = self._parent_runtime(operation, session)
+            committed_runtime = session.runtime_for(session.committed_version())
+            if committed_runtime is None:
+                raise invalid_descriptor("KV placement session has no committed runtime")
+            pages = self.cache_pool.validate_pages(
+                placement.block_table,
+                scratch=False,
+                group=placement.group_id,
             )
+            pages_to_zero = self.cache_pool.validate_pages(
+                placement.pages_to_zero,
+                scratch=False,
+                group=placement.group_id,
+            )
+            if placement.resulting_length > len(pages) * self.cache_pool.block_size:
+                raise invalid_descriptor("KV placement resulting extent exceeds its block table")
+            if placement.prefix_length != placement.visible_length:
+                raise invalid_descriptor(
+                    "KV placement write cursor differs from its visible extent"
+                )
+            if placement.visible_length != parent_runtime.kv_visible_len:
+                raise invalid_descriptor("KV placement visible extent disagrees with its parent")
+            if committed_runtime.kv_visible_len > placement.visible_length:
+                raise invalid_descriptor("KV placement precedes the committed KV extent")
+            cache_rows.append(
+                (
+                    (placement.request_key, placement.op_id, placement.group_id),
+                    CacheRow(
+                        block_table=pages,
+                        length=placement.visible_length,
+                        capacity=len(pages) * self.cache_pool.block_size,
+                        group_id=placement.group_id,
+                        initialized_length=max(
+                            placement.visible_length,
+                            parent_runtime.kv_initialized_len,
+                        ),
+                        committed_length=committed_runtime.kv_visible_len,
+                        published_length=min(
+                            committed_runtime.kv_visible_len,
+                            max(
+                                parent_runtime.kv_published_len,
+                                self.cache_publications.published_extent(
+                                    placement.request_key.session_id
+                                ),
+                            ),
+                        ),
+                    ),
+                    pages_to_zero,
+                )
+            )
+        branch_rows: list[
+            tuple[
+                tuple[RequestKey, int, int],
+                tuple[RequestKey, int, int, int],
+                CacheRow,
+                tuple[int, ...],
+            ]
+        ] = []
+        for branch_placement in partition.kv_branch_placements:
+            pages = self.cache_pool.validate_pages(
+                branch_placement.block_table,
+                scratch=True,
+                group=branch_placement.group_id,
+            )
+            pages_to_zero = self.cache_pool.validate_pages(
+                branch_placement.pages_to_zero,
+                scratch=True,
+                group=branch_placement.group_id,
+            )
+            persistent_identity = (
+                branch_placement.request_key,
+                branch_placement.branch_index,
+                branch_placement.group_id,
+            )
+            if pages_to_zero:
+                if set(pages_to_zero) != set(pages):
+                    raise invalid_descriptor(
+                        "fresh generation KV placement must initialize its complete block table"
+                    )
+                row = CacheRow(
+                    block_table=pages,
+                    length=0,
+                    capacity=len(pages) * self.cache_pool.block_size,
+                    group_id=branch_placement.group_id,
+                )
+            else:
+                continued_row = self._branch_cache_rows.get(persistent_identity)
+                if continued_row is None:
+                    raise invalid_descriptor(
+                        "generation KV placement continues an unknown physical branch"
+                    )
+                row = continued_row
+                if row.block_table != pages or row.group_id != branch_placement.group_id:
+                    raise invalid_descriptor(
+                        "generation KV continuation changes its physical branch placement"
+                    )
+            branch_rows.append(
+                (
+                    persistent_identity,
+                    (
+                        branch_placement.request_key,
+                        branch_placement.op_id,
+                        branch_placement.branch_index,
+                        branch_placement.group_id,
+                    ),
+                    row,
+                    pages_to_zero,
+                )
+            )
+        for cache_identity, row, pages_to_zero in cache_rows:
+            self.cache_pool.zero_pages(row.group_id, pages_to_zero)
+            scope.cache_rows[cache_identity] = row
+        for persistent_identity, branch_identity, row, pages_to_zero in branch_rows:
+            self.cache_pool.zero_pages(row.group_id, pages_to_zero)
+            self._branch_cache_rows[persistent_identity] = row
+            scope.branch_rows[branch_identity] = row
+
+    @staticmethod
+    def _parent_runtime(
+        operation: Operation,
+        session: RequestSession,
+    ) -> ResolvedRuntimeState:
+        parent = operation.parent
+        selected = (
+            parent if parent.is_fixed() else session.selected_for_operation(parent.producer_op_id)
+        )
+        runtime = None if selected is None else session.runtime_for(selected)
+        if runtime is None:
+            raise invalid_descriptor("operation parent has no resolved runtime state")
+        return runtime
+
+    def _cache_row(
+        self,
+        operation: Operation,
+        scope: _ExecutionScope,
+        *,
+        group_id: int = 0,
+    ) -> CacheRow:
+        row = scope.cache_rows.get((operation.request_key, operation.op_id, int(group_id)))
+        if row is None:
+            raise invalid_descriptor("operation has no scheduler KV placement")
+        return row
+
+    def _logical_lengths(
+        self,
+        operation: Operation,
+        session: RequestSession,
+        row: CacheRow | None,
+        *,
+        latent_len: int | None = None,
+    ) -> LogicalLengths:
+        if row is None:
+            runtime = self._parent_runtime(operation, session)
+            reserved = runtime.kv_reserved_len
+            initialized = runtime.kv_initialized_len
+            visible = runtime.kv_visible_len
+            committed = runtime.kv_committed_len
+            published = runtime.kv_published_len
+        else:
+            extents = row.extents()
+            reserved = extents.reserved
+            initialized = extents.initialized
+            visible = extents.visible
+            committed = extents.committed
+            published = extents.published
+        return LogicalLengths(
+            token_len=session.logical_position,
+            kv_visible_len=visible,
+            latent_len=session.flow_step if latent_len is None else int(latent_len),
+            kv_reserved_len=reserved,
+            kv_initialized_len=initialized,
+            kv_committed_len=committed,
+            kv_published_len=published,
+        )
 
     def _stage_input_products(
         self,
@@ -2884,17 +3121,17 @@ class ModelExecutor:
                     snapshot = transfer.snapshot
                     if snapshot is None:
                         raise RuntimeError("prepared KV transfer has no validated snapshot")
-                    if self.transport is None:
-                        raise capability_mismatch(
-                            "cross-stage KV input requires a configured transport"
+                    existing = self.cache_publications.resident(product)
+                    if existing is not None and existing != snapshot:
+                        raise invalid_descriptor(
+                            "staged KV publication conflicts with its product identity"
                         )
-                    scope.kv.import_snapshot(
-                        product.request_key.session_id,
-                        snapshot,
-                        self.transport,
-                        transferred_tensors=transfer.tensors(),
-                    )
-                    scope.kv.stage_publication(product, snapshot)
+                    staged = scope.cache_publication_inputs.get(product)
+                    if staged is not None and staged != snapshot:
+                        raise invalid_descriptor(
+                            "batch repeats a KV product with conflicting publication data"
+                        )
+                    scope.cache_publication_inputs[product] = snapshot
                     continue
                 tensors = transfer.tensors()
                 if not tensors:
@@ -3013,7 +3250,7 @@ class ModelExecutor:
         for operation, session, entry, weights, current in zip(
             operations,
             sessions,
-            layout.kv_entries,
+            layout.cache_rows,
             layout.weights,
             current_tokens,
             strict=True,
@@ -3076,7 +3313,7 @@ class ModelExecutor:
         for operation, session, entry, start, sampled in zip(
             operations,
             sessions,
-            layout.kv_entries,
+            layout.cache_rows,
             starts,
             samples,
             strict=True,
@@ -3505,9 +3742,10 @@ class ModelExecutor:
         query_lens = tuple(task.query_tokens for task in tasks)
         if any(task.entry is None for task in tasks):
             raise RuntimeError("paged attention task has no aligned KV entry")
-        view = scope.kv.view_entries(
-            tuple(cast(KvEntry, task.entry) for task in tasks),
-            query_lens=query_lens,
+        view = CacheBatchView(
+            self.cache_pool,
+            tuple(cast(CacheRow, task.entry) for task in tasks),
+            query_lengths=query_lens,
         )
         block_table = view.block_table(device, slot=staging_slot)
         cache_seqlens = view.cache_seqlens(device, slot=staging_slot)
@@ -3523,7 +3761,7 @@ class ModelExecutor:
         if all(query == 1 for query in query_lens):
             page_ids = _stage_ints(
                 tuple(
-                    task.entry.block_ids[task.entry.length // view.block_size]
+                    task.entry.block_table[task.entry.length // view.block_size]
                     for task in tasks
                     if task.entry is not None
                 ),
@@ -3533,7 +3771,7 @@ class ModelExecutor:
                 name="decode_page_ids",
             )
             page_offsets = _stage_ints(
-                tuple(cast(KvEntry, task.entry).length % view.block_size for task in tasks),
+                tuple(cast(CacheRow, task.entry).length % view.block_size for task in tasks),
                 dtype=torch.int32,
                 device=device,
                 slot=staging_slot,
@@ -3624,10 +3862,14 @@ class ModelExecutor:
         device: torch.device,
         staging_slot: TensorStagingSlot,
     ) -> tuple[KvView, PackedAttentionPlan]:
-        rows = tuple(
-            (cast(KvEntry, task.entry), task.query_tokens, task.write_kv) for task in tasks
+        if any(task.entry is None for task in tasks):
+            raise RuntimeError("packed attention task has no aligned KV row")
+        view = CacheBatchView(
+            self.cache_pool,
+            tuple(cast(CacheRow, task.entry) for task in tasks),
+            tuple(task.query_tokens for task in tasks),
+            tuple(task.write_kv for task in tasks),
         )
-        view = scope.kv.packed_view(rows)
         query_lens = tuple(task.query_tokens for task in tasks)
         base_lens = view.base_lens
         key_lens = tuple(base + query for base, query in zip(base_lens, query_lens, strict=True))
@@ -4017,7 +4259,7 @@ class ModelExecutor:
             )
         elif reference.kind is ProductKind.VISION_FEATURE:
             session.logical_position = position + 1
-        return self._state_outcome(operation, outcome, base=position)
+        return self._state_outcome(operation, outcome, scope, base=position)
 
     def _decode(
         self,
@@ -4098,7 +4340,9 @@ class ModelExecutor:
             draft_token_ids=draft,
         )
         sampled = _sample_result((yield (sample_task,))[0])
-        initialized = scope.kv.initialize(operation.request_key.session_id, task.query_tokens)
+        if task.entry is None:
+            raise RuntimeError("verification task has no scheduler KV row")
+        initialized = task.entry.initialize(task.query_tokens)
         self._publish_token_product(operation, sampled, scope)
         accepted = cast(_CompletionInteger, sampled.num_accepted_tokens)
         selected_point = _CompletionSpeculativePoint(
@@ -4136,7 +4380,7 @@ class ModelExecutor:
         scope: _ExecutionScope,
         *,
         session: RequestSession | None = None,
-        kv_entry: KvEntry | None = None,
+        kv_entry: CacheRow | None = None,
         base: int,
         tokens: int | _CompletionDerivedInteger | _CompletionSpeculativePoint,
         committed_tokens: tuple[int | _CompletionToken, ...],
@@ -4145,9 +4389,8 @@ class ModelExecutor:
     ) -> _Outcome:
         if session is None:
             session = self.sessions.get(operation.request_key.session_id)
-        extents = (
-            self.kv.get(operation.request_key.session_id) if kv_entry is None else kv_entry
-        ).extents()
+        row = self._cache_row(operation, scope) if kv_entry is None else kv_entry
+        extents = row.extents()
         visible = (
             extents.visible
             if selection is None
@@ -4201,7 +4444,7 @@ class ModelExecutor:
         selection: TokenSelection,
         scope: _ExecutionScope,
         *,
-        entry: KvEntry | None = None,
+        entry: CacheRow | None = None,
         weights: WeightSet | None = None,
     ) -> _ForwardTask:
         stage = self._primary_stage(operation.work.variant)
@@ -4231,7 +4474,7 @@ class ModelExecutor:
             stage=stage,
             route=self._route(stage),
             row=row,
-            entry=self.kv.get(operation.request_key.session_id) if entry is None else entry,
+            entry=self._cache_row(operation, scope) if entry is None else entry,
             write_kv=True,
             causal=True,
         )
@@ -4247,10 +4490,9 @@ class ModelExecutor:
             raise RuntimeError("KV commit count is outside the task query span")
         if count == 0:
             return
-        if task.scratch:
-            scope.kv.advance_entry(cast(KvEntry, task.entry), count)
-        else:
-            scope.kv.advance(task.operation.request_key.session_id, count)
+        if task.entry is None:
+            raise RuntimeError("KV task has no scheduler cache row")
+        task.entry.advance(count)
 
     def _operation_token_ids(
         self,
@@ -4692,7 +4934,13 @@ class ModelExecutor:
             raise invalid_descriptor(
                 "generation transition requires one exact conditioning input and latent output"
             )
-        self.kv.validate_conditioning(session_id, conditioning[0])
+        cache_row = self._cache_row(operation, scope)
+        self.cache_publications.validate_conditioning(
+            session_id,
+            conditioning[0],
+            cache_row,
+            scope.cache_publication_inputs.get(conditioning[0]),
+        )
         session = self.sessions.get(session_id)
         image = session.image
         if image is None:
@@ -4728,19 +4976,14 @@ class ModelExecutor:
             )
         )
         session.latent_product = output
-        length = self.kv.get(session_id).length
-        extents = self.kv.get(session_id).extents()
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1,
-            logical_lengths=LogicalLengths(
-                token_len=session.logical_position,
-                kv_visible_len=length,
+            logical_lengths=self._logical_lengths(
+                operation,
+                session,
+                cache_row,
                 latent_len=0,
-                kv_reserved_len=extents.reserved,
-                kv_initialized_len=extents.initialized,
-                kv_committed_len=extents.committed,
-                kv_published_len=extents.published,
             ),
             token_span=TokenSpan(base=session.logical_position, len=0),
             finish_flags=FinishFlags(),
@@ -4767,7 +5010,13 @@ class ModelExecutor:
             raise invalid_descriptor(
                 "flow operation requires exact conditioning and one latent input/output generation"
             )
-        self.kv.validate_conditioning(session_id, conditioning[0])
+        cache_row = self._cache_row(operation, scope)
+        self.cache_publications.validate_conditioning(
+            session_id,
+            conditioning[0],
+            cache_row,
+            scope.cache_publication_inputs.get(conditioning[0]),
+        )
         session = self.sessions.get(session_id)
         image = session.image
         if image is None:
@@ -4809,13 +5058,9 @@ class ModelExecutor:
         if record.step != start_step or session.flow_step != start_step:
             raise invalid_descriptor("flow operation start step does not match committed state")
 
-        # A flow quantum publishes a new immutable latent generation. Carry the
-        # already-computed CFG branch prefixes forward under that exact successor
-        # owner instead of rebuilding them for every denoise step.
-        scope.kv.rebind_scratch_owner(latent_input, latent_output)
-
         schedule = flow.schedule(int(image.steps), float(image.timestep_shift))
         current = latent_read.tensor
+        entries: dict[Branch, CacheRow] = {}
         for step in range(start_step, start_step + step_count):
             t, t_next = schedule.pair(
                 step,
@@ -4835,27 +5080,43 @@ class ModelExecutor:
             if len(guide.branches) > int(flow.max_cfg_branches):
                 raise invalid_descriptor("flow CFG plan exceeds the model branch bound")
 
-            entries: dict[Branch, KvEntry] = {}
             prefix_tasks: list[_ForwardTask] = []
-            for branch in guide.branches:
+            for branch_index, branch in enumerate(guide.branches, start=1):
+                if branch in entries:
+                    continue
                 source = self._branch_source(branch)
                 prefix, copy_conditioning = self._flow_prefix(
                     source,
                     image_prompt,
                     session,
                 )
-                query = self._flow_physical_tokens(record.height, record.width)
-                entry, created = scope.kv.scratch_entry(
-                    latent_output,
-                    branch.value,
-                    capacity_tokens=(
-                        self.kv.get(session_id).length if copy_conditioning else len(prefix)
-                    )
-                    + query,
-                    copy_conditioning=copy_conditioning,
+                entry = scope.branch_rows.get(
+                    (operation.request_key, operation.op_id, branch_index, 0)
                 )
+                if entry is None:
+                    raise invalid_descriptor("flow branch has no scheduler scratch placement")
+                query = self._flow_physical_tokens(record.height, record.width)
+                prefix_length = cache_row.length if copy_conditioning else len(prefix)
+                if prefix_length + query > entry.capacity:
+                    raise invalid_descriptor("flow branch exceeds scheduler scratch placement")
+                if entry.length not in {0, prefix_length}:
+                    raise invalid_descriptor(
+                        "flow branch prefix disagrees with its initialized physical state"
+                    )
+                initialize_prefix = entry.length == 0 and prefix_length > 0
+                if initialize_prefix and copy_conditioning:
+                    prefix_pages = (
+                        cache_row.length + self.cache_pool.block_size - 1
+                    ) // self.cache_pool.block_size
+                    self.cache_pool.copy_pages(
+                        entry.group_id,
+                        cache_row.block_table[:prefix_pages],
+                        entry.block_table[:prefix_pages],
+                    )
+                    entry.length = cache_row.length
+                    entry.initialized_length = cache_row.length
                 entries[branch] = entry
-                if created and prefix:
+                if initialize_prefix and prefix:
                     prefix_tasks.append(
                         self._flow_prefix_task(
                             operation,
@@ -4913,24 +5174,14 @@ class ModelExecutor:
             )
         )
         session.latent_product = latent_output
-        if record.step == int(image.steps):
-            scope.kv.release_scratch_owner(latent_output)
-        length = self.kv.get(session_id).length
-        extents = self.kv.get(session_id).extents()
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1,
-            logical_lengths=LogicalLengths(
-                token_len=session.logical_position,
-                kv_visible_len=length,
-                # The cumulative denoise steps this lineage has advanced to after
-                # the quantum (start_step + step_count), which the ordered-commit
-                # validator matches against the request's expected denoise step.
+            logical_lengths=self._logical_lengths(
+                operation,
+                session,
+                cache_row,
                 latent_len=record.step,
-                kv_reserved_len=extents.reserved,
-                kv_initialized_len=extents.initialized,
-                kv_committed_len=extents.committed,
-                kv_published_len=extents.published,
             ),
             token_span=TokenSpan(base=session.logical_position, len=0),
             finish_flags=FinishFlags(),
@@ -4982,7 +5233,7 @@ class ModelExecutor:
         self,
         operation: Operation,
         tokens: tuple[int, ...],
-        entry: KvEntry,
+        entry: CacheRow,
         branch: Branch,
         scope: _ExecutionScope,
     ) -> _ForwardTask:
@@ -5020,7 +5271,7 @@ class ModelExecutor:
         operation: Operation,
         conditioning_position: int,
         branch: Branch,
-        entry: KvEntry,
+        entry: CacheRow,
         latent: torch.Tensor,
         timestep: torch.Tensor,
         height: int,
@@ -5095,7 +5346,7 @@ class ModelExecutor:
     def _flow_temporal_position(
         branch: Branch,
         conditioning_position: int,
-        entry: KvEntry,
+        entry: CacheRow,
     ) -> int:
         if branch is Branch.COND:
             return int(conditioning_position)
@@ -5160,24 +5411,18 @@ class ModelExecutor:
         self,
         operation: Operation,
         outcome: _StateOutcome,
+        scope: _ExecutionScope,
         *,
         base: int | None = None,
         products: tuple[ProductPayload, ...] = (),
     ) -> _Outcome:
         session = self.sessions.get(operation.request_key.session_id)
-        extents = self.kv.get(operation.request_key.session_id).extents()
+        row = scope.cache_rows.get((operation.request_key, operation.op_id, 0))
         span_base = session.logical_position if base is None else int(base)
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1 if operation.advances_state else 0,
-            logical_lengths=LogicalLengths(
-                token_len=session.logical_position,
-                kv_visible_len=extents.visible,
-                kv_reserved_len=extents.reserved,
-                kv_initialized_len=extents.initialized,
-                kv_committed_len=extents.committed,
-                kv_published_len=extents.published,
-            ),
+            logical_lengths=self._logical_lengths(operation, session, row),
             token_span=TokenSpan(base=span_base, len=outcome.sampled_tokens),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
@@ -5188,24 +5433,18 @@ class ModelExecutor:
     def _non_state_outcome(
         self,
         operation: Operation,
+        scope: _ExecutionScope,
         *,
         products: tuple[ProductPayload, ...] = (),
         completion_tasks: tuple[_CompletionImagePayload, ...] = (),
     ) -> _Outcome:
         session = self.sessions.get(operation.request_key.session_id)
-        extents = self.kv.get(operation.request_key.session_id).extents()
+        row = scope.cache_rows.get((operation.request_key, operation.op_id, 0))
         base = session.logical_position
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1 if operation.advances_state else 0,
-            logical_lengths=LogicalLengths(
-                token_len=session.logical_position,
-                kv_visible_len=extents.visible,
-                kv_reserved_len=extents.reserved,
-                kv_initialized_len=extents.initialized,
-                kv_committed_len=extents.committed,
-                kv_published_len=extents.published,
-            ),
+            logical_lengths=self._logical_lengths(operation, session, row),
             token_span=TokenSpan(base=base, len=0),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
@@ -5322,7 +5561,7 @@ class ModelExecutor:
                     payload=cast(bytes, descriptor),
                 ),
             )
-        return self._non_state_outcome(operation, products=products)
+        return self._non_state_outcome(operation, scope, products=products)
 
     def _materialize_driver(
         self,
@@ -5444,6 +5683,7 @@ class ModelExecutor:
         )
         return self._non_state_outcome(
             operation,
+            scope,
             products=products,
             completion_tasks=(image_task,),
         )
@@ -5468,9 +5708,10 @@ class ModelExecutor:
                 raise invalid_descriptor("KV publication requires one KV output product")
             if any(reference.kind is ProductKind.KV for reference in operation.inputs):
                 raise invalid_descriptor("KV publication is rooted only by its fixed parent")
-            expected_base = scope.kv.destination_base(session_id, "gen")
-            snapshot = scope.kv.publish_kv(
-                session_id,
+            row = self._cache_row(operation, scope)
+            expected_base = self.cache_publications.destination_base(session_id, "gen")
+            snapshot = self.cache_publications.publish(
+                row,
                 source_version=operation.parent,
                 source_digest=point.semantic_digest,
                 destination="gen",
@@ -5478,6 +5719,8 @@ class ModelExecutor:
                 product=outputs[0],
                 transport=self.transport,
             )
+            scope.cache_publications.append((outputs[0], snapshot))
+            row.published_length = snapshot.published_extent
             for encoded in snapshot.locators:
                 scope.published.append(Locator.from_wire_json(encoded))
             payload = _CompletionTransferPayload(
@@ -5489,6 +5732,7 @@ class ModelExecutor:
             )
             return self._non_state_outcome(
                 operation,
+                scope,
                 products=(ProductPayload(product=outputs[0], payload=cast(bytes, payload)),),
             )
         if mode == TransferMode.KV_INSTALL.value:
@@ -5498,19 +5742,24 @@ class ModelExecutor:
             outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
             if len(inputs) != 1 or len(outputs) != 1:
                 raise invalid_descriptor("KV installation requires one input and one output")
-            snapshot = scope.kv.install_publication(
-                session_id,
-                inputs[0],
-                outputs[0],
-                self.transport,
+            row = self._cache_row(operation, scope)
+            installed = self.cache_publications.install(
+                row,
+                session_id=session_id,
+                source=inputs[0],
+                installed_product=outputs[0],
+                transport=self.transport,
                 transferred_tensors=(
                     None
                     if (prepared := scope.prepared_transfers.get(inputs[0])) is None
                     else prepared.tensors()
                 ),
+                publication=scope.cache_publication_inputs.get(inputs[0]),
             )
+            scope.cache_installations.append((inputs[0], outputs[0], installed))
             return self._non_state_outcome(
                 operation,
+                scope,
                 products=(ProductPayload(product=outputs[0], payload=b""),),
             )
         value, metadata = self._fetch_product_tensor(operation, scope)
@@ -5522,7 +5771,7 @@ class ModelExecutor:
             width=_metadata_uint(metadata, "width", 0),
             value_range=_metadata_string(metadata, "value_range", ""),
         )
-        return self._non_state_outcome(operation)
+        return self._non_state_outcome(operation, scope)
 
     def _encode_source(
         self,
@@ -5754,7 +6003,7 @@ class ModelExecutor:
             stage=stage,
             route=self._route(stage),
             row=row,
-            entry=self.kv.get(operation.request_key.session_id),
+            entry=self._cache_row(operation, scope),
             write_kv=True,
             causal=False,
             attention_indexes=_positions_as_three_axis(positions, _token_input_length(row)),
@@ -5864,7 +6113,7 @@ class ModelExecutor:
             stage=stage,
             route=self._route(stage),
             row=row,
-            entry=self.kv.get(operation.request_key.session_id),
+            entry=self._cache_row(operation, scope),
             write_kv=True,
             causal=False,
             attention_indexes=indexes,
@@ -5890,7 +6139,7 @@ class ModelExecutor:
             max_bytes=int(operation.bounds.max_completion_bytes),
             discard_handles=(),
         )
-        return self._non_state_outcome(operation, completion_tasks=(image_task,))
+        return self._non_state_outcome(operation, scope, completion_tasks=(image_task,))
 
     def _defer_image_encoding(
         self,

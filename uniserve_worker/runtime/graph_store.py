@@ -41,6 +41,8 @@ from uniserve_worker.forward import (
 from uniserve_worker.foundation.sizing import bucketed_length
 from uniserve_worker.models.runtime import CacheGeometry
 
+from .cache_pool import CacheBatchView, CachePool
+
 __all__ = ["GraphExecutionError", "GraphRun", "GraphStore"]
 
 logger = logging.getLogger(__name__)
@@ -780,10 +782,7 @@ def _view_signature(context: ForwardContext) -> tuple[object, ...]:
     if isinstance(kv, EmptyKvView):
         storage: object = "empty"
     else:
-        pool = getattr(kv, "_pool", None)
-        if pool is None:
-            cache = getattr(kv, "_cache", None)
-            pool = getattr(cache, "pool", None)
+        pool = _cache_pool(context)
         storage = (
             type(kv).__qualname__,
             id(pool),
@@ -798,12 +797,13 @@ def _view_signature(context: ForwardContext) -> tuple[object, ...]:
 
 
 def _quantized_kv(batch: ForwardBatch) -> bool:
-    kv = batch.context.kv
-    pool = getattr(kv, "_pool", None)
-    if pool is None:
-        cache = getattr(kv, "_cache", None)
-        pool = getattr(cache, "pool", None)
+    pool = _cache_pool(batch.context)
     return bool(getattr(pool, "is_quantized", False))
+
+
+def _cache_pool(context: ForwardContext) -> CachePool | None:
+    kv = context.kv
+    return kv.pool if isinstance(kv, CacheBatchView) else None
 
 
 def _run(
@@ -849,19 +849,15 @@ def _decode_geometry(
         or len({row.selection for row in rows}) != 1
     ):
         return None
-    pool = getattr(batch.context.kv, "_pool", None)
+    pool = _cache_pool(batch.context)
     if pool is None:
-        cache = getattr(batch.context.kv, "_cache", None)
-        pool = getattr(cache, "pool", None)
-    reserved = tuple(int(value) for value in getattr(pool, "reserved_block_ids", ()))
+        return None
     padding = int(bucket) - live_rows
+    reserved = (0,) * ((padding + int(block_size) - 1) // int(block_size))
     live_width = int(attention.block_table.shape[1])
     width = max(live_width, int(context_blocks), len(reserved))
-    if (
-        int(getattr(pool, "block_size", 0)) != int(block_size)
-        or (padding > 0 and not reserved)
-        or padding > len(reserved) * int(block_size)
-        or (context_blocks > 0 and live_width > int(context_blocks))
+    if int(pool.block_size) != int(block_size) or (
+        context_blocks > 0 and live_width > int(context_blocks)
     ):
         return None
     return _DecodeGeometry(
@@ -911,18 +907,16 @@ def _prefill_geometry(
     padding = int(token_bucket) - live_tokens
     if len(rows) >= int(row_bucket):
         return None
-    pool = getattr(batch.context.kv, "_pool", None)
+    pool = _cache_pool(batch.context)
     if pool is None:
-        cache = getattr(batch.context.kv, "_cache", None)
-        pool = getattr(cache, "pool", None)
-    reserved = tuple(int(value) for value in getattr(pool, "reserved_block_ids", ()))
+        return None
     previous_bucket = max((value for value in token_sizes if value < token_bucket), default=0)
     maximum_padding = int(token_bucket) - int(previous_bucket)
     required_blocks = (maximum_padding + int(block_size) - 1) // int(block_size)
+    reserved = (0,) * required_blocks
     live_width = int(attention.block_table.shape[1])
     if (
-        int(getattr(pool, "block_size", 0)) != int(block_size)
-        or required_blocks > len(reserved)
+        int(pool.block_size) != int(block_size)
         or (int(context_blocks) > 0 and live_width > int(context_blocks))
         or not callable(getattr(batch.context.kv, "with_synthetic_row", None))
     ):
@@ -1436,12 +1430,11 @@ def _decode_padding(
     positions = packed_token_positions(rows)
     if input_ids is None or positions is None:
         return None
-    pool = getattr(batch.context.kv, "_pool", None)
+    pool = _cache_pool(batch.context)
     if pool is None:
-        cache = getattr(batch.context.kv, "_cache", None)
-        pool = getattr(cache, "pool", None)
-    reserved = tuple(int(value) for value in getattr(pool, "reserved_block_ids", ()))
+        return None
     capacity = len(rows)
+    reserved = (0,) * max(1, (capacity + int(block_size) - 1) // int(block_size))
     offsets = torch.arange(
         capacity,
         dtype=attention.cache_seqlens.dtype,
@@ -1472,15 +1465,9 @@ def _prefill_padding(batch: ForwardBatch) -> _PrefillPadding | None:
     attention = batch.context.attention
     if not isinstance(attention, PagedVarlenPlan):
         return None
-    pool = getattr(batch.context.kv, "_pool", None)
-    if pool is None:
-        cache = getattr(batch.context.kv, "_cache", None)
-        pool = getattr(cache, "pool", None)
-    reserved = tuple(int(value) for value in getattr(pool, "reserved_block_ids", ()))
-    if not reserved:
+    if _cache_pool(batch.context) is None:
         return None
     block_row = attention.block_table.new_zeros((int(attention.block_table.shape[1]),))
-    block_row[: len(reserved)].copy_(attention.block_table.new_tensor(reserved))
     return _PrefillPadding(block_row=block_row)
 
 

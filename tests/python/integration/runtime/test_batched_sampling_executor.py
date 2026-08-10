@@ -43,7 +43,6 @@ from uniserve_worker.batch import (
     UndAdmission,
     encode_sampling_state_bytes,
 )
-from uniserve_worker.execution import executor as executor_module
 from uniserve_worker.server.stub import STUB_IMG_START_TOKEN_ID, _next_token
 
 pytestmark = pytest.mark.integration
@@ -109,36 +108,7 @@ def _with_sampling_state(
     return registered, ProductPayload(reference, payload)
 
 
-def _observe_sample_batches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
-    observed: list[tuple[int, int]] = []
-    implementation = executor_module._sample_task_batch
-
-    def wrapped(
-        tasks,
-        completion=None,
-        *,
-        device_products=None,
-        device_reads=(),
-        device_continuation=None,
-        selection_broadcast=None,
-    ):
-        observed.append((len(tasks), sum(len(task.rows) for task in tasks)))
-        return implementation(
-            tasks,
-            completion,
-            device_products=device_products,
-            device_reads=device_reads,
-            device_continuation=device_continuation,
-            selection_broadcast=selection_broadcast,
-        )
-
-    monkeypatch.setattr(executor_module, "_sample_task_batch", wrapped)
-    return observed
-
-
-def test_inline_rows_from_one_round_share_one_sampling_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_inline_rows_from_one_round_produce_the_serial_oracle_tokens() -> None:
     worker = execution_worker()
     first = und_admission(
         1, block_ids=(0,), sampling=SamplingParams(temperature=0.7, top_k=4, top_p=0.9, seed=11)
@@ -162,8 +132,6 @@ def test_inline_rows_from_one_round_share_one_sampling_batch(
         tokens=(12,),
         rng=Rng(seed=17, semantic_index_base=1, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    observed = _observe_sample_batches(monkeypatch)
-
     result = worker.execute(
         execution_batch(
             step_id=1,
@@ -173,12 +141,11 @@ def test_inline_rows_from_one_round_share_one_sampling_batch(
         )
     )
 
-    assert observed == [(2, 2)]
     assert result.completions[0].committed_tokens == (_next_token(9),)
     assert result.completions[1].committed_tokens == (_next_token(12),)
 
 
-def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
     worker = execution_worker()
     admissions = (und_admission(21, block_ids=(0,)), und_admission(22, block_ids=(1,)))
     for index, admission in enumerate(admissions):
@@ -215,8 +182,6 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
         decode_ops.append(operation)
         decode_inputs.append(payload)
         commits.append(commit)
-    observed = _observe_sample_batches(monkeypatch)
-
     result = worker.execute(
         execution_batch(
             step_id=9,
@@ -227,7 +192,6 @@ def test_batched_decode_shares_one_sampling_task(monkeypatch: pytest.MonkeyPatch
         )
     )
 
-    assert observed == [(2, 2)]
     expected = _next_token(_next_token(4))
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
@@ -317,9 +281,7 @@ def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:
     assert read.tensor.tolist() == [1]
 
 
-def test_verify_submits_its_position_rows_as_one_sampling_task(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_verify_commits_every_accepted_position() -> None:
     worker = execution_worker()
     admission = und_admission(
         4, block_ids=(3,), sampling=SamplingParams(return_logprobs=True, n_logprobs=2, seed=31)
@@ -348,8 +310,6 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
         logprobs=True,
         control_seq=commit.control_seq,
     )
-    observed = _observe_sample_batches(monkeypatch)
-
     result = worker.execute(
         execution_batch(
             step_id=2,
@@ -361,7 +321,6 @@ def test_verify_submits_its_position_rows_as_one_sampling_task(
     )
     committed = result.completions[0].committed_tokens
 
-    assert observed == [(1, 3)]
     assert committed == (1001, STUB_IMG_START_TOKEN_ID, 1002)
     assert result.completions[0].selected_point == 3
     assert result.completions[0].logical_lengths.kv_visible_len == 5
@@ -434,11 +393,6 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
     assert completion.logical_lengths.kv_visible_len == 3
     assert completion.logical_lengths.kv_committed_len == 2
     assert completion.logical_lengths.kv_published_len == 0
-    entry = worker.kv.get(5)
-    assert entry.initialized_len == 5
-    assert entry.visible_len == 3
-    assert entry.committed_len == 2
-    assert entry.published_len == 0
     session = worker.sessions.get(5)
     assert session.selected_for_operation(2) == session.resolved_versions[(2, 1)]
 

@@ -1,17 +1,17 @@
-//! Logical KV block management for the engine layer. Owns
-//! block identity, ownership, the reference-counted state machine, an intrusive
+//! Physical KV page management for the engine layer. Owns
+//! page identity, ownership, the reference-counted state machine, an intrusive
 //! LRU free/eviction queue, one-or-more KV-cache groups (hybrid attention),
-//! sliding-window/sink trimming, the per-request segment table, the scratch
-//! budget, the prefix-cache hash→block map, and a cache-event stream.
-//! Holds no GPU memory. Its integer block ids are logical cache identities;
-//! each worker independently maps them into its physical page pool.
+//! sliding-window/sink trimming, the per-request segment table, the
+//! prefix-cache hash→page map, and a cache-event stream.
+//! Holds no GPU memory. Its integer block ids are the page indices every worker
+//! uses directly in its rank-local physical cache pool.
 //!
 //! **substrate.** Blocks are reference-counted; a block becomes eligible
 //! for reuse only at `ref_cnt == 0`, when it is appended to its group's free
 //! queue (most-recently-used end). Allocation pops the queue's LRU end; if the
 //! popped block was *cached* (retains a prefix hash) its hash is dropped from the
 //! map and a `BlockRemoved` event is emitted. This state machine supports prefix
-//! caching and preemption-recompute without acquiring physical page authority.
+//! caching and preemption-recompute under one physical page authority.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::collections::{HashMap, VecDeque};
@@ -139,7 +139,7 @@ struct Group {
 }
 
 /// All per-request KV state, consolidated under a single `RequestId` key so a
-/// request's blocks, segment table, scratch reservation, and trim offsets can
+/// request's blocks, segment table, and trim offsets can
 /// never drift out of sync across parallel maps.
 #[derive(Debug, Default)]
 struct RequestGroupState {
@@ -153,15 +153,6 @@ struct RequestKvState {
     // `None` means no segment table is materialized; `Some` retains an explicit
     // table even when it is empty.
     segments: Option<SegmentTable>,
-    scratch_res: u64,
-}
-
-impl RequestKvState {
-    fn is_empty(&self) -> bool {
-        self.groups.iter().all(|group| group.blocks.is_empty())
-            && self.segments.is_none()
-            && self.scratch_res == 0
-    }
 }
 
 pub struct BlockManager {
@@ -173,9 +164,6 @@ pub struct BlockManager {
     requests: HashMap<RequestId, RequestKvState>,
     // prefix cache: hash -> the cached block holding that prefix.
     hash_to_block: HashMap<u64, BlockId>,
-    // scratch budget
-    scratch_capacity: u64,
-    scratch_used: u64,
     // cache events (bounded ring)
     events: VecDeque<CacheEvent>,
     events_cap: usize,
@@ -183,22 +171,21 @@ pub struct BlockManager {
 }
 
 impl BlockManager {
-    /// Single full-attention group spanning the complete logical capacity.
-    pub fn new(num_blocks: usize, block_size: usize, scratch_capacity: u64) -> Self {
+    /// Single full-attention group spanning the complete physical page capacity.
+    pub fn new(num_blocks: usize, block_size: usize) -> Self {
         Self::with_groups(
             num_blocks,
             block_size,
-            scratch_capacity,
             &[(
                 KvGroupKind::Full,
                 0,
-                u32::try_from(num_blocks).expect("logical KV capacity exceeds u32"),
+                u32::try_from(num_blocks).expect("physical KV page capacity exceeds u32"),
             )],
         )
     }
 
     /// Validate that `(kind, first_block, count)` groups partition the complete
-    /// logical block range without gaps, overlaps, empty groups, or overflow.
+    /// physical request-page range without gaps, overlaps, empty groups, or overflow.
     pub fn validate_group_specs(
         num_blocks: usize,
         group_specs: &[(KvGroupKind, u32, u32)],
@@ -233,14 +220,14 @@ impl BlockManager {
         }
         if let Some(b) = covered.iter().position(|c| !c) {
             return Err(format!(
-                "block {b} is not covered by any group (logical capacity must be fully partitioned)"
+                "block {b} is not covered by any group (physical capacity must be fully partitioned)"
             ));
         }
         Ok(())
     }
 
     /// Build with explicit `(kind, first_block, count)` groups that partition the
-    /// complete logical capacity.
+    /// complete physical request-page capacity.
     ///
     /// Panics with a descriptive message (via [`Self::validate_group_specs`]) if
     /// the specs are malformed — a buggy/version-skewed worker handshake that
@@ -251,7 +238,6 @@ impl BlockManager {
     pub fn with_groups(
         num_blocks: usize,
         block_size: usize,
-        scratch_capacity: u64,
         group_specs: &[(KvGroupKind, u32, u32)],
     ) -> Self {
         if let Err(e) = Self::validate_group_specs(num_blocks, group_specs) {
@@ -282,8 +268,6 @@ impl BlockManager {
             block_group,
             requests: HashMap::new(),
             hash_to_block: HashMap::new(),
-            scratch_capacity,
-            scratch_used: 0,
             events: VecDeque::new(),
             events_cap: 4096,
             stats: BlockManagerStats {
@@ -703,29 +687,7 @@ impl BlockManager {
         self.stats.free = self.total_free();
     }
 
-    // ---- scratch budget ----
-    pub fn can_reserve_scratch(&self, tokens: u64) -> bool {
-        self.scratch_used + tokens <= self.scratch_capacity
-    }
-    pub fn reserve_scratch(&mut self, req: RequestId, tokens: u64) -> bool {
-        if !self.can_reserve_scratch(tokens) {
-            return false;
-        }
-        self.requests.entry(req).or_default().scratch_res += tokens;
-        self.scratch_used += tokens;
-        true
-    }
-    pub fn release_scratch(&mut self, req: RequestId) {
-        if let Some(rec) = self.requests.get_mut(&req) {
-            self.scratch_used -= rec.scratch_res;
-            rec.scratch_res = 0;
-            if rec.is_empty() {
-                self.requests.remove(&req);
-            }
-        }
-    }
-
-    /// Release all of a request's blocks (deref → free queue) and its scratch.
+    /// Release all of a request's blocks (deref → free queue).
     pub fn release(&mut self, req: RequestId) {
         if let Some(rec) = self.requests.remove(&req) {
             for b in rec
@@ -737,7 +699,6 @@ impl BlockManager {
                 // the free queue (Cached if it has a hash, else Free).
                 self.deref_block(b);
             }
-            self.scratch_used -= rec.scratch_res;
         }
         self.stats.free = self.total_free();
     }
@@ -752,7 +713,7 @@ impl BlockManager {
         self.hash_to_block.len()
     }
 
-    /// Total logical blocks negotiated with the worker.
+    /// Total physical request pages negotiated with the worker.
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
     }
@@ -772,7 +733,7 @@ mod tests {
 
     #[test]
     fn single_group_allocate_release_roundtrip() {
-        let mut bm = BlockManager::new(8, 4, 0);
+        let mut bm = BlockManager::new(8, 4);
         assert_eq!(bm.free_blocks(), 7);
         let blocks = bm.allocate(rid(1), 3).unwrap();
         assert_eq!(blocks.len(), 3);
@@ -788,7 +749,7 @@ mod tests {
     fn lru_reclaim_order() {
         // Freed blocks return to the MRU end; allocation pops the LRU end, so the
         // earliest-freed block is reclaimed first.
-        let mut bm = BlockManager::new(5, 4, 0);
+        let mut bm = BlockManager::new(5, 4);
         let a = bm.allocate(rid(1), 1).unwrap()[0];
         let b = bm.allocate(rid(2), 1).unwrap()[0];
         let c = bm.allocate(rid(3), 1).unwrap()[0];
@@ -809,7 +770,7 @@ mod tests {
 
     #[test]
     fn ref_counted_block_not_evicted_until_zero() {
-        let mut bm = BlockManager::new(4, 4, 0);
+        let mut bm = BlockManager::new(4, 4);
         let blk = bm.allocate(rid(1), 1).unwrap()[0];
         let toks = &[1u32, 2, 3, 4];
         bm.cache_block(blk, 0xABCD, toks);
@@ -833,7 +794,7 @@ mod tests {
 
     #[test]
     fn prefix_reuse_acquire_and_release() {
-        let mut bm = BlockManager::new(6, 4, 0);
+        let mut bm = BlockManager::new(6, 4);
         let blk = bm.allocate(rid(1), 1).unwrap()[0];
         let toks = &[5u32, 6, 7, 8];
         bm.cache_block(blk, 42, toks);
@@ -853,7 +814,7 @@ mod tests {
     /// one request another's KV for a different prefix.
     #[test]
     fn prefix_lookup_rejects_hash_collision_with_different_tokens() {
-        let mut bm = BlockManager::new(6, 4, 0);
+        let mut bm = BlockManager::new(6, 4);
         let blk = bm.allocate(rid(1), 1).unwrap()[0];
         let real = &[10u32, 11, 12, 13];
         bm.cache_block(blk, 0xC0FFEE, real);
@@ -873,7 +834,7 @@ mod tests {
 
     #[test]
     fn cache_events_emitted() {
-        let mut bm = BlockManager::new(4, 4, 0);
+        let mut bm = BlockManager::new(4, 4);
         let blk = bm.allocate(rid(1), 1).unwrap()[0];
         bm.cache_block(blk, 7, &[1, 2, 3, 4]);
         bm.release(rid(1));
@@ -895,7 +856,6 @@ mod tests {
         let mut bm = BlockManager::with_groups(
             16,
             4,
-            0,
             &[(KvGroupKind::SlidingWindow { window: 8, sink: 4 }, 0, 16)],
         );
         // allocate 5 blocks covering tokens [0,20)
@@ -943,7 +903,7 @@ mod tests {
         // a still-Active cached block may be SHARED by another request
         // (ref_cnt bumps — the point of prefix caching), but re-acquiring it for a
         // request that already holds it is refused so its ref_cnt cannot drift.
-        let mut bm = BlockManager::new(6, 4, 0);
+        let mut bm = BlockManager::new(6, 4);
         let blk = bm.allocate(rid(1), 1).unwrap()[0];
         let toks = &[9u32, 8, 7, 6];
         bm.cache_block(blk, 77, toks);
@@ -984,7 +944,6 @@ mod tests {
         let mut bm = BlockManager::with_groups(
             8,
             4,
-            0,
             &[(KvGroupKind::Full, 0, 4), (KvGroupKind::Full, 4, 4)],
         );
         assert_eq!(bm.request_page_capacity(), 3);
@@ -1007,12 +966,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid KV-cache group specs")]
     fn with_groups_panics_on_out_of_range_spec() {
-        let _ = BlockManager::with_groups(8, 4, 0, &[(KvGroupKind::Full, 0, 20)]);
+        let _ = BlockManager::with_groups(8, 4, &[(KvGroupKind::Full, 0, 20)]);
     }
 
     #[test]
     fn block_zero_is_reserved_for_graph_padding() {
-        let mut bm = BlockManager::new(4, 4, 0);
+        let mut bm = BlockManager::new(4, 4);
         assert_eq!(bm.free_blocks(), 3);
         let all = bm.allocate(rid(1), 3).unwrap();
         assert_eq!(all, vec![BlockId(1), BlockId(2), BlockId(3)]);
@@ -1029,7 +988,6 @@ mod tests {
         let mut bm = BlockManager::with_groups(
             16,
             4,
-            0,
             &[(KvGroupKind::SlidingWindow { window: 8, sink: 4 }, 0, 16)],
         );
         // 5 blocks covering tokens [0,4),[4,8),[8,12),[12,16),[16,20).
@@ -1059,7 +1017,7 @@ mod tests {
 
     #[test]
     fn full_group_never_trims() {
-        let mut bm = BlockManager::new(16, 4, 0);
+        let mut bm = BlockManager::new(16, 4);
         let _ = bm.allocate(rid(1), 5).unwrap();
         bm.trim_sliding_window(rid(1), 20);
         assert_eq!(bm.blocks_for_group(rid(1), 0).len(), 5);

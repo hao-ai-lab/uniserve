@@ -434,6 +434,13 @@ mod tests {
         assert!(rendered.starts_with("<|im_start|>system\nYou are an image generation"));
         assert!(rendered.contains("You support two modes:"));
         assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n<img>"));
+        let negative = profile
+            .preprocessing
+            .render_negative_prompt_ids(&tokenizer, "")
+            .unwrap();
+        let rendered_negative = tokenizer.decode(&negative, false).unwrap();
+        assert!(rendered_negative.starts_with("<|im_start|>system\nYou are an image generation"));
+        assert!(rendered_negative.ends_with("<|im_start|>assistant\n<img>"));
         let ingest = profile
             .preprocessing
             .image_ingest_for_dimensions(2048, 1152, 1)

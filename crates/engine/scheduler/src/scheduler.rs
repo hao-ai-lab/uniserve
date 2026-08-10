@@ -164,9 +164,9 @@ use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
     CompletionReport, Control, Disposition, ExecutionCapability, GenAdmission, KvAdmission,
-    KvPlacement, LatentPlacement, OpId, OpStatus, Operation, Point, ProductKind, ProductPayload,
-    ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef, WorkVariant,
-    WorkerCapabilities, WorkerForwardStats,
+    KvBranchPlacement, KvPlacement, LatentPlacement, OpId, OpStatus, Operation, Point, ProductKind,
+    ProductPayload, ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef,
+    WorkVariant, WorkerCapabilities, WorkerForwardStats,
 };
 
 use crate::image_artifact::validate_png_artifact;
@@ -450,6 +450,81 @@ struct LatentPagePool {
     allocations: HashMap<RequestId, Vec<u32>>,
 }
 
+struct KvScratchPagePool {
+    page_size: u32,
+    free: Vec<BlockId>,
+    allocations: HashMap<RequestId, Vec<BlockId>>,
+    pending_zero: HashMap<RequestId, Vec<BlockId>>,
+}
+
+impl KvScratchPagePool {
+    fn new(page_offset: u32, capacity_tokens: u64, page_size: u32) -> Self {
+        let page_size = page_size.max(1);
+        let page_count = capacity_tokens.div_ceil(u64::from(page_size));
+        let end = u64::from(page_offset)
+            .checked_add(page_count)
+            .and_then(|value| u32::try_from(value).ok())
+            .expect("KV scratch page range exceeds u32");
+        Self {
+            page_size,
+            free: (page_offset..end).rev().map(BlockId).collect(),
+            allocations: HashMap::new(),
+            pending_zero: HashMap::new(),
+        }
+    }
+
+    fn pages_needed(&self, tokens: u64) -> Option<usize> {
+        usize::try_from(tokens.div_ceil(u64::from(self.page_size))).ok()
+    }
+
+    fn can_reserve(&self, request_id: RequestId, tokens: u64) -> bool {
+        let Some(needed) = self.pages_needed(tokens) else {
+            return false;
+        };
+        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
+        needed.saturating_sub(held) <= self.free.len()
+    }
+
+    fn reserve(&mut self, request_id: RequestId, tokens: u64) -> bool {
+        if !self.can_reserve(request_id, tokens) {
+            return false;
+        }
+        let needed = self.pages_needed(tokens).unwrap_or_default();
+        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
+        let mut pages = Vec::with_capacity(needed.saturating_sub(held));
+        for _ in held..needed {
+            pages.push(self.free.pop().expect("KV scratch free-page invariant"));
+        }
+        self.pending_zero
+            .entry(request_id)
+            .or_default()
+            .extend(pages.iter().copied());
+        self.allocations
+            .entry(request_id)
+            .or_default()
+            .extend(pages);
+        true
+    }
+
+    fn pages_for(&self, request_id: RequestId) -> &[BlockId] {
+        self.allocations
+            .get(&request_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn take_pages_to_zero(&mut self, request_id: RequestId) -> Vec<BlockId> {
+        self.pending_zero.remove(&request_id).unwrap_or_default()
+    }
+
+    fn release(&mut self, request_id: RequestId) {
+        self.pending_zero.remove(&request_id);
+        if let Some(pages) = self.allocations.remove(&request_id) {
+            self.free.extend(pages.into_iter().rev());
+        }
+    }
+}
+
 impl LatentPagePool {
     fn new(num_pages: u32, page_units: u32) -> Self {
         Self {
@@ -651,6 +726,7 @@ pub struct Scheduler {
     reserved_encoder_entries: usize,
     request_slots: RequestSlotPool,
     latent_pages: LatentPagePool,
+    kv_scratch_pages: KvScratchPagePool,
     running: HashMap<RequestId, ReqState>,
     /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
@@ -1032,23 +1108,14 @@ impl Scheduler {
         // build from the worker's reported KV-cache groups (hybrid layouts);
         // Empty means one full-attention group.
         let bm = if caps.groups.is_empty() {
-            BlockManager::new(
-                caps.num_blocks as usize,
-                caps.block_size as usize,
-                caps.scratch_capacity_tokens,
-            )
+            BlockManager::new(caps.num_blocks as usize, caps.block_size as usize)
         } else {
             let specs: Vec<(uniserve_core::KvGroupKind, u32, u32)> = caps
                 .groups
                 .iter()
                 .map(|g| (g.kind, g.block_offset, g.num_blocks))
                 .collect();
-            BlockManager::with_groups(
-                caps.num_blocks as usize,
-                caps.block_size as usize,
-                caps.scratch_capacity_tokens,
-                &specs,
-            )
+            BlockManager::with_groups(caps.num_blocks as usize, caps.block_size as usize, &specs)
         };
         let usable_blocks = bm.request_page_capacity();
         let stats = Arc::new(SchedStats::default());
@@ -1059,6 +1126,11 @@ impl Scheduler {
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
         let request_slots = RequestSlotPool::new(config.max_num_seqs);
         let latent_pages = LatentPagePool::new(caps.num_latent_pages, caps.latent_page_units);
+        let kv_scratch_pages = KvScratchPagePool::new(
+            caps.num_blocks,
+            caps.scratch_capacity_tokens,
+            caps.block_size,
+        );
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
@@ -1112,6 +1184,7 @@ impl Scheduler {
             reserved_encoder_entries: 0,
             request_slots,
             latent_pages,
+            kv_scratch_pages,
             running: HashMap::new(),
             completed_outputs: HashMap::new(),
             retiring_sessions: HashMap::new(),
@@ -1873,11 +1946,76 @@ impl Scheduler {
         uniserve_core::denoise_scratch_tokens(
             self.num_vae(&st.req.image),
             u64::from(self.caps.commit_marker_tokens),
-            u64::from(st.image_gen.cond_pos),
+            u64::from(st.und.physical_kv_len),
             st.context.negative_prompt_ids.len() as u64,
             u64::from(cfg_branch_count(&st.req.image)),
             u64::from(self.caps.block_size),
         )
+    }
+
+    fn kv_branch_placements_for(
+        &mut self,
+        request_id: RequestId,
+        request_key: RequestKey,
+        op_id: OpId,
+    ) -> Result<Vec<KvBranchPlacement>, &'static str> {
+        let Some(state) = self.running.get(&request_id) else {
+            return Err("generation request lost its runtime state");
+        };
+        let branch_count = usize::from(cfg_branch_count(&state.req.image).max(1));
+        let block_size = u64::from(self.caps.block_size.max(1));
+        let branch_tokens = self
+            .num_vae(&state.req.image)
+            .saturating_add(u64::from(self.caps.commit_marker_tokens));
+        let conditioning_tokens = u64::from(state.und.physical_kv_len);
+        let negative_tokens = state.context.negative_prompt_ids.len() as u64;
+        let branch_pages = |prefix_tokens: u64| {
+            usize::try_from(
+                branch_tokens
+                    .saturating_add(prefix_tokens)
+                    .div_ceil(block_size),
+            )
+            .map_err(|_| "generation scratch page count exceeds usize")
+        };
+        let primary_pages = branch_pages(conditioning_tokens)?;
+        let auxiliary_pages = branch_pages(conditioning_tokens.max(negative_tokens))?;
+        let pages = self.kv_scratch_pages.pages_for(request_id).to_vec();
+        let expected = primary_pages
+            .saturating_add(auxiliary_pages.saturating_mul(branch_count.saturating_sub(1)));
+        if pages.len() != expected {
+            return Err("generation scratch allocation disagrees with its branch geometry");
+        }
+        let pages_to_zero = self
+            .kv_scratch_pages
+            .take_pages_to_zero(request_id)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut placements = Vec::with_capacity(branch_count);
+        let mut offset = 0usize;
+        for branch in 0..branch_count {
+            let width = if branch == 0 {
+                primary_pages
+            } else {
+                auxiliary_pages
+            };
+            let block_table = pages[offset..offset + width].to_vec();
+            let zero = block_table
+                .iter()
+                .copied()
+                .filter(|page| pages_to_zero.contains(page))
+                .collect();
+            placements.push(KvBranchPlacement {
+                request_key,
+                op_id,
+                branch_index: u32::try_from(branch + 1)
+                    .map_err(|_| "generation branch index exceeds u32")?,
+                group_id: 0,
+                block_table,
+                pages_to_zero: zero,
+            });
+            offset += width;
+        }
+        Ok(placements)
     }
 
     fn cap_max_vae_grid_tokens(&self) -> usize {
@@ -1938,8 +2076,8 @@ impl Scheduler {
         let host_scratch_ok = self.running.get(&id).is_some_and(|st| {
             st.resources.host_scratch_tokens > 0
                 || self
-                    .bm
-                    .can_reserve_scratch(self.denoise_host_scratch_tokens(st))
+                    .kv_scratch_pages
+                    .can_reserve(id, self.denoise_host_scratch_tokens(st))
         });
         worker_capacity_ok && host_scratch_ok
     }
@@ -1962,7 +2100,11 @@ impl Scheduler {
             .get(&id)
             .is_some_and(|st| st.resources.host_scratch_tokens == 0)
             && resources.host_scratch_tokens > 0;
-        if needs_host_scratch && !self.bm.reserve_scratch(id, resources.host_scratch_tokens) {
+        if needs_host_scratch
+            && !self
+                .kv_scratch_pages
+                .reserve(id, resources.host_scratch_tokens)
+        {
             return false;
         }
         if resources.latent_units > 0
@@ -1970,7 +2112,7 @@ impl Scheduler {
             && !self.latent_pages.reserve(id, resources.latent_units)
         {
             if needs_host_scratch {
-                self.bm.release_scratch(id);
+                self.kv_scratch_pages.release(id);
             }
             return false;
         }
@@ -1994,7 +2136,7 @@ impl Scheduler {
                     self.latent_pages.release(id);
                 }
                 uniserve_worker_wire::ResourceClass::Scratch => {
-                    self.bm.release_scratch(id);
+                    self.kv_scratch_pages.release(id);
                     if let Some(st) = self.running.get_mut(&id) {
                         st.resources.host_scratch_tokens = 0;
                     }
@@ -2289,6 +2431,7 @@ impl Scheduler {
                         self.retiring_sessions.remove(&id);
                         self.bm.release(id);
                         self.latent_pages.release(id);
+                        self.kv_scratch_pages.release(id);
                         if let Err(error) = self.request_slots.release(retiring.request_pool_idx) {
                             tracing::error!(
                                 request_id = id.0,
@@ -4055,6 +4198,7 @@ impl Scheduler {
             .map(|admission| admission.request_key)
             .collect::<HashSet<_>>();
         let mut kv_placements = HashMap::with_capacity(transitions.len());
+        let mut kv_branch_placements = HashMap::with_capacity(transitions.len());
         let mut latent_placements = HashMap::with_capacity(transitions.len());
         for mut transition in transitions {
             let oid = self.next_op_id;
@@ -4254,6 +4398,25 @@ impl Scheduler {
                     operation_kv_placements,
                 );
             }
+            if operation.work.variant() == WorkVariant::GenFlow {
+                let placements = match self.kv_branch_placements_for(
+                    request_id,
+                    operation.request_key,
+                    operation.op_id,
+                ) {
+                    Ok(placements) => placements,
+                    Err(error) => {
+                        tracing::error!(
+                            request_id = request_id.0,
+                            error,
+                            "invalid generation KV branch placement"
+                        );
+                        self.fatal = true;
+                        return;
+                    }
+                };
+                kv_branch_placements.insert((operation.request_key, operation.op_id), placements);
+            }
             if matches!(
                 operation.work.variant(),
                 WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
@@ -4434,7 +4597,12 @@ impl Scheduler {
             })
             .collect::<Vec<_>>();
         controls.extend(releases);
-        let partitions = self.partition_batch(wire_ops, &kv_placements, &latent_placements);
+        let partitions = self.partition_batch(
+            wire_ops,
+            &kv_placements,
+            &kv_branch_placements,
+            &latent_placements,
+        );
         let partition_ids = partitions
             .iter()
             .map(|partition| partition.partition_id)
@@ -4466,6 +4634,7 @@ impl Scheduler {
         &mut self,
         operations: Vec<Operation>,
         kv_placements: &HashMap<(RequestKey, OpId), Vec<KvPlacement>>,
+        kv_branch_placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
         latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     ) -> Vec<BatchPartition> {
         let mut routes: RouteDomainOperations = Vec::new();
@@ -4546,6 +4715,8 @@ impl Scheduler {
                 for (domain, operations) in mixed_candidates {
                     let request_pool_indices = self.request_pool_indices(&operations);
                     let kv_placements = self.kv_placements(&operations, kv_placements);
+                    let kv_branch_placements =
+                        self.kv_branch_placements(&operations, kv_branch_placements);
                     let latent_placements = self.latent_placements(&operations, latent_placements);
                     partitions.push(BatchPartition {
                         partition_id: next_partition_id,
@@ -4559,6 +4730,7 @@ impl Scheduler {
                         operations,
                         request_pool_indices,
                         kv_placements,
+                        kv_branch_placements,
                         latent_placements,
                     });
                     next_partition_id = next_partition_id.saturating_add(1);
@@ -4573,6 +4745,8 @@ impl Scheduler {
                 };
                 let request_pool_indices = self.request_pool_indices(&operations);
                 let kv_placements = self.kv_placements(&operations, kv_placements);
+                let kv_branch_placements =
+                    self.kv_branch_placements(&operations, kv_branch_placements);
                 let latent_placements = self.latent_placements(&operations, latent_placements);
                 partitions.push(BatchPartition {
                     partition_id: next_partition_id,
@@ -4586,6 +4760,7 @@ impl Scheduler {
                     operations,
                     request_pool_indices,
                     kv_placements,
+                    kv_branch_placements,
                     latent_placements,
                 });
                 next_partition_id = next_partition_id.saturating_add(1);
@@ -4637,6 +4812,23 @@ impl Scheduler {
             .filter_map(|operation| {
                 placements
                     .get(&(operation.request_key, operation.op_id))
+                    .cloned()
+            })
+            .collect()
+    }
+
+    fn kv_branch_placements(
+        &self,
+        operations: &[Operation],
+        placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
+    ) -> Vec<KvBranchPlacement> {
+        operations
+            .iter()
+            .flat_map(|operation| {
+                placements
+                    .get(&(operation.request_key, operation.op_id))
+                    .into_iter()
+                    .flatten()
                     .cloned()
             })
             .collect()
@@ -6273,6 +6465,7 @@ impl Scheduler {
         if !awaits_close {
             self.bm.release(id);
             self.latent_pages.release(id);
+            self.kv_scratch_pages.release(id);
             if let Some(index) = request_pool_idx
                 && let Err(error) = self.request_slots.release(index)
             {
@@ -6328,9 +6521,10 @@ fn transition_kv_lengths(delta: &TransitionDelta, state: Option<&ReqState>) -> O
             physical_position, ..
         } => (*physical_position, 1),
         TransitionDelta::PublishKv { .. } => (state?.und.physical_kv_len, 0),
+        TransitionDelta::TransitionGen { .. } | TransitionDelta::DenoiseGen { .. } => {
+            (state?.und.physical_kv_len, 0)
+        }
         TransitionDelta::EncodeImageStep { .. }
-        | TransitionDelta::TransitionGen { .. }
-        | TransitionDelta::DenoiseGen { .. }
         | TransitionDelta::CommitGen { .. }
         | TransitionDelta::EncodeFeedbackStep { .. } => return None,
     };

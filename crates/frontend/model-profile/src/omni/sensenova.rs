@@ -148,9 +148,6 @@ impl SenseNovaProfile {
         tokenizer: &HuggingFaceTokenizer,
         prompt: &str,
     ) -> crate::tokenizer::Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Ok(Vec::new());
-        }
         encode(
             tokenizer,
             &chatml(Some(IMAGE_SYSTEM_PROMPT), prompt, NEGATIVE_ASSISTANT_PREFIX),

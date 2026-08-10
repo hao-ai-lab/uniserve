@@ -3,10 +3,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::time::{Duration, Instant};
 
-use uniserve_core::{BlockId, CommandWaker, RequestId};
+use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_wire::{
-    Batch, CompletionReport, Operation, RequestKind, SnapshotRef, WorkVariant, WorkerCapabilities,
-    WorkerRequest,
+    Batch, CacheCopy, CompletionReport, Operation, RecoveryPlacement, RequestKind, SnapshotRef,
+    WorkVariant, WorkerCapabilities, WorkerRequest,
 };
 
 /// Synchronous model-engine seam used by deterministic local implementations.
@@ -293,10 +293,13 @@ impl TensorHandle {
 #[derive(Debug, Clone)]
 pub enum ControlOp {
     DropSession(RequestId),
-    CopyKv(Vec<(BlockId, BlockId)>),
+    CopyKv(Vec<CacheCopy>),
     ReleaseProducts(Vec<u64>),
-    SnapshotSession(RequestId),
-    RestoreSession(SnapshotRef),
+    SnapshotSession(RecoveryPlacement),
+    RestoreSession {
+        snapshot: SnapshotRef,
+        placement: RecoveryPlacement,
+    },
 }
 
 impl ControlOp {
@@ -306,7 +309,7 @@ impl ControlOp {
             Self::CopyKv(_) => RequestKind::CopyKv,
             Self::ReleaseProducts(_) => RequestKind::ReleaseProducts,
             Self::SnapshotSession(_) => RequestKind::SnapshotSession,
-            Self::RestoreSession(_) => RequestKind::RestoreSession,
+            Self::RestoreSession { .. } => RequestKind::RestoreSession,
         }
     }
 
@@ -316,7 +319,7 @@ impl ControlOp {
             Self::CopyKv(_) => "copy_kv",
             Self::ReleaseProducts(_) => "release_products",
             Self::SnapshotSession(_) => "snapshot_session",
-            Self::RestoreSession(_) => "restore_session",
+            Self::RestoreSession { .. } => "restore_session",
         }
     }
 
@@ -325,8 +328,11 @@ impl ControlOp {
             Self::DropSession(id) => WorkerRequest::drop_session(*id),
             Self::CopyKv(copies) => WorkerRequest::copy_kv(copies.clone()),
             Self::ReleaseProducts(handles) => WorkerRequest::release_products(handles.clone()),
-            Self::SnapshotSession(id) => WorkerRequest::snapshot_session(*id),
-            Self::RestoreSession(snapshot) => WorkerRequest::restore_session(snapshot.clone()),
+            Self::SnapshotSession(placement) => WorkerRequest::snapshot_session(placement.clone()),
+            Self::RestoreSession {
+                snapshot,
+                placement,
+            } => WorkerRequest::restore_session(snapshot.clone(), placement.clone()),
         };
         req.call_id = Some(call_id);
         req

@@ -322,7 +322,6 @@ impl StageRouter {
             .filter_map(|variant| routed_caps(variant).map(|caps| caps.encoder_cache_budget))
             .min()
             .unwrap_or(0);
-        merged.restored_snapshots.clear();
         merged.validate()?;
         Ok(merged)
     }
@@ -1266,6 +1265,7 @@ mod tests {
                                 u32::try_from(encode_key.session_id.0).unwrap().max(1),
                             ],
                             kv_placements: Vec::new(),
+                            kv_branch_placements: Vec::new(),
                             latent_placements: Vec::new(),
                         },
                         BatchPartition {
@@ -1282,6 +1282,7 @@ mod tests {
                                 u32::try_from(prefill_key.session_id.0).unwrap().max(1),
                             ],
                             kv_placements: Vec::new(),
+                            kv_branch_placements: Vec::new(),
                             latent_placements: Vec::new(),
                         },
                     ],
@@ -1407,6 +1408,7 @@ mod tests {
                         operations: vec![encode],
                         request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
                         kv_placements: Vec::new(),
+                        kv_branch_placements: Vec::new(),
                         latent_placements: Vec::new(),
                     }],
                 )
@@ -1450,6 +1452,7 @@ mod tests {
                 operations: vec![consume],
                 request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
                 kv_placements: Vec::new(),
+                kv_branch_placements: Vec::new(),
                 latent_placements: Vec::new(),
             }],
         );
@@ -1532,6 +1535,7 @@ mod tests {
                         operations: vec![encode],
                         request_pool_indices: vec![u32::try_from(key.session_id.0).unwrap().max(1)],
                         kv_placements: Vec::new(),
+                        kv_branch_placements: Vec::new(),
                         latent_placements: Vec::new(),
                     }],
                 )

@@ -6,8 +6,7 @@ use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError, WorkerLossError};
 use uniserve_worker_wire::{
-    Batch, CompletionRecord, CompletionReport, Point, SamplingOwnership, SnapshotRef,
-    WorkerCapabilities,
+    Batch, CompletionRecord, CompletionReport, SamplingOwnership, WorkerCapabilities,
 };
 
 use crate::WorkerLaunchConfig;
@@ -39,10 +38,6 @@ struct MultiprocSpawnSpec {
 }
 
 impl MultiprocSpawnSpec {
-    fn snapshots_enabled(&self) -> bool {
-        self.worker_config.snapshot_dir.is_some()
-    }
-
     fn launch(&self) -> anyhow::Result<Vec<Box<dyn Executor>>> {
         let tp_init_method = if self.world_size > 1 {
             Some(allocate_tp_init_method()?)
@@ -121,8 +116,6 @@ impl MultiprocExecutor {
         let caps = workers[0].caps();
         let mut canonical = caps.clone();
         canonical.rank.tp_rank = 0;
-        canonical.restored_snapshots.clear();
-        let mut restored_versions = None;
         for (rank, worker) in workers.iter().enumerate() {
             let rank_caps = worker.caps();
             rank_caps
@@ -140,18 +133,8 @@ impl MultiprocExecutor {
                 worker.pipeline_depth(),
                 rank_caps.pipeline_depth.max(1),
             );
-            let rank_restored = restored_snapshot_versions(&rank_caps.restored_snapshots);
-            if let Some(expected) = &restored_versions {
-                anyhow::ensure!(
-                    expected == &rank_restored,
-                    "TP rank {rank} restored snapshot versions disagree with rank 0"
-                );
-            } else {
-                restored_versions = Some(rank_restored);
-            }
             let mut normalized = rank_caps;
             normalized.rank.tp_rank = 0;
-            normalized.restored_snapshots.clear();
             anyhow::ensure!(
                 normalized == canonical,
                 "TP rank {rank} capabilities disagree with rank 0"
@@ -355,105 +338,23 @@ impl MultiprocExecutor {
     }
 
     fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Result<()> {
-        let mut spec = self.spawn_spec.clone().ok_or_else(|| {
+        let spec = self.spawn_spec.clone().ok_or_else(|| {
             anyhow::anyhow!("worker process failed without a restart specification: {cause}")
         })?;
-        spec.worker_config.restore_snapshots = spec.snapshots_enabled();
         tracing::warn!(error = %cause, "worker process lost; replacing its complete rank group");
         for worker in &mut self.workers {
             worker.shutdown();
         }
 
-        let snapshots_enabled = spec.snapshots_enabled();
-        let workers = match spec.launch() {
-            Ok(workers) => workers,
-            Err(restore_error) if snapshots_enabled => {
-                let root =
-                    spec.worker_config.snapshot_dir.clone().ok_or_else(|| {
-                        anyhow::anyhow!("snapshot recovery requires a snapshot root")
-                    })?;
-                spec.worker_config.snapshot_dir = Some(
-                    std::path::PathBuf::from(root)
-                        .join("generations")
-                        .join(format!("{:x}", crate::uniproc::nano_id()))
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                let workers = spec.launch().with_context(|| {
-                    format!(
-                        "worker replacement failed after snapshot restore error: {restore_error}"
-                    )
-                })?;
-                self.install_replacement(workers, &spec)?;
-                self.spawn_spec = Some(spec);
-                self.discard_sessions_after_loss()?;
-                return Err(WorkerLossError {
-                    message: format!(
-                        "worker snapshots could not be restored; affected sessions terminated: {restore_error}"
-                    ),
-                }
-                .into());
-            }
-            Err(error) => return Err(error.context("spawning replacement worker ranks")),
-        };
+        let workers = spec.launch().context("spawning replacement worker ranks")?;
         self.install_replacement(workers, &spec)?;
         self.spawn_spec = Some(spec);
-
-        let restored_by_rank = self.replacement_restored_snapshots();
-        let reconstructable = self.reconstructable_admissions();
-        let required = self
-            .known_sessions
-            .difference(&reconstructable)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if !snapshots_enabled
-            || !self.recovery_checkpoint_complete(&restored_by_rank, &reconstructable, &required)
-        {
-            self.discard_sessions_after_loss()?;
-            return Err(WorkerLossError {
-                message: if snapshots_enabled {
-                    "worker snapshot set was incomplete; affected sessions terminated".to_string()
-                } else {
-                    "worker process was replaced without snapshots; affected sessions terminated"
-                        .to_string()
-                },
-            }
-            .into());
+        self.discard_sessions_after_loss();
+        Err(WorkerLossError {
+            message: "worker process was replaced and affected sessions were terminated"
+                .to_string(),
         }
-
-        for (rank, restored) in restored_by_rank.iter().enumerate() {
-            for session_id in restored
-                .keys()
-                .filter(|session_id| !required.contains(session_id))
-                .copied()
-            {
-                let worker = &mut self.workers[rank];
-                let acknowledgments =
-                    worker.control_wait(ControlOp::DropSession(session_id), None)?;
-                anyhow::ensure!(
-                    acknowledgments.iter().all(|ack| ack.ok),
-                    "replacement worker could not discard stale session {}",
-                    session_id.0
-                );
-            }
-        }
-        for batch in self.pending_batches.values() {
-            for (rank, worker) in self.workers.iter_mut().enumerate() {
-                worker.submit(batch.clone()).with_context(|| {
-                    format!(
-                        "resubmitting step {} to replacement rank {rank}",
-                        batch.step_id
-                    )
-                })?;
-            }
-        }
-        self.inflight = self.pending_batches.len();
-        tracing::info!(
-            sessions = self.known_sessions.len(),
-            batches = self.pending_batches.len(),
-            "worker rank group restored from durable snapshots"
-        );
-        Ok(())
+        .into())
     }
 
     fn install_replacement(
@@ -473,75 +374,13 @@ impl MultiprocExecutor {
         Ok(())
     }
 
-    fn replacement_restored_snapshots(&self) -> Vec<BTreeMap<RequestId, SnapshotRef>> {
-        self.workers
-            .iter()
-            .map(|worker| restored_snapshot_map(worker.caps().restored_snapshots))
-            .collect()
-    }
-
-    fn recovery_checkpoint_complete(
-        &self,
-        restored_by_rank: &[BTreeMap<RequestId, SnapshotRef>],
-        reconstructable: &BTreeSet<RequestId>,
-        required: &BTreeSet<RequestId>,
-    ) -> bool {
-        self.dirty_sessions.is_subset(reconstructable)
-            && required.iter().all(|session_id| {
-                let Some(first) = restored_by_rank
-                    .first()
-                    .and_then(|restored| restored.get(session_id))
-                else {
-                    return false;
-                };
-                restored_by_rank.iter().all(|restored| {
-                    restored
-                        .get(session_id)
-                        .is_some_and(|snapshot| snapshot.version == first.version)
-                })
-            })
-    }
-
-    fn discard_sessions_after_loss(&mut self) -> anyhow::Result<()> {
-        let restored_by_rank = self.replacement_restored_snapshots();
-        for (rank, restored) in restored_by_rank.into_iter().enumerate() {
-            for session_id in restored.into_keys() {
-                let worker = &mut self.workers[rank];
-                let acknowledgments =
-                    worker.control_wait(ControlOp::DropSession(session_id), None)?;
-                anyhow::ensure!(
-                    acknowledgments.iter().all(|ack| ack.ok),
-                    "replacement worker could not discard unrestorable session {}",
-                    session_id.0
-                );
-            }
-        }
+    fn discard_sessions_after_loss(&mut self) {
         self.pending_batches.clear();
         self.pending_partitions.clear();
         self.buffers.iter_mut().for_each(VecDeque::clear);
         self.inflight = 0;
         self.known_sessions.clear();
         self.dirty_sessions.clear();
-        Ok(())
-    }
-
-    fn reconstructable_admissions(&self) -> BTreeSet<RequestId> {
-        self.pending_batches
-            .values()
-            .flat_map(|batch| {
-                batch.operations().filter_map(|operation| {
-                    // A depth-one admission root: point zero of the request's
-                    // admission operation. Only such operations can be replayed
-                    // from a fresh admission after a rank group is replaced.
-                    (matches!(operation.parent.point, Point::Fixed { point_index: 0, .. })
-                        && batch
-                            .admissions
-                            .iter()
-                            .any(|admission| admission.request_key == operation.request_key))
-                    .then_some(operation.request_key.session_id)
-                })
-            })
-            .collect()
     }
 
     fn discard_inflight(&mut self) {
@@ -559,7 +398,7 @@ impl MultiprocExecutor {
                 self.known_sessions.remove(session_id);
                 self.dirty_sessions.remove(session_id);
             }
-            ControlOp::RestoreSession(snapshot) => {
+            ControlOp::RestoreSession { snapshot, .. } => {
                 let session_id = snapshot.version.request_key.session_id;
                 self.known_sessions.insert(session_id);
                 self.dirty_sessions.remove(&session_id);
@@ -862,35 +701,11 @@ fn validate_replacement_caps(
         .with_context(|| format!("replacement rank {rank} reported invalid capabilities"))?;
     let mut normalized_expected = expected.clone();
     normalized_expected.rank.tp_rank = rank as u32;
-    normalized_expected.restored_snapshots.clear();
-    let mut normalized_actual = actual.clone();
-    normalized_actual.restored_snapshots.clear();
     anyhow::ensure!(
-        normalized_expected == normalized_actual,
+        normalized_expected == *actual,
         "replacement rank {rank} capabilities changed"
     );
     Ok(())
-}
-
-fn restored_snapshot_versions(
-    snapshots: &[SnapshotRef],
-) -> BTreeMap<RequestId, uniserve_worker_wire::VersionRef> {
-    snapshots
-        .iter()
-        .map(|snapshot| {
-            (
-                snapshot.version.request_key.session_id,
-                snapshot.version.clone(),
-            )
-        })
-        .collect()
-}
-
-fn restored_snapshot_map(snapshots: Vec<SnapshotRef>) -> BTreeMap<RequestId, SnapshotRef> {
-    snapshots
-        .into_iter()
-        .map(|snapshot| (snapshot.version.request_key.session_id, snapshot))
-        .collect()
 }
 
 fn allocate_tp_init_method() -> anyhow::Result<String> {
@@ -1168,7 +983,8 @@ impl Executor for MultiprocExecutor {
                 continue;
             }
             let succeeded = acks.iter().all(|ack| ack.ok);
-            if succeeded && let ControlOp::SnapshotSession(session_id) = &op {
+            if succeeded && let ControlOp::SnapshotSession(placement) = &op {
+                let session_id = placement.request_key.session_id;
                 let references = acks
                     .iter()
                     .map(|ack| {
@@ -1188,12 +1004,12 @@ impl Executor for MultiprocExecutor {
                 let first = references[0];
                 anyhow::ensure!(
                     references.iter().all(|reference| {
-                        reference.version.request_key.session_id == *session_id
+                        reference.version.request_key.session_id == session_id
                             && reference.version == first.version
                     }),
                     "tensor-parallel snapshot ranks disagree on session, epoch, or version"
                 );
-                self.dirty_sessions.remove(session_id);
+                self.dirty_sessions.remove(&session_id);
             }
             self.apply_control_session_effect(&op, succeeded);
             return Ok(acks);
@@ -1209,7 +1025,7 @@ impl Executor for MultiprocExecutor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::collections::{BTreeSet, VecDeque};
     use std::time::Duration;
 
     use super::{MultiprocExecutor, device_for_rank, report_partition_ids};
@@ -1219,8 +1035,8 @@ mod tests {
         AttentionRegime, Batch, BatchPartition, Bounds, CompletionRecord, CompletionReport, DType,
         Domain, ExecutionCapability, FinishFlags, LogicalLengths, OpId, OpStatus, Operation,
         PartitionCompletion, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-        RequestKey, RouteId, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass,
-        TimingCounters, TokenMode, TokenSpan, VersionRef, Work, WorkerCapabilities,
+        RequestKey, RouteId, SamplingOwnership, ShapeBound, StorageClass, TimingCounters,
+        TokenMode, TokenSpan, VersionRef, Work, WorkerCapabilities,
     };
 
     #[test]
@@ -1349,58 +1165,6 @@ mod tests {
             digest_error.contains("completion 0 differs"),
             "got: {digest_error}"
         );
-    }
-
-    #[test]
-    fn worker_recovery_accepts_only_exact_or_fresh_admission_state() {
-        let mut exec = fake_multiproc(2);
-        let session = RequestId(7);
-        exec.known_sessions.insert(session);
-        exec.dirty_sessions.insert(session);
-        let restored = vec![
-            BTreeMap::from([(session, snapshot(session, 0))]),
-            BTreeMap::from([(session, snapshot(session, 1))]),
-        ];
-        let reconstructable = BTreeSet::new();
-        let required = BTreeSet::from([session]);
-
-        assert!(!exec.recovery_checkpoint_complete(&restored, &reconstructable, &required,));
-
-        exec.dirty_sessions.clear();
-        assert!(exec.recovery_checkpoint_complete(&restored, &reconstructable, &required,));
-
-        let incomplete = vec![
-            BTreeMap::from([(session, snapshot(session, 0))]),
-            BTreeMap::new(),
-        ];
-        assert!(!exec.recovery_checkpoint_complete(&incomplete, &reconstructable, &required,));
-
-        let mut conflicting = snapshot(session, 1);
-        conflicting.version.producer_op_id = OpId(2);
-        let ambiguous = vec![
-            BTreeMap::from([(session, snapshot(session, 0))]),
-            BTreeMap::from([(session, conflicting)]),
-        ];
-        assert!(!exec.recovery_checkpoint_complete(&ambiguous, &reconstructable, &required,));
-
-        exec.dirty_sessions.insert(session);
-        assert!(exec.recovery_checkpoint_complete(
-            &[BTreeMap::new(), BTreeMap::new()],
-            &BTreeSet::from([session]),
-            &BTreeSet::new(),
-        ));
-    }
-
-    fn snapshot(session_id: RequestId, rank: u8) -> SnapshotRef {
-        SnapshotRef {
-            version: VersionRef::admission_root(
-                RequestKey::new(1, session_id, 1),
-                OpId(1),
-                "a".repeat(64),
-            ),
-            digest: format!("{rank:x}").repeat(64),
-            locator: format!("{rank:x}").repeat(64),
-        }
     }
 
     #[test]
@@ -1537,6 +1301,7 @@ mod tests {
                 operations: vec![operation],
                 request_pool_indices: vec![1],
                 kv_placements: Vec::new(),
+                kv_branch_placements: Vec::new(),
                 latent_placements: Vec::new(),
             }],
         )
@@ -1576,6 +1341,7 @@ mod tests {
             operations: vec![operation],
             request_pool_indices: vec![2],
             kv_placements: Vec::new(),
+            kv_branch_placements: Vec::new(),
             latent_placements: Vec::new(),
         });
         batch

@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
 
-from ..batch import Batch, CompletionReport, SamplingOwnership, SnapshotRef, WorkVariant
+import torch
+
+from ..batch import (
+    Batch,
+    CacheCopy,
+    CompletionReport,
+    RecoveryPlacement,
+    SamplingOwnership,
+    SnapshotRef,
+    WorkVariant,
+)
 from ..capabilities import (
     RankInfo,
     RequestKind,
@@ -16,8 +25,8 @@ from ..capabilities import (
 from ..execution import ModelExecutor
 from ..foundation.errors import capability_mismatch, unsupported_control
 from ..runtime.arena_capacity import operation_window, system_arena_capacity
+from ..runtime.cache_pool import CachePool
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..runtime.kv_store import KvStore
 from ..runtime.latent_store import LatentStore
 from ..runtime.mover import Mover
 from ..runtime.product_store import ProductRecord, ProductStore
@@ -42,7 +51,6 @@ class SystemWorker:
         completion_payload_bytes: int,
         device: str,
         snapshot_dir: str | None = None,
-        restore_snapshots: bool = False,
     ) -> None:
         supported = frozenset({WorkVariant.MATERIALIZE})
         if not allowed_work_variants <= supported:
@@ -112,7 +120,16 @@ class SystemWorker:
             completion_payload_bytes=int(completion_payload_bytes),
         )
         self.sessions = SessionStore()
-        self.kv = KvStore()
+        self.cache_pool = CachePool(
+            num_layers=1,
+            request_pages=int(self._capabilities.num_blocks),
+            scratch_pages=0,
+            page_size=int(self._capabilities.block_size),
+            num_kv_heads=1,
+            head_dim=1,
+            device=device,
+            dtype=torch.bfloat16,
+        )
         self.latents = LatentStore()
         self.products = ProductStore(
             device_product_capacity=arena.device_products,
@@ -132,7 +149,7 @@ class SystemWorker:
             runner=None,
             attention=None,
             sessions=self.sessions,
-            kv=self.kv,
+            cache_pool=self.cache_pool,
             latents=self.latents,
             products=self.products,
             replay=self.replay,
@@ -163,18 +180,12 @@ class SystemWorker:
                 },
                 device=device,
                 sessions=self.sessions,
-                kv=self.kv,
+                cache_pool=self.cache_pool,
+                cache_publications=self.executor.cache_publications,
                 latents=self.latents,
                 products=self.products,
                 replay=self.replay,
                 transport=self.mover.transport,
-            )
-            restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
-            self._capabilities = replace(
-                self._capabilities,
-                restored_snapshots=tuple(
-                    sorted(restored, key=lambda reference: reference.version.request_key.session_id)
-                ),
             )
 
     @property
@@ -194,7 +205,6 @@ class SystemWorker:
         self.products.drop(session_id)
         self.latents.drop_session(session_id)
         self.replay.drop_session(session_id)
-        self.kv.drop(session_id)
         self.sessions.drop(session_id)
         if self.snapshot_provider is not None:
             self.snapshot_provider.drop_session(session_id)
@@ -211,7 +221,7 @@ class SystemWorker:
                 ),
             )
 
-    def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None:
+    def copy_kv(self, copies: tuple[CacheCopy, ...]) -> None:
         del copies
         raise unsupported_control(RequestKind.COPY_KV.value)
 
@@ -223,15 +233,19 @@ class SystemWorker:
         self.products.release(tuple(int(handle) for handle in handles))
         self.sessions.discard_product_handles({int(handle) for handle in handles})
 
-    def snapshot_session(self, session_id: int) -> SnapshotRef:
+    def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         if self.snapshot_provider is None:
             raise unsupported_control(RequestKind.SNAPSHOT_SESSION.value)
-        return self.snapshot_provider.snapshot_session(int(session_id))
+        return self.snapshot_provider.snapshot_session(placement)
 
-    def restore_session(self, reference: SnapshotRef) -> None:
+    def restore_session(
+        self,
+        reference: SnapshotRef,
+        placement: RecoveryPlacement,
+    ) -> None:
         if self.snapshot_provider is None:
             raise unsupported_control(RequestKind.RESTORE_SESSION.value)
-        self.snapshot_provider.restore(reference)
+        self.snapshot_provider.restore(reference, placement)
 
     def resource_pressure(self) -> list[dict[str, object]]:
         total = int(self.products.encoder_cache_budget)

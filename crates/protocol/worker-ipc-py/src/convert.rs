@@ -24,14 +24,15 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_wire::{
-    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
-    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, EncodeMode,
-    ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, GenMode,
-    KvAdmission, KvPlacement, LatentPlacement, LogicalLengths, OpId, OpStatus, Operation,
-    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    RegistrationAck, RequestKey, RequestKind, ResponseKind, Rng, ShapeBound, SnapshotRef,
-    StorageClass, TimingCounters, TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef,
-    Work, WorkerForwardStats, WorkerRequest, WorkerResponse,
+    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CacheCopy, CacheGroupPlacement,
+    CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound, Disposition, Domain,
+    DrawLayout, EncodeMode, ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags,
+    GenAdmission, GenMode, KvAdmission, KvBranchPlacement, KvPlacement, LatentPlacement,
+    LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind,
+    ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck, RequestKey, RequestKind,
+    ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenMode, TokenSpan,
+    TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats, WorkerRequest,
+    WorkerResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -58,13 +59,14 @@ pub(crate) fn execute_request_to_py<'py>(
     )?;
     dict.set_item(intern!(py, "step_id"), request.step_id)?;
     dict.set_item(intern!(py, "session_id"), request.session_id.map(|id| id.0))?;
-    match &request.copies {
-        Some(copies) => dict.set_item(
-            intern!(py, "copies"),
-            PyList::new(py, copies.iter().map(|(src, dst)| (src.0, dst.0)))?,
-        )?,
-        None => dict.set_item(intern!(py, "copies"), py.None())?,
-    }
+    dict.set_item(
+        intern!(py, "copies"),
+        request
+            .copies
+            .as_ref()
+            .map(|copies| dict_list(py, copies, |copy| cache_copy_to_py(py, copy)))
+            .transpose()?,
+    )?;
     match &request.product_handles {
         Some(handles) => dict.set_item(
             intern!(py, "product_handles"),
@@ -78,6 +80,14 @@ pub(crate) fn execute_request_to_py<'py>(
             .snapshot
             .as_ref()
             .map(|snapshot| snapshot_to_py(py, snapshot))
+            .transpose()?,
+    )?;
+    dict.set_item(
+        intern!(py, "recovery_placement"),
+        request
+            .recovery_placement
+            .as_ref()
+            .map(|placement| recovery_placement_to_py(py, placement))
             .transpose()?,
     )?;
     Ok(dict)
@@ -151,10 +161,40 @@ fn batch_partition_to_py<'py>(
         })?,
     )?;
     dict.set_item(
+        intern!(py, "kv_branch_placements"),
+        dict_list(py, &partition.kv_branch_placements, |placement| {
+            kv_branch_placement_to_py(py, placement, context)
+        })?,
+    )?;
+    dict.set_item(
         intern!(py, "latent_placements"),
         dict_list(py, &partition.latent_placements, |placement| {
             latent_placement_to_py(py, placement, context)
         })?,
+    )?;
+    Ok(dict)
+}
+
+fn kv_branch_placement_to_py<'py>(
+    py: Python<'py>,
+    placement: &KvBranchPlacement,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        intern!(py, "request_key"),
+        context.request_key(placement.request_key)?,
+    )?;
+    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
+    dict.set_item(intern!(py, "branch_index"), placement.branch_index)?;
+    dict.set_item(intern!(py, "group_id"), placement.group_id)?;
+    dict.set_item(
+        intern!(py, "block_table"),
+        PyList::new(py, placement.block_table.iter().map(|block| block.0))?,
+    )?;
+    dict.set_item(
+        intern!(py, "pages_to_zero"),
+        PyList::new(py, placement.pages_to_zero.iter().map(|block| block.0))?,
     )?;
     Ok(dict)
 }
@@ -767,6 +807,55 @@ fn snapshot_to_py<'py>(py: Python<'py>, snapshot: &SnapshotRef) -> PyResult<Boun
     Ok(dict)
 }
 
+fn cache_copy_to_py<'py>(py: Python<'py>, copy: &CacheCopy) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "group_id"), copy.group_id)?;
+    dict.set_item(intern!(py, "source_page"), copy.source_page.0)?;
+    dict.set_item(intern!(py, "destination_page"), copy.destination_page.0)?;
+    Ok(dict)
+}
+
+fn cache_group_placement_to_py<'py>(
+    py: Python<'py>,
+    placement: &CacheGroupPlacement,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "group_id"), placement.group_id)?;
+    dict.set_item(
+        intern!(py, "page_ids"),
+        u32_list(
+            py,
+            &placement
+                .page_ids
+                .iter()
+                .map(|page| page.0)
+                .collect::<Vec<_>>(),
+        )?,
+    )?;
+    dict.set_item(intern!(py, "length"), placement.length)?;
+    Ok(dict)
+}
+
+fn recovery_placement_to_py<'py>(
+    py: Python<'py>,
+    placement: &RecoveryPlacement,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mut context = RequestConversion::new(py);
+    let dict = PyDict::new(py);
+    dict.set_item(
+        intern!(py, "request_key"),
+        context.request_key(placement.request_key)?,
+    )?;
+    dict.set_item(intern!(py, "request_pool_idx"), placement.request_pool_idx)?;
+    dict.set_item(
+        intern!(py, "cache_groups"),
+        dict_list(py, &placement.cache_groups, |group| {
+            cache_group_placement_to_py(py, group)
+        })?,
+    )?;
+    Ok(dict)
+}
+
 fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, PyString> {
     match kind {
         RequestKind::GetCapabilities => intern!(py, "get_capabilities"),
@@ -1333,7 +1422,7 @@ fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Opt
 mod tests {
     use pythonize::{depythonize, pythonize};
     use uniserve_core::{BlockId, RequestId};
-    use uniserve_worker_wire::{ResourcePressure, WorkVariant, WorkerMetrics};
+    use uniserve_worker_wire::{CacheCopy, ResourcePressure, WorkVariant, WorkerMetrics};
 
     use super::*;
 
@@ -1600,6 +1689,7 @@ mod tests {
                 .collect(),
             operations,
             kv_placements,
+            kv_branch_placements: Vec::new(),
             latent_placements,
         }
     }
@@ -1751,7 +1841,18 @@ mod tests {
             let mut request = WorkerRequest::execute(comprehensive_batch());
             request.call_id = Some(3);
             request.session_id = Some(RequestId(u64::MAX));
-            request.copies = Some(vec![(BlockId(1), BlockId(2)), (BlockId(3), BlockId(4))]);
+            request.copies = Some(vec![
+                CacheCopy {
+                    group_id: 0,
+                    source_page: BlockId(1),
+                    destination_page: BlockId(2),
+                },
+                CacheCopy {
+                    group_id: 1,
+                    source_page: BlockId(3),
+                    destination_page: BlockId(4),
+                },
+            ]);
             request.product_handles = Some(vec![1, u64::MAX]);
             request.snapshot = Some(SnapshotRef {
                 version: VersionRef {
@@ -1764,6 +1865,22 @@ mod tests {
                 },
                 digest: digest(9),
                 locator: digest(9),
+            });
+            request.recovery_placement = Some(RecoveryPlacement {
+                request_key: RequestKey::new(1, RequestId(6), 7),
+                request_pool_idx: 5,
+                cache_groups: vec![
+                    CacheGroupPlacement {
+                        group_id: 0,
+                        page_ids: vec![BlockId(7), BlockId(8)],
+                        length: 17,
+                    },
+                    CacheGroupPlacement {
+                        group_id: 1,
+                        page_ids: vec![BlockId(9)],
+                        length: 8,
+                    },
+                ],
             });
             assert_matches_pythonize(py, &request);
         });

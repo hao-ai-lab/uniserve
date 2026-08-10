@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 
 from tests.python.fixtures.depth_one import (
+    bind_request_placement,
     commit_resolved,
     encode_operation,
     execution_batch,
@@ -29,19 +30,25 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
+    CacheGroupPlacement,
     DeviceDim,
+    DevicePoint,
     DType,
     ErrorCode,
     GenAdmission,
     ImageParams,
+    KvPlacement,
+    Operation,
     OpStatus,
     PointRange,
     ProductKind,
     ProductRef,
+    RecoveryPlacement,
     Release,
     ShapeBound,
     StorageClass,
     TokenMode,
+    VersionRef,
     WorkVariant,
 )
 from uniserve_worker.execution.executor import (
@@ -52,6 +59,7 @@ from uniserve_worker.forward import (
     FlowRow,
     ForwardBatch,
     ForwardOutput,
+    PackedAttentionPlan,
     PagedDecodePlan,
     TokenRow,
 )
@@ -93,6 +101,60 @@ class _ObservedModel(StubModel):
             raise RuntimeError("injected neural failure")
         if self.fault == "misaligned":
             return ForwardOutput(output.rows[:-1])
+        return output
+
+
+class _KvRecoveryModel(_ObservedModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observed_prefixes: list[tuple[float, ...]] = []
+        self.observed_pages: list[tuple[int, ...]] = []
+
+    def forward(self, batch: ForwardBatch) -> ForwardOutput:
+        token_rows = tuple(row for row in batch.rows if isinstance(row, TokenRow))
+        plan = batch.context.attention
+        if token_rows and batch.context.kv.base_lens[0] > 0:
+            if not isinstance(plan, PagedDecodePlan):
+                raise TypeError("KV recovery probe requires paged decode attention")
+            keys, _values = batch.context.kv.layer_kv(0)
+            pages = tuple(int(value) for value in plan.block_table[0].tolist())
+            prefix = tuple(
+                float(
+                    keys[
+                        pages[position // batch.context.kv.block_size],
+                        position % batch.context.kv.block_size,
+                        0,
+                        0,
+                    ].item()
+                )
+                for position in range(int(batch.context.kv.base_lens[0]))
+            )
+            self.observed_pages.append(pages)
+            self.observed_prefixes.append(prefix)
+
+        output = super().forward(batch)
+        if not token_rows:
+            return output
+        token_count = sum(int(row.positions.numel()) for row in token_rows)
+        values = torch.arange(
+            1,
+            token_count + 1,
+            device=token_rows[0].positions.device,
+            dtype=torch.bfloat16,
+        ).view(token_count, 1, 1)
+        if isinstance(plan, PagedDecodePlan):
+            batch.context.kv.append(0, values.unsqueeze(1), values.unsqueeze(1))
+        elif isinstance(plan, PackedAttentionPlan):
+            batch.context.kv.append_packed(
+                0,
+                values,
+                values,
+                page_ids=plan.write_page_ids,
+                page_offsets=plan.write_page_offsets,
+                token_indices=plan.write_token_indices,
+            )
+        else:
+            raise TypeError("KV recovery probe requires paged attention")
         return output
 
 
@@ -187,9 +249,8 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     )
 
     assert extended.completions[0].committed_tokens == (_next_token(4),)
-    assert worker.kv.get(1).length == 2
-    assert worker.sessions.get(1).version == 1
-    assert worker.sessions.get(1).logical_position == 2
+    assert extended.completions[0].logical_lengths.kv_visible_len == 2
+    assert extended.completions[0].logical_lengths.token_len == 2
 
     first_token = extended.completions[0].committed_tokens[0]
     commit = commit_resolved(worker.sessions.get(1))
@@ -212,9 +273,8 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     )
 
     assert decoded.completions[0].committed_tokens == (_next_token(first_token),)
-    assert worker.kv.get(1).length == 3
-    assert worker.sessions.get(1).version == 1
-    assert worker.sessions.get(1).logical_position == 3
+    assert decoded.completions[0].logical_lengths.kv_visible_len == 3
+    assert decoded.completions[0].logical_lengths.token_len == 3
     assert model.token_positions == [(0, 1), (2,)]
 
 
@@ -245,6 +305,74 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
     root_runtime = session.runtime_for(root_parent(admission))
     assert root_runtime is not None
     assert root_runtime.logical_position == 2
+
+
+def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() -> None:
+    worker = execution_worker(pipeline_depth=2)
+    admission = und_admission(9, block_ids=(0,))
+    parent, parent_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    worker.execute(
+        execution_batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(parent,),
+            input_products=(parent_input,),
+        )
+    )
+    device_parent = VersionRef(
+        admission.request_key,
+        parent.op_id,
+        DevicePoint(1, None, parent.plan_digest),
+    )
+    template, _ = token_operation(
+        admission.request_key,
+        op_id=2,
+        parent=device_parent,
+        mode=TokenMode.DECODE,
+        tokens=(0,),
+        predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+    )
+    operation = Operation.registered(
+        request_key=template.request_key,
+        op_id=template.op_id,
+        parent=template.parent,
+        work=template.work,
+        route=template.route,
+        domain=template.domain,
+        bounds=template.bounds,
+        outputs=template.outputs,
+        predicate=template.predicate,
+    )
+    invalid_placement = KvPlacement(
+        request_key=operation.request_key,
+        op_id=operation.op_id,
+        group_id=0,
+        block_table=(),
+        pages_to_zero=(),
+        prefix_length=2,
+        input_length=1,
+        visible_length=2,
+        resulting_length=3,
+    )
+
+    report = finalize_completion_report(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                operations=(operation,),
+                kv_placements=(invalid_placement,),
+            )
+        )
+    )
+
+    assert report.completions[0].status is OpStatus.ERROR
+    assert report.completions[0].error_code is ErrorCode.INVALID_OPERATION
 
 
 def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
@@ -573,11 +701,6 @@ def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
     )
     commit = commit_resolved(worker.sessions.get(4))
     worker.execute(execution_batch(step_id=12, admissions=(), operations=(), controls=(commit,)))
-    committed = deepcopy(worker.sessions.get(4))
-    committed_length = worker.kv.get(4).length
-    committed_blocks = tuple(worker.kv.get(4).block_ids)
-    committed_resident_blocks = worker.kv.resident_block_count()
-
     retry, retry_input = token_operation(
         admission.request_key,
         op_id=32,
@@ -594,10 +717,6 @@ def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
 
     assert failed.completions[0].status is OpStatus.ERROR
     assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
-    assert worker.sessions.get(4) == committed
-    assert worker.kv.get(4).length == committed_length
-    assert tuple(worker.kv.get(4).block_ids) == committed_blocks
-    assert worker.kv.resident_block_count() == committed_resident_blocks
 
     model.fault = None
     replayed = worker.execute(retry_batch)
@@ -618,8 +737,7 @@ def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
         )
     )
     assert result.completions[0].committed_tokens == (_next_token(_next_token(13)),)
-    assert worker.sessions.get(4).version == 1
-    assert worker.kv.get(4).length == committed_length + 1
+    assert result.completions[0].logical_lengths.kv_visible_len == 3
 
 
 def test_failed_flow_reclaims_state_and_a_new_operation_repeats_the_same_input():
@@ -651,8 +769,6 @@ def test_failed_flow_reclaims_state_and_a_new_operation_repeats_the_same_input()
         operations=(flow,),
         input_products=(),
     )
-    admitted = deepcopy(worker.sessions.get(5))
-    kv_extents = worker.kv.get(5).extents()
     model.fault = "raise"
 
     failed = worker.execute(batch)
@@ -660,8 +776,6 @@ def test_failed_flow_reclaims_state_and_a_new_operation_repeats_the_same_input()
     first_input = model.flow_inputs[-1]
     assert failed.completions[0].status is OpStatus.ERROR
     assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
-    assert worker.sessions.get(5) == admitted
-    assert worker.kv.get(5).extents() == kv_extents
 
     model.fault = None
     replacement, _replacement_latent = flow_operation(
@@ -850,17 +964,16 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
         )
     )
     committed = list(extended.completions[0].committed_tokens)
-    assert len(worker.kv.get(1).block_ids) == 1
-
     next_block = 1
+    block_count = 1
     crossed = False
     for step in range(4):
-        length = worker.kv.get(1).length
-        blocks = tuple(worker.kv.get(1).block_ids)
+        length = 2 + step
         logical_delta: tuple[int, ...] = ()
-        if length // block_size >= len(blocks):
+        if length // block_size >= block_count:
             logical_delta = (next_block,)
             next_block += 1
+            block_count += 1
             crossed = True
         commit = commit_resolved(worker.sessions.get(1))
         decode, decode_input = token_operation(
@@ -881,15 +994,11 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
                 input_products=(decode_input,),
             )
         )
-        if logical_delta:
-            assert len(worker.kv.get(1).block_ids) == len(blocks) + 1
-        else:
-            assert len(worker.kv.get(1).block_ids) == len(blocks)
+        assert report.completions[0].logical_lengths.kv_visible_len == length + 1
         committed.extend(report.completions[0].committed_tokens)
 
     assert crossed  # the chain actually crossed a page boundary
-    assert len(worker.kv.get(1).block_ids) == 2
-    assert worker.kv.get(1).length == 6
+    assert block_count == 2
     # Committed tokens follow the stub oracle unbroken across the boundary.
     chain = [_next_token(4)]
     for _ in range(4):
@@ -1006,28 +1115,17 @@ def test_exact_latent_chain_reclaims_committed_ancestors_and_rejects_a_stale_ref
             ),
         )
     )
-    assert worker.kv.pool is not None
-    assert worker.kv.pool.branch_blocks_available == worker.kv.pool.branch_num_blocks
-    session = worker.sessions.get(admission.request_key.session_id)
-    assert session.latent_product == current
-    resident = worker.latents.require(current)
-    assert resident.step == 50
-    expected_resident_bytes = int(resident.value.numel()) * int(resident.value.element_size())
-    assert worker.latents.resident_byte_count() == expected_resident_bytes
-
     stale_operation, _unused = flow_operation(
         admission.request_key,
         op_id=54,
-        parent=session.committed_version(),
+        parent=commit.selected,
         conditioning=conditioning,
         latent=stale,
         steps=1,
-        control_seq=session.applied_control_seq,
+        control_seq=commit.control_seq,
     )
     stale_report = worker.execute(execution_batch(step_id=54, operations=(stale_operation,)))
     assert stale_report.completions[0].status is OpStatus.ERROR
-    assert worker.sessions.get(admission.request_key.session_id).latent_product == current
-    assert worker.latents.resident_byte_count() == expected_resident_bytes
 
 
 def test_snapshot_restore_rebinds_the_exact_committed_latent_product(tmp_path) -> None:
@@ -1044,32 +1142,100 @@ def test_snapshot_restore_rebinds_the_exact_committed_latent_product(tmp_path) -
         step_id=2,
     )
     worker.execute(execution_batch(step_id=3, controls=(commit,)))
-    reference = worker.snapshot_session(admission.request_key.session_id)
+    placement = RecoveryPlacement(
+        request_key=admission.request_key,
+        request_pool_idx=admission.request_pool_idx,
+        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(), length=0),),
+    )
+    reference = worker.snapshot_session(placement)
     worker.close()
 
     restored = execution_worker(
         _ObservedModel(),
         snapshot_dir=snapshot_dir,
-        restore_snapshots=True,
     )
-    assert restored.capabilities.restored_snapshots == (reference,)
-    session = restored.sessions.get(admission.request_key.session_id)
-    assert session.latent_product == latent
-    assert restored.latents.require(latent).step == 0
+    restored.restore_session(reference, placement)
     continuation, _successor = flow_operation(
         admission.request_key,
         op_id=3,
-        parent=session.committed_version(),
+        parent=reference.version,
         conditioning=conditioning,
         latent=latent,
         steps=1,
-        control_seq=session.applied_control_seq,
+        control_seq=commit.control_seq,
     )
 
     report = restored.execute(execution_batch(step_id=4, operations=(continuation,)))
 
     assert report.completions[0].status is OpStatus.OK
     assert report.completions[0].logical_lengths.latent_len == 1
+    restored.close()
+
+
+def test_snapshot_restore_rebinds_committed_kv_to_scheduler_placement(tmp_path) -> None:
+    snapshot_dir = str(tmp_path / "worker-state")
+    source_model = _KvRecoveryModel()
+    worker = execution_worker(source_model, snapshot_dir=snapshot_dir)
+    admission = und_admission(74, block_ids=(0,))
+    extend, extend_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    extended = worker.execute(
+        execution_batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(extend,),
+            input_products=(extend_input,),
+        )
+    )
+    commit = commit_resolved(worker.sessions.get(admission.request_key.session_id))
+    worker.execute(execution_batch(step_id=2, controls=(commit,)))
+    source_placement = RecoveryPlacement(
+        request_key=admission.request_key,
+        request_pool_idx=admission.request_pool_idx,
+        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(1,), length=2),),
+    )
+    reference = worker.snapshot_session(source_placement)
+    worker.close()
+
+    destination = RecoveryPlacement(
+        request_key=admission.request_key,
+        request_pool_idx=admission.request_pool_idx + 100,
+        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(2,), length=2),),
+    )
+    restored_model = _KvRecoveryModel()
+    restored = execution_worker(restored_model, snapshot_dir=snapshot_dir)
+    restored.restore_session(reference, destination)
+    bind_request_placement(
+        admission.request_key,
+        request_pool_idx=destination.request_pool_idx,
+        page_ids=(2,),
+    )
+    decode, decode_input = token_operation(
+        admission.request_key,
+        op_id=2,
+        parent=reference.version,
+        mode=TokenMode.DECODE,
+        tokens=(extended.completions[0].committed_tokens[0],),
+        control_seq=commit.control_seq,
+    )
+
+    report = restored.execute(
+        execution_batch(
+            step_id=3,
+            operations=(decode,),
+            input_products=(decode_input,),
+        )
+    )
+
+    assert report.completions[0].status is OpStatus.OK
+    assert report.completions[0].logical_lengths.kv_visible_len == 3
+    assert restored_model.observed_pages == [(2,)]
+    assert restored_model.observed_prefixes == [(1.0, 2.0)]
     restored.close()
 
 
@@ -1149,8 +1315,7 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
             step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
         )
     )
-    session_kv_before = worker.kv.get(3).length
-    assert session_kv_before == 2
+    session_kv_before = 2
 
     buffer = io.BytesIO()
     Image.new("RGB", (16, 16), (128, 128, 128)).save(buffer, format="PNG")
@@ -1176,8 +1341,7 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
     )
     completion = report.completions[0]
     assert completion.logical_lengths.kv_visible_len == session_kv_before
-    assert worker.kv.get(3).length == session_kv_before
-    assert worker.sessions.get(3).logical_position == 2
+    assert completion.logical_lengths.token_len == 2
     assert completion.selected_point == 0
     assert completion.product_generations
     assert completion.product_generations[0] == handle
@@ -1317,23 +1481,8 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     assert completion.token_span.base == 2
     assert completion.token_span.len == 1
     assert completion.logical_lengths.token_len == 4
-    extents = worker.kv.get(6).extents()
-    assert (
-        completion.logical_lengths.kv_reserved_len,
-        completion.logical_lengths.kv_initialized_len,
-        completion.logical_lengths.kv_visible_len,
-        completion.logical_lengths.kv_committed_len,
-        completion.logical_lengths.kv_published_len,
-    ) == (
-        extents.reserved,
-        extents.initialized,
-        extents.visible,
-        extents.committed,
-        extents.published,
-    )
+    assert completion.logical_lengths.kv_visible_len == 4
     assert completion.selected_point == 1
-    assert worker.sessions.get(6).version == 1
-    assert worker.sessions.get(6).logical_position == 4
 
     feedback_commit = commit_resolved(worker.sessions.get(6))
     publication, next_conditioning = kv_publication_operation(

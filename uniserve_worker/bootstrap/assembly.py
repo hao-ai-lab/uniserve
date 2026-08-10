@@ -28,7 +28,6 @@ def assemble_worker(config: WorkerLaunchConfig):
             completion_payload_bytes=config.ipc.max_payload_bytes,
             device=config.placement.device,
             snapshot_dir=config.snapshot_dir,
-            restore_snapshots=config.restore_snapshots,
         )
 
     from ..backends.attention import resolve_attention_selection
@@ -132,7 +131,6 @@ def assemble_worker(config: WorkerLaunchConfig):
         pipeline_depth=config.ipc.pipeline_depth,
         completion_payload_bytes=config.ipc.max_payload_bytes,
         snapshot_dir=config.snapshot_dir,
-        restore_snapshots=config.restore_snapshots,
     )
 
 

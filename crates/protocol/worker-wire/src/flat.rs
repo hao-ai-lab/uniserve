@@ -8,15 +8,15 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 
 use crate::schema::uniserve::wire as fbs;
 use crate::{
-    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, CompletionRecord,
-    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
-    ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission, KvAdmission,
-    KvPlacement, LatentPlacement, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion,
-    Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
-    RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, SamplingOwnership,
-    ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
-    Work, WorkVariant, WorkerCapabilities, WorkerForwardStats, WorkerMetrics, WorkerRequest,
-    WorkerResponse,
+    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CacheCopy, CacheGroupPlacement,
+    CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound, Disposition, Domain,
+    DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission,
+    KvAdmission, KvBranchPlacement, KvPlacement, LatentPlacement, LogicalLengths, OpId, OpStatus,
+    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    RecoveryPlacement, RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure,
+    ResponseKind, Rng, RouteId, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass,
+    TimingCounters, TokenSpan, UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities,
+    WorkerForwardStats, WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 
 pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -81,13 +81,21 @@ fn request_from_table(request: fbs::WorkerRequest<'_>) -> anyhow::Result<WorkerR
         copies: request.copies().map(|items| {
             items
                 .iter()
-                .map(|pair| (BlockId(pair.src()), BlockId(pair.dst())))
+                .map(|copy| CacheCopy {
+                    group_id: copy.group_id(),
+                    source_page: BlockId(copy.src()),
+                    destination_page: BlockId(copy.dst()),
+                })
                 .collect()
         }),
         product_handles: request
             .product_handles()
             .map(|items| items.iter().collect()),
         snapshot: request.snapshot().map(snapshot_from_table).transpose()?,
+        recovery_placement: request
+            .recovery_placement()
+            .map(recovery_placement_from_table)
+            .transpose()?,
     };
     validate_request_shape(&request)?;
     Ok(request)
@@ -214,6 +222,16 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<Ba
             })
             .transpose()?
             .unwrap_or_default(),
+        kv_branch_placements: partition
+            .kv_branch_placements()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(kv_branch_placement_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         latent_placements: partition
             .latent_placements()
             .map(|items| {
@@ -297,6 +315,28 @@ fn kv_placement_from_table(placement: fbs::KvPlacement<'_>) -> anyhow::Result<Kv
         input_length: placement.input_length(),
         visible_length: placement.visible_length(),
         resulting_length: placement.resulting_length(),
+    })
+}
+
+fn kv_branch_placement_from_table(
+    placement: fbs::KvBranchPlacement<'_>,
+) -> anyhow::Result<KvBranchPlacement> {
+    Ok(KvBranchPlacement {
+        request_key: request_key_from_table(
+            placement.request_key(),
+            "KV branch placement.request_key",
+        )?,
+        op_id: OpId(placement.op_id()),
+        branch_index: placement.branch_index(),
+        group_id: placement.group_id(),
+        block_table: placement
+            .block_table()
+            .map(|items| items.iter().map(BlockId).collect())
+            .unwrap_or_default(),
+        pages_to_zero: placement
+            .pages_to_zero()
+            .map(|items| items.iter().map(BlockId).collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -782,11 +822,6 @@ fn capabilities_from_table(
             .protocol_layout_digest()
             .map(str::to_string)
             .context("capabilities.protocol_layout_digest is missing")?,
-        restored_snapshots: caps
-            .restored_snapshots()
-            .map(|items| items.iter().map(snapshot_from_table).collect())
-            .transpose()?
-            .unwrap_or_default(),
     };
     caps.validate()?;
     Ok(caps)
@@ -1014,6 +1049,36 @@ fn snapshot_from_table(snapshot: fbs::SnapshotRef<'_>) -> anyhow::Result<Snapsho
     Ok(snapshot)
 }
 
+fn recovery_placement_from_table(
+    placement: fbs::RecoveryPlacement<'_>,
+) -> anyhow::Result<RecoveryPlacement> {
+    let placement = RecoveryPlacement {
+        request_key: request_key_from_table(
+            placement.request_key(),
+            "recovery placement.request_key",
+        )?,
+        request_pool_idx: placement.request_pool_idx(),
+        cache_groups: placement
+            .cache_groups()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .map(|group| CacheGroupPlacement {
+                        group_id: group.group_id(),
+                        page_ids: group
+                            .page_ids()
+                            .map(|pages| pages.iter().map(BlockId).collect())
+                            .unwrap_or_default(),
+                        length: group.length(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    placement.validate()?;
+    Ok(placement)
+}
+
 // ---------------------------------------------------------------------------
 // Request / response framing
 // ---------------------------------------------------------------------------
@@ -1033,14 +1098,20 @@ fn request_to_fb(request: &WorkerRequest) -> anyhow::Result<fbs::WorkerRequestT>
         copies: request.copies.as_ref().map(|items| {
             items
                 .iter()
-                .map(|(source, destination)| fbs::BlockPairT {
-                    src: source.0,
-                    dst: destination.0,
+                .map(|copy| fbs::BlockPairT {
+                    group_id: copy.group_id,
+                    src: copy.source_page.0,
+                    dst: copy.destination_page.0,
                 })
                 .collect()
         }),
         product_handles: request.product_handles.clone(),
         snapshot: request.snapshot.as_ref().map(snapshot_to_fb).map(Box::new),
+        recovery_placement: request
+            .recovery_placement
+            .as_ref()
+            .map(recovery_placement_to_fb)
+            .map(Box::new),
     })
 }
 
@@ -1058,13 +1129,21 @@ fn request_from_fb(request: fbs::WorkerRequestT) -> anyhow::Result<WorkerRequest
         copies: request.copies.map(|items| {
             items
                 .into_iter()
-                .map(|pair| (BlockId(pair.src), BlockId(pair.dst)))
+                .map(|copy| CacheCopy {
+                    group_id: copy.group_id,
+                    source_page: BlockId(copy.src),
+                    destination_page: BlockId(copy.dst),
+                })
                 .collect()
         }),
         product_handles: request.product_handles,
         snapshot: request
             .snapshot
             .map(|value| snapshot_from_fb(*value))
+            .transpose()?,
+        recovery_placement: request
+            .recovery_placement
+            .map(|value| recovery_placement_from_fb(*value))
             .transpose()?,
     };
     validate_request_shape(&request)?;
@@ -1077,7 +1156,8 @@ fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
         + usize::from(request.session_id.is_some())
         + usize::from(request.copies.is_some())
         + usize::from(request.product_handles.is_some())
-        + usize::from(request.snapshot.is_some());
+        + usize::from(request.snapshot.is_some())
+        + usize::from(request.recovery_placement.is_some());
     match request.kind {
         RequestKind::Execute => {
             let batch = request
@@ -1098,22 +1178,48 @@ fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
             request.session_id.is_some() && payload_count == 1,
             "drop_session requires exactly one session id"
         ),
-        RequestKind::CopyKv => anyhow::ensure!(
-            request.copies.is_some() && payload_count == 1,
-            "copy_kv requires exactly one block-pair list"
-        ),
+        RequestKind::CopyKv => {
+            anyhow::ensure!(
+                request.copies.is_some() && payload_count == 1,
+                "copy_kv requires exactly one cache-copy list"
+            );
+            for copy in request.copies.as_deref().unwrap_or_default() {
+                copy.validate()?;
+            }
+        }
         RequestKind::ReleaseProducts => anyhow::ensure!(
             request.product_handles.is_some() && payload_count == 1,
             "release_products requires exactly one handle list"
         ),
-        RequestKind::SnapshotSession => anyhow::ensure!(
-            request.session_id.is_some() && payload_count == 1,
-            "snapshot_session requires exactly one session id"
-        ),
-        RequestKind::RestoreSession => anyhow::ensure!(
-            request.snapshot.is_some() && payload_count == 1,
-            "restore_session requires exactly one snapshot reference"
-        ),
+        RequestKind::SnapshotSession => {
+            anyhow::ensure!(
+                request.recovery_placement.is_some() && payload_count == 1,
+                "snapshot_session requires exactly one recovery placement"
+            );
+            request
+                .recovery_placement
+                .as_ref()
+                .expect("checked recovery placement")
+                .validate()?;
+        }
+        RequestKind::RestoreSession => {
+            anyhow::ensure!(
+                request.snapshot.is_some()
+                    && request.recovery_placement.is_some()
+                    && payload_count == 2,
+                "restore_session requires one snapshot reference and recovery placement"
+            );
+            request
+                .snapshot
+                .as_ref()
+                .expect("checked snapshot")
+                .validate()?;
+            request
+                .recovery_placement
+                .as_ref()
+                .expect("checked recovery placement")
+                .validate()?;
+        }
         RequestKind::GetCapabilities
         | RequestKind::Shutdown
         | RequestKind::GetMetrics
@@ -1325,6 +1431,13 @@ fn partition_to_fb(partition: &BatchPartition) -> anyhow::Result<fbs::BatchParti
                 .map(kv_placement_to_fb)
                 .collect(),
         ),
+        kv_branch_placements: Some(
+            partition
+                .kv_branch_placements
+                .iter()
+                .map(kv_branch_placement_to_fb)
+                .collect(),
+        ),
         latent_placements: Some(
             partition
                 .latent_placements
@@ -1391,6 +1504,12 @@ fn partition_from_fb(partition: fbs::BatchPartitionT) -> anyhow::Result<BatchPar
             .unwrap_or_default()
             .into_iter()
             .map(kv_placement_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        kv_branch_placements: partition
+            .kv_branch_placements
+            .unwrap_or_default()
+            .into_iter()
+            .map(kv_branch_placement_from_fb)
             .collect::<anyhow::Result<_>>()?,
         latent_placements: partition
             .latent_placements
@@ -1485,6 +1604,51 @@ fn kv_admission_to_fb(admission: &KvAdmission) -> fbs::KvAdmissionT {
     }
 }
 
+fn recovery_placement_to_fb(placement: &RecoveryPlacement) -> fbs::RecoveryPlacementT {
+    fbs::RecoveryPlacementT {
+        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
+        request_pool_idx: placement.request_pool_idx,
+        cache_groups: Some(
+            placement
+                .cache_groups
+                .iter()
+                .map(|group| fbs::CacheGroupPlacementT {
+                    group_id: group.group_id,
+                    page_ids: Some(group.page_ids.iter().map(|page| page.0).collect()),
+                    length: group.length,
+                })
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn recovery_placement_from_fb(
+    placement: fbs::RecoveryPlacementT,
+) -> anyhow::Result<RecoveryPlacement> {
+    let placement = RecoveryPlacement {
+        request_key: request_key_from_fb(placement.request_key, "recovery placement.request_key")?,
+        request_pool_idx: placement.request_pool_idx,
+        cache_groups: placement
+            .cache_groups
+            .unwrap_or_default()
+            .into_iter()
+            .map(|group| CacheGroupPlacement {
+                group_id: group.group_id,
+                page_ids: group
+                    .page_ids
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(BlockId)
+                    .collect(),
+                length: group.length,
+            })
+            .collect(),
+    };
+    placement.validate()?;
+    Ok(placement)
+}
+
 #[cfg(test)]
 fn kv_admission_from_fb(admission: fbs::KvAdmissionT) -> KvAdmission {
     KvAdmission {
@@ -1511,6 +1675,47 @@ fn kv_placement_to_fb(placement: &KvPlacement) -> fbs::KvPlacementT {
         visible_length: placement.visible_length,
         resulting_length: placement.resulting_length,
     }
+}
+
+fn kv_branch_placement_to_fb(placement: &KvBranchPlacement) -> fbs::KvBranchPlacementT {
+    fbs::KvBranchPlacementT {
+        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
+        op_id: placement.op_id.0,
+        branch_index: placement.branch_index,
+        group_id: placement.group_id,
+        block_table: Some(placement.block_table.iter().map(|block| block.0).collect()),
+        pages_to_zero: Some(
+            placement
+                .pages_to_zero
+                .iter()
+                .map(|block| block.0)
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn kv_branch_placement_from_fb(
+    placement: fbs::KvBranchPlacementT,
+) -> anyhow::Result<KvBranchPlacement> {
+    Ok(KvBranchPlacement {
+        request_key: request_key_from_fb(placement.request_key, "KV branch placement.request_key")?,
+        op_id: OpId(placement.op_id),
+        branch_index: placement.branch_index,
+        group_id: placement.group_id,
+        block_table: placement
+            .block_table
+            .unwrap_or_default()
+            .into_iter()
+            .map(BlockId)
+            .collect(),
+        pages_to_zero: placement
+            .pages_to_zero
+            .unwrap_or_default()
+            .into_iter()
+            .map(BlockId)
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -2179,7 +2384,6 @@ fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCa
         model_identity: Some(caps.model_identity.clone()),
         weight_digest: Some(caps.weight_digest.clone()),
         protocol_layout_digest: Some(caps.protocol_layout_digest.clone()),
-        restored_snapshots: Some(caps.restored_snapshots.iter().map(snapshot_to_fb).collect()),
     })
 }
 
@@ -2259,12 +2463,6 @@ fn capabilities_from_fb(caps: fbs::WorkerCapabilitiesT) -> anyhow::Result<Worker
         protocol_layout_digest: caps
             .protocol_layout_digest
             .context("capabilities.protocol_layout_digest is missing")?,
-        restored_snapshots: caps
-            .restored_snapshots
-            .unwrap_or_default()
-            .into_iter()
-            .map(snapshot_from_fb)
-            .collect::<anyhow::Result<_>>()?,
     };
     caps.validate()?;
     Ok(caps)

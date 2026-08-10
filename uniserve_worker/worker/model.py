@@ -8,6 +8,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import replace
 
+import torch
 from torch import nn
 
 from ..batch import (
@@ -15,15 +16,18 @@ from ..batch import (
     AttentionRegime,
     Batch,
     BatchPartition,
+    CacheCopy,
     CompletionReport,
     Domain,
     ExecutionCapability,
+    KvBranchPlacement,
     KvPlacement,
     LatentPlacement,
     Operation,
     OpStatus,
     ProductPayload,
     ProductRef,
+    RecoveryPlacement,
     RequestKey,
     SnapshotRef,
     StorageClass,
@@ -35,7 +39,7 @@ from ..execution.executor import completion_report_ready, finalize_completion_re
 from ..forward import AttentionSelection
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import ExecutionConfig, graph_memory_budget_bytes
-from ..foundation.sizing import device_total_bytes
+from ..foundation.sizing import ceil_div, device_total_bytes
 from ..foundation.sync_detector import (
     sync_detection_active,
     sync_detection_enforced,
@@ -45,19 +49,19 @@ from ..loader.weight_set import WeightSet
 from ..models.generation import GenerationPipeline
 from ..models.identity import ModelIdentity, architecture_identity
 from ..models.runtime import ExecutionModel, WorkerDeployment
+from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..nn.mesh import DeviceMesh
 from ..runtime.arena_capacity import model_arena_capacity
+from ..runtime.cache_pool import CachePool
 from ..runtime.capabilities import resolve_capabilities
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.graph_store import GraphStore
-from ..runtime.kv_store import KvStore
 from ..runtime.latent_store import LatentStore
 from ..runtime.mesh_store import MeshStore
 from ..runtime.mover import Mover
 from ..runtime.product_store import ProductStore
 from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
-from ..runtime.residency import ResidencyStore
 from ..runtime.snapshot_store import SnapshotProvider
 
 logger = logging.getLogger(__name__)
@@ -69,7 +73,8 @@ def _warmup_batch(
     admissions: tuple[Admission, ...],
     operations: tuple[Operation, ...],
     request_pool_indices: dict[RequestKey, int],
-    kv_placements: dict[tuple[RequestKey, int], KvPlacement],
+    kv_placements: dict[tuple[RequestKey, int], tuple[KvPlacement, ...]],
+    kv_branch_placements: dict[tuple[RequestKey, int], tuple[KvBranchPlacement, ...]],
     latent_placements: dict[tuple[RequestKey, int], LatentPlacement],
     input_products: tuple[ProductPayload, ...] = (),
 ) -> Batch:
@@ -102,9 +107,21 @@ def _warmup_batch(
                 request_pool_indices[operation.request_key] for operation in members
             ),
             kv_placements=tuple(
-                kv_placements[(operation.request_key, operation.op_id)]
+                placement
                 for operation in members
-                if operation.kv_capacity_pages > 0
+                for placement in kv_placements.get(
+                    (operation.request_key, operation.op_id),
+                    (),
+                )
+                if (operation.request_key, operation.op_id) in kv_placements
+            ),
+            kv_branch_placements=tuple(
+                placement
+                for operation in members
+                for placement in kv_branch_placements.get(
+                    (operation.request_key, operation.op_id),
+                    (),
+                )
             ),
             latent_placements=tuple(
                 latent_placements[(operation.request_key, operation.op_id)]
@@ -182,7 +199,6 @@ class ModelWorker:
         pipeline_depth: int,
         completion_payload_bytes: int,
         snapshot_dir: str | None = None,
-        restore_snapshots: bool = False,
     ) -> None:
         if not isinstance(model, ExecutionModel) or type(model).forward is nn.Module.forward:
             raise capability_mismatch("model worker requires nn.Module.forward(ForwardBatch)")
@@ -244,13 +260,32 @@ class ModelWorker:
             supported_work=tuple(variant for variant in WorkVariant if variant in advertised_work),
             pipeline_depth=int(pipeline_depth),
         )
-        self.residency = ResidencyStore.from_model(
-            model,
-            self._capabilities,
-            model.resource_geometry,
+        cache = model.cache_geometry
+        cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
+        if not isinstance(cache_dtype, torch.dtype):
+            raise capability_mismatch(f"unsupported cache dtype {cache.dtype!r}")
+        self.cache_pool = CachePool(
+            num_layers=int(cache.num_layers),
+            request_pages=int(self._capabilities.num_blocks),
+            scratch_pages=ceil_div(
+                int(self._capabilities.scratch_capacity_tokens),
+                int(self._capabilities.block_size),
+            ),
+            page_size=int(self._capabilities.block_size),
+            num_kv_heads=int(cache.num_kv_heads),
+            head_dim=int(cache.head_dim),
             device=deployment.device,
+            dtype=cache_dtype,
+            store_dtype=cache.store_dtype,
+            group_ranges=(
+                tuple(
+                    (int(group.block_offset), int(group.num_blocks))
+                    for group in self._capabilities.groups
+                )
+                if self._capabilities.groups
+                else None
+            ),
         )
-        self.kv = KvStore(self.residency.kv)
         self.sessions = SessionStore()
         self.latents = LatentStore(capacity_bytes=arena.latent_bytes)
         self.products = ProductStore(
@@ -284,7 +319,7 @@ class ModelWorker:
             runner=ModelRunner(model, self.graphs, self.trace),
             attention=attention,
             sessions=self.sessions,
-            kv=self.kv,
+            cache_pool=self.cache_pool,
             latents=self.latents,
             products=self.products,
             replay=self.replay,
@@ -302,6 +337,8 @@ class ModelWorker:
             cpu_task_capacity=arena.cpu_tasks,
             pinned_staging_capacity=arena.pinned_staging_bytes,
         )
+        self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
+        self._warmup_scratch_pages: dict[RequestKey, list[int]] = {}
         self._warmup_step_id = 0
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:
@@ -319,29 +356,19 @@ class ModelWorker:
                 },
                 device=deployment.device,
                 sessions=self.sessions,
-                kv=self.kv,
+                cache_pool=self.cache_pool,
+                cache_publications=self.executor.cache_publications,
                 latents=self.latents,
                 products=self.products,
                 replay=self.replay,
                 transport=self.mover.transport,
             )
-            restored = self.snapshot_provider.restore_latest() if restore_snapshots else ()
-            self._capabilities = replace(
-                self._capabilities,
-                restored_snapshots=tuple(
-                    sorted(restored, key=lambda reference: reference.version.request_key.session_id)
-                ),
-            )
-            logger.info("restored %d durable worker sessions", len(restored))
 
     @property
     def capabilities(self) -> WorkerCapabilities:
         return self._capabilities
 
     def _decode_context_blocks(self) -> int:
-        pool = self.kv.pool
-        if pool is None:
-            return 0
         max_tokens = max(
             (
                 self.model.route_max_tokens(stage.route)
@@ -356,7 +383,7 @@ class ModelWorker:
         blocks = (max_tokens + int(self.deployment.block_size) - 1) // int(
             self.deployment.block_size
         )
-        return min(blocks, int(pool.leasable_num_blocks))
+        return min(blocks, max(0, int(self.cache_pool.request_pages) - 1))
 
     def execute(self, batch: Batch) -> CompletionReport:
         with self._sync_guard("execute"):
@@ -425,17 +452,11 @@ class ModelWorker:
     ) -> Batch:
         self._warmup_step_id += 1
         admissions_by_key = {admission.request_key: admission for admission in admissions}
-        occupied_blocks = {
-            block
-            for session_id in self.sessions.session_ids()
-            for block in self.kv.get(session_id).logical_blocks
-        }
+        occupied_blocks = {page for pages in self._warmup_kv_pages.values() for page in pages}
         request_pool_indices: dict[RequestKey, int] = {}
-        kv_placements: dict[tuple[RequestKey, int], KvPlacement] = {}
+        kv_placements: dict[tuple[RequestKey, int], tuple[KvPlacement, ...]] = {}
+        kv_branch_placements: dict[tuple[RequestKey, int], tuple[KvBranchPlacement, ...]] = {}
         latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
-        pool = self.kv.pool
-        if pool is None:
-            raise RuntimeError("worker warmup requires a resident KV pool")
         for operation in operations:
             session = self.sessions.peek(int(operation.request_key.session_id))
             admission = admissions_by_key.get(operation.request_key)
@@ -446,45 +467,69 @@ class ModelWorker:
                 request_pool_indices[operation.request_key] = admission.request_pool_idx
             else:
                 request_pool_indices[operation.request_key] = session.request_pool_idx
-            if operation.kv_capacity_pages == 0:
+            if operation.work.variant not in {
+                WorkVariant.TOKEN_EXTEND,
+                WorkVariant.TOKEN_DECODE,
+                WorkVariant.TOKEN_VERIFY,
+                WorkVariant.DRAFT,
+                WorkVariant.TRANSFER_KV_PUBLISH,
+                WorkVariant.TRANSFER_KV_INSTALL,
+                WorkVariant.GEN_TRANSITION,
+                WorkVariant.GEN_FLOW,
+            }:
                 continue
-            if session is None:
-                if admission is None:
-                    raise invalid_descriptor("warmup operation has no KV admission")
-                if admission.und is None or admission.und.kv.prefix_len != 0:
-                    raise invalid_descriptor("warmup KV admission requires an empty prefix")
-                block_table: list[int] = []
-                group_id = admission.und.kv.group_id
-            else:
-                entry = self.kv.get(int(operation.request_key.session_id))
-                block_table = list(entry.logical_blocks)
-                group_id = entry.group_id
-            missing = int(operation.kv_capacity_pages) - len(block_table)
-            if missing < 0:
-                raise invalid_descriptor("warmup operation regresses its KV capacity")
-            allocated = tuple(
-                candidate
-                for candidate in range(1, pool.leasable_num_blocks)
-                if candidate not in occupied_blocks
-            )[:missing]
-            if len(allocated) != missing:
-                raise invalid_descriptor("warmup KV placement exceeds resident capacity")
-            block_table.extend(allocated)
-            occupied_blocks.update(allocated)
-            kv_placements[(operation.request_key, operation.op_id)] = KvPlacement(
-                request_key=operation.request_key,
-                op_id=operation.op_id,
-                group_id=group_id,
-                block_table=tuple(block_table),
-                pages_to_zero=allocated,
-                prefix_length=(0 if session is None else int(entry.visible_len)),
-                input_length=int(operation.bounds.max_tokens),
-                visible_length=(0 if session is None else int(entry.visible_len)),
-                resulting_length=(
-                    (0 if session is None else int(entry.visible_len))
-                    + int(operation.bounds.max_tokens)
-                ),
+            if (
+                session is None
+                and admission is not None
+                and admission.und is not None
+                and admission.und.kv.prefix_len != 0
+            ):
+                raise invalid_descriptor("warmup KV admission requires an empty prefix")
+            visible = 0
+            if session is not None:
+                runtime = self.executor._parent_runtime(operation, session)
+                visible = int(runtime.kv_visible_len)
+            input_length = (
+                int(operation.bounds.max_tokens)
+                if operation.work.variant
+                in {
+                    WorkVariant.TOKEN_EXTEND,
+                    WorkVariant.TOKEN_DECODE,
+                    WorkVariant.TOKEN_VERIFY,
+                    WorkVariant.DRAFT,
+                }
+                else 0
             )
+            placements: list[KvPlacement] = []
+            for group_id in range(self.cache_pool.group_count):
+                lease_key = (operation.request_key, group_id)
+                block_table = self._warmup_kv_pages.setdefault(lease_key, [])
+                missing = int(operation.kv_capacity_pages) - len(block_table)
+                if missing < 0:
+                    raise invalid_descriptor("warmup operation regresses its KV capacity")
+                allocated = tuple(
+                    candidate
+                    for candidate in self.cache_pool.request_page_ids(group_id)
+                    if candidate not in occupied_blocks
+                )[:missing]
+                if len(allocated) != missing:
+                    raise invalid_descriptor("warmup KV placement exceeds resident capacity")
+                block_table.extend(allocated)
+                occupied_blocks.update(allocated)
+                placements.append(
+                    KvPlacement(
+                        request_key=operation.request_key,
+                        op_id=operation.op_id,
+                        group_id=group_id,
+                        block_table=tuple(block_table),
+                        pages_to_zero=allocated,
+                        prefix_length=visible,
+                        input_length=input_length,
+                        visible_length=visible,
+                        resulting_length=visible + input_length,
+                    )
+                )
+            kv_placements[(operation.request_key, operation.op_id)] = tuple(placements)
         height, width = self._warmup_image_geometry()
         latent_units = max(
             1,
@@ -514,15 +559,96 @@ class ModelWorker:
                     else 0
                 ),
             )
+            if operation.work.variant is WorkVariant.GEN_FLOW:
+                kv_branch_placements[(operation.request_key, operation.op_id)] = (
+                    self._warmup_branch_placements(operation, height, width)
+                )
         return _warmup_batch(
             step_id=self._warmup_step_id,
             admissions=admissions,
             operations=operations,
             request_pool_indices=request_pool_indices,
             kv_placements=kv_placements,
+            kv_branch_placements=kv_branch_placements,
             latent_placements=latent_placements,
             input_products=input_products,
         )
+
+    def _warmup_branch_placements(
+        self,
+        operation: Operation,
+        height: int,
+        width: int,
+    ) -> tuple[KvBranchPlacement, ...]:
+        session = self.sessions.get(operation.request_key.session_id)
+        image = session.image
+        generation = self.model.generation
+        if image is None or generation is None:
+            raise invalid_descriptor("generation warmup has no admitted image runtime")
+        guide = build_flow_cfg_plan(
+            cfg_text_scale=float(image.cfg_text_scale),
+            cfg_img_scale=float(image.cfg_img_scale),
+            recipe=generation.cfg_recipe,
+            renorm=image.cfg_renorm_type,
+            renorm_min=float(image.cfg_renorm_min),
+            use_cfg=True,
+        )
+        runtime = self.executor._parent_runtime(operation, session)
+        query = generation.physical_tokens(height, width)
+        image_prompt = image.image_prompts[0] if image.image_prompts else ""
+        prefix_lengths = []
+        for branch in guide.branches:
+            prefix, copy_conditioning = generation.prefix(
+                generation.branch_source(branch),
+                image_prompt=image_prompt,
+                negative_prompt=image.negative_prompt,
+                negative_token_ids=session.negative_token_ids,
+                tokenizer=self.executor.tokenizer,
+            )
+            prefix_lengths.append(int(runtime.kv_visible_len) if copy_conditioning else len(prefix))
+        widths = tuple(
+            ceil_div(query + prefix_length, self.cache_pool.block_size)
+            for prefix_length in prefix_lengths
+        )
+        required = sum(widths)
+        lease = self._warmup_scratch_pages.setdefault(operation.request_key, [])
+        missing = required - len(lease)
+        if missing < 0:
+            raise invalid_descriptor("warmup generation scratch geometry changed")
+        occupied = {
+            page
+            for request_key, pages in self._warmup_scratch_pages.items()
+            if request_key != operation.request_key
+            for page in pages
+        }
+        allocated = tuple(
+            page
+            for page in range(
+                self.cache_pool.scratch_page_offset,
+                self.cache_pool.num_pages,
+            )
+            if page not in occupied
+        )[:missing]
+        if len(allocated) != missing:
+            raise invalid_descriptor("warmup generation scratch exceeds fixed capacity")
+        lease.extend(allocated)
+        fresh = set(allocated)
+        placements: list[KvBranchPlacement] = []
+        offset = 0
+        for branch_index, width in enumerate(widths, start=1):
+            block_table = tuple(lease[offset : offset + width])
+            placements.append(
+                KvBranchPlacement(
+                    request_key=operation.request_key,
+                    op_id=operation.op_id,
+                    branch_index=branch_index,
+                    group_id=0,
+                    block_table=block_table,
+                    pages_to_zero=tuple(page for page in block_table if page in fresh),
+                )
+            )
+            offset += width
+        return tuple(placements)
 
     def warmup(self) -> None:
         """Complete pre-admission kernel JIT and open the serving epoch.
@@ -593,8 +719,8 @@ class ModelWorker:
         variants = self._effective_work_variants
         if WorkVariant.TOKEN_EXTEND not in variants:
             return
-        pool = self.kv.pool
-        if pool is None or self.sessions.session_ids():
+        pool = self.cache_pool
+        if self.sessions.session_ids():
             return
         if (
             self._execution.cuda_graph
@@ -613,11 +739,7 @@ class ModelWorker:
         )
         batch_sizes = tuple(
             sorted(
-                {
-                    int(value)
-                    for value in configured
-                    if 0 < int(value) <= int(pool.leasable_num_blocks)
-                },
+                {int(value) for value in configured if 0 < int(value) < int(pool.request_pages)},
                 reverse=True,
             )
         )
@@ -779,8 +901,8 @@ class ModelWorker:
             encode_token_product_bytes,
         )
 
-        pool = self.kv.pool
-        if pool is None or self.sessions.session_ids():
+        pool = self.cache_pool
+        if self.sessions.session_ids():
             return
         max_route_tokens = max(
             (
@@ -793,7 +915,7 @@ class ModelWorker:
         )
         capacity = min(
             max_route_tokens,
-            int(pool.leasable_num_blocks) * int(pool.block_size),
+            max(0, int(pool.request_pages) - 1) * int(pool.block_size),
         )
         token_buckets = tuple(
             sorted(
@@ -1013,8 +1135,11 @@ class ModelWorker:
         self.products.drop(session_id)
         self.latents.drop_session(session_id)
         self.replay.drop_session(session_id)
-        self.kv.drop(session_id)
         self.sessions.drop(session_id)
+        if session is not None:
+            for group_id in range(self.cache_pool.group_count):
+                self._warmup_kv_pages.pop((session.request_key, group_id), None)
+            self._warmup_scratch_pages.pop(session.request_key, None)
         if self.snapshot_provider is not None:
             self.snapshot_provider.drop_session(session_id)
         if session is not None:
@@ -1030,8 +1155,14 @@ class ModelWorker:
                 ),
             )
 
-    def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None:
-        self.kv.copy(copies)
+    def copy_kv(self, copies: tuple[CacheCopy, ...]) -> None:
+        for group_id in {copy.group_id for copy in copies}:
+            selected = tuple(copy for copy in copies if copy.group_id == group_id)
+            self.cache_pool.copy_pages(
+                group_id,
+                tuple(copy.source_page for copy in selected),
+                tuple(copy.destination_page for copy in selected),
+            )
 
     def release_products(self, handles: tuple[int, ...]) -> None:
         records = tuple(
@@ -1041,33 +1172,34 @@ class ModelWorker:
         self.products.release(tuple(int(handle) for handle in handles))
         self.sessions.discard_product_handles({int(handle) for handle in handles})
 
-    def snapshot_session(self, session_id: int) -> SnapshotRef:
+    def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         if self.snapshot_provider is None:
             raise capability_mismatch("this worker has no configured snapshot provider")
-        return self.snapshot_provider.snapshot_session(int(session_id))
+        return self.snapshot_provider.snapshot_session(placement)
 
-    def restore_session(self, reference: SnapshotRef) -> None:
+    def restore_session(
+        self,
+        reference: SnapshotRef,
+        placement: RecoveryPlacement,
+    ) -> None:
         if self.snapshot_provider is None:
             raise capability_mismatch("this worker has no configured snapshot provider")
-        self.snapshot_provider.restore(reference)
+        self.snapshot_provider.restore(reference, placement)
 
     def resource_pressure(self) -> list[dict[str, object]]:
         caps = self._capabilities
         counts = {
-            "kv_block": self.kv.resident_block_count(),
-            "scratch": self.kv.scratch_token_count(),
             "image_latent": self.latents.resident_byte_count(),
             "encoder_output": self.products.encoder_output_count(),
         }
         totals = {
-            "kv_block": int(caps.num_blocks),
-            "scratch": int(caps.scratch_capacity_tokens),
             "image_latent": int(self.latents.capacity_bytes),
             "encoder_output": int(caps.encoder_cache_budget),
         }
         return [
             _pressure(value.value, counts[value.value], totals[value.value])
             for value in caps.resource_classes
+            if value.value in counts
         ]
 
     def close(self) -> None:

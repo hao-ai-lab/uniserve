@@ -87,7 +87,7 @@ enum KvGroupKind : ubyte { Full, SlidingWindow }
 
 table U32List { items:[uint]; }
 table TokenBias { token_id:uint; bias:float; }
-table BlockPair { src:uint; dst:uint; }
+table BlockPair { group_id:uint; src:uint; dst:uint; }
 table StringU64Pair { key:string; value:ulong; }
 
 table SnapshotRef {
@@ -202,7 +202,6 @@ table WorkerCapabilities {
   model_identity:string;
   weight_digest:string;
   protocol_layout_digest:string;
-  restored_snapshots:[SnapshotRef];
 }
 
 // ---- Identities and the four protocol records -----------------------------
@@ -301,6 +300,15 @@ table KvPlacement {
   input_length:uint;
   visible_length:uint;
   resulting_length:uint;
+}
+
+table KvBranchPlacement {
+  request_key:RequestKey;
+  op_id:ulong;
+  branch_index:uint;
+  group_id:uint;
+  block_table:[uint];
+  pages_to_zero:[uint];
 }
 
 table LatentPlacement {
@@ -419,6 +427,7 @@ table BatchPartition {
   operations:[Operation];
   request_pool_indices:[uint];
   kv_placements:[KvPlacement];
+  kv_branch_placements:[KvBranchPlacement];
   latent_placements:[LatentPlacement];
 }
 
@@ -509,6 +518,18 @@ table WorkerMetrics {
   forward:WorkerForwardStats;
 }
 
+table CacheGroupPlacement {
+  group_id:uint;
+  page_ids:[uint];
+  length:uint;
+}
+
+table RecoveryPlacement {
+  request_key:RequestKey;
+  request_pool_idx:uint;
+  cache_groups:[CacheGroupPlacement];
+}
+
 table WorkerRequest {
   kind:ReqKind;
   call_id:ulong = null;
@@ -518,6 +539,7 @@ table WorkerRequest {
   copies:[BlockPair];
   product_handles:[ulong];
   snapshot:SnapshotRef;
+  recovery_placement:RecoveryPlacement;
 }
 
 table ErrorOperationIdentity {

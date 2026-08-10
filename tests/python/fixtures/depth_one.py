@@ -17,6 +17,7 @@ from uniserve_worker.batch import (
     BatchPartition,
     Bounds,
     Commit,
+    Control,
     DeviceDim,
     Disposition,
     Domain,
@@ -28,6 +29,7 @@ from uniserve_worker.batch import (
     GenAdmission,
     ImageParams,
     KvAdmission,
+    KvBranchPlacement,
     KvPlacement,
     LatentPlacement,
     Operation,
@@ -49,12 +51,41 @@ from uniserve_worker.batch import (
     WorkVariant,
     encode_token_product_bytes,
 )
+from uniserve_worker.runtime.request_session import RequestSession
 
 AUTHORITY = 0
 _BLOCK_TABLES: dict[RequestKey, list[int]] = {}
+_REQUEST_POOL_INDICES: dict[RequestKey, int] = {}
 _PAGES_TO_ZERO: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
 _UNBOUND_PAGES: dict[RequestKey, list[int]] = {}
 _IMAGE_PARAMS: dict[RequestKey, ImageParams] = {}
+_OP_KV_LENGTHS: dict[tuple[RequestKey, int], tuple[int, int, int, int]] = {}
+_OP_KV_RESULTS: dict[tuple[RequestKey, int], int] = {}
+_OP_KV_VERIFY_BASES: dict[tuple[RequestKey, int], int] = {}
+_SCRATCH_PAGES: tuple[int, ...] = ()
+_MAX_CFG_BRANCHES = 1
+
+
+def configure_physical_pool(
+    *,
+    request_pages: int,
+    scratch_pages: int,
+    max_cfg_branches: int,
+) -> None:
+    global _SCRATCH_PAGES, _MAX_CFG_BRANCHES
+    _SCRATCH_PAGES = tuple(range(int(request_pages), int(request_pages) + int(scratch_pages)))
+    _MAX_CFG_BRANCHES = max(1, int(max_cfg_branches))
+
+
+def _reset_request(rk: RequestKey) -> None:
+    _BLOCK_TABLES[rk] = []
+    _REQUEST_POOL_INDICES.pop(rk, None)
+    _UNBOUND_PAGES[rk] = []
+    _IMAGE_PARAMS.pop(rk, None)
+    for table in (_PAGES_TO_ZERO, _OP_KV_LENGTHS, _OP_KV_RESULTS, _OP_KV_VERIFY_BASES):
+        for identity in tuple(identity for identity in table if identity[0] == rk):
+            table.pop(identity, None)
+    _OP_KV_RESULTS[(rk, 0)] = 0
 
 
 def _kv_page(value: int) -> int:
@@ -81,13 +112,74 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
     )
 
 
+def _parent_kv_length(parent: VersionRef) -> int:
+    identity = (parent.request_key, int(parent.producer_op_id))
+    if identity in _OP_KV_VERIFY_BASES:
+        return _OP_KV_VERIFY_BASES[identity] + int(parent.point.point_index)
+    return _OP_KV_RESULTS.get(identity, 0)
+
+
+def record_kv_result(rk: RequestKey, op_id: int, visible_length: int) -> None:
+    _OP_KV_RESULTS[(rk, int(op_id))] = int(visible_length)
+
+
+def bind_request_placement(
+    rk: RequestKey,
+    *,
+    request_pool_idx: int,
+    page_ids: Sequence[int],
+) -> None:
+    pages = [int(page) for page in page_ids]
+    if int(request_pool_idx) < 1 or any(page < 1 for page in pages):
+        raise ValueError("request placement identifiers must be positive")
+    if len(set(pages)) != len(pages):
+        raise ValueError("request placement repeats a KV page")
+    _REQUEST_POOL_INDICES[rk] = int(request_pool_idx)
+    _BLOCK_TABLES[rk] = pages
+    _UNBOUND_PAGES[rk] = []
+
+
+def _record_existing_kv(
+    rk: RequestKey,
+    op_id: int,
+    parent: VersionRef,
+    input_length: int,
+) -> int:
+    prefix = _parent_kv_length(parent)
+    resulting = prefix + int(input_length)
+    block_table = _BLOCK_TABLES.get(rk, ())
+    _OP_KV_LENGTHS[(rk, op_id)] = (prefix, int(input_length), prefix, resulting)
+    _OP_KV_RESULTS[(rk, op_id)] = resulting
+    return len(block_table)
+
+
+def _branch_placements(operation: Operation) -> tuple[KvBranchPlacement, ...]:
+    if operation.work.variant is not WorkVariant.GEN_FLOW:
+        return ()
+    if not _SCRATCH_PAGES or len(_SCRATCH_PAGES) < _MAX_CFG_BRANCHES:
+        raise RuntimeError("test scheduler has no generation scratch placement")
+    width = len(_SCRATCH_PAGES) // _MAX_CFG_BRANCHES
+    return tuple(
+        KvBranchPlacement(
+            request_key=operation.request_key,
+            op_id=operation.op_id,
+            branch_index=index + 1,
+            group_id=0,
+            block_table=_SCRATCH_PAGES[index * width : (index + 1) * width],
+            pages_to_zero=_SCRATCH_PAGES[index * width : (index + 1) * width],
+        )
+        for index in range(_MAX_CFG_BRANCHES)
+    )
+
+
 def execution_batch(
     *,
     step_id: int,
     admissions: Sequence[Admission] = (),
     operations: Sequence[Operation] = (),
     input_products: Sequence[ProductPayload] = (),
-    controls: Sequence[object] = (),
+    controls: Sequence[Control] = (),
+    kv_placements: Sequence[KvPlacement] = (),
 ) -> Batch:
     """Build the explicit physical partitions used by executor behavior tests."""
 
@@ -98,6 +190,33 @@ def execution_batch(
     for operation in operations:
         by_route.setdefault(int(operation.route), []).append(operation)
     partitions: list[BatchPartition] = []
+    explicit_kv: dict[tuple[RequestKey, int], list[KvPlacement]] = {}
+    for placement in kv_placements:
+        explicit_kv.setdefault((placement.request_key, placement.op_id), []).append(placement)
+
+    def placements_for(operation: Operation) -> tuple[KvPlacement, ...]:
+        explicit = explicit_kv.get((operation.request_key, operation.op_id))
+        if explicit is not None:
+            return tuple(explicit)
+        lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
+        if lengths is None:
+            return ()
+        return (
+            KvPlacement(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                group_id=0,
+                block_table=tuple(
+                    _BLOCK_TABLES.get(operation.request_key, ())[: operation.kv_capacity_pages]
+                ),
+                pages_to_zero=_PAGES_TO_ZERO.get((operation.request_key, operation.op_id), ()),
+                prefix_length=lengths[0],
+                input_length=lengths[1],
+                visible_length=lengths[2],
+                resulting_length=lengths[3],
+            ),
+        )
+
     partition_id = 1
     for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
         domains = tuple(
@@ -143,30 +262,22 @@ def execution_batch(
                                 for admission in admissions
                                 if admission.request_key == operation.request_key
                             ),
-                            int(operation.request_key.session_id) + 1,
+                            _REQUEST_POOL_INDICES.get(
+                                operation.request_key,
+                                int(operation.request_key.session_id) + 1,
+                            ),
                         )
                         for operation in domain_operations
                     ),
                     kv_placements=tuple(
-                        KvPlacement(
-                            request_key=operation.request_key,
-                            op_id=operation.op_id,
-                            group_id=0,
-                            block_table=tuple(
-                                _BLOCK_TABLES.get(operation.request_key, ())[
-                                    : operation.kv_capacity_pages
-                                ]
-                            ),
-                            pages_to_zero=_PAGES_TO_ZERO.get(
-                                (operation.request_key, operation.op_id), ()
-                            ),
-                            prefix_length=0,
-                            input_length=operation.bounds.max_tokens,
-                            visible_length=0,
-                            resulting_length=operation.bounds.max_tokens,
-                        )
+                        placement
                         for operation in domain_operations
-                        if operation.kv_capacity_pages > 0
+                        for placement in placements_for(operation)
+                    ),
+                    kv_branch_placements=tuple(
+                        placement
+                        for operation in domain_operations
+                        for placement in _branch_placements(operation)
                     ),
                     latent_placements=tuple(
                         _latent_placement(operation)
@@ -203,8 +314,11 @@ def und_admission(
     sampling: SamplingParams | None = None,
 ) -> Admission:
     rk = request_key(session_id, epoch)
+    _reset_request(rk)
     _BLOCK_TABLES[rk] = [_kv_page(value) for value in block_ids]
     _UNBOUND_PAGES[rk] = list(_BLOCK_TABLES[rk])
+    _REQUEST_POOL_INDICES[rk] = session_id + 1
+    _OP_KV_RESULTS[(rk, 0)] = int(prefix_len)
     return Admission.create(
         rk,
         request_pool_idx=session_id + 1,
@@ -221,7 +335,9 @@ def und_admission(
 
 def gen_admission(session_id: int, image: ImageParams, *, epoch: int = 1) -> Admission:
     rk = request_key(session_id, epoch)
+    _reset_request(rk)
     _IMAGE_PARAMS[rk] = image
+    _REQUEST_POOL_INDICES[rk] = session_id + 1
     return Admission.create(
         rk,
         request_pool_idx=session_id + 1,
@@ -235,9 +351,14 @@ def root_parent(admission: Admission) -> VersionRef:
     return VersionRef(admission.request_key, 0, FixedPoint(0, admission.digest))
 
 
-def commit_resolved(session: object, *, public_event_limit: int = 0) -> Commit:
+def commit_resolved(session: RequestSession, *, public_event_limit: int = 0) -> Commit:
     expected_parent = session.committed_version()
     selected = session.resolved_version()
+    runtime = session.runtime_for(selected)
+    if runtime is not None:
+        _OP_KV_RESULTS[(session.request_key, int(selected.producer_op_id))] = int(
+            runtime.kv_visible_len
+        )
     return Commit(
         request_key=session.request_key,
         control_seq=session.applied_control_seq + 1,
@@ -287,6 +408,18 @@ def token_operation(
     pending.extend(added)
     _PAGES_TO_ZERO[(rk, op_id)] = tuple(pending)
     pending.clear()
+    prefix_length = _parent_kv_length(parent)
+    input_length = len(tokens)
+    _OP_KV_LENGTHS[(rk, op_id)] = (
+        prefix_length,
+        input_length,
+        prefix_length,
+        prefix_length + input_length,
+    )
+    if mode is TokenMode.VERIFY:
+        _OP_KV_VERIFY_BASES[(rk, op_id)] = prefix_length
+    else:
+        _OP_KV_RESULTS[(rk, op_id)] = prefix_length + input_length
 
     reference = _token_input_ref(rk, op_id, len(tokens))
     token_output = ProductRef(
@@ -416,17 +549,20 @@ def encode_operation(
     if (image_base64 is None) == (source_product is None):
         raise ValueError("encode operation requires exactly one image source")
     image_bytes = None if image_base64 is None else image_base64.encode("utf-8")
-    image_ref = source_product or ProductRef(
-        request_key=rk,
-        producer_op_id=op_id,
-        output_index=0xFFFF,
-        generation=op_id * 3 + 2,
-        kind=ProductKind.ARTIFACT,
-        storage_class=StorageClass.HOST_STAGING,
-        dtype=DType.U8,
-        shape_bound=ShapeBound((StaticDim(len(image_bytes)),)),
-        point_range=PointRange(),
-    )
+    image_ref = source_product
+    if image_ref is None:
+        assert image_bytes is not None
+        image_ref = ProductRef(
+            request_key=rk,
+            producer_op_id=op_id,
+            output_index=0xFFFF,
+            generation=op_id * 3 + 2,
+            kind=ProductKind.ARTIFACT,
+            storage_class=StorageClass.HOST_STAGING,
+            dtype=DType.U8,
+            shape_bound=ShapeBound((StaticDim(len(image_bytes)),)),
+            point_range=PointRange(),
+        )
     output_ref = ProductRef(
         request_key=rk,
         producer_op_id=op_id,
@@ -451,7 +587,7 @@ def encode_operation(
         control_seq=control_seq,
     )
     payload = (
-        None if image_base64 is None else ProductPayload(product=image_ref, payload=image_bytes)
+        None if image_bytes is None else ProductPayload(product=image_ref, payload=image_bytes)
     )
     return operation, payload
 
@@ -488,6 +624,7 @@ def gen_transition_operation(
         shape_bound=ShapeBound(),
         point_range=PointRange(),
     )
+    capacity = _record_existing_kv(rk, op_id, parent, 0)
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -498,6 +635,7 @@ def gen_transition_operation(
         bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
         inputs=(conditioning,),
         outputs=(latent, ready),
+        kv_capacity_pages=capacity,
         rng=Rng(
             seed=int(seed),
             semantic_index_base=int(image_index),
@@ -529,6 +667,7 @@ def flow_operation(
         shape_bound=latent.shape_bound,
         point_range=PointRange(),
     )
+    capacity = _record_existing_kv(rk, op_id, parent, 0)
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -539,6 +678,7 @@ def flow_operation(
         bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
         inputs=(conditioning, latent),
         outputs=(output,),
+        kv_capacity_pages=capacity,
         control_seq=control_seq,
     )
     return operation, output
@@ -562,6 +702,7 @@ def kv_publication_operation(
         shape_bound=ShapeBound((DeviceDim(1 << 20),)),
         point_range=PointRange(),
     )
+    capacity = _record_existing_kv(rk, op_id, parent, 0)
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -571,6 +712,7 @@ def kv_publication_operation(
         domain=Domain.UND,
         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
         outputs=(product,),
+        kv_capacity_pages=capacity,
         control_seq=control_seq,
     )
     return operation, product
@@ -585,7 +727,7 @@ def materialize_operation(
     feedback_source: bool = False,
     control_seq: int = 0,
 ) -> Operation:
-    outputs = (
+    outputs: tuple[ProductRef, ...] = (
         ProductRef(
             request_key=rk,
             producer_op_id=op_id,
@@ -639,7 +781,7 @@ def visual_state_operation(
     max_tokens: int,
     control_seq: int = 0,
 ) -> Operation:
-    outputs = (
+    outputs: tuple[ProductRef, ...] = (
         ProductRef(
             request_key=rk,
             producer_op_id=op_id,
@@ -666,6 +808,7 @@ def visual_state_operation(
                 point_range=PointRange(),
             ),
         )
+    capacity = _record_existing_kv(rk, op_id, parent, max_tokens)
     return Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -676,12 +819,14 @@ def visual_state_operation(
         bounds=Bounds(max_points=1, max_tokens=max_tokens),
         inputs=(feature,),
         outputs=outputs,
+        kv_capacity_pages=capacity,
         control_seq=control_seq,
     )
 
 
 __all__ = [
     "AUTHORITY",
+    "bind_request_placement",
     "commit_resolved",
     "encode_operation",
     "execution_batch",
@@ -690,6 +835,7 @@ __all__ = [
     "gen_admission",
     "materialize_operation",
     "kv_publication_operation",
+    "record_kv_result",
     "request_key",
     "root_parent",
     "token_operation",

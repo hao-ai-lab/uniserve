@@ -7,12 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from .batch import (
-    SamplingOwnership,
-    SnapshotRef,
-    WorkVariant,
-    protocol_layout_digest,
-)
+from .batch import SamplingOwnership, WorkVariant, protocol_layout_digest
 from .foundation.errors import invalid_descriptor
 
 # Two work variants are never admitted onto a configured serving route:
@@ -183,7 +178,6 @@ class WorkerCapabilities:
     resource_classes: tuple[ResourceClass, ...]
     model_identity: str
     weight_digest: str
-    restored_snapshots: tuple[SnapshotRef, ...] = ()
     protocol_layout_digest: str = ""
 
     @property
@@ -210,6 +204,22 @@ class WorkerCapabilities:
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"capabilities.{name} must be positive")
+        if self.groups:
+            next_offset = 0
+            for index, group in enumerate(self.groups):
+                if (
+                    group.group_id != index
+                    or group.block_offset != next_offset
+                    or group.num_blocks < 1
+                ):
+                    raise invalid_descriptor(
+                        "capabilities.groups must be a canonical physical page partition"
+                    )
+                next_offset += group.num_blocks
+            if next_offset != self.num_blocks:
+                raise invalid_descriptor(
+                    "capabilities.groups must cover the physical request page pool"
+                )
         for name in (
             "scratch_capacity_tokens",
             "latent_page_units",
@@ -267,11 +277,6 @@ class WorkerCapabilities:
             raise invalid_descriptor(
                 "capability model identities must be lowercase SHA-256 digests"
             )
-        restored_session_ids = tuple(
-            reference.version.request_key.session_id for reference in self.restored_snapshots
-        )
-        if restored_session_ids != tuple(sorted(set(restored_session_ids))):
-            raise invalid_descriptor("capabilities restored snapshots are not canonical")
         object.__setattr__(self, "protocol_layout_digest", protocol_layout_digest())
 
     @classmethod
@@ -359,12 +364,6 @@ class WorkerCapabilities:
             ),
             model_identity=_str(data.get("model_identity", ""), f"{where}.model_identity"),
             weight_digest=_str(data.get("weight_digest", ""), f"{where}.weight_digest"),
-            restored_snapshots=tuple(
-                SnapshotRef.from_wire(item, f"{where}.restored_snapshots[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("restored_snapshots", ()), f"{where}.restored_snapshots")
-                )
-            ),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -407,7 +406,6 @@ class WorkerCapabilities:
             "model_identity": self.model_identity,
             "weight_digest": self.weight_digest,
             "protocol_layout_digest": self.protocol_layout_digest,
-            "restored_snapshots": [reference.to_wire() for reference in self.restored_snapshots],
         }
 
 

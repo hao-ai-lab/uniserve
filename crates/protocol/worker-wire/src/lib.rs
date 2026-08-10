@@ -1163,9 +1163,116 @@ pub struct BatchPartition {
     pub request_pool_indices: Vec<u32>,
     /// Complete scheduler-owned KV mappings for operations that address KV.
     pub kv_placements: Vec<KvPlacement>,
+    /// Scheduler-owned temporary KV mappings for generation branch rows.
+    pub kv_branch_placements: Vec<KvBranchPlacement>,
     /// Complete scheduler-owned latent mappings for operations that address a
     /// generation trajectory.
     pub latent_placements: Vec<LatentPlacement>,
+}
+
+/// One generation branch's scheduler-owned temporary KV placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvBranchPlacement {
+    pub request_key: RequestKey,
+    pub op_id: OpId,
+    pub branch_index: u32,
+    pub group_id: u32,
+    pub block_table: Vec<BlockId>,
+    pub pages_to_zero: Vec<BlockId>,
+}
+
+/// One cache group's exact physical pages for snapshot export or restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheGroupPlacement {
+    pub group_id: u32,
+    pub page_ids: Vec<BlockId>,
+    pub length: u32,
+}
+
+impl CacheGroupPlacement {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.page_ids.iter().all(|page| page.0 > 0)
+                && self.page_ids.iter().collect::<HashSet<_>>().len() == self.page_ids.len(),
+            "cache recovery placement repeats a page or carries page zero"
+        );
+        Ok(())
+    }
+}
+
+/// Scheduler-assigned request slot and physical pages for administrative recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPlacement {
+    pub request_key: RequestKey,
+    pub request_pool_idx: u32,
+    pub cache_groups: Vec<CacheGroupPlacement>,
+}
+
+/// One exact in-pool cache page copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCopy {
+    pub group_id: u32,
+    pub source_page: BlockId,
+    pub destination_page: BlockId,
+}
+
+impl CacheCopy {
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.source_page.0 > 0 && self.destination_page.0 > 0,
+            "cache copy carries page zero"
+        );
+        Ok(())
+    }
+}
+
+impl RecoveryPlacement {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.request_pool_idx > 0,
+            "recovery placement request slot must be positive"
+        );
+        let mut groups = HashSet::with_capacity(self.cache_groups.len());
+        for group in &self.cache_groups {
+            anyhow::ensure!(
+                groups.insert(group.group_id),
+                "recovery placement repeats a cache group"
+            );
+            group.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl KvBranchPlacement {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.op_id.0 > 0,
+            "KV branch placement operation id must be positive"
+        );
+        anyhow::ensure!(
+            self.branch_index > 0,
+            "KV branch placement index must be positive"
+        );
+        anyhow::ensure!(!self.block_table.is_empty(), "KV branch placement is empty");
+        anyhow::ensure!(
+            self.block_table.iter().all(|page| page.0 > 0)
+                && self.block_table.iter().collect::<HashSet<_>>().len() == self.block_table.len(),
+            "KV branch placement repeats a page or carries page zero"
+        );
+        anyhow::ensure!(
+            self.pages_to_zero.iter().all(|page| page.0 > 0)
+                && self.pages_to_zero.iter().collect::<HashSet<_>>().len()
+                    == self.pages_to_zero.len(),
+            "KV branch placement repeats a page-to-zero or carries page zero"
+        );
+        let pages = self.block_table.iter().collect::<HashSet<_>>();
+        anyhow::ensure!(
+            self.pages_to_zero.iter().all(|page| pages.contains(page)),
+            "KV branch placement zeroes a page outside its block table"
+        );
+        Ok(())
+    }
 }
 
 /// One operation's complete scheduler-owned KV placement.
@@ -1284,6 +1391,35 @@ impl BatchPartition {
             .iter()
             .map(|operation| ((operation.request_key, operation.op_id), operation))
             .collect::<HashMap<_, _>>();
+        let mut branch_ids = HashSet::with_capacity(self.kv_branch_placements.len());
+        let mut branch_pages = HashSet::new();
+        for placement in &self.kv_branch_placements {
+            placement.validate()?;
+            let identity = (
+                placement.request_key,
+                placement.op_id,
+                placement.branch_index,
+                placement.group_id,
+            );
+            anyhow::ensure!(
+                branch_ids.insert(identity),
+                "batch partition repeats a KV branch placement identity"
+            );
+            let operation = operations
+                .get(&(placement.request_key, placement.op_id))
+                .ok_or_else(|| anyhow::anyhow!("KV branch placement does not name an operation"))?;
+            anyhow::ensure!(
+                operation.work.variant() == WorkVariant::GenFlow,
+                "KV branch placement names a non-generation-flow operation"
+            );
+            anyhow::ensure!(
+                placement
+                    .block_table
+                    .iter()
+                    .all(|page| branch_pages.insert(*page)),
+                "KV branch placements overlap physical pages"
+            );
+        }
         let mut placement_ids = HashSet::with_capacity(self.kv_placements.len());
         for placement in &self.kv_placements {
             placement.validate()?;
@@ -1969,7 +2105,6 @@ pub struct WorkerCapabilities {
     pub model_identity: Digest,
     pub weight_digest: Digest,
     pub protocol_layout_digest: Digest,
-    pub restored_snapshots: Vec<SnapshotRef>,
 }
 
 impl WorkerCapabilities {
@@ -2024,6 +2159,24 @@ impl WorkerCapabilities {
                 && self.bytes_per_token > 0,
             "worker capabilities declare invalid cache geometry"
         );
+        if !self.groups.is_empty() {
+            let mut next_offset = 0u64;
+            for (index, group) in self.groups.iter().enumerate() {
+                anyhow::ensure!(
+                    group.group_id == index as u32
+                        && u64::from(group.block_offset) == next_offset
+                        && group.num_blocks > 0,
+                    "worker KV groups are not a canonical physical page partition"
+                );
+                next_offset = next_offset
+                    .checked_add(u64::from(group.num_blocks))
+                    .ok_or_else(|| anyhow::anyhow!("worker KV group page range overflows"))?;
+            }
+            anyhow::ensure!(
+                next_offset == u64::from(self.num_blocks),
+                "worker KV groups do not cover the physical request page pool"
+            );
+        }
         let has_latent_geometry = self.latent_page_units > 0
             || self.num_latent_pages > 0
             || self.latent_width > 0
@@ -2056,20 +2209,6 @@ impl WorkerCapabilities {
             (self.model_identity.is_empty() && self.weight_digest.is_empty())
                 || (is_digest(&self.model_identity) && is_digest(&self.weight_digest)),
             "worker capability model and weight identities are incomplete"
-        );
-        let restored_session_ids = self
-            .restored_snapshots
-            .iter()
-            .map(|snapshot| snapshot.version.request_key.session_id)
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            self.restored_snapshots
-                .iter()
-                .all(|snapshot| snapshot.validate().is_ok())
-                && restored_session_ids
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1]),
-            "worker restored snapshot identities are invalid or non-canonical"
         );
         Ok(())
     }
@@ -2145,7 +2284,6 @@ impl Default for WorkerCapabilities {
             model_identity: String::new(),
             weight_digest: String::new(),
             protocol_layout_digest: protocol_layout_digest(),
-            restored_snapshots: Vec::new(),
         }
     }
 }
@@ -2182,7 +2320,7 @@ pub fn protocol_layout_digest() -> Digest {
         digest.string(control);
     }
     // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 12] = [
+    let record_layouts: [&[&str]; 16] = [
         &[
             "request_key",
             "op_id",
@@ -2251,6 +2389,17 @@ pub fn protocol_layout_digest() -> Digest {
         &[
             "request_key",
             "op_id",
+            "branch_index",
+            "group_id",
+            "block_table",
+            "pages_to_zero",
+        ],
+        &["group_id", "page_ids", "length"],
+        &["request_key", "request_pool_idx", "cache_groups"],
+        &["group_id", "source_page", "destination_page"],
+        &[
+            "request_key",
+            "op_id",
             "page_table",
             "latent_units",
             "height",
@@ -2270,6 +2419,7 @@ pub fn protocol_layout_digest() -> Digest {
             "operations",
             "request_pool_indices",
             "kv_placements",
+            "kv_branch_placements",
             "latent_placements",
         ],
         &[
@@ -2311,7 +2461,6 @@ pub fn protocol_layout_digest() -> Digest {
             "model_identity",
             "weight_digest",
             "protocol_layout_digest",
-            "restored_snapshots",
         ],
     ];
     for record in record_layouts {
@@ -2417,9 +2566,10 @@ pub struct WorkerRequest {
     pub batch: Option<Batch>,
     pub step_id: Option<u64>,
     pub session_id: Option<RequestId>,
-    pub copies: Option<Vec<(BlockId, BlockId)>>,
+    pub copies: Option<Vec<CacheCopy>>,
     pub product_handles: Option<Vec<u64>>,
     pub snapshot: Option<SnapshotRef>,
+    pub recovery_placement: Option<RecoveryPlacement>,
 }
 
 impl WorkerRequest {
@@ -2433,6 +2583,7 @@ impl WorkerRequest {
             copies: None,
             product_handles: None,
             snapshot: None,
+            recovery_placement: None,
         }
     }
 
@@ -2460,7 +2611,7 @@ impl WorkerRequest {
     pub fn shutdown() -> Self {
         Self::bare(RequestKind::Shutdown)
     }
-    pub fn copy_kv(copies: Vec<(BlockId, BlockId)>) -> Self {
+    pub fn copy_kv(copies: Vec<CacheCopy>) -> Self {
         Self {
             copies: Some(copies),
             ..Self::bare(RequestKind::CopyKv)
@@ -2478,15 +2629,16 @@ impl WorkerRequest {
     pub fn get_pressure() -> Self {
         Self::bare(RequestKind::GetPressure)
     }
-    pub fn snapshot_session(session_id: RequestId) -> Self {
+    pub fn snapshot_session(placement: RecoveryPlacement) -> Self {
         Self {
-            session_id: Some(session_id),
+            recovery_placement: Some(placement),
             ..Self::bare(RequestKind::SnapshotSession)
         }
     }
-    pub fn restore_session(snapshot: SnapshotRef) -> Self {
+    pub fn restore_session(snapshot: SnapshotRef, placement: RecoveryPlacement) -> Self {
         Self {
             snapshot: Some(snapshot),
+            recovery_placement: Some(placement),
             ..Self::bare(RequestKind::RestoreSession)
         }
     }

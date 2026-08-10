@@ -106,7 +106,7 @@ impl SimExecutor {
                     .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
             }
             ControlOp::CopyKv(_) | ControlOp::ReleaseProducts(_) => {}
-            ControlOp::SnapshotSession(_) | ControlOp::RestoreSession(_) => {
+            ControlOp::SnapshotSession(_) | ControlOp::RestoreSession { .. } => {
                 unreachable!("unsupported controls are rejected before dispatch")
             }
         }
@@ -1105,6 +1105,7 @@ mod tests {
                 operations: vec![operation],
                 request_pool_indices: vec![1],
                 kv_placements: Vec::new(),
+                kv_branch_placements: Vec::new(),
                 latent_placements: Vec::new(),
             }],
         )

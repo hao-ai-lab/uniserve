@@ -653,7 +653,6 @@ impl WorkerLaunchArgs {
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
             flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
             snapshot_dir: self.snapshot_dir.clone(),
-            restore_snapshots: false,
         }
     }
 

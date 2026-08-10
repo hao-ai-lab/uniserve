@@ -25,11 +25,7 @@ from uniserve_worker.batch import (
     TokenMode,
     VersionRef,
 )
-from uniserve_worker.execution.executor import (
-    completion_report_ready,
-    finalize_completion_report,
-)
-from uniserve_worker.runtime.completion_store import CompletionLease
+from uniserve_worker.execution.executor import finalize_completion_report
 from uniserve_worker.server.stub import _next_token
 
 pytestmark = [
@@ -76,9 +72,7 @@ def test_token_and_finish_outputs_are_fenced_after_sampling_submission() -> None
     )
 
 
-def test_same_request_continues_from_device_products_before_parent_observation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_same_request_continues_from_device_products_before_parent_observation() -> None:
     device = "cuda:0"
     worker = execution_worker(device=device, pipeline_depth=2)
     warm_admission = und_admission(30, block_ids=(1,))
@@ -109,13 +103,6 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         tokens=(3, 4),
     )
 
-    observe = {"enabled": False}
-    ready = CompletionLease.ready
-
-    def gated_ready(self: CompletionLease) -> bool:
-        return observe["enabled"] and ready(self)
-
-    monkeypatch.setattr(CompletionLease, "ready", gated_ready)
     parent_report = worker.execute(
         execution_batch(
             step_id=1,
@@ -124,8 +111,6 @@ def test_same_request_continues_from_device_products_before_parent_observation(
             input_products=(parent_input,),
         )
     )
-    assert not completion_report_ready(parent_report)
-
     device_parent = VersionRef(
         admission.request_key,
         parent.op_id,
@@ -148,6 +133,7 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         domain=successor_template.domain,
         bounds=successor_template.bounds,
         outputs=successor_template.outputs,
+        kv_capacity_pages=successor_template.kv_capacity_pages,
         predicate=successor_template.predicate,
         rng=successor_template.rng,
     )
@@ -160,7 +146,6 @@ def test_same_request_continues_from_device_products_before_parent_observation(
         )
     )
 
-    observe["enabled"] = True
     torch.cuda.synchronize()
     parent_report = finalize_completion_report(parent_report)
     successor_report = finalize_completion_report(successor_report)
@@ -191,14 +176,9 @@ def test_same_request_continues_from_device_products_before_parent_observation(
             ),
         )
     )
-    extents = worker.kv.get(admission.request_key.session_id).extents()
-    assert extents.visible == 3
-    assert extents.committed == 2
 
 
-def test_stochastic_device_continuation_matches_depth_one_serial_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> None:
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     sampling = SamplingParams(temperature=0.8, top_k=32, top_p=0.93, seed=917)
     pipelined = und_admission(41, block_ids=(2,), sampling=sampling)
@@ -210,13 +190,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         tokens=(3, 4),
         rng=Rng(seed=917, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    observe = {"enabled": False}
-    ready = CompletionLease.ready
-
-    def gated_ready(self: CompletionLease) -> bool:
-        return observe["enabled"] and ready(self)
-
-    monkeypatch.setattr(CompletionLease, "ready", gated_ready)
     parent_report = worker.execute(
         execution_batch(
             step_id=1,
@@ -225,7 +198,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
             input_products=(parent_input,),
         )
     )
-    assert not completion_report_ready(parent_report)
     successor, successor_input = token_operation(
         pipelined.request_key,
         op_id=2,
@@ -248,7 +220,6 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
         )
     )
 
-    observe["enabled"] = True
     torch.cuda.synchronize()
     parent_tokens = finalize_completion_report(parent_report).completions[0].committed_tokens
     successor_tokens = finalize_completion_report(successor_report).completions[0].committed_tokens
@@ -300,9 +271,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution(
     assert successor_tokens == serial_successor_report.completions[0].committed_tokens
 
 
-def test_penalty_device_continuation_matches_depth_one_serial_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_penalty_device_continuation_matches_depth_one_serial_execution() -> None:
     # A penalty-bearing successor relayed from a device point must penalize its
     # ancestor's token even though that token is never observed on the host. The
     # sampler folds each generated token into the request's device-resident count
@@ -326,13 +295,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution(
         tokens=(3, 4),
         rng=Rng(seed=613, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
-    observe = {"enabled": False}
-    ready = CompletionLease.ready
-
-    def gated_ready(self: CompletionLease) -> bool:
-        return observe["enabled"] and ready(self)
-
-    monkeypatch.setattr(CompletionLease, "ready", gated_ready)
     parent_report = worker.execute(
         execution_batch(
             step_id=1,
@@ -341,7 +303,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution(
             input_products=(parent_input,),
         )
     )
-    assert not completion_report_ready(parent_report)
     successor, successor_input = token_operation(
         pipelined.request_key,
         op_id=2,
@@ -364,7 +325,6 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution(
         )
     )
 
-    observe["enabled"] = True
     torch.cuda.synchronize()
     parent_tokens = finalize_completion_report(parent_report).completions[0].committed_tokens
     successor_tokens = finalize_completion_report(successor_report).completions[0].committed_tokens

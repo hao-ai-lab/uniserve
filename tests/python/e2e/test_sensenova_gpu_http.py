@@ -198,16 +198,16 @@ def test_sensenova_public_production_lineage(tmp_path: Path):
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "Use this color in one generated image."},
+                            {"type": "text", "text": "Use this color in two generated images."},
                             {"type": "image_url", "image_url": {"url": input_image_url}},
                         ],
                     }
                 ],
                 "modalities": ["text", "image"],
-                "max_completion_tokens": 2,
+                "max_completion_tokens": 4,
                 "temperature": 0.0,
                 "logit_bias": {str(image_start_token_id(model)): 100.0},
-                "image_config": {"num_images": 1, "steps": 1, "seed": 7},
+                "image_config": {"num_images": 2, "steps": 2, "seed": 7},
             },
             timeout_s=600,
         )
@@ -220,10 +220,10 @@ def test_sensenova_public_production_lineage(tmp_path: Path):
         ]
         assert finish_reasons == ["length"]
         usage = next(event["usage"] for event in interleaved if event.get("usage"))
-        assert usage["completion_tokens"] == 2
-        assert usage["image_count"] == 1
-        assert usage["image_steps"] == 1
-        assert usage["image_steps_per_image"] == [1]
+        assert usage["completion_tokens"] == 4
+        assert usage["image_count"] == 2
+        assert usage["image_steps"] == 4
+        assert usage["image_steps_per_image"] == [2, 2]
         visible_events = [
             (event, delta)
             for event in interleaved
@@ -245,7 +245,8 @@ def test_sensenova_public_production_lineage(tmp_path: Path):
             for _, delta in visible_events
             for image in delta.get("images", [])
         ]
-        assert len(images) == 1
-        image_url = images[0]["image_url"]["url"]
-        assert image_url.startswith("data:image/png;base64,")
-        assert png_size_from_b64(image_url.split(",", 1)[1]) == IMAGE_SIZE
+        assert len(images) == 2
+        for image in images:
+            image_url = image["image_url"]["url"]
+            assert image_url.startswith("data:image/png;base64,")
+            assert png_size_from_b64(image_url.split(",", 1)[1]) == IMAGE_SIZE

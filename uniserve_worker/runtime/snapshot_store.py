@@ -20,6 +20,7 @@ from ..batch import (
     FixedPoint,
     ImageParams,
     ProductRef,
+    RecoveryPlacement,
     RequestKey,
     SamplingParams,
     SnapshotRef,
@@ -27,7 +28,8 @@ from ..batch import (
     VersionRef,
 )
 from ..foundation.errors import invalid_descriptor
-from .kv_store import KvBranchState, KvCommittedState, KvPageState, KvSnapshot, KvStore
+from ..transfer.cache import CachePublication, CachePublications, CachePublicationState
+from .cache_pool import CachePool, CacheRow
 from .latent_store import LatentRecord, LatentStore
 from .product_store import (
     EncodedImageProduct,
@@ -45,14 +47,22 @@ from .replay import ReplayRecord, ReplayStore
 from .request_session import RequestSession, ResolvedRuntimeState, SessionStore
 from .transfer import Locator, Transport, restore_durable_tensor
 
-SNAPSHOT_FORMAT_VERSION = 11
+SNAPSHOT_FORMAT_VERSION = 12
 _ASSET_PREFIX = "asset:"
+
+
+@dataclass(frozen=True, slots=True)
+class _CacheGroupState:
+    group_id: int
+    length: int
+    tensors: tuple[torch.Tensor, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _DecodedSnapshot:
     sessions: tuple[RequestSession, ...]
-    kv: tuple[KvCommittedState, ...]
+    cache: tuple[tuple[int, tuple[_CacheGroupState, ...]], ...]
+    cache_publications: tuple[CachePublicationState, ...]
     latents: tuple[LatentRecord, ...]
     products: tuple[ProductRecord, ...]
     replay: tuple[ReplayRecord, ...]
@@ -71,7 +81,8 @@ class SnapshotProvider:
         topology: Mapping[str, object],
         device: str | torch.device,
         sessions: SessionStore,
-        kv: KvStore,
+        cache_pool: CachePool,
+        cache_publications: CachePublications,
         latents: LatentStore,
         products: ProductStore,
         replay: ReplayStore,
@@ -85,7 +96,8 @@ class SnapshotProvider:
         self.topology = dict(topology)
         self.device = torch.device(device)
         self.sessions = sessions
-        self.kv = kv
+        self.cache_pool = cache_pool
+        self.cache_publications = cache_publications
         self.latents = latents
         self.products = products
         self.replay = replay
@@ -94,34 +106,42 @@ class SnapshotProvider:
         self._current_refs: dict[int, SnapshotRef] = {}
         self.objects.mkdir(parents=True, exist_ok=True)
 
-    def snapshot_sessions(self, session_ids: set[int]) -> tuple[SnapshotRef, ...]:
-        references, _ = self._snapshot_sessions(session_ids)
+    def snapshot_sessions(
+        self,
+        placements: Sequence[RecoveryPlacement],
+    ) -> tuple[SnapshotRef, ...]:
+        references, _ = self._snapshot_sessions(placements)
         return references
 
     def _snapshot_sessions(
         self,
-        session_ids: set[int],
+        placements: Sequence[RecoveryPlacement],
     ) -> tuple[tuple[SnapshotRef, ...], dict[str, str]]:
-        requested = {int(value) for value in session_ids}
-        if not requested:
+        by_session = {int(placement.request_key.session_id): placement for placement in placements}
+        requested = set(by_session)
+        if not requested or len(by_session) != len(placements):
             raise invalid_descriptor("snapshot operation requires at least one session")
         with self._lock:
             sessions = self.sessions.snapshot_committed(requested)
             if {value.session_id for value in sessions} != requested:
                 raise invalid_descriptor("snapshot operation contains an unknown session")
-            committed_kv_lengths = {
-                session.session_id: cast(
-                    ResolvedRuntimeState,
-                    session.runtime_for(session.resolved_version()),
-                ).kv_visible_len
-                for session in sessions
-            }
+            for session in sessions:
+                self._validate_recovery_placement(session, by_session[session.session_id])
             committed_latents = {
                 session.latent_product for session in sessions if session.latent_product is not None
             }
             manifest, tensors, locator_assets = self._encode(
                 sessions=sessions,
-                kv=self.kv.snapshot_committed(requested, committed_kv_lengths),
+                cache=tuple(
+                    (
+                        session.session_id,
+                        self._snapshot_cache_groups(by_session[session.session_id]),
+                    )
+                    for session in sessions
+                ),
+                cache_publications=tuple(
+                    self.cache_publications.snapshot(session.session_id) for session in sessions
+                ),
                 latents=tuple(
                     record
                     for record in self.latents.snapshot_records(requested)
@@ -150,24 +170,23 @@ class SnapshotProvider:
                 raw: self._durable_locator(raw, digest, key) for raw, key in locator_assets.items()
             }
             self.products.rewrite_locators(requested, replacements)
-            self.kv.rewrite_locators(requested, replacements)
             return refs, replacements
 
     def drop_session(self, session_id: int) -> None:
         with self._lock:
-            catalog = self._read_catalog()
-            cast(dict[str, object], catalog["sessions"]).pop(str(int(session_id)), None)
-            self._current_refs.pop(int(session_id), None)
-            self._write_catalog(catalog)
+            selected = int(session_id)
+            self._current_refs.pop(selected, None)
 
-    def snapshot_session(self, session_id: int) -> SnapshotRef:
-        return self.snapshot_sessions({int(session_id)})[0]
+    def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
+        return self.snapshot_sessions((placement,))[0]
 
-    def restore(self, reference: SnapshotRef) -> None:
+    def restore(self, reference: SnapshotRef, placement: RecoveryPlacement) -> None:
         with self._lock:
             session_id = reference.version.request_key.session_id
-            if self._current_refs.get(session_id) == reference:
-                return
+            if placement.request_key != reference.version.request_key:
+                raise invalid_descriptor("restore placement request identity is inconsistent")
+            if self.sessions.peek(session_id) is not None:
+                raise invalid_descriptor("restore target request is already resident")
             manifest, tensors = self._load_object(reference.locator)
             decoded = self._decode(manifest, tensors, {session_id})
             if len(decoded.sessions) != 1:
@@ -175,58 +194,108 @@ class SnapshotProvider:
             session = decoded.sessions[0]
             if session.committed_version() != reference.version:
                 raise invalid_descriptor("snapshot reference version does not match its payload")
-            self._restore(decoded)
+            self._restore(decoded, {session_id: placement})
             self._current_refs[session_id] = reference
 
-    def restore_latest(self) -> tuple[SnapshotRef, ...]:
+    def available_snapshots(self) -> tuple[SnapshotRef, ...]:
         with self._lock:
             catalog = self._read_catalog()
             raw_entries = cast(dict[str, object], catalog["sessions"])
-            refs = tuple(
+            return tuple(
                 SnapshotRef.from_wire(value, f"catalog.sessions[{key}]")
                 for key, value in sorted(raw_entries.items(), key=lambda item: int(item[0]))
             )
-            groups: dict[str, set[int]] = {}
-            for ref in refs:
-                groups.setdefault(ref.locator, set()).add(ref.version.request_key.session_id)
-            decoded_groups: list[_DecodedSnapshot] = []
-            try:
-                for locator, session_ids in groups.items():
-                    manifest, tensors = self._load_object(locator)
-                    decoded_groups.append(self._decode(manifest, tensors, session_ids))
-            except BaseException:
-                for group in decoded_groups:
-                    self._release_assets(group.published_assets)
-                raise
-            decoded = _DecodedSnapshot(
-                sessions=tuple(session for group in decoded_groups for session in group.sessions),
-                kv=tuple(state for group in decoded_groups for state in group.kv),
-                latents=tuple(record for group in decoded_groups for record in group.latents),
-                products=tuple(record for group in decoded_groups for record in group.products),
-                replay=tuple(record for group in decoded_groups for record in group.replay),
-                published_assets=tuple(
-                    locator for group in decoded_groups for locator in group.published_assets
-                ),
+
+    def _validate_recovery_placement(
+        self,
+        session: RequestSession,
+        placement: RecoveryPlacement,
+    ) -> None:
+        if placement.request_key != session.request_key:
+            raise invalid_descriptor("recovery placement request identity is inconsistent")
+        runtime = session.runtime_for(session.committed_version())
+        if runtime is None:
+            raise invalid_descriptor("recovery placement session has no committed runtime")
+        expected_groups = set(range(self.cache_pool.group_count))
+        actual_groups = {group.group_id for group in placement.cache_groups}
+        if actual_groups != expected_groups:
+            raise invalid_descriptor("recovery placement does not cover every cache group")
+        for group in placement.cache_groups:
+            self.cache_pool.validate_group(group.group_id)
+            pages = self.cache_pool.validate_pages(group.page_ids, scratch=False)
+            if (
+                group.length != runtime.kv_visible_len
+                or group.length > len(pages) * self.cache_pool.block_size
+            ):
+                raise invalid_descriptor("recovery placement KV extent is inconsistent")
+
+    def _snapshot_cache_groups(
+        self,
+        placement: RecoveryPlacement,
+    ) -> tuple[_CacheGroupState, ...]:
+        session = self.sessions.get(placement.request_key.session_id)
+        self._validate_recovery_placement(session, placement)
+        return self._read_cache_groups(placement)
+
+    def _read_cache_groups(
+        self,
+        placement: RecoveryPlacement,
+    ) -> tuple[_CacheGroupState, ...]:
+        return tuple(
+            _CacheGroupState(
+                group_id=group.group_id,
+                length=group.length,
+                tensors=self.cache_pool.page_view(group.group_id, group.page_ids),
             )
-            if decoded.sessions:
-                self._restore(decoded)
-            actual = {
-                session.session_id: session.committed_version() for session in decoded.sessions
-            }
-            for ref in refs:
-                session_id = ref.version.request_key.session_id
-                if actual.get(session_id) != ref.version:
+            for group in placement.cache_groups
+        )
+
+    def _restore_cache(
+        self,
+        states: Sequence[tuple[int, tuple[_CacheGroupState, ...]]],
+        placements: Mapping[int, RecoveryPlacement],
+    ) -> None:
+        for session_id, groups in states:
+            placement = placements.get(session_id)
+            if placement is None:
+                raise invalid_descriptor("cache restore has no scheduler placement")
+            by_group = {group.group_id: group for group in placement.cache_groups}
+            if set(by_group) != {group.group_id for group in groups}:
+                raise invalid_descriptor("cache restore groups disagree with scheduler placement")
+            for state in groups:
+                destination = by_group[state.group_id]
+                if destination.length != state.length:
                     raise invalid_descriptor(
-                        f"catalog snapshot identity conflicts for session {session_id}"
+                        "cache restore extent disagrees with scheduler placement"
                     )
-            self._current_refs = {ref.version.request_key.session_id: ref for ref in refs}
-            return refs
+                self.cache_pool.validate_group(state.group_id)
+                self.cache_pool.validate_pages(destination.page_ids, scratch=False)
+                self.cache_pool.restore_pages(
+                    state.group_id,
+                    destination.page_ids,
+                    state.tensors,
+                )
+
+    def _recovery_rows(self, placement: RecoveryPlacement) -> dict[int, CacheRow]:
+        return {
+            group.group_id: CacheRow(
+                block_table=group.page_ids,
+                length=group.length,
+                capacity=len(group.page_ids) * self.cache_pool.block_size,
+                group_id=group.group_id,
+                initialized_length=group.length,
+                committed_length=group.length,
+                published_length=group.length,
+            )
+            for group in placement.cache_groups
+        }
 
     def _encode(
         self,
         *,
         sessions: Sequence[RequestSession],
-        kv: Sequence[KvCommittedState],
+        cache: Sequence[tuple[int, tuple[_CacheGroupState, ...]]],
+        cache_publications: Sequence[CachePublicationState],
         latents: Sequence[LatentRecord],
         products: Sequence[ProductRecord],
         replay: Sequence[ReplayRecord],
@@ -268,7 +337,64 @@ class SnapshotProvider:
         manifest.update(
             {
                 "sessions": [self._session_to_json(value) for value in sessions],
-                "kv": [self._kv_to_json(value, tensor, locator) for value in kv],
+                "cache": [
+                    {
+                        "session_id": session_id,
+                        "groups": [
+                            {
+                                "group_id": group.group_id,
+                                "length": group.length,
+                                "tensors": [
+                                    tensor(
+                                        f"cache.{session_id}.{group.group_id}.{index}",
+                                        value,
+                                    )
+                                    for index, value in enumerate(group.tensors)
+                                ],
+                            }
+                            for group in groups
+                        ],
+                    }
+                    for session_id, groups in cache
+                ],
+                "cache_publications": [
+                    {
+                        "session_id": state.session_id,
+                        "products": [
+                            {
+                                "product": product.to_wire(),
+                                "publication": {
+                                    **publication.to_wire(),
+                                    "locators": [
+                                        locator(
+                                            raw,
+                                            f"cache_publications.{state.session_id}.{index}.{locator_index}",
+                                        )
+                                        for locator_index, raw in enumerate(publication.locators)
+                                    ],
+                                },
+                            }
+                            for index, (product, publication) in enumerate(state.products)
+                        ],
+                        "destination_bases": [
+                            {
+                                "destination": destination,
+                                "version": version.to_wire(),
+                                "extent": extent,
+                            }
+                            for destination, version, extent in state.destination_bases
+                        ],
+                        "installed_bases": [
+                            {
+                                "destination": destination,
+                                "version": version.to_wire(),
+                                "extent": extent,
+                            }
+                            for destination, version, extent in state.installed_bases
+                        ],
+                    }
+                    for state in cache_publications
+                ],
                 "latents": [
                     self._latent_to_json(value, index, tensor)
                     for index, value in enumerate(latents)
@@ -313,12 +439,24 @@ class SnapshotProvider:
         )
         if {session.session_id for session in sessions} != selected:
             raise invalid_descriptor("snapshot does not contain every selected session")
-        raw_kv = tuple(
+        raw_cache = tuple(
             value
-            for value in _sequence(manifest.get("kv"), "snapshot.kv")
+            for value in _sequence(manifest.get("cache"), "snapshot.cache")
             if _uint(
-                _mapping(value, "snapshot.kv[]").get("session_id"),
-                "snapshot.kv[].session_id",
+                _mapping(value, "snapshot.cache[]").get("session_id"),
+                "snapshot.cache[].session_id",
+            )
+            in selected
+        )
+        raw_cache_publications = tuple(
+            value
+            for value in _sequence(
+                manifest.get("cache_publications"),
+                "snapshot.cache_publications",
+            )
+            if _uint(
+                _mapping(value, "snapshot.cache_publications[]").get("session_id"),
+                "snapshot.cache_publications[].session_id",
             )
             in selected
         )
@@ -350,18 +488,25 @@ class SnapshotProvider:
             in selected
         )
         required_assets = {
-            key for value in (*raw_kv, *raw_products) for key in _asset_references(value)
+            key
+            for value in (*raw_cache_publications, *raw_products)
+            for key in _asset_references(value)
         }
         assets, published_assets = self._restore_assets(manifest, tensors, required_assets)
         try:
-            kv = tuple(self._kv_from_json(value, tensors, assets) for value in raw_kv)
+            cache = tuple(self._cache_from_json(value, tensors) for value in raw_cache)
+            cache_publications = tuple(
+                self._cache_publications_from_json(value, assets)
+                for value in raw_cache_publications
+            )
             products = tuple(
                 self._product_from_json(value, tensors, assets) for value in raw_products
             )
             replay = tuple(self._replay_from_json(value) for value in raw_replay)
             decoded = _DecodedSnapshot(
                 sessions,
-                kv,
+                cache,
+                cache_publications,
                 latents,
                 products,
                 replay,
@@ -373,7 +518,11 @@ class SnapshotProvider:
             self._release_assets(published_assets)
             raise
 
-    def _restore(self, decoded: _DecodedSnapshot) -> None:
+    def _restore(
+        self,
+        decoded: _DecodedSnapshot,
+        placements: Mapping[int, RecoveryPlacement],
+    ) -> None:
         session_ids = {value.session_id for value in decoded.sessions}
         try:
             self._validate_decoded(decoded, session_ids)
@@ -382,12 +531,21 @@ class SnapshotProvider:
             raise
         existing_ids = {value for value in session_ids if self.sessions.peek(value) is not None}
         prior_sessions = self.sessions.snapshot_live(existing_ids)
-        prior_kv = self.kv.snapshot_committed(existing_ids)
+        prior_cache = {
+            session_id: self._read_cache_groups(placements[session_id])
+            for session_id in session_ids
+        }
         prior_latents = self.latents.snapshot_records(session_ids)
         prior_products = self.products.snapshot_records(session_ids)
         prior_replay = self.replay.snapshot_records(session_ids)
         try:
-            self.kv.restore_committed(decoded.kv, session_ids)
+            self._restore_cache(decoded.cache, placements)
+            for state in decoded.cache_publications:
+                self.cache_publications.restore(
+                    state,
+                    self._recovery_rows(placements[state.session_id]),
+                    self.transport,
+                )
             self.latents.restore_records(session_ids, decoded.latents)
             self.products.restore_records(session_ids, decoded.products)
             restored_latents = self.products.device_products.restore_published(
@@ -413,11 +571,22 @@ class SnapshotProvider:
                         )
                     ),
                 )
-            self.sessions.restore_sessions(decoded.sessions, session_ids)
+            restored_sessions = tuple(
+                replace(
+                    session,
+                    request_pool_idx=placements[session.session_id].request_pool_idx,
+                )
+                for session in decoded.sessions
+            )
+            self.sessions.restore_sessions(restored_sessions, session_ids)
             self.replay.restore_records(session_ids, decoded.replay)
-            self.kv.retain_restored_publications(decoded.kv, self.transport)
         except BaseException:
-            self.kv.restore_committed(prior_kv, session_ids)
+            self._restore_cache(
+                tuple((session_id, groups) for session_id, groups in prior_cache.items()),
+                placements,
+            )
+            for session_id in session_ids:
+                self.cache_publications.discard(session_id, release_locators=False)
             self.latents.restore_records(session_ids, prior_latents)
             self.products.restore_records(session_ids, prior_products)
             restored_latents = self.products.device_products.restore_published(
@@ -453,9 +622,11 @@ class SnapshotProvider:
         decoded: _DecodedSnapshot,
         selected: set[int],
     ) -> None:
-        if {state.session_id for state in decoded.kv} != selected:
+        if {session_id for session_id, _groups in decoded.cache} != selected:
             raise invalid_descriptor("snapshot KV state does not align with sessions")
-        kv_by_session = {state.session_id: state for state in decoded.kv}
+        if {state.session_id for state in decoded.cache_publications} != selected:
+            raise invalid_descriptor("snapshot KV publications do not align with sessions")
+        cache_by_session = dict(decoded.cache)
         latent_by_reference = {record.reference: record for record in decoded.latents}
         product_by_handle = {record.handle: record for record in decoded.products}
         if len(latent_by_reference) != len(decoded.latents):
@@ -464,7 +635,8 @@ class SnapshotProvider:
             raise invalid_descriptor("snapshot repeats a product handle")
         for session in decoded.sessions:
             runtime = session.runtime_for(session.resolved_version())
-            if runtime is None or runtime.kv_length != kv_by_session[session.session_id].length:
+            groups = cache_by_session[session.session_id]
+            if runtime is None or any(group.length != runtime.kv_visible_len for group in groups):
                 raise invalid_descriptor(
                     f"session {session.session_id} runtime state does not align with KV"
                 )
@@ -624,7 +796,6 @@ class SnapshotProvider:
             "authority_id": session.request_key.authority_id,
             "session_id": session.session_id,
             "epoch": session.epoch,
-            "request_pool_idx": session.request_pool_idx,
             "version": session.version,
             "resolved_op_id": session.resolved_op_id,
             "resolved_digest": str(session.resolved_digest),
@@ -781,9 +952,7 @@ class SnapshotProvider:
         )
         session = RequestSession(
             request_key=request_key,
-            request_pool_idx=_uint(
-                data.get("request_pool_idx"), "snapshot session.request_pool_idx"
-            ),
+            request_pool_idx=1,
             admission_digest=_digest(
                 data.get("admission_digest"), "snapshot session.admission_digest"
             ),
@@ -859,197 +1028,87 @@ class SnapshotProvider:
         return session
 
     @staticmethod
-    def _kv_to_json(
-        state: KvCommittedState,
-        tensor: Any,
-        locator: Any,
-    ) -> dict[str, object]:
-        return {
-            "session_id": state.session_id,
-            "block_ids": list(state.block_ids),
-            "logical_blocks": list(state.logical_blocks),
-            "prefix_len": state.prefix_len,
-            "length": state.length,
-            "group_id": state.group_id,
-            "reserved_len": state.reserved_len,
-            "initialized_len": state.initialized_len,
-            "committed_len": state.committed_len,
-            "published_by_destination": [
-                {"destination": destination, "extent": extent}
-                for destination, extent in state.published_by_destination
-            ],
-            "mapping_generation": state.mapping_generation,
-            "scale_identity": state.scale_identity,
-            "pages": _pages_to_json(state.pages, f"kv.{state.session_id}.pages", tensor),
-            "branches": [
-                {
-                    "owner": branch.owner.to_wire(),
-                    "branch": branch.branch,
-                    "length": branch.length,
-                    "block_count": branch.block_count,
-                    "pages": _pages_to_json(
-                        branch.pages,
-                        f"kv.{state.session_id}.branches.{index}",
-                        tensor,
-                    ),
-                }
-                for index, branch in enumerate(state.branches)
-            ],
-            "publications": [
-                {
-                    "product": product.to_wire(),
-                    "publication": {
-                        **publication.to_wire(),
-                        "locators": [
-                            locator(
-                                raw,
-                                f"kv.{state.session_id}.publications.{index}.{locator_index}",
-                            )
-                            for locator_index, raw in enumerate(publication.locators)
-                        ],
-                    },
-                }
-                for index, (product, publication) in enumerate(state.publications)
-            ],
-            "destination_bases": [
-                {
-                    "destination": destination,
-                    "version": version.to_wire(),
-                    "extent": extent,
-                    "block_ids": list(block_ids),
-                    "group_id": group_id,
-                    "scale_identity": scale_identity,
-                }
-                for destination, version, extent, block_ids, group_id, scale_identity in (
-                    state.destination_bases
-                )
-            ],
-            "installed_bases": [
-                {
-                    "destination": destination,
-                    "version": version.to_wire(),
-                    "extent": extent,
-                }
-                for destination, version, extent in state.installed_bases
-            ],
-        }
-
-    @staticmethod
-    def _kv_from_json(
+    def _cache_from_json(
         value: object,
         tensors: Mapping[str, torch.Tensor],
+    ) -> tuple[int, tuple[_CacheGroupState, ...]]:
+        data = _mapping(value, "snapshot cache")
+        groups = tuple(
+            _CacheGroupState(
+                group_id=_uint(group.get("group_id"), "snapshot cache group.group_id"),
+                length=_uint(group.get("length"), "snapshot cache group.length"),
+                tensors=tuple(
+                    _tensor(tensors, key, "snapshot cache group.tensors[]")
+                    for key in _sequence(
+                        group.get("tensors"),
+                        "snapshot cache group.tensors",
+                    )
+                ),
+            )
+            for raw_group in _sequence(data.get("groups"), "snapshot cache.groups")
+            for group in (_mapping(raw_group, "snapshot cache group"),)
+        )
+        if len({group.group_id for group in groups}) != len(groups):
+            raise invalid_descriptor("snapshot cache repeats a group")
+        return _uint(data.get("session_id"), "snapshot cache.session_id"), groups
+
+    @staticmethod
+    def _cache_publications_from_json(
+        value: object,
         assets: Mapping[str, str],
-    ) -> KvCommittedState:
-        data = _mapping(value, "snapshot KV")
-        branches = tuple(
-            KvBranchState(
-                owner=ProductRef.from_wire(
-                    branch.get("owner"),
-                    "snapshot KV branch.owner",
-                ),
-                branch=_string(branch.get("branch"), "snapshot KV branch.branch"),
-                length=_uint(branch.get("length"), "snapshot KV branch.length"),
-                block_count=_uint(branch.get("block_count"), "snapshot KV branch.block_count"),
-                pages=cast(
-                    KvPageState,
-                    _pages_from_json(branch.get("pages"), tensors, "snapshot KV branch.pages"),
-                ),
-            )
-            for raw in _sequence(data.get("branches"), "snapshot KV.branches")
-            for branch in (_mapping(raw, "snapshot KV branch"),)
-        )
-        if any(branch.pages is None for branch in branches):
-            raise invalid_descriptor("snapshot KV scratch branch is missing pages")
-        published = tuple(
-            (
-                _string(item.get("destination"), "snapshot KV publication.destination"),
-                _uint(item.get("extent"), "snapshot KV publication.extent"),
-            )
-            for raw in _sequence(
-                data.get("published_by_destination"),
-                "snapshot KV.published_by_destination",
-            )
-            for item in (_mapping(raw, "snapshot KV publication"),)
-        )
-        publications: list[tuple[ProductRef, KvSnapshot]] = []
-        for raw in _sequence(data.get("publications"), "snapshot KV.publications"):
-            item = _mapping(raw, "snapshot KV publication identity")
+    ) -> CachePublicationState:
+        data = _mapping(value, "snapshot cache publications")
+        products: list[tuple[ProductRef, CachePublication]] = []
+        for raw in _sequence(
+            data.get("products"),
+            "snapshot cache publications.products",
+        ):
+            item = _mapping(raw, "snapshot cache publication product")
             publication = dict(
-                _mapping(item.get("publication"), "snapshot KV publication descriptor")
+                _mapping(
+                    item.get("publication"),
+                    "snapshot cache publication descriptor",
+                )
             )
             publication["locators"] = [
                 _resolve_asset(
-                    _string(locator, "snapshot KV publication.locators[]"),
+                    _string(locator, "snapshot cache publication.locators[]"),
                     assets,
                 )
                 for locator in _sequence(
                     publication.get("locators"),
-                    "snapshot KV publication.locators",
+                    "snapshot cache publication.locators",
                 )
             ]
-            publications.append(
+            products.append(
                 (
                     ProductRef.from_wire(
                         item.get("product"),
-                        "snapshot KV publication.product",
+                        "snapshot cache publication.product",
                     ),
-                    KvSnapshot.from_wire(publication),
+                    CachePublication.from_wire(publication),
                 )
             )
-        destination_bases = tuple(
-            (
-                _string(item.get("destination"), "snapshot KV destination base.destination"),
-                VersionRef.from_wire(
-                    item.get("version"),
-                    "snapshot KV destination base.version",
-                ),
-                _uint(item.get("extent"), "snapshot KV destination base.extent"),
-                _uint_tuple(
-                    item.get("block_ids"),
-                    "snapshot KV destination base.block_ids",
-                ),
-                _uint(item.get("group_id"), "snapshot KV destination base.group_id"),
-                _string(
-                    item.get("scale_identity"),
-                    "snapshot KV destination base.scale_identity",
-                ),
+
+        def bases(name: str) -> tuple[tuple[str, VersionRef, int], ...]:
+            return tuple(
+                (
+                    _string(item.get("destination"), f"snapshot {name}.destination"),
+                    VersionRef.from_wire(item.get("version"), f"snapshot {name}.version"),
+                    _uint(item.get("extent"), f"snapshot {name}.extent"),
+                )
+                for raw in _sequence(data.get(name), f"snapshot {name}")
+                for item in (_mapping(raw, f"snapshot {name}[]"),)
             )
-            for raw in _sequence(data.get("destination_bases"), "snapshot KV.destination_bases")
-            for item in (_mapping(raw, "snapshot KV destination base"),)
-        )
-        installed_bases = tuple(
-            (
-                _string(item.get("destination"), "snapshot KV installed base.destination"),
-                VersionRef.from_wire(
-                    item.get("version"),
-                    "snapshot KV installed base.version",
-                ),
-                _uint(item.get("extent"), "snapshot KV installed base.extent"),
-            )
-            for raw in _sequence(data.get("installed_bases"), "snapshot KV.installed_bases")
-            for item in (_mapping(raw, "snapshot KV installed base"),)
-        )
-        return KvCommittedState(
-            session_id=_uint(data.get("session_id"), "snapshot KV.session_id"),
-            block_ids=_uint_tuple(data.get("block_ids"), "snapshot KV.block_ids"),
-            logical_blocks=_uint_tuple(data.get("logical_blocks"), "snapshot KV.logical_blocks"),
-            prefix_len=_uint(data.get("prefix_len"), "snapshot KV.prefix_len"),
-            length=_uint(data.get("length"), "snapshot KV.length"),
-            group_id=_uint(data.get("group_id"), "snapshot KV.group_id"),
-            reserved_len=_uint(data.get("reserved_len"), "snapshot KV.reserved_len"),
-            initialized_len=_uint(data.get("initialized_len"), "snapshot KV.initialized_len"),
-            committed_len=_uint(data.get("committed_len"), "snapshot KV.committed_len"),
-            published_by_destination=published,
-            mapping_generation=_uint(
-                data.get("mapping_generation"),
-                "snapshot KV.mapping_generation",
+
+        return CachePublicationState(
+            session_id=_uint(
+                data.get("session_id"),
+                "snapshot cache publications.session_id",
             ),
-            scale_identity=_string(data.get("scale_identity"), "snapshot KV.scale_identity"),
-            pages=_pages_from_json(data.get("pages"), tensors, "snapshot KV.pages"),
-            branches=branches,
-            publications=tuple(publications),
-            destination_bases=destination_bases,
-            installed_bases=installed_bases,
+            products=tuple(products),
+            destination_bases=bases("destination_bases"),
+            installed_bases=bases("installed_bases"),
         )
 
     @staticmethod
@@ -1172,59 +1231,6 @@ class SnapshotProvider:
     def _release_assets(self, locators: Sequence[Locator]) -> None:
         for locator in reversed(tuple(locators)):
             self.transport.release(locator)
-
-
-def _pages_to_json(
-    pages: KvPageState | None,
-    prefix: str,
-    tensor: Any,
-) -> dict[str, object] | None:
-    if pages is None:
-        return None
-    return {
-        "key": tensor(f"{prefix}.key", pages.key),
-        "value": tensor(f"{prefix}.value", pages.value),
-        "key_scale": (
-            None if pages.key_scale is None else tensor(f"{prefix}.key_scale", pages.key_scale)
-        ),
-        "value_scale": (
-            None
-            if pages.value_scale is None
-            else tensor(f"{prefix}.value_scale", pages.value_scale)
-        ),
-        "key_scale_set": (
-            None
-            if pages.key_scale_set is None
-            else tensor(f"{prefix}.key_scale_set", pages.key_scale_set)
-        ),
-        "value_scale_set": (
-            None
-            if pages.value_scale_set is None
-            else tensor(f"{prefix}.value_scale_set", pages.value_scale_set)
-        ),
-    }
-
-
-def _pages_from_json(
-    value: object,
-    tensors: Mapping[str, torch.Tensor],
-    where: str,
-) -> KvPageState | None:
-    if value is None:
-        return None
-    data = _mapping(value, where)
-    return KvPageState(
-        key=_tensor(tensors, data.get("key"), f"{where}.key"),
-        value=_tensor(tensors, data.get("value"), f"{where}.value"),
-        key_scale=_optional_tensor(tensors, data.get("key_scale"), f"{where}.key_scale"),
-        value_scale=_optional_tensor(tensors, data.get("value_scale"), f"{where}.value_scale"),
-        key_scale_set=_optional_tensor(
-            tensors, data.get("key_scale_set"), f"{where}.key_scale_set"
-        ),
-        value_scale_set=_optional_tensor(
-            tensors, data.get("value_scale_set"), f"{where}.value_scale_set"
-        ),
-    )
 
 
 def _product_payload_to_json(

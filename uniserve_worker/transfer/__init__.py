@@ -1,0 +1,1 @@
+"""Concrete asynchronous transfer owners."""

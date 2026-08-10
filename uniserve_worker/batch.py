@@ -339,6 +339,17 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
     (
         "request_key",
         "op_id",
+        "branch_index",
+        "group_id",
+        "block_table",
+        "pages_to_zero",
+    ),
+    ("group_id", "page_ids", "length"),
+    ("request_key", "request_pool_idx", "cache_groups"),
+    ("group_id", "source_page", "destination_page"),
+    (
+        "request_key",
+        "op_id",
         "page_table",
         "latent_units",
         "height",
@@ -358,6 +369,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "operations",
         "request_pool_indices",
         "kv_placements",
+        "kv_branch_placements",
         "latent_placements",
     ),
     (
@@ -399,7 +411,6 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "model_identity",
         "weight_digest",
         "protocol_layout_digest",
-        "restored_snapshots",
     ),
 )
 
@@ -1958,6 +1969,162 @@ class KvPlacement:
 
 
 @dataclass(frozen=True, slots=True)
+class KvBranchPlacement:
+    request_key: RequestKey
+    op_id: int
+    branch_index: int
+    group_id: int
+    block_table: tuple[int, ...]
+    pages_to_zero: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.op_id < 1 or self.branch_index < 1 or self.group_id < 0:
+            raise invalid_descriptor("KV branch placement identity is invalid")
+        if (
+            not self.block_table
+            or any(page < 1 for page in self.block_table)
+            or len(set(self.block_table)) != len(self.block_table)
+        ):
+            raise invalid_descriptor(
+                "KV branch placement is empty, repeats a page, or carries page zero"
+            )
+        if (
+            any(page < 1 for page in self.pages_to_zero)
+            or len(set(self.pages_to_zero)) != len(self.pages_to_zero)
+            or not set(self.pages_to_zero).issubset(self.block_table)
+        ):
+            raise invalid_descriptor("KV branch placement zero set is invalid")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "KV branch placement") -> KvBranchPlacement:
+        data = _map(value, where)
+        return cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
+            branch_index=_uint(data.get("branch_index"), f"{where}.branch_index"),
+            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
+            block_table=_uints(data.get("block_table", ()), f"{where}.block_table"),
+            pages_to_zero=_uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_key": self.request_key.to_wire(),
+            "op_id": self.op_id,
+            "branch_index": self.branch_index,
+            "group_id": self.group_id,
+            "block_table": list(self.block_table),
+            "pages_to_zero": list(self.pages_to_zero),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CacheGroupPlacement:
+    group_id: int
+    page_ids: tuple[int, ...]
+    length: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.group_id < 0
+            or self.length < 0
+            or any(page < 1 for page in self.page_ids)
+            or len(set(self.page_ids)) != len(self.page_ids)
+        ):
+            raise invalid_descriptor("cache recovery placement is invalid")
+
+    @classmethod
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "cache recovery placement",
+    ) -> CacheGroupPlacement:
+        data = _map(value, where)
+        return cls(
+            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
+            page_ids=_uints(data.get("page_ids", ()), f"{where}.page_ids"),
+            length=_uint(data.get("length"), f"{where}.length"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "group_id": self.group_id,
+            "page_ids": list(self.page_ids),
+            "length": self.length,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryPlacement:
+    request_key: RequestKey
+    request_pool_idx: int
+    cache_groups: tuple[CacheGroupPlacement, ...]
+
+    def __post_init__(self) -> None:
+        groups = tuple(group.group_id for group in self.cache_groups)
+        if self.request_pool_idx < 1 or len(set(groups)) != len(groups):
+            raise invalid_descriptor("recovery placement identity is invalid")
+
+    @classmethod
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "recovery placement",
+    ) -> RecoveryPlacement:
+        data = _map(value, where)
+        return cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_pool_idx=_uint(
+                data.get("request_pool_idx"),
+                f"{where}.request_pool_idx",
+            ),
+            cache_groups=tuple(
+                CacheGroupPlacement.from_wire(item, f"{where}.cache_groups[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("cache_groups", ()), f"{where}.cache_groups")
+                )
+            ),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_key": self.request_key.to_wire(),
+            "request_pool_idx": self.request_pool_idx,
+            "cache_groups": [group.to_wire() for group in self.cache_groups],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CacheCopy:
+    group_id: int
+    source_page: int
+    destination_page: int
+
+    def __post_init__(self) -> None:
+        if self.group_id < 0 or self.source_page < 1 or self.destination_page < 1:
+            raise invalid_descriptor("cache copy identity is invalid")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "cache copy") -> CacheCopy:
+        data = _map(value, where)
+        return cls(
+            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
+            source_page=_uint(data.get("source_page"), f"{where}.source_page"),
+            destination_page=_uint(
+                data.get("destination_page"),
+                f"{where}.destination_page",
+            ),
+        )
+
+    def to_wire(self) -> dict[str, int]:
+        return {
+            "group_id": self.group_id,
+            "source_page": self.source_page,
+            "destination_page": self.destination_page,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class LatentPlacement:
     request_key: RequestKey
     op_id: int
@@ -2022,6 +2189,7 @@ class BatchPartition:
     operations: tuple[Operation, ...]
     request_pool_indices: tuple[int, ...]
     kv_placements: tuple[KvPlacement, ...] = ()
+    kv_branch_placements: tuple[KvBranchPlacement, ...] = ()
     latent_placements: tuple[LatentPlacement, ...] = ()
 
     def __post_init__(self) -> None:
@@ -2076,6 +2244,24 @@ class BatchPartition:
             for operation in self.operations
         ):
             raise invalid_descriptor("operation with logical KV capacity has no placement")
+        branch_ids: set[tuple[RequestKey, int, int, int]] = set()
+        branch_pages: set[int] = set()
+        for placement in self.kv_branch_placements:
+            identity = (
+                placement.request_key,
+                placement.op_id,
+                placement.branch_index,
+                placement.group_id,
+            )
+            if identity in branch_ids:
+                raise invalid_descriptor("batch partition repeats a KV branch placement identity")
+            branch_ids.add(identity)
+            operation = operations.get(identity[:2])
+            if operation is None or operation.work.variant is not WorkVariant.GEN_FLOW:
+                raise invalid_descriptor("KV branch placement does not name generation flow")
+            if not branch_pages.isdisjoint(placement.block_table):
+                raise invalid_descriptor("KV branch placements overlap physical pages")
+            branch_pages.update(placement.block_table)
         latent_ids: set[tuple[RequestKey, int]] = set()
         latent_variants = {
             WorkVariant.GEN_TRANSITION,
@@ -2140,6 +2326,15 @@ class BatchPartition:
                     _seq(data.get("kv_placements", ()), f"{where}.kv_placements")
                 )
             ),
+            kv_branch_placements=tuple(
+                KvBranchPlacement.from_wire(item, f"{where}.kv_branch_placements[{index}]")
+                for index, item in enumerate(
+                    _seq(
+                        data.get("kv_branch_placements", ()),
+                        f"{where}.kv_branch_placements",
+                    )
+                )
+            ),
             latent_placements=tuple(
                 LatentPlacement.from_wire(item, f"{where}.latent_placements[{index}]")
                 for index, item in enumerate(
@@ -2161,6 +2356,9 @@ class BatchPartition:
             "operations": [operation.to_wire() for operation in self.operations],
             "request_pool_indices": list(self.request_pool_indices),
             "kv_placements": [placement.to_wire() for placement in self.kv_placements],
+            "kv_branch_placements": [
+                placement.to_wire() for placement in self.kv_branch_placements
+            ],
             "latent_placements": [placement.to_wire() for placement in self.latent_placements],
         }
 

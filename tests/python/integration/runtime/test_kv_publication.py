@@ -10,6 +10,9 @@ from tests.python.fixtures.depth_one import (
     token_operation,
     und_admission,
 )
+from tests.python.fixtures.depth_one import (
+    kv_publication_operation as _publication_operation,
+)
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
@@ -17,6 +20,7 @@ from uniserve_worker.batch import (
     DeviceDim,
     Domain,
     DType,
+    KvPlacement,
     Operation,
     PointRange,
     ProductKind,
@@ -30,47 +34,12 @@ from uniserve_worker.batch import (
     VersionRef,
     Work,
 )
-from uniserve_worker.runtime.kv_store import KvSnapshot
 from uniserve_worker.runtime.transfer import (
     Locator,
     decode_transfer_descriptor,
     encode_transfer_descriptor,
 )
-
-
-def _publication_operation(
-    admission: Admission,
-    *,
-    op_id: int,
-    parent: VersionRef,
-    control_seq: int,
-) -> tuple[Operation, ProductRef]:
-    request_key = admission.request_key
-    product = ProductRef(
-        request_key=request_key,
-        producer_op_id=op_id,
-        output_index=0,
-        generation=op_id * 10 + 1,
-        kind=ProductKind.KV,
-        storage_class=StorageClass.PAGED_KV,
-        dtype=DType.U8,
-        shape_bound=ShapeBound((DeviceDim(1 << 20),)),
-        point_range=PointRange(),
-    )
-    return (
-        Operation.registered(
-            request_key=request_key,
-            op_id=op_id,
-            parent=parent,
-            work=Work("transfer", TransferMode.KV_PUBLISH.value),
-            route=0,
-            domain=Domain.UND,
-            bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
-            outputs=(product,),
-            control_seq=control_seq,
-        ),
-        product,
-    )
+from uniserve_worker.transfer.cache import CachePublication
 
 
 def _installation_operation(
@@ -105,6 +74,20 @@ def _installation_operation(
             kv_capacity_pages=1,
         ),
         product,
+    )
+
+
+def _installation_placement(operation: Operation, length: int) -> KvPlacement:
+    return KvPlacement(
+        request_key=operation.request_key,
+        op_id=operation.op_id,
+        group_id=0,
+        block_table=(1,),
+        pages_to_zero=(1,),
+        prefix_length=0,
+        input_length=int(length),
+        visible_length=0,
+        resulting_length=int(length),
     )
 
 
@@ -145,6 +128,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         bounds=closure_template.bounds,
         inputs=closure_template.inputs,
         outputs=(),
+        kv_capacity_pages=closure_template.kv_capacity_pages,
         control_seq=closure_template.control_seq,
     )
     closure_result = worker.execute(
@@ -163,7 +147,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
 
     second_commit = commit_resolved(worker.sessions.get(41))
     publication, publication_product = _publication_operation(
-        admission,
+        admission.request_key,
         op_id=3,
         parent=second_commit.selected,
         control_seq=second_commit.control_seq,
@@ -183,12 +167,11 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     kind, descriptor, producer_plan_digest = decode_transfer_descriptor(payload.payload)
     assert kind == "kv"
     assert producer_plan_digest == publication.plan_digest
-    snapshot = KvSnapshot.from_wire(descriptor["snapshot"])
+    snapshot = CachePublication.from_wire(descriptor["snapshot"])
     assert payload.product == publication_product
     assert snapshot.source_version == second_commit.selected
     assert snapshot.base_extent == 0
     assert snapshot.published_extent == 3
-    assert worker.kv.validate_conditioning(41, publication_product) == snapshot
 
     suffix_template, suffix_input = token_operation(
         admission.request_key,
@@ -208,6 +191,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         bounds=suffix_template.bounds,
         inputs=suffix_template.inputs,
         outputs=(),
+        kv_capacity_pages=suffix_template.kv_capacity_pages,
         control_seq=suffix_template.control_seq,
     )
     suffix_result = worker.execute(
@@ -222,7 +206,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
 
     suffix_commit = commit_resolved(worker.sessions.get(41))
     incremental, incremental_product = _publication_operation(
-        admission,
+        admission.request_key,
         op_id=5,
         parent=suffix_commit.selected,
         control_seq=suffix_commit.control_seq,
@@ -239,19 +223,18 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     kind, descriptor, producer_plan_digest = decode_transfer_descriptor(incremental_payload.payload)
     assert kind == "kv"
     assert producer_plan_digest == incremental.plan_digest
-    incremental_snapshot = KvSnapshot.from_wire(descriptor["snapshot"])
+    incremental_snapshot = CachePublication.from_wire(descriptor["snapshot"])
     assert incremental_payload.product == incremental_product
     assert incremental_snapshot.source_version == suffix_commit.selected
     assert incremental_snapshot.base_version == second_commit.selected
     assert incremental_snapshot.base_extent == 3
     assert incremental_snapshot.published_extent == 4
-    assert worker.kv.validate_conditioning(41, publication_product) == snapshot
-    assert worker.kv.validate_conditioning(41, incremental_product) == incremental_snapshot
 
 
 def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
     producer = execution_worker(transfer_backend="shm")
     consumer = execution_worker(transfer_backend="shm")
+    released_consumer = execution_worker(transfer_backend="shm")
     admission = und_admission(42, block_ids=(0,))
     extend, extend_input = token_operation(
         admission.request_key,
@@ -271,7 +254,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         )
         commit = commit_resolved(producer.sessions.get(42))
         publication, source = _publication_operation(
-            admission,
+            admission.request_key,
             op_id=2,
             parent=commit.selected,
             control_seq=commit.control_seq,
@@ -295,6 +278,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             admissions=(admission,),
             operations=(installation,),
             input_products=(published.products[0],),
+            kv_placements=(_installation_placement(installation, 2),),
         )
         prepared = consumer.prepare_execute(batch)
         assert prepared is not None
@@ -304,19 +288,40 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         assert prepared.ready()
         report = consumer.execute_prepared(prepared)
         assert report.completions[0].status.value == "ok"
-        assert consumer.kv.get(42).extents().committed == 2
-        assert consumer.kv.validate_installed(42, installed).source_version == commit.selected
-        assert producer.kv.published_locator_count() > 0
+        assert report.completions[0].logical_lengths.kv_visible_len == 2
+        assert report.products[0].product == installed
         producer.execute(
             execution_batch(
                 step_id=4,
                 controls=(Release(admission.request_key, publication.op_id),),
             )
         )
-        assert producer.kv.published_locator_count() == 0
+        expired_install, _ = _installation_operation(
+            admission,
+            op_id=4,
+            parent=root_parent(admission),
+            source=source,
+        )
+        expired = released_consumer.prepare_execute(
+            execution_batch(
+                step_id=5,
+                admissions=(admission,),
+                operations=(expired_install,),
+                input_products=(published.products[0],),
+                kv_placements=(_installation_placement(expired_install, 2),),
+            )
+        )
+        assert expired is not None
+        deadline = time.monotonic() + 5.0
+        while not expired.ready() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert expired.ready()
+        expired_report = released_consumer.execute_prepared(expired)
+        assert expired_report.completions[0].status.value == "error"
     finally:
         producer.close()
         consumer.close()
+        released_consumer.close()
 
 
 def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination() -> None:
@@ -341,7 +346,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
         )
         commit = commit_resolved(producer.sessions.get(43))
         publication, source = _publication_operation(
-            admission,
+            admission.request_key,
             op_id=2,
             parent=commit.selected,
             control_seq=commit.control_seq,
@@ -350,7 +355,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
             execution_batch(step_id=2, operations=(publication,), controls=(commit,))
         ).products[0]
         kind, value, producer_digest = decode_transfer_descriptor(published.payload)
-        snapshot = KvSnapshot.from_wire(value["snapshot"])
+        snapshot = CachePublication.from_wire(value["snapshot"])
         first = Locator.from_wire_json(snapshot.locators[0])
         missing = replace(first, handle=b"uniserve-missing-transfer-segment")
         broken = replace(
@@ -377,6 +382,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
                 admissions=(admission,),
                 operations=(installation,),
                 input_products=(payload,),
+                kv_placements=(_installation_placement(installation, 2),),
             )
         )
         assert prepared is not None
@@ -389,12 +395,31 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
 
         assert report.completions[0].status.value == "error"
         assert report.completions[0].error_code is not None
-        assert producer.kv.get(43).extents().committed == 2
-        assert producer.kv.validate_conditioning(43, source).source_version == commit.selected
-        assert consumer.sessions.peek(43) is None
-        assert consumer.kv.resident_block_count() == 0
-        assert consumer.kv.pool is not None
-        assert consumer.kv.pool.session_blocks_available == consumer.kv.pool.leasable_num_blocks
+
+        retry, installed = _installation_operation(
+            admission,
+            op_id=4,
+            parent=root_parent(admission),
+            source=source,
+        )
+        prepared_retry = consumer.prepare_execute(
+            execution_batch(
+                step_id=4,
+                admissions=(admission,),
+                operations=(retry,),
+                input_products=(published,),
+                kv_placements=(_installation_placement(retry, 2),),
+            )
+        )
+        assert prepared_retry is not None
+        deadline = time.monotonic() + 5.0
+        while not prepared_retry.ready() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert prepared_retry.ready()
+        retry_report = consumer.execute_prepared(prepared_retry)
+        assert retry_report.completions[0].status.value == "ok"
+        assert retry_report.completions[0].logical_lengths.kv_visible_len == 2
+        assert retry_report.products[0].product == installed
     finally:
         producer.close()
         consumer.close()
