@@ -19,8 +19,8 @@ use uniserve_worker_wire::{RequestKind, ResponseKind, WorkerRequest, WorkerRespo
 mod events;
 use events::{ClientEvents, ServerEvents};
 pub use events::{
-    EVENT_DRIVEN_ENV, EVENT_WAIT_SAFETY_NET, EVT_COMMAND, EVT_DEATH, EVT_RESULT, WakeEvents,
-    WakeSender, event_driven_enabled,
+    EVENT_DRIVEN_ENV, EVENT_WAIT_SAFETY_NET, EVT_COMMAND, EVT_DEATH, EVT_REQUEST, EVT_RESULT,
+    WakeEvents, WakeSender, event_driven_enabled,
 };
 
 pub mod transfer_agent;
@@ -264,6 +264,9 @@ impl ClientEndpoint {
         *request.user_header_mut() = header;
         let request = request.write_from_slice(payload);
         let pending = request.send().context("sending iceoryx2 request")?;
+        if let Some(events) = &self.events {
+            events.notify_request();
+        }
         Ok(pending)
     }
 
@@ -382,6 +385,9 @@ impl ServerEndpoint {
         else {
             return Ok(None);
         };
+        if let Some(events) = &self.events {
+            events.drain_requests()?;
+        }
         let header = *active.user_header();
         let payload = active.payload().to_vec();
         verify_header_len(header, payload.len())?;
@@ -398,14 +404,14 @@ impl ServerEndpoint {
         }
     }
 
-    /// Park until an inbound command wake fires or `timeout` elapses. When the
+    /// Park until an inbound request wake fires or `timeout` elapses. When the
     /// event-driven boundary is enabled the server parks on its wake listener,
     /// so an idle controller advances on notification rather than a sleep poll;
     /// otherwise it falls back to the safety-net sleep. The caller re-checks the
     /// transport after each return, so a spurious wake is harmless.
     pub fn wait_incoming(&self, timeout: Duration) -> anyhow::Result<()> {
         match &self.events {
-            Some(events) => events.wait_command(timeout),
+            Some(events) => events.wait_request(timeout),
             None => {
                 std::thread::sleep(timeout);
                 Ok(())

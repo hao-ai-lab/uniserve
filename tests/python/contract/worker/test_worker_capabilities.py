@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker import batch
-from uniserve_worker.batch import SamplingOwnership, WorkVariant
-from uniserve_worker.capabilities import WorkerCapabilities
+from uniserve_worker.batch import Domain, SamplingOwnership, WorkVariant
+from uniserve_worker.capabilities import (
+    GraphBucketCapability,
+    LaneCapabilities,
+    WorkerCapabilities,
+)
 from uniserve_worker.runtime.arena_capacity import operation_window
 from uniserve_worker.server.app import dispatch
 
@@ -53,7 +59,35 @@ def test_worker_capability_wire_reports_schedulable_work_and_bounds() -> None:
 
 
 def test_worker_capability_wire_round_trips_exactly() -> None:
-    capabilities = execution_worker().capabilities
+    base = execution_worker().capabilities
+    capabilities = replace(
+        base,
+        lanes=(
+            LaneCapabilities(
+                lane_id="und",
+                domains=(Domain.UND,),
+                resolved_sm_count=64,
+                kv_capacity_tokens=65_536,
+                latent_capacity_units=None,
+                max_batch_operations=128,
+                max_batch_tokens=16_384,
+                max_inflight=2,
+                graph_buckets=(
+                    GraphBucketCapability(
+                        phase="text_decode",
+                        batch_size=32,
+                        token_bucket=32,
+                        attention_form="paged_decode",
+                        height=0,
+                        width=0,
+                        cfg_branches=1,
+                    ),
+                ),
+                eager_max_batch_operations=128,
+                eager_max_batch_tokens=16_384,
+            ),
+        ),
+    )
 
     restored = WorkerCapabilities.from_wire(capabilities.to_wire())
 

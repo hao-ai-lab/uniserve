@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..foundation.sizing import ceil_div
 from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from .latent_capacity import latent_store_capacity_bytes
@@ -13,7 +12,6 @@ from .product_capacity import device_product_arena_bytes
 _PRODUCTS_PER_OPERATION = 5
 _MAX_TRANSFER_ENTRIES = 256
 _CPU_TASKS = 256
-_COMPLETION_FIELDS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +22,6 @@ class ArenaCapacity:
     transfer_bytes: int
     transfer_tickets: int
     cpu_tasks: int
-    pinned_staging_bytes: int
 
 
 def operation_window(pipeline_depth: int, max_operations: int) -> int:
@@ -55,16 +52,8 @@ def model_arena_capacity(
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_operations
-    window = operation_window(depth, max_operations)
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(deployment.block_size)
-    kv_pages = int(num_blocks) + ceil_div(int(scratch_capacity_tokens), block_size)
-    routes = {
-        stage.route
-        for variant in model.supported_work
-        for stage in model.lower(variant, retain_image=True)
-    }
-    max_route_tokens = max((model.route_max_tokens(route) for route in routes), default=1)
     max_transfer_bytes = max(
         int(num_blocks) * block_size * int(bytes_per_token),
         int(max_latent_feature_bytes),
@@ -105,9 +94,6 @@ def model_arena_capacity(
         max_product_bytes=max_product_bytes,
     )
 
-    per_operation_staging = payload_bytes + max_route_tokens * 32 + kv_pages * 8 + 256
-    completion_words = _COMPLETION_FIELDS * max_operations + (payload_bytes + 3) // 4
-    completion_arena_bytes = depth * completion_words * 8
     return ArenaCapacity(
         latent_bytes=latent_bytes,
         device_products=device_products,
@@ -115,10 +101,6 @@ def model_arena_capacity(
         transfer_bytes=max_transfer_bytes * transfer_tickets,
         transfer_tickets=transfer_tickets,
         cpu_tasks=_CPU_TASKS,
-        pinned_staging_bytes=max(
-            completion_arena_bytes,
-            per_operation_staging * window,
-        ),
     )
 
 
@@ -134,9 +116,6 @@ def system_arena_capacity(
     if depth < 1 or operations < 1 or payload_bytes < 1:
         raise ValueError("system arena sizing requires positive runtime bounds")
     slots = depth * operations
-    window = operation_window(depth, operations)
-    per_operation_staging = payload_bytes + 256
-    completion_words = _COMPLETION_FIELDS * operations + (payload_bytes + 3) // 4
     return ArenaCapacity(
         latent_bytes=0,
         device_products=1,
@@ -144,10 +123,6 @@ def system_arena_capacity(
         transfer_bytes=(1 << 20) * slots,
         transfer_tickets=slots,
         cpu_tasks=_CPU_TASKS,
-        pinned_staging_bytes=max(
-            depth * completion_words * 8,
-            per_operation_staging * window,
-        ),
     )
 
 

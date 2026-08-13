@@ -46,6 +46,7 @@ class SystemWorker:
         *,
         allowed_work_variants: frozenset[WorkVariant],
         block_size: int,
+        max_batch_tokens: int,
         transfer_backend: str,
         pipeline_depth: int,
         completion_payload_bytes: int,
@@ -106,6 +107,8 @@ class SystemWorker:
             encoder_cache_budget=0,
             supported_controls=controls,
             max_batch_operations=_MAX_OPERATIONS,
+            max_batch_tokens=int(max_batch_tokens),
+            max_request_pool_size=_MAX_OPERATIONS,
             max_unresolved_window=window,
             incremental_kv_publication=True,
             tensorized_mixed=False,
@@ -149,6 +152,7 @@ class SystemWorker:
             runner=None,
             attention=None,
             sessions=self.sessions,
+            runtime_states=None,
             cache_pool=self.cache_pool,
             latents=self.latents,
             products=self.products,
@@ -164,7 +168,6 @@ class SystemWorker:
             pipeline_depth=pipeline_depth,
             completion_payload_bytes=completion_payload_bytes,
             cpu_task_capacity=arena.cpu_tasks,
-            pinned_staging_capacity=arena.pinned_staging_bytes,
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:

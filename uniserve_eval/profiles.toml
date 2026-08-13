@@ -3,7 +3,7 @@ artifact_root = "artifacts/benchmark"
 [servers.qwen]
 host = "127.0.0.1"
 port = 18081
-command = ["target/release/uniserve", "serve", "${UNISERVE_QWEN3_MODEL}", "--model-description", "qwen3", "--served-model-name", "Qwen3-32B", "--host", "127.0.0.1", "--port", "18081", "--worker-python", ".venv/bin/python", "--max-total-tokens", "131072", "--max-running-requests", "128", "--max-num-batched-tokens", "16384", "--chunked-prefill-size", "16384", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--prefill-cuda-graph-warmup", "true"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_QWEN3_MODEL}", "--model-description", "qwen3", "--served-model-name", "Qwen3-32B", "--host", "127.0.0.1", "--port", "18081", "--worker-python", ".venv/bin/python", "--max-total-tokens", "131072", "--max-running-requests", "128", "--max-num-batched-tokens", "16384", "--chunked-prefill-size", "16384", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true"]
 
 [servers.qwen.environment]
 CUDA_VISIBLE_DEVICES = "0"
@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES = "0"
 [servers.sensenova]
 host = "127.0.0.1"
 port = 18082
-command = ["target/release/uniserve", "serve", "${UNISERVE_SENSENOVA_MODEL}", "--model-description", "sensenova", "--served-model-name", "SenseNova-U1", "--host", "127.0.0.1", "--port", "18082", "--worker-python", ".venv/bin/python", "--max-running-requests", "32", "--max-num-batched-tokens", "8192", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--prefill-cuda-graph-warmup", "true"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_SENSENOVA_MODEL}", "--model-description", "sensenova", "--served-model-name", "SenseNova-U1", "--host", "127.0.0.1", "--port", "18082", "--worker-python", ".venv/bin/python", "--max-running-requests", "32", "--max-num-batched-tokens", "8192", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true"]
 
 [servers.sensenova.environment]
 CUDA_VISIBLE_DEVICES = "0"

@@ -23,6 +23,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         return SystemWorker(
             allowed_work_variants=plan.allowed_work_variants,
             block_size=config.resources.block_size,
+            max_batch_tokens=config.resources.max_batch_tokens,
             transfer_backend=config.data_plane.backend,
             pipeline_depth=config.ipc.pipeline_depth,
             completion_payload_bytes=config.ipc.max_payload_bytes,
@@ -54,7 +55,10 @@ def assemble_worker(config: WorkerLaunchConfig):
         stub = StubModel()
         model: ExecutionModel = stub
         deployment = replace(
-            stub_deployment(config.resources.block_size),
+            stub_deployment(
+                config.resources.block_size,
+                max_batch_tokens=config.resources.max_batch_tokens,
+            ),
             device=config.placement.device,
             model_scope=plan.model_scope.value,
             tp_rank=config.placement.tp_rank,
@@ -86,6 +90,7 @@ def assemble_worker(config: WorkerLaunchConfig):
                 model_path=config.model.path,
                 device=config.placement.device,
                 block_size=config.resources.block_size,
+                max_batch_tokens=config.resources.max_batch_tokens,
                 kv_token_capacity=config.resources.kv_token_capacity,
                 attention_backend=config.model.attention_backend,
                 execution=config.execution,

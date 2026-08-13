@@ -21,9 +21,16 @@ def execution_worker(
     pipeline_depth: int = 1,
     snapshot_dir: str | None = None,
     transfer_backend: str = "local",
+    execution: ExecutionConfig | None = None,
+    max_batch_tokens: int = 8192,
+    max_request_pool_size: int = 128,
 ) -> ModelWorker:
     ready = StubModel() if model is None else model
-    deployment = replace(stub_deployment(block_size), device=device)
+    deployment = replace(
+        stub_deployment(block_size, max_batch_tokens=max_batch_tokens),
+        device=device,
+        max_request_pool_size=max_request_pool_size,
+    )
     worker = ModelWorker(
         ready,
         mesh=DeviceMesh.trivial(device),
@@ -33,7 +40,11 @@ def execution_worker(
             tuning=FlashInferTuningConfig(),
             block_size=block_size,
         ),
-        execution=ExecutionConfig(cuda_graph=False, prefill_cuda_graph=False),
+        execution=(
+            ExecutionConfig(cuda_graph=False, prefill_cuda_graph=False)
+            if execution is None
+            else execution
+        ),
         tokenizer=None,
         allowed_work_variants=ready.supported_work,
         defer_sampling=defer_sampling,

@@ -1,4 +1,4 @@
-"""Immutable values crossing the runner-to-model boundary.
+"""Ephemeral tensor views crossing the runner-to-model boundary.
 
 The model receives one :class:`ForwardBatch` and returns one
 :class:`ForwardOutput`.  Both sides are closed, row-aligned value algebras;
@@ -14,15 +14,6 @@ from enum import StrEnum
 from typing import Protocol, TypeAlias, runtime_checkable
 
 import torch
-
-
-class RouteId(str):
-    """Validated physical route identity."""
-
-    def __new__(cls, value: str) -> RouteId:
-        if not isinstance(value, str) or not value:
-            raise ValueError("route id must be a non-empty string")
-        return str.__new__(cls, value)
 
 
 @runtime_checkable
@@ -225,13 +216,6 @@ class EmptyOutputView:
         raise RuntimeError("this forward route has no output view")
 
 
-@dataclass(frozen=True, slots=True)
-class GraphBinding:
-    """Opaque per-capture identity with no executable behavior."""
-
-    identity: int
-
-
 @runtime_checkable
 class AttentionBackend(Protocol):
     """One explicitly provisioned attention implementation."""
@@ -279,7 +263,7 @@ class PagedDecodePlan:
     decode_page_offsets: torch.Tensor
     max_context_len: int
     causal: bool
-    binding: GraphBinding
+    binding: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +285,7 @@ class PagedVarlenPlan:
     max_seqlen_k: int
     max_context_len: int
     causal: bool
-    binding: GraphBinding
+    binding: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,94 +309,18 @@ class PackedAttentionPlan:
     max_seqlen_k: int
     use_prefix_bounds: bool
     fully_visible: bool
-    binding: GraphBinding
+    binding: int
+    query_lens_cpu: tuple[int, ...]
+    key_lens_cpu: tuple[int, ...]
 
 
 AttnPlan: TypeAlias = NoAttention | PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
-
-
-@dataclass(frozen=True, slots=True)
-class ForwardContext:
-    """The complete bounded capability set for one model call."""
-
-    kv: KvView | EmptyKvView
-    latent: LatentView | EmptyLatentView
-    attention: AttnPlan
-    mesh: MeshView | EmptyMeshView
-    output: OutputView | EmptyOutputView
 
 
 class TokenSelection(StrEnum):
     LAST_LOGITS = "last_logits"
     ALL_LOGITS = "all_logits"
     HIDDEN = "hidden"
-
-
-@dataclass(frozen=True, slots=True)
-class TokenIds:
-    values: torch.Tensor
-
-    def __post_init__(self) -> None:
-        if self.values.dtype not in (torch.int32, torch.int64):
-            raise ValueError("token ids must use an integer dtype")
-
-
-@dataclass(frozen=True, slots=True)
-class TokenEmbeddings:
-    values: torch.Tensor
-
-    def __post_init__(self) -> None:
-        if not self.values.is_floating_point():
-            raise ValueError("token embeddings must use a floating dtype")
-
-
-TokenSegment: TypeAlias = TokenIds | TokenEmbeddings
-
-
-@dataclass(frozen=True, slots=True)
-class TokenSegments:
-    """Ordered token-id and embedding spans forming one logical token row."""
-
-    values: tuple[TokenSegment, ...]
-
-    def __post_init__(self) -> None:
-        if not self.values:
-            raise ValueError("segmented token input must contain at least one span")
-
-
-TokenInput: TypeAlias = TokenIds | TokenEmbeddings | TokenSegments
-
-
-@dataclass(frozen=True, slots=True)
-class TokenRow:
-    """Autoregressive or multimodal token computation."""
-
-    row_id: int
-    inputs: TokenInput
-    positions: torch.Tensor
-    output_slot: int
-    selection: TokenSelection
-
-    def __post_init__(self) -> None:
-        _validate_row(self.row_id, self.output_slot)
-        if self.positions.dtype not in (torch.int32, torch.int64):
-            raise ValueError("token positions must use an integer dtype")
-
-
-def packed_token_ids(rows: Sequence[TokenRow]) -> torch.Tensor | None:
-    """Return the shared contiguous token-id storage behind aligned row views."""
-
-    if not rows or any(not isinstance(row.inputs, TokenIds) for row in rows):
-        return None
-    return packed_tensor_views(
-        tuple(row.inputs.values for row in rows if isinstance(row.inputs, TokenIds))
-    )
-
-
-def packed_token_positions(rows: Sequence[TokenRow]) -> torch.Tensor | None:
-    """Return the shared contiguous position storage behind aligned row views."""
-
-    return packed_tensor_views(tuple(row.positions for row in rows))
 
 
 def packed_tensor_views(values: Sequence[torch.Tensor]) -> torch.Tensor | None:
@@ -439,11 +347,6 @@ def packed_tensor_views(values: Sequence[torch.Tensor]) -> torch.Tensor | None:
 
 
 @dataclass(frozen=True, slots=True)
-class NoFlowConditioning:
-    """Typed absence of external conditioning features."""
-
-
-@dataclass(frozen=True, slots=True)
 class FlowPatches:
     """Explicit current-latent patches for a flow branch's neural tower."""
 
@@ -460,229 +363,125 @@ class FlowPatches:
             raise ValueError("flow noise scale must be scalar")
 
 
-FlowConditioning: TypeAlias = NoFlowConditioning | FlowPatches
-
-
-@dataclass(frozen=True, slots=True)
-class FlowRow:
-    """One raw diffusion or rectified-flow branch evaluation."""
-
-    row_id: int
-    conditioning: FlowConditioning
-    positions: torch.Tensor
-    timestep: torch.Tensor
-    latent: torch.Tensor
-    image_tokens: int
-    image_height: int
-    image_width: int
-    output_slot: int
-
-    def __post_init__(self) -> None:
-        _validate_row(self.row_id, self.output_slot)
-        if self.image_tokens < 1 or self.image_height < 1 or self.image_width < 1:
-            raise ValueError("flow image geometry must be positive")
-
-
 class EncodeKind(StrEnum):
     VISION = "vision"
     LATENT = "latent"
 
 
-@dataclass(frozen=True, slots=True)
-class PatchInput:
-    pixels: torch.Tensor
-    grid: torch.Tensor
-    # Host-known patch grid (grid_height, grid_width) for this one image, taken
-    # from the registration-time image transform. Lets the encoder resolve the
-    # per-image conv geometry without reading the device ``grid`` tensor back.
-    grid_shape: tuple[int, int]
-
-
-@dataclass(frozen=True, slots=True)
-class TowerInput:
-    pixels: torch.Tensor
-
-
-EncodeInput: TypeAlias = PatchInput | TowerInput
-
-
-@dataclass(frozen=True, slots=True)
-class EncodeRow:
-    """Encoder or tower computation over an explicit tensor input."""
-
-    row_id: int
-    kind: EncodeKind
-    inputs: EncodeInput
-    output_slot: int
-
-    def __post_init__(self) -> None:
-        _validate_row(self.row_id, self.output_slot)
-
-
-@dataclass(frozen=True, slots=True)
-class DecodeRow:
-    """Neural decoding of an explicit latent into a product tensor."""
-
-    row_id: int
-    latent: torch.Tensor
-    image_height: int
-    image_width: int
-    output_slot: int
-
-    def __post_init__(self) -> None:
-        _validate_row(self.row_id, self.output_slot)
-        if self.image_height < 1 or self.image_width < 1:
-            raise ValueError("decode image geometry must be positive")
-
-
-ForwardRow: TypeAlias = TokenRow | FlowRow | EncodeRow | DecodeRow
+class ModelPhase(StrEnum):
+    TEXT = "text"
+    DENOISE = "denoise"
+    ENCODE_VISION = "encode_vision"
+    ENCODE_LATENT = "encode_latent"
+    DECODE_LATENT = "decode_latent"
 
 
 @dataclass(frozen=True, slots=True)
 class ForwardBatch:
-    """The sole immutable argument accepted by a concrete model."""
+    """One borrowed columnar view over execution-partition input buffers."""
 
-    route: RouteId
-    rows: tuple[ForwardRow, ...]
-    context: ForwardContext
+    phase: ModelPhase
+    row_count: int
+    request_pool_indices: torch.Tensor
+    attention: AttnPlan
+    token_row_indices: tuple[int, ...] = ()
+    flow_row_indices: tuple[int, ...] = ()
+    input_ids: torch.Tensor | None = None
+    input_embeddings: torch.Tensor | None = None
+    embedding_mask: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
+    query_lens: tuple[int, ...] = ()
+    token_selections: tuple[TokenSelection, ...] = ()
+    flow_positions: tuple[torch.Tensor, ...] = ()
+    flow_timesteps: tuple[torch.Tensor, ...] = ()
+    flow_latents: tuple[torch.Tensor, ...] = ()
+    flow_conditioning: tuple[FlowPatches | None, ...] = ()
+    flow_image_tokens: tuple[int, ...] = ()
+    flow_heights: tuple[int, ...] = ()
+    flow_widths: tuple[int, ...] = ()
+    encode_pixels: tuple[torch.Tensor, ...] = ()
+    encode_grids: tuple[torch.Tensor | None, ...] = ()
+    encode_grid_shapes: tuple[tuple[int, int] | None, ...] = ()
+    decode_latents: tuple[torch.Tensor, ...] = ()
+    decode_heights: tuple[int, ...] = ()
+    decode_widths: tuple[int, ...] = ()
+    kv: KvView | EmptyKvView = EmptyKvView()
+    mesh: MeshView | EmptyMeshView = EmptyMeshView()
+    output: OutputView | EmptyOutputView = EmptyOutputView()
 
     def __post_init__(self) -> None:
-        if not self.rows:
+        if self.row_count < 1:
             raise ValueError("forward batch must contain at least one row")
-        row_ids = tuple(row.row_id for row in self.rows)
-        if len(set(row_ids)) != len(row_ids):
-            raise ValueError("forward row ids must be unique")
-        slots = tuple(row.output_slot for row in self.rows)
-        if len(set(slots)) != len(slots):
-            raise ValueError("forward output slots must be unique")
-
-
-@dataclass(frozen=True, slots=True)
-class TokenLogits:
-    value: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class TokenHidden:
-    value: torch.Tensor
-
-
-TokenValue: TypeAlias = TokenLogits | TokenHidden
-
-
-@dataclass(frozen=True, slots=True)
-class TokenOutput:
-    row_id: int
-    output_slot: int
-    value: TokenValue
-
-
-@dataclass(frozen=True, slots=True)
-class FlowOutput:
-    row_id: int
-    output_slot: int
-    prediction: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class EncodeOutput:
-    row_id: int
-    output_slot: int
-    features: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class DecodeOutput:
-    row_id: int
-    output_slot: int
-    tensor: torch.Tensor
-
-
-ForwardRowOutput: TypeAlias = TokenOutput | FlowOutput | EncodeOutput | DecodeOutput
+        if int(self.request_pool_indices.numel()) != self.row_count:
+            raise ValueError("forward request indices do not align with rows")
+        row_indices = (*self.token_row_indices, *self.flow_row_indices)
+        if row_indices and (
+            len(set(row_indices)) != len(row_indices)
+            or min(row_indices) < 0
+            or max(row_indices) >= self.row_count
+        ):
+            raise ValueError("forward row indexes are invalid")
+        if len(self.token_row_indices) != len(self.query_lens) or len(
+            self.token_row_indices
+        ) != len(self.token_selections):
+            raise ValueError("forward token columns are not aligned")
+        flow_count = len(self.flow_row_indices)
+        if any(
+            len(values) != flow_count
+            for values in (
+                self.flow_positions,
+                self.flow_timesteps,
+                self.flow_latents,
+                self.flow_conditioning,
+                self.flow_image_tokens,
+                self.flow_heights,
+                self.flow_widths,
+            )
+        ):
+            raise ValueError("forward flow columns are not aligned")
+        encode_count = len(self.encode_pixels)
+        if any(
+            len(values) != encode_count for values in (self.encode_grids, self.encode_grid_shapes)
+        ):
+            raise ValueError("forward encoder columns are not aligned")
+        decode_count = len(self.decode_latents)
+        if any(len(values) != decode_count for values in (self.decode_heights, self.decode_widths)):
+            raise ValueError("forward decoder columns are not aligned")
 
 
 @dataclass(frozen=True, slots=True)
 class ForwardOutput:
-    """Ordered raw neural outputs aligned with :class:`ForwardBatch.rows`."""
+    """Ordered raw tensors aligned with a :class:`ForwardBatch`."""
 
-    rows: tuple[ForwardRowOutput, ...]
+    values: tuple[torch.Tensor, ...]
 
     def validate_for(self, batch: ForwardBatch) -> None:
-        if len(self.rows) != len(batch.rows):
+        if len(self.values) != batch.row_count:
             raise ValueError("model output count does not match forward rows")
-        for input_row, output_row in zip(batch.rows, self.rows, strict=True):
-            if output_row.row_id != input_row.row_id:
-                raise ValueError("model output row id does not match its input row")
-            if output_row.output_slot != input_row.output_slot:
-                raise ValueError("model output slot does not match its input row")
-            if not _matching_output(input_row, output_row):
-                raise ValueError("model output variant does not match its input row")
-
-
-def _validate_row(row_id: int, output_slot: int) -> None:
-    if row_id < 0 or output_slot < 0:
-        raise ValueError("row id and output slot must be non-negative")
-
-
-def _matching_output(input_row: ForwardRow, output_row: ForwardRowOutput) -> bool:
-    return (
-        isinstance(input_row, TokenRow)
-        and isinstance(output_row, TokenOutput)
-        or isinstance(input_row, FlowRow)
-        and isinstance(output_row, FlowOutput)
-        or isinstance(input_row, EncodeRow)
-        and isinstance(output_row, EncodeOutput)
-        or isinstance(input_row, DecodeRow)
-        and isinstance(output_row, DecodeOutput)
-    )
+        if any(not isinstance(value, torch.Tensor) for value in self.values):
+            raise TypeError("model output values must be tensors")
 
 
 __all__ = [
     "AttnPlan",
-    "DecodeOutput",
-    "DecodeRow",
     "EmptyKvView",
     "EmptyLatentView",
     "EmptyMeshView",
     "EmptyOutputView",
-    "EncodeInput",
     "EncodeKind",
-    "EncodeOutput",
-    "EncodeRow",
-    "FlowOutput",
-    "FlowConditioning",
     "FlowPatches",
-    "FlowRow",
     "ForwardBatch",
-    "ForwardContext",
     "ForwardOutput",
-    "ForwardRow",
-    "ForwardRowOutput",
-    "GraphBinding",
     "KvView",
     "LatentView",
     "MeshView",
     "NoAttention",
-    "NoFlowConditioning",
     "OutputView",
     "PackedAttentionPlan",
     "PagedDecodePlan",
     "PagedVarlenPlan",
-    "PatchInput",
-    "RouteId",
-    "TokenEmbeddings",
-    "TokenHidden",
-    "TokenIds",
-    "TokenInput",
-    "TokenLogits",
-    "TokenOutput",
-    "TokenRow",
-    "TokenSegment",
-    "TokenSegments",
+    "ModelPhase",
     "TokenSelection",
-    "TowerInput",
     "WrittenRange",
     "packed_tensor_views",
-    "packed_token_ids",
-    "packed_token_positions",
 ]

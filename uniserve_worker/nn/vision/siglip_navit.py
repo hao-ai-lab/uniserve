@@ -1,4 +1,5 @@
 """Shared SigLIP-NaViT encoder."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from ..layer import LayerSpec
 from ..linear import LinearBase
 from .encoder import VisionEncoder, VisionEncoderConfig
@@ -15,9 +16,9 @@ from .patching import patchify_batch
 from .position import get_flattened_position_ids_extrapolate
 
 __all__ = [
-    'SiglipNavitConfig',
-    'SIGLIP_SO400M',
-    'SiglipNavitEncoder',
+    "SiglipNavitConfig",
+    "SIGLIP_SO400M",
+    "SiglipNavitEncoder",
 ]
 
 
@@ -74,7 +75,7 @@ class SiglipNavitEncoder(nn.Module):
         self,
         pixels: torch.Tensor,
         grid: Any,
-        context: ForwardContext,
+        context: ForwardBatch,
     ) -> torch.Tensor:
         packed, pos_ids, cu_seqlens, seq_lens = self._pack_inputs(pixels, grid)
         x = self.patch_embedding(packed) + self.position_embedding(pos_ids)
@@ -120,5 +121,7 @@ class SiglipNavitEncoder(nn.Module):
             self.max_num_patch_per_side,
             device=pixels.device,
         ).repeat(batch)
-        cu = torch.arange(0, (batch + 1) * per_image, per_image, device=pixels.device, dtype=torch.int32)
+        cu = torch.arange(
+            0, (batch + 1) * per_image, per_image, device=pixels.device, dtype=torch.int32
+        )
         return patches, pos, cu, (per_image,) * int(batch)

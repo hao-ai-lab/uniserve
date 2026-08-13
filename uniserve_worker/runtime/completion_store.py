@@ -328,6 +328,13 @@ class CompletionArena:
         self._cursor = 0
         self._next_owner = 1
 
+    def close(self) -> None:
+        for slot in self._slots:
+            slot.events.clear()
+        self._slots.clear()
+        self._free_token_ranges.clear()
+        self._host_tokens = torch.empty(0, dtype=torch.long)
+
     def reserve(
         self,
         rows: int,

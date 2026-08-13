@@ -34,10 +34,10 @@ use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyModule};
+use pyo3::types::{PyAny, PyDict, PyList, PyModule};
 use pythonize::{depythonize, pythonize};
 use uniserve_worker_ipc_core::ServerEndpoint;
-use uniserve_worker_wire::{RequestKind, WorkerRequest, WorkerResponse};
+use uniserve_worker_wire::{Batch, RequestKind, WorkerRequest, WorkerResponse};
 
 #[pyclass(name = "Server")]
 struct PyServer {
@@ -131,16 +131,20 @@ fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyA
     // decoder preserve that validation result instead of hashing every operation
     // again. Rare request kinds keep the reflective conversion.
     if request.kind == RequestKind::Execute {
-        let request = convert::execute_request_to_py(py, request)?;
-        mark_validated_batch(py, &request)?;
-        return Ok(request.into_any().unbind());
+        let object = convert::execute_request_to_py(py, request)?;
+        mark_validated_batch(py, &object, request.batch.as_ref())?;
+        return Ok(object.into_any().unbind());
     }
     let object = pythonize(py, request)
         .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
     Ok(object.unbind())
 }
 
-fn mark_validated_batch(py: Python<'_>, request: &Bound<'_, PyDict>) -> PyResult<()> {
+fn mark_validated_batch(
+    py: Python<'_>,
+    request: &Bound<'_, PyDict>,
+    validated: Option<&Batch>,
+) -> PyResult<()> {
     if let Some(batch) = request.get_item("batch")? {
         let batch = batch.cast::<PyDict>()?;
         let module = py.import("uniserve_worker.batch")?;
@@ -148,6 +152,19 @@ fn mark_validated_batch(py: Python<'_>, request: &Bound<'_, PyDict>) -> PyResult
             module.getattr("_WIRE_VALIDATION_KEY")?,
             module.getattr("_WIRE_VALIDATION_TOKEN")?,
         )?;
+        if let Some(validated) = validated {
+            let controls = batch
+                .get_item("controls")?
+                .ok_or_else(|| py_runtime("validated batch has no controls"))?;
+            let controls = controls.cast::<PyList>()?;
+            if controls.len() != validated.controls.len() {
+                return Err(py_runtime("validated batch controls are not aligned"));
+            }
+            for (wire, control) in controls.iter().zip(&validated.controls) {
+                wire.cast::<PyDict>()?
+                    .set_item("_content_digest", control.content_digest())?;
+            }
+        }
     }
     Ok(())
 }
@@ -204,7 +221,7 @@ mod tests {
             let request = PyDict::new(py);
             let batch = PyDict::new(py);
             request.set_item("batch", &batch).unwrap();
-            mark_validated_batch(py, &request).unwrap();
+            mark_validated_batch(py, &request, None).unwrap();
             let module = py.import("uniserve_worker.batch").unwrap();
             let key = module.getattr("_WIRE_VALIDATION_KEY").unwrap();
             let token = module.getattr("_WIRE_VALIDATION_TOKEN").unwrap();

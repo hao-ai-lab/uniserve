@@ -4,12 +4,14 @@
 //! The request-response ports (`Client`/`Server`) carry no file descriptor, so
 //! they cannot be parked on directly — only an event `Listener` implements
 //! `SynchronousMultiplexing`. Each request-response service therefore gets a
-//! companion `<svc>/evt_wake` event service: the worker notifies after sending a
-//! response, and the host's command ingress / worker-death watcher notify here
-//! too; the host (client) parks here for {result, command, death} (the scheduler
-//! park). Worker request pickup uses the bounded ring poll in
-//! [`crate::ServerEndpoint::recv`], which avoids building a wake backlog while
-//! the worker is inside long GPU sections.
+//! companion `<svc>/evt_host_wake` event service: the worker notifies after
+//! sending a response, and the host's command ingress / worker-death watcher
+//! notify here too; the host (client) parks here for {result, command, death}
+//! (the scheduler park). A separate `<svc>/evt_worker_wake` service carries
+//! request-ring notifications to the worker. Keeping the two directions separate is
+//! essential: an event notifier broadcasts to every listener on its service, so
+//! a shared service would enqueue every result on the worker's own listener
+//! while it is busy on the GPU and eventually overflow that listener.
 //!
 //! Every wait carries a bounded safety-net timeout ([`EVENT_WAIT_SAFETY_NET`]),
 //! so a missed notification degrades to the old poll latency instead of
@@ -28,12 +30,14 @@ use iceoryx2::service::port_factory::event::PortFactory as EventFactory;
 
 use crate::IxService;
 
-/// `evt_wake`: the worker signals the host that a response is available.
+/// `evt_host_wake`: the worker signals the host that a response is available.
 pub const EVT_RESULT: usize = 2;
-/// `evt_wake`: the command ingress signals the host that a command was enqueued.
+/// `evt_host_wake`: command ingress signals that work was enqueued for the host.
 pub const EVT_COMMAND: usize = 3;
-/// `evt_wake`: the worker-death watcher signals the host that the worker exited.
+/// `evt_host_wake`: the worker-death watcher signals worker exit to the host.
 pub const EVT_DEATH: usize = 4;
+/// `evt_worker_wake`: the host signals that an IPC request was queued.
+pub const EVT_REQUEST: usize = 5;
 
 /// Env switch for the event-driven boundary. Default on; set to `0`/`false`/
 /// `off` to fall back to the fixed-interval poll on both ends. The host
@@ -58,8 +62,12 @@ pub fn event_driven_enabled() -> bool {
     }
 }
 
-fn wake_event_name(svc: &str) -> String {
-    format!("{svc}/evt_wake")
+fn host_wake_event_name(svc: &str) -> String {
+    format!("{svc}/evt_host_wake")
+}
+
+fn worker_wake_event_name(svc: &str) -> String {
+    format!("{svc}/evt_worker_wake")
 }
 
 fn open_event_service(
@@ -92,9 +100,8 @@ fn make_listener(factory: &EventFactory<IxService>) -> anyhow::Result<Listener<I
         .map_err(|e| anyhow::anyhow!("creating iceoryx2 listener: {e:?}"))
 }
 
-/// A cloneable, thread-safe wake source: a shared notifier port plus the
-/// `EventId` to stamp. Used for the host-local command and worker-death wakes,
-/// which can fire from arbitrary frontend / watcher threads.
+/// A cloneable, thread-safe host wake source plus the `EventId` to stamp.
+/// Commands and worker death can fire from arbitrary frontend / watcher threads.
 #[derive(Clone)]
 pub struct WakeSender {
     notifier: Arc<Notifier<IxService>>,
@@ -133,25 +140,29 @@ impl WakeEvents {
     }
 }
 
-/// Host-side (client) event ports: a listener for {result, command, death} and
-/// a notifier used by host-local wake sources.
+/// Host-side event ports: a listener for {result, command, death}, a host-local
+/// notifier, and a distinct notifier for the worker's request listener.
 pub(crate) struct ClientEvents {
     wake_listener: Listener<IxService>,
     wake_notifier: Arc<Notifier<IxService>>,
+    request_notifier: Notifier<IxService>,
     command_pending: Arc<AtomicBool>,
     death_pending: Arc<AtomicBool>,
 }
 
 impl ClientEvents {
     pub(crate) fn open(node: &Node<IxService>, service: &str) -> anyhow::Result<Self> {
-        let wake = open_event_service(node, &wake_event_name(service))?;
+        let wake = open_event_service(node, &host_wake_event_name(service))?;
+        let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
         let wake_notifier = Arc::new(make_notifier(&wake, EVT_COMMAND)?);
+        let request_notifier = make_notifier(&request_wake, EVT_REQUEST)?;
         let wake_listener = make_listener(&wake)?;
         let command_pending = Arc::new(AtomicBool::new(false));
         let death_pending = Arc::new(AtomicBool::new(false));
         Ok(Self {
             wake_listener,
             wake_notifier,
+            request_notifier,
             command_pending,
             death_pending,
         })
@@ -197,10 +208,17 @@ impl ClientEvents {
             pending: Arc::clone(&self.death_pending),
         }
     }
+
+    /// Tell the worker that one or more requests are available in the ring.
+    pub(crate) fn notify_request(&self) {
+        let _ = self
+            .request_notifier
+            .notify_with_custom_event_id(EventId::new(EVT_REQUEST));
+    }
 }
 
-/// Worker-side (server) event ports: a notifier fired after each response so
-/// the host wakes immediately.
+/// Worker-side event ports: a notifier fired after each response on the host
+/// service and a listener on the separate request service.
 pub(crate) struct ServerEvents {
     wake_notifier: Notifier<IxService>,
     wake_listener: Listener<IxService>,
@@ -208,9 +226,10 @@ pub(crate) struct ServerEvents {
 
 impl ServerEvents {
     pub(crate) fn open(node: &Node<IxService>, service: &str) -> anyhow::Result<Self> {
-        let wake = open_event_service(node, &wake_event_name(service))?;
+        let wake = open_event_service(node, &host_wake_event_name(service))?;
+        let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
         let wake_notifier = make_notifier(&wake, EVT_RESULT)?;
-        let wake_listener = make_listener(&wake)?;
+        let wake_listener = make_listener(&request_wake)?;
         Ok(Self {
             wake_notifier,
             wake_listener,
@@ -224,14 +243,23 @@ impl ServerEvents {
             .notify_with_custom_event_id(EventId::new(EVT_RESULT));
     }
 
-    /// Park until an inbound command wake fires or `timeout` elapses, draining
-    /// every pending event id. The command ingress fires `EVT_COMMAND` on send,
-    /// so an idle server wakes immediately instead of polling; the timeout is the
+    /// Park until an inbound request wake fires or `timeout` elapses, draining
+    /// every pending event id. The IPC client fires `EVT_REQUEST` after send, so
+    /// an idle server wakes immediately instead of polling; the timeout is the
     /// safety-net re-check floor for a missed notification.
-    pub(crate) fn wait_command(&self, timeout: Duration) -> anyhow::Result<()> {
+    pub(crate) fn wait_request(&self, timeout: Duration) -> anyhow::Result<()> {
         self.wake_listener
             .timed_wait_all(|_id| {}, timeout)
             .map_err(|e| anyhow::anyhow!("waiting on iceoryx2 server wake listener: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Drain request notifications after consuming from the ring. This keeps a
+    /// busy worker's event queue aligned with the ring it is already servicing.
+    pub(crate) fn drain_requests(&self) -> anyhow::Result<()> {
+        self.wake_listener
+            .try_wait_all(|_id| {})
+            .map_err(|e| anyhow::anyhow!("draining iceoryx2 worker wake listener: {e:?}"))?;
         Ok(())
     }
 }
@@ -252,6 +280,7 @@ mod tests {
             .as_nanos();
         let service = format!("uniserve/test/events/{}/{nonce}", std::process::id());
         let events = ClientEvents::open(&node, &service).expect("open client events");
+        let server = ServerEvents::open(&node, &service).expect("open server events");
         let command = events.command_wake();
         let death = events.death_wake();
 
@@ -263,6 +292,18 @@ mod tests {
                 .wait(Duration::from_secs(1))
                 .expect("drain command wake")
                 .command
+        );
+        events.notify_request();
+        server
+            .wait_request(Duration::from_secs(1))
+            .expect("drain worker request wake");
+
+        server.notify_response();
+        assert!(
+            events
+                .wait(Duration::from_secs(1))
+                .expect("receive result wake")
+                .result
         );
 
         command.wake();

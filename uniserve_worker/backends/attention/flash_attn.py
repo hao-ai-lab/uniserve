@@ -1,14 +1,15 @@
 """flash-attn attention backend."""
+
 from __future__ import annotations
 
 import torch
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from .base import AttentionCapabilities
 from .layout import QKVLayout, normalize_kv, normalize_to
 
 __all__ = [
-    'FlashAttentionBackend',
+    "FlashAttentionBackend",
 ]
 
 try:  # pragma: no cover - optional CUDA package.
@@ -53,7 +54,7 @@ class FlashAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if _flash_attn_func is None:
@@ -84,7 +85,7 @@ class FlashAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if _flash_attn_with_kvcache is None:
@@ -124,7 +125,7 @@ class FlashAttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if _flash_attn_varlen_func is None:

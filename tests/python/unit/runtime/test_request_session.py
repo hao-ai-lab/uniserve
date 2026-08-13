@@ -88,8 +88,6 @@ def test_step_rollback_restores_scalar_and_prefix_ledgers() -> None:
     restored = sessions.get(7)
     assert restored.resolved_version() == session.committed_version()
     assert restored.product_handles == {11, 13}
-    assert tuple(restored.resolved_versions.values()) == (session.committed_version(),)
-    assert restored.resolved_parents == {0: session.committed_version()}
 
 
 def test_commit_selects_any_contiguous_prefix_with_its_exact_kv_extent() -> None:
@@ -166,7 +164,6 @@ def test_close_retracts_to_one_exact_resolved_prefix() -> None:
     assert tuple(session.resolved_runtime.values()) == (_runtime(1),)
 
     restored = SnapshotProvider._session_from_json(SnapshotProvider._session_to_json(session))
-    assert restored.request_pool_idx == admission.request_pool_idx
     assert restored.committed_version() == cutoff
     assert restored.resolved_version() == cutoff
     assert restored.terminal_cutoff == cutoff

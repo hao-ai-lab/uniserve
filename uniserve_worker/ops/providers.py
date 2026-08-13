@@ -8,7 +8,7 @@ from importlib import import_module
 
 import torch
 
-from ..forward import PagedDecodePlan
+from ..execution.forward_batch import PagedDecodePlan
 from ..foundation.env import env_flag
 from .core import Capabilities, CommDispatcher, Dispatcher, Handoff
 from .requests import (

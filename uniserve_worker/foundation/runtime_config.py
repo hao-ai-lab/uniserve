@@ -6,10 +6,13 @@ Bootstrap passes the immutable value into every configured subsystem.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, cast
 
-from .env import DEFAULT_ATTENTION_BACKEND, DEFAULT_COMPILE_BACKEND
+from uniserve_worker.batch import Domain
+
+from .env import DEFAULT_ATTENTION_BACKEND
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
@@ -18,7 +21,7 @@ __all__ = [
     "graph_padding_block_count",
     "graph_memory_budget_bytes",
     "FlashInferTuningConfig",
-    "TorchCompileRuntimeConfig",
+    "LaneConfig",
     "ExecutionConfig",
     "execution_config_from_namespace",
 ]
@@ -27,11 +30,35 @@ __all__ = [
 DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
     1,
     2,
+    3,
     4,
+    5,
+    6,
+    7,
     8,
+    9,
+    10,
+    11,
     12,
+    13,
+    14,
+    15,
     16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
     24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
     32,
     40,
     48,
@@ -152,13 +179,34 @@ def graph_memory_budget_bytes(total_device_bytes: int) -> int:
     return max(0, int(float(max(0, int(total_device_bytes))) * DEFAULT_GRAPH_MEMORY_FRACTION))
 
 
-@dataclass(frozen=True)
-class TorchCompileRuntimeConfig:
-    enabled: bool = False
-    backend: str = DEFAULT_COMPILE_BACKEND
-    mode: str | None = None
-    fullgraph: bool = False
-    dynamic: bool | None = None
+@dataclass(frozen=True, slots=True)
+class LaneConfig:
+    lane_id: str
+    sm_budget: int
+    domains: tuple[Domain, ...]
+    kv_capacity_tokens: int | None = None
+    latent_capacity_units: int | None = None
+    max_batch_operations: int | None = None
+    max_batch_tokens: int | None = None
+    max_inflight: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.lane_id or any(character.isspace() for character in self.lane_id):
+            raise ValueError("lane id must be a non-empty token")
+        if int(self.sm_budget) < 1:
+            raise ValueError("lane SM budget must be positive")
+        if not self.domains or len(set(self.domains)) != len(self.domains):
+            raise ValueError("lane domains must be non-empty and unique")
+        for name in (
+            "kv_capacity_tokens",
+            "latent_capacity_units",
+            "max_batch_operations",
+            "max_batch_tokens",
+            "max_inflight",
+        ):
+            value = getattr(self, name)
+            if value is not None and int(value) < 1:
+                raise ValueError(f"lane {name} must be positive when configured")
 
 
 @dataclass(frozen=True)
@@ -183,15 +231,15 @@ class ExecutionConfig:
     kv_memory_fraction: float = 0.70
     tp_backend: str | None = None
     tp_init_method: str | None = None
+    lanes: tuple[LaneConfig, ...] = ()
     cuda_graph: bool = True
-    cuda_graph_warmup: bool = True
-    cuda_graph_warmup_batches: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
+    decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
     prefill_cuda_graph: bool = False
-    prefill_cuda_graph_warmup: bool = False
-    prefill_cuda_graph_warmup_tokens: tuple[int, ...] = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
+    prefill_graph_token_sizes: tuple[int, ...] = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
+    flow_graph_batch_sizes: tuple[int, ...] = (1, 2, 3, 4)
+    flow_graph_shapes: tuple[tuple[int, int], ...] = ((1152, 2048), (2048, 1152))
     mixed_text_max_tokens: int = 8192
     varlen_prefill: bool = True
-    torch_compile: TorchCompileRuntimeConfig = TorchCompileRuntimeConfig()
     flashinfer: FlashInferTuningConfig = FlashInferTuningConfig()
 
 
@@ -208,27 +256,24 @@ def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
         ),
         tp_backend=_none_if_empty(namespace.tp_backend),
         tp_init_method=_none_if_empty(namespace.tp_init_method),
+        lanes=_parse_lanes(getattr(namespace, "lane", ())),
         cuda_graph=bool(namespace.cuda_graph),
-        cuda_graph_warmup=bool(namespace.cuda_graph_warmup),
-        cuda_graph_warmup_batches=_parse_positive_int_csv(
-            namespace.cuda_graph_warmup_batches,
+        decode_graph_batch_sizes=_parse_positive_int_csv(
+            namespace.decode_graph_batch_sizes,
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
         ),
         prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
-        prefill_cuda_graph_warmup=bool(namespace.prefill_cuda_graph_warmup),
-        prefill_cuda_graph_warmup_tokens=_parse_positive_int_csv(
-            namespace.prefill_cuda_graph_warmup_tokens,
+        prefill_graph_token_sizes=_parse_positive_int_csv(
+            namespace.prefill_graph_token_sizes,
             default=DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
         ),
+        flow_graph_batch_sizes=_parse_positive_int_csv(
+            namespace.flow_graph_batch_sizes,
+            default=(1, 2, 3, 4),
+        ),
+        flow_graph_shapes=_parse_image_shapes(namespace.flow_graph_shapes),
         mixed_text_max_tokens=max(0, int(namespace.mixed_text_max_tokens)),
         varlen_prefill=bool(namespace.varlen_prefill),
-        torch_compile=TorchCompileRuntimeConfig(
-            enabled=bool(namespace.torch_compile),
-            backend=str(namespace.torch_compile_backend),
-            mode=_none_if_empty(namespace.torch_compile_mode),
-            fullgraph=bool(namespace.torch_compile_fullgraph),
-            dynamic=_parse_optional_bool(namespace.torch_compile_dynamic),
-        ),
         flashinfer=FlashInferTuningConfig(
             workspace_size=max(
                 1,
@@ -285,6 +330,80 @@ def _parse_positive_int_csv(raw: object | None, *, default: tuple[int, ...]) -> 
     if tuple(sorted(set(values))) != values:
         raise ValueError("integer bucket lists must be strictly increasing")
     return values
+
+
+def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
+    if raw is None:
+        return ((1152, 2048), (2048, 1152))
+    values: list[tuple[int, int]] = []
+    for item in str(raw).split(","):
+        height_text, separator, width_text = item.strip().lower().partition("x")
+        if not separator:
+            raise ValueError("flow graph shapes must use HEIGHTxWIDTH")
+        shape = int(height_text), int(width_text)
+        if min(shape) < 1 or shape in values:
+            raise ValueError("flow graph shapes must be positive and unique")
+        values.append(shape)
+    if not values:
+        raise ValueError("flow graph shapes must not be empty")
+    return tuple(values)
+
+
+def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
+    result: list[LaneConfig] = []
+    values = () if raw is None else raw
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("lanes must be a sequence of JSON objects")
+    for index, value in enumerate(values):
+        try:
+            data = json.loads(str(value))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"lane {index} is not valid JSON") from error
+        if not isinstance(data, dict):
+            raise ValueError(f"lane {index} must be a JSON object")
+        known = {
+            "lane_id",
+            "sm_budget",
+            "domains",
+            "kv_capacity_tokens",
+            "latent_capacity_units",
+            "max_batch_operations",
+            "max_batch_tokens",
+            "max_inflight",
+        }
+        unknown = set(data).difference(known)
+        if unknown:
+            raise ValueError(f"lane {index} has unknown fields {sorted(unknown)!r}")
+        domains = data.get("domains")
+        if not isinstance(domains, list):
+            raise ValueError(f"lane {index}.domains must be a JSON list")
+        result.append(
+            LaneConfig(
+                lane_id=str(data.get("lane_id", "")),
+                sm_budget=int(data.get("sm_budget", 0)),
+                domains=tuple(Domain(str(item)) for item in domains),
+                kv_capacity_tokens=_json_optional_int(data, "kv_capacity_tokens"),
+                latent_capacity_units=_json_optional_int(data, "latent_capacity_units"),
+                max_batch_operations=_json_optional_int(data, "max_batch_operations"),
+                max_batch_tokens=_json_optional_int(data, "max_batch_tokens"),
+                max_inflight=_json_optional_int(data, "max_inflight"),
+            )
+        )
+    if len({lane.lane_id for lane in result}) != len(result):
+        raise ValueError("lane ids must be unique")
+    domains = tuple(domain for lane in result for domain in lane.domains)
+    if len(set(domains)) != len(domains):
+        raise ValueError("execution domains must have one lane binding")
+    return tuple(result)
+
+
+def _json_optional_int(data: dict[str, object], name: str) -> int | None:
+    value = data.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"lane {name} must be an integer")
+    return int(value)
 
 
 def _parse_optional_bool(value: object | None) -> bool | None:

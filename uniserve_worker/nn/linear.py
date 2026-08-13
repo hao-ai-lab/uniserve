@@ -1,4 +1,5 @@
 """Linear layers with a shared weight-loading and quantization seam."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -6,7 +7,7 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 
-from ..forward import MeshView
+from ..execution.forward_batch import MeshView
 from .layer import LayerSpec
 from .mesh import TensorParallelSpec, divide
 from .placement import (
@@ -18,11 +19,11 @@ from .placement import (
 )
 
 __all__ = [
-    'LinearBase',
-    'ColumnParallelLinear',
-    'RowParallelLinear',
-    'MergedColumnParallelLinear',
-    'QKVParallelLinear',
+    "LinearBase",
+    "ColumnParallelLinear",
+    "RowParallelLinear",
+    "MergedColumnParallelLinear",
+    "QKVParallelLinear",
 ]
 
 

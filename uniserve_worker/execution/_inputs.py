@@ -15,7 +15,6 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
 from uniserve_worker.batch import EncodeMode
-from uniserve_worker.forward import PatchInput, TowerInput
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.inputs import (
     ImageProcessor,
@@ -29,7 +28,9 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 @dataclass(frozen=True, slots=True)
 class PreparedImage:
-    inputs: PatchInput | TowerInput
+    pixels: torch.Tensor
+    grid: torch.Tensor | None
+    grid_shape: tuple[int, int] | None
     height: int
     width: int
 
@@ -61,11 +62,9 @@ def prepare_image(
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
         return PreparedImage(
-            PatchInput(
-                _stage(pixels, spec, device),
-                grid.to(device=device, non_blocking=True),
-                grid_shape=(grid_height, grid_width),
-            ),
+            _stage(pixels, spec, device),
+            grid.to(device=device, non_blocking=True),
+            (grid_height, grid_width),
             height,
             width,
         )
@@ -76,7 +75,7 @@ def prepare_image(
     height, width = canvas.height, canvas.width
     tower_image = _resize_stride(canvas, transform.resize)
     pixels = _normalize(tower_image, transform.normalization)
-    return PreparedImage(TowerInput(_stage(pixels, spec, device)), height, width)
+    return PreparedImage(_stage(pixels, spec, device), None, None, height, width)
 
 
 def prepare_tensor_image(
@@ -123,11 +122,9 @@ def prepare_tensor_image(
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
         return PreparedImage(
-            PatchInput(
-                _stage(pixels, spec, device),
-                grid.to(device=device, non_blocking=True),
-                grid_shape=(grid_height, grid_width),
-            ),
+            _stage(pixels, spec, device),
+            grid.to(device=device, non_blocking=True),
+            (grid_height, grid_width),
             source_height,
             source_width,
         )
@@ -160,7 +157,9 @@ def prepare_tensor_image(
     value = _resize_tensor(value, target_height, target_width)
     normalized = _normalize_tensor(value, transform.normalization)
     return PreparedImage(
-        TowerInput(_stage(normalized, spec, device)),
+        _stage(normalized, spec, device),
+        None,
+        None,
         source_height,
         source_width,
     )

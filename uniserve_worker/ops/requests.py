@@ -1,4 +1,5 @@
 """Typed operator requests."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +8,7 @@ from typing import Any
 
 import torch
 
-from ..forward import ForwardContext
+from ..execution.forward_batch import ForwardBatch
 
 
 class AttentionRegime(str, Enum):
@@ -87,7 +88,7 @@ class AttentionReq:
     attn_mask: torch.Tensor | None = None
     kv_cache: Any | None = None
     metadata: Any | None = None
-    ctx: ForwardContext | None = None
+    ctx: ForwardBatch | None = None
     stats: Any | None = None
     block_table: torch.Tensor | None = None
     cache_seqlens: torch.Tensor | None = None

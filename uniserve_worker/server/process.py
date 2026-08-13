@@ -70,10 +70,7 @@ def _request_session_ids(request: Mapping[str, Any]) -> frozenset[int]:
 def _response_session_ids(response: Mapping[str, Any]) -> frozenset[int]:
     report = response.get("completion_report")
     completions = getattr(report, "completions", ())
-    return frozenset(
-        int(completion.request_key.session_id)
-        for completion in completions
-    )
+    return frozenset(int(completion.request_key.session_id) for completion in completions)
 
 
 class WorkerIpcTransport(Protocol):
@@ -172,9 +169,7 @@ class WorkerServeLoop:
             if request_sessions is None:
                 # Preserve direct test/debug injection into ``inflight`` while
                 # keeping the normal polling path allocation-free.
-                request_sessions = _request_session_ids(request) | _response_session_ids(
-                    response
-                )
+                request_sessions = _request_session_ids(request) | _response_session_ids(response)
                 self._inflight_sessions[response_id] = request_sessions
             lineage_ready = earlier_sessions.isdisjoint(request_sessions)
             if lineage_ready and _response_ready(response):

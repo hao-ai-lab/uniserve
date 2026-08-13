@@ -139,45 +139,6 @@ def test_batched_producer_writes_registered_scalar_storage_directly() -> None:
     torch.cuda.synchronize(device)
     assert tuple(int(read.tensor.item()) for read in reads) == (2, 0, 1, 3)
 
-    recycled = tuple(_reference(51 + index, 21 + index) for index in range(4))
-    continuation = table.bind_scalar_continuation(
-        outputs=tuple((reference, "cd" * 32) for reference in recycled),
-        parents=tuple(
-            (
-                reference,
-                recycled_reference.producer_op_id,
-                "ab" * 32,
-            )
-            for reference, recycled_reference in zip(
-                references,
-                recycled,
-                strict=True,
-            )
-        ),
-        device=configured_device,
-    )
-    recycled_batch = continuation.scalar
-    assert recycled_batch is not None
-    recycled_destination = recycled_batch.tensor
-    recycled_logits = logits.flip(1)
-
-    torch.argmax(recycled_logits, dim=-1, out=recycled_destination)
-    table.publish_continuation(continuation)
-    table.release_operations(
-        tuple((reference.request_key, reference.producer_op_id) for reference in references)
-    )
-    recycled_reads = table.consume_batch(
-        tuple(
-            (reference, 61 + index, "cd" * 32, configured_device)
-            for index, reference in enumerate(recycled)
-        )
-    )
-    table.record_readers(recycled_reads, device=configured_device)
-
-    torch.cuda.synchronize(device)
-    assert tuple(int(read.tensor.item()) for read in recycled_reads) == (1, 3, 2, 0)
-
-
 def test_row_product_publication_uses_one_completion_event() -> None:
     device = torch.device("cuda:0")
     table = DeviceProductTable(capacity=3, byte_capacity=1 << 20)

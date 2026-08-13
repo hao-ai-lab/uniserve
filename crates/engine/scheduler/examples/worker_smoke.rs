@@ -30,6 +30,7 @@ fn main() -> anyhow::Result<()> {
         8 << 20,
         None,
         256,
+        8192,
         "auto",
         &worker_config,
     )?;

@@ -20,6 +20,7 @@ from ..batch import (
     CompletionReport,
     Domain,
     ExecutionCapability,
+    ImageParams,
     KvBranchPlacement,
     KvPlacement,
     LatentPlacement,
@@ -33,12 +34,18 @@ from ..batch import (
     StorageClass,
     WorkVariant,
 )
-from ..capabilities import RequestKind, WorkerCapabilities
+from ..capabilities import (
+    GraphBucketCapability,
+    LaneCapabilities,
+    RequestKind,
+    WorkerCapabilities,
+)
 from ..execution import ModelExecutor, ModelRunner
+from ..execution.cuda_graph import CudaGraphRunner
 from ..execution.executor import completion_report_ready, finalize_completion_report
-from ..forward import AttentionSelection
+from ..execution.forward_batch import AttentionSelection
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import ExecutionConfig, graph_memory_budget_bytes
+from ..foundation.runtime_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
 from ..foundation.sizing import ceil_div, device_total_bytes
 from ..foundation.sync_detector import (
     sync_detection_active,
@@ -55,13 +62,13 @@ from ..runtime.arena_capacity import model_arena_capacity
 from ..runtime.cache_pool import CachePool
 from ..runtime.capabilities import resolve_capabilities
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..runtime.graph_store import GraphStore
 from ..runtime.latent_store import LatentStore
 from ..runtime.mesh_store import MeshStore
 from ..runtime.mover import Mover
 from ..runtime.product_store import ProductStore
 from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
+from ..runtime.runtime_states import RuntimeStates
 from ..runtime.snapshot_store import SnapshotProvider
 
 logger = logging.getLogger(__name__)
@@ -77,6 +84,7 @@ def _warmup_batch(
     kv_branch_placements: dict[tuple[RequestKey, int], tuple[KvBranchPlacement, ...]],
     latent_placements: dict[tuple[RequestKey, int], LatentPlacement],
     input_products: tuple[ProductPayload, ...] = (),
+    tensorized_mixed: bool = False,
 ) -> Batch:
     groups: list[tuple[Domain, int, list[Operation]]] = []
     for operation in operations:
@@ -95,11 +103,18 @@ def _warmup_batch(
     partitions = tuple(
         BatchPartition(
             partition_id=index,
-            submission_group=index,
-            collective_seq=max(1, int(step_id) * 16 + index),
+            submission_group=1 if tensorized_mixed else index,
+            collective_seq=max(
+                1,
+                int(step_id) * 16 + (1 if tensorized_mixed else index),
+            ),
             domain=domain,
             route=route,
-            execution=ExecutionCapability.DOMAIN_HOMOGENEOUS,
+            execution=(
+                ExecutionCapability.TENSORIZED_MIXED
+                if tensorized_mixed
+                else ExecutionCapability.DOMAIN_HOMOGENEOUS
+            ),
             attention=AttentionRegime.HYBRID,
             shape_class=0,
             operations=tuple(members),
@@ -201,7 +216,9 @@ class ModelWorker:
         snapshot_dir: str | None = None,
     ) -> None:
         if not isinstance(model, ExecutionModel) or type(model).forward is nn.Module.forward:
-            raise capability_mismatch("model worker requires nn.Module.forward(ForwardBatch)")
+            raise capability_mismatch(
+                "model worker requires forward(input_ids, positions, forward_batch)"
+            )
         if not isinstance(deployment, WorkerDeployment):
             raise capability_mismatch("model worker requires a worker deployment")
         self.model = model
@@ -287,6 +304,12 @@ class ModelWorker:
             ),
         )
         self.sessions = SessionStore()
+        self.runtime_states = RuntimeStates(
+            request_pool_size=int(self._capabilities.max_request_pool_size),
+            vocab_size=int(model.vocab_size),
+            continuation_width=1,
+            device=deployment.device,
+        )
         self.latents = LatentStore(capacity_bytes=arena.latent_bytes)
         self.products = ProductStore(
             encoder_cache_budget=model.resource_geometry.encoder_cache_entries,
@@ -300,25 +323,359 @@ class ModelWorker:
             transfer_ticket_capacity=arena.transfer_tickets,
             cross_process=bool(cross_process),
         )
-        self.graphs = GraphStore(
-            enabled=execution.cuda_graph,
-            prefill_enabled=execution.prefill_cuda_graph,
-            cache=model.cache_geometry,
-            block_size=deployment.block_size,
-            weight_digest=self.weight_digest,
-            memory_budget_bytes=graph_memory_budget_bytes(device_total_bytes(deployment.device)),
-            decode_batch_sizes=execution.cuda_graph_warmup_batches,
-            decode_context_blocks=self._decode_context_blocks(),
-            prefill_token_sizes=execution.prefill_cuda_graph_warmup_tokens,
+        max_rows = min(
+            int(self._capabilities.max_batch_operations),
+            int(self._capabilities.max_request_pool_size),
         )
+        flow = model.generation
+        max_staged_rows = max_rows * (
+            1 if flow is None else int(flow.max_cfg_branches)
+        )
+        max_text_staged_tokens = int(self._capabilities.max_batch_tokens)
+        max_flow_staged_tokens = (
+            0
+            if flow is None
+            else max(
+                (
+                    int(flow.max_latent_tokens),
+                    *(
+                        flow.physical_tokens(int(height), int(width))
+                        for height, width in execution.flow_graph_shapes
+                    ),
+                )
+            )
+            * int(flow.max_cfg_branches)
+        )
+        # Flow may be the final operation admitted after earlier text consumes
+        # the nominal token budget. Keep the fixed sequence arena large enough
+        # for that text span plus one exact CFG-expanded flow operation.
+        max_staged_tokens = max_text_staged_tokens + max_flow_staged_tokens
+        und_lane = next(
+            (lane for lane in execution.lanes if Domain.UND in lane.domains),
+            None,
+        )
+        gen_lane = next(
+            (lane for lane in execution.lanes if Domain.GEN in lane.domains),
+            None,
+        )
+        und_max_operations = min(
+            max_rows,
+            max_rows if und_lane is None else int(und_lane.max_batch_operations or max_rows),
+        )
+        und_max_tokens = min(
+            int(self._capabilities.max_batch_tokens),
+            (
+                int(self._capabilities.max_batch_tokens)
+                if und_lane is None
+                else int(und_lane.max_batch_tokens or self._capabilities.max_batch_tokens)
+            ),
+        )
+        gen_max_operations = min(
+            max_rows,
+            max_rows if gen_lane is None else int(gen_lane.max_batch_operations or max_rows),
+        )
+        decode_graph_batch_sizes = tuple(
+            value
+            for value in execution.decode_graph_batch_sizes
+            if 0 < int(value) <= und_max_operations
+            and int(value) < int(self._capabilities.num_blocks)
+        )
+        prefill_capacity = min(
+            int(self._capabilities.max_batch_tokens),
+            int(model.text_max_tokens),
+            max(0, int(self._capabilities.num_blocks) - 1) * int(deployment.block_size),
+        )
+        prefill_graph_token_sizes = tuple(
+            value
+            for value in execution.prefill_graph_token_sizes
+            if 0 < int(value) <= min(prefill_capacity, und_max_tokens)
+        )
+        flow_graph_buckets = (
+            ()
+            if flow is None
+            else tuple(
+                (int(batch_size), int(height), int(width))
+                for height, width in execution.flow_graph_shapes
+                for batch_size in execution.flow_graph_batch_sizes
+                if 0 < int(batch_size) <= gen_max_operations
+                and int(batch_size)
+                * flow.physical_tokens(int(height), int(width))
+                * int(flow.max_cfg_branches)
+                <= max_staged_tokens
+                and flow.image_tokens(int(height), int(width))
+                <= int(self._capabilities.latent_capacity_units)
+                and int(batch_size)
+                * math.prod(flow.latent_shape(int(height), int(width)))
+                * torch.empty((), dtype=cache_dtype).element_size()
+                * 2
+                <= int(self.latents.capacity_bytes)
+            )
+        )
+        mixed_text_batch_sizes = (
+            ()
+            if not flow_graph_buckets or not model.tensorized_mixed
+            else tuple(
+                range(
+                    1,
+                    max(int(batch_size) for batch_size in execution.flow_graph_batch_sizes) + 1,
+                )
+            )
+        )
+        mixed_flow_graph_buckets = tuple(
+            (text_batch_size, height, width)
+            for batch_size, height, width in flow_graph_buckets
+            if batch_size == 1
+            for text_batch_size in mixed_text_batch_sizes
+        )
+        flow_prefix_lengths: tuple[int, ...] = ()
+        if flow is not None and model.tensorized_mixed and flow_graph_buckets:
+            image = ImageParams()
+            guide = build_flow_cfg_plan(
+                cfg_text_scale=float(image.cfg_text_scale),
+                cfg_img_scale=float(image.cfg_img_scale),
+                recipe=flow.cfg_recipe,
+                renorm=image.cfg_renorm_type,
+                renorm_min=float(image.cfg_renorm_min),
+                use_cfg=True,
+            )
+            flow_prefix_lengths = tuple(
+                len(prefix)
+                for branch in guide.branches
+                for prefix, copy_conditioning in (
+                    flow.prefix(
+                        flow.branch_source(branch),
+                        image_prompt="",
+                        negative_prompt=image.negative_prompt,
+                        negative_token_ids=(),
+                        tokenizer=tokenizer,
+                    ),
+                )
+                if prefix and not copy_conditioning
+            )
+        flow_prefix_graph_batches = tuple(
+            batch_size
+            for batch_size in sorted({bucket[0] for bucket in flow_graph_buckets})
+            if flow_prefix_lengths
+            and sum(1 for candidate in flow_graph_buckets if candidate[0] == batch_size) > 1
+        )
+        self._decode_graph_batch_sizes = decode_graph_batch_sizes
+        self._prefill_graph_token_sizes = prefill_graph_token_sizes
+        self._flow_graph_buckets = flow_graph_buckets
+        self._mixed_flow_graph_buckets = mixed_flow_graph_buckets
+        graph_budget = graph_memory_budget_bytes(device_total_bytes(deployment.device))
+
+        def graph_factory(
+            device: torch.device,
+            lane: LaneConfig | None,
+            stream: torch.cuda.Stream | None,
+            expected_context: int | None,
+        ) -> CudaGraphRunner:
+            domains = tuple(Domain) if lane is None else lane.domains
+            owns_model_compute = str(device) == str(torch.device(deployment.device))
+            lane_max_operations = (
+                max_rows if lane is None else int(lane.max_batch_operations or max_rows)
+            )
+            lane_max_tokens = (
+                prefill_capacity if lane is None else int(lane.max_batch_tokens or prefill_capacity)
+            )
+            lane_decode_buckets = (
+                tuple(
+                    value for value in decode_graph_batch_sizes if int(value) <= lane_max_operations
+                )
+                if owns_model_compute and Domain.UND in domains
+                else ()
+            )
+            lane_prefill_buckets = (
+                tuple(value for value in prefill_graph_token_sizes if int(value) <= lane_max_tokens)
+                if owns_model_compute and Domain.UND in domains
+                else ()
+            )
+            lane_flow_buckets = (
+                tuple(value for value in flow_graph_buckets if value[0] <= lane_max_operations)
+                if owns_model_compute and Domain.GEN in domains
+                else ()
+            )
+            lane_mixed_flow_buckets = (
+                tuple(
+                    value
+                    for value in mixed_flow_graph_buckets
+                    if value[0] + 1 <= lane_max_operations
+                )
+                if owns_model_compute and {Domain.UND, Domain.GEN} <= set(domains)
+                else ()
+            )
+            expected_captures = 0
+            if execution.cuda_graph:
+                if WorkVariant.TOKEN_DECODE in self._effective_work_variants:
+                    expected_captures += len(lane_decode_buckets)
+                if (
+                    execution.prefill_cuda_graph
+                    and WorkVariant.TOKEN_EXTEND in self._effective_work_variants
+                ):
+                    expected_captures += len(lane_prefill_buckets)
+                if execution.prefill_cuda_graph and {
+                    WorkVariant.GEN_TRANSITION,
+                    WorkVariant.GEN_FLOW,
+                }.issubset(self._effective_work_variants):
+                    expected_captures += len(lane_flow_buckets)
+                    if WorkVariant.TOKEN_DECODE in self._effective_work_variants:
+                        expected_captures += len(lane_mixed_flow_buckets)
+                    if Domain.UND in domains:
+                        expected_captures += len(flow_prefix_graph_batches)
+            output_slots = int(
+                (pipeline_depth if lane is None else lane.max_inflight or pipeline_depth) + 1
+            )
+            return CudaGraphRunner(
+                enabled=execution.cuda_graph,
+                prefill_enabled=execution.prefill_cuda_graph,
+                cache=model.cache_geometry,
+                block_size=deployment.block_size,
+                weight_digest=self.weight_digest,
+                memory_budget_bytes=graph_budget,
+                decode_batch_sizes=lane_decode_buckets,
+                decode_context_blocks=self._decode_context_blocks(),
+                packed_context_blocks=max_blocks_per_row,
+                prefill_token_sizes=lane_prefill_buckets,
+                stream=stream,
+                expected_context=expected_context,
+                expected_captures=expected_captures,
+                output_slot_count=output_slots,
+            )
+
         self._execution = execution
         self.trace = ExecutionTrace(self.identity.architecture_digest)
+        max_blocks_per_row = max(
+            1,
+            ceil_div(int(model.text_max_tokens), int(deployment.block_size)),
+            ceil_div(
+                int(self._capabilities.scratch_capacity_tokens),
+                int(deployment.block_size),
+            ),
+        )
+        max_latent_pages_per_row = (
+            0 if flow is None else ceil_div(int(flow.max_latent_tokens), int(deployment.block_size))
+        )
+        devices = (
+            (deployment.device,)
+            if deployment.generation_device is None
+            else (deployment.device, deployment.generation_device)
+        )
+        self.runner = ModelRunner(
+            model,
+            None,
+            self.trace,
+            max_rows=max_staged_rows,
+            max_tokens=max_staged_tokens,
+            max_text_tokens=max_text_staged_tokens,
+            max_blocks_per_row=max_blocks_per_row,
+            max_latent_pages_per_row=max_latent_pages_per_row,
+            hidden_size=int(model.hidden_size),
+            devices=devices,
+            lanes=execution.lanes,
+            max_inflight=int(pipeline_depth),
+            graph_factory=graph_factory,
+        )
+        if execution.lanes:
+            lane_by_id = {lane.lane_id: lane for lane in execution.lanes}
+            lane_capabilities: list[LaneCapabilities] = []
+            for partition in self.runner.partitions:
+                if partition.lane_id is None:
+                    continue
+                lane = lane_by_id[partition.lane_id]
+                max_operations = min(
+                    int(self._capabilities.max_batch_operations),
+                    int(lane.max_batch_operations or self._capabilities.max_batch_operations),
+                )
+                max_tokens = min(
+                    int(self._capabilities.max_batch_tokens),
+                    int(lane.max_batch_tokens or self._capabilities.max_batch_tokens),
+                )
+                buckets: list[GraphBucketCapability] = []
+                if execution.cuda_graph and Domain.UND in lane.domains:
+                    buckets.extend(
+                        GraphBucketCapability(
+                            phase="text_decode",
+                            batch_size=int(batch_size),
+                            token_bucket=int(batch_size),
+                            attention_form="paged_decode",
+                            height=0,
+                            width=0,
+                            cfg_branches=1,
+                        )
+                        for batch_size in decode_graph_batch_sizes
+                        if int(batch_size) <= max_operations
+                    )
+                    if execution.prefill_cuda_graph:
+                        buckets.extend(
+                            GraphBucketCapability(
+                                phase="text_prefill",
+                                batch_size=8,
+                                token_bucket=int(token_size),
+                                attention_form="paged_varlen",
+                                height=0,
+                                width=0,
+                                cfg_branches=1,
+                            )
+                            for token_size in prefill_graph_token_sizes
+                            if int(token_size) <= max_tokens
+                        )
+                        buckets.extend(
+                            GraphBucketCapability(
+                                phase="text_prefill",
+                                batch_size=int(batch_size) * len(flow_prefix_lengths),
+                                token_bucket=int(batch_size) * sum(flow_prefix_lengths),
+                                attention_form="packed",
+                                height=0,
+                                width=0,
+                                cfg_branches=1,
+                                layout="flow_prefix",
+                            )
+                            for batch_size in flow_prefix_graph_batches
+                            if int(batch_size) * len(flow_prefix_lengths) <= max_operations
+                            and int(batch_size) * sum(flow_prefix_lengths) <= max_tokens
+                        )
+                if (
+                    execution.cuda_graph
+                    and execution.prefill_cuda_graph
+                    and Domain.GEN in lane.domains
+                    and flow is not None
+                ):
+                    buckets.extend(
+                        GraphBucketCapability(
+                            phase="denoise",
+                            batch_size=int(batch_size),
+                            token_bucket=0,
+                            attention_form="none",
+                            height=int(height),
+                            width=int(width),
+                            cfg_branches=int(flow.max_cfg_branches),
+                        )
+                        for batch_size, height, width in flow_graph_buckets
+                        if batch_size <= max_operations
+                    )
+                lane_capabilities.append(
+                    LaneCapabilities(
+                        lane_id=lane.lane_id,
+                        domains=lane.domains,
+                        resolved_sm_count=partition.sm_count,
+                        kv_capacity_tokens=lane.kv_capacity_tokens,
+                        latent_capacity_units=lane.latent_capacity_units,
+                        max_batch_operations=max_operations,
+                        max_batch_tokens=max_tokens,
+                        max_inflight=int(lane.max_inflight or pipeline_depth),
+                        graph_buckets=tuple(buckets),
+                        eager_max_batch_operations=max_operations,
+                        eager_max_batch_tokens=max_tokens,
+                    )
+                )
+            self._capabilities = replace(self._capabilities, lanes=tuple(lane_capabilities))
         self.executor = ModelExecutor(
             model=model,
             deployment=deployment,
-            runner=ModelRunner(model, self.graphs, self.trace),
+            runner=self.runner,
             attention=attention,
             sessions=self.sessions,
+            runtime_states=self.runtime_states,
             cache_pool=self.cache_pool,
             latents=self.latents,
             products=self.products,
@@ -335,7 +692,6 @@ class ModelWorker:
             defer_sampling=defer_sampling,
             completion_payload_bytes=completion_payload_bytes,
             cpu_task_capacity=arena.cpu_tasks,
-            pinned_staging_capacity=arena.pinned_staging_bytes,
         )
         self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
         self._warmup_scratch_pages: dict[RequestKey, list[int]] = {}
@@ -369,15 +725,7 @@ class ModelWorker:
         return self._capabilities
 
     def _decode_context_blocks(self) -> int:
-        max_tokens = max(
-            (
-                self.model.route_max_tokens(stage.route)
-                for variant in self.model.supported_work
-                for stage in self.model.lower(variant)
-                if stage.row.value == "token"
-            ),
-            default=0,
-        )
+        max_tokens = int(self.model.text_max_tokens)
         if max_tokens < 1:
             return 0
         blocks = (max_tokens + int(self.deployment.block_size) - 1) // int(
@@ -449,6 +797,8 @@ class ModelWorker:
         admissions: tuple[Admission, ...],
         operations: tuple[Operation, ...],
         input_products: tuple[ProductPayload, ...] = (),
+        tensorized_mixed: bool = False,
+        image_geometry: tuple[int, int] | None = None,
     ) -> Batch:
         self._warmup_step_id += 1
         admissions_by_key = {admission.request_key: admission for admission in admissions}
@@ -530,7 +880,7 @@ class ModelWorker:
                     )
                 )
             kv_placements[(operation.request_key, operation.op_id)] = tuple(placements)
-        height, width = self._warmup_image_geometry()
+        height, width = image_geometry or self._warmup_image_geometry()
         latent_units = max(
             1,
             (height // max(1, int(self._capabilities.latent_downsample)))
@@ -572,6 +922,7 @@ class ModelWorker:
             kv_branch_placements=kv_branch_placements,
             latent_placements=latent_placements,
             input_products=input_products,
+            tensorized_mixed=tensorized_mixed,
         )
 
     def _warmup_branch_placements(
@@ -665,6 +1016,7 @@ class ModelWorker:
         if torch.device(self.deployment.device).type == "cuda":
             self._warmup_sequence()
             self._warmup_flow()
+        self.runner.complete_startup()
         self.executor.complete_startup()
 
     def _warmup_image_geometry(self) -> tuple[int, int]:
@@ -722,19 +1074,11 @@ class ModelWorker:
         pool = self.cache_pool
         if self.sessions.session_ids():
             return
-        if (
-            self._execution.cuda_graph
-            and self._execution.prefill_cuda_graph
-            and self._execution.prefill_cuda_graph_warmup
-        ):
+        if self._execution.cuda_graph and self._execution.prefill_cuda_graph:
             self._warmup_prefill_graphs()
         configured = (
-            self._execution.cuda_graph_warmup_batches
-            if (
-                self._execution.cuda_graph
-                and self._execution.cuda_graph_warmup
-                and WorkVariant.TOKEN_DECODE in variants
-            )
+            self._decode_graph_batch_sizes
+            if (self._execution.cuda_graph and WorkVariant.TOKEN_DECODE in variants)
             else (1,)
         )
         batch_sizes = tuple(
@@ -817,7 +1161,7 @@ class ModelWorker:
                 domain=Domain.UND,
                 bounds=Bounds(max_points=1, max_tokens=1),
                 outputs=outputs,
-                kv_capacity_pages=1,
+                kv_capacity_pages=ceil_div(op_id, int(pool.block_size)),
                 predicate=token_output,
             )
 
@@ -843,10 +1187,10 @@ class ModelWorker:
             predecessors.update(zip(session_ids, operations, strict=True))
             if WorkVariant.TOKEN_DECODE not in variants:
                 return
-            repeats = 2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
-            for batch_size in batch_sizes:
-                selected = session_ids[:batch_size]
-                for _ in range(repeats):
+            repeats = 2 if self._execution.cuda_graph else 1
+            for _ in range(repeats):
+                for batch_size in batch_sizes:
+                    selected = session_ids[:batch_size]
                     operations = []
                     for sid in selected:
                         op_ids[sid] += 1
@@ -904,15 +1248,7 @@ class ModelWorker:
         pool = self.cache_pool
         if self.sessions.session_ids():
             return
-        max_route_tokens = max(
-            (
-                self.model.route_max_tokens(stage.route)
-                for variant in self.model.supported_work
-                for stage in self.model.lower(variant)
-                if stage.row.value == "token"
-            ),
-            default=0,
-        )
+        max_route_tokens = int(self.model.text_max_tokens)
         capacity = min(
             max_route_tokens,
             max(0, int(pool.request_pages) - 1) * int(pool.block_size),
@@ -921,7 +1257,7 @@ class ModelWorker:
             sorted(
                 {
                     int(value)
-                    for value in self._execution.prefill_cuda_graph_warmup_tokens
+                    for value in self._prefill_graph_token_sizes
                     if 0 < int(value) <= capacity
                 },
                 reverse=True,
@@ -931,18 +1267,17 @@ class ModelWorker:
             return
         logger.info("warming %d paged-prefill CUDA graph token buckets", len(token_buckets))
         session_id = 0
-        for token_count in token_buckets:
-            block_count = (token_count + int(pool.block_size) - 1) // int(pool.block_size)
-            tokens = (0,) * token_count
-            # Two rounds per bucket: the first captures the graph, the second
-            # replays it. Every round uses a fresh session and operation id so
-            # no replay or session state carries between rounds.
-            for _ in range(2):
+        # First warm every configured physical call in descending footprint,
+        # then capture every bucket in the same order.
+        for _ in range(2):
+            for token_count in token_buckets:
+                block_count = (token_count + int(pool.block_size) - 1) // int(pool.block_size)
+                tokens = (0,) * token_count
                 session_id += 1
                 rk = RequestKey(0, session_id, 1)
                 admission = Admission.create(
                     rk,
-                    request_pool_idx=session_id,
+                    request_pool_idx=1,
                     und=UndAdmission(
                         sampling=SamplingParams(temperature=0.0, ignore_eos=True),
                         kv=KvAdmission(),
@@ -994,138 +1329,438 @@ class ModelWorker:
             Admission,
             Bounds,
             DeviceDim,
+            DevicePoint,
             Domain,
             DrawLayout,
             DType,
             FixedPoint,
             GenAdmission,
             ImageParams,
+            KvAdmission,
             Operation,
             PointRange,
             ProductKind,
+            ProductPayload,
             ProductRef,
             RequestKey,
             Rng,
+            SamplingParams,
             ShapeBound,
             StaticDim,
             StorageClass,
+            TokenMode,
             TransferMode,
+            UndAdmission,
             VersionRef,
             Work,
+            encode_token_product_bytes,
         )
 
-        if WorkVariant.GEN_TRANSITION not in self._effective_work_variants or not isinstance(
+        if not {
+            WorkVariant.GEN_TRANSITION,
+            WorkVariant.GEN_FLOW,
+        }.issubset(self._effective_work_variants) or not isinstance(
             self.model.generation, GenerationPipeline
         ):
             return
         if self.sessions.session_ids():
             return
-        session_id = 2
-        rk = RequestKey(0, session_id, 1)
-        height, width = self._warmup_image_geometry()
-        admission = Admission.create(
-            rk,
-            request_pool_idx=session_id,
-            gen_admission=GenAdmission(
-                image=ImageParams(steps=1, height=height, width=width, seed=0)
-            ),
-        )
-        try:
-            root = VersionRef(rk, 0, FixedPoint(0, admission.digest))
-            conditioning = ProductRef(
-                request_key=rk,
-                producer_op_id=1,
-                output_index=0,
-                generation=4,
-                kind=ProductKind.KV,
-                storage_class=StorageClass.PAGED_KV,
-                dtype=DType.U8,
-                shape_bound=ShapeBound((DeviceDim(1 << 20),)),
-                point_range=PointRange(),
+        configured: tuple[tuple[int, int, int], ...]
+        if not self._execution.cuda_graph:
+            configured = ((1, *self._warmup_image_geometry()),)
+        else:
+            configured = tuple(
+                sorted(
+                    (
+                        (int(batch_size), int(height), int(width))
+                        for batch_size, height, width in self._flow_graph_buckets
+                    ),
+                    key=lambda value: value[0] * value[1] * value[2],
+                    reverse=True,
+                )
             )
-            publication = Operation.registered(
-                request_key=rk,
-                op_id=1,
-                parent=root,
-                work=Work("transfer", TransferMode.KV_PUBLISH.value),
-                route=0,
-                domain=Domain.UND,
-                bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
-                outputs=(conditioning,),
+        next_session_id = 1
+        next_generation = 1
+        for batch_size, height, width in configured:
+            if batch_size > int(self._capabilities.max_request_pool_size):
+                continue
+            mixed_text_sizes = tuple(
+                text_batch_size
+                for text_batch_size, mixed_height, mixed_width in self._mixed_flow_graph_buckets
+                if batch_size == 1
+                and mixed_height == height
+                and mixed_width == width
+                and text_batch_size + batch_size <= int(self._capabilities.max_request_pool_size)
             )
-            self._execute_warmup(
-                self._build_warmup_batch(admissions=(admission,), operations=(publication,))
+            session_ids = tuple(range(next_session_id, next_session_id + batch_size))
+            next_session_id += batch_size
+            keys = tuple(RequestKey(0, session_id, 1) for session_id in session_ids)
+            admissions = tuple(
+                Admission.create(
+                    key,
+                    request_pool_idx=index,
+                    gen_admission=GenAdmission(
+                        image=ImageParams(
+                            steps=2 + 2 * len(mixed_text_sizes),
+                            height=height,
+                            width=width,
+                            seed=0,
+                        )
+                    ),
+                )
+                for index, key in enumerate(keys, start=1)
             )
-            max_latent_elements = max(
-                1,
-                math.prod(self.model.generation.latent_shape(height, width)),
+            text_session_count = max(mixed_text_sizes, default=0)
+            text_session_ids = tuple(range(next_session_id, next_session_id + text_session_count))
+            next_session_id += text_session_count
+            text_keys = {
+                session_id: RequestKey(0, session_id, 1) for session_id in text_session_ids
+            }
+            text_admissions = {
+                session_id: Admission.create(
+                    text_keys[session_id],
+                    request_pool_idx=batch_size + index,
+                    und=UndAdmission(
+                        sampling=SamplingParams(temperature=0.0, ignore_eos=True),
+                        kv=KvAdmission(),
+                    ),
+                )
+                for index, session_id in enumerate(text_session_ids, start=1)
+            }
+            roots = tuple(
+                VersionRef(key, 0, FixedPoint(0, admission.digest))
+                for key, admission in zip(keys, admissions, strict=True)
             )
-            initial_latent = ProductRef(
-                request_key=rk,
-                producer_op_id=2,
-                output_index=0,
-                generation=5,
-                kind=ProductKind.LATENT,
-                storage_class=StorageClass.LATENT_ARENA,
-                dtype=DType.BF16,
-                shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
-                point_range=PointRange(),
-            )
-            transition_ready = ProductRef(
-                request_key=rk,
-                producer_op_id=2,
-                output_index=1,
-                generation=6,
-                kind=ProductKind.COMPLETION,
-                storage_class=StorageClass.DEVICE_TENSOR,
-                dtype=DType.U32,
-                shape_bound=ShapeBound((StaticDim(1),)),
-                point_range=PointRange(),
-            )
-            transition = Operation.registered(
-                request_key=rk,
-                op_id=2,
-                parent=root,
-                work=Work("gen", "transition"),
-                route=0,
-                domain=Domain.GEN,
-                bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=max_latent_elements * 2),
-                inputs=(conditioning,),
-                outputs=(initial_latent, transition_ready),
-                rng=Rng(
-                    seed=0,
-                    semantic_index_base=1,
-                    draw_layout=DrawLayout.FLOW_NOISE,
-                ),
-            )
-            self._execute_warmup(self._build_warmup_batch(admissions=(), operations=(transition,)))
-            next_latent = ProductRef(
-                request_key=rk,
-                producer_op_id=3,
-                output_index=0,
-                generation=7,
-                kind=ProductKind.LATENT,
-                storage_class=StorageClass.LATENT_ARENA,
-                dtype=DType.BF16,
-                shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
-                point_range=PointRange(),
-            )
-            flow = Operation.registered(
-                request_key=rk,
-                op_id=3,
-                parent=self.sessions.get(session_id).committed_version(),
-                work=Work("gen", "flow"),
-                route=0,
-                domain=Domain.GEN,
-                bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=max_latent_elements * 2),
-                inputs=(conditioning, initial_latent),
-                outputs=(next_latent,),
-            )
-            self._execute_warmup(
-                self._build_warmup_batch(admissions=(), operations=(flow,), input_products=())
-            )
-        finally:
-            self.drop_session(session_id)
+            conditionings: list[ProductRef] = []
+            publications: list[Operation] = []
+            for key, root in zip(keys, roots, strict=True):
+                conditioning = ProductRef(
+                    request_key=key,
+                    producer_op_id=1,
+                    output_index=0,
+                    generation=next_generation,
+                    kind=ProductKind.KV,
+                    storage_class=StorageClass.PAGED_KV,
+                    dtype=DType.U8,
+                    shape_bound=ShapeBound((DeviceDim(1 << 20),)),
+                    point_range=PointRange(),
+                )
+                next_generation += 1
+                conditionings.append(conditioning)
+                publications.append(
+                    Operation.registered(
+                        request_key=key,
+                        op_id=1,
+                        parent=root,
+                        work=Work("transfer", TransferMode.KV_PUBLISH.value),
+                        route=0,
+                        domain=Domain.UND,
+                        bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
+                        outputs=(conditioning,),
+                    )
+                )
+            try:
+                self._execute_warmup(
+                    self._build_warmup_batch(
+                        admissions=admissions,
+                        operations=tuple(publications),
+                        image_geometry=(height, width),
+                    )
+                )
+                text_predecessors: dict[int, Operation] = {}
+                text_op_ids = {session_id: 1 for session_id in text_session_ids}
+                if text_session_ids:
+                    prompt_operations: list[Operation] = []
+                    prompt_payloads: list[ProductPayload] = []
+                    for session_id in text_session_ids:
+                        key = text_keys[session_id]
+                        token_ref = ProductRef(
+                            request_key=key,
+                            producer_op_id=1,
+                            output_index=(1 << 16) - 1,
+                            generation=next_generation,
+                            kind=ProductKind.TOKEN,
+                            storage_class=StorageClass.HOST_STAGING,
+                            dtype=DType.U32,
+                            shape_bound=ShapeBound((StaticDim(1),)),
+                            point_range=PointRange(),
+                        )
+                        next_generation += 1
+                        prompt_outputs = _warmup_token_outputs(key, 1, next_generation)
+                        next_generation += len(prompt_outputs)
+                        operation = Operation.registered(
+                            request_key=key,
+                            op_id=1,
+                            parent=VersionRef(
+                                key,
+                                0,
+                                FixedPoint(0, text_admissions[session_id].digest),
+                            ),
+                            work=Work.token(TokenMode.EXTEND),
+                            route=0,
+                            domain=Domain.UND,
+                            bounds=Bounds(max_points=1, max_tokens=1),
+                            inputs=(token_ref,),
+                            outputs=prompt_outputs,
+                            kv_capacity_pages=1,
+                        )
+                        prompt_operations.append(operation)
+                        prompt_payloads.append(
+                            ProductPayload(
+                                product=token_ref,
+                                payload=encode_token_product_bytes((0,)),
+                            )
+                        )
+                    self._execute_warmup(
+                        self._build_warmup_batch(
+                            admissions=tuple(
+                                text_admissions[session_id] for session_id in text_session_ids
+                            ),
+                            operations=tuple(prompt_operations),
+                            input_products=tuple(prompt_payloads),
+                            image_geometry=(height, width),
+                        ),
+                        retain_device_outputs=True,
+                    )
+                    text_predecessors.update(zip(text_session_ids, prompt_operations, strict=True))
+                max_latent_elements = max(
+                    1,
+                    math.prod(self.model.generation.latent_shape(height, width)),
+                )
+                initial_latents: list[ProductRef] = []
+                transitions: list[Operation] = []
+                for key, root, conditioning in zip(keys, roots, conditionings, strict=True):
+                    initial_latent = ProductRef(
+                        request_key=key,
+                        producer_op_id=2,
+                        output_index=0,
+                        generation=next_generation,
+                        kind=ProductKind.LATENT,
+                        storage_class=StorageClass.LATENT_ARENA,
+                        dtype=DType.BF16,
+                        shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
+                        point_range=PointRange(),
+                    )
+                    next_generation += 1
+                    ready = ProductRef(
+                        request_key=key,
+                        producer_op_id=2,
+                        output_index=1,
+                        generation=next_generation,
+                        kind=ProductKind.COMPLETION,
+                        storage_class=StorageClass.DEVICE_TENSOR,
+                        dtype=DType.U32,
+                        shape_bound=ShapeBound((StaticDim(1),)),
+                        point_range=PointRange(),
+                    )
+                    next_generation += 1
+                    initial_latents.append(initial_latent)
+                    transitions.append(
+                        Operation.registered(
+                            request_key=key,
+                            op_id=2,
+                            parent=root,
+                            work=Work("gen", "transition"),
+                            route=0,
+                            domain=Domain.GEN,
+                            bounds=Bounds(
+                                max_points=1,
+                                max_tokens=1,
+                                max_latent_bytes=max_latent_elements * 2,
+                            ),
+                            inputs=(conditioning,),
+                            outputs=(initial_latent, ready),
+                            rng=Rng(
+                                seed=0,
+                                semantic_index_base=1,
+                                draw_layout=DrawLayout.FLOW_NOISE,
+                            ),
+                        )
+                    )
+                self._execute_warmup(
+                    self._build_warmup_batch(
+                        admissions=(),
+                        operations=tuple(transitions),
+                        image_geometry=(height, width),
+                    )
+                )
+                current_latents = tuple(initial_latents)
+                flow_predecessors = dict(zip(session_ids, transitions, strict=True))
+                for op_id in (3, 4):
+                    outputs: list[ProductRef] = []
+                    flows: list[Operation] = []
+                    for session_id, key, conditioning, current in zip(
+                        session_ids, keys, conditionings, current_latents, strict=True
+                    ):
+                        output = ProductRef(
+                            request_key=key,
+                            producer_op_id=op_id,
+                            output_index=0,
+                            generation=next_generation,
+                            kind=ProductKind.LATENT,
+                            storage_class=StorageClass.LATENT_ARENA,
+                            dtype=DType.BF16,
+                            shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
+                            point_range=PointRange(),
+                        )
+                        next_generation += 1
+                        outputs.append(output)
+                        flows.append(
+                            Operation.registered(
+                                request_key=key,
+                                op_id=op_id,
+                                parent=VersionRef(
+                                    key,
+                                    flow_predecessors[session_id].op_id,
+                                    DevicePoint(
+                                        1,
+                                        None,
+                                        flow_predecessors[session_id].plan_digest,
+                                    ),
+                                ),
+                                work=Work("gen", "flow"),
+                                route=0,
+                                domain=Domain.GEN,
+                                bounds=Bounds(
+                                    max_points=1,
+                                    max_tokens=1,
+                                    max_latent_bytes=max_latent_elements * 2,
+                                ),
+                                inputs=(conditioning, current),
+                                outputs=(output,),
+                            )
+                        )
+                    self._execute_warmup(
+                        self._build_warmup_batch(
+                            admissions=(),
+                            operations=tuple(flows),
+                            image_geometry=(height, width),
+                        )
+                    )
+                    released_latents = tuple(
+                        (reference.request_key, int(reference.producer_op_id))
+                        for reference in current_latents
+                    )
+                    self.latents.release_operations(released_latents)
+                    self.products.device_products.release_operations(released_latents)
+                    current_latents = tuple(outputs)
+                    flow_predecessors.update(zip(session_ids, flows, strict=True))
+                flow_op_id = 5
+                for text_batch_size in mixed_text_sizes:
+                    selected_text = text_session_ids[:text_batch_size]
+                    for _ in range(2):
+                        text_operations: list[Operation] = []
+                        for session_id in selected_text:
+                            predecessor = text_predecessors[session_id]
+                            token_output = next(
+                                output
+                                for output in predecessor.outputs
+                                if output.kind is ProductKind.TOKEN
+                            )
+                            text_op_ids[session_id] += 1
+                            op_id = text_op_ids[session_id]
+                            token_outputs = _warmup_token_outputs(
+                                text_keys[session_id], op_id, next_generation
+                            )
+                            next_generation += len(token_outputs)
+                            text_operations.append(
+                                Operation.registered(
+                                    request_key=text_keys[session_id],
+                                    op_id=op_id,
+                                    parent=VersionRef(
+                                        text_keys[session_id],
+                                        predecessor.op_id,
+                                        DevicePoint(1, None, predecessor.plan_digest),
+                                    ),
+                                    work=Work.token(TokenMode.DECODE),
+                                    route=0,
+                                    domain=Domain.UND,
+                                    bounds=Bounds(max_points=1, max_tokens=1),
+                                    outputs=token_outputs,
+                                    kv_capacity_pages=ceil_div(
+                                        op_id, int(self.cache_pool.block_size)
+                                    ),
+                                    predicate=token_output,
+                                )
+                            )
+
+                        flow_outputs: list[ProductRef] = []
+                        flow_operations: list[Operation] = []
+                        for session_id, key, conditioning, current in zip(
+                            session_ids,
+                            keys,
+                            conditionings,
+                            current_latents,
+                            strict=True,
+                        ):
+                            output = ProductRef(
+                                request_key=key,
+                                producer_op_id=flow_op_id,
+                                output_index=0,
+                                generation=next_generation,
+                                kind=ProductKind.LATENT,
+                                storage_class=StorageClass.LATENT_ARENA,
+                                dtype=DType.BF16,
+                                shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
+                                point_range=PointRange(),
+                            )
+                            next_generation += 1
+                            flow_outputs.append(output)
+                            flow_operations.append(
+                                Operation.registered(
+                                    request_key=key,
+                                    op_id=flow_op_id,
+                                    parent=VersionRef(
+                                        key,
+                                        flow_predecessors[session_id].op_id,
+                                        DevicePoint(
+                                            1,
+                                            None,
+                                            flow_predecessors[session_id].plan_digest,
+                                        ),
+                                    ),
+                                    work=Work("gen", "flow"),
+                                    route=0,
+                                    domain=Domain.GEN,
+                                    bounds=Bounds(
+                                        max_points=1,
+                                        max_tokens=1,
+                                        max_latent_bytes=max_latent_elements * 2,
+                                    ),
+                                    inputs=(conditioning, current),
+                                    outputs=(output,),
+                                )
+                            )
+                        flow_op_id += 1
+                        self._execute_warmup(
+                            self._build_warmup_batch(
+                                admissions=(),
+                                operations=(*text_operations, *flow_operations),
+                                tensorized_mixed=True,
+                                image_geometry=(height, width),
+                            ),
+                            retain_device_outputs=True,
+                        )
+                        self.products.release(
+                            tuple(
+                                int(output.generation)
+                                for session_id in selected_text
+                                for output in text_predecessors[session_id].outputs
+                                if output.storage_class is StorageClass.DEVICE_TENSOR
+                            )
+                        )
+                        text_predecessors.update(zip(selected_text, text_operations, strict=True))
+                        released_latents = tuple(
+                            (reference.request_key, int(reference.producer_op_id))
+                            for reference in current_latents
+                        )
+                        self.latents.release_operations(released_latents)
+                        self.products.device_products.release_operations(released_latents)
+                        current_latents = tuple(flow_outputs)
+                        flow_predecessors.update(zip(session_ids, flow_operations, strict=True))
+            finally:
+                for session_id in (*session_ids, *text_session_ids):
+                    self.drop_session(session_id)
 
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
@@ -1185,6 +1820,17 @@ class ModelWorker:
         if self.snapshot_provider is None:
             raise capability_mismatch("this worker has no configured snapshot provider")
         self.snapshot_provider.restore(reference, placement)
+        session = self.sessions.get(placement.request_key.session_id)
+        valid_cache_length = max(
+            (int(group.length) for group in placement.cache_groups),
+            default=0,
+        )
+        self.runtime_states.reset(
+            (int(session.request_pool_idx),),
+            valid_cache_lengths=(valid_cache_length,),
+            logical_lengths=(int(session.logical_position),),
+            sampling_positions=(int(session.rng_counter),),
+        )
 
     def resource_pressure(self) -> list[dict[str, object]]:
         caps = self._capabilities
@@ -1203,9 +1849,12 @@ class ModelWorker:
         ]
 
     def close(self) -> None:
+        self.runner.synchronize()
         self.executor.close()
-        self.graphs.close()
         self.mover.close()
+        self.latents.close()
+        self.products.close()
+        self.runner.close()
 
     def _release_records(self, records: tuple[object, ...]) -> None:
         from ..runtime.product_store import ProductRecord

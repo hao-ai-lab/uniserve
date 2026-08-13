@@ -1929,7 +1929,7 @@ mod tests {
                 .unwrap();
             let request = WorkerRequest::execute(comprehensive_batch());
             let dict = execute_request_to_py(py, &request).unwrap();
-            crate::mark_validated_batch(py, &dict).unwrap();
+            crate::mark_validated_batch(py, &dict, request.batch.as_ref()).unwrap();
             let wire_batch = dict.get_item("batch").unwrap().unwrap();
             let decoded = batch_type
                 .call_method1("from_wire", (wire_batch,))

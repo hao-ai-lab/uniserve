@@ -5,6 +5,7 @@ The FA4 reference kernel is an attention-only kernel: unlike FA2's
 This backend keeps that contract explicit by writing the current K/V span into
 the worker-owned paged cache before calling the FA4 paged forward.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -14,14 +15,14 @@ from typing import Any, Protocol
 
 import torch
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from ...foundation.sizing import ceil_div
 from ..paged_kv_math import paged_kv_write, write_locations
 from .base import AttentionCapabilities
 from .layout import QKVLayout, normalize_kv, normalize_to
 
 __all__ = [
-    'Fa4CuteAttentionBackend',
+    "Fa4CuteAttentionBackend",
 ]
 
 _IMPORT_ERROR: Exception | None = None
@@ -114,7 +115,7 @@ class Fa4CuteAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if attn_mask is not None:
@@ -148,7 +149,7 @@ class Fa4CuteAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         q_blh, restore = normalize_to(q, QKVLayout.BLHD)
         _validate_unified_trunk_geometry(
@@ -210,7 +211,7 @@ class Fa4CuteAttentionBackend:
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         """Run the hybrid ``visible_end`` mask path.
 

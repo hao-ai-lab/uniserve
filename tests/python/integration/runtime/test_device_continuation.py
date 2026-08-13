@@ -178,6 +178,69 @@ def test_same_request_continues_from_device_products_before_parent_observation()
     )
 
 
+def test_device_continuation_chain_matches_serial_token_sequence() -> None:
+    worker = execution_worker(device="cuda:0", pipeline_depth=4)
+    admission = und_admission(32, block_ids=(0,))
+    operation, token_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    reports = [
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(operation,),
+                input_products=(token_input,),
+            )
+        )
+    ]
+    operations = [operation]
+
+    for step_id in range(2, 5):
+        parent = operations[-1]
+        operation, token_input = token_operation(
+            admission.request_key,
+            op_id=step_id,
+            parent=VersionRef(
+                admission.request_key,
+                parent.op_id,
+                DevicePoint(1, None, parent.plan_digest),
+            ),
+            mode=TokenMode.DECODE,
+            tokens=(0,),
+            predicate=next(
+                output for output in parent.outputs if output.kind is ProductKind.TOKEN
+            ),
+        )
+        reports.append(
+            worker.execute(
+                execution_batch(
+                    step_id=step_id,
+                    admissions=(),
+                    operations=(operation,),
+                    input_products=(token_input,),
+                )
+            )
+        )
+        operations.append(operation)
+
+    torch.cuda.synchronize()
+    tokens = tuple(
+        finalize_completion_report(report).completions[0].committed_tokens[0]
+        for report in reports
+    )
+    expected = []
+    current = 4
+    for _ in range(4):
+        current = _next_token(current)
+        expected.append(current)
+    assert tokens == tuple(expected)
+
+
 def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> None:
     worker = execution_worker(device="cuda:0", pipeline_depth=2)
     sampling = SamplingParams(temperature=0.8, top_k=32, top_p=0.93, seed=917)

@@ -1,4 +1,5 @@
 """Shared configurable vision encoder stack."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -9,16 +10,16 @@ import torch.nn as nn
 
 import uniserve_worker.ops as ops
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from ..attention import RadixAttention
 from ..layer import LayerSpec
 from ..linear import LinearBase
 
 __all__ = [
-    'VisionEncoderConfig',
-    'VisionSelfAttention',
-    'VisionEncoderLayer',
-    'VisionEncoder',
+    "VisionEncoderConfig",
+    "VisionSelfAttention",
+    "VisionEncoderLayer",
+    "VisionEncoder",
 ]
 
 
@@ -38,7 +39,7 @@ class VisionSelfAttention(nn.Module):
             raise ValueError("vision hidden_size must be divisible by num_attention_heads")
         self.num_heads = int(num_heads)
         self.head_dim = int(hidden_size) // self.num_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.q_proj = LinearBase(hidden_size, hidden_size, spec=spec)
         self.k_proj = LinearBase(hidden_size, hidden_size, spec=spec)
         self.v_proj = LinearBase(hidden_size, hidden_size, spec=spec)
@@ -49,7 +50,7 @@ class VisionSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         max_seqlen: int,
         seq_lens: Sequence[int],
@@ -134,7 +135,7 @@ class VisionEncoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         max_seqlen: int,
         seq_lens: Sequence[int],
@@ -168,7 +169,7 @@ class VisionEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         cu_seqlens: torch.Tensor | None = None,
         *,
         seq_lens: Sequence[int] | None = None,

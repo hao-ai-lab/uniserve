@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from torch import nn
 
 from ..batch import WorkVariant
-from ..forward import ForwardRow, RouteId
 from ..foundation.errors import invalid_descriptor
 
 if TYPE_CHECKING:
@@ -20,30 +19,9 @@ _FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 _KV_DTYPES = frozenset({*_FLOAT_DTYPES, "float8_e4m3fn"})
 
 
-class RowKind(StrEnum):
-    TOKEN = "token"
-    FLOW = "flow"
-    ENCODE = "encode"
-    DECODE = "decode"
-
-
-class DeviceRole(StrEnum):
-    PRIMARY = "primary"
-    GENERATION = "generation"
-
-
 class PositionLayout(StrEnum):
     TEMPORAL = "temporal"
     TEMPORAL_SPATIAL = "temporal_spatial"
-
-
-@dataclass(frozen=True, slots=True)
-class LoweredStage:
-    """One neural call produced while lowering a registered operation."""
-
-    route: RouteId
-    row: RowKind
-    publishes_state: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +95,8 @@ class WorkerDeployment:
     kv_cache_dtype: str | None
     kv_memory_fraction: float
     max_batch_operations: int
+    max_batch_tokens: int
+    max_request_pool_size: int
     generation_device: str | None
 
     def __post_init__(self) -> None:
@@ -124,7 +104,12 @@ class WorkerDeployment:
             raise invalid_descriptor("worker deployment placement must be named")
         if self.tp_size < 1 or not 0 <= self.tp_rank < self.tp_size:
             raise invalid_descriptor("worker deployment TP rank is invalid")
-        if self.block_size < 1 or self.max_batch_operations < 1:
+        if (
+            self.block_size < 1
+            or self.max_batch_operations < 1
+            or self.max_batch_tokens < 1
+            or self.max_request_pool_size < 1
+        ):
             raise invalid_descriptor("worker deployment capacities must be positive")
         if not 0 < self.kv_memory_fraction <= 1:
             raise invalid_descriptor("worker deployment KV memory fraction must be in (0, 1]")
@@ -135,70 +120,25 @@ class WorkerDeployment:
 
 
 class ExecutionModel(nn.Module):
-    """Concrete models implement physical lowering beside their forward method."""
+    """Common required geometry for concrete imperative model implementations."""
 
     architecture: str
     serving_dtype: str = "bfloat16"
     cache_geometry: CacheGeometry
     resource_geometry: ResourceGeometry
     supported_work: frozenset[WorkVariant]
+    vocab_size: int
+    hidden_size: int
+    text_max_tokens: int
+    text_topology: tuple[str, ...] = ("tp",)
+    tensorized_mixed: bool = False
     image_processor: ImageProcessor | None = None
     generation: GenerationPipeline | None = None
 
-    def lower(
-        self,
-        variant: WorkVariant,
-        *,
-        retain_image: bool = False,
-    ) -> tuple[LoweredStage, ...]:
-        raise NotImplementedError
 
-    def route_dtype(self, route: RouteId) -> str:
-        raise NotImplementedError
-
-    def route_device_role(self, route: RouteId) -> DeviceRole:
-        raise NotImplementedError
-
-    def route_topology(self, route: RouteId) -> tuple[str, ...]:
-        raise NotImplementedError
-
-    def route_graph_eligible(self, route: RouteId) -> bool:
-        raise NotImplementedError
-
-    def route_max_tokens(self, route: RouteId) -> int:
-        raise NotImplementedError
-
-    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
-        raise NotImplementedError
-
-    def route_uses_packed_attention(self, route: RouteId) -> bool:
-        return False
-
-    def allows_mixed(self, route: RouteId, rows: frozenset[RowKind]) -> bool:
-        return False
-
-    def primary_stage(self, variant: WorkVariant) -> LoweredStage:
-        primary = tuple(stage for stage in self.lower(variant) if not stage.publishes_state)
-        if len(primary) != 1:
-            raise invalid_descriptor(
-                f"operation {variant.value!r} requires exactly one primary neural stage"
-            )
-        return primary[0]
-
-    def state_stages(
-        self,
-        variant: WorkVariant,
-        *,
-        retain_image: bool,
-    ) -> tuple[LoweredStage, ...]:
-        return tuple(
-            stage
-            for stage in self.lower(variant, retain_image=retain_image)
-            if stage.publishes_state
-        )
-
-
-def active_latent_capacity_tokens(per_image_tokens: int, concurrency_token_budget: int | None) -> int:
+def active_latent_capacity_tokens(
+    per_image_tokens: int, concurrency_token_budget: int | None
+) -> int:
     per_image = max(0, int(per_image_tokens))
     if per_image == 0:
         return 0
@@ -209,12 +149,9 @@ def active_latent_capacity_tokens(per_image_tokens: int, concurrency_token_budge
 
 __all__ = [
     "CacheGeometry",
-    "DeviceRole",
     "ExecutionModel",
-    "LoweredStage",
     "PositionLayout",
     "ResourceGeometry",
-    "RowKind",
     "ScratchGeometry",
     "WorkerDeployment",
     "active_latent_capacity_tokens",

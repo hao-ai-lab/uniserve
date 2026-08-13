@@ -1,4 +1,5 @@
 """Shared Qwen-style decoder components."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -7,7 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ...forward import MeshView
+from ...execution.forward_batch import MeshView
 from ..activation import GeluAndMul
 from ..layer import LayerSpec
 from ..linear import MergedColumnParallelLinear, RowParallelLinear

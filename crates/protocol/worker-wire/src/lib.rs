@@ -2063,6 +2063,35 @@ impl CompletionReport {
 // Capabilities and startup agreement
 // ---------------------------------------------------------------------------
 
+/// One direct physical CUDA graph shape advertised by an execution lane.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GraphBucketCapability {
+    pub phase: String,
+    pub batch_size: u32,
+    pub token_bucket: u32,
+    pub attention_form: String,
+    pub height: u32,
+    pub width: u32,
+    pub cfg_branches: u32,
+    pub layout: String,
+}
+
+/// Immutable scheduler-visible resources and execution coverage for one lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneCapabilities {
+    pub lane_id: String,
+    pub domains: Vec<Domain>,
+    pub resolved_sm_count: u32,
+    pub kv_capacity_tokens: Option<u64>,
+    pub latent_capacity_units: Option<u64>,
+    pub max_batch_operations: u32,
+    pub max_batch_tokens: u32,
+    pub max_inflight: u32,
+    pub graph_buckets: Vec<GraphBucketCapability>,
+    pub eager_max_batch_operations: u32,
+    pub eager_max_batch_tokens: u32,
+}
+
 /// A worker's advertised capabilities. Admission requires every rank, worker,
 /// and frontend to agree on the protocol layout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2097,6 +2126,8 @@ pub struct WorkerCapabilities {
     pub encoder_cache_budget: u32,
     pub supported_controls: Vec<RequestKind>,
     pub max_batch_operations: u32,
+    pub max_batch_tokens: u32,
+    pub max_request_pool_size: u32,
     pub max_unresolved_window: u32,
     pub incremental_kv_publication: bool,
     pub tensorized_mixed: bool,
@@ -2105,6 +2136,7 @@ pub struct WorkerCapabilities {
     pub model_identity: Digest,
     pub weight_digest: Digest,
     pub protocol_layout_digest: Digest,
+    pub lanes: Vec<LaneCapabilities>,
 }
 
 impl WorkerCapabilities {
@@ -2145,8 +2177,48 @@ impl WorkerCapabilities {
                 == self.resource_classes.len(),
             "worker capabilities repeat a resource class"
         );
+        let mut lane_ids = HashSet::with_capacity(self.lanes.len());
+        let mut lane_domains = HashSet::new();
+        for lane in &self.lanes {
+            anyhow::ensure!(
+                !lane.lane_id.is_empty() && lane_ids.insert(lane.lane_id.as_str()),
+                "worker capabilities repeat or omit a lane id"
+            );
+            anyhow::ensure!(
+                lane.resolved_sm_count > 0
+                    && lane.max_batch_operations > 0
+                    && lane.max_batch_tokens > 0
+                    && lane.max_inflight > 0
+                    && lane.eager_max_batch_operations > 0
+                    && lane.eager_max_batch_tokens > 0,
+                "worker lane declares a zero execution bound"
+            );
+            anyhow::ensure!(!lane.domains.is_empty(), "worker lane binds no domain");
+            for domain in &lane.domains {
+                anyhow::ensure!(
+                    lane_domains.insert(*domain),
+                    "worker capabilities repeat a lane domain binding"
+                );
+            }
+            anyhow::ensure!(
+                lane.graph_buckets.iter().collect::<HashSet<_>>().len() == lane.graph_buckets.len(),
+                "worker lane repeats a graph bucket"
+            );
+            for bucket in &lane.graph_buckets {
+                anyhow::ensure!(
+                    !bucket.phase.is_empty()
+                        && !bucket.attention_form.is_empty()
+                        && bucket.batch_size > 0
+                        && bucket.cfg_branches > 0,
+                    "worker lane graph bucket is invalid"
+                );
+            }
+        }
         anyhow::ensure!(
-            self.max_batch_operations > 0 && self.max_unresolved_window > 0,
+            self.max_batch_operations > 0
+                && self.max_batch_tokens > 0
+                && self.max_request_pool_size > 0
+                && self.max_unresolved_window > 0,
             "worker capabilities declare a zero scheduling bound"
         );
         anyhow::ensure!(
@@ -2276,6 +2348,8 @@ impl Default for WorkerCapabilities {
             encoder_cache_budget: 0,
             supported_controls: Vec::new(),
             max_batch_operations: 1,
+            max_batch_tokens: 8192,
+            max_request_pool_size: 128,
             max_unresolved_window: 1,
             incremental_kv_publication: true,
             tensorized_mixed: false,
@@ -2284,6 +2358,7 @@ impl Default for WorkerCapabilities {
             model_identity: String::new(),
             weight_digest: String::new(),
             protocol_layout_digest: protocol_layout_digest(),
+            lanes: Vec::new(),
         }
     }
 }

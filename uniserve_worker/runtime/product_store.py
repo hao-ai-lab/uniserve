@@ -21,6 +21,7 @@ from ..batch import (
     TokenMode,
 )
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
+from ..foundation.profiling import profile_range
 from .device_events import DeviceEventPool
 from .host_staging import canonical_device
 from .product_capacity import device_product_storage
@@ -172,25 +173,6 @@ class DeviceProductBindingBatch:
     scalar: DeviceProductScalarBatch | None = None
 
 
-@dataclass(slots=True)
-class DeviceProductContinuationBatch:
-    """One aligned device-parent read and scalar-output write transaction."""
-
-    inputs: tuple[torch.Tensor, ...]
-    writes: tuple[DeviceProductWrite, ...]
-    scalar: DeviceProductScalarBatch | None
-    _parents: tuple[DeviceProductWrite, ...] = field(repr=False, compare=False)
-    _consumer_op_ids: tuple[int, ...] = field(repr=False, compare=False)
-    _device: torch.device = field(repr=False, compare=False)
-    _table_token: object = field(repr=False, compare=False)
-    _published: bool = field(default=False, repr=False, compare=False)
-    _readers_recorded: bool = field(default=False, repr=False, compare=False)
-
-    @property
-    def published(self) -> bool:
-        return self._published
-
-
 class DeviceProductTable:
     """Bounded physical slots for generation-tagged device products.
 
@@ -231,6 +213,18 @@ class DeviceProductTable:
     def allocated_bytes(self) -> int:
         with self._lock:
             return self._allocated_bytes
+
+    def close(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._operation_writes.clear()
+            self._scalar_arenas.clear()
+            self._slots.clear()
+            self._occupied_slots.clear()
+            self._free_slots.clear()
+            self._free_slot_queues.clear()
+            self._compatible_free_slots.clear()
+            self._allocated_bytes = 0
 
     @staticmethod
     def _tensor_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -603,127 +597,6 @@ class DeviceProductTable:
                 self._restore_planned_slots_locked(slots)
                 raise
 
-    def bind_scalar_continuation(
-        self,
-        *,
-        outputs: tuple[tuple[ProductRef, str], ...],
-        parents: tuple[tuple[ProductRef, int, str], ...],
-        device: torch.device | str,
-    ) -> DeviceProductContinuationBatch:
-        """Pin aligned device parents and atomically bind scalar descendants."""
-
-        if not outputs or len(outputs) != len(parents):
-            raise invalid_descriptor(
-                "device continuation requires aligned non-empty parents and outputs"
-            )
-        target = _resolved_device(device)
-        target_name = str(target)
-        with self._lock:
-            parent_entries: list[DeviceProductWrite] = []
-            input_tensors: list[torch.Tensor] = []
-            consumer_op_ids: list[int] = []
-            for reference, consumer_op_id, producer_plan_digest in parents:
-                entry = self._require_locked(reference)
-                if entry.released or entry.logical_references < 1:
-                    raise invalid_descriptor("device product was consumed after logical release")
-                if not entry.producer_recorded:
-                    raise invalid_descriptor(
-                        "device product was consumed before producer publication"
-                    )
-                if entry.producer_plan_digest != producer_plan_digest:
-                    raise invalid_descriptor(
-                        "device parent plan digest does not match its producer"
-                    )
-                storage = entry.slot.tensor
-                if storage is None:
-                    raise _invariant("device product has no physical tensor")
-                if entry.slot.device_name != target_name:
-                    raise invalid_descriptor("device product consumer names a different device")
-                tensor = (
-                    storage
-                    if entry.actual_shape == entry.slot.shape
-                    else storage.reshape(-1)[: entry.actual_extent].reshape(entry.actual_shape)
-                )
-                parent_entries.append(entry)
-                input_tensors.append(tensor)
-                consumer_op_ids.append(int(consumer_op_id))
-
-            if target.type == "cuda":
-                stream = torch.cuda.current_stream(target)
-                stream_id = int(stream.cuda_stream)
-                first_event = parent_entries[0].producer_event
-                if first_event is None:
-                    raise _invariant("CUDA device product has no producer event")
-                if all(entry.producer_event is first_event for entry in parent_entries):
-                    if any(entry.producer_stream != stream_id for entry in parent_entries):
-                        stream.wait_event(first_event)
-                else:
-                    waited: set[int] = set()
-                    for entry in parent_entries:
-                        event = entry.producer_event
-                        if event is None:
-                            raise _invariant("CUDA device product has no producer event")
-                        identity = id(event)
-                        if identity in waited:
-                            continue
-                        stream.wait_event(event)
-                        waited.add(identity)
-
-            first_output = outputs[0][0]
-            output_dtype = _device_dtype(first_output.dtype)
-            if any(
-                reference.storage_class
-                not in {
-                    StorageClass.DEVICE_TENSOR,
-                    StorageClass.LATENT_ARENA,
-                }
-                or int(reference.output_index) != 0
-                or _device_shape(reference) != (1,)
-                or _device_dtype(reference.dtype) != output_dtype
-                for reference, _plan_digest in outputs
-            ):
-                raise invalid_descriptor(
-                    "device continuation outputs must use compatible scalar storage"
-                )
-            binding: DeviceProductBindingBatch | None = None
-            try:
-                binding = self._bind_homogeneous_outputs(
-                    tuple((reference, plan_digest, target) for reference, plan_digest in outputs),
-                    target,
-                    (1,),
-                    output_dtype,
-                    index_operations=False,
-                )
-                if len(binding.writes) != len(outputs):
-                    raise _invariant("device continuation lost an output registration")
-                if any(
-                    int(write.reference.producer_op_id) != consumer_op_id
-                    for write, consumer_op_id in zip(
-                        binding.writes,
-                        consumer_op_ids,
-                        strict=True,
-                    )
-                ):
-                    raise invalid_descriptor(
-                        "device continuation output does not match its consumer operation"
-                    )
-                continuation = DeviceProductContinuationBatch(
-                    inputs=tuple(input_tensors),
-                    writes=binding.writes,
-                    scalar=binding.scalar,
-                    _parents=tuple(parent_entries),
-                    _consumer_op_ids=tuple(consumer_op_ids),
-                    _device=target,
-                    _table_token=self._binding_token,
-                )
-            except BaseException:
-                if binding is not None:
-                    self.abandon_writes(binding.writes)
-                raise
-            for entry in parent_entries:
-                entry.inflight_read_batches += 1
-            return continuation
-
     def producer_view(self, reference: ProductRef) -> torch.Tensor:
         """Return a bound unpublished tensor for the registered producer."""
 
@@ -920,115 +793,6 @@ class DeviceProductTable:
                 device=batch.tensor.device,
             )
 
-    def publish_continuation(
-        self,
-        continuation: DeviceProductContinuationBatch,
-        values: torch.Tensor | None = None,
-        *,
-        after_reads: tuple[DeviceProductRead, ...] = (),
-        producer_event: torch.cuda.Event | None = None,
-    ) -> None:
-        """Publish scalar descendants and fence their pinned device parents."""
-
-        with self._lock:
-            self._require_continuation_locked(continuation)
-            if continuation._published:
-                raise _invariant("device continuation was published more than once")
-            scalar = continuation.scalar
-            if scalar is not None:
-                if values is not None:
-                    source = values.detach().reshape(-1)
-                    if int(source.numel()) != len(continuation.writes):
-                        raise invalid_descriptor(
-                            "device continuation requires one scalar per output"
-                        )
-                    aliases_destination = (
-                        source.device == scalar.tensor.device
-                        and source.dtype == scalar.tensor.dtype
-                        and source.untyped_storage().data_ptr()
-                        == scalar.tensor.untyped_storage().data_ptr()
-                        and int(source.storage_offset()) == int(scalar.tensor.storage_offset())
-                    )
-                    if not aliases_destination:
-                        scalar.tensor.copy_(
-                            source.to(dtype=scalar.tensor.dtype),
-                            non_blocking=source.device.type == "cuda",
-                        )
-                event = self._publish_scalar_batch_locked(
-                    scalar,
-                    producer_event=producer_event,
-                )
-            else:
-                if values is None:
-                    raise invalid_descriptor(
-                        "non-contiguous device continuation requires scalar values"
-                    )
-                self._publish_batch_locked(
-                    continuation.writes,
-                    values,
-                    producer_event=producer_event,
-                )
-                event = continuation.writes[0].producer_event
-            continuation._published = True
-            self._record_continuation_readers_locked(
-                continuation,
-                event=event,
-            )
-            self._record_readers_after_write_locked(
-                after_reads,
-                continuation.writes,
-                event=event,
-                device=continuation._device,
-            )
-
-    def publish_continuation_group(
-        self,
-        continuation: DeviceProductContinuationBatch,
-        scalar_batches: tuple[DeviceProductScalarBatch, ...],
-        *,
-        after_reads: tuple[DeviceProductRead, ...] = (),
-    ) -> None:
-        """Publish prefilled continuation and scalar outputs behind one fence."""
-
-        with self._lock:
-            self._require_continuation_locked(continuation)
-            if continuation._published:
-                raise _invariant("device continuation was published more than once")
-            continuation_scalar = continuation.scalar
-            if continuation_scalar is None:
-                raise invalid_descriptor(
-                    "grouped device continuation requires contiguous scalar outputs"
-                )
-            batches = (*scalar_batches, continuation_scalar)
-            for batch in batches:
-                self._require_live_scalar_batch_locked(batch)
-                if batch._published:
-                    raise _invariant("device product was published more than once")
-                if batch.tensor.device != continuation._device:
-                    raise invalid_descriptor(
-                        "grouped device continuation spans incompatible devices"
-                    )
-            writes = tuple(write for batch in batches for write in batch.writes)
-            if len({id(write) for write in writes}) != len(writes):
-                raise invalid_descriptor("grouped device continuation repeats an output binding")
-
-            event: torch.cuda.Event | None = None
-            if continuation._device.type == "cuda":
-                event, _stream_id = self._record_event_locked(continuation._device)
-            for batch in batches:
-                self._publish_scalar_batch_locked(batch, producer_event=event)
-            continuation._published = True
-            self._record_continuation_readers_locked(
-                continuation,
-                event=event,
-            )
-            self._record_readers_after_write_locked(
-                after_reads,
-                continuation.writes,
-                event=event,
-                device=continuation._device,
-            )
-
     def publish_scalar_group(
         self,
         batches: tuple[DeviceProductScalarBatch, ...],
@@ -1062,44 +826,6 @@ class DeviceProductTable:
                 event=event,
                 device=device,
             )
-
-    def finish_continuation(
-        self,
-        continuation: DeviceProductContinuationBatch,
-    ) -> None:
-        """Finalize split publication and fence the continuation's pinned parents."""
-
-        with self._lock:
-            self._require_continuation_locked(continuation)
-            if not continuation._published:
-                published = tuple(
-                    self._require_write_locked(write).producer_recorded
-                    for write in continuation.writes
-                )
-                if any(published) and not all(published):
-                    raise _invariant("device continuation was only partially published")
-                if all(published):
-                    continuation._published = True
-            if continuation._readers_recorded:
-                return
-            event: torch.cuda.Event | None = None
-            if continuation._device.type == "cuda":
-                event, _stream_id = self._record_event_locked(continuation._device)
-            self._record_continuation_readers_locked(
-                continuation,
-                event=event,
-            )
-
-    def validate_continuation(
-        self,
-        continuation: DeviceProductContinuationBatch,
-    ) -> None:
-        with self._lock:
-            self._require_continuation_locked(continuation)
-            if not continuation._published:
-                raise _invariant("completion packing found an unpublished device continuation")
-            if not continuation._readers_recorded:
-                raise _invariant("device continuation did not fence its parent products")
 
     def _publish_scalar_batch_locked(
         self,
@@ -1806,52 +1532,6 @@ class DeviceProductTable:
         for write in batch.writes:
             self._require_write_locked(write)
 
-    def _require_continuation_locked(
-        self,
-        continuation: DeviceProductContinuationBatch,
-    ) -> None:
-        if continuation._table_token is not self._binding_token:
-            raise _invariant("device continuation belongs to a different product table")
-        scalar = continuation.scalar
-        if scalar is not None:
-            self._require_live_scalar_batch_locked(scalar)
-            return
-        for write in continuation.writes:
-            self._require_write_locked(write)
-
-    def _record_continuation_readers_locked(
-        self,
-        continuation: DeviceProductContinuationBatch,
-        *,
-        event: torch.cuda.Event | None,
-    ) -> None:
-        if continuation._readers_recorded:
-            return
-        parents = continuation._parents
-        if continuation._device.type == "cuda":
-            if event is None:
-                raise _invariant("CUDA device continuation has no reader completion event")
-            if all(parent.reader_events is None for parent in parents):
-                for parent in parents:
-                    parent.reader_events = event
-                self._retain_event_locked(
-                    event,
-                    continuation._device,
-                    len(parents),
-                )
-            else:
-                for parent in parents:
-                    self._append_reader_event_locked(
-                        parent,
-                        event,
-                        continuation._device,
-                    )
-        for parent in parents:
-            if parent.inflight_read_batches < 1:
-                raise _invariant("device continuation parent pin underflow")
-            parent.inflight_read_batches -= 1
-        continuation._readers_recorded = True
-
     def _scalar_batch_locked(
         self,
         writes: tuple[DeviceProductWrite, ...],
@@ -2419,6 +2099,13 @@ class ProductStore:
         with self._lock:
             return self._records.get(int(handle))
 
+    def close(self) -> None:
+        self.device_products.close()
+        with self._lock:
+            self._records.clear()
+            self._session_handles.clear()
+        self.device_events.close()
+
     def require(self, handle: int) -> ProductRecord:
         value = self.get(handle)
         if value is None:
@@ -2505,10 +2192,11 @@ class ProductStore:
                     continue
                 self._records.pop(handle, None)
                 self._revisions[handle] = self._revision()
-        self.device_products.drop_session(
-            session_id,
-            retained_generations=retained,
-        )
+        with profile_range("uniserve.product_store.drop_session"):
+            self.device_products.drop_session(
+                session_id,
+                retained_generations=retained,
+            )
 
     def snapshot_records(self, session_ids: set[int]) -> tuple[ProductRecord, ...]:
         requested = {int(value) for value in session_ids}

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from .batch import SamplingOwnership, WorkVariant, protocol_layout_digest
+from .batch import Domain, SamplingOwnership, WorkVariant, protocol_layout_digest
 from .foundation.errors import invalid_descriptor
 
 # Two work variants are never admitted onto a configured serving route:
@@ -140,6 +140,138 @@ class RankInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class GraphBucketCapability:
+    phase: str
+    batch_size: int
+    token_bucket: int
+    attention_form: str
+    height: int
+    width: int
+    cfg_branches: int
+    layout: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.phase or not self.attention_form:
+            raise invalid_descriptor("graph bucket phase and attention form must be non-empty")
+        if self.batch_size < 1 or self.token_bucket < 0:
+            raise invalid_descriptor("graph bucket batch and token dimensions are invalid")
+        if min(self.height, self.width) < 0 or self.cfg_branches < 1:
+            raise invalid_descriptor("graph bucket image dimensions are invalid")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str) -> GraphBucketCapability:
+        data = _map(value, where)
+        return cls(
+            phase=_str(data.get("phase"), f"{where}.phase"),
+            batch_size=_uint(data.get("batch_size"), f"{where}.batch_size"),
+            token_bucket=_uint(data.get("token_bucket"), f"{where}.token_bucket"),
+            attention_form=_str(data.get("attention_form"), f"{where}.attention_form"),
+            height=_uint(data.get("height"), f"{where}.height"),
+            width=_uint(data.get("width"), f"{where}.width"),
+            cfg_branches=_uint(data.get("cfg_branches"), f"{where}.cfg_branches"),
+            layout=_str(data.get("layout", ""), f"{where}.layout"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "phase": self.phase,
+            "batch_size": self.batch_size,
+            "token_bucket": self.token_bucket,
+            "attention_form": self.attention_form,
+            "height": self.height,
+            "width": self.width,
+            "cfg_branches": self.cfg_branches,
+            "layout": self.layout,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LaneCapabilities:
+    lane_id: str
+    domains: tuple[Domain, ...]
+    resolved_sm_count: int
+    kv_capacity_tokens: int | None
+    latent_capacity_units: int | None
+    max_batch_operations: int
+    max_batch_tokens: int
+    max_inflight: int
+    graph_buckets: tuple[GraphBucketCapability, ...]
+    eager_max_batch_operations: int
+    eager_max_batch_tokens: int
+
+    def __post_init__(self) -> None:
+        if not self.lane_id or not self.domains or len(set(self.domains)) != len(self.domains):
+            raise invalid_descriptor("lane capability identity and domains are invalid")
+        for name in (
+            "resolved_sm_count",
+            "max_batch_operations",
+            "max_batch_tokens",
+            "max_inflight",
+            "eager_max_batch_operations",
+            "eager_max_batch_tokens",
+        ):
+            if getattr(self, name) < 1:
+                raise invalid_descriptor(f"lane capability {name} must be positive")
+        for name in ("kv_capacity_tokens", "latent_capacity_units"):
+            value = getattr(self, name)
+            if value is not None and value < 1:
+                raise invalid_descriptor(f"lane capability {name} must be positive")
+        if len(set(self.graph_buckets)) != len(self.graph_buckets):
+            raise invalid_descriptor("lane capability repeats a graph bucket")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str) -> LaneCapabilities:
+        data = _map(value, where)
+        return cls(
+            lane_id=_str(data.get("lane_id"), f"{where}.lane_id"),
+            domains=tuple(
+                _enum(Domain, item, f"{where}.domains[{index}]")
+                for index, item in enumerate(_seq(data.get("domains"), f"{where}.domains"))
+            ),
+            resolved_sm_count=_uint(data.get("resolved_sm_count"), f"{where}.resolved_sm_count"),
+            kv_capacity_tokens=_optional_uint(
+                data.get("kv_capacity_tokens"), f"{where}.kv_capacity_tokens"
+            ),
+            latent_capacity_units=_optional_uint(
+                data.get("latent_capacity_units"), f"{where}.latent_capacity_units"
+            ),
+            max_batch_operations=_uint(
+                data.get("max_batch_operations"), f"{where}.max_batch_operations"
+            ),
+            max_batch_tokens=_uint(data.get("max_batch_tokens"), f"{where}.max_batch_tokens"),
+            max_inflight=_uint(data.get("max_inflight"), f"{where}.max_inflight"),
+            graph_buckets=tuple(
+                GraphBucketCapability.from_wire(item, f"{where}.graph_buckets[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("graph_buckets", ()), f"{where}.graph_buckets")
+                )
+            ),
+            eager_max_batch_operations=_uint(
+                data.get("eager_max_batch_operations"),
+                f"{where}.eager_max_batch_operations",
+            ),
+            eager_max_batch_tokens=_uint(
+                data.get("eager_max_batch_tokens"), f"{where}.eager_max_batch_tokens"
+            ),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "lane_id": self.lane_id,
+            "domains": [domain.value for domain in self.domains],
+            "resolved_sm_count": self.resolved_sm_count,
+            "kv_capacity_tokens": self.kv_capacity_tokens,
+            "latent_capacity_units": self.latent_capacity_units,
+            "max_batch_operations": self.max_batch_operations,
+            "max_batch_tokens": self.max_batch_tokens,
+            "max_inflight": self.max_inflight,
+            "graph_buckets": [bucket.to_wire() for bucket in self.graph_buckets],
+            "eager_max_batch_operations": self.eager_max_batch_operations,
+            "eager_max_batch_tokens": self.eager_max_batch_tokens,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerCapabilities:
     block_size: int
     num_blocks: int
@@ -171,6 +303,8 @@ class WorkerCapabilities:
     encoder_cache_budget: int
     supported_controls: tuple[RequestKind, ...]
     max_batch_operations: int
+    max_batch_tokens: int
+    max_request_pool_size: int
     max_unresolved_window: int
     incremental_kv_publication: bool
     tensorized_mixed: bool
@@ -179,6 +313,7 @@ class WorkerCapabilities:
     model_identity: str
     weight_digest: str
     protocol_layout_digest: str = ""
+    lanes: tuple[LaneCapabilities, ...] = ()
 
     @property
     def latent_capacity_units(self) -> int:
@@ -200,6 +335,8 @@ class WorkerCapabilities:
             "gen_rope_advance",
             "max_cfg_branches",
             "max_batch_operations",
+            "max_batch_tokens",
+            "max_request_pool_size",
             "max_unresolved_window",
         ):
             if getattr(self, name) < 1:
@@ -241,6 +378,11 @@ class WorkerCapabilities:
             raise invalid_descriptor("capabilities repeat a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
             raise invalid_descriptor("capabilities repeat a resource class")
+        if len({lane.lane_id for lane in self.lanes}) != len(self.lanes):
+            raise invalid_descriptor("capabilities repeat a lane id")
+        lane_domains = tuple(domain for lane in self.lanes for domain in lane.domains)
+        if len(set(lane_domains)) != len(lane_domains):
+            raise invalid_descriptor("capabilities repeat a lane domain binding")
         has_latent_geometry = bool(
             self.latent_page_units
             or self.num_latent_pages
@@ -346,6 +488,10 @@ class WorkerCapabilities:
             max_batch_operations=_uint(
                 data.get("max_batch_operations"), f"{where}.max_batch_operations"
             ),
+            max_batch_tokens=_uint(data.get("max_batch_tokens"), f"{where}.max_batch_tokens"),
+            max_request_pool_size=_uint(
+                data.get("max_request_pool_size"), f"{where}.max_request_pool_size"
+            ),
             max_unresolved_window=_uint(
                 data.get("max_unresolved_window"), f"{where}.max_unresolved_window"
             ),
@@ -364,6 +510,10 @@ class WorkerCapabilities:
             ),
             model_identity=_str(data.get("model_identity", ""), f"{where}.model_identity"),
             weight_digest=_str(data.get("weight_digest", ""), f"{where}.weight_digest"),
+            lanes=tuple(
+                LaneCapabilities.from_wire(item, f"{where}.lanes[{index}]")
+                for index, item in enumerate(_seq(data.get("lanes", ()), f"{where}.lanes"))
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -398,6 +548,8 @@ class WorkerCapabilities:
             "encoder_cache_budget": self.encoder_cache_budget,
             "supported_controls": [value.value for value in self.supported_controls],
             "max_batch_operations": self.max_batch_operations,
+            "max_batch_tokens": self.max_batch_tokens,
+            "max_request_pool_size": self.max_request_pool_size,
             "max_unresolved_window": self.max_unresolved_window,
             "incremental_kv_publication": self.incremental_kv_publication,
             "tensorized_mixed": self.tensorized_mixed,
@@ -406,6 +558,7 @@ class WorkerCapabilities:
             "model_identity": self.model_identity,
             "weight_digest": self.weight_digest,
             "protocol_layout_digest": self.protocol_layout_digest,
+            "lanes": [lane.to_wire() for lane in self.lanes],
         }
 
 
@@ -437,6 +590,10 @@ def _uint(value: object, where: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(f"{where} must be a non-negative integer")
     return value
+
+
+def _optional_uint(value: object, where: str) -> int | None:
+    return None if value is None else _uint(value, where)
 
 
 def _bool(value: object, where: str) -> bool:

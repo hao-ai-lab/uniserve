@@ -6,7 +6,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from ...foundation.runtime_config import FlashInferTuningConfig
 from .base import AttentionCapabilities
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
@@ -78,7 +78,7 @@ class TRTLLMMHAAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         raise RuntimeError("trtllm_mha requires paged KV metadata")
@@ -95,7 +95,7 @@ class TRTLLMMHAAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del causal
         if _trtllm_decode is None:
@@ -150,7 +150,7 @@ class TRTLLMMHAAttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         if _trtllm_context is None:
             raise RuntimeError("FlashInfer TRT-LLM MHA context is not available")

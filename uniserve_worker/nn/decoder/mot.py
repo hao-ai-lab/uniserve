@@ -9,7 +9,7 @@ from typing import Protocol, cast
 import torch
 import torch.nn as nn
 
-from ...forward import ForwardContext, PackedAttentionPlan, PagedDecodePlan
+from ...execution.forward_batch import ForwardBatch, PackedAttentionPlan, PagedDecodePlan
 from ..attention import RadixAttention
 from ..layer import LayerSpec
 from ..linear import (
@@ -82,10 +82,10 @@ def _apply(
     module: nn.Module,
     value: torch.Tensor,
     *,
-    context: ForwardContext,
+    context: ForwardBatch,
     coordinate: int,
     target: torch.device,
-    call: Callable[[nn.Module, torch.Tensor, ForwardContext], torch.Tensor],
+    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
     staged = context.mesh.dispatch(value, "tower", coordinate)
     result = call(module, staged, context)
@@ -102,8 +102,8 @@ def _route(
     has_flow: bool,
     text_module: nn.Module,
     flow_module: nn.Module,
-    context: ForwardContext,
-    call: Callable[[nn.Module, torch.Tensor, ForwardContext], torch.Tensor],
+    context: ForwardBatch,
+    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
     target = value.device
     if has_text and has_flow:
@@ -149,7 +149,7 @@ def _route(
 def _plain_call(
     module: nn.Module,
     value: torch.Tensor,
-    context: ForwardContext,
+    context: ForwardBatch,
 ) -> torch.Tensor:
     del context
     return cast(torch.Tensor, module(value))
@@ -158,7 +158,7 @@ def _plain_call(
 def _parallel_call(
     module: nn.Module,
     value: torch.Tensor,
-    context: ForwardContext,
+    context: ForwardBatch,
 ) -> torch.Tensor:
     return cast(torch.Tensor, module(value, context.mesh))
 
@@ -270,7 +270,7 @@ class MoTDecoderLayer(nn.Module):
         hidden: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         target = hidden.device
         staged = context.mesh.dispatch(hidden, "tower", expert.coordinate)
@@ -304,7 +304,7 @@ class MoTDecoderLayer(nn.Module):
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         plan: PackedAttentionPlan | None,
     ) -> torch.Tensor:
         """Apply the selected experts and one shared attention operation."""
@@ -407,7 +407,7 @@ class MoTModel(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:

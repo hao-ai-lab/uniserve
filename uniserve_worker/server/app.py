@@ -25,6 +25,7 @@ from ..foundation.errors import (
     should_capture_trace,
     unsupported_control,
 )
+from ..foundation.profiling import profile_range
 from ..worker.protocol import Worker
 from .metrics import MetricsService
 from .process import WorkerIpcTransport
@@ -325,21 +326,30 @@ class WorkerServer:
             if self._execute_count > self._terminate_after:
                 os._exit(1)
         try:
-            if raw_kind == RequestKind.POLL_COMPLETIONS.value:
-                step_id = request.get("step_id")
-                if not isinstance(step_id, int) or isinstance(step_id, bool) or step_id < 0:
-                    raise invalid_descriptor("poll_completions requires an unsigned step id")
-                report = self._pending_completion_reports.get(step_id)
-                if report is None:
-                    raise invalid_descriptor(
-                        f"poll_completions names step {step_id} with no pending partitions"
-                    )
-                response = _response(ResponseKind.RESULT, completion_report=report)
-            elif raw_kind == RequestKind.EXECUTE.value:
+            if raw_kind == RequestKind.EXECUTE.value:
                 with self.profiler.step("uniserve.worker.execute"):
                     response = dispatch(self.worker, request, self.metrics)
             else:
-                response = dispatch(self.worker, request, self.metrics)
+                request_name = raw_kind if isinstance(raw_kind, str) else "unknown"
+                with profile_range(f"uniserve.worker.{request_name}"):
+                    if raw_kind == RequestKind.POLL_COMPLETIONS.value:
+                        step_id = request.get("step_id")
+                        if (
+                            not isinstance(step_id, int)
+                            or isinstance(step_id, bool)
+                            or step_id < 0
+                        ):
+                            raise invalid_descriptor(
+                                "poll_completions requires an unsigned step id"
+                            )
+                        report = self._pending_completion_reports.get(step_id)
+                        if report is None:
+                            raise invalid_descriptor(
+                                f"poll_completions names step {step_id} with no pending partitions"
+                            )
+                        response = _response(ResponseKind.RESULT, completion_report=report)
+                    else:
+                        response = dispatch(self.worker, request, self.metrics)
             try:
                 kind = RequestKind(str(raw_kind))
             except ValueError:
@@ -405,6 +415,10 @@ class WorkerServer:
         )
 
     def respond(self, response: dict[str, Any]) -> None:
+        with profile_range("uniserve.worker.respond"):
+            self._respond(response)
+
+    def _respond(self, response: dict[str, Any]) -> None:
         if self.ipc_endpoint is None:
             raise RuntimeError("worker server has no IPC endpoint")
         result = response.get("completion_report")
@@ -437,7 +451,9 @@ class WorkerServer:
                 partitions=ready,
             )
         started = self.metrics.now_ns()
-        self.ipc_endpoint.respond(_finalize_response(response))
+        with profile_range("uniserve.worker.finalize_response"):
+            finalized = _finalize_response(response)
+        self.ipc_endpoint.respond(finalized)
         self.metrics.record_pipeline("send", self.metrics.now_ns() - started)
 
     def serve(self) -> None:

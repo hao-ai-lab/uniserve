@@ -1,4 +1,5 @@
 """Attention backend interface."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,14 +7,14 @@ from typing import Protocol
 
 import torch
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 
 __all__ = [
-    'AttentionCapabilities',
-    'AttentionBackend',
-    'PagedAttentionBackend',
-    'VarlenAttentionBackend',
-    'VisibleEndAttentionBackend',
+    "AttentionCapabilities",
+    "AttentionBackend",
+    "PagedAttentionBackend",
+    "VarlenAttentionBackend",
+    "VisibleEndAttentionBackend",
 ]
 
 
@@ -94,8 +95,7 @@ class AttentionBackend(Protocol):
 
     name: str
 
-    def capabilities(self) -> AttentionCapabilities:
-        ...
+    def capabilities(self) -> AttentionCapabilities: ...
 
     def forward(
         self,
@@ -106,9 +106,8 @@ class AttentionBackend(Protocol):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
-    ) -> torch.Tensor:
-        ...
+        context: ForwardBatch | None = None,
+    ) -> torch.Tensor: ...
 
 
 class PagedAttentionBackend(AttentionBackend, Protocol):
@@ -131,9 +130,8 @@ class PagedAttentionBackend(AttentionBackend, Protocol):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardContext | None = None,
-    ) -> torch.Tensor:
-        ...
+        context: ForwardBatch | None = None,
+    ) -> torch.Tensor: ...
 
 
 class VarlenAttentionBackend(AttentionBackend, Protocol):
@@ -157,9 +155,8 @@ class VarlenAttentionBackend(AttentionBackend, Protocol):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
-    ) -> torch.Tensor:
-        ...
+        context: ForwardBatch | None = None,
+    ) -> torch.Tensor: ...
 
 
 class VisibleEndAttentionBackend(AttentionBackend, Protocol):
@@ -188,6 +185,5 @@ class VisibleEndAttentionBackend(AttentionBackend, Protocol):
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
-        context: ForwardContext | None = None,
-    ) -> torch.Tensor:
-        ...
+        context: ForwardBatch | None = None,
+    ) -> torch.Tensor: ...

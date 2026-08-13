@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from ..forward import FlowPatches, NoFlowConditioning
+from ..execution.forward_batch import FlowPatches
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..nn.diffusion.cfg import Branch, CfgRecipe
 from ..nn.diffusion.schedule import FlowMatchSchedule, ScheduleDirection, ScheduleShiftDomain
@@ -140,16 +140,19 @@ class GenerationPipeline:
         self.noise_scale_maximum = float(noise_scale_maximum)
         self.timestep_shift = None if timestep_shift is None else float(timestep_shift)
         self.prompt = prompt
-        if min(
-            self.latent_downsample,
-            self.max_latent_tokens,
-            self.max_vae_grid_tokens,
-            self.commit_marker_tokens,
-            self.rope_advance,
-            self.max_cfg_branches,
-            self.latent_channels,
-            self.latent_patch_size,
-        ) < 1:
+        if (
+            min(
+                self.latent_downsample,
+                self.max_latent_tokens,
+                self.max_vae_grid_tokens,
+                self.commit_marker_tokens,
+                self.rope_advance,
+                self.max_cfg_branches,
+                self.latent_channels,
+                self.latent_patch_size,
+            )
+            < 1
+        ):
             raise invalid_descriptor("generation geometry must be positive")
 
     def schedule(self, steps: int, requested_shift: float) -> FlowMatchSchedule:
@@ -200,7 +203,11 @@ class GenerationPipeline:
 
     def physical_tokens(self, height: int, width: int) -> int:
         count = self.image_tokens(height, width)
-        return count + self.commit_marker_tokens if self.latent_layout is LatentLayout.PATCH_TOKENS else count
+        return (
+            count + self.commit_marker_tokens
+            if self.latent_layout is LatentLayout.PATCH_TOKENS
+            else count
+        )
 
     def latent_shape(self, height: int, width: int) -> tuple[int, ...]:
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
@@ -243,9 +250,9 @@ class GenerationPipeline:
         width: int,
         *,
         patch_size: int | None,
-    ) -> FlowPatches | NoFlowConditioning:
+    ) -> FlowPatches | None:
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
-            return NoFlowConditioning()
+            return None
         if patch_size is None:
             raise invalid_descriptor("image-space generation requires an image patch processor")
         pixels = patchify_batch(latent, patch_size, channel_first=True).reshape(

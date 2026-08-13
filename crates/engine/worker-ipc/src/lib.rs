@@ -8,4 +8,4 @@ mod uniproc;
 
 pub use multiproc::MultiprocExecutor;
 pub use stage_router::StageRouter;
-pub use uniproc::{UniprocExecutor, WorkerLaunchConfig};
+pub use uniproc::{LaneConfig, UniprocExecutor, WorkerLaunchConfig};

@@ -1,39 +1,28 @@
-"""Device execution for one immutable forward plan."""
+"""Direct staged execution of concrete model phases."""
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeVar, cast
+from typing import Any
 
 import torch
 from torch import nn
 
-from uniserve_worker.forward import (
-    AttnPlan,
-    DecodeOutput,
-    DecodeRow,
-    EncodeOutput,
-    EncodeRow,
-    FlowOutput,
-    FlowPatches,
-    FlowRow,
+from uniserve_worker.batch import Domain
+from uniserve_worker.execution.cuda_graph import CudaGraphRunner, GraphExecutionError
+from uniserve_worker.execution.forward_batch import (
+    EmptyKvView,
+    EmptyMeshView,
     ForwardBatch,
     ForwardOutput,
-    ForwardRow,
-    NoAttention,
-    PagedDecodePlan,
-    PagedVarlenPlan,
-    PatchInput,
-    TokenEmbeddings,
-    TokenHidden,
-    TokenIds,
-    TokenOutput,
-    TokenRow,
-    TokenSegments,
-    TowerInput,
-    packed_tensor_views,
+    KvView,
+    MeshView,
+    ModelPhase,
+    TokenSelection,
 )
 from uniserve_worker.foundation.errors import (
     ComputeError,
@@ -48,13 +37,10 @@ from uniserve_worker.runtime.execution_trace import (
     ExecutionTrace,
     OperationTrace,
 )
-from uniserve_worker.runtime.graph_store import GraphExecutionError, GraphStore
-from uniserve_worker.runtime.host_staging import (
-    TensorStagingSlot,
-    pack_integer_tensors,
-)
 
-from ._forward_plan import ForwardBinding, ForwardPlan
+from .forward_batch import AttnPlan
+from .input_buffers import InputBuffers
+from .lane import ExecutionPartitionRuntime, LaneConfig, create_green_contexts
 
 
 class RunPath(StrEnum):
@@ -76,201 +62,540 @@ class RunObservation:
     graph_padded_tokens: int
 
 
+class _ConcretePhase(nn.Module):
+    """Invoke the one concrete method family implemented by a loaded model."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        batch: ForwardBatch,
+    ) -> ForwardOutput:
+        model: Any = self.model
+        if batch.phase in {ModelPhase.TEXT, ModelPhase.DENOISE}:
+            hidden = model(input_ids, positions, batch)
+            if not isinstance(hidden, torch.Tensor):
+                raise TypeError("model text/denoise forward must return a tensor")
+            result = model.project(hidden, batch)
+        elif batch.phase is ModelPhase.ENCODE_VISION:
+            result = model.encode(batch.encode_pixels, batch)
+        elif batch.phase is ModelPhase.ENCODE_LATENT:
+            result = model.encode_latent(batch.encode_pixels, batch)
+        elif batch.phase is ModelPhase.DECODE_LATENT:
+            result = model.decode_latent(batch.decode_latents, batch)
+        else:
+            raise TypeError(f"unsupported model phase {batch.phase.value!r}")
+        if not isinstance(result, ForwardOutput):
+            raise TypeError("concrete model phase must return ForwardOutput")
+        return result
+
+
 class ModelRunner:
-    """Stage one route, invoke the model once, and validate raw outputs."""
+    """Own fixed input buffers and invoke concrete model methods."""
 
     def __init__(
         self,
         model: nn.Module,
-        graph_store: GraphStore,
+        graph_runner: CudaGraphRunner | None,
         trace: ExecutionTrace,
+        *,
+        max_rows: int,
+        max_tokens: int,
+        max_text_tokens: int | None = None,
+        max_blocks_per_row: int,
+        max_latent_pages_per_row: int,
+        hidden_size: int,
+        devices: tuple[torch.device | str, ...],
+        lanes: tuple[LaneConfig, ...] = (),
+        max_inflight: int = 1,
+        graph_factory: Callable[
+            [torch.device, LaneConfig | None, torch.cuda.Stream | None, int | None],
+            CudaGraphRunner,
+        ]
+        | None = None,
     ) -> None:
         if type(model).forward is nn.Module.forward:
-            raise TypeError("runner model must implement forward(ForwardBatch)")
+            raise TypeError("runner model must implement forward(input_ids, positions, batch)")
+        canonical = tuple(dict.fromkeys(str(torch.device(device)) for device in devices))
+        if not canonical:
+            raise ValueError("model runner requires an execution device")
         self.model = model
-        self.graph_store = graph_store
+        self._phase = _ConcretePhase(model)
         self.trace = trace
+        self.uses_lanes = bool(lanes)
+        self._partitions: dict[tuple[str, Domain], ExecutionPartitionRuntime] = {}
+        self._owned_partitions: list[ExecutionPartitionRuntime] = []
+
+        def make_buffer(device: str) -> InputBuffers:
+            return InputBuffers(
+                max_rows=max_rows,
+                max_tokens=max_tokens,
+                max_text_tokens=max_text_tokens,
+                max_blocks_per_row=max_blocks_per_row,
+                max_latent_pages_per_row=max_latent_pages_per_row,
+                hidden_size=hidden_size,
+                device=device,
+            )
+
+        if lanes:
+            if len(canonical) != 1:
+                raise ValueError("Green Context lanes require one physical CUDA device")
+            if graph_factory is None:
+                raise ValueError("lane deployment requires partition-local graph runners")
+            device = torch.device(canonical[0])
+            for green in create_green_contexts(lanes, device):
+                with torch.cuda.stream(green.stream):
+                    buffer = make_buffer(str(device))
+                graphs = graph_factory(device, green.lane, green.stream, int(green.context))
+                event_slots = int(green.lane.max_inflight or max_inflight) + 1
+                partition = ExecutionPartitionRuntime(
+                    lane=green.lane,
+                    device=device,
+                    stream=green.stream,
+                    sm_count=green.sm_count,
+                    buffer=buffer,
+                    graphs=graphs,
+                    green=green,
+                    event_slots=event_slots,
+                )
+                partition.verify_stream()
+                self._owned_partitions.append(partition)
+                for domain in green.lane.domains:
+                    self._partitions[(str(device), domain)] = partition
+            missing = set(Domain).difference(domain for lane in lanes for domain in lane.domains)
+            if missing:
+                names = ", ".join(sorted(domain.value for domain in missing))
+                raise ValueError(f"lane deployment has no binding for domains: {names}")
+        else:
+            if graph_factory is None and len(canonical) != 1:
+                raise ValueError("multiple execution devices require partition-local graph runners")
+            for device_name in canonical:
+                device = torch.device(device_name)
+                stream: torch.cuda.Stream | None = None
+                context = nullcontext() if stream is None else torch.cuda.stream(stream)
+                with context:
+                    buffer = make_buffer(device_name)
+                graphs = (
+                    graph_factory(device, None, stream, None)
+                    if graph_factory is not None
+                    else _claim_graph_runner(graph_runner, stream, None)
+                )
+                sm_count = (
+                    int(torch.cuda.get_device_properties(device).multi_processor_count)
+                    if device.type == "cuda"
+                    else 0
+                )
+                partition = ExecutionPartitionRuntime(
+                    lane=None,
+                    device=device,
+                    stream=stream,
+                    sm_count=sm_count,
+                    buffer=buffer,
+                    graphs=graphs,
+                    event_slots=int(max_inflight) + 1,
+                )
+                self._owned_partitions.append(partition)
+                for domain in Domain:
+                    self._partitions[(device_name, domain)] = partition
         self._last_observation: RunObservation | None = None
+        self._last_request_pool_indices: torch.Tensor | None = None
+        self._last_output_event: torch.cuda.Event | None = None
 
     @property
     def last_observation(self) -> RunObservation | None:
         return self._last_observation
 
-    def run(self, plan: ForwardPlan) -> ForwardOutput:
+    @property
+    def last_request_pool_indices(self) -> torch.Tensor | None:
+        return self._last_request_pool_indices
+
+    @property
+    def last_output_event(self) -> torch.cuda.Event | None:
+        return self._last_output_event
+
+    @property
+    def buffers(self) -> tuple[InputBuffers, ...]:
+        return tuple(partition.buffer for partition in self._owned_partitions)
+
+    @property
+    def partitions(self) -> tuple[ExecutionPartitionRuntime, ...]:
+        return tuple(self._owned_partitions)
+
+    def partition_identity(self, device: torch.device | str, domain: Domain) -> int:
+        partition = self._partitions.get((str(torch.device(device)), domain))
+        if partition is None:
+            raise InputError(
+                f"model runner has no {domain.value!r} execution partition for {device}",
+                phase="partition_selection",
+                route=domain.value,
+            )
+        return id(partition)
+
+    def complete_startup(self) -> None:
+        for partition in self._owned_partitions:
+            try:
+                partition.graphs.complete_startup()
+            except GraphExecutionError as error:
+                raise GraphExecutionError(
+                    f"execution partition {partition.lane_id or 'default'} failed startup"
+                ) from error
+            partition.verify_stream()
+        signature = tuple(
+            (
+                partition.lane_id,
+                partition.sm_count,
+                tuple(domain.value for domain in partition.domains),
+                partition.graphs.startup_signature,
+            )
+            for partition in self._owned_partitions
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered: list[object] = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, signature)
+            if any(value != signature for value in gathered):
+                raise GraphExecutionError("tensor-parallel execution partitions disagree")
+
+    def close(self) -> None:
+        self._last_request_pool_indices = None
+        self._last_output_event = None
+        for partition in reversed(self._owned_partitions):
+            partition.close()
+        self._partitions.clear()
+        self._owned_partitions.clear()
+
+    def synchronize(self) -> None:
+        for partition in self._owned_partitions:
+            if partition.stream is not None:
+                partition.stream.synchronize()
+
+    def run(
+        self,
+        tasks: tuple[Any, ...],
+        *,
+        device: torch.device | str,
+        kv: KvView | EmptyKvView,
+        attention: AttnPlan,
+        mesh: MeshView | EmptyMeshView,
+        graph_shape: tuple[object, ...],
+        graph_eligible: bool,
+        domain: Domain | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        if not tasks:
+            raise ValueError("model runner received an empty call")
+        self._last_request_pool_indices = None
+        self._last_output_event = None
         started = time.perf_counter_ns()
-        operations = _trace_operations(plan)
-        counts = _row_kind_counts(plan.rows)
+        target = torch.device(device)
+        phases = frozenset(task.phase for task in tasks)
+        if phases <= {ModelPhase.TEXT, ModelPhase.DENOISE}:
+            phase = ModelPhase.DENOISE if ModelPhase.DENOISE in phases else ModelPhase.TEXT
+        elif len(phases) == 1:
+            phase = next(iter(phases))
+        else:
+            raise ValueError("one model call cannot mix unrelated execution phases")
+        operations = tuple(
+            OperationTrace(
+                task.operation.request_key.session_id,
+                task.operation.request_key.epoch,
+                task.operation.op_id,
+                _base_version(task.operation),
+            )
+            for task in tasks
+        )
+        resolved_domain = domain or (
+            Domain.GEN
+            if phase in {ModelPhase.ENCODE_LATENT, ModelPhase.DECODE_LATENT}
+            else Domain.UND
+        )
+        partition = self._partitions.get((str(target), resolved_domain))
+        if partition is None:
+            raise InputError(
+                f"model runner has no {resolved_domain.value!r} execution partition for {target}",
+                phase="input_staging",
+                route=phase.value,
+                operations=tuple((item.session_id, item.epoch, item.op_id) for item in operations),
+            )
+        buffers = partition.buffer
+        counts = _kind_counts(tasks)
         try:
-            batch = _stage(plan)
+            if partition.stream is not None:
+                partition.order_after(torch.cuda.current_stream(target))
+            stream_context = (
+                nullcontext() if partition.stream is None else torch.cuda.stream(partition.stream)
+            )
+            with stream_context:
+                batch = buffers.stage(
+                    phase=phase,
+                    row_count=len(tasks),
+                    request_pool_indices=tuple(task.session.request_pool_idx for task in tasks),
+                    token_row_indices=tuple(
+                        index for index, task in enumerate(tasks) if task.token_ids is not None
+                    ),
+                    token_ids=tuple(task.token_ids for task in tasks if task.token_ids is not None),
+                    token_embeddings=tuple(
+                        task.token_embeddings for task in tasks if task.token_ids is not None
+                    ),
+                    token_embedding_masks=tuple(
+                        task.token_embedding_mask for task in tasks if task.token_ids is not None
+                    ),
+                    token_positions=tuple(
+                        task.positions for task in tasks if task.token_ids is not None
+                    ),
+                    token_selections=tuple(
+                        task.selection for task in tasks if task.token_ids is not None
+                    ),
+                    flow_row_indices=tuple(
+                        index
+                        for index, task in enumerate(tasks)
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    flow_positions=tuple(
+                        task.positions
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    flow_timesteps=tuple(
+                        task.timestep
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    flow_latents=tuple(
+                        task.latent
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    flow_conditioning=tuple(
+                        task.flow_conditioning
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    flow_image_tokens=tuple(
+                        task.image_tokens
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    flow_heights=tuple(
+                        task.image_height
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    flow_widths=tuple(
+                        task.image_width
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens > 0
+                    ),
+                    encode_pixels=tuple(
+                        task.encode_pixels for task in tasks if task.encode_pixels is not None
+                    ),
+                    encode_grids=tuple(
+                        task.encode_grid for task in tasks if task.encode_pixels is not None
+                    ),
+                    encode_grid_shapes=tuple(
+                        task.encode_grid_shape for task in tasks if task.encode_pixels is not None
+                    ),
+                    decode_latents=tuple(
+                        task.latent
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens == 0
+                    ),
+                    decode_heights=tuple(
+                        task.image_height
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens == 0
+                    ),
+                    decode_widths=tuple(
+                        task.image_width
+                        for task in tasks
+                        if task.latent is not None and task.image_tokens == 0
+                    ),
+                    kv=kv,
+                    attention=attention,
+                    mesh=mesh,
+                )
+                self._last_request_pool_indices = batch.request_pool_indices
         except Exception as error:
-            _mark_staging_submitted(plan)
             self.trace.emit(
                 ExecutionPhase.ROUTE_EXECUTION,
                 operations,
                 duration_us=(time.perf_counter_ns() - started) // 1000,
-                route=str(plan.route),
+                route=phase.value,
                 row_kind_counts=counts,
                 error=error,
             )
-            input_failure = _input_failure(error, plan, "input_staging")
-            if input_failure is error:
-                raise
-            raise input_failure from error
+            raise _input_failure(error, phase, operations) from error
+
         calls = 0
+        weights = tasks[0].weights
+        if any(
+            task.weights.digest != weights.digest or task.weights.version != weights.version
+            for task in tasks
+        ):
+            raise ValueError("one model call cannot mix immutable weight sets")
 
         def invoke(value: ForwardBatch) -> ForwardOutput:
             nonlocal calls
             calls += 1
-            if plan.weights.version == 0:
-                result = self.model(value)
+            ids = buffers.input_ids[:0] if value.input_ids is None else value.input_ids
+            positions = buffers.positions[0, :0] if value.positions is None else value.positions
+            if weights.version == 0:
+                result = self._phase(ids, positions, value)
             else:
                 result = torch.func.functional_call(
-                    self.model,
-                    dict(plan.weights.tensors),
-                    (value,),
+                    self._phase,
+                    {f"model.{name}": tensor for name, tensor in weights.tensors.items()},
+                    (ids, positions, value),
                     strict=True,
                 )
-            if not isinstance(result, ForwardOutput):
-                raise TypeError("model forward must return ForwardOutput")
             return result
 
         try:
             self.trace.emit(
                 ExecutionPhase.ROUTE_EXECUTION,
                 operations,
-                route=str(plan.route),
+                route=phase.value,
                 row_kind_counts=counts,
             )
             with torch.inference_mode():
-                graph_run = self.graph_store.execute(
-                    plan.graph_key,
+                graph_run = partition.graphs.execute(
+                    (phase.value, *graph_shape),
                     batch,
                     invoke,
-                    eligible=plan.graph_eligible,
+                    eligible=graph_eligible,
+                    borrow_output=all(
+                        task.token_ids is not None
+                        and int(task.token_ids.numel()) == 1
+                        and task.selection is TokenSelection.LAST_LOGITS
+                        for task in tasks
+                    ),
                 )
-                output = graph_run.output
-                graph_path = graph_run.path
-        except Exception as error:
-            _mark_staging_submitted(plan)
-            self.trace.emit(
-                ExecutionPhase.FORWARD_COMPLETION,
-                operations,
-                duration_us=(time.perf_counter_ns() - started) // 1000,
-                route=str(plan.route),
-                row_kind_counts=counts,
-                error=error,
-            )
-            execution_failure = _execution_failure(error, plan)
-            if execution_failure is error:
-                raise
-            raise execution_failure from error
-        _mark_staging_submitted(plan)
-        try:
+            output = graph_run.output
+            path = RunPath(graph_run.path)
             output.validate_for(batch)
-            _validate_tensors(batch, output, plan.bindings, torch.device(plan.device))
+            _validate_outputs(output.values, tasks, target)
+            self._last_output_event = partition.record_output()
         except Exception as error:
             self.trace.emit(
                 ExecutionPhase.FORWARD_COMPLETION,
                 operations,
                 duration_us=(time.perf_counter_ns() - started) // 1000,
-                route=str(plan.route),
+                route=phase.value,
                 row_kind_counts=counts,
                 error=error,
-                execution_path=graph_path,
             )
-            output_failure = _compute_failure(error, plan, "output_validation")
-            if output_failure is error:
-                raise
-            raise output_failure from error
+            raise _execution_failure(error, phase, operations) from error
+
         expected_calls = {
-            RunPath.EAGER.value: 1,
-            RunPath.GRAPH_CAPTURE.value: 1,
-            RunPath.GRAPH_REPLAY.value: 0,
+            RunPath.EAGER: 1,
+            RunPath.GRAPH_CAPTURE: 1,
+            RunPath.GRAPH_REPLAY: 0,
         }
-        if graph_path in expected_calls and calls != expected_calls[graph_path]:
+        if path in expected_calls and calls != expected_calls[path]:
             raise ComputeError(
-                f"route execution path {graph_path!r} made {calls} model forward calls",
+                f"model execution path {path.value!r} made {calls} forward calls",
                 phase="graph_execution",
-                route=str(plan.route),
-                operations=plan.operations,
+                route=phase.value,
+                operations=tuple((item.session_id, item.epoch, item.op_id) for item in operations),
             )
-        if graph_path == RunPath.GRAPH_FALLBACK.value and calls not in {1, 2}:
-            raise ComputeError(
-                f"graph fallback made {calls} model forward calls",
-                phase="graph_execution",
-                route=str(plan.route),
-                operations=plan.operations,
-            )
-        path = RunPath(graph_path)
         duration_us = (time.perf_counter_ns() - started) // 1000
         self._last_observation = RunObservation(
-            route=str(plan.route),
-            row_count=len(plan.rows),
+            route=phase.value,
+            row_count=len(tasks),
             row_kind_counts=tuple(sorted(counts.items())),
             path=path,
             model_forward_calls=calls,
             duration_us=duration_us,
-            graph_unpadded_tokens=(
-                graph_run.row_count if path is not RunPath.EAGER else 0
-            ),
+            graph_unpadded_tokens=graph_run.row_count if path is not RunPath.EAGER else 0,
             graph_padded_tokens=(
-                graph_run.padded_row_count - graph_run.row_count
-                if path is not RunPath.EAGER
-                else 0
+                graph_run.padded_row_count - graph_run.row_count if path is not RunPath.EAGER else 0
             ),
         )
         self.trace.emit(
             ExecutionPhase.FORWARD_COMPLETION,
             operations,
             duration_us=duration_us,
-            route=str(plan.route),
+            route=phase.value,
             row_kind_counts=counts,
             execution_path=path.value,
         )
-        return output
+        return output.values
 
 
-def _trace_operations(plan: ForwardPlan) -> tuple[OperationTrace, ...]:
-    return tuple(
-        OperationTrace(binding.session_id, binding.epoch, binding.op_id, binding.base_version)
-        for binding in plan.bindings
-    )
+def _kind_counts(tasks: tuple[Any, ...]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for task in tasks:
+        result[task.kind] = result.get(task.kind, 0) + 1
+    return result
 
 
-def _row_kind_counts(rows: tuple[ForwardRow, ...]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for row in rows:
-        name = type(row).__name__.removesuffix("Row").lower()
-        counts[name] = counts.get(name, 0) + 1
-    return counts
+def _claim_graph_runner(
+    graph_runner: CudaGraphRunner | None,
+    stream: torch.cuda.Stream | None,
+    expected_context: int | None,
+) -> CudaGraphRunner:
+    if graph_runner is None:
+        raise ValueError("model runner requires a graph runner")
+    graph_runner.bind_partition(stream, expected_context)
+    return graph_runner
 
 
-def _input_failure(error: BaseException, plan: ForwardPlan, phase: str) -> InputError:
+def _base_version(operation: Any) -> int:
+    point = operation.parent.point
+    value = getattr(point, "point_index", 0)
+    return int(value)
+
+
+def _validate_outputs(
+    values: tuple[torch.Tensor, ...],
+    tasks: tuple[Any, ...],
+    device: torch.device,
+) -> None:
+    for value, task in zip(values, tasks, strict=True):
+        if value.device != device:
+            raise ValueError(f"model output is on {value.device}, expected {device}")
+        if not value.is_floating_point():
+            raise ValueError("raw neural outputs must use a floating dtype")
+        if task.token_ids is not None and value.ndim < 2:
+            raise ValueError("token output must retain token and feature dimensions")
+        if task.latent is not None and task.image_tokens > 0 and value.shape != task.latent.shape:
+            raise ValueError("flow prediction shape does not match its latent")
+        if task.encode_pixels is not None and value.numel() == 0:
+            raise ValueError("encoder output must not be empty")
+        if task.latent is not None and task.image_tokens == 0:
+            if value.ndim < 2 or tuple(value.shape[-2:]) != (
+                task.image_height,
+                task.image_width,
+            ):
+                raise ValueError("decoded tensor does not match declared image geometry")
+
+
+def _input_failure(
+    error: BaseException,
+    phase: ModelPhase,
+    operations: tuple[OperationTrace, ...],
+) -> InputError:
     if isinstance(error, InputError):
-        return _enrich(error, plan, phase)
+        return error
     return InputError(
         str(error) or type(error).__name__,
-        phase=phase,
-        route=str(plan.route),
-        operations=plan.operations,
+        phase="input_staging",
+        route=phase.value,
+        operations=tuple((item.session_id, item.epoch, item.op_id) for item in operations),
     )
 
 
-def _compute_failure(error: BaseException, plan: ForwardPlan, phase: str) -> ComputeError:
-    if isinstance(error, ComputeError):
-        return _enrich(error, plan, phase)
-    return ComputeError(
-        str(error) or type(error).__name__,
-        phase=phase,
-        route=str(plan.route),
-        operations=plan.operations,
-    )
-
-
-def _execution_failure(error: BaseException, plan: ForwardPlan) -> WorkerError:
-    if isinstance(error, (InputError, ComputeError, ResourceError)):
-        return _enrich(error, plan, "neural_execution")
+def _execution_failure(
+    error: BaseException,
+    phase: ModelPhase,
+    operations: tuple[OperationTrace, ...],
+) -> WorkerError:
+    if isinstance(error, WorkerError):
+        return error
     classified = classify(error)
+    identities = tuple((item.session_id, item.epoch, item.op_id) for item in operations)
     if isinstance(error, GraphExecutionError) or classified.code in {
         ErrorCode.RESOURCE_ERROR,
         ErrorCode.FATAL_WORKER_FAILURE,
@@ -278,258 +603,17 @@ def _execution_failure(error: BaseException, plan: ForwardPlan) -> WorkerError:
         return ResourceError(
             str(error) or type(error).__name__,
             phase="graph_or_device",
-            route=str(plan.route),
-            operations=plan.operations,
+            route=phase.value,
+            operations=identities,
             retryable=classified.retryable,
             fatal=classified.fatal,
         )
     return ComputeError(
         str(error) or type(error).__name__,
         phase="neural_execution",
-        route=str(plan.route),
-        operations=plan.operations,
+        route=phase.value,
+        operations=identities,
     )
-
-
-_WorkerFailure = TypeVar("_WorkerFailure", bound=WorkerError)
-
-
-def _enrich(error: _WorkerFailure, plan: ForwardPlan, phase: str) -> _WorkerFailure:
-    if error.phase is None:
-        error.phase = phase
-    if error.route is None:
-        error.route = str(plan.route)
-    if not error.operations:
-        error.operations = plan.operations
-    return error
-
-
-def _stage(plan: ForwardPlan) -> ForwardBatch:
-    device = torch.device(plan.device)
-    rows = _stage_rows(plan.rows, device, plan.staging_slot)
-    attention = plan.context.attention
-    staged_attention: AttnPlan
-    if isinstance(attention, NoAttention):
-        staged_attention = attention
-    elif isinstance(attention, PagedDecodePlan):
-        staged_attention = replace(
-            attention,
-            block_table=attention.block_table.to(device=device, non_blocking=True),
-            cache_seqlens=attention.cache_seqlens.to(device=device, non_blocking=True),
-            kv_seqlens=attention.kv_seqlens.to(device=device, non_blocking=True),
-            query_lens=attention.query_lens.to(device=device, non_blocking=True),
-            decode_page_ids=attention.decode_page_ids.to(device=device, non_blocking=True),
-            decode_page_offsets=attention.decode_page_offsets.to(device=device, non_blocking=True),
-        )
-    elif isinstance(attention, PagedVarlenPlan):
-        staged_attention = replace(
-            attention,
-            block_table=attention.block_table.to(device=device, non_blocking=True),
-            cache_seqlens=attention.cache_seqlens.to(device=device, non_blocking=True),
-            query_lens=attention.query_lens.to(device=device, non_blocking=True),
-            kv_seqlens=attention.kv_seqlens.to(device=device, non_blocking=True),
-            cu_seqlens_q=attention.cu_seqlens_q.to(device=device, non_blocking=True),
-            cu_seqlens_k=attention.cu_seqlens_k.to(device=device, non_blocking=True),
-        )
-    else:
-        staged_attention = replace(
-            attention,
-            indexes=attention.indexes.to(device=device, non_blocking=True),
-            route_indicators=attention.route_indicators.to(device=device, non_blocking=True),
-            text_indices=attention.text_indices.to(device=device, non_blocking=True),
-            visible_end=attention.visible_end.to(device=device, non_blocking=True),
-            cu_seqlens_q=attention.cu_seqlens_q.to(device=device, non_blocking=True),
-            page_table=attention.page_table.to(device=device, non_blocking=True),
-            seqused_k=attention.seqused_k.to(device=device, non_blocking=True),
-            write_page_ids=attention.write_page_ids.to(device=device, non_blocking=True),
-            write_page_offsets=attention.write_page_offsets.to(device=device, non_blocking=True),
-            write_token_indices=attention.write_token_indices.to(device=device, non_blocking=True),
-        )
-    return ForwardBatch(
-        route=plan.route,
-        rows=rows,
-        context=replace(plan.context, attention=staged_attention),
-    )
-
-
-def _stage_rows(
-    rows: tuple[ForwardRow, ...],
-    device: torch.device,
-    slot: TensorStagingSlot | None,
-) -> tuple[ForwardRow, ...]:
-    if rows and all(isinstance(row, TokenRow) for row in rows):
-        token_rows = tuple(row for row in rows if isinstance(row, TokenRow))
-        if all(isinstance(row.inputs, TokenIds) for row in token_rows):
-            inputs = _pack_to_device(
-                tuple(
-                    row.inputs.values
-                    for row in token_rows
-                    if isinstance(row.inputs, TokenIds)
-                ),
-                device,
-                slot=slot,
-                name="token_ids",
-            )
-            positions = _pack_to_device(
-                tuple(row.positions for row in token_rows),
-                device,
-                slot=slot,
-                name="token_positions",
-            )
-            if inputs is not None and positions is not None:
-                staged: list[ForwardRow] = []
-                input_offset = 0
-                position_offset = 0
-                for row in token_rows:
-                    input_count = int(cast(TokenIds, row.inputs).values.numel())
-                    position_count = int(row.positions.numel())
-                    staged.append(
-                        replace(
-                            row,
-                            inputs=TokenIds(inputs[input_offset : input_offset + input_count]),
-                            positions=positions[
-                                position_offset : position_offset + position_count
-                            ],
-                        )
-                    )
-                    input_offset += input_count
-                    position_offset += position_count
-                return tuple(staged)
-    return tuple(_stage_row(row, device) for row in rows)
-
-
-def _pack_to_device(
-    values: tuple[torch.Tensor, ...],
-    device: torch.device,
-    *,
-    slot: TensorStagingSlot | None,
-    name: str,
-) -> torch.Tensor | None:
-    if not values:
-        return None
-    flattened = tuple(value.reshape(-1) for value in values)
-    if all(value.device == device for value in flattened):
-        packed = packed_tensor_views(flattened)
-        if packed is not None:
-            return packed
-    return pack_integer_tensors(
-        flattened,
-        device=device,
-        slot=slot,
-        name=name,
-    )
-
-
-def _mark_staging_submitted(plan: ForwardPlan) -> None:
-    slot = plan.staging_slot
-    if slot is not None:
-        slot.stager.mark_submitted(slot, plan.device)
-
-
-def _stage_row(row: ForwardRow, device: torch.device) -> ForwardRow:
-    def move(value: torch.Tensor) -> torch.Tensor:
-        return value.to(device=device, non_blocking=True)
-
-    if isinstance(row, TokenRow):
-        inputs = row.inputs
-        staged_inputs: TokenIds | TokenEmbeddings | TokenSegments
-        if isinstance(inputs, TokenIds):
-            staged_inputs = TokenIds(move(inputs.values))
-        elif isinstance(inputs, TokenEmbeddings):
-            staged_inputs = TokenEmbeddings(move(inputs.values))
-        else:
-            staged_inputs = TokenSegments(
-                tuple(
-                    TokenIds(move(segment.values))
-                    if isinstance(segment, TokenIds)
-                    else TokenEmbeddings(move(segment.values))
-                    for segment in inputs.values
-                )
-            )
-        return replace(row, inputs=staged_inputs, positions=move(row.positions))
-    if isinstance(row, FlowRow):
-        return replace(
-            row,
-            conditioning=(
-                FlowPatches(
-                    move(row.conditioning.pixels),
-                    move(row.conditioning.grid),
-                    move(row.conditioning.noise_scale),
-                )
-                if isinstance(row.conditioning, FlowPatches)
-                else row.conditioning
-            ),
-            positions=move(row.positions),
-            timestep=move(row.timestep),
-            latent=move(row.latent),
-        )
-    if isinstance(row, EncodeRow):
-        encode_inputs = row.inputs
-        staged_encode = (
-            PatchInput(
-                move(encode_inputs.pixels),
-                move(encode_inputs.grid),
-                grid_shape=encode_inputs.grid_shape,
-            )
-            if isinstance(encode_inputs, PatchInput)
-            else TowerInput(move(encode_inputs.pixels))
-        )
-        return replace(row, inputs=staged_encode)
-    return replace(row, latent=move(row.latent))
-
-
-def _validate_tensors(
-    batch: ForwardBatch,
-    output: ForwardOutput,
-    bindings: tuple[ForwardBinding, ...],
-    device: torch.device,
-) -> None:
-    for input_row, output_row, binding in zip(
-        batch.rows, output.rows, bindings, strict=True
-    ):
-        expected_dtype = getattr(torch, binding.output_dtype.removeprefix("torch."), None)
-        if not isinstance(expected_dtype, torch.dtype):
-            raise ValueError(f"forward output declares unknown dtype {binding.output_dtype!r}")
-        tensor = _output_tensor(output_row)
-        if tensor.device != device:
-            raise ValueError(
-                f"output row {output_row.row_id} is on {tensor.device}, expected {device}"
-            )
-        if not tensor.is_floating_point():
-            raise ValueError("raw neural outputs must use a floating dtype")
-        if tensor.dtype is not expected_dtype:
-            raise ValueError(
-                f"output row {output_row.row_id} uses {tensor.dtype}, expected {expected_dtype}"
-            )
-        if isinstance(input_row, TokenRow):
-            if tensor.ndim < 2:
-                raise ValueError("token output must retain token/feature dimensions")
-            if isinstance(output_row, TokenOutput):
-                expected_hidden = input_row.selection.value == "hidden"
-                if expected_hidden != isinstance(output_row.value, TokenHidden):
-                    raise ValueError("token output representation does not match selection")
-        elif isinstance(input_row, FlowRow):
-            if tensor.shape != input_row.latent.shape:
-                raise ValueError("flow prediction shape does not match its latent")
-        elif isinstance(input_row, EncodeRow):
-            if tensor.numel() == 0:
-                raise ValueError("encoder output must not be empty")
-        elif isinstance(input_row, DecodeRow):
-            if tensor.ndim < 2 or tuple(tensor.shape[-2:]) != (
-                input_row.image_height,
-                input_row.image_width,
-            ):
-                raise ValueError("decoded tensor does not match declared image geometry")
-
-
-def _output_tensor(output: TokenOutput | FlowOutput | EncodeOutput | DecodeOutput) -> torch.Tensor:
-    if isinstance(output, TokenOutput):
-        return output.value.value
-    if isinstance(output, FlowOutput):
-        return output.prediction
-    if isinstance(output, EncodeOutput):
-        return output.features
-    return output.tensor
 
 
 __all__ = ["ModelRunner", "RunObservation", "RunPath"]

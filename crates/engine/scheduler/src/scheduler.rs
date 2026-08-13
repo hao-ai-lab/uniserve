@@ -1096,12 +1096,29 @@ impl Scheduler {
     ) -> Self {
         let caps = executor.caps();
         let cpu_waker = executor.command_waker();
-        let max_batch_ops = caps.max_batch_operations as usize;
+        let max_batch_ops = caps
+            .lanes
+            .iter()
+            .map(|lane| lane.max_batch_operations as usize)
+            .min()
+            .unwrap_or(caps.max_batch_operations as usize)
+            .min(caps.max_batch_operations as usize);
+        let max_batch_tokens = caps
+            .lanes
+            .iter()
+            .map(|lane| lane.max_batch_tokens as usize)
+            .min()
+            .unwrap_or(caps.max_batch_tokens as usize)
+            .min(caps.max_batch_tokens as usize);
         let transfer_capacity = (caps.pipeline_depth as usize)
             .saturating_mul(max_batch_ops)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
-        config.max_num_seqs = config.max_num_seqs.clamp(1, MAX_NUM_SEQS);
+        config.max_num_seqs = config
+            .max_num_seqs
+            .clamp(1, MAX_NUM_SEQS)
+            .min(caps.max_request_pool_size as usize);
+        config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
@@ -1154,6 +1171,8 @@ impl Scheduler {
                     "num_blocks": caps.num_blocks,
                     "supported_work": &caps.supported_work,
                     "max_batch_operations": caps.max_batch_operations,
+                    "max_batch_tokens": caps.max_batch_tokens,
+                    "max_request_pool_size": caps.max_request_pool_size,
                     "pipeline_depth": caps.pipeline_depth,
                     "latent_page_units": caps.latent_page_units,
                     "num_latent_pages": caps.num_latent_pages,
@@ -3115,10 +3134,7 @@ impl Scheduler {
                     // submission and clamped to the host observation.
                     let submitted_us = st
                         .trace
-                        .operations()
-                        .iter()
-                        .find(|op| op.key.op_id == op_key.op_id)
-                        .and_then(|op| op.at(crate::trace::LifecyclePhase::Submitted));
+                        .at(op_key.op_id, crate::trace::LifecyclePhase::Submitted);
                     if let Some(submitted_us) = submitted_us {
                         let timing = &record.timing_counters;
                         let device_started = submitted_us

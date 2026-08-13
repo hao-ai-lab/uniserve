@@ -3,37 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
 
 from ..batch import WorkVariant
-from ..forward import (
-    DecodeOutput,
-    DecodeRow,
-    EncodeKind,
-    EncodeOutput,
-    EncodeRow,
-    FlowOutput,
-    FlowRow,
+from ..execution.forward_batch import (
     ForwardBatch,
-    ForwardContext,
     ForwardOutput,
-    ForwardRow,
-    NoFlowConditioning,
     PagedDecodePlan,
-    RouteId,
-    TokenEmbeddings,
-    TokenHidden,
-    TokenIds,
-    TokenLogits,
-    TokenOutput,
-    TokenRow,
-    TokenSegments,
     TokenSelection,
-    TowerInput,
-    packed_token_positions,
 )
 from ..loader.schema import (
     Rename,
@@ -80,12 +60,9 @@ from .inputs import (
 )
 from .runtime import (
     CacheGeometry,
-    DeviceRole,
     ExecutionModel,
-    LoweredStage,
     PositionLayout,
     ResourceGeometry,
-    RowKind,
     ScratchGeometry,
 )
 
@@ -259,7 +236,7 @@ class _BagelGraph(nn.Module):
     def device(self) -> torch.device:
         return self.lm_head.weight.device
 
-    def embed_tokens(self, ids: torch.Tensor, context: ForwardContext) -> torch.Tensor:
+    def embed_tokens(self, ids: torch.Tensor, context: ForwardBatch) -> torch.Tensor:
         return self.lm.embed_tokens(ids, context.mesh)
 
     def gen_segment_embeds(
@@ -268,7 +245,7 @@ class _BagelGraph(nn.Module):
         vae_pos_ids,
         x_t,
         timestep,
-        context: ForwardContext,
+        context: ForwardBatch,
     ) -> torch.Tensor:
         """Marker/VAE-latent/timestep embeddings for one gen segment, ``[num_vae+2, hidden]``.
 
@@ -301,7 +278,7 @@ class _BagelGraph(nn.Module):
     def logits(
         self,
         hidden_last_row: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
     ) -> torch.Tensor:
         return self.lm_head(hidden_last_row, context.mesh)
 
@@ -316,7 +293,7 @@ class _BagelGraph(nn.Module):
     def vit_encode_batch(
         self,
         image_tensors: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
     ) -> torch.Tensor:
         if image_tensors.ndim != 4:
             raise ValueError("BAGEL batched ViT encode expects NCHW pixels")
@@ -531,9 +508,7 @@ class BagelForConditionalGeneration(ExecutionModel):
             num_attention_heads=local_attention_head_count(
                 int(llm.num_attention_heads), parallel=self._parallel
             ),
-            num_kv_heads=local_kv_head_count(
-                int(llm.num_key_value_heads), parallel=self._parallel
-            ),
+            num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads), parallel=self._parallel),
             head_dim=int(llm.head_dim),
             dtype="bfloat16",
             store_dtype="bfloat16",
@@ -559,278 +534,157 @@ class BagelForConditionalGeneration(ExecutionModel):
             }
         )
         self.max_vit_grid_tokens = int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS
-        self._route_token_bounds = {
-            RouteId("mot"): max(
-                int(llm.max_position_embeddings),
-                int(self.cfg.latent_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS,
-            ),
-            RouteId("vae"): int(self.cfg.latent_token_capacity),
-            RouteId("vit"): int(self.cfg.vit_token_capacity),
-        }
-
-    def lower(
-        self,
-        variant: WorkVariant,
-        *,
-        retain_image: bool = False,
-    ) -> tuple[LoweredStage, ...]:
-        if variant in {
-            WorkVariant.TOKEN_EXTEND,
-            WorkVariant.TOKEN_DECODE,
-            WorkVariant.TOKEN_VERIFY,
-        }:
-            return (LoweredStage(RouteId("mot"), RowKind.TOKEN),)
-        if variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}:
-            return (LoweredStage(RouteId("mot"), RowKind.FLOW),)
-        if variant is WorkVariant.ENCODE_VISION:
-            return (
-                LoweredStage(RouteId("vit"), RowKind.ENCODE),
-                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
-            )
-        if variant is WorkVariant.ENCODE_LATENT:
-            return (
-                LoweredStage(RouteId("vae"), RowKind.ENCODE),
-                LoweredStage(RouteId("mot"), RowKind.FLOW, publishes_state=True),
-            )
-        if variant is WorkVariant.MATERIALIZE:
-            stages = [LoweredStage(RouteId("vae"), RowKind.DECODE)]
-            if retain_image:
-                stages.append(LoweredStage(RouteId("mot"), RowKind.FLOW, publishes_state=True))
-            return tuple(stages)
-        if variant is WorkVariant.TRANSFER_PRODUCT:
-            return ()
-        if variant in {WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL}:
-            return (LoweredStage(RouteId("mot"), RowKind.FLOW),)
-        return ()
-
-    def route_dtype(self, route: RouteId) -> str:
-        self._require_route(route)
-        return "bfloat16"
-
-    def route_device_role(self, route: RouteId) -> DeviceRole:
-        self._require_route(route)
-        return DeviceRole.GENERATION if route == "vae" else DeviceRole.PRIMARY
-
-    def route_topology(self, route: RouteId) -> tuple[str, ...]:
-        self._require_route(route)
-        return ("tp", "tower") if route == "mot" else ("tp",)
-
-    def route_graph_eligible(self, route: RouteId) -> bool:
-        self._require_route(route)
-        return route == "mot"
-
-    def route_max_tokens(self, route: RouteId) -> int:
-        try:
-            return self._route_token_bounds[route]
-        except KeyError:
-            raise ValueError(f"BAGEL received unknown route {route!s}") from None
-
-    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
-        self._require_route(route)
-        if route == "mot":
-            return ()
-        if route == "vae":
-            if isinstance(row, (FlowRow, DecodeRow)):
-                return row.image_height, row.image_width
-            if isinstance(row, EncodeRow):
-                return tuple(int(value) for value in row.inputs.pixels.shape[-2:])
-        if isinstance(row, EncodeRow):
-            return tuple(int(value) for value in row.inputs.pixels.shape)
-        raise TypeError(f"BAGEL route {route!s} received an incompatible row")
-
-    def route_uses_packed_attention(self, route: RouteId) -> bool:
-        self._require_route(route)
-        return route == "mot"
-
-    def allows_mixed(self, route: RouteId, rows: frozenset[RowKind]) -> bool:
-        self._require_route(route)
-        return route == "mot" and rows <= {RowKind.TOKEN, RowKind.FLOW}
-
-    @staticmethod
-    def _require_route(route: RouteId) -> None:
-        if route not in {"mot", "vit", "vae"}:
-            raise ValueError(f"BAGEL received unknown route {route!s}")
+        self.vocab_size = int(llm.vocab_size)
+        self.hidden_size = int(llm.hidden_size)
+        self.text_max_tokens = max(
+            int(llm.max_position_embeddings),
+            int(self.cfg.latent_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS,
+        )
+        self.text_topology = ("tp", "tower")
+        self.tensorized_mixed = True
 
     @torch.inference_mode()
-    def forward(self, batch: ForwardBatch) -> ForwardOutput:
-        if batch.route == "mot":
-            return self._forward_mot(batch)
-        if batch.route == "vit":
-            return self._forward_vit(batch)
-        if batch.route == "vae":
-            return self._forward_vae(batch)
-        raise ValueError(f"BAGEL received unknown route {batch.route!s}")
-
-    def _forward_mot(self, batch: ForwardBatch) -> ForwardOutput:
-        rows: list[TokenRow | FlowRow] = []
-        for row in batch.rows:
-            if not isinstance(row, (TokenRow, FlowRow)):
-                raise TypeError("BAGEL mot route accepts TokenRow and FlowRow values")
-            rows.append(row)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        batch = forward_batch
         decode_positions: torch.Tensor | None = None
-        if isinstance(batch.context.attention, PagedDecodePlan):
-            if any(not isinstance(row, TokenRow) for row in rows):
+        if isinstance(batch.attention, PagedDecodePlan):
+            if batch.flow_row_indices:
                 raise TypeError("BAGEL paged decode accepts token rows only")
-            token_rows = tuple(row for row in rows if isinstance(row, TokenRow))
-            decode_positions = packed_token_positions(token_rows)
-            if decode_positions is None:
-                decode_positions = torch.cat(
-                    tuple(row.positions.reshape(-1) for row in token_rows),
-                    dim=0,
-                )
-        chunks: list[torch.Tensor] = []
-        spans: list[tuple[int, int]] = []
-        offset = 0
-        for row in rows:
-            if isinstance(row, TokenRow):
-                chunk = self._token_embeddings(row, batch.context)
-            else:
-                if not isinstance(row.conditioning, NoFlowConditioning):
-                    raise TypeError("BAGEL flow rows do not accept external feature conditioning")
-                latent_tokens = int(row.image_tokens) - _BAGEL_IMAGE_MARKER_TOKENS
-                if latent_tokens < 1 or int(row.latent.shape[-2]) != latent_tokens:
-                    raise ValueError("BAGEL flow latent does not match its image-token geometry")
-                chunk = self.model.gen_segment_embeds(
-                    latent_tokens,
-                    row.positions,
-                    row.latent,
-                    row.timestep,
-                    batch.context,
-                )
+            decode_positions = positions
+        token_embeds = self.model.embed_tokens(input_ids.reshape(-1), batch)
+        if batch.input_embeddings is not None:
+            if batch.embedding_mask is None:
+                raise RuntimeError("BAGEL embedding input lost its selection mask")
+            token_embeds = torch.where(
+                batch.embedding_mask.reshape(-1, 1),
+                batch.input_embeddings.to(dtype=token_embeds.dtype),
+                token_embeds,
+            )
+        chunks: list[torch.Tensor | None] = [None] * batch.row_count
+        token_offset = 0
+        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+            chunks[row_index] = token_embeds[token_offset : token_offset + count]
+            token_offset += count
+        for flow_index, row_index in enumerate(batch.flow_row_indices):
+            if batch.flow_conditioning[flow_index] is not None:
+                raise TypeError("BAGEL denoise does not accept external feature conditioning")
+            image_tokens = int(batch.flow_image_tokens[flow_index])
+            latent_tokens = image_tokens - _BAGEL_IMAGE_MARKER_TOKENS
+            latent = batch.flow_latents[flow_index]
+            if latent_tokens < 1 or int(latent.shape[-2]) != latent_tokens:
+                raise ValueError("BAGEL flow latent does not match its image-token geometry")
+            chunks[row_index] = self.model.gen_segment_embeds(
+                latent_tokens,
+                batch.flow_positions[flow_index],
+                latent,
+                batch.flow_timesteps[flow_index],
+                batch,
+            )
+        if any(value is None for value in chunks):
+            raise RuntimeError("BAGEL forward batch contains an unbound row")
+        typed_chunks = tuple(value for value in chunks if value is not None)
+        normalized: list[torch.Tensor] = []
+        for chunk in typed_chunks:
             chunk = chunk.reshape(-1, chunk.shape[-1]).to(torch.bfloat16)
-            chunks.append(chunk)
-            spans.append((offset, offset + int(chunk.shape[0])))
-            offset += int(chunk.shape[0])
-        hidden = self.model.lm(
-            torch.cat(chunks, dim=0),
-            batch.context,
+            normalized.append(chunk)
+        return self.model.lm(
+            torch.cat(normalized, dim=0),
+            batch,
             positions=decode_positions,
         )
-        row_hidden = tuple(hidden[begin:end] for begin, end in spans)
+
+    def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
+        row_lengths = [0] * batch.row_count
+        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+            row_lengths[row_index] = count
+        for flow_index, row_index in enumerate(batch.flow_row_indices):
+            row_lengths[row_index] = int(batch.flow_image_tokens[flow_index])
+        row_hidden: list[torch.Tensor] = []
+        offset = 0
+        for count in row_lengths:
+            row_hidden.append(hidden[offset : offset + count])
+            offset += count
+        selection_by_row = dict(zip(batch.token_row_indices, batch.token_selections, strict=True))
+        row_hidden_values = tuple(row_hidden)
         projected_rows = tuple(
             index
-            for index, row in enumerate(rows)
-            if isinstance(row, TokenRow) and row.selection is not TokenSelection.HIDDEN
+            for index, selection in selection_by_row.items()
+            if selection is not TokenSelection.HIDDEN
         )
         projected: torch.Tensor | None = None
         if projected_rows:
             if (
-                len(projected_rows) == len(rows)
+                len(projected_rows) == batch.row_count
                 and all(
-                    isinstance(row, TokenRow) and row.selection is TokenSelection.LAST_LOGITS
-                    for row in rows
+                    selection is TokenSelection.LAST_LOGITS
+                    for selection in selection_by_row.values()
                 )
-                and all(int(value.shape[0]) == 1 for value in row_hidden)
+                and all(int(value.shape[0]) == 1 for value in row_hidden_values)
             ):
                 selected = hidden
             else:
                 selected_rows = tuple(
-                    row_hidden[index]
-                    if cast(TokenRow, rows[index]).selection is TokenSelection.ALL_LOGITS
+                    row_hidden_values[index]
+                    if selection_by_row[index] is TokenSelection.ALL_LOGITS
                     else row_hidden[index][-1:]
                     for index in projected_rows
                 )
                 selected = (
                     selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
                 )
-            projected = self.model.logits(selected, batch.context)
+            projected = self.model.logits(selected, batch)
 
-        outputs: list[TokenOutput | FlowOutput] = []
+        outputs: list[torch.Tensor] = []
         projected_offset = 0
-        for index, row in enumerate(rows):
-            value_hidden = row_hidden[index]
-            if isinstance(row, TokenRow):
-                value: TokenHidden | TokenLogits
-                if row.selection is TokenSelection.HIDDEN:
-                    value = TokenHidden(value_hidden)
+        flow_by_row = {row_index: index for index, row_index in enumerate(batch.flow_row_indices)}
+        for index in range(batch.row_count):
+            value_hidden = row_hidden_values[index]
+            selection = selection_by_row.get(index)
+            if selection is not None:
+                if selection is TokenSelection.HIDDEN:
+                    value = value_hidden
                 else:
                     if projected is None:
                         raise RuntimeError("BAGEL projected output buffer is missing")
                     count = (
-                        int(value_hidden.shape[0])
-                        if row.selection is TokenSelection.ALL_LOGITS
-                        else 1
+                        int(value_hidden.shape[0]) if selection is TokenSelection.ALL_LOGITS else 1
                     )
-                    value = TokenLogits(projected[projected_offset : projected_offset + count])
+                    value = projected[projected_offset : projected_offset + count]
                     projected_offset += count
-                outputs.append(TokenOutput(row.row_id, row.output_slot, value))
+                outputs.append(value)
             else:
+                flow_index = flow_by_row[index]
                 prediction = self.model.velocity_from_hidden(
                     value_hidden,
-                    int(row.image_tokens) - _BAGEL_IMAGE_MARKER_TOKENS,
+                    int(batch.flow_image_tokens[flow_index]) - _BAGEL_IMAGE_MARKER_TOKENS,
                 )
-                outputs.append(FlowOutput(row.row_id, row.output_slot, prediction))
+                outputs.append(prediction)
         return ForwardOutput(tuple(outputs))
 
-    def _token_embeddings(
-        self,
-        row: TokenRow,
-        context: ForwardContext,
-    ) -> torch.Tensor:
-        if isinstance(row.inputs, TokenIds):
-            return self.model.embed_tokens(row.inputs.values.reshape(-1), context)
-        if isinstance(row.inputs, TokenEmbeddings):
-            return row.inputs.values.reshape(-1, row.inputs.values.shape[-1])
-        if not isinstance(row.inputs, TokenSegments):
-            raise TypeError("BAGEL token row has an unknown input variant")
-        return torch.cat(
-            tuple(
-                self.model.embed_tokens(segment.values.reshape(-1), context)
-                if isinstance(segment, TokenIds)
-                else segment.values.reshape(-1, segment.values.shape[-1])
-                for segment in row.inputs.values
-            ),
-            dim=0,
-        )
+    def encode(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+        features = self.model.vit_encode_batch(torch.stack(pixels, dim=0), batch)
+        return ForwardOutput(tuple(features[index] for index in range(len(pixels))))
 
-    def _forward_vit(self, batch: ForwardBatch) -> ForwardOutput:
-        rows = tuple(row for row in batch.rows if isinstance(row, EncodeRow))
-        if len(rows) != len(batch.rows) or any(
-            row.kind is not EncodeKind.VISION or not isinstance(row.inputs, TowerInput)
-            for row in rows
-        ):
-            raise TypeError("BAGEL vit route requires tower vision encode rows")
-        pixels = torch.stack(tuple(row.inputs.pixels for row in rows), dim=0)
-        features = self.model.vit_encode_batch(pixels, batch.context)
-        return ForwardOutput(
-            tuple(
-                EncodeOutput(row.row_id, row.output_slot, features[index])
-                for index, row in enumerate(rows)
-            )
-        )
+    def encode_latent(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+        del batch
+        latents, _positions, _shape = self.model.vae_encode_clean_batch(torch.stack(pixels, dim=0))
+        return ForwardOutput(tuple(latents[index] for index in range(len(pixels))))
 
-    def _forward_vae(self, batch: ForwardBatch) -> ForwardOutput:
-        first = batch.rows[0]
-        if isinstance(first, EncodeRow):
-            encode_rows = tuple(row for row in batch.rows if isinstance(row, EncodeRow))
-            if len(encode_rows) != len(batch.rows) or any(
-                row.kind is not EncodeKind.LATENT or not isinstance(row.inputs, TowerInput)
-                for row in encode_rows
-            ):
-                raise TypeError("BAGEL vae encode route requires latent tower rows")
-            pixels = torch.stack(tuple(row.inputs.pixels for row in encode_rows), dim=0)
-            latents, _positions, _shape = self.model.vae_encode_clean_batch(pixels)
-            return ForwardOutput(
-                tuple(
-                    EncodeOutput(row.row_id, row.output_slot, latents[index])
-                    for index, row in enumerate(encode_rows)
-                )
-            )
-        decode_rows = tuple(row for row in batch.rows if isinstance(row, DecodeRow))
-        if len(decode_rows) != len(batch.rows):
-            raise TypeError("BAGEL vae route cannot mix encode and decode rows")
-        geometry = {(row.image_height, row.image_width) for row in decode_rows}
+    def decode_latent(
+        self, latents: tuple[torch.Tensor, ...], batch: ForwardBatch
+    ) -> ForwardOutput:
+        geometry = set(zip(batch.decode_heights, batch.decode_widths, strict=True))
         if len(geometry) != 1:
-            raise ValueError("BAGEL vae route requires one image geometry")
+            raise ValueError("BAGEL latent decode requires one image geometry")
         height, width = next(iter(geometry))
         decoded = self.model.vae_decode_batch(
-            torch.stack(tuple(row.latent for row in decode_rows), dim=0),
+            torch.stack(latents, dim=0),
             height,
             width,
         )
-        return ForwardOutput(
-            tuple(
-                DecodeOutput(row.row_id, row.output_slot, decoded[index])
-                for index, row in enumerate(decode_rows)
-            )
-        )
+        return ForwardOutput(tuple(decoded[index] for index in range(len(latents))))

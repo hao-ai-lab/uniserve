@@ -11,12 +11,13 @@ use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, Bounds, CacheCopy, CacheGroupPlacement,
     CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound, Disposition, Domain,
     DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission,
-    KvAdmission, KvBranchPlacement, KvPlacement, LatentPlacement, LogicalLengths, OpId, OpStatus,
-    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    RecoveryPlacement, RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure,
-    ResponseKind, Rng, RouteId, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass,
-    TimingCounters, TokenSpan, UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities,
-    WorkerForwardStats, WorkerMetrics, WorkerRequest, WorkerResponse,
+    GraphBucketCapability, KvAdmission, KvBranchPlacement, KvPlacement, LaneCapabilities,
+    LatentPlacement, LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point,
+    PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
+    RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId,
+    SamplingOwnership, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenSpan,
+    UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities, WorkerForwardStats,
+    WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 
 pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -796,6 +797,8 @@ fn capabilities_from_table(
             .transpose()?
             .unwrap_or_default(),
         max_batch_operations: caps.max_batch_operations(),
+        max_batch_tokens: caps.max_batch_tokens(),
+        max_request_pool_size: caps.max_request_pool_size(),
         max_unresolved_window: caps.max_unresolved_window(),
         incremental_kv_publication: caps.incremental_kv_publication(),
         tensorized_mixed: caps.tensorized_mixed(),
@@ -822,6 +825,16 @@ fn capabilities_from_table(
             .protocol_layout_digest()
             .map(str::to_string)
             .context("capabilities.protocol_layout_digest is missing")?,
+        lanes: caps
+            .lanes()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(lane_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
     };
     caps.validate()?;
     Ok(caps)
@@ -2325,6 +2338,127 @@ fn error_operation_from_fb(
 // Capabilities
 // ---------------------------------------------------------------------------
 
+fn graph_bucket_from_table(
+    bucket: fbs::GraphBucketCapability<'_>,
+) -> anyhow::Result<GraphBucketCapability> {
+    Ok(GraphBucketCapability {
+        phase: required_str(bucket.phase(), "graph_bucket.phase")?,
+        batch_size: bucket.batch_size(),
+        token_bucket: bucket.token_bucket(),
+        attention_form: required_str(bucket.attention_form(), "graph_bucket.attention_form")?,
+        height: bucket.height(),
+        width: bucket.width(),
+        cfg_branches: bucket.cfg_branches(),
+        layout: bucket.layout().unwrap_or_default().to_string(),
+    })
+}
+
+fn lane_from_table(lane: fbs::LaneCapabilities<'_>) -> anyhow::Result<LaneCapabilities> {
+    Ok(LaneCapabilities {
+        lane_id: required_str(lane.lane_id(), "lane.lane_id")?,
+        domains: lane
+            .domains()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(domain_from_fb)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        resolved_sm_count: lane.resolved_sm_count(),
+        kv_capacity_tokens: lane.kv_capacity_tokens(),
+        latent_capacity_units: lane.latent_capacity_units(),
+        max_batch_operations: lane.max_batch_operations(),
+        max_batch_tokens: lane.max_batch_tokens(),
+        max_inflight: lane.max_inflight(),
+        graph_buckets: lane
+            .graph_buckets()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(graph_bucket_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        eager_max_batch_operations: lane.eager_max_batch_operations(),
+        eager_max_batch_tokens: lane.eager_max_batch_tokens(),
+    })
+}
+
+fn graph_bucket_to_fb(bucket: &GraphBucketCapability) -> fbs::GraphBucketCapabilityT {
+    fbs::GraphBucketCapabilityT {
+        phase: Some(bucket.phase.clone()),
+        batch_size: bucket.batch_size,
+        token_bucket: bucket.token_bucket,
+        attention_form: Some(bucket.attention_form.clone()),
+        height: bucket.height,
+        width: bucket.width,
+        cfg_branches: bucket.cfg_branches,
+        layout: Some(bucket.layout.clone()),
+    }
+}
+
+fn lane_to_fb(lane: &LaneCapabilities) -> fbs::LaneCapabilitiesT {
+    fbs::LaneCapabilitiesT {
+        lane_id: Some(lane.lane_id.clone()),
+        domains: Some(lane.domains.iter().copied().map(domain_to_fb).collect()),
+        resolved_sm_count: lane.resolved_sm_count,
+        kv_capacity_tokens: lane.kv_capacity_tokens,
+        latent_capacity_units: lane.latent_capacity_units,
+        max_batch_operations: lane.max_batch_operations,
+        max_batch_tokens: lane.max_batch_tokens,
+        max_inflight: lane.max_inflight,
+        graph_buckets: Some(lane.graph_buckets.iter().map(graph_bucket_to_fb).collect()),
+        eager_max_batch_operations: lane.eager_max_batch_operations,
+        eager_max_batch_tokens: lane.eager_max_batch_tokens,
+    }
+}
+
+#[cfg(test)]
+fn graph_bucket_from_fb(
+    bucket: fbs::GraphBucketCapabilityT,
+) -> anyhow::Result<GraphBucketCapability> {
+    Ok(GraphBucketCapability {
+        phase: required_string(bucket.phase, "graph_bucket.phase")?,
+        batch_size: bucket.batch_size,
+        token_bucket: bucket.token_bucket,
+        attention_form: required_string(bucket.attention_form, "graph_bucket.attention_form")?,
+        height: bucket.height,
+        width: bucket.width,
+        cfg_branches: bucket.cfg_branches,
+        layout: bucket.layout.unwrap_or_default(),
+    })
+}
+
+#[cfg(test)]
+fn lane_from_fb(lane: fbs::LaneCapabilitiesT) -> anyhow::Result<LaneCapabilities> {
+    Ok(LaneCapabilities {
+        lane_id: required_string(lane.lane_id, "lane.lane_id")?,
+        domains: lane
+            .domains
+            .unwrap_or_default()
+            .into_iter()
+            .map(domain_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        resolved_sm_count: lane.resolved_sm_count,
+        kv_capacity_tokens: lane.kv_capacity_tokens,
+        latent_capacity_units: lane.latent_capacity_units,
+        max_batch_operations: lane.max_batch_operations,
+        max_batch_tokens: lane.max_batch_tokens,
+        max_inflight: lane.max_inflight,
+        graph_buckets: lane
+            .graph_buckets
+            .unwrap_or_default()
+            .into_iter()
+            .map(graph_bucket_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        eager_max_batch_operations: lane.eager_max_batch_operations,
+        eager_max_batch_tokens: lane.eager_max_batch_tokens,
+    })
+}
+
 fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCapabilitiesT> {
     caps.validate()?;
     Ok(fbs::WorkerCapabilitiesT {
@@ -2370,6 +2504,8 @@ fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCa
                 .collect(),
         ),
         max_batch_operations: caps.max_batch_operations,
+        max_batch_tokens: caps.max_batch_tokens,
+        max_request_pool_size: caps.max_request_pool_size,
         max_unresolved_window: caps.max_unresolved_window,
         incremental_kv_publication: caps.incremental_kv_publication,
         tensorized_mixed: caps.tensorized_mixed,
@@ -2384,6 +2520,7 @@ fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCa
         model_identity: Some(caps.model_identity.clone()),
         weight_digest: Some(caps.weight_digest.clone()),
         protocol_layout_digest: Some(caps.protocol_layout_digest.clone()),
+        lanes: Some(caps.lanes.iter().map(lane_to_fb).collect()),
     })
 }
 
@@ -2444,6 +2581,8 @@ fn capabilities_from_fb(caps: fbs::WorkerCapabilitiesT) -> anyhow::Result<Worker
             .map(request_kind_from_fb)
             .collect::<anyhow::Result<_>>()?,
         max_batch_operations: caps.max_batch_operations,
+        max_batch_tokens: caps.max_batch_tokens,
+        max_request_pool_size: caps.max_request_pool_size,
         max_unresolved_window: caps.max_unresolved_window,
         incremental_kv_publication: caps.incremental_kv_publication,
         tensorized_mixed: caps.tensorized_mixed,
@@ -2463,6 +2602,12 @@ fn capabilities_from_fb(caps: fbs::WorkerCapabilitiesT) -> anyhow::Result<Worker
         protocol_layout_digest: caps
             .protocol_layout_digest
             .context("capabilities.protocol_layout_digest is missing")?,
+        lanes: caps
+            .lanes
+            .unwrap_or_default()
+            .into_iter()
+            .map(lane_from_fb)
+            .collect::<anyhow::Result<_>>()?,
     };
     caps.validate()?;
     Ok(caps)

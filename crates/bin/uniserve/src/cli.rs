@@ -19,7 +19,7 @@ use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
     ModelDescription, SchedulingPolicy,
 };
-use uniserve_worker_ipc::WorkerLaunchConfig;
+use uniserve_worker_ipc::{LaneConfig, WorkerLaunchConfig};
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
@@ -573,28 +573,21 @@ pub(crate) struct WorkerLaunchArgs {
     pub worker_mesh: Option<String>,
     #[arg(long, hide = true)]
     pub tp_backend: Option<String>,
-    #[arg(long = "enable-torch-compile")]
-    pub torch_compile: bool,
-    #[arg(long, default_value = "inductor", hide = true)]
-    pub torch_compile_backend: String,
-    #[arg(long, hide = true)]
-    pub torch_compile_mode: Option<String>,
-    #[arg(long, hide = true)]
-    pub torch_compile_fullgraph: bool,
-    #[arg(long, hide = true)]
-    pub torch_compile_dynamic: Option<String>,
+    /// Repeatable JSON descriptor for a deployment-static execution lane.
+    #[arg(long = "lane")]
+    pub lanes: Vec<LaneConfig>,
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub cuda_graph: bool,
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
-    pub cuda_graph_warmup: bool,
     #[arg(long, hide = true)]
-    pub cuda_graph_warmup_batches: Option<String>,
+    pub decode_graph_batch_sizes: Option<String>,
     #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
     pub prefill_cuda_graph: bool,
-    #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
-    pub prefill_cuda_graph_warmup: bool,
     #[arg(long, hide = true)]
-    pub prefill_cuda_graph_warmup_tokens: Option<String>,
+    pub prefill_graph_token_sizes: Option<String>,
+    #[arg(long, hide = true)]
+    pub flow_graph_batch_sizes: Option<String>,
+    #[arg(long, hide = true)]
+    pub flow_graph_shapes: Option<String>,
     #[arg(long, default_value_t = 8192, hide = true)]
     pub mixed_text_max_tokens: u32,
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
@@ -631,17 +624,13 @@ impl WorkerLaunchArgs {
             disable_model_arch: self.disable_model_arch.clone(),
             mesh: self.worker_mesh.clone(),
             tp_backend: self.tp_backend.clone(),
-            torch_compile: self.torch_compile,
-            torch_compile_backend: self.torch_compile_backend.clone(),
-            torch_compile_mode: self.torch_compile_mode.clone(),
-            torch_compile_fullgraph: self.torch_compile_fullgraph,
-            torch_compile_dynamic: self.torch_compile_dynamic.clone(),
+            lanes: self.lanes.clone(),
             cuda_graph: self.cuda_graph,
-            cuda_graph_warmup: self.cuda_graph_warmup,
-            cuda_graph_warmup_batches: self.cuda_graph_warmup_batches.clone(),
+            decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
             prefill_cuda_graph: self.prefill_cuda_graph,
-            prefill_cuda_graph_warmup: self.prefill_cuda_graph_warmup,
-            prefill_cuda_graph_warmup_tokens: self.prefill_cuda_graph_warmup_tokens.clone(),
+            prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
+            flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
+            flow_graph_shapes: self.flow_graph_shapes.clone(),
             mixed_text_max_tokens: self.mixed_text_max_tokens,
             varlen_prefill: self.varlen_prefill,
             flashinfer_workspace_size: self.flashinfer_workspace_size,
@@ -685,39 +674,15 @@ impl WorkerLaunchArgs {
         }
         push_option(args, "--worker-mesh", cfg.mesh.as_ref());
         push_option(args, "--tp-backend", cfg.tp_backend.as_ref());
-        if cfg.torch_compile {
-            args.push("--enable-torch-compile".to_string());
+        for lane in &cfg.lanes {
+            args.push("--lane".to_string());
+            args.push(lane.worker_arg());
         }
-        push_if_changed(
-            args,
-            "--torch-compile-backend",
-            &cfg.torch_compile_backend,
-            &default.torch_compile_backend,
-        );
-        push_option(
-            args,
-            "--torch-compile-mode",
-            cfg.torch_compile_mode.as_ref(),
-        );
-        if cfg.torch_compile_fullgraph {
-            args.push("--torch-compile-fullgraph".to_string());
-        }
-        push_option(
-            args,
-            "--torch-compile-dynamic",
-            cfg.torch_compile_dynamic.as_ref(),
-        );
         push_bool_value(args, "--cuda-graph", cfg.cuda_graph, default.cuda_graph);
-        push_bool_value(
-            args,
-            "--cuda-graph-warmup",
-            cfg.cuda_graph_warmup,
-            default.cuda_graph_warmup,
-        );
         push_option(
             args,
-            "--cuda-graph-warmup-batches",
-            cfg.cuda_graph_warmup_batches.as_ref(),
+            "--decode-graph-batch-sizes",
+            cfg.decode_graph_batch_sizes.as_ref(),
         );
         push_bool_value(
             args,
@@ -725,17 +690,17 @@ impl WorkerLaunchArgs {
             cfg.prefill_cuda_graph,
             default.prefill_cuda_graph,
         );
-        push_bool_value(
+        push_option(
             args,
-            "--prefill-cuda-graph-warmup",
-            cfg.prefill_cuda_graph_warmup,
-            default.prefill_cuda_graph_warmup,
+            "--prefill-graph-token-sizes",
+            cfg.prefill_graph_token_sizes.as_ref(),
         );
         push_option(
             args,
-            "--prefill-cuda-graph-warmup-tokens",
-            cfg.prefill_cuda_graph_warmup_tokens.as_ref(),
+            "--flow-graph-batch-sizes",
+            cfg.flow_graph_batch_sizes.as_ref(),
         );
+        push_option(args, "--flow-graph-shapes", cfg.flow_graph_shapes.as_ref());
         push_u32_if_changed(
             args,
             "--mixed-text-max-tokens",
@@ -959,8 +924,6 @@ mod tests {
             "false",
             "--prefill-cuda-graph",
             "true",
-            "--prefill-cuda-graph-warmup",
-            "true",
             "--varlen-prefill",
             "false",
             "--flashinfer-fast-decode-plan",
@@ -973,7 +936,6 @@ mod tests {
         let settings = args.runtime.engine_settings();
         assert!(!settings.worker_launch.cuda_graph);
         assert!(settings.worker_launch.prefill_cuda_graph);
-        assert!(settings.worker_launch.prefill_cuda_graph_warmup);
         assert!(!settings.worker_launch.varlen_prefill);
         assert!(!settings.worker_launch.flashinfer_fast_decode_plan);
 
@@ -987,11 +949,6 @@ mod tests {
             engine_args
                 .windows(2)
                 .any(|pair| pair[0] == "--prefill-cuda-graph" && pair[1] == "true")
-        );
-        assert!(
-            engine_args
-                .windows(2)
-                .any(|pair| pair[0] == "--prefill-cuda-graph-warmup" && pair[1] == "true")
         );
         assert!(
             engine_args
@@ -1284,7 +1241,8 @@ mod tests {
             "--mem-fraction-static",
             "0.5",
             "--trust-remote-code",
-            "--enable-torch-compile",
+            "--lane",
+            r#"{"lane_id":"und","sm_budget":64,"domains":["und"]}"#,
         ]);
 
         assert_eq!(runtime.worker_ranks, 2);
@@ -1298,7 +1256,7 @@ mod tests {
         assert_eq!(runtime.worker_launch.model_dtype, "float16");
         assert_eq!(runtime.worker_launch.kv_memory_fraction, "0.5");
         assert!(runtime.worker_launch.transformers_trust_remote_code);
-        assert!(runtime.worker_launch.torch_compile);
+        assert_eq!(runtime.worker_launch.lanes.len(), 1);
     }
 
     #[test]

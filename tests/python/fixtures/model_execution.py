@@ -3,6 +3,6 @@
 from uniserve_worker.server.stub import StubModel, stub_deployment
 
 TEST_MODEL = StubModel()
-TEST_DEPLOYMENT = stub_deployment(64)
+TEST_DEPLOYMENT = stub_deployment(64, max_batch_tokens=8192)
 
 __all__ = ["TEST_DEPLOYMENT", "TEST_MODEL"]

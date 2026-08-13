@@ -1,18 +1,17 @@
 """Conformance for shared vision building blocks."""
+
 from __future__ import annotations
 
 import pytest
 import torch
 
-import uniserve_worker.nn.vision.encoder as vision_encoder
 from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
-from uniserve_worker.forward import (
+from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
     EmptyKvView,
-    EmptyLatentView,
     EmptyMeshView,
-    EmptyOutputView,
-    ForwardContext,
+    ForwardBatch,
+    ModelPhase,
     NoAttention,
 )
 from uniserve_worker.nn.layer import LayerSpec
@@ -30,14 +29,15 @@ from uniserve_worker.nn.vision.encoder import VisionSelfAttention
 pytestmark = pytest.mark.unit
 
 
-def _forward_context() -> ForwardContext:
+def _forward_context() -> ForwardBatch:
     selection = AttentionSelection("torch_sdpa", (TorchSDPAAttentionBackend(),))
-    return ForwardContext(
+    return ForwardBatch(
+        phase=ModelPhase.ENCODE_VISION,
+        row_count=1,
+        request_pool_indices=torch.tensor([1]),
         kv=EmptyKvView(),
-        latent=EmptyLatentView(),
         attention=NoAttention(selection),
         mesh=EmptyMeshView(),
-        output=EmptyOutputView(),
     )
 
 
@@ -74,14 +74,8 @@ def test_position_embedding_supports_bagel_and_sensenova_initialization_modes():
     torch.testing.assert_close(ids, torch.tensor([0, 1, 2, 8, 9, 10]))
 
 
-def test_vision_attention_uses_portable_fallback_when_selection_cannot_run(monkeypatch):
+def test_vision_attention_preserves_packed_image_shape():
     context = _forward_context()
-
-    def reject_selected_backend(*_args, **kwargs):
-        assert kwargs["selection"] is context.attention.backends
-        return False
-
-    monkeypatch.setattr(vision_encoder.ops, "can_run_attention", reject_selected_backend)
     attention = VisionSelfAttention(
         hidden_size=8,
         num_heads=2,

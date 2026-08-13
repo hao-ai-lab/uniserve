@@ -5,33 +5,24 @@ from __future__ import annotations
 import torch
 
 from ..batch import WorkVariant
-from ..forward import (
-    EncodeKind,
-    EncodeOutput,
-    EncodeRow,
-    FlowOutput,
-    FlowRow,
+from ..execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
-    ForwardRow,
     PackedAttentionPlan,
     PagedDecodePlan,
-    PatchInput,
-    RouteId,
-    TokenEmbeddings,
-    TokenHidden,
-    TokenIds,
-    TokenLogits,
-    TokenOutput,
-    TokenRow,
-    TokenSegments,
+    PagedVarlenPlan,
     TokenSelection,
-    TowerInput,
 )
-from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
+from ..foundation.sizing import (
+    DEFAULT_BLOCK_SIZE,
+    DEFAULT_MAX_BATCH_OPS,
+    DEFAULT_MAX_REQUEST_POOL_SIZE,
+)
 from ..loader.schema import WeightSpec
 from ..models.generation import BranchSource, GenerationPipeline, LatentLayout, Materialization
 from ..models.inputs import (
+    FeatureInjection,
+    FeatureLayout,
     ImageProcessor,
     PatchTransform,
     StrideResize,
@@ -39,12 +30,9 @@ from ..models.inputs import (
 )
 from ..models.runtime import (
     CacheGeometry,
-    DeviceRole,
     ExecutionModel,
-    LoweredStage,
     PositionLayout,
     ResourceGeometry,
-    RowKind,
     ScratchGeometry,
     WorkerDeployment,
 )
@@ -70,7 +58,11 @@ __all__ = [
 ]
 
 
-def stub_deployment(block_size: int = DEFAULT_BLOCK_SIZE) -> WorkerDeployment:
+def stub_deployment(
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    *,
+    max_batch_tokens: int,
+) -> WorkerDeployment:
     return WorkerDeployment(
         device="cpu",
         model_scope="whole",
@@ -84,12 +76,14 @@ def stub_deployment(block_size: int = DEFAULT_BLOCK_SIZE) -> WorkerDeployment:
         kv_cache_dtype=None,
         kv_memory_fraction=1.0,
         max_batch_operations=DEFAULT_MAX_BATCH_OPS,
+        max_batch_tokens=int(max_batch_tokens),
+        max_request_pool_size=DEFAULT_MAX_REQUEST_POOL_SIZE,
         generation_device=None,
     )
 
 
 class StubModel(ExecutionModel):
-    """Stateless neural test double that obeys the canonical model boundary."""
+    """Stateless neural test double for the concrete imperative model boundary."""
 
     architectures = ("UniServeStubForUnifiedGeneration",)
 
@@ -114,6 +108,11 @@ class StubModel(ExecutionModel):
             ),
             vae=TowerTransform(image_resize),
             staging_dtype="bfloat16",
+            feature_injection=FeatureInjection(
+                layout=FeatureLayout.DIRECT,
+                positions=PositionLayout.TEMPORAL_SPATIAL,
+                end_token_id=1007,
+            ),
         )
         self.cache_geometry = CacheGeometry(
             num_layers=STUB_NUM_LAYERS,
@@ -150,198 +149,194 @@ class StubModel(ExecutionModel):
         )
         self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
         self.supported_work = frozenset(WorkVariant)
-
-    def lower(
-        self,
-        variant: WorkVariant,
-        *,
-        retain_image: bool = False,
-    ) -> tuple[LoweredStage, ...]:
-        del retain_image
-        if variant in {WorkVariant.TOKEN_EXTEND, WorkVariant.TOKEN_DECODE, WorkVariant.TOKEN_VERIFY}:
-            return (LoweredStage(RouteId("stub"), RowKind.TOKEN),)
-        if variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}:
-            return (LoweredStage(RouteId("stub"), RowKind.FLOW),)
-        if variant in {WorkVariant.ENCODE_VISION, WorkVariant.ENCODE_LATENT}:
-            return (LoweredStage(RouteId("encode"), RowKind.ENCODE),)
-        return ()
-
-    def route_dtype(self, route: RouteId) -> str:
-        self._require_route(route)
-        return "bfloat16"
-
-    def route_device_role(self, route: RouteId) -> DeviceRole:
-        self._require_route(route)
-        return DeviceRole.PRIMARY
-
-    def route_topology(self, route: RouteId) -> tuple[str, ...]:
-        self._require_route(route)
-        return ("tp",)
-
-    def route_graph_eligible(self, route: RouteId) -> bool:
-        self._require_route(route)
-        return False
-
-    def route_max_tokens(self, route: RouteId) -> int:
-        self._require_route(route)
-        return STUB_MAX_LATENT_SIZE
-
-    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
-        self._require_route(route)
-        if route == "stub":
-            return ()
-        if isinstance(row, EncodeRow):
-            return tuple(int(value) for value in row.inputs.pixels.shape)
-        raise TypeError("stub encode route requires an encode row")
-
-    def route_uses_packed_attention(self, route: RouteId) -> bool:
-        self._require_route(route)
-        return route == "stub"
-
-    def allows_mixed(self, route: RouteId, rows: frozenset[RowKind]) -> bool:
-        self._require_route(route)
-        return route == "stub" and rows <= {RowKind.TOKEN, RowKind.FLOW}
-
-    @staticmethod
-    def _require_route(route: RouteId) -> None:
-        if route not in {"stub", "encode"}:
-            raise ValueError(f"stub model received unknown route {route!s}")
+        self.vocab_size = _STUB_VOCAB_SIZE
+        self.hidden_size = _STUB_HIDDEN_SIZE
+        self.text_max_tokens = STUB_MAX_LATENT_SIZE
+        self.text_topology = ("tp",)
+        self.tensorized_mixed = True
 
     @torch.inference_mode()
-    def forward(self, batch: ForwardBatch) -> ForwardOutput:
-        if batch.route == "stub":
-            return self._sequence_and_flow(batch)
-        if batch.route == "encode":
-            return self._encode(batch)
-        raise ValueError(f"stub model received unknown route {batch.route!s}")
-
-    def _sequence_and_flow(self, batch: ForwardBatch) -> ForwardOutput:
-        rows: list[TokenRow | FlowRow] = []
-        for row in batch.rows:
-            if not isinstance(row, (TokenRow, FlowRow)):
-                raise TypeError("stub route accepts token and flow rows")
-            rows.append(row)
-        query_tokens = sum(
-            _row_token_count(row) if isinstance(row, TokenRow) else int(row.image_tokens)
-            for row in rows
-        )
-        zeros = torch.zeros(
-            (query_tokens, 1, 1),
-            dtype=torch.bfloat16,
-            device=_row_device(rows[0]),
-        )
-        plan = batch.context.attention
-        if isinstance(plan, PagedDecodePlan):
-            if any(not isinstance(row, TokenRow) or _row_token_count(row) != 1 for row in rows):
-                raise TypeError("stub paged decode requires one token per row")
-            batch.context.kv.append(0, zeros.unsqueeze(1), zeros.unsqueeze(1))
-        elif isinstance(plan, PackedAttentionPlan):
-            batch.context.kv.append_packed(
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        query_tokens = sum(forward_batch.query_lens) + sum(forward_batch.flow_image_tokens)
+        device = positions.device
+        if query_tokens < 1:
+            raise ValueError("stub text/denoise forward requires query tokens")
+        kv = torch.zeros((query_tokens, 1, 1), dtype=torch.bfloat16, device=device)
+        attention = forward_batch.attention
+        if isinstance(attention, PagedDecodePlan):
+            forward_batch.kv.append(0, kv.unsqueeze(1), kv.unsqueeze(1))
+        elif isinstance(attention, PagedVarlenPlan):
+            forward_batch.kv.append_varlen(
                 0,
-                zeros,
-                zeros,
-                page_ids=plan.write_page_ids,
-                page_offsets=plan.write_page_offsets,
-                token_indices=plan.write_token_indices,
+                kv,
+                kv,
+                attention.query_lens_cpu,
+                block_table=attention.block_table,
+                cache_seqlens=attention.cache_seqlens,
+                query_offsets=attention.cu_seqlens_q,
+            )
+        elif isinstance(attention, PackedAttentionPlan):
+            forward_batch.kv.append_packed(
+                0,
+                kv,
+                kv,
+                page_ids=attention.write_page_ids,
+                page_offsets=attention.write_page_offsets,
+                token_indices=attention.write_token_indices,
             )
         else:
-            raise TypeError("stub sequence/flow route requires a paged attention plan")
-        outputs: list[TokenOutput | FlowOutput] = []
-        for row in rows:
-            if isinstance(row, TokenRow):
-                outputs.append(self._token(row))
-            else:
-                outputs.append(
-                    FlowOutput(
-                        row_id=row.row_id,
-                        output_slot=row.output_slot,
-                        prediction=torch.zeros_like(row.latent, dtype=torch.bfloat16),
-                    )
+            raise TypeError("stub text/denoise forward requires paged attention")
+
+        chunks: list[torch.Tensor | None] = [None] * forward_batch.row_count
+        token_offset = 0
+        for row_index, count in zip(
+            forward_batch.token_row_indices,
+            forward_batch.query_lens,
+            strict=True,
+        ):
+            row_positions = positions[..., token_offset : token_offset + count]
+            temporal = row_positions.reshape(-1) if row_positions.ndim == 1 else row_positions[0]
+            temporal = temporal.to(torch.bfloat16)
+            chunks[row_index] = torch.stack(
+                (
+                    temporal,
+                    temporal.remainder(17),
+                    temporal.remainder(31),
+                    torch.ones_like(temporal),
+                ),
+                dim=-1,
+            )
+            token_offset += count
+        for flow_index, row_index in enumerate(forward_batch.flow_row_indices):
+            count = int(forward_batch.flow_image_tokens[flow_index])
+            chunks[row_index] = torch.zeros(
+                (count, _STUB_HIDDEN_SIZE),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        if any(chunk is None for chunk in chunks):
+            raise RuntimeError("stub forward batch contains an unbound row")
+        return torch.cat(tuple(chunk for chunk in chunks if chunk is not None), dim=0)
+
+    def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
+        row_lengths = [0] * forward_batch.row_count
+        for row_index, count in zip(
+            forward_batch.token_row_indices,
+            forward_batch.query_lens,
+            strict=True,
+        ):
+            row_lengths[row_index] = count
+        for row_index, count in zip(
+            forward_batch.flow_row_indices,
+            forward_batch.flow_image_tokens,
+            strict=True,
+        ):
+            row_lengths[row_index] = count
+        rows: list[torch.Tensor] = []
+        offset = 0
+        for count in row_lengths:
+            rows.append(hidden[offset : offset + count])
+            offset += count
+
+        token_ids: dict[int, torch.Tensor] = {}
+        token_offset = 0
+        if forward_batch.input_ids is not None:
+            for row_index, count in zip(
+                forward_batch.token_row_indices,
+                forward_batch.query_lens,
+                strict=True,
+            ):
+                token_ids[row_index] = forward_batch.input_ids[token_offset : token_offset + count]
+                token_offset += count
+        selections = dict(
+            zip(
+                forward_batch.token_row_indices,
+                forward_batch.token_selections,
+                strict=True,
+            )
+        )
+        flow_rows = set(forward_batch.flow_row_indices)
+        outputs: list[torch.Tensor] = []
+        for row_index, row_hidden in enumerate(rows):
+            selection = selections.get(row_index)
+            if selection is TokenSelection.HIDDEN:
+                outputs.append(row_hidden)
+            elif selection is not None:
+                ids = token_ids[row_index]
+                targets = _next_tokens(ids)
+                if selection is TokenSelection.LAST_LOGITS:
+                    targets = targets[-1:]
+                logits = torch.full(
+                    (int(targets.numel()), _STUB_VOCAB_SIZE),
+                    -16.0,
+                    dtype=torch.bfloat16,
+                    device=ids.device,
                 )
+                logits.scatter_(1, targets.reshape(-1, 1), 16.0)
+                outputs.append(logits)
+            elif row_index in flow_rows:
+                flow_index = forward_batch.flow_row_indices.index(row_index)
+                outputs.append(
+                    torch.zeros_like(forward_batch.flow_latents[flow_index], dtype=torch.bfloat16)
+                )
+            else:
+                raise RuntimeError("stub output row has no concrete phase")
         return ForwardOutput(tuple(outputs))
 
-    def _token(self, row: TokenRow) -> TokenOutput:
-        value: TokenHidden | TokenLogits
-        if row.selection is TokenSelection.HIDDEN:
-            value = TokenHidden(self._hidden(row))
-        else:
-            targets = self._targets(row)
-            if row.selection is TokenSelection.LAST_LOGITS:
-                targets = targets[-1:]
-            logits = torch.full(
-                (len(targets), _STUB_VOCAB_SIZE),
-                -16.0,
-                dtype=torch.bfloat16,
-                device=row.positions.device,
-            )
-            for index, target in enumerate(targets):
-                logits[index, target] = 16.0
-            value = TokenLogits(logits)
-        return TokenOutput(row.row_id, row.output_slot, value)
+    def encode(
+        self,
+        pixels: tuple[torch.Tensor, ...],
+        batch: ForwardBatch,
+    ) -> ForwardOutput:
+        outputs: list[torch.Tensor] = []
+        for value, grid in zip(pixels, batch.encode_grids, strict=True):
+            typed = value.to(torch.bfloat16)
+            if grid is not None:
+                features = typed.mean(dim=-1, keepdim=True).repeat(1, _STUB_HIDDEN_SIZE)
+            else:
+                features = typed.mean().reshape(1, 1).repeat(1, _STUB_HIDDEN_SIZE)
+            outputs.append(features)
+        return ForwardOutput(tuple(outputs))
 
-    @staticmethod
-    def _hidden(row: TokenRow) -> torch.Tensor:
-        positions = (
-            row.positions.reshape(-1) if row.positions.ndim == 1 else row.positions[0].reshape(-1)
-        ).to(torch.bfloat16)
-        return torch.stack(
-            (
-                positions,
-                positions.remainder(17),
-                positions.remainder(31),
-                torch.ones_like(positions),
-            ),
-            dim=-1,
+    def encode_latent(
+        self,
+        pixels: tuple[torch.Tensor, ...],
+        batch: ForwardBatch,
+    ) -> ForwardOutput:
+        del batch
+        return ForwardOutput(
+            tuple(
+                value.to(torch.bfloat16).unsqueeze(0)
+                if value.ndim == 3
+                else value.to(torch.bfloat16)
+                for value in pixels
+            )
         )
 
-    @staticmethod
-    def _targets(row: TokenRow) -> tuple[int, ...]:
-        ids = _token_ids(row)
-        return tuple(_next_token(token) for token in ids)
-
-    @staticmethod
-    def _encode(batch: ForwardBatch) -> ForwardOutput:
-        rows: list[EncodeRow] = []
-        for row in batch.rows:
-            if not isinstance(row, EncodeRow):
-                raise TypeError("stub encode route accepts encode rows")
-            rows.append(row)
-        outputs: list[EncodeOutput] = []
-        for row in rows:
-            if isinstance(row.inputs, PatchInput):
-                pixels = row.inputs.pixels.to(torch.bfloat16)
-                mean = pixels.mean(dim=-1, keepdim=True)
-                features = mean.repeat(1, _STUB_HIDDEN_SIZE)
-            elif isinstance(row.inputs, TowerInput):
-                pixels = row.inputs.pixels.to(torch.bfloat16)
-                if row.kind is EncodeKind.LATENT:
-                    features = pixels.unsqueeze(0) if pixels.ndim == 3 else pixels
-                else:
-                    features = pixels.mean().reshape(1, 1).repeat(1, _STUB_HIDDEN_SIZE)
-            else:
-                raise TypeError("stub encode row has an unknown input variant")
-            outputs.append(EncodeOutput(row.row_id, row.output_slot, features))
-        return ForwardOutput(tuple(outputs))
-
-
-def _row_device(row: TokenRow | FlowRow) -> torch.device:
-    return row.positions.device
-
-
-def _token_ids(row: TokenRow) -> tuple[int, ...]:
-    if isinstance(row.inputs, TokenIds):
-        return tuple(int(value) for value in row.inputs.values.reshape(-1).tolist())
-    if isinstance(row.inputs, TokenEmbeddings):
-        return (1001,) * _row_token_count(row)
-    if isinstance(row.inputs, TokenSegments):
-        values: list[int] = []
-        for segment in row.inputs.values:
-            if isinstance(segment, TokenIds):
-                values.extend(int(value) for value in segment.values.reshape(-1).tolist())
-            else:
-                values.extend([1001] * int(segment.values.shape[0]))
-        return tuple(values)
-    raise TypeError("stub token row has an unknown input variant")
+    def decode_latent(
+        self,
+        latents: tuple[torch.Tensor, ...],
+        batch: ForwardBatch,
+    ) -> ForwardOutput:
+        outputs = tuple(
+            torch.zeros(
+                (3, height, width),
+                dtype=torch.bfloat16,
+                device=latent.device,
+            )
+            for latent, height, width in zip(
+                latents,
+                batch.decode_heights,
+                batch.decode_widths,
+                strict=True,
+            )
+        )
+        return ForwardOutput(outputs)
 
 
 def _next_token(token: int) -> int:
@@ -358,8 +353,10 @@ def _next_token(token: int) -> int:
     return 1000
 
 
-def _row_token_count(row: TokenRow) -> int:
-    inputs = row.inputs
-    if isinstance(inputs, (TokenIds, TokenEmbeddings)):
-        return int(inputs.values.shape[0])
-    return sum(int(segment.values.shape[0]) for segment in inputs.values)
+def _next_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    targets = torch.full_like(tokens, 1000)
+    targets = torch.where(tokens == 1000, 1001, targets)
+    targets = torch.where(tokens == 1001, STUB_IMG_START_TOKEN_ID, targets)
+    targets = torch.where(tokens == STUB_IMG_START_TOKEN_ID, 1002, targets)
+    targets = torch.where((tokens >= 1002) & (tokens < 1007), tokens + 1, targets)
+    return torch.where(tokens == 1007, STUB_EOS_TOKEN_ID, targets)

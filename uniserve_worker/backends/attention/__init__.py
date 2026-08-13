@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ...forward import AttentionBackend, AttentionSelection
+from ...execution.forward_batch import AttentionBackend, AttentionSelection
 from ...foundation.errors import capability_mismatch
 from ...foundation.runtime_config import FlashInferTuningConfig
 from .base import AttentionCapabilities

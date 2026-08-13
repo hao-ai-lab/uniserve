@@ -132,6 +132,11 @@ class DeviceEventPool:
             state = self._active.get(id(event))
             return state is not None and state.event is event and state.recorded
 
+    def close(self) -> None:
+        with self._lock:
+            self._active.clear()
+            self._available.clear()
+
     def _require_locked(
         self,
         event: torch.cuda.Event,

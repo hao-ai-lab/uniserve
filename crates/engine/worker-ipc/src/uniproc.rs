@@ -9,14 +9,15 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uniserve_core::CommandWaker;
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError};
 use uniserve_worker_ipc_core::{
     ClientEndpoint, Frame, Pending, event_driven_enabled, service_name,
 };
 use uniserve_worker_wire::{
-    Batch, CompletionReport, ResponseKind, WorkerCapabilities, WorkerRequest, WorkerResponse,
+    Batch, CompletionReport, Domain, ResponseKind, WorkerCapabilities, WorkerRequest,
+    WorkerResponse,
 };
 
 use crate::death_watch::DeathWatcher;
@@ -42,6 +43,52 @@ const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Explicit Python worker launch configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneConfig {
+    pub lane_id: String,
+    pub sm_budget: u32,
+    pub domains: Vec<Domain>,
+    pub kv_capacity_tokens: Option<u64>,
+    pub latent_capacity_units: Option<u64>,
+    pub max_batch_operations: Option<u32>,
+    pub max_batch_tokens: Option<u32>,
+    pub max_inflight: Option<u32>,
+}
+
+impl std::str::FromStr for LaneConfig {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let lane: Self = serde_json::from_str(value)
+            .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
+        if lane.lane_id.is_empty()
+            || lane.sm_budget == 0
+            || lane.domains.is_empty()
+            || lane.domains.iter().copied().collect::<HashSet<_>>().len() != lane.domains.len()
+        {
+            return Err("execution lane identity, SM budget, and domains must be valid".into());
+        }
+        Ok(lane)
+    }
+}
+
+impl LaneConfig {
+    pub fn worker_arg(&self) -> String {
+        serde_json::json!({
+            "lane_id": self.lane_id,
+            "sm_budget": self.sm_budget,
+            "domains": self.domains,
+            "kv_capacity_tokens": self.kv_capacity_tokens,
+            "latent_capacity_units": self.latent_capacity_units,
+            "max_batch_operations": self.max_batch_operations,
+            "max_batch_tokens": self.max_batch_tokens,
+            "max_inflight": self.max_inflight,
+        })
+        .to_string()
+    }
+}
+
+/// Explicit Python worker launch configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkerLaunchConfig {
     pub stub: bool,
@@ -53,17 +100,13 @@ pub struct WorkerLaunchConfig {
     pub disable_model_arch: Vec<String>,
     pub mesh: Option<String>,
     pub tp_backend: Option<String>,
-    pub torch_compile: bool,
-    pub torch_compile_backend: String,
-    pub torch_compile_mode: Option<String>,
-    pub torch_compile_fullgraph: bool,
-    pub torch_compile_dynamic: Option<String>,
+    pub lanes: Vec<LaneConfig>,
     pub cuda_graph: bool,
-    pub cuda_graph_warmup: bool,
-    pub cuda_graph_warmup_batches: Option<String>,
+    pub decode_graph_batch_sizes: Option<String>,
     pub prefill_cuda_graph: bool,
-    pub prefill_cuda_graph_warmup: bool,
-    pub prefill_cuda_graph_warmup_tokens: Option<String>,
+    pub prefill_graph_token_sizes: Option<String>,
+    pub flow_graph_batch_sizes: Option<String>,
+    pub flow_graph_shapes: Option<String>,
     pub mixed_text_max_tokens: u32,
     pub varlen_prefill: bool,
     pub flashinfer_workspace_size: u64,
@@ -89,17 +132,13 @@ impl Default for WorkerLaunchConfig {
             disable_model_arch: Vec::new(),
             mesh: None,
             tp_backend: None,
-            torch_compile: false,
-            torch_compile_backend: "inductor".to_string(),
-            torch_compile_mode: None,
-            torch_compile_fullgraph: false,
-            torch_compile_dynamic: None,
+            lanes: Vec::new(),
             cuda_graph: true,
-            cuda_graph_warmup: true,
-            cuda_graph_warmup_batches: None,
+            decode_graph_batch_sizes: None,
             prefill_cuda_graph: false,
-            prefill_cuda_graph_warmup: false,
-            prefill_cuda_graph_warmup_tokens: None,
+            prefill_graph_token_sizes: None,
+            flow_graph_batch_sizes: None,
+            flow_graph_shapes: None,
             mixed_text_max_tokens: 8192,
             varlen_prefill: true,
             flashinfer_workspace_size: 512 * 1024 * 1024,
@@ -140,37 +179,26 @@ impl WorkerLaunchConfig {
         if let Some(value) = &self.tp_backend {
             cmd.arg("--tp-backend").arg(value);
         }
-        if self.torch_compile {
-            cmd.arg("--torch-compile");
-        }
-        cmd.arg("--torch-compile-backend")
-            .arg(&self.torch_compile_backend);
-        if let Some(value) = &self.torch_compile_mode {
-            cmd.arg("--torch-compile-mode").arg(value);
-        }
-        if self.torch_compile_fullgraph {
-            cmd.arg("--torch-compile-fullgraph");
-        }
-        if let Some(value) = &self.torch_compile_dynamic {
-            cmd.arg("--torch-compile-dynamic").arg(value);
+        for lane in &self.lanes {
+            cmd.arg("--lane").arg(lane.worker_arg());
         }
         if !self.cuda_graph {
             cmd.arg("--no-cuda-graph");
         }
-        if !self.cuda_graph_warmup {
-            cmd.arg("--no-cuda-graph-warmup");
-        }
-        if let Some(value) = &self.cuda_graph_warmup_batches {
-            cmd.arg("--cuda-graph-warmup-batches").arg(value);
+        if let Some(value) = &self.decode_graph_batch_sizes {
+            cmd.arg("--decode-graph-batch-sizes").arg(value);
         }
         if self.prefill_cuda_graph {
             cmd.arg("--prefill-cuda-graph");
         }
-        if self.prefill_cuda_graph_warmup {
-            cmd.arg("--prefill-cuda-graph-warmup");
+        if let Some(value) = &self.prefill_graph_token_sizes {
+            cmd.arg("--prefill-graph-token-sizes").arg(value);
         }
-        if let Some(value) = &self.prefill_cuda_graph_warmup_tokens {
-            cmd.arg("--prefill-cuda-graph-warmup-tokens").arg(value);
+        if let Some(value) = &self.flow_graph_batch_sizes {
+            cmd.arg("--flow-graph-batch-sizes").arg(value);
+        }
+        if let Some(value) = &self.flow_graph_shapes {
+            cmd.arg("--flow-graph-shapes").arg(value);
         }
         cmd.arg("--mixed-text-max-tokens")
             .arg(self.mixed_text_max_tokens.to_string());
@@ -256,6 +284,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_tokens: u32,
         attention_backend: &str,
     ) -> anyhow::Result<Self> {
         Self::spawn_with_config(
@@ -267,6 +296,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_tokens,
             attention_backend,
             &WorkerLaunchConfig::default(),
         )
@@ -282,6 +312,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_tokens: u32,
         attention_backend: &str,
         worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
@@ -294,6 +325,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_tokens,
             attention_backend,
             0,
             1,
@@ -312,6 +344,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_tokens: u32,
         attention_backend: &str,
         tp_rank: u32,
         tp_size: u32,
@@ -326,6 +359,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_tokens,
             attention_backend,
             tp_rank,
             tp_size,
@@ -344,6 +378,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_tokens: u32,
         attention_backend: &str,
         tp_rank: u32,
         tp_size: u32,
@@ -359,6 +394,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_tokens,
             attention_backend,
             tp_rank,
             tp_size,
@@ -382,6 +418,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_tokens: u32,
         attention_backend: &str,
         tp_rank: u32,
         tp_size: u32,
@@ -418,6 +455,8 @@ impl UniprocExecutor {
             .arg(attention_backend)
             .arg("--block-size")
             .arg(block_size.to_string())
+            .arg("--max-batch-tokens")
+            .arg(max_batch_tokens.to_string())
             .arg("--tp-rank")
             .arg(tp_rank.to_string())
             .arg("--tp-size")

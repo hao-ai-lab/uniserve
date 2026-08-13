@@ -5,6 +5,7 @@ vocab padding, and they fail loudly for tp>1 unless the required collectives
 are initialized.  This keeps the load-time sharding seam usable before a full
 distributed runtime is made default.
 """
+
 from __future__ import annotations
 
 import math
@@ -13,19 +14,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..forward import MeshView
+from ..execution.forward_batch import MeshView
 from .layer import LayerSpec
 from .linear import ColumnParallelLinear
 
 __all__ = [
-    'pad_vocab_size',
-    'zero_vocab_padding',
-    'VocabParallelEmbedding',
-    'ParallelLMHead',
+    "pad_vocab_size",
+    "zero_vocab_padding",
+    "VocabParallelEmbedding",
+    "ParallelLMHead",
 ]
 
 # Vocab is padded to a multiple of this for TP sharding / kernel alignment.
 _VOCAB_PAD_MULTIPLE = 64
+
 
 def pad_vocab_size(vocab_size: int, *, pad_to: int = _VOCAB_PAD_MULTIPLE, tp_size: int = 1) -> int:
     vocab_size = int(vocab_size)

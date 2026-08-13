@@ -46,6 +46,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
+    parser.add_argument("--max-batch-tokens", type=int, required=True)
     parser.add_argument("--kv-token-capacity", type=int, default=None)
     parser.add_argument("--kv-cache-dtype", default=None)
     parser.add_argument("--kv-memory-fraction", type=float, default=0.70)
@@ -74,40 +75,26 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tp-backend", default=None)
     parser.add_argument("--tp-init-method", default=None)
-    parser.add_argument("--torch-compile", action="store_true", default=False)
-    parser.add_argument("--torch-compile-backend", default="inductor")
-    parser.add_argument("--torch-compile-mode", default=None)
     parser.add_argument(
-        "--torch-compile-fullgraph",
-        action="store_true",
-        default=False,
+        "--lane",
+        action="append",
+        default=[],
+        help="repeatable JSON lane descriptor with lane_id, sm_budget, and domains",
     )
-    parser.add_argument("--torch-compile-dynamic", default=None)
     parser.add_argument(
         "--cuda-graph",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument(
-        "--cuda-graph-warmup",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--cuda-graph-warmup-batches", default=None)
+    parser.add_argument("--decode-graph-batch-sizes", default=None)
     parser.add_argument(
         "--prefill-cuda-graph",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    parser.add_argument(
-        "--prefill-cuda-graph-warmup",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument(
-        "--prefill-cuda-graph-warmup-tokens",
-        default=None,
-    )
+    parser.add_argument("--prefill-graph-token-sizes", default=None)
+    parser.add_argument("--flow-graph-batch-sizes", default=None)
+    parser.add_argument("--flow-graph-shapes", default=None)
     parser.add_argument("--mixed-text-max-tokens", type=int, default=8192)
     parser.add_argument(
         "--varlen-prefill",

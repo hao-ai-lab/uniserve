@@ -1138,6 +1138,8 @@ fn full_caps() -> WorkerCapabilities {
         encoder_cache_budget: 77,
         supported_controls: vec![RequestKind::Execute, RequestKind::DropSession],
         max_batch_operations: 64,
+        max_batch_tokens: 4096,
+        max_request_pool_size: 96,
         max_unresolved_window: 3,
         tensorized_mixed: true,
         sampling_ownership: SamplingOwnership::DesignatedRank,
@@ -1148,6 +1150,28 @@ fn full_caps() -> WorkerCapabilities {
         latent_dtype: "bfloat16".into(),
         model_identity: digest_string(0x21),
         weight_digest: digest_string(0x22),
+        lanes: vec![LaneCapabilities {
+            lane_id: "und".into(),
+            domains: vec![Domain::Und],
+            resolved_sm_count: 64,
+            kv_capacity_tokens: Some(65_536),
+            latent_capacity_units: None,
+            max_batch_operations: 128,
+            max_batch_tokens: 16_384,
+            max_inflight: 2,
+            graph_buckets: vec![GraphBucketCapability {
+                phase: "text_decode".into(),
+                batch_size: 32,
+                token_bucket: 32,
+                attention_form: "paged_decode".into(),
+                height: 0,
+                width: 0,
+                cfg_branches: 1,
+                layout: String::new(),
+            }],
+            eager_max_batch_operations: 128,
+            eager_max_batch_tokens: 16_384,
+        }],
         ..WorkerCapabilities::default()
     }
 }

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
-from ..batch import SamplingOwnership, WorkVariant
+from ..batch import SamplingOwnership
 from ..capabilities import (
     RankInfo,
     RequestKind,
@@ -19,53 +17,10 @@ from ..foundation.runtime_config import (
 )
 from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
 from ..models.generation import GenerationPipeline
-from ..models.runtime import (
-    ExecutionModel,
-    LoweredStage,
-    RowKind,
-    WorkerDeployment,
-    active_latent_capacity_tokens,
-)
+from ..models.runtime import ExecutionModel, WorkerDeployment, active_latent_capacity_tokens
 from .arena_capacity import operation_window
 
-__all__ = ["prove_depth_one_lowering", "resolve_capabilities"]
-
-
-def prove_depth_one_lowering(
-    model: ExecutionModel,
-    supported_work: Sequence[WorkVariant],
-) -> dict[WorkVariant, LoweredStage | None]:
-    """Prove that each advertised leaf lowers to at most one neural primary."""
-
-    primary_by_variant: dict[WorkVariant, LoweredStage | None] = {}
-    for variant in supported_work:
-        primaries = tuple(stage for stage in model.lower(variant) if not stage.publishes_state)
-        if len(primaries) > 1:
-            raise invalid_descriptor(
-                f"work variant {variant.value!r} declares multiple primary stages, "
-                "breaking one-variant-to-one-route lowering"
-            )
-        if not primaries:
-            primary_by_variant[variant] = None
-            continue
-        primary_by_variant[variant] = primaries[0]
-    return primary_by_variant
-
-
-def _route_tensorized_mixed(
-    model: ExecutionModel,
-    primary_by_variant: dict[WorkVariant, LoweredStage | None],
-) -> bool:
-    primary_rows: dict[str, set[RowKind]] = {}
-    for stage in primary_by_variant.values():
-        if stage is not None:
-            primary_rows.setdefault(stage.route, set()).add(stage.row)
-    return any(
-        len(rows) > 1 and model.allows_mixed(stage.route, frozenset(rows))
-        for stage in primary_by_variant.values()
-        if stage is not None
-        for rows in (primary_rows[stage.route],)
-    )
+__all__ = ["resolve_capabilities"]
 
 
 def resolve_capabilities(
@@ -140,8 +95,7 @@ def resolve_capabilities(
         RequestKind.RELEASE_PRODUCTS,
     ]
     supported_work = configured_work_variants(model.supported_work)
-    primary_by_variant = prove_depth_one_lowering(model, supported_work)
-    tensorized_mixed = _route_tensorized_mixed(model, primary_by_variant)
+    tensorized_mixed = bool(model.tensorized_mixed)
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
     return WorkerCapabilities(
         block_size=int(deployment.block_size),
@@ -165,6 +119,8 @@ def resolve_capabilities(
         bytes_per_token=bytes_per_token,
         supported_controls=tuple(controls),
         max_batch_operations=int(deployment.max_batch_operations),
+        max_batch_tokens=int(deployment.max_batch_tokens),
+        max_request_pool_size=int(deployment.max_request_pool_size),
         max_unresolved_window=unresolved_window,
         incremental_kv_publication=True,
         tensorized_mixed=tensorized_mixed,

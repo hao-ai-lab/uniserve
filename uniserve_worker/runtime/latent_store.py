@@ -69,6 +69,10 @@ class LatentStore:
                 raise invalid_descriptor("stale latent product generation")
             return record
 
+    def close(self) -> None:
+        with self._lock:
+            self._records.clear()
+
     def require(self, reference: ProductRef) -> LatentRecord:
         value = self.get(reference)
         if value is None:

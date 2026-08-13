@@ -10,8 +10,7 @@ from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL
 from uniserve_worker.batch import WorkVariant
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.identity import ModelIdentity, architecture_identity
-from uniserve_worker.models.runtime import RowKind
-from uniserve_worker.runtime.capabilities import prove_depth_one_lowering, resolve_capabilities
+from uniserve_worker.runtime.capabilities import resolve_capabilities
 
 pytestmark = pytest.mark.unit
 
@@ -55,18 +54,6 @@ def test_capabilities_project_model_behavior_and_resource_geometry():
     )
     assert capabilities.model_identity == "a" * 64
     assert capabilities.weight_digest == "b" * 64
-
-
-def test_depth_one_lowering_maps_neural_and_model_free_work():
-    variants = (WorkVariant.TOKEN_EXTEND, WorkVariant.GEN_FLOW, WorkVariant.MATERIALIZE)
-
-    lowering = prove_depth_one_lowering(TEST_MODEL, variants)
-
-    assert lowering[WorkVariant.TOKEN_EXTEND] is not None
-    assert lowering[WorkVariant.TOKEN_EXTEND].row is RowKind.TOKEN
-    assert lowering[WorkVariant.GEN_FLOW] is not None
-    assert lowering[WorkVariant.GEN_FLOW].row is RowKind.FLOW
-    assert lowering[WorkVariant.MATERIALIZE] is None
 
 
 @pytest.mark.parametrize(

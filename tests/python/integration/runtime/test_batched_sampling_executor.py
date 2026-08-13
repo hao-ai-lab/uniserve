@@ -13,6 +13,7 @@ from dataclasses import replace
 from typing import cast
 
 import pytest
+import torch
 
 from tests.python.fixtures.depth_one import (
     commit_resolved,
@@ -72,6 +73,12 @@ def _logprob_positions(payload: bytes) -> tuple[tuple[tuple[int, float, int], ..
     positions = tuple(read_entries() for _ in range(read_u32()))
     assert offset == len(payload)
     return positions
+
+
+def _sampled_logprobs(payload: bytes) -> tuple[tuple[int, float, int], ...]:
+    assert payload[0] == 1
+    count = struct.unpack_from("<I", payload, 5)[0]
+    return tuple(struct.unpack_from("<IfI", payload, 9 + 12 * index) for index in range(count))
 
 
 def _with_sampling_state(
@@ -232,6 +239,44 @@ def test_admission_finish_policy_drives_the_device_finish_product() -> None:
         device="cpu",
     )
     assert read.tensor.tolist() == [1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_completion_publishes_logprobs_with_committed_tokens() -> None:
+    worker = execution_worker(device="cuda:0")
+    admission = und_admission(
+        51,
+        block_ids=(11,),
+        sampling=SamplingParams(return_logprobs=True, n_logprobs=2, seed=37),
+    )
+    operation, token_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        logprobs=True,
+    )
+
+    result = worker.execute(
+        execution_batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(operation,),
+            input_products=(token_input,),
+        )
+    )
+
+    assert len(result.completions[0].committed_tokens) == 1
+    payload = next(
+        product.payload
+        for product in result.products
+        if product.product.kind is ProductKind.LOGPROB
+    )
+    assert isinstance(payload, bytes)
+    entries = _sampled_logprobs(payload)
+    assert len(entries) >= 2
+    assert all(rank >= 1 and value <= 0.0 for _token, value, rank in entries)
 
 
 def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:

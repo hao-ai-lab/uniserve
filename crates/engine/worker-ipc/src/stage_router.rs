@@ -270,6 +270,18 @@ impl StageRouter {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
+        merged.max_batch_tokens = pools
+            .iter()
+            .map(|pool| pool.exec.caps().max_batch_tokens)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
+        merged.max_request_pool_size = pools
+            .iter()
+            .map(|pool| pool.exec.caps().max_request_pool_size)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
         merged.max_unresolved_window = pools
             .iter()
             .map(|pool| pool.exec.caps().max_unresolved_window)
@@ -1169,6 +1181,40 @@ mod tests {
                 forward_stats: Default::default(),
             }],
         }
+    }
+
+    #[test]
+    fn merged_capabilities_publish_the_tightest_execution_bounds() {
+        let mut encoder_caps = caps(WorkVariant::EncodeVision);
+        encoder_caps.max_batch_operations = 24;
+        encoder_caps.max_batch_tokens = 4096;
+        encoder_caps.max_request_pool_size = 96;
+        let mut prefill_caps = caps(WorkVariant::TokenExtend);
+        prefill_caps.max_batch_operations = 16;
+        prefill_caps.max_batch_tokens = 6144;
+        prefill_caps.max_request_pool_size = 64;
+        let router = StageRouter::try_new(vec![
+            (
+                WorkerKind::Encoder,
+                Box::new(RecordingExecutor {
+                    caps: encoder_caps,
+                    submissions: Arc::new(Mutex::new(Vec::new())),
+                }),
+            ),
+            (
+                WorkerKind::Prefill,
+                Box::new(RecordingExecutor {
+                    caps: prefill_caps,
+                    submissions: Arc::new(Mutex::new(Vec::new())),
+                }),
+            ),
+        ])
+        .unwrap();
+
+        let merged = router.caps();
+        assert_eq!(merged.max_batch_operations, 16);
+        assert_eq!(merged.max_batch_tokens, 4096);
+        assert_eq!(merged.max_request_pool_size, 64);
     }
 
     #[test]

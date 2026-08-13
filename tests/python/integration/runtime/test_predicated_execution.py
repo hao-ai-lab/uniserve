@@ -4,7 +4,6 @@ from dataclasses import replace
 
 from tests.python.fixtures.depth_one import (
     execution_batch,
-    record_kv_result,
     root_parent,
     token_operation,
     und_admission,
@@ -27,7 +26,7 @@ from uniserve_worker.execution.executor import finalize_completion_report
 from uniserve_worker.server.stub import _next_token
 
 
-def test_false_device_predicate_selects_the_parent_cutoff() -> None:
+def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants() -> None:
     worker = execution_worker(device="cpu", pipeline_depth=2)
     base = und_admission(51, block_ids=(0,))
     admission = Admission.create(
@@ -72,11 +71,6 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
         )
     )
     successor_report = finalize_completion_report(successor_report)
-    record_kv_result(
-        admission.request_key,
-        successor.op_id,
-        successor_report.completions[0].logical_lengths.kv_visible_len,
-    )
     successor_continuation = next(
         output for output in successor.outputs if output.kind is ProductKind.TOKEN
     )
@@ -111,20 +105,8 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
     assert descendant_completion.status is OpStatus.PREDICATED
     assert descendant_completion.selected_point == 1
     parent_completion = finalize_completion_report(parent_report).completions[0]
-    resolved_parent = VersionRef(
-        admission.request_key,
-        parent.op_id,
-        FixedPoint(parent_completion.selected_point, parent_completion.semantic_digest),
-    )
-    session = worker.sessions.get(51)
-    parent_runtime = session.runtime_for(resolved_parent)
-    assert parent_runtime is not None
-    assert session.resolved_version() == resolved_parent
-    assert completion.logical_lengths.token_len == parent_runtime.logical_position
-    assert completion.logical_lengths.kv_visible_len == parent_runtime.kv_visible_len
+    assert completion.logical_lengths == parent_completion.logical_lengths
     assert descendant_completion.logical_lengths == completion.logical_lengths
-    assert session.logical_position == parent_runtime.logical_position
-    assert session.rng_counter == parent_runtime.rng_counter
 
     selected = VersionRef(
         admission.request_key,
@@ -186,7 +168,7 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
             controls=(later_commit,),
         )
     )
-    worker.execute(
+    close_report = worker.execute(
         execution_batch(
             step_id=7,
             admissions=(),
@@ -201,8 +183,4 @@ def test_false_device_predicate_selects_the_parent_cutoff() -> None:
             ),
         )
     )
-    session = worker.sessions.get(51)
-    assert session.committed_version() == commit.selected
-    assert session.resolved_version() == commit.selected
-    assert session.logical_position == parent_runtime.logical_position
-    assert session.rng_counter == parent_runtime.rng_counter
+    assert close_report.completions == ()

@@ -17,23 +17,11 @@ from typing import cast
 
 import torch
 
-from ..forward import (
+from ..execution.forward_batch import (
     ForwardBatch,
-    ForwardContext,
     ForwardOutput,
-    ForwardRow,
     PagedVarlenPlan,
-    RouteId,
-    TokenEmbeddings,
-    TokenHidden,
-    TokenIds,
-    TokenLogits,
-    TokenOutput,
-    TokenRow,
-    TokenSegments,
     TokenSelection,
-    packed_token_ids,
-    packed_token_positions,
 )
 
 __all__ = [
@@ -68,11 +56,8 @@ from ..nn.decoder import Qwen3MLP
 from ..nn.logits import LogitsProcessor
 from .runtime import (
     CacheGeometry,
-    DeviceRole,
     ExecutionModel,
-    LoweredStage,
     ResourceGeometry,
-    RowKind,
 )
 
 
@@ -246,7 +231,7 @@ class Qwen3Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -277,7 +262,7 @@ class Qwen3Attention(nn.Module):
         self,
         qkv: torch.Tensor,
         state_shape: torch.Size,
-        context: ForwardContext,
+        context: ForwardBatch,
         batched: bool,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -388,7 +373,7 @@ class Qwen3MoE(nn.Module):
             norm_topk_prob=True,
         )
 
-    def forward(self, hidden_states: torch.Tensor, context: ForwardContext) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, context: ForwardBatch) -> torch.Tensor:
         return self.experts(hidden_states, self.gate(hidden_states), context.mesh)
 
 
@@ -406,7 +391,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -452,7 +437,7 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -530,164 +515,95 @@ class Qwen3ForCausalLM(ExecutionModel):
             dtype="bfloat16",
         )
         self.resource_geometry = ResourceGeometry()
-        self._max_sequence_tokens = int(cfg.max_position_embeddings)
-
-    def lower(
-        self,
-        variant: WorkVariant,
-        *,
-        retain_image: bool = False,
-    ) -> tuple[LoweredStage, ...]:
-        del retain_image
-        if variant in self.supported_work:
-            return (LoweredStage(RouteId("text"), RowKind.TOKEN),)
-        return ()
-
-    def route_dtype(self, route: RouteId) -> str:
-        self._require_text_route(route)
-        return "bfloat16"
-
-    def route_device_role(self, route: RouteId) -> DeviceRole:
-        self._require_text_route(route)
-        return DeviceRole.PRIMARY
-
-    def route_topology(self, route: RouteId) -> tuple[str, ...]:
-        self._require_text_route(route)
-        return ("tp",)
-
-    def route_graph_eligible(self, route: RouteId) -> bool:
-        self._require_text_route(route)
-        return True
-
-    def route_max_tokens(self, route: RouteId) -> int:
-        self._require_text_route(route)
-        return self._max_sequence_tokens
-
-    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
-        del row
-        self._require_text_route(route)
-        return ()
-
-    @staticmethod
-    def _require_text_route(route: RouteId) -> None:
-        if route != "text":
-            raise ValueError(f"Qwen3 received unknown route {route!s}")
+        self.vocab_size = int(cfg.vocab_size)
+        self.hidden_size = int(cfg.hidden_size)
+        self.text_max_tokens = int(cfg.max_position_embeddings)
+        self.text_topology = ("tp",)
+        self.tensorized_mixed = False
 
     @torch.inference_mode()
-    def forward(self, batch: ForwardBatch) -> ForwardOutput:
-        if any(not isinstance(row, TokenRow) for row in batch.rows):
-            raise TypeError("Qwen3 text route accepts TokenRow values only")
-        rows = cast(tuple[TokenRow, ...], batch.rows)
-        positions = packed_token_positions(rows)
-        if positions is None:
-            positions = torch.cat(tuple(row.positions.reshape(-1) for row in rows), dim=0)
-        if all(isinstance(row.inputs, TokenIds) for row in rows):
-            input_ids = packed_token_ids(rows)
-            if input_ids is None:
-                input_ids = torch.cat(
-                    tuple(cast(TokenIds, row.inputs).values.reshape(-1) for row in rows),
-                    dim=0,
-                )
-            hidden = self.model(input_ids, positions, batch.context)
-        else:
-            embeddings = tuple(self._row_embeddings(row, batch.context) for row in rows)
-            inputs = torch.cat(embeddings, dim=0)
-            placeholder = torch.zeros(inputs.shape[0], dtype=torch.long, device=inputs.device)
-            hidden = self.model(
-                placeholder,
-                positions,
-                batch.context,
-                input_embeds=inputs,
-            )
-        return self._outputs(hidden, rows, batch.context)
-
-    def _outputs(
+    def forward(
         self,
-        hidden: torch.Tensor,
-        rows: tuple[TokenRow, ...],
-        context: ForwardContext,
-    ) -> ForwardOutput:
-        attention = getattr(context, "attention", None)
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        input_embeds: torch.Tensor | None = None
+        if forward_batch.input_embeddings is not None:
+            embedded = self.model.embed_tokens(input_ids.reshape(-1), forward_batch.mesh)
+            mask = forward_batch.embedding_mask
+            if mask is None:
+                raise RuntimeError("Qwen3 embedding input lost its selection mask")
+            input_embeds = torch.where(
+                mask.reshape(-1, 1),
+                forward_batch.input_embeddings.to(dtype=embedded.dtype),
+                embedded,
+            )
+        return self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+        )
+
+    def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
+        selections = forward_batch.token_selections
+        query_lens = forward_batch.query_lens
+        attention = forward_batch.attention
         dynamic_last = (
             attention.output_indices
             if isinstance(attention, PagedVarlenPlan)
-            and all(row.selection is TokenSelection.LAST_LOGITS for row in rows)
+            and all(selection is TokenSelection.LAST_LOGITS for selection in selections)
             else None
         )
         if dynamic_last is not None:
             selected = hidden.index_select(0, dynamic_last.to(dtype=torch.long))
-            dynamic_projected = self.logits(self.lm_head(selected, context.mesh))
+            dynamic_projected = self.logits(self.lm_head(selected, forward_batch.mesh))
             return ForwardOutput(
-                tuple(
-                    TokenOutput(
-                        row.row_id,
-                        row.output_slot,
-                        TokenLogits(dynamic_projected[index : index + 1]),
-                    )
-                    for index, row in enumerate(rows)
-                )
+                tuple(dynamic_projected[index : index + 1] for index in range(len(selections)))
             )
         row_hidden: list[torch.Tensor] = []
         begin = 0
-        for row in rows:
-            count = int(row.positions.numel())
+        for count in query_lens:
             row_hidden.append(hidden[begin : begin + count])
             begin += count
         projected_rows = tuple(
-            index for index, row in enumerate(rows) if row.selection is not TokenSelection.HIDDEN
+            index
+            for index, selection in enumerate(selections)
+            if selection is not TokenSelection.HIDDEN
         )
         projected: torch.Tensor | None = None
         if projected_rows:
             if (
-                len(projected_rows) == len(rows)
-                and all(row.selection is TokenSelection.LAST_LOGITS for row in rows)
+                len(projected_rows) == len(selections)
+                and all(selection is TokenSelection.LAST_LOGITS for selection in selections)
                 and all(int(value.shape[0]) == 1 for value in row_hidden)
             ):
                 selected = hidden
             else:
                 selected_rows = tuple(
                     row_hidden[index]
-                    if rows[index].selection is TokenSelection.ALL_LOGITS
+                    if selections[index] is TokenSelection.ALL_LOGITS
                     else row_hidden[index][-1:]
                     for index in projected_rows
                 )
                 selected = (
                     selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
                 )
-            projected = self.logits(self.lm_head(selected, context.mesh))
+            projected = self.logits(self.lm_head(selected, forward_batch.mesh))
 
-        outputs: list[TokenOutput] = []
+        outputs: list[torch.Tensor] = []
         projected_offset = 0
-        for index, row in enumerate(rows):
-            value: TokenHidden | TokenLogits
-            if row.selection is TokenSelection.HIDDEN:
-                value = TokenHidden(row_hidden[index])
+        for index, selection in enumerate(selections):
+            if selection is TokenSelection.HIDDEN:
+                value = row_hidden[index]
             else:
                 if projected is None:
                     raise RuntimeError("Qwen3 projected output buffer is missing")
                 count = (
-                    int(row_hidden[index].shape[0])
-                    if row.selection is TokenSelection.ALL_LOGITS
-                    else 1
+                    int(row_hidden[index].shape[0]) if selection is TokenSelection.ALL_LOGITS else 1
                 )
-                value = TokenLogits(projected[projected_offset : projected_offset + count])
+                value = projected[projected_offset : projected_offset + count]
                 projected_offset += count
-            outputs.append(TokenOutput(row.row_id, row.output_slot, value))
+            outputs.append(value)
         return ForwardOutput(tuple(outputs))
-
-    def _row_embeddings(self, row: TokenRow, context: ForwardContext) -> torch.Tensor:
-        if isinstance(row.inputs, TokenEmbeddings):
-            return row.inputs.values.reshape(-1, row.inputs.values.shape[-1])
-        if isinstance(row.inputs, TokenIds):
-            return self.model.embed_tokens(row.inputs.values.reshape(-1), context.mesh)
-        if not isinstance(row.inputs, TokenSegments):
-            raise TypeError("Qwen3 token row has an unknown input variant")
-        return torch.cat(
-            tuple(
-                self.model.embed_tokens(segment.values.reshape(-1), context.mesh)
-                if isinstance(segment, TokenIds)
-                else segment.values.reshape(-1, segment.values.shape[-1])
-                for segment in row.inputs.values
-            ),
-            dim=0,
-        )

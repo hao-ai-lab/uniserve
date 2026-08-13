@@ -163,6 +163,31 @@ table ResourcePressure {
   free:ulong;
 }
 
+table GraphBucketCapability {
+  phase:string;
+  batch_size:uint;
+  token_bucket:uint;
+  attention_form:string;
+  height:uint;
+  width:uint;
+  cfg_branches:uint;
+  layout:string;
+}
+
+table LaneCapabilities {
+  lane_id:string;
+  domains:[Domain];
+  resolved_sm_count:uint;
+  kv_capacity_tokens:ulong = null;
+  latent_capacity_units:ulong = null;
+  max_batch_operations:uint;
+  max_batch_tokens:uint;
+  max_inflight:uint;
+  graph_buckets:[GraphBucketCapability];
+  eager_max_batch_operations:uint;
+  eager_max_batch_tokens:uint;
+}
+
 table WorkerCapabilities {
   block_size:uint;
   num_blocks:uint;
@@ -194,6 +219,8 @@ table WorkerCapabilities {
   encoder_cache_budget:uint;
   supported_controls:[ReqKind];
   max_batch_operations:uint;
+  max_batch_tokens:uint;
+  max_request_pool_size:uint;
   max_unresolved_window:uint = 1;
   incremental_kv_publication:bool;
   tensorized_mixed:bool;
@@ -202,6 +229,7 @@ table WorkerCapabilities {
   model_identity:string;
   weight_digest:string;
   protocol_layout_digest:string;
+  lanes:[LaneCapabilities];
 }
 
 // ---- Identities and the four protocol records -----------------------------

@@ -116,6 +116,32 @@ def test_batch_view_derives_attention_metadata_and_writes_from_scheduler_rows() 
     torch.testing.assert_close(second, key[1:])
 
 
+def test_varlen_batch_write_consumes_staged_physical_indices() -> None:
+    pool = _pool()
+    view = CacheBatchView(
+        pool,
+        (CacheRow((1,), 0, 4), CacheRow((2,), 0, 4)),
+        query_lengths=(1, 2),
+    )
+    key = _tokens(3, offset=12)
+
+    view.append_varlen(
+        0,
+        key,
+        key + 100,
+        (1, 2),
+        block_table=torch.tensor(((3,), (4,)), dtype=torch.int32),
+        cache_seqlens=torch.tensor((1, 0), dtype=torch.int32),
+        query_offsets=torch.tensor((0, 1, 3), dtype=torch.int32),
+    )
+
+    first, _ = pool.read(0, (3,), start=1, length=1)
+    second, _ = pool.read(0, (4,), start=0, length=2)
+    assert first is not None and second is not None
+    torch.testing.assert_close(first, key[:1])
+    torch.testing.assert_close(second, key[1:])
+
+
 def test_repeated_page_zero_is_valid_only_for_padded_attention_rows() -> None:
     pool = _pool()
     live = CacheBatchView(pool, (CacheRow((1,), 0, 4),), query_lengths=(1,))

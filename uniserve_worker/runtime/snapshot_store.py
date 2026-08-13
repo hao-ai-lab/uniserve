@@ -1024,7 +1024,7 @@ class SnapshotProvider:
         session.resolved_versions[key] = resolved
         session.resolved_runtime[key] = runtime
         session.resolved_operations[session.resolved_op_id] = resolved
-        session.resolved_parents[session.resolved_op_id] = resolved
+        session.declared_parents[session.resolved_op_id] = resolved
         return session
 
     @staticmethod

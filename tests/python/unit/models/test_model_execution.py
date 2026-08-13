@@ -9,24 +9,18 @@ import torch
 from torch import nn
 
 from uniserve_worker.batch import WorkVariant
-from uniserve_worker.forward import (
+from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
     EmptyKvView,
-    EmptyLatentView,
     EmptyMeshView,
-    EmptyOutputView,
-    ForwardContext,
-    GraphBinding,
+    ForwardBatch,
+    ModelPhase,
     PagedDecodePlan,
     PagedVarlenPlan,
-    TokenIds,
-    TokenLogits,
-    TokenRow,
     TokenSelection,
 )
 from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
-from uniserve_worker.models.runtime import RowKind
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.diffusion.schedule import ScheduleDirection
@@ -79,35 +73,11 @@ class _LoadedBagelGraph(nn.Module):
         self.cfg = config
 
 
-class _CountingProjection(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.calls = 0
-        self.register_buffer("weight", torch.arange(8 * 32, dtype=torch.float32).view(8, 32))
-
-    def forward(self, value: torch.Tensor, _mesh: object) -> torch.Tensor:
-        self.calls += 1
-        return value @ self.weight
-
-
-class _AttentionCausalityRecorder(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.values: list[bool] = []
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        context: ForwardContext,
-        *,
-        causal: bool,
-        scale: float,
-    ) -> torch.Tensor:
-        del key, value, context, scale
-        self.values.append(bool(causal))
-        return query
+def _projection_weight(module: nn.Module) -> torch.Tensor:
+    weight = torch.arange(module.weight.numel(), dtype=torch.float32).reshape_as(module.weight)
+    with torch.no_grad():
+        module.weight.copy_(weight)
+    return weight[:32]
 
 
 def _sensenova_config() -> NeoChatConfig:
@@ -145,9 +115,9 @@ def _sensenova_config() -> NeoChatConfig:
     )
 
 
-def _paged_decode_context(rows: int) -> ForwardContext:
+def _decode_attention(rows: int) -> PagedDecodePlan:
     provider = SimpleNamespace(name="test")
-    attention = PagedDecodePlan(
+    return PagedDecodePlan(
         backends=AttentionSelection("test", (provider,)),
         block_table=torch.zeros((rows, 1), dtype=torch.int32),
         cache_seqlens=torch.zeros(rows, dtype=torch.int32),
@@ -160,14 +130,28 @@ def _paged_decode_context(rows: int) -> ForwardContext:
         decode_page_offsets=torch.zeros(rows, dtype=torch.long),
         max_context_len=1,
         causal=True,
-        binding=GraphBinding(1),
+        binding=1,
     )
-    return ForwardContext(
+
+
+def _text_batch(
+    query_lens: tuple[int, ...],
+    *,
+    attention: PagedDecodePlan | PagedVarlenPlan,
+) -> ForwardBatch:
+    rows = len(query_lens)
+    return ForwardBatch(
+        phase=ModelPhase.TEXT,
+        row_count=rows,
+        request_pool_indices=torch.arange(1, rows + 1),
+        token_row_indices=tuple(range(rows)),
+        input_ids=torch.zeros(sum(query_lens), dtype=torch.long),
+        positions=torch.arange(sum(query_lens), dtype=torch.long),
+        query_lens=query_lens,
+        token_selections=(TokenSelection.LAST_LOGITS,) * rows,
         kv=EmptyKvView(),
-        latent=EmptyLatentView(),
         attention=attention,
         mesh=EmptyMeshView(),
-        output=EmptyOutputView(),
     )
 
 
@@ -196,7 +180,7 @@ def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
 
     assert model.architecture == "Qwen3ForCausalLM"
     assert model.cache_geometry.num_layers == 1
-    assert model.route_max_tokens("text") == 128
+    assert model.text_max_tokens == 128
     assert model.supported_work == {
         WorkVariant.TOKEN_EXTEND,
         WorkVariant.TOKEN_DECODE,
@@ -204,100 +188,33 @@ def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
     }
 
 
-def test_qwen_projects_one_decode_wave_as_one_logit_matrix():
+def test_qwen_decode_projection_preserves_row_alignment():
     model = Qwen3ForCausalLM(_qwen_config(), layer_spec=_layer_spec())
-    projection = _CountingProjection()
-    model.lm_head = projection
-    model.logits = nn.Identity()
-    rows = tuple(
-        TokenRow(
-            row_id=index,
-            inputs=TokenIds(torch.tensor([index])),
-            positions=torch.tensor([index]),
-            output_slot=index,
-            selection=TokenSelection.LAST_LOGITS,
-        )
-        for index in range(4)
-    )
+    weight = _projection_weight(model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
+    batch = _text_batch((1, 1, 1, 1), attention=_decode_attention(4))
 
-    output = model._outputs(hidden, rows, SimpleNamespace(mesh=object()))
+    output = model.project(hidden, batch)
 
-    assert projection.calls == 1
-    assert len(output.rows) == 4
-    logits = torch.cat(
-        tuple(row.value.value for row in output.rows if isinstance(row.value, TokenLogits))
-    )
-    assert torch.equal(logits, hidden @ projection.weight)
+    assert len(output.values) == 4
+    assert torch.equal(torch.cat(output.values), hidden @ weight.T)
 
 
-def test_sensenova_projects_one_decode_wave_as_one_logit_matrix():
+def test_sensenova_decode_projection_preserves_row_alignment():
     model = NEOChatModel(_sensenova_config(), layer_spec=_layer_spec())
-    projection = _CountingProjection()
-    model.language_model.lm_head = projection
-    rows = tuple(
-        TokenRow(
-            row_id=index,
-            inputs=TokenIds(torch.tensor([index])),
-            positions=torch.tensor([index]),
-            output_slot=index,
-            selection=TokenSelection.LAST_LOGITS,
-        )
-        for index in range(4)
-    )
+    weight = _projection_weight(model.language_model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
+    batch = _text_batch((1, 1, 1, 1), attention=_decode_attention(4))
 
-    output = model._mot_outputs(
-        hidden,
-        rows,
-        tuple((index, index + 1) for index in range(4)),
-        SimpleNamespace(mesh=object()),
-    )
+    output = model.project(hidden, batch)
 
-    assert projection.calls == 1
-    assert len(output.rows) == 4
-    logits = torch.cat(
-        tuple(row.value.value for row in output.rows if isinstance(row.value, TokenLogits))
-    )
-    assert torch.equal(logits, hidden @ projection.weight)
+    assert len(output.values) == 4
+    assert torch.equal(torch.cat(output.values), hidden @ weight.T)
 
 
-def test_sensenova_paged_decode_executes_causal_attention():
-    model = NEOChatModel(_sensenova_config(), layer_spec=_layer_spec())
-    attention = model.language_model.model.layers[0].self_attn
-    recorder = _AttentionCausalityRecorder()
-    attention.attention = recorder
-
-    model.language_model.model(
-        torch.zeros((2, 8)),
-        _paged_decode_context(2),
-        positions=torch.tensor((7, 11)),
-    )
-
-    assert recorder.values == [True]
-
-
-def test_qwen_prefill_uses_device_output_indices_for_ragged_rows():
+def test_qwen_prefill_selects_the_last_logit_for_each_ragged_row():
     model = Qwen3ForCausalLM(_qwen_config(), layer_spec=_layer_spec())
-    projection = _CountingProjection()
-    model.lm_head = projection
-    model.logits = nn.Identity()
-    rows = (
-        TokenRow(
-            row_id=0,
-            inputs=TokenIds(torch.tensor([1, 2])),
-            positions=torch.tensor([0, 1]),
-            output_slot=0,
-            selection=TokenSelection.LAST_LOGITS,
-        ),
-        TokenRow(
-            row_id=1,
-            inputs=TokenIds(torch.tensor([3, 4, 5, 6, 7])),
-            positions=torch.tensor([0, 1, 2, 3, 4]),
-            output_slot=1,
-            selection=TokenSelection.LAST_LOGITS,
-        ),
-    )
+    weight = _projection_weight(model.lm_head)
     provider = SimpleNamespace(name="test")
     attention = PagedVarlenPlan(
         backends=AttentionSelection("test", (provider,)),
@@ -315,21 +232,14 @@ def test_qwen_prefill_uses_device_output_indices_for_ragged_rows():
         max_seqlen_k=5,
         max_context_len=8,
         causal=True,
-        binding=GraphBinding(1),
+        binding=1,
     )
     hidden = torch.arange(56, dtype=torch.float32).view(7, 8)
+    batch = _text_batch((2, 5), attention=attention)
 
-    output = model._outputs(
-        hidden,
-        rows,
-        SimpleNamespace(attention=attention, mesh=object()),
-    )
+    output = model.project(hidden, batch)
 
-    assert projection.calls == 1
-    logits = torch.cat(
-        tuple(row.value.value for row in output.rows if isinstance(row.value, TokenLogits))
-    )
-    assert torch.equal(logits, hidden[[1, 6]] @ projection.weight)
+    assert torch.equal(torch.cat(output.values), hidden[[1, 6]] @ weight.T)
 
 
 def test_qwen_rejects_incomplete_or_untyped_configuration():
@@ -347,10 +257,10 @@ def test_bagel_exposes_configured_generation_behavior():
         graph=_LoadedBagelGraph(config),  # type: ignore[arg-type]
     )
 
-    assert model.allows_mixed("mot", frozenset({RowKind.TOKEN, RowKind.FLOW}))
+    assert model.tensorized_mixed
     assert model.generation.schedule_direction is ScheduleDirection.DESCENDING
     assert model.cache_geometry.num_layers == 1
-    assert model.route_max_tokens("vit") == config.vit_token_capacity
+    assert model.text_max_tokens >= config.latent_token_capacity
 
 
 def test_sensenova_freezes_runtime_behavior_at_construction():
@@ -359,13 +269,11 @@ def test_sensenova_freezes_runtime_behavior_at_construction():
     config.downsample_ratio = 0.25
     config.max_image_seq_len = 2048
 
-    assert model.allows_mixed("mot", frozenset({RowKind.TOKEN, RowKind.FLOW}))
+    assert model.tensorized_mixed
     assert model.generation.latent_downsample == 4
     assert model.generation.max_latent_tokens == 16
     assert model.generation.schedule_direction is ScheduleDirection.ASCENDING
 
 
-def test_simulation_model_executes_the_configured_mixed_route():
-    model = StubModel()
-
-    assert model.allows_mixed("stub", frozenset({RowKind.TOKEN, RowKind.FLOW}))
+def test_simulation_model_accepts_tensorized_text_and_flow_rows():
+    assert StubModel().tensorized_mixed

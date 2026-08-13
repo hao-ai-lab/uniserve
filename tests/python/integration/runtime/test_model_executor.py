@@ -49,24 +49,19 @@ from uniserve_worker.batch import (
     StorageClass,
     TokenMode,
     VersionRef,
-    WorkVariant,
 )
 from uniserve_worker.execution.executor import (
     completion_report_ready,
     finalize_completion_report,
 )
-from uniserve_worker.forward import (
-    FlowRow,
+from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
     PackedAttentionPlan,
     PagedDecodePlan,
-    TokenRow,
 )
 from uniserve_worker.foundation.errors import ErrorCode as HostErrorCode
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.models.inputs import FeatureInjection, FeatureLayout
-from uniserve_worker.models.runtime import LoweredStage, PositionLayout, RowKind
 from uniserve_worker.runtime.completion_store import CompletionArena
 from uniserve_worker.runtime.transfer import TRANSFER_DESCRIPTOR_PREFIX
 from uniserve_worker.server.stub import StubModel, _next_token
@@ -79,28 +74,35 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 class _ObservedModel(StubModel):
     def __init__(self) -> None:
         super().__init__()
-        self.calls: list[tuple[str, tuple[str, ...]]] = []
         self.flow_inputs: list[torch.Tensor] = []
         self.token_positions: list[tuple[int, ...]] = []
         self.attention_plans: list[object] = []
         self.fault: str | None = None
 
-    def forward(self, batch: ForwardBatch) -> ForwardOutput:
-        self.calls.append((str(batch.route), tuple(type(row).__name__ for row in batch.rows)))
-        self.attention_plans.append(batch.context.attention)
-        self.flow_inputs.extend(
-            row.latent.detach().clone() for row in batch.rows if isinstance(row, FlowRow)
-        )
-        self.token_positions.extend(
-            tuple(int(value) for value in row.positions.reshape(-1).tolist())
-            for row in batch.rows
-            if isinstance(row, TokenRow)
-        )
-        output = super().forward(batch)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        batch: ForwardBatch,
+    ) -> torch.Tensor:
+        self.attention_plans.append(batch.attention)
+        self.flow_inputs.extend(value.detach().clone() for value in batch.flow_latents)
+        offset = 0
+        for count in batch.query_lens:
+            row_positions = positions[..., offset : offset + count]
+            self.token_positions.append(
+                tuple(int(value) for value in row_positions.reshape(-1).tolist())
+            )
+            offset += count
+        hidden = super().forward(input_ids, positions, batch)
         if self.fault == "raise":
             raise RuntimeError("injected neural failure")
+        return hidden
+
+    def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
+        output = super().project(hidden, batch)
         if self.fault == "misaligned":
-            return ForwardOutput(output.rows[:-1])
+            return ForwardOutput(output.values[:-1])
         return output
 
 
@@ -110,42 +112,47 @@ class _KvRecoveryModel(_ObservedModel):
         self.observed_prefixes: list[tuple[float, ...]] = []
         self.observed_pages: list[tuple[int, ...]] = []
 
-    def forward(self, batch: ForwardBatch) -> ForwardOutput:
-        token_rows = tuple(row for row in batch.rows if isinstance(row, TokenRow))
-        plan = batch.context.attention
-        if token_rows and batch.context.kv.base_lens[0] > 0:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        batch: ForwardBatch,
+    ) -> torch.Tensor:
+        token_rows = batch.token_row_indices
+        plan = batch.attention
+        if token_rows and batch.kv.base_lens[0] > 0:
             if not isinstance(plan, PagedDecodePlan):
                 raise TypeError("KV recovery probe requires paged decode attention")
-            keys, _values = batch.context.kv.layer_kv(0)
+            keys, _values = batch.kv.layer_kv(0)
             pages = tuple(int(value) for value in plan.block_table[0].tolist())
             prefix = tuple(
                 float(
                     keys[
-                        pages[position // batch.context.kv.block_size],
-                        position % batch.context.kv.block_size,
+                        pages[position // batch.kv.block_size],
+                        position % batch.kv.block_size,
                         0,
                         0,
                     ].item()
                 )
-                for position in range(int(batch.context.kv.base_lens[0]))
+                for position in range(int(batch.kv.base_lens[0]))
             )
             self.observed_pages.append(pages)
             self.observed_prefixes.append(prefix)
 
-        output = super().forward(batch)
+        output = super().forward(input_ids, positions, batch)
         if not token_rows:
             return output
-        token_count = sum(int(row.positions.numel()) for row in token_rows)
+        token_count = sum(batch.query_lens)
         values = torch.arange(
             1,
             token_count + 1,
-            device=token_rows[0].positions.device,
+            device=positions.device,
             dtype=torch.bfloat16,
         ).view(token_count, 1, 1)
         if isinstance(plan, PagedDecodePlan):
-            batch.context.kv.append(0, values.unsqueeze(1), values.unsqueeze(1))
+            batch.kv.append(0, values.unsqueeze(1), values.unsqueeze(1))
         elif isinstance(plan, PackedAttentionPlan):
-            batch.context.kv.append_packed(
+            batch.kv.append_packed(
                 0,
                 values,
                 values,
@@ -158,40 +165,10 @@ class _KvRecoveryModel(_ObservedModel):
         return output
 
 
-class _RetainedImageStateModel(_ObservedModel):
+class _SeparatePhaseModel(_ObservedModel):
     def __init__(self) -> None:
         super().__init__()
-        assert self.image_processor is not None
-        self.image_processor = replace(
-            self.image_processor,
-            feature_injection=FeatureInjection(
-                layout=FeatureLayout.DIRECT,
-                positions=PositionLayout.TEMPORAL_SPATIAL,
-                end_token_id=1007,
-            ),
-        )
-
-    def lower(
-        self,
-        variant: WorkVariant,
-        *,
-        retain_image: bool = False,
-    ) -> tuple[LoweredStage, ...]:
-        stages = super().lower(variant, retain_image=retain_image)
-        if variant is WorkVariant.ENCODE_VISION and retain_image:
-            return (*stages, LoweredStage("stub", RowKind.TOKEN, publishes_state=True))
-        return stages
-
-
-class _SupersetMixedModel(_ObservedModel):
-    """Accepts a three-row-kind mix while rejecting its two-kind subsets."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def allows_mixed(self, route, rows: frozenset[RowKind]) -> bool:
-        self._require_route(route)
-        return route == "stub" and rows == {RowKind.TOKEN, RowKind.FLOW, RowKind.ENCODE}
+        self.tensorized_mixed = False
 
 
 def _publish_conditioning(worker: object, admission: Admission, *, op_id: int, step_id: int):
@@ -375,7 +352,7 @@ def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() 
     assert report.completions[0].error_code is ErrorCode.INVALID_OPERATION
 
 
-def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
+def test_mixed_token_and_flow_match_homogeneous_results():
     mixed_model = _ObservedModel()
     mixed = execution_worker(mixed_model)
     sequence_admission = und_admission(1, block_ids=(0,))
@@ -476,13 +453,10 @@ def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
         rtol=0,
         atol=0,
     )
-    assert len(mixed_model.calls) == 1
-    assert set(mixed_model.calls[0][1]) == {"TokenRow", "FlowRow"}
-    assert len(split_model.calls) == 2
 
 
-def test_unsupported_tensorized_mixed_combination_is_rejected():
-    worker = execution_worker(_SupersetMixedModel())
+def test_mixed_submission_requires_tensorized_model_capability():
+    worker = execution_worker(_SeparatePhaseModel())
     token_admission = und_admission(1, block_ids=(0,))
     flow_admission = gen_admission(2, ImageParams(steps=1, height=16, width=16, seed=29))
     token, token_input = token_operation(
@@ -654,7 +628,6 @@ def test_replay_identity_is_idempotent_and_conflicts_are_atomic():
     committed = deepcopy(worker.sessions.get(3))
 
     assert replayed.completions == first.completions
-    assert len(model.calls) == 1
     assert worker.sessions.get(3).version == 1
 
     # Token values ride the input payload, not the plan identity, so a genuine
@@ -677,7 +650,6 @@ def test_replay_identity_is_idempotent_and_conflicts_are_atomic():
         )
 
     assert worker.sessions.get(3) == committed
-    assert len(model.calls) == 1
 
 
 def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
@@ -844,7 +816,6 @@ def test_mixed_partition_descriptor_failure_does_not_rollback_the_other_domain()
     assert by_request[62].error_code is ErrorCode.INVALID_OPERATION
     assert worker.sessions.get(61).version == 1
     assert worker.sessions.get(62).version == transition_commit.selected.point.point_index
-    assert model.calls[-1][1] == ("TokenRow",)
 
 
 def test_mixed_partition_completion_pressure_is_contained_to_one_domain():
@@ -903,7 +874,6 @@ def test_mixed_partition_completion_pressure_is_contained_to_one_domain():
     assert by_request[64].error_code is ErrorCode.RESOURCE_EXHAUSTED
     assert worker.sessions.get(63).version == 1
     assert worker.sessions.get(64).latent_product == latent
-    assert model.calls[-1][1] == ("TokenRow",)
 
 
 def test_initial_flow_noise_is_stable_across_operation_schedules():
@@ -1204,7 +1174,7 @@ def test_snapshot_restore_rebinds_committed_kv_to_scheduler_placement(tmp_path) 
 
     destination = RecoveryPlacement(
         request_key=admission.request_key,
-        request_pool_idx=admission.request_pool_idx + 100,
+        request_pool_idx=admission.request_pool_idx + 1,
         cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(2,), length=2),),
     )
     restored_model = _KvRecoveryModel()
@@ -1273,7 +1243,7 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
             parent=root_parent(admission),
             feature=operation.outputs[0],
             sample_continuation=False,
-            max_tokens=1,
+            max_tokens=2,
         )
         batch = execution_batch(
             step_id=2,
@@ -1349,7 +1319,7 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
 
 
 def test_generated_feedback_commits_absolute_visual_token_state():
-    worker = execution_worker(_RetainedImageStateModel())
+    worker = execution_worker(_ObservedModel())
     understanding = und_admission(6, block_ids=(0,))
     admission = Admission.create(
         understanding.request_key,

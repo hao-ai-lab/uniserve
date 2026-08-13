@@ -7,12 +7,15 @@
 //! reported durations rather than observed synchronously. The trace is bounded;
 //! completed request traces move to a ring for post-finish reconstruction.
 
+use std::collections::HashMap;
+
 use uniserve_core::TraceId;
 use uniserve_worker_wire::{Domain, OpId, Operation, RequestKey};
 
 const MAX_OPERATIONS: usize = 512;
 
 /// The twelve lifecycle phases of one operation, in causal order.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LifecyclePhase {
     Planned,
@@ -64,10 +67,7 @@ impl LifecyclePhase {
     }
 
     fn index(self) -> usize {
-        LifecyclePhase::ALL
-            .iter()
-            .position(|phase| *phase == self)
-            .expect("every phase is enumerated")
+        self as usize
     }
 }
 
@@ -155,6 +155,7 @@ pub struct RequestTrace {
     pub finished_us: Option<u64>,
     pub finish_reason: Option<&'static str>,
     operations: Vec<OperationLifecycle>,
+    operation_indices: HashMap<u64, usize>,
 }
 
 impl RequestTrace {
@@ -166,6 +167,7 @@ impl RequestTrace {
             finished_us: None,
             finish_reason: None,
             operations: Vec::new(),
+            operation_indices: HashMap::new(),
         }
     }
 
@@ -195,20 +197,16 @@ impl RequestTrace {
         // alone identifies the operation's lifecycle. Later phases (commit,
         // release) arrive under a different control sequence than registration,
         // so matching on the operation id keeps them on the same lifecycle.
-        let entry = match self
-            .operations
-            .iter_mut()
-            .find(|op| op.key.op_id == key.op_id)
-        {
-            Some(entry) => entry,
+        let entry = match self.operation_indices.get(&key.op_id.0).copied() {
+            Some(index) => &mut self.operations[index],
             None => {
                 if self.operations.len() >= MAX_OPERATIONS {
                     return;
                 }
+                let index = self.operations.len();
                 self.operations.push(OperationLifecycle::new(key));
-                self.operations
-                    .last_mut()
-                    .expect("just pushed one operation")
+                self.operation_indices.insert(key.op_id.0, index);
+                &mut self.operations[index]
             }
         };
         if op_kind.is_some() {
@@ -222,9 +220,17 @@ impl RequestTrace {
     /// operation's registration, so no lifecycle is created here; an unknown
     /// `op_id` is a no-op.
     pub fn stamp_existing(&mut self, op_id: OpId, phase: LifecyclePhase, at_us: u64) {
-        if let Some(entry) = self.operations.iter_mut().find(|op| op.key.op_id == op_id) {
+        if let Some(index) = self.operation_indices.get(&op_id.0).copied() {
+            let entry = &mut self.operations[index];
             entry.stamp(phase, at_us);
         }
+    }
+
+    /// Return one phase timestamp for a registered operation without scanning
+    /// the bounded lifecycle history.
+    pub fn at(&self, op_id: OpId, phase: LifecyclePhase) -> Option<u64> {
+        let index = *self.operation_indices.get(&op_id.0)?;
+        self.operations[index].at(phase)
     }
 
     pub fn operations(&self) -> &[OperationLifecycle] {

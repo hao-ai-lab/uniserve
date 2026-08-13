@@ -35,6 +35,7 @@ class WorkerPlacement:
 @dataclass(frozen=True)
 class WorkerResourceConfig:
     block_size: int
+    max_batch_tokens: int
     kv_token_capacity: int | None
     generation_kv_capacity_tokens: int | None
 
@@ -111,6 +112,7 @@ class WorkerLaunchConfig:
             ),
             resources=WorkerResourceConfig(
                 block_size=int(namespace.block_size),
+                max_batch_tokens=int(namespace.max_batch_tokens),
                 kv_token_capacity=(
                     int(namespace.kv_token_capacity)
                     if namespace.kv_token_capacity is not None
@@ -142,6 +144,7 @@ def _validate_scalars(
 ) -> None:
     positive_fields = {
         "--block-size": namespace.block_size,
+        "--max-batch-tokens": namespace.max_batch_tokens,
         "--pipeline-depth": namespace.pipeline_depth,
         "--ipc-payload-cap": namespace.ipc_payload_cap,
         "--ipc-max-inflight": namespace.ipc_max_inflight,

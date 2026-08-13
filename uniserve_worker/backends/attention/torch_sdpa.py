@@ -1,4 +1,5 @@
 """Portable torch SDPA attention backend."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -6,11 +7,11 @@ from collections.abc import Callable, Sequence
 import torch
 import torch.nn.functional as F
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from .base import AttentionCapabilities
 
 __all__ = [
-    'TorchSDPAAttentionBackend',
+    "TorchSDPAAttentionBackend",
 ]
 
 
@@ -25,6 +26,7 @@ class TorchSDPAAttentionBackend:
             varlen_attention=True,
             varlen_paged_kv=True,
             visible_end=True,
+            visible_end_cuda_graph=True,
             tree_verify=True,
         )
 
@@ -37,7 +39,7 @@ class TorchSDPAAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if q.ndim == 3:
@@ -58,7 +60,7 @@ class TorchSDPAAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         plan = None if context is None else context.attention
         base_lens = getattr(plan, "cache_seqlens_cpu", None)
@@ -120,11 +122,13 @@ class TorchSDPAAttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del max_seqlen_q, max_seqlen_k
         if q.ndim != 3:
-            raise ValueError("portable varlen attention expects packed [tokens, heads, dim] queries")
+            raise ValueError(
+                "portable varlen attention expects packed [tokens, heads, dim] queries"
+            )
         if block_table is not None:
             # Paged varlen carries a PagedVarlenPlan whose host-mirrored per-row
             # query/key lengths give the packed offsets without reading the
@@ -185,13 +189,21 @@ class TorchSDPAAttentionBackend:
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
-        del max_seqlen_q, max_seqlen_k, use_prefix_bounds, context
+        del max_seqlen_q, max_seqlen_k, use_prefix_bounds
+        plan = None if context is None else context.attention
+        query_lens = getattr(plan, "query_lens_cpu", None)
+        key_lens = getattr(plan, "key_lens_cpu", None)
         if q.ndim == 3:
-            if cu_seqlens_q is None:
-                raise ValueError("packed visible-end attention requires query offsets")
-            q_offsets = _validated_offsets(cu_seqlens_q, int(q.shape[0]), "query")
+            if query_lens is None:
+                if cu_seqlens_q is None:
+                    raise ValueError("packed visible-end attention requires query offsets")
+                q_offsets = _validated_offsets(cu_seqlens_q, int(q.shape[0]), "query")
+            else:
+                q_offsets = _offsets_from_lengths(query_lens)
+                if q_offsets[-1] != int(q.shape[0]):
+                    raise ValueError("packed query lengths do not span their tensor")
             q_rows = [q[q_offsets[row] : q_offsets[row + 1]] for row in range(len(q_offsets) - 1)]
             restore: Callable[[list[torch.Tensor]], torch.Tensor] = _concatenate_rows
         elif q.ndim == 4:
@@ -205,7 +217,11 @@ class TorchSDPAAttentionBackend:
         if page_table is not None:
             if seqused_k is None or int(page_table.shape[0]) != len(q_rows):
                 raise ValueError("paged visible-end attention requires one key length per row")
-            key_lengths = _integer_values(seqused_k, "visible-end key lengths")
+            key_lengths = (
+                _integer_values(seqused_k, "visible-end key lengths")
+                if key_lens is None
+                else tuple(int(value) for value in key_lens)
+            )
             key_rows = [
                 _read_paged_row(k, page_table[row], key_lengths[row]) for row in range(len(q_rows))
             ]
@@ -215,7 +231,9 @@ class TorchSDPAAttentionBackend:
         else:
             if cu_seqlens_k is None:
                 if k.ndim != 4 or int(k.shape[0]) != len(q_rows):
-                    raise ValueError("visible-end K/V rows require key offsets or a batch dimension")
+                    raise ValueError(
+                        "visible-end K/V rows require key offsets or a batch dimension"
+                    )
                 key_rows = [k[row].transpose(0, 1) for row in range(len(q_rows))]
                 value_rows = [v[row].transpose(0, 1) for row in range(len(q_rows))]
             else:
@@ -226,9 +244,7 @@ class TorchSDPAAttentionBackend:
                 value_rows = [v[k_offsets[row] : k_offsets[row + 1]] for row in range(len(q_rows))]
 
         outputs: list[torch.Tensor] = []
-        for row, (query, keys, values) in enumerate(
-            zip(q_rows, key_rows, value_rows, strict=True)
-        ):
+        for row, (query, keys, values) in enumerate(zip(q_rows, key_rows, value_rows, strict=True)):
             if fully_visible:
                 mask = None
             else:
@@ -366,8 +382,10 @@ def _validated_offsets(
     name: str,
 ) -> tuple[int, ...]:
     offsets = _integer_values(value, f"{name} offsets")
-    if len(offsets) < 2 or offsets[0] != 0 or any(
-        right < left for left, right in zip(offsets, offsets[1:])
+    if (
+        len(offsets) < 2
+        or offsets[0] != 0
+        or any(right < left for left, right in zip(offsets, offsets[1:]))
     ):
         raise ValueError(f"{name} offsets are invalid")
     if terminal is not None and offsets[-1] != terminal:
@@ -413,8 +431,10 @@ def _paged_current_rows(value: torch.Tensor, query_lens: tuple[int, ...]) -> lis
         if int(value.shape[0]) != row_count:
             raise ValueError("current paged K/V batch does not match queries")
         rows = [value[row].transpose(0, 1) for row in range(row_count)]
-    elif value.ndim == 3 and int(value.shape[0]) == row_count and all(
-        length == 1 for length in query_lens
+    elif (
+        value.ndim == 3
+        and int(value.shape[0]) == row_count
+        and all(length == 1 for length in query_lens)
     ):
         rows = [value[row : row + 1] for row in range(row_count)]
     elif value.ndim == 3 and row_count == 1:

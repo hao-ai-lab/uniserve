@@ -1,0 +1,1010 @@
+"""Bounded CUDA graph executables over fixed and exact-shape forward batches."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable, Hashable, Iterator
+from contextlib import nullcontext
+from dataclasses import dataclass, fields, is_dataclass, replace
+from typing import Any, cast
+
+import torch
+
+from uniserve_worker.execution.forward_batch import (
+    AttentionSelection,
+    ForwardBatch,
+    ForwardOutput,
+    NoAttention,
+    PackedAttentionPlan,
+    PagedDecodePlan,
+    PagedVarlenPlan,
+    TokenSelection,
+)
+from uniserve_worker.execution.lane import verify_graph_context
+from uniserve_worker.foundation.sizing import bucketed_length
+from uniserve_worker.models.runtime import CacheGeometry
+
+logger = logging.getLogger(__name__)
+
+
+class GraphExecutionError(RuntimeError):
+    """A configured CUDA graph bucket could not execute safely."""
+
+
+class _GraphMiss(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class GraphRun:
+    output: ForwardOutput
+    path: str
+    row_count: int
+    padded_row_count: int
+
+
+@dataclass(slots=True)
+class _GraphState:
+    graph: torch.cuda.CUDAGraph
+    batch: ForwardBatch
+    output: ForwardOutput
+    published: tuple[ForwardOutput, ...]
+    releases: tuple[Callable[[], None], ...]
+    startup_resident: bool
+    signature: tuple[object, ...]
+    publish_cursor: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodeGeometry:
+    bucket: int
+    width: int
+    padding: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefillGeometry:
+    token_bucket: int
+    row_bucket: int
+    width: int
+    padding: int
+    maximum_padding: int
+    max_query_len: int
+    max_key_len: int
+
+
+class CudaGraphRunner:
+    """Own the immutable CUDA graph set for one execution partition."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        prefill_enabled: bool,
+        cache: CacheGeometry,
+        block_size: int,
+        weight_digest: str,
+        memory_budget_bytes: int,
+        decode_batch_sizes: tuple[int, ...] = (),
+        decode_context_blocks: int = 0,
+        packed_context_blocks: int = 0,
+        prefill_token_sizes: tuple[int, ...] = (),
+        prefill_row_bucket: int = 8,
+        stream: torch.cuda.Stream | None = None,
+        expected_context: int | None = None,
+        expected_captures: int | None = None,
+        output_slot_count: int = 2,
+    ) -> None:
+        if not weight_digest or block_size < 1 or memory_budget_bytes < 0 or output_slot_count < 1:
+            raise ValueError("graph-store identity and geometry are invalid")
+        self.enabled = bool(enabled)
+        self.prefill_enabled = bool(prefill_enabled)
+        self.cache = cache
+        self.block_size = int(block_size)
+        self.weight_digest = str(weight_digest)
+        self.memory_budget_bytes = int(memory_budget_bytes)
+        self.decode_batch_sizes = tuple(
+            sorted({int(value) for value in decode_batch_sizes if int(value) > 0})
+        )
+        self.decode_context_blocks = max(0, int(decode_context_blocks))
+        self.packed_context_blocks = max(0, int(packed_context_blocks))
+        self.prefill_token_sizes = tuple(
+            sorted({int(value) for value in prefill_token_sizes if int(value) > 0})
+        )
+        self.prefill_row_bucket = max(1, int(prefill_row_bucket))
+        self.captures = 0
+        self._states: dict[tuple[object, ...], _GraphState] = {}
+        self._warmed: set[tuple[object, ...]] = set()
+        self._warmed_exact: set[tuple[object, ...]] = set()
+        self._covered_exact: set[tuple[object, ...]] = set()
+        self._next_binding = 1
+        self._device: torch.device | None = None
+        self._pool_handle: Any = None
+        self._sealed = False
+        self._stream = stream
+        self._expected_context = expected_context
+        self._expected_captures = (
+            None if expected_captures is None else max(0, int(expected_captures))
+        )
+        self._output_slot_count = int(output_slot_count)
+
+    @property
+    def resident_bytes(self) -> int:
+        return _private_pool_bytes(self._device)
+
+    def bind_partition(
+        self,
+        stream: torch.cuda.Stream | None,
+        expected_context: int | None,
+    ) -> None:
+        if self._warmed or self._states or self._sealed:
+            raise GraphExecutionError("CUDA graph runner was bound after startup began")
+        self._stream = stream
+        self._expected_context = expected_context
+
+    def complete_startup(self) -> None:
+        """Verify and seal the configured bucket set before request admission."""
+
+        if self._sealed:
+            return
+        self._warmed.difference_update(self._warmed_exact)
+        self._covered_exact.difference_update(self._warmed_exact)
+        self._warmed_exact.clear()
+        if self._warmed:
+            raise GraphExecutionError("startup left configured graph buckets uncaptured")
+        if self._expected_captures is not None and len(self._states) != self._expected_captures:
+            raise GraphExecutionError(
+                "captured CUDA graph count does not match the advertised bucket catalog: "
+                f"captured={len(self._states)} advertised={self._expected_captures}"
+            )
+        if self.resident_bytes > self.memory_budget_bytes:
+            raise GraphExecutionError("captured graph residency exceeds its startup budget")
+        self._sealed = True
+
+    @property
+    def startup_signature(self) -> tuple[object, ...]:
+        return (
+            self.decode_batch_sizes,
+            self.prefill_token_sizes,
+            tuple(sorted((repr(key) for key in self._states))),
+            self.captures,
+            self._sealed,
+        )
+
+    def execute(
+        self,
+        key: Hashable,
+        batch: ForwardBatch,
+        forward: Callable[[ForwardBatch], ForwardOutput],
+        *,
+        eligible: bool,
+        borrow_output: bool = False,
+    ) -> GraphRun:
+        rows = batch.row_count
+        if not eligible or not self.enabled or not _cuda_batch(batch):
+            return GraphRun(self._eager(batch, forward), "eager", rows, rows)
+        if isinstance(batch.attention, PagedVarlenPlan) and (
+            not self.prefill_enabled
+            or any(
+                selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections
+            )
+        ):
+            return GraphRun(self._eager(batch, forward), "eager", rows, rows)
+        if isinstance(batch.attention, PackedAttentionPlan) and not self.prefill_enabled:
+            return GraphRun(self._eager(batch, forward), "eager", rows, rows)
+        if isinstance(batch.attention, PackedAttentionPlan) and _quantized_kv(batch):
+            return GraphRun(self._eager(batch, forward), "eager", rows, rows)
+
+        decode = _decode_geometry(
+            batch,
+            self.decode_batch_sizes,
+            self.block_size,
+            self.decode_context_blocks,
+        )
+        prefill = (
+            None
+            if decode is not None
+            else _prefill_geometry(
+                batch,
+                self.prefill_token_sizes,
+                self.block_size,
+                self.prefill_row_bucket,
+                self.decode_context_blocks,
+            )
+        )
+        if decode is not None:
+            execution = _pad_decode_batch(batch, decode)
+            state_key = _decode_signature(batch, decode)
+            signature = state_key
+            padded_rows = decode.bucket
+            startup_resident = True
+        elif prefill is not None:
+            execution = _pad_prefill_batch(batch, prefill)
+            state_key = _prefill_signature(batch, prefill)
+            signature = state_key
+            padded_rows = prefill.row_bucket
+            startup_resident = True
+        else:
+            execution = _normalize_exact_batch(
+                batch,
+                context_blocks=self.packed_context_blocks,
+                block_size=self.block_size,
+            )
+            signature = _exact_signature(execution)
+            direct_key = ("exact", *_direct_key(key))
+            state_key = (*direct_key, signature)
+            padded_rows = rows
+            startup_resident = False
+
+        if not startup_resident and not self._sealed:
+            self._covered_exact.add(state_key)
+        state = self._states.get(state_key)
+        if state is None:
+            covered = startup_resident or state_key in self._covered_exact
+            if self._sealed:
+                if covered:
+                    raise GraphExecutionError("configured CUDA graph bucket is not resident")
+                return GraphRun(self._eager(execution, forward), "eager", rows, padded_rows)
+            if state_key not in self._warmed:
+                self._warmed.add(state_key)
+                if not startup_resident:
+                    self._warmed_exact.add(state_key)
+                return GraphRun(
+                    _trim_output(self._eager(execution, forward), rows),
+                    "graph_fallback",
+                    rows,
+                    padded_rows,
+                )
+            if self.memory_budget_bytes == 0:
+                raise GraphExecutionError("configured CUDA graph residency has no memory budget")
+            try:
+                state = self._capture(
+                    execution,
+                    forward,
+                    startup_resident=startup_resident,
+                    signature=signature,
+                )
+                self._states[state_key] = state
+                self._warmed.remove(state_key)
+                self._warmed_exact.discard(state_key)
+                self.captures += 1
+                self._replay(state, execution)
+            except Exception as error:
+                removed = self._states.pop(state_key, None)
+                if removed is not None:
+                    _release_state(removed)
+                raise GraphExecutionError("configured CUDA graph capture failed") from error
+            output = (
+                _trim_output(state.output, rows)
+                if borrow_output
+                else self._publish_output(state, rows)
+            )
+            return GraphRun(output, "graph_capture", rows, padded_rows)
+        if state.signature != signature:
+            raise GraphExecutionError("configured CUDA graph physical shape changed")
+        try:
+            self._replay(state, execution)
+        except Exception as error:
+            raise GraphExecutionError("CUDA graph replay failed") from error
+        output = (
+            _trim_output(state.output, rows)
+            if borrow_output
+            else self._publish_output(state, rows)
+        )
+        return GraphRun(output, "graph_replay", rows, padded_rows)
+
+    def close(self) -> None:
+        states = tuple(self._states.values())
+        self._states.clear()
+        self._warmed.clear()
+        self._warmed_exact.clear()
+        self._covered_exact.clear()
+        for state in states:
+            _release_state(state)
+
+    def _capture(
+        self,
+        batch: ForwardBatch,
+        forward: Callable[[ForwardBatch], ForwardOutput],
+        *,
+        startup_resident: bool,
+        signature: tuple[object, ...],
+    ) -> _GraphState:
+        self._device = _batch_device(batch)
+        static = _graph_batch(
+            batch,
+            self._next_binding,
+            own_inputs=not startup_resident,
+        )
+        self._next_binding += 1
+        releases = self._prepare_attention(static, batch, capture=True)
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        try:
+            if self._pool_handle is None:
+                self._pool_handle = torch.cuda.graph_pool_handle()
+            with torch.cuda.graph(graph, pool=self._pool_handle, stream=self._stream):
+                output = forward(static)
+            if not isinstance(output, ForwardOutput):
+                raise TypeError("captured model call did not return ForwardOutput")
+            graph.instantiate()
+            verify_graph_context(graph, self._expected_context)
+            context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+            with context:
+                published = tuple(
+                    ForwardOutput(tuple(torch.empty_like(value) for value in output.values))
+                    for _ in range(self._output_slot_count)
+                )
+            return _GraphState(
+                graph,
+                static,
+                output,
+                published,
+                releases,
+                startup_resident,
+                signature,
+            )
+        except Exception:
+            for release in reversed(releases):
+                release()
+            reset = getattr(graph, "reset", None)
+            if callable(reset):
+                reset()
+            raise
+
+    def _eager(
+        self,
+        batch: ForwardBatch,
+        forward: Callable[[ForwardBatch], ForwardOutput],
+    ) -> ForwardOutput:
+        context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+        with context:
+            return forward(batch)
+
+    def _replay(self, state: _GraphState, execution: ForwardBatch) -> None:
+        context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+        with context:
+            if not state.startup_resident:
+                _copy_value_tensors(state.batch, execution)
+            else:
+                _copy_plan_tensors(state.batch.attention, execution.attention)
+            self._prepare_attention(state.batch, execution, capture=False)
+            state.graph.replay()
+
+    def _publish_output(self, state: _GraphState, rows: int) -> ForwardOutput:
+        published = state.published[state.publish_cursor]
+        state.publish_cursor = (state.publish_cursor + 1) % len(state.published)
+        context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+        with context:
+            for destination, source in zip(
+                published.values[:rows], state.output.values[:rows], strict=True
+            ):
+                destination.copy_(source)
+        return ForwardOutput(published.values[:rows])
+
+    def _prepare_attention(
+        self,
+        static_batch: ForwardBatch,
+        live_batch: ForwardBatch,
+        *,
+        capture: bool,
+    ) -> tuple[Callable[[], None], ...]:
+        static = static_batch.attention
+        live = live_batch.attention
+        if type(static) is not type(live):
+            raise _GraphMiss("attention form changed for a graph bucket")
+        if isinstance(static, (NoAttention, PackedAttentionPlan)):
+            return ()
+        if not isinstance(static, (PagedDecodePlan, PagedVarlenPlan)) or not isinstance(
+            live, (PagedDecodePlan, PagedVarlenPlan)
+        ):
+            return ()
+        prepared = _live_attention(static, live)
+        providers = static.backends.providers
+        if len(providers) != 1:
+            raise _GraphMiss("graph execution requires one attention provider")
+        backend = providers[0]
+        key_cache, _value_cache = static_batch.kv.layer_kv(0)
+        q_dtype = key_cache.dtype
+        kv_dtype = key_cache.dtype
+        releases: list[Callable[[], None]] = []
+        if isinstance(static, PagedDecodePlan) and isinstance(prepared, PagedDecodePlan):
+            prepare = getattr(backend, "prepare_paged_decode_cuda_graph", None)
+            if callable(prepare):
+                prepare(
+                    static.binding,
+                    prepared,
+                    batch_size=int(static.block_table.shape[0]),
+                    max_indices=max(1, int(static.block_table.numel())),
+                    num_q_heads=int(self.cache.num_attention_heads),
+                    num_kv_heads=int(self.cache.num_kv_heads),
+                    head_dim=int(self.cache.head_dim),
+                    page_size=self.block_size,
+                    q_dtype=q_dtype,
+                    kv_dtype=kv_dtype,
+                )
+                if capture:
+                    release = getattr(backend, "release_paged_decode_graph_binding", None)
+                    if callable(release):
+                        releases.append(_release_call(release, static.binding))
+            return tuple(releases)
+        if not isinstance(static, PagedVarlenPlan) or not isinstance(prepared, PagedVarlenPlan):
+            return ()
+        bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
+        prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
+        if callable(bind) and callable(prepare):
+            if capture:
+                bind(static.binding, static, device=static.block_table.device)
+                release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
+                if callable(release):
+                    releases.append(_release_call(release, static.binding))
+            prepare(
+                static.binding,
+                prepared,
+                num_q_heads=int(self.cache.num_attention_heads),
+                num_kv_heads=int(self.cache.num_kv_heads),
+                head_dim=int(self.cache.head_dim),
+                page_size=self.block_size,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
+                causal=static.causal,
+            )
+        return tuple(releases)
+
+
+def _decode_geometry(
+    batch: ForwardBatch,
+    batch_sizes: tuple[int, ...],
+    block_size: int,
+    context_blocks: int,
+) -> _DecodeGeometry | None:
+    attention = batch.attention
+    if not isinstance(attention, PagedDecodePlan) or not batch_sizes:
+        return None
+    rows = batch.row_count
+    bucket = next((value for value in batch_sizes if value >= rows), None)
+    if bucket is None or batch.input_ids is None or batch.positions is None:
+        return None
+    if (
+        batch.token_row_indices != tuple(range(rows))
+        or tuple(batch.query_lens) != (1,) * rows
+        or int(batch.input_ids.numel()) != rows
+        or int(batch.positions.shape[-1]) != rows
+        or len(set(batch.token_selections)) != 1
+        or not callable(getattr(batch.kv, "with_synthetic_row", None))
+    ):
+        return None
+    live_width = int(attention.block_table.shape[1])
+    if context_blocks > 0 and live_width > context_blocks:
+        return None
+    reserved_width = max(1, (int(bucket) + int(block_size) - 1) // int(block_size))
+    return _DecodeGeometry(
+        bucket=int(bucket),
+        width=max(live_width, int(context_blocks), reserved_width),
+        padding=int(bucket) - rows,
+    )
+
+
+def _prefill_geometry(
+    batch: ForwardBatch,
+    token_sizes: tuple[int, ...],
+    block_size: int,
+    row_bucket: int,
+    context_blocks: int,
+) -> _PrefillGeometry | None:
+    attention = batch.attention
+    if not isinstance(attention, PagedVarlenPlan) or not token_sizes:
+        return None
+    rows = batch.row_count
+    query_lens = tuple(int(value) for value in attention.query_lens_cpu)
+    if (
+        rows >= row_bucket
+        or batch.input_ids is None
+        or batch.positions is None
+        or batch.token_row_indices != tuple(range(rows))
+        or len(query_lens) != rows
+        or any(value < 1 for value in query_lens)
+        or tuple(batch.query_lens) != query_lens
+        or int(batch.input_ids.numel()) != sum(query_lens)
+        or int(batch.positions.shape[-1]) != sum(query_lens)
+        or not callable(getattr(batch.kv, "with_synthetic_row", None))
+    ):
+        return None
+    live_tokens = sum(query_lens)
+    token_bucket = next((value for value in token_sizes if value >= live_tokens), None)
+    if token_bucket is None:
+        return None
+    live_width = int(attention.block_table.shape[1])
+    if context_blocks > 0 and live_width > context_blocks:
+        return None
+    previous = max((value for value in token_sizes if value < token_bucket), default=0)
+    maximum_padding = int(token_bucket) - int(previous)
+    reserved_width = max(1, (maximum_padding + int(block_size) - 1) // int(block_size))
+    width = max(live_width, int(context_blocks), reserved_width)
+    return _PrefillGeometry(
+        token_bucket=int(token_bucket),
+        row_bucket=int(row_bucket),
+        width=width,
+        padding=int(token_bucket) - live_tokens,
+        maximum_padding=maximum_padding,
+        max_query_len=bucketed_length(int(token_bucket)),
+        max_key_len=width * int(block_size),
+    )
+
+
+def _pad_decode_batch(batch: ForwardBatch, geometry: _DecodeGeometry) -> ForwardBatch:
+    attention = cast(PagedDecodePlan, batch.attention)
+    bucket = geometry.bucket
+    input_ids = _fixed_view(cast(torch.Tensor, batch.input_ids), (bucket,))
+    positions = _expand_token_axis(cast(torch.Tensor, batch.positions), bucket)
+    input_embeddings = (
+        None
+        if batch.input_embeddings is None
+        else _fixed_view(
+            batch.input_embeddings,
+            (bucket, int(batch.input_embeddings.shape[1])),
+        )
+    )
+    embedding_mask = (
+        None if batch.embedding_mask is None else _fixed_view(batch.embedding_mask, (bucket,))
+    )
+    kv = batch.kv
+    if geometry.padding:
+        kv = cast(Any, kv).with_synthetic_rows(
+            (0,),
+            count=geometry.padding,
+            base_len=0,
+            query_len=1,
+        )
+    padded_attention = replace(
+        attention,
+        block_table=_fixed_view(attention.block_table, (bucket, geometry.width)),
+        cache_seqlens=_fixed_view(attention.cache_seqlens, (bucket,)),
+        kv_seqlens=_fixed_view(attention.kv_seqlens, (bucket,)),
+        query_lens=_fixed_view(attention.query_lens, (bucket,)),
+        cache_seqlens_cpu=(*attention.cache_seqlens_cpu, *(0 for _ in range(geometry.padding))),
+        kv_seqlens_cpu=(*attention.kv_seqlens_cpu, *(1 for _ in range(geometry.padding))),
+        query_lens_cpu=(*attention.query_lens_cpu, *(1 for _ in range(geometry.padding))),
+        decode_page_ids=_fixed_view(attention.decode_page_ids, (bucket,)),
+        decode_page_offsets=_fixed_view(attention.decode_page_offsets, (bucket,)),
+        max_context_len=geometry.width * int(kv.block_size),
+    )
+    return replace(
+        batch,
+        row_count=bucket,
+        request_pool_indices=_fixed_view(batch.request_pool_indices, (bucket,)),
+        token_row_indices=tuple(range(bucket)),
+        input_ids=input_ids,
+        input_embeddings=input_embeddings,
+        embedding_mask=embedding_mask,
+        positions=positions,
+        query_lens=(1,) * bucket,
+        token_selections=(batch.token_selections[0],) * bucket,
+        kv=kv,
+        attention=padded_attention,
+    )
+
+
+def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> ForwardBatch:
+    attention = cast(PagedVarlenPlan, batch.attention)
+    live_rows = batch.row_count
+    dummy_rows = geometry.row_bucket - live_rows
+    input_ids = _fixed_view(cast(torch.Tensor, batch.input_ids), (geometry.token_bucket,))
+    positions = _expand_token_axis(cast(torch.Tensor, batch.positions), geometry.token_bucket)
+    input_embeddings = (
+        None
+        if batch.input_embeddings is None
+        else _fixed_view(
+            batch.input_embeddings,
+            (geometry.token_bucket, int(batch.input_embeddings.shape[1])),
+        )
+    )
+    embedding_mask = (
+        None
+        if batch.embedding_mask is None
+        else _fixed_view(batch.embedding_mask, (geometry.token_bucket,))
+    )
+    block_table = _fixed_view(
+        attention.block_table,
+        (geometry.row_bucket, geometry.width),
+    )
+    cache_seqlens = _fixed_view(attention.cache_seqlens, (geometry.row_bucket,))
+    query_lens = _fixed_view(attention.query_lens, (geometry.row_bucket,))
+    kv_seqlens = _fixed_view(attention.kv_seqlens, (geometry.row_bucket,))
+    cu_seqlens_q = _fixed_view(attention.cu_seqlens_q, (geometry.row_bucket + 1,))
+    cu_seqlens_k = _fixed_view(attention.cu_seqlens_k, (geometry.row_bucket + 1,))
+    output_indices = _fixed_view(attention.output_indices, (geometry.row_bucket,))
+    cache_seqlens[live_rows:].zero_()
+    query_lens[live_rows:].zero_()
+    kv_seqlens[live_rows:].zero_()
+    if geometry.padding:
+        query_lens[live_rows] = geometry.padding
+        kv_seqlens[live_rows] = geometry.padding
+    cu_seqlens_q[live_rows + 1 :].fill_(geometry.token_bucket)
+    padded_kv_tokens = sum(int(value) for value in attention.kv_seqlens_cpu) + geometry.padding
+    cu_seqlens_k[live_rows + 1 :].fill_(padded_kv_tokens)
+    output_indices[live_rows:].zero_()
+    if geometry.padding:
+        output_indices[live_rows] = geometry.token_bucket - 1
+    dummy_query_lens = (geometry.padding, *(0 for _ in range(dummy_rows - 1)))
+    kv = batch.kv
+    reserved = (0,) * max(
+        1,
+        (geometry.maximum_padding + int(kv.block_size) - 1) // int(kv.block_size),
+    )
+    for index in range(dummy_rows):
+        kv = cast(Any, kv).with_synthetic_row(
+            reserved if index == 0 else (),
+            base_len=0,
+            query_len=dummy_query_lens[index],
+        )
+    padded_attention = replace(
+        attention,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        query_lens=query_lens,
+        kv_seqlens=kv_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        output_indices=output_indices,
+        cache_seqlens_cpu=(*attention.cache_seqlens_cpu, *(0 for _ in range(dummy_rows))),
+        query_lens_cpu=(*attention.query_lens_cpu, *dummy_query_lens),
+        kv_seqlens_cpu=(*attention.kv_seqlens_cpu, *dummy_query_lens),
+        max_seqlen_q=geometry.max_query_len,
+        max_seqlen_k=geometry.max_key_len,
+        max_context_len=geometry.max_key_len,
+    )
+    return replace(
+        batch,
+        row_count=geometry.row_bucket,
+        request_pool_indices=_fixed_view(
+            batch.request_pool_indices,
+            (geometry.row_bucket,),
+        ),
+        token_row_indices=tuple(range(geometry.row_bucket)),
+        input_ids=input_ids,
+        input_embeddings=input_embeddings,
+        embedding_mask=embedding_mask,
+        positions=positions,
+        query_lens=(*batch.query_lens, *dummy_query_lens),
+        token_selections=(batch.token_selections[0],) * geometry.row_bucket,
+        kv=kv,
+        attention=padded_attention,
+    )
+
+
+def _decode_signature(batch: ForwardBatch, geometry: _DecodeGeometry) -> tuple[object, ...]:
+    attention = cast(PagedDecodePlan, batch.attention)
+    return (
+        "paged_decode_bucket",
+        batch.phase.value,
+        geometry.bucket,
+        geometry.width,
+        batch.token_selections[0].value,
+        _batch_tensor_signature(batch),
+        attention.backends.identity,
+        bool(attention.causal),
+        _owner_signature(batch),
+    )
+
+
+def _prefill_signature(batch: ForwardBatch, geometry: _PrefillGeometry) -> tuple[object, ...]:
+    attention = cast(PagedVarlenPlan, batch.attention)
+    return (
+        "paged_prefill_bucket",
+        batch.phase.value,
+        geometry.row_bucket,
+        geometry.token_bucket,
+        geometry.width,
+        geometry.max_query_len,
+        geometry.max_key_len,
+        batch.token_selections[0].value,
+        _batch_tensor_signature(batch),
+        attention.backends.identity,
+        bool(attention.causal),
+        _owner_signature(batch),
+    )
+
+
+def _batch_tensor_signature(batch: ForwardBatch) -> tuple[object, ...]:
+    assert batch.input_ids is not None and batch.positions is not None
+    return (
+        str(batch.input_ids.dtype),
+        batch.input_ids.device.type,
+        batch.positions.ndim,
+        int(batch.positions.shape[0]) if batch.positions.ndim == 2 else 1,
+        str(batch.positions.dtype),
+        batch.input_embeddings is not None,
+        None if batch.input_embeddings is None else str(batch.input_embeddings.dtype),
+    )
+
+
+def _owner_signature(batch: ForwardBatch) -> tuple[object, ...]:
+    return (
+        type(batch.kv).__qualname__,
+        type(batch.mesh).__qualname__,
+        type(batch.output).__qualname__,
+    )
+
+
+def _direct_key(key: Hashable) -> tuple[object, ...]:
+    if isinstance(key, tuple):
+        return tuple(key)
+    return (key,)
+
+
+def _exact_signature(batch: ForwardBatch) -> tuple[object, ...]:
+    attention = batch.attention
+    attention_values: list[object] = [type(attention).__qualname__]
+    for field in fields(attention):
+        value = getattr(attention, field.name)
+        if field.name in {"binding", "query_lens_cpu", "key_lens_cpu"}:
+            continue
+        if field.name == "backends":
+            attention_values.append((field.name, value.identity))
+        elif isinstance(value, torch.Tensor):
+            attention_values.append((field.name, _tensor_signature(value)))
+        else:
+            attention_values.append((field.name, value))
+    return (
+        batch.phase.value,
+        batch.row_count,
+        batch.token_row_indices,
+        batch.flow_row_indices,
+        batch.query_lens,
+        tuple(value.value for value in batch.token_selections),
+        batch.flow_image_tokens,
+        batch.flow_heights,
+        batch.flow_widths,
+        tuple(value is not None for value in batch.flow_conditioning),
+        tuple(_tensor_signature(value) for value in _tensor_leaves(batch)),
+        tuple(attention_values),
+        _owner_signature(batch),
+    )
+
+
+def _normalize_exact_batch(
+    batch: ForwardBatch,
+    *,
+    context_blocks: int,
+    block_size: int,
+) -> ForwardBatch:
+    """Give exact packed graphs their startup-fixed KV table geometry.
+
+    Packed flow and mixed calls use request-variable KV prefix lengths, but the
+    partition input buffer already owns a maximum-width, zero-scrubbed block
+    table.  Capturing the active request-width view makes otherwise identical
+    startup and serving calls different graph shapes.  Widening that view here
+    keeps the physical kernel launch fixed while ``seqused_k`` and the other
+    staged tensors carry the live lengths on every replay.
+    """
+
+    attention = batch.attention
+    if not isinstance(attention, PackedAttentionPlan) or context_blocks <= 0:
+        return batch
+    if int(attention.page_table.shape[1]) > context_blocks:
+        raise _GraphMiss("packed attention exceeds the configured context width")
+    normalized = replace(
+        attention,
+        page_table=_fixed_view(
+            attention.page_table,
+            (int(attention.page_table.shape[0]), int(context_blocks)),
+        ),
+        max_seqlen_k=int(context_blocks) * int(block_size),
+    )
+    return replace(batch, attention=normalized)
+
+
+def _tensor_signature(value: torch.Tensor) -> tuple[object, ...]:
+    return (
+        tuple(int(extent) for extent in value.shape),
+        str(value.dtype),
+        value.device.type,
+    )
+
+
+def _graph_batch(
+    batch: ForwardBatch,
+    binding: int,
+    *,
+    own_inputs: bool,
+) -> ForwardBatch:
+    graph_batch = _clone_value(batch) if own_inputs else batch
+    if not isinstance(graph_batch, ForwardBatch):
+        raise TypeError("graph input cloning did not preserve ForwardBatch")
+    attention = graph_batch.attention
+    selection = _graph_selection(attention)
+    graph_attention: NoAttention | PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
+    if isinstance(attention, NoAttention):
+        graph_attention = replace(attention, backends=selection)
+    else:
+        graph_attention = replace(attention, backends=selection, binding=int(binding))
+    return replace(graph_batch, attention=graph_attention)
+
+
+def _clone_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.clone(memory_format=torch.preserve_format)
+    if isinstance(value, AttentionSelection):
+        return value
+    if isinstance(value, tuple):
+        return tuple(_clone_value(item) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return replace(
+            value,
+            **{field.name: _clone_value(getattr(value, field.name)) for field in fields(value)},
+        )
+    return value
+
+
+def _tensor_leaves(value: Any) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+        return
+    if isinstance(value, AttentionSelection):
+        return
+    if isinstance(value, tuple):
+        for item in value:
+            yield from _tensor_leaves(item)
+        return
+    if is_dataclass(value) and not isinstance(value, type):
+        for field in fields(value):
+            yield from _tensor_leaves(getattr(value, field.name))
+
+
+def _copy_value_tensors(target: object, source: object) -> None:
+    target_tensors = tuple(_tensor_leaves(target))
+    source_tensors = tuple(_tensor_leaves(source))
+    if len(target_tensors) != len(source_tensors):
+        raise _GraphMiss("forward tensor structure changed")
+    for destination, value in zip(target_tensors, source_tensors, strict=True):
+        if (
+            destination.shape != value.shape
+            or destination.dtype != value.dtype
+            or destination.device != value.device
+        ):
+            raise _GraphMiss("forward tensor geometry changed")
+        destination.copy_(value, non_blocking=True)
+
+
+def _copy_plan_tensors(target: object, source: object) -> None:
+    target_tensors = tuple(_tensor_leaves(target))
+    source_tensors = tuple(_tensor_leaves(source))
+    if len(target_tensors) != len(source_tensors):
+        raise _GraphMiss("attention tensor structure changed")
+    for destination, value in zip(target_tensors, source_tensors, strict=True):
+        if (
+            destination.shape != value.shape
+            or destination.dtype != value.dtype
+            or destination.device != value.device
+        ):
+            raise _GraphMiss("attention tensor geometry changed")
+        destination.copy_(value, non_blocking=True)
+
+
+def _graph_selection(plan: object) -> AttentionSelection:
+    selection = getattr(plan, "backends", None)
+    if not isinstance(selection, AttentionSelection):
+        raise _GraphMiss("attention plan has no resolved provider selection")
+    for provider in selection.providers:
+        capabilities = provider.capabilities()
+        if isinstance(plan, PackedAttentionPlan):
+            safe = bool(getattr(capabilities, "visible_end_cuda_graph", False))
+        elif isinstance(plan, PagedVarlenPlan):
+            safe = bool(getattr(capabilities, "paged_varlen_cuda_graph", False)) or (
+                callable(getattr(provider, "bind_paged_prefill_graph_wrapper", None))
+                and callable(getattr(provider, "prepare_paged_prefill_cuda_graph", None))
+            )
+        elif isinstance(plan, PagedDecodePlan):
+            safe = bool(getattr(capabilities, "paged_kv", False))
+        else:
+            safe = True
+        if safe:
+            return AttentionSelection(
+                identity=f"{selection.identity}:graph:{provider.name}",
+                providers=(provider,),
+            )
+    raise _GraphMiss("no provisioned attention provider is graph-safe")
+
+
+_PLAN_LENGTH_BOUNDS = frozenset({"max_seqlen_q", "max_seqlen_k", "max_context_len"})
+
+
+def _live_attention(static: object, live: object) -> object:
+    if not is_dataclass(static) or not is_dataclass(live):
+        raise _GraphMiss("attention plan is not immutable data")
+    updates: dict[str, object] = {}
+    for field in fields(static):
+        static_value = getattr(static, field.name)
+        if (
+            isinstance(static_value, torch.Tensor)
+            or field.name in {"binding", "backends"}
+            or field.name in _PLAN_LENGTH_BOUNDS
+        ):
+            updates[field.name] = static_value
+        else:
+            updates[field.name] = getattr(live, field.name)
+    return replace(cast(Any, live), **updates)
+
+
+def _fixed_view(tensor: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    if tensor.ndim != len(shape) or any(value < 0 for value in shape):
+        raise _GraphMiss("fixed graph view rank changed")
+    strides = tuple(int(value) for value in tensor.stride())
+    if any(value < 0 for value in strides):
+        raise _GraphMiss("fixed graph view has a negative stride")
+    maximum = int(tensor.storage_offset())
+    for extent, stride in zip(shape, strides, strict=True):
+        if extent:
+            maximum += (int(extent) - 1) * stride
+    storage_elements = tensor.untyped_storage().nbytes() // tensor.element_size()
+    if maximum >= storage_elements:
+        raise _GraphMiss("graph bucket exceeds its fixed input storage")
+    return tensor.as_strided(shape, strides, storage_offset=int(tensor.storage_offset()))
+
+
+def _expand_token_axis(tensor: torch.Tensor, tokens: int) -> torch.Tensor:
+    if tensor.ndim == 1:
+        return _fixed_view(tensor, (tokens,))
+    if tensor.ndim == 2:
+        return _fixed_view(tensor, (int(tensor.shape[0]), tokens))
+    raise _GraphMiss("graph token positions have an invalid rank")
+
+
+def _cuda_batch(batch: ForwardBatch) -> bool:
+    tensors = tuple(_tensor_leaves(batch))
+    return bool(
+        tensors
+        and torch.cuda.is_available()
+        and all(value.device.type == "cuda" for value in tensors)
+        and len({value.device for value in tensors}) == 1
+    )
+
+
+def _batch_device(batch: ForwardBatch) -> torch.device:
+    for tensor in _tensor_leaves(batch):
+        return tensor.device
+    raise _GraphMiss("forward batch carries no device tensors")
+
+
+def _quantized_kv(batch: ForwardBatch) -> bool:
+    pool = getattr(batch.kv, "pool", None)
+    return bool(getattr(pool, "is_quantized", False))
+
+
+def _private_pool_bytes(device: torch.device | None) -> int:
+    if device is None or not torch.cuda.is_available():
+        return 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    total = 0
+    for segment in torch.cuda.memory_snapshot():
+        if segment.get("device") != index:
+            continue
+        pool_id = segment.get("segment_pool_id")
+        if isinstance(pool_id, tuple) and any(pool_id):
+            total += int(segment.get("total_size", 0))
+    return total
+
+
+def _trim_output(output: ForwardOutput, rows: int) -> ForwardOutput:
+    return ForwardOutput(tuple(output.values[:rows]))
+
+
+def _release_call(method: Callable[[int], object], binding: int) -> Callable[[], None]:
+    def release() -> None:
+        method(binding)
+
+    return release
+
+
+def _release_state(state: _GraphState) -> None:
+    for release in reversed(state.releases):
+        try:
+            release()
+        except Exception:
+            logger.warning("attention graph binding release failed", exc_info=True)
+    reset = getattr(state.graph, "reset", None)
+    if callable(reset):
+        reset()
+
+
+__all__ = ["CudaGraphRunner", "GraphExecutionError", "GraphRun"]

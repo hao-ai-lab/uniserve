@@ -11,7 +11,7 @@ __all__ = [
     "FlashInferAttentionBackend",
 ]
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from ...foundation.runtime_config import FlashInferTuningConfig
 from .base import AttentionCapabilities
 from .flashinfer_kernels import (
@@ -130,7 +130,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if _flashinfer is None:
@@ -159,7 +159,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del causal
         if _BatchDecodeWithPagedKVCacheWrapper is None:
@@ -349,7 +349,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del max_seqlen_q, max_seqlen_k
         if _BatchPrefillWithPagedKVCacheWrapper is None:

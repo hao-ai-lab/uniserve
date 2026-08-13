@@ -13,14 +13,16 @@ from torch import nn
 
 from ..foundation.errors import capability_mismatch
 from ..foundation.runtime_config import ExecutionConfig
-from ..foundation.sizing import DEFAULT_MAX_BATCH_OPS
+from ..foundation.sizing import (
+    DEFAULT_MAX_BATCH_OPS,
+    DEFAULT_MAX_REQUEST_POOL_SIZE,
+)
 from ..loader import Loader
 from ..loader.paths import read_config, resolve_model_path
 from ..loader.schema import ModelLoadScope
 from ..models.identity import ModelIdentity, architecture_identity
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import TensorParallelSpec
-from ..runtime.compile import TorchCompileConfig, compile_model_pieces
 from .catalog import CatalogEntry, resolve_catalog_entry
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,7 @@ class WorkerModelLoadRequest:
     model_path: str
     device: str
     block_size: int
+    max_batch_tokens: int
     kv_token_capacity: int | None
     attention_backend: str | None
     execution: ExecutionConfig
@@ -69,7 +72,6 @@ def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
     )
     model = _check_model_conformance(loaded.model)
 
-    _compile_model(model, request.execution)
     weight_digest = _checkpoint_weight_digest(model_path, config)
     _resolve_input_tokens(model, loaded.tokenizer)
     deployment = _deployment(request)
@@ -170,6 +172,8 @@ def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
         kv_cache_dtype=execution.kv_cache_dtype,
         kv_memory_fraction=execution.kv_memory_fraction,
         max_batch_operations=DEFAULT_MAX_BATCH_OPS,
+        max_batch_tokens=request.max_batch_tokens,
+        max_request_pool_size=DEFAULT_MAX_REQUEST_POOL_SIZE,
         generation_device=request.generation_device,
     )
 
@@ -185,13 +189,3 @@ def _check_model_conformance(model: nn.Module) -> ExecutionModel:
     if not isinstance(model, ExecutionModel):
         raise capability_mismatch(f"{type(model).__name__} must implement ExecutionModel")
     return model
-
-
-def _compile_model(model: nn.Module, execution: ExecutionConfig) -> None:
-    config = TorchCompileConfig.from_runtime_config(execution.torch_compile)
-    report = compile_model_pieces(model, config=config)
-    if report.compiled:
-        logger.info(
-            "enabled model-stack torch.compile pieces count=%s",
-            report.compiled,
-        )

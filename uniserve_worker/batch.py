@@ -1669,6 +1669,7 @@ class Commit:
     selected: VersionRef
     public_event_limit: int
     disposition: Disposition
+    _content_digest: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1677,12 +1678,14 @@ class Close:
     control_seq: int
     cutoff: VersionRef
     reason: CloseReason
+    _content_digest: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Release:
     request_key: RequestKey
     op_id: int
+    _content_digest: str | None = field(default=None, compare=False, repr=False)
 
 
 Control: TypeAlias = Commit | Close | Release
@@ -1697,6 +1700,8 @@ def _control_variant_index(control: Control) -> int:
 
 
 def control_content_digest(control: Control) -> str:
+    if control._content_digest is not None:
+        return control._content_digest
     digest = _Digest(b"uniserve-control\0")
     digest.u8(_control_variant_index(control))
     _digest_request_key(digest, control.request_key)
@@ -1715,32 +1720,54 @@ def control_content_digest(control: Control) -> str:
     return digest.finish()
 
 
-def control_from_wire(value: object, where: str = "control") -> Control:
+def control_from_wire(
+    value: object,
+    where: str = "control",
+    *,
+    _validated_wire: bool = False,
+) -> Control:
     kind, payload = _tagged(value, where)
+    envelope = _map(value, where)
     data = _map(payload, f"{where}.value")
-    request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.value.request_key")
+    request_key = _fast_request_key(data.get("request_key"))
+    if request_key is None:
+        request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.value.request_key")
+    cached_digest = envelope.get("_content_digest") if _validated_wire else None
+    if cached_digest is not None and not _is_digest(cached_digest):
+        raise invalid_descriptor(f"{where} has an invalid trusted content digest")
     if kind == "commit":
+        expected_parent = _fast_version_ref(data.get("expected_parent"))
+        if expected_parent is None:
+            expected_parent = VersionRef.from_wire(
+                data.get("expected_parent"), f"{where}.value.expected_parent"
+            )
+        selected = _fast_version_ref(data.get("selected"))
+        if selected is None:
+            selected = VersionRef.from_wire(data.get("selected"), f"{where}.value.selected")
         commit = Commit(
             request_key=request_key,
             control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
-            expected_parent=VersionRef.from_wire(
-                data.get("expected_parent"), f"{where}.value.expected_parent"
-            ),
-            selected=VersionRef.from_wire(data.get("selected"), f"{where}.value.selected"),
+            expected_parent=expected_parent,
+            selected=selected,
             public_event_limit=_uint(
                 data.get("public_event_limit"), f"{where}.value.public_event_limit"
             ),
             disposition=_enum(Disposition, data.get("disposition"), f"{where}.value.disposition"),
+            _content_digest=cast(str | None, cached_digest),
         )
         if not commit.selected.is_fixed():
             raise invalid_descriptor("a commit control must select a fixed version")
         control: Control = commit
     elif kind == "close":
+        cutoff = _fast_version_ref(data.get("cutoff"))
+        if cutoff is None:
+            cutoff = VersionRef.from_wire(data.get("cutoff"), f"{where}.value.cutoff")
         control = Close(
             request_key=request_key,
             control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
-            cutoff=VersionRef.from_wire(data.get("cutoff"), f"{where}.value.cutoff"),
+            cutoff=cutoff,
             reason=_enum(CloseReason, data.get("reason"), f"{where}.value.reason"),
+            _content_digest=cast(str | None, cached_digest),
         )
         if not control.cutoff.is_fixed():
             raise invalid_descriptor("a close control must name a fixed cutoff version")
@@ -1748,6 +1775,7 @@ def control_from_wire(value: object, where: str = "control") -> Control:
         control = Release(
             request_key=request_key,
             op_id=_uint(data.get("op_id"), f"{where}.value.op_id"),
+            _content_digest=cast(str | None, cached_digest),
         )
     else:
         raise invalid_descriptor(f"{where} has unknown variant {kind!r}")
@@ -1940,19 +1968,45 @@ class KvPlacement:
             raise invalid_descriptor("KV placement lengths are inconsistent")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "KV placement") -> KvPlacement:
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "KV placement",
+        *,
+        _validated_wire: bool = False,
+    ) -> KvPlacement:
         data = _map(value, where)
-        return cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
-            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
-            block_table=_uints(data.get("block_table", ()), f"{where}.block_table"),
-            pages_to_zero=_uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero"),
-            prefix_length=_uint(data.get("prefix_length"), f"{where}.prefix_length"),
-            input_length=_uint(data.get("input_length"), f"{where}.input_length"),
-            visible_length=_uint(data.get("visible_length"), f"{where}.visible_length"),
-            resulting_length=_uint(data.get("resulting_length"), f"{where}.resulting_length"),
+        request_key = _fast_request_key(data.get("request_key"))
+        if request_key is None:
+            request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.request_key")
+
+        def uint_field(name: str) -> int:
+            raw = data.get(name)
+            return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
+
+        block_table = _fast_uints(data.get("block_table", ()))
+        if block_table is None:
+            block_table = _uints(data.get("block_table", ()), f"{where}.block_table")
+        pages_to_zero = _fast_uints(data.get("pages_to_zero", ()))
+        if pages_to_zero is None:
+            pages_to_zero = _uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero")
+        fields = (
+            request_key,
+            uint_field("op_id"),
+            uint_field("group_id"),
+            block_table,
+            pages_to_zero,
+            uint_field("prefix_length"),
+            uint_field("input_length"),
+            uint_field("visible_length"),
+            uint_field("resulting_length"),
         )
+        if _validated_wire:
+            placement = object.__new__(cls)
+            for name, item in zip(cls.__slots__, fields, strict=True):
+                object.__setattr__(placement, name, item)
+            return placement
+        return cls(*fields)
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -1996,16 +2050,42 @@ class KvBranchPlacement:
             raise invalid_descriptor("KV branch placement zero set is invalid")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "KV branch placement") -> KvBranchPlacement:
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "KV branch placement",
+        *,
+        _validated_wire: bool = False,
+    ) -> KvBranchPlacement:
         data = _map(value, where)
-        return cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
-            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            branch_index=_uint(data.get("branch_index"), f"{where}.branch_index"),
-            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
-            block_table=_uints(data.get("block_table", ()), f"{where}.block_table"),
-            pages_to_zero=_uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero"),
+        request_key = _fast_request_key(data.get("request_key"))
+        if request_key is None:
+            request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.request_key")
+
+        def uint_field(name: str) -> int:
+            raw = data.get(name)
+            return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
+
+        block_table = _fast_uints(data.get("block_table", ()))
+        if block_table is None:
+            block_table = _uints(data.get("block_table", ()), f"{where}.block_table")
+        pages_to_zero = _fast_uints(data.get("pages_to_zero", ()))
+        if pages_to_zero is None:
+            pages_to_zero = _uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero")
+        fields = (
+            request_key,
+            uint_field("op_id"),
+            uint_field("branch_index"),
+            uint_field("group_id"),
+            block_table,
+            pages_to_zero,
         )
+        if _validated_wire:
+            placement = object.__new__(cls)
+            for name, item in zip(cls.__slots__, fields, strict=True):
+                object.__setattr__(placement, name, item)
+            return placement
+        return cls(*fields)
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -2298,7 +2378,7 @@ class BatchPartition:
         _validated_wire: bool = False,
     ) -> BatchPartition:
         data = _map(value, where)
-        return cls(
+        fields = dict(
             partition_id=_uint(data.get("partition_id"), f"{where}.partition_id"),
             submission_group=_uint(data.get("submission_group"), f"{where}.submission_group"),
             collective_seq=_uint(data.get("collective_seq"), f"{where}.collective_seq"),
@@ -2321,13 +2401,21 @@ class BatchPartition:
                 data.get("request_pool_indices", ()), f"{where}.request_pool_indices"
             ),
             kv_placements=tuple(
-                KvPlacement.from_wire(item, f"{where}.kv_placements[{index}]")
+                KvPlacement.from_wire(
+                    item,
+                    f"{where}.kv_placements[{index}]",
+                    _validated_wire=_validated_wire,
+                )
                 for index, item in enumerate(
                     _seq(data.get("kv_placements", ()), f"{where}.kv_placements")
                 )
             ),
             kv_branch_placements=tuple(
-                KvBranchPlacement.from_wire(item, f"{where}.kv_branch_placements[{index}]")
+                KvBranchPlacement.from_wire(
+                    item,
+                    f"{where}.kv_branch_placements[{index}]",
+                    _validated_wire=_validated_wire,
+                )
                 for index, item in enumerate(
                     _seq(
                         data.get("kv_branch_placements", ()),
@@ -2342,6 +2430,12 @@ class BatchPartition:
                 )
             ),
         )
+        if _validated_wire:
+            partition = object.__new__(cls)
+            for name, item in fields.items():
+                object.__setattr__(partition, name, item)
+            return partition
+        return cls(**fields)
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -2531,7 +2625,11 @@ class Batch:
         )
         controls = tuple(
             _fast_release_control(item)
-            or control_from_wire(item, f"execute batch.controls[{index}]")
+            or control_from_wire(
+                item,
+                f"execute batch.controls[{index}]",
+                _validated_wire=validated_wire,
+            )
             for index, item in enumerate(_seq(data.get("controls", ()), "execute batch.controls"))
         )
         input_products = tuple(

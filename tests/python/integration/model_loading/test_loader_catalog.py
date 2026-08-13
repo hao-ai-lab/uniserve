@@ -133,6 +133,7 @@ def test_qwen_checkpoint_load_resolves_architecture_and_weight_identity(tmp_path
         model_path=str(tmp_path),
         device="cpu",
         block_size=16,
+        max_batch_tokens=4096,
         kv_token_capacity=64,
         attention_backend="torch_sdpa",
         execution=_execution("bfloat16"),
@@ -148,6 +149,7 @@ def test_qwen_checkpoint_load_resolves_architecture_and_weight_identity(tmp_path
     assert loaded.tokenizer is None
     assert loaded.model.image_processor is None
     assert loaded.model.weight_spec.targets
+    assert loaded.deployment.max_batch_tokens == 4096
     for name, parameter in loaded.model.named_parameters():
         torch.testing.assert_close(parameter, checkpoint[name].to(torch.bfloat16))
 
@@ -169,6 +171,7 @@ def test_partial_scope_is_rejected_before_model_materialization(tmp_path):
                 model_path=str(tmp_path),
                 device="cpu",
                 block_size=16,
+                max_batch_tokens=4096,
                 kv_token_capacity=64,
                 attention_backend="torch_sdpa",
                 execution=_execution(),

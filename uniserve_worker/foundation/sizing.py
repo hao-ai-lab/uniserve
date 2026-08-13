@@ -1,22 +1,24 @@
 """Shared scalar sizing helpers for worker capacity declarations."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
-    'DEFAULT_NUM_BLOCKS_FALLBACK',
-    'DEFAULT_MAX_BATCH_OPS',
-    'DEFAULT_BLOCK_SIZE',
-    'CudaKVCapacity',
-    'RuntimeKVCapacity',
-    'bucketed_length',
-    'bucketed_page_count',
-    'ceil_div',
-    'device_total_bytes',
-    'derive_cuda_kv_capacity',
-    'derive_num_blocks',
-    'derive_runtime_kv_capacity',
+    "DEFAULT_NUM_BLOCKS_FALLBACK",
+    "DEFAULT_MAX_BATCH_OPS",
+    "DEFAULT_MAX_REQUEST_POOL_SIZE",
+    "DEFAULT_BLOCK_SIZE",
+    "CudaKVCapacity",
+    "RuntimeKVCapacity",
+    "bucketed_length",
+    "bucketed_page_count",
+    "ceil_div",
+    "device_total_bytes",
+    "derive_cuda_kv_capacity",
+    "derive_num_blocks",
+    "derive_runtime_kv_capacity",
 ]
 
 # Number of KV blocks assumed when a model declares no explicit token capacity
@@ -24,6 +26,7 @@ __all__ = [
 # block-count fallback rather than a token multiplier.
 DEFAULT_NUM_BLOCKS_FALLBACK = 4096
 DEFAULT_MAX_BATCH_OPS = 1024
+DEFAULT_MAX_REQUEST_POOL_SIZE = 128
 
 DEFAULT_BLOCK_SIZE = 64
 

@@ -12,30 +12,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...batch import WorkVariant
-from ...forward import (
-    EncodeKind,
-    EncodeOutput,
-    EncodeRow,
-    FlowOutput,
-    FlowPatches,
-    FlowRow,
+from ...execution.forward_batch import (
     ForwardBatch,
-    ForwardContext,
     ForwardOutput,
-    ForwardRow,
     PackedAttentionPlan,
     PagedDecodePlan,
-    PatchInput,
-    RouteId,
-    TokenEmbeddings,
-    TokenHidden,
-    TokenIds,
-    TokenLogits,
-    TokenOutput,
-    TokenRow,
-    TokenSegments,
     TokenSelection,
-    packed_token_positions,
 )
 from ...loader.schema import Stack, TowerSplit, WeightSpec
 from ...nn.attention import RadixAttention
@@ -77,12 +59,9 @@ from ..inputs import (
 )
 from ..runtime import (
     CacheGeometry,
-    DeviceRole,
     ExecutionModel,
-    LoweredStage,
     PositionLayout,
     ResourceGeometry,
-    RowKind,
     ScratchGeometry,
 )
 from .config import NeoChatConfig, NeoLlmConfig, NeoVisionConfig
@@ -125,10 +104,10 @@ def _module_tensor(
     module: nn.Module,
     value: torch.Tensor,
     *,
-    context: ForwardContext,
+    context: ForwardBatch,
     coordinate: int,
     target: torch.device,
-    call: Callable[[nn.Module, torch.Tensor, ForwardContext], torch.Tensor],
+    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
     staged = context.mesh.dispatch(value, "tower", coordinate)
     result = call(module, staged, context)
@@ -143,8 +122,8 @@ def _route_tensor(
     plan: PackedAttentionPlan | None,
     text_module: nn.Module,
     flow_module: nn.Module,
-    context: ForwardContext,
-    call: Callable[[nn.Module, torch.Tensor, ForwardContext], torch.Tensor],
+    context: ForwardBatch,
+    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
     target = value.device
     if plan is None:
@@ -199,7 +178,7 @@ def _route_tensor(
 def _plain_call(
     module: nn.Module,
     value: torch.Tensor,
-    context: ForwardContext,
+    context: ForwardBatch,
 ) -> torch.Tensor:
     del context
     return cast(torch.Tensor, module(value))
@@ -208,7 +187,7 @@ def _plain_call(
 def _parallel_call(
     module: nn.Module,
     value: torch.Tensor,
-    context: ForwardContext,
+    context: ForwardBatch,
 ) -> torch.Tensor:
     return cast(torch.Tensor, module(value, context.mesh))
 
@@ -364,7 +343,7 @@ class _SenseAttention(nn.Module):
         rope: _PackedRope,
         *,
         generation: bool,
-        context: ForwardContext,
+        context: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         coordinate = _FLOW_COORDINATE if generation else _TEXT_COORDINATE
         target = hidden.device
@@ -419,7 +398,7 @@ class _SenseAttention(nn.Module):
         self,
         hidden: torch.Tensor,
         *,
-        context: ForwardContext,
+        context: ForwardBatch,
         plan: PackedAttentionPlan | None,
         rope: _PackedRope,
     ) -> torch.Tensor:
@@ -496,7 +475,7 @@ class _SenseLayer(nn.Module):
         self,
         hidden: torch.Tensor,
         *,
-        context: ForwardContext,
+        context: ForwardBatch,
         plan: PackedAttentionPlan | None,
         rope: _PackedRope,
     ) -> torch.Tensor:
@@ -557,7 +536,7 @@ class _SenseDecoder(nn.Module):
     def forward(
         self,
         inputs: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -715,9 +694,7 @@ class NEOChatModel(ExecutionModel):
                     )
                 )
             ),
-            noise_scale_base_tokens=float(
-                getattr(config, "noise_scale_base_image_seq_len", 1.0)
-            ),
+            noise_scale_base_tokens=float(getattr(config, "noise_scale_base_image_seq_len", 1.0)),
             noise_scale_maximum=float(getattr(config, "noise_scale_max_value", 1.0)),
             text_unconditional=BranchSource.NEGATIVE_OR_START,
             image_unconditional=BranchSource.START,
@@ -754,9 +731,7 @@ class NEOChatModel(ExecutionModel):
             num_attention_heads=local_attention_head_count(
                 int(llm.num_attention_heads), parallel=self._parallel
             ),
-            num_kv_heads=local_kv_head_count(
-                int(llm.num_key_value_heads), parallel=self._parallel
-            ),
+            num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads), parallel=self._parallel),
             head_dim=int(llm.head_dim),
             dtype="bfloat16",
             store_dtype="bfloat16",
@@ -781,110 +756,25 @@ class NEOChatModel(ExecutionModel):
             }
         )
         self.max_vit_grid_tokens = _MAX_VISION_TOKENS
-        self._route_token_bounds = {
-            RouteId("mot"): max(max_text, max_image),
-            RouteId("vit"): _MAX_VISION_TOKENS,
-        }
-
-    def lower(
-        self,
-        variant: WorkVariant,
-        *,
-        retain_image: bool = False,
-    ) -> tuple[LoweredStage, ...]:
-        if variant in {
-            WorkVariant.TOKEN_EXTEND,
-            WorkVariant.TOKEN_DECODE,
-            WorkVariant.TOKEN_VERIFY,
-        }:
-            return (LoweredStage(RouteId("mot"), RowKind.TOKEN),)
-        if variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}:
-            return (LoweredStage(RouteId("mot"), RowKind.FLOW),)
-        if variant is WorkVariant.ENCODE_VISION:
-            return (
-                LoweredStage(RouteId("vit"), RowKind.ENCODE),
-                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
-            )
-        if variant is WorkVariant.MATERIALIZE:
-            if not retain_image:
-                return ()
-            return (
-                LoweredStage(RouteId("vit"), RowKind.ENCODE, publishes_state=True),
-                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
-            )
-        if variant is WorkVariant.TRANSFER_PRODUCT:
-            return ()
-        if variant in {WorkVariant.TRANSFER_KV_PUBLISH, WorkVariant.TRANSFER_KV_INSTALL}:
-            return (
-                LoweredStage(RouteId("vit"), RowKind.ENCODE, publishes_state=True),
-                LoweredStage(RouteId("mot"), RowKind.TOKEN, publishes_state=True),
-            )
-        return ()
-
-    def route_dtype(self, route: RouteId) -> str:
-        self._require_route(route)
-        return "bfloat16"
-
-    def route_device_role(self, route: RouteId) -> DeviceRole:
-        self._require_route(route)
-        return DeviceRole.PRIMARY
-
-    def route_topology(self, route: RouteId) -> tuple[str, ...]:
-        self._require_route(route)
-        return ("tp", "tower") if route == "mot" else ("tp",)
-
-    def route_graph_eligible(self, route: RouteId) -> bool:
-        self._require_route(route)
-        return route == "mot"
-
-    def route_max_tokens(self, route: RouteId) -> int:
-        try:
-            return self._route_token_bounds[route]
-        except KeyError:
-            raise ValueError(f"SenseNova received unknown route {route!s}") from None
-
-    def route_shape_key(self, route: RouteId, row: ForwardRow) -> tuple[int, ...]:
-        self._require_route(route)
-        if route == "mot":
-            return ()
-        if isinstance(row, EncodeRow):
-            return tuple(int(value) for value in row.inputs.pixels.shape)
-        raise TypeError(f"SenseNova route {route!s} received an incompatible row")
-
-    def route_uses_packed_attention(self, route: RouteId) -> bool:
-        self._require_route(route)
-        return route == "mot"
-
-    def allows_mixed(self, route: RouteId, rows: frozenset[RowKind]) -> bool:
-        self._require_route(route)
-        return route == "mot" and rows <= {RowKind.TOKEN, RowKind.FLOW}
-
-    @staticmethod
-    def _require_route(route: RouteId) -> None:
-        if route not in {"mot", "vit"}:
-            raise ValueError(f"SenseNova received unknown route {route!s}")
-
-    def forward(self, batch: ForwardBatch) -> ForwardOutput:
-        if batch.route == "mot":
-            return self._forward_mot(batch)
-        if batch.route == "vit":
-            return self._forward_vision(batch)
-        raise ValueError(f"SenseNova received unknown route {batch.route!s}")
+        self.vocab_size = int(llm.vocab_size)
+        self.hidden_size = int(llm.hidden_size)
+        self.text_max_tokens = max(max_text, max_image)
+        self.text_topology = ("tp", "tower")
+        self.tensorized_mixed = True
 
     def _flow_embeddings(
         self,
-        rows: tuple[FlowRow, ...],
-        context: ForwardContext,
+        batch: ForwardBatch,
     ) -> dict[int, torch.Tensor]:
-        patches = tuple(row.conditioning for row in rows)
-        if any(not isinstance(value, FlowPatches) for value in patches):
+        patches = batch.flow_conditioning
+        if any(value is None for value in patches):
             raise TypeError("SenseNova flow rows require patch conditioning")
-        typed = cast(tuple[FlowPatches, ...], patches)
-        target = rows[0].latent.device
+        typed = tuple(value for value in patches if value is not None)
+        target = batch.flow_latents[0].device
         pixels = torch.cat(tuple(value.pixels for value in typed), dim=0)
         grids = torch.cat(tuple(value.grid for value in typed), dim=0)
-        local_pixels = context.mesh.dispatch(pixels, "tower", _FLOW_COORDINATE)
-        local_grids = context.mesh.dispatch(grids, "tower", _FLOW_COORDINATE)
+        local_pixels = batch.mesh.dispatch(pixels, "tower", _FLOW_COORDINATE)
+        local_grids = batch.mesh.dispatch(grids, "tower", _FLOW_COORDINATE)
         tower = self.fm_modules["vision_model_mot_gen"]
         feature_dtype = next(tower.parameters()).dtype
         # Each flow row's image patch grid (height/patch, width/patch) is known
@@ -893,31 +783,35 @@ class NEOChatModel(ExecutionModel):
         # tensor back, keeping the flow forward capturable in a CUDA graph.
         patch = self._patch_size
         grid_shapes = tuple(
-            (int(row.image_height) // patch, int(row.image_width) // patch) for row in rows
+            (height // patch, width // patch)
+            for height, width in zip(batch.flow_heights, batch.flow_widths, strict=True)
         )
-        features = tower(
-            local_pixels.to(dtype=feature_dtype), local_grids, grid_shapes=grid_shapes
-        )
+        features = tower(local_pixels.to(dtype=feature_dtype), local_grids, grid_shapes=grid_shapes)
         if not isinstance(features, torch.Tensor):
             raise TypeError("SenseNova flow vision tower must return a tensor")
-        features = context.mesh.combine(
+        features = batch.mesh.combine(
             features,
             "tower",
             _FLOW_COORDINATE,
             target,
         )
-        expected = sum(int(row.image_tokens) for row in rows)
+        expected = sum(batch.flow_image_tokens)
         if int(features.shape[0]) != expected:
             raise ValueError("SenseNova flow vision features do not match row geometry")
 
         timesteps = torch.cat(
-            tuple(row.timestep.reshape(1).expand(int(row.image_tokens)) for row in rows),
+            tuple(
+                timestep.reshape(1).expand(image_tokens)
+                for timestep, image_tokens in zip(
+                    batch.flow_timesteps, batch.flow_image_tokens, strict=True
+                )
+            ),
             dim=0,
         )
         time_features = _module_tensor(
             self.fm_modules["timestep_embedder"],
             timesteps,
-            context=context,
+            context=batch,
             coordinate=_FLOW_COORDINATE,
             target=target,
             call=_plain_call,
@@ -926,8 +820,8 @@ class NEOChatModel(ExecutionModel):
         if self._add_noise_embedding:
             noise = torch.cat(
                 tuple(
-                    value.noise_scale.reshape(1).expand(int(row.image_tokens))
-                    for row, value in zip(rows, typed, strict=True)
+                    value.noise_scale.reshape(1).expand(image_tokens)
+                    for image_tokens, value in zip(batch.flow_image_tokens, typed, strict=True)
                 ),
                 dim=0,
             )
@@ -935,7 +829,7 @@ class NEOChatModel(ExecutionModel):
             features = features + _module_tensor(
                 self.fm_modules["noise_scale_embedder"],
                 noise,
-                context=context,
+                context=batch,
                 coordinate=_FLOW_COORDINATE,
                 target=target,
                 call=_plain_call,
@@ -943,71 +837,79 @@ class NEOChatModel(ExecutionModel):
 
         result: dict[int, torch.Tensor] = {}
         offset = 0
-        for row in rows:
-            end = offset + int(row.image_tokens)
-            result[row.row_id] = features[offset:end]
+        for row_index, image_tokens in zip(
+            batch.flow_row_indices, batch.flow_image_tokens, strict=True
+        ):
+            end = offset + image_tokens
+            result[row_index] = features[offset:end]
             offset = end
         return result
 
-    def _forward_mot(self, batch: ForwardBatch) -> ForwardOutput:
-        rows: list[TokenRow | FlowRow] = []
-        for row in batch.rows:
-            if not isinstance(row, (TokenRow, FlowRow)):
-                raise TypeError("SenseNova mot route accepts token and flow rows")
-            rows.append(row)
-        attention = batch.context.attention
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        batch: ForwardBatch,
+    ) -> torch.Tensor:
+        attention = batch.attention
         decode_positions: torch.Tensor | None = None
         if isinstance(attention, PagedDecodePlan):
-            if any(not isinstance(row, TokenRow) for row in rows):
+            if batch.flow_row_indices:
                 raise TypeError("SenseNova paged decode accepts token rows only")
-            token_rows = cast(tuple[TokenRow, ...], tuple(rows))
-            decode_positions = packed_token_positions(token_rows)
-            if decode_positions is None:
-                decode_positions = torch.cat(
-                    tuple(row.positions.reshape(-1) for row in token_rows),
-                    dim=0,
-                )
-        flow_rows = tuple(row for row in rows if isinstance(row, FlowRow))
-        flow_embeddings = self._flow_embeddings(flow_rows, batch.context) if flow_rows else {}
-        chunks: list[torch.Tensor] = []
-        spans: list[tuple[int, int]] = []
-        offset = 0
-        for row in rows:
-            if isinstance(row, TokenRow):
-                chunk = self._token_embeddings(row, batch.context)
-            else:
-                chunk = flow_embeddings[row.row_id]
-            chunk = chunk.reshape(-1, chunk.shape[-1])
-            chunks.append(chunk)
-            spans.append((offset, offset + int(chunk.shape[0])))
-            offset += int(chunk.shape[0])
-        hidden = self.language_model.model(
-            torch.cat(chunks, dim=0),
-            batch.context,
+            decode_positions = positions
+        token_embeds = self.language_model.model.embed_tokens(input_ids.reshape(-1), batch.mesh)
+        if batch.input_embeddings is not None:
+            if batch.embedding_mask is None:
+                raise RuntimeError("SenseNova embedding input lost its selection mask")
+            token_embeds = torch.where(
+                batch.embedding_mask.reshape(-1, 1),
+                batch.input_embeddings.to(dtype=token_embeds.dtype),
+                token_embeds,
+            )
+        flow_embeddings = self._flow_embeddings(batch) if batch.flow_row_indices else {}
+        chunks: list[torch.Tensor | None] = [None] * batch.row_count
+        token_offset = 0
+        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+            chunks[row_index] = token_embeds[token_offset : token_offset + count]
+            token_offset += count
+        for row_index in batch.flow_row_indices:
+            chunks[row_index] = flow_embeddings[row_index]
+        if any(value is None for value in chunks):
+            raise RuntimeError("SenseNova forward batch contains an unbound row")
+        return self.language_model.model(
+            torch.cat(
+                tuple(value.reshape(-1, value.shape[-1]) for value in chunks if value is not None),
+                dim=0,
+            ),
+            batch,
             positions=decode_positions,
         )
-        return self._mot_outputs(hidden, tuple(rows), tuple(spans), batch.context)
 
-    def _mot_outputs(
-        self,
-        hidden: torch.Tensor,
-        rows: tuple[TokenRow | FlowRow, ...],
-        spans: tuple[tuple[int, int], ...],
-        context: ForwardContext,
-    ) -> ForwardOutput:
-        row_hidden = tuple(hidden[begin:end] for begin, end in spans)
+    def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
+        row_lengths = [0] * batch.row_count
+        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+            row_lengths[row_index] = count
+        for row_index, count in zip(batch.flow_row_indices, batch.flow_image_tokens, strict=True):
+            row_lengths[row_index] = count
+        rows: list[torch.Tensor] = []
+        offset = 0
+        for count in row_lengths:
+            rows.append(hidden[offset : offset + count])
+            offset += count
+        row_hidden = tuple(rows)
+        selection_by_row = dict(zip(batch.token_row_indices, batch.token_selections, strict=True))
         projected_rows = tuple(
             index
-            for index, row in enumerate(rows)
-            if isinstance(row, TokenRow) and row.selection is not TokenSelection.HIDDEN
+            for index, selection in selection_by_row.items()
+            if selection is not TokenSelection.HIDDEN
         )
         projected: torch.Tensor | None = None
         if projected_rows:
             if (
-                len(projected_rows) == len(rows)
+                len(projected_rows) == batch.row_count
                 and all(
-                    isinstance(row, TokenRow) and row.selection is TokenSelection.LAST_LOGITS
-                    for row in rows
+                    selection is TokenSelection.LAST_LOGITS
+                    for selection in selection_by_row.values()
                 )
                 and all(int(value.shape[0]) == 1 for value in row_hidden)
             ):
@@ -1015,69 +917,50 @@ class NEOChatModel(ExecutionModel):
             else:
                 selected_rows = tuple(
                     row_hidden[index]
-                    if cast(TokenRow, rows[index]).selection is TokenSelection.ALL_LOGITS
+                    if selection_by_row[index] is TokenSelection.ALL_LOGITS
                     else row_hidden[index][-1:]
                     for index in projected_rows
                 )
                 selected = (
                     selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
                 )
-            projected = self.language_model.lm_head(selected, context.mesh)
+            projected = self.language_model.lm_head(selected, batch.mesh)
 
-        outputs: list[TokenOutput | FlowOutput] = []
+        outputs: list[torch.Tensor] = []
         projected_offset = 0
-        for index, row in enumerate(rows):
+        flow_by_row = {row_index: index for index, row_index in enumerate(batch.flow_row_indices)}
+        for index in range(batch.row_count):
             value_hidden = row_hidden[index]
-            if isinstance(row, TokenRow):
-                value: TokenHidden | TokenLogits
-                if row.selection is TokenSelection.HIDDEN:
-                    value = TokenHidden(value_hidden)
+            selection = selection_by_row.get(index)
+            if selection is not None:
+                if selection is TokenSelection.HIDDEN:
+                    value = value_hidden
                 else:
                     if projected is None:
                         raise RuntimeError("SenseNova projected output buffer is missing")
                     count = (
-                        int(value_hidden.shape[0])
-                        if row.selection is TokenSelection.ALL_LOGITS
-                        else 1
+                        int(value_hidden.shape[0]) if selection is TokenSelection.ALL_LOGITS else 1
                     )
-                    value = TokenLogits(projected[projected_offset : projected_offset + count])
+                    value = projected[projected_offset : projected_offset + count]
                     projected_offset += count
-                outputs.append(TokenOutput(row.row_id, row.output_slot, value))
+                outputs.append(value)
             else:
-                prediction = self._velocity(value_hidden, row, context)
-                outputs.append(FlowOutput(row.row_id, row.output_slot, prediction))
+                flow_index = flow_by_row[index]
+                outputs.append(self._velocity(value_hidden, flow_index, batch))
         return ForwardOutput(tuple(outputs))
-
-    def _token_embeddings(
-        self,
-        row: TokenRow,
-        context: ForwardContext,
-    ) -> torch.Tensor:
-        embed = self.language_model.model.embed_tokens
-        if isinstance(row.inputs, TokenIds):
-            return embed(row.inputs.values.reshape(-1), context.mesh)
-        if isinstance(row.inputs, TokenEmbeddings):
-            return row.inputs.values.reshape(-1, row.inputs.values.shape[-1])
-        if not isinstance(row.inputs, TokenSegments):
-            raise TypeError("SenseNova token row has an unknown input variant")
-        return torch.cat(
-            tuple(
-                embed(segment.values.reshape(-1), context.mesh)
-                if isinstance(segment, TokenIds)
-                else segment.values.reshape(-1, segment.values.shape[-1])
-                for segment in row.inputs.values
-            ),
-            dim=0,
-        )
 
     def _velocity(
         self,
         hidden: torch.Tensor,
-        row: FlowRow,
-        context: ForwardContext,
+        flow_index: int,
+        context: ForwardBatch,
     ) -> torch.Tensor:
-        target = row.latent.device
-        latent = row.latent
+        target = context.flow_latents[flow_index].device
+        latent = context.flow_latents[flow_index]
+        image_tokens = context.flow_image_tokens[flow_index]
+        image_height = context.flow_heights[flow_index]
+        image_width = context.flow_widths[flow_index]
+        timestep = context.flow_timesteps[flow_index]
         was_flat = latent.ndim == 2
         latent_batch = latent.unsqueeze(0) if was_flat else latent
         hidden_batch = hidden.unsqueeze(0)
@@ -1092,16 +975,16 @@ class NEOChatModel(ExecutionModel):
             _FLOW_COORDINATE,
         )
         local_timestep = context.mesh.dispatch(
-            row.timestep.reshape(1),
+            timestep.reshape(1),
             "tower",
             _FLOW_COORDINATE,
         )
         batch, latent_tokens = int(local_latent.shape[0]), int(local_latent.shape[1])
         if self._use_pixel_head:
             merge = int(1 / self._downsample_ratio)
-            token_height = row.image_height // (self._patch_size * merge)
-            token_width = row.image_width // (self._patch_size * merge)
-            image = local_hidden[:, -row.image_tokens :].view(
+            token_height = image_height // (self._patch_size * merge)
+            token_width = image_width // (self._patch_size * merge)
+            image = local_hidden[:, -image_tokens:].view(
                 batch,
                 token_height,
                 token_width,
@@ -1125,12 +1008,12 @@ class NEOChatModel(ExecutionModel):
             )
         elif self._use_deep_head:
             predicted = self.fm_modules["fm_head"](
-                local_hidden[:, -row.image_tokens :].reshape(batch * latent_tokens, -1),
+                local_hidden[:, -image_tokens:].reshape(batch * latent_tokens, -1),
                 local_timestep.repeat(batch * latent_tokens),
             ).view(batch, latent_tokens, -1)
         else:
             predicted = self.fm_modules["fm_head"](
-                local_hidden[:, -row.image_tokens :].view(batch, latent_tokens, -1)
+                local_hidden[:, -image_tokens:].view(batch, latent_tokens, -1)
             ).view(batch, latent_tokens, -1)
         velocity = (predicted - local_latent) / (1 - local_timestep).clamp_min(_GENERATION_EPSILON)
         velocity = context.mesh.combine(
@@ -1141,41 +1024,25 @@ class NEOChatModel(ExecutionModel):
         )
         return velocity[0] if was_flat else velocity
 
-    def _forward_vision(self, batch: ForwardBatch) -> ForwardOutput:
-        rows = tuple(row for row in batch.rows if isinstance(row, EncodeRow))
-        if len(rows) != len(batch.rows) or any(
-            row.kind is not EncodeKind.VISION or not isinstance(row.inputs, PatchInput)
-            for row in rows
+    def encode(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+        if any(grid is None for grid in batch.encode_grids) or any(
+            shape is None for shape in batch.encode_grid_shapes
         ):
-            raise TypeError("SenseNova vit route requires vision patch rows")
-        pixels = torch.cat(
-            tuple(cast(PatchInput, row.inputs).pixels for row in rows),
-            dim=0,
-        )
-        grids = torch.cat(
-            tuple(cast(PatchInput, row.inputs).grid for row in rows),
-            dim=0,
-        )
-        grid_shapes = tuple(cast(PatchInput, row.inputs).grid_shape for row in rows)
-        features = self.vision_model(pixels, grids, grid_shapes=grid_shapes)
+            raise TypeError("SenseNova vision encode requires patch grids")
+        grids = torch.cat(tuple(grid for grid in batch.encode_grids if grid is not None), dim=0)
+        grid_shapes = tuple(shape for shape in batch.encode_grid_shapes if shape is not None)
+        packed_pixels = torch.cat(pixels, dim=0)
+        features = self.vision_model(packed_pixels, grids, grid_shapes=grid_shapes)
         factor = max(
             1,
             int(round(1 / self._downsample_ratio)),
         )
-        counts = tuple(
-            int(cast(PatchInput, row.inputs).pixels.shape[0]) // (factor * factor) for row in rows
-        )
+        counts = tuple(int(value.shape[0]) // (factor * factor) for value in pixels)
         if sum(counts) != int(features.shape[0]):
             raise ValueError("SenseNova vision output does not align with encode rows")
-        outputs: list[EncodeOutput] = []
+        outputs: list[torch.Tensor] = []
         offset = 0
-        for row, count in zip(rows, counts, strict=True):
-            outputs.append(
-                EncodeOutput(
-                    row.row_id,
-                    row.output_slot,
-                    features[offset : offset + count],
-                )
-            )
+        for count in counts:
+            outputs.append(features[offset : offset + count])
             offset += count
         return ForwardOutput(tuple(outputs))

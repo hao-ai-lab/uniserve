@@ -160,6 +160,7 @@ class CachePool:
         )
         self.k = torch.zeros(shape, device=device, dtype=self.store_dtype)
         self.v = torch.zeros(shape, device=device, dtype=self.store_dtype)
+        self._page_ids = torch.arange(self.num_pages, dtype=torch.long, device=self.k.device)
         scale_shape = (self.num_layers, self.num_pages, 1, 1, 1)
         self.k_scale = (
             torch.ones(scale_shape, device=device, dtype=torch.float32)
@@ -178,6 +179,9 @@ class CachePool:
         self.v_scale_set = (
             torch.zeros(scale_flags, device=device, dtype=torch.bool) if self.is_quantized else None
         )
+        self._validated_page_tuples: dict[
+            tuple[tuple[int, ...], bool, bool | None, int | None], tuple[int, ...]
+        ] = {}
 
     def _group_ranges(
         self,
@@ -225,6 +229,23 @@ class CachePool:
         group: int | None = None,
     ) -> tuple[int, ...]:
         pages = tuple(int(page) for page in page_ids)
+        key = (pages, bool(allow_sentinel), scratch, group)
+        cached = self._validated_page_tuples.get(key)
+        if cached is not None:
+            return cached
+        validated = self._validate_page_tuple(pages, allow_sentinel, scratch, group)
+        if len(self._validated_page_tuples) >= 16_384:
+            self._validated_page_tuples.clear()
+        self._validated_page_tuples[key] = validated
+        return validated
+
+    def _validate_page_tuple(
+        self,
+        pages: tuple[int, ...],
+        allow_sentinel: bool,
+        scratch: bool | None,
+        group: int | None,
+    ) -> tuple[int, ...]:
         real_pages = tuple(page for page in pages if page != 0)
         if len(set(real_pages)) != len(real_pages):
             raise invalid_descriptor("KV placement repeats a physical page")
@@ -251,7 +272,7 @@ class CachePool:
         pages = self.validate_pages(page_ids, group=group)
         if not pages:
             return
-        indices = torch.tensor(pages, dtype=torch.long, device=self.k.device)
+        indices = self._device_page_indices(pages)
         self.k.index_fill_(1, indices, 0)
         self.v.index_fill_(1, indices, 0)
         if self.k_scale is not None and self.v_scale is not None:
@@ -273,9 +294,8 @@ class CachePool:
         target_ids = self.validate_pages(target_pages, group=group)
         if not source_ids:
             return
-        device = self.k.device
-        source = torch.tensor(source_ids, dtype=torch.long, device=device)
-        target = torch.tensor(target_ids, dtype=torch.long, device=device)
+        source = self._device_page_indices(source_ids)
+        target = self._device_page_indices(target_ids)
         for store in (
             self.k,
             self.v,
@@ -309,7 +329,7 @@ class CachePool:
         page_ids: Iterable[int],
     ) -> tuple[torch.Tensor, ...]:
         pages = self.validate_pages(page_ids, group=group)
-        index = torch.tensor(pages, dtype=torch.long, device=self.k.device)
+        index = self._device_page_indices(pages)
         values: list[torch.Tensor] = [
             self.k.index_select(1, index),
             self.v.index_select(1, index),
@@ -340,7 +360,7 @@ class CachePool:
         )
         if len(tensors) != len(stores):
             raise invalid_descriptor("KV page payload does not match pool fields")
-        index = torch.tensor(pages, dtype=torch.long, device=self.k.device)
+        index = self._device_page_indices(pages)
         for store, tensor in zip(stores, tensors, strict=True):
             expected = (self.num_layers, len(pages), *store.shape[2:])
             if tuple(tensor.shape) != expected:
@@ -350,6 +370,14 @@ class CachePool:
                 index,
                 tensor.to(device=store.device, dtype=store.dtype),
             )
+
+    def _device_page_indices(self, pages: tuple[int, ...]) -> torch.Tensor:
+        if not pages:
+            return self._page_ids[:0]
+        first = pages[0]
+        if pages == tuple(range(first, first + len(pages))):
+            return self._page_ids[first : first + len(pages)]
+        return torch.stack(tuple(self._page_ids[page] for page in pages))
 
     def layer_cache(self, layer: int, group: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         self.validate_group(group)
@@ -545,6 +573,49 @@ class CacheBatchView:
         self._block_tables: dict[torch.device, torch.Tensor] = {}
         self._cache_lengths: dict[torch.device, torch.Tensor] = {}
 
+    @classmethod
+    def from_validated_rows(
+        cls,
+        pool: CachePool,
+        rows: Sequence[CacheRow],
+        query_lengths: Sequence[int] | None = None,
+        write_rows: Sequence[bool] | None = None,
+    ) -> CacheBatchView:
+        """Build a model view from rows validated at partition registration."""
+
+        if not rows:
+            raise invalid_descriptor("KV batch view requires at least one row")
+        view = cls.__new__(cls)
+        view._pool = pool
+        view._rows = tuple(rows)
+        view._block_ids = tuple(row.block_table for row in rows)
+        view._base_lens = tuple(int(row.length) for row in rows)
+        view._query_lens = (
+            None if query_lengths is None else tuple(int(value) for value in query_lengths)
+        )
+        if view._query_lens is not None and len(view._query_lens) != len(rows):
+            raise invalid_descriptor("KV query lengths do not align with rows")
+        view._write_rows = (
+            (True,) * len(rows)
+            if write_rows is None
+            else tuple(bool(value) for value in write_rows)
+        )
+        if len(view._write_rows) != len(rows):
+            raise invalid_descriptor("KV write predicates do not align with rows")
+        for row, query, write in zip(
+            rows,
+            view._query_lens or (0,) * len(rows),
+            view._write_rows,
+            strict=True,
+        ):
+            required = row.length + query if write else row.length
+            if required > row.capacity:
+                raise invalid_descriptor("KV row exceeds scheduler capacity")
+        view._block_table_width = bucketed_page_count(max(map(len, view._block_ids)))
+        view._block_tables = {}
+        view._cache_lengths = {}
+        return view
+
     @property
     def block_size(self) -> int:
         return self._pool.block_size
@@ -574,18 +645,49 @@ class CacheBatchView:
         base_len: int,
         query_len: int,
     ) -> CacheBatchView:
+        return self.with_synthetic_rows(
+            block_ids,
+            count=1,
+            base_len=base_len,
+            query_len=query_len,
+        )
+
+    def with_synthetic_rows(
+        self,
+        block_ids: Sequence[int],
+        *,
+        count: int,
+        base_len: int,
+        query_len: int,
+    ) -> CacheBatchView:
+        """Extend a validated view with repeated bounded padding rows."""
+
         if self._query_lens is None:
             raise invalid_descriptor("synthetic KV rows require declared query lengths")
-        row = CacheRow(
-            tuple(block_ids),
-            int(base_len),
-            len(block_ids) * self.block_size,
+        row_count = int(count)
+        if row_count < 0:
+            raise invalid_descriptor("synthetic KV row count must not be negative")
+        if row_count == 0:
+            return self
+        pages = self._pool.validate_pages(
+            block_ids,
+            allow_sentinel=True,
+            group=self._rows[0].group_id,
         )
-        return CacheBatchView(
+        rows = tuple(
+            CacheRow(
+                pages,
+                int(base_len),
+                len(pages) * self.block_size,
+                group_id=self._rows[0].group_id,
+            )
+            for _ in range(row_count)
+        )
+        return CacheBatchView.from_validated_rows(
             self._pool,
-            (*self._rows, row),
-            (*self._query_lens, int(query_len)),
-            (*self._write_rows, True),
+            (*self._rows, *rows),
+            (*self._query_lens, *((int(query_len),) * row_count)),
+            (*self._write_rows, *((True,) * row_count)),
         )
 
     def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -619,10 +721,41 @@ class CacheBatchView:
         cache_seqlens: torch.Tensor,
         query_offsets: torch.Tensor,
     ) -> None:
-        del block_table, cache_seqlens, query_offsets
         lengths = tuple(int(item) for item in row_lengths)
         if key.shape != value.shape or key.ndim != 3 or sum(lengths) != int(key.shape[0]):
             raise invalid_descriptor("ragged KV append tensors do not align with rows")
+        if not self._pool.is_quantized and all(self._write_rows):
+            row_count = len(lengths)
+            token_count = int(key.shape[0])
+            if (
+                block_table.ndim != 2
+                or int(block_table.shape[0]) != row_count
+                or tuple(cache_seqlens.shape) != (row_count,)
+                or tuple(query_offsets.shape) != (row_count + 1,)
+            ):
+                raise invalid_descriptor("ragged KV write metadata does not align with rows")
+            token_indices = torch.arange(token_count, device=key.device, dtype=torch.int64)
+            offsets = query_offsets.to(device=key.device, dtype=torch.int64)
+            row_indices = torch.searchsorted(offsets[1:], token_indices, right=True)
+            positions = cache_seqlens.to(device=key.device, dtype=torch.int64).index_select(
+                0, row_indices
+            )
+            positions += token_indices - offsets.index_select(0, row_indices)
+            page_slots = torch.div(positions, self.block_size, rounding_mode="floor")
+            page_ids = block_table.to(device=key.device).to(dtype=torch.int64)[
+                row_indices, page_slots
+            ]
+            key_cache, value_cache = self.layer_kv(layer)
+            paged_kv_write(
+                key_cache,
+                value_cache,
+                page_ids,
+                torch.remainder(positions, self.block_size),
+                key,
+                value,
+                cast=key.dtype != key_cache.dtype or value.dtype != value_cache.dtype,
+            )
+            return
         offset = 0
         for row, length, write in zip(self._rows, lengths, self._write_rows, strict=True):
             if write and length:

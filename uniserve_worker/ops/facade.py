@@ -1,7 +1,8 @@
 """Thin model-facing operator functions."""
+
 from __future__ import annotations
 
-from ..forward import AttentionSelection
+from ..execution.forward_batch import AttentionSelection
 from .requests import (
     AddRmsNormReq,
     AttentionRegime,
@@ -18,10 +19,20 @@ from .requests import (
 def rms_norm(hidden_states, weight, eps: float, *, override: str | None = None):
     from .providers import rms_norm_dispatcher
 
-    return rms_norm_dispatcher().run(RmsNormReq(hidden_states, weight, float(eps)), override=override)
+    return rms_norm_dispatcher().run(
+        RmsNormReq(hidden_states, weight, float(eps)), override=override
+    )
 
 
-def add_rms_norm(hidden_states, residual, weight, eps: float, *, in_place: bool = False, override: str | None = None):
+def add_rms_norm(
+    hidden_states,
+    residual,
+    weight,
+    eps: float,
+    *,
+    in_place: bool = False,
+    override: str | None = None,
+):
     from .providers import add_rms_norm_dispatcher
 
     return add_rms_norm_dispatcher().run(
@@ -44,7 +55,14 @@ def qk_norm(q, k, q_weight, k_weight, eps: float, *, axis_dims=None, override: s
     from .providers import qk_norm_dispatcher
 
     return qk_norm_dispatcher().run(
-        QKNormReq(q, k, q_weight, k_weight, float(eps), None if axis_dims is None else tuple(int(v) for v in axis_dims)),
+        QKNormReq(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            float(eps),
+            None if axis_dims is None else tuple(int(v) for v in axis_dims),
+        ),
         override=override,
     )
 
@@ -86,7 +104,9 @@ def qk_norm_rope(
     )
 
 
-def qk_norm_packed_rope(q, k, q_weight, k_weight, cos, sin, eps: float, *, override: str | None = None):
+def qk_norm_packed_rope(
+    q, k, q_weight, k_weight, cos, sin, eps: float, *, override: str | None = None
+):
     q, k = qk_norm(q, k, q_weight, k_weight, eps, override=override)
     return rope(q, cos, sin, override=override), rope(k, cos, sin, override=override)
 

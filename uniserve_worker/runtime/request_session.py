@@ -6,10 +6,7 @@ import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
-
-if TYPE_CHECKING:
-    import torch
+from typing import Protocol, TypeAlias, cast
 
 from ..batch import (
     Admission,
@@ -137,7 +134,7 @@ class RequestSession:
     resolved_versions: dict[tuple[int, int], VersionRef] = field(default_factory=dict)
     resolved_runtime: dict[tuple[int, int], ResolvedRuntimeState] = field(default_factory=dict)
     resolved_operations: dict[int, VersionRef] = field(default_factory=dict)
-    resolved_parents: dict[int, VersionRef] = field(default_factory=dict)
+    declared_parents: dict[int, VersionRef] = field(default_factory=dict)
     terminal_cutoff: VersionRef | None = None
     latent_product: ProductRef | None = None
     product_handles: set[int] = field(default_factory=set)
@@ -147,13 +144,6 @@ class RequestSession:
     rng_counter: int = 0
     last_op_id: int | None = None
     last_step_id: int | None = None
-    # Device-resident committed penalty count base: a dense per-vocabulary count
-    # tensor the sampler folds each generated token into as its operation
-    # executes. A successor reads it before its predecessors are host-observed,
-    # so repetition/frequency/presence penalties are device-continuous without
-    # any host token history. Allocated lazily on the first penalty-bearing
-    # operation; ``None`` while the request uses no penalties.
-    penalty_counts: "torch.Tensor | None" = None
 
     def __post_init__(self) -> None:
         if self.request_pool_idx < 1:
@@ -212,6 +202,23 @@ class RequestSession:
 
     def selected_for_operation(self, op_id: int) -> VersionRef | None:
         return self.resolved_operations.get(int(op_id))
+
+    def semantic_parent_for_operation(self, op_id: int) -> VersionRef | None:
+        """Resolve an operation's declared execution parent to its semantic point."""
+
+        parent = self.declared_parents.get(int(op_id))
+        if parent is None or parent.is_fixed():
+            return parent
+        return self.selected_for_operation(parent.producer_op_id)
+
+    def execution_runtime_for_operation(
+        self,
+        op_id: int,
+        point_index: int,
+    ) -> ResolvedRuntimeState | None:
+        """Return the physical runtime produced by one exact operation point."""
+
+        return self.resolved_runtime.get((int(op_id), int(point_index)))
 
 
 class SessionStore:
@@ -366,7 +373,7 @@ class SessionStore:
             root_key = session.point_key(root)
             session.resolved_versions[root_key] = root
             session.resolved_operations[0] = root
-            session.resolved_parents[0] = root
+            session.declared_parents[0] = root
             session.resolved_runtime[root_key] = ResolvedRuntimeState(
                 logical_position=session.logical_position,
                 rng_counter=session.rng_counter,
@@ -402,7 +409,7 @@ class SessionStore:
         session_id: int,
         op_id: int,
         parent: VersionRef,
-    ) -> tuple[VersionRef, ResolvedRuntimeState, bool]:
+    ) -> tuple[VersionRef, ResolvedRuntimeState]:
         """Resolve a device-predicated no-op to its predecessor's selected point."""
 
         session = self.get(session_id)
@@ -431,14 +438,7 @@ class SessionStore:
             session.resolved_versions[key] = selected
             session.resolved_runtime[key] = runtime
             session.resolved_operations[int(op_id)] = selected
-            session.resolved_parents[int(op_id)] = selected
-            latest = session.resolved_op_id == int(op_id)
-            if latest:
-                session.version = int(point.point_index)
-                session.resolved_op_id = int(selected.producer_op_id)
-                session.resolved_digest = point.semantic_digest
-                session.install_runtime(runtime)
-            return selected, runtime, latest
+            return selected, runtime
 
     def finalize_prefixes(
         self,
@@ -522,8 +522,14 @@ class SessionStore:
             raise invalid_descriptor("commit control selected point is not fixed")
         if session.resolved_versions.get(session.point_key(selected)) != selected:
             raise invalid_descriptor("commit control selected point was not resolved")
-        if session.resolved_parents.get(int(selected.producer_op_id)) != control.expected_parent:
-            raise invalid_descriptor("commit control selected point is not a child of its parent")
+        resolved_parent = session.semantic_parent_for_operation(selected.producer_op_id)
+        if resolved_parent != control.expected_parent:
+            raise invalid_descriptor(
+                "commit control selected point has a different resolved parent: "
+                f"selected producer {selected.producer_op_id}, "
+                f"resolved parent {resolved_parent!r}, "
+                f"expected parent {control.expected_parent!r}"
+            )
         runtime = session.runtime_for(selected)
         if runtime is None:
             raise invalid_descriptor("commit control selected point lost its runtime state")
@@ -579,8 +585,7 @@ class SessionStore:
         session.resolved_versions = {key: cutoff}
         session.resolved_runtime = {key: runtime}
         session.resolved_operations = {int(cutoff.producer_op_id): cutoff}
-        parent = session.resolved_parents.get(int(cutoff.producer_op_id), cutoff)
-        session.resolved_parents = {int(cutoff.producer_op_id): parent}
+        session.declared_parents = {int(cutoff.producer_op_id): cutoff}
         return KvControlUpdate(
             session_id=session.session_id,
             visible_len=runtime.kv_visible_len,
@@ -628,8 +633,7 @@ class SessionStore:
                 snapshot.resolved_versions = {key: committed}
                 snapshot.resolved_runtime = {key: runtime}
                 snapshot.resolved_operations = {snapshot.committed_op_id: committed}
-                parent = snapshot.resolved_parents.get(snapshot.committed_op_id, committed)
-                snapshot.resolved_parents = {snapshot.committed_op_id: parent}
+                snapshot.declared_parents = {snapshot.committed_op_id: committed}
                 snapshots.append(snapshot)
             return tuple(snapshots)
         finally:
@@ -883,11 +887,7 @@ class StepTxn:
                 session.version = point.point_index
                 session.resolved_op_id = selected.producer_op_id
                 session.resolved_digest = point.semantic_digest
-                runtime = (
-                    resolved_runtime.get(operation.request_key.session_id)
-                    if operation.advances_state
-                    else session.runtime_for(selected)
-                )
+                runtime = resolved_runtime.get(operation.request_key.session_id)
                 if runtime is None:
                     raise RuntimeError("resolved operation runtime state is missing")
                 prefixes = (
@@ -920,6 +920,16 @@ class StepTxn:
                     and session.resolved_versions.get(session.point_key(selected)) != selected
                 ):
                     raise RuntimeError("selected operation point is absent from its prefix ledger")
+                if not operation.advances_state:
+                    key = session.point_key(selected)
+                    self._record_history_write(
+                        operation.request_key.session_id,
+                        "runtime",
+                        cast(dict[object, object], session.resolved_runtime),
+                        key,
+                    )
+                    session.resolved_runtime[key] = runtime
+                    session.install_runtime(runtime)
                 self._record_history_write(
                     operation.request_key.session_id,
                     "operation",
@@ -927,20 +937,18 @@ class StepTxn:
                     int(operation.op_id),
                 )
                 session.resolved_operations[int(operation.op_id)] = selected
-                resolved_parent = (
-                    parent
-                    if parent.is_fixed()
-                    else session.selected_for_operation(parent.producer_op_id)
-                )
-                if resolved_parent is None:
+                if (
+                    not parent.is_fixed()
+                    and session.selected_for_operation(parent.producer_op_id) is None
+                ):
                     raise RuntimeError("resolved operation parent is missing")
                 self._record_history_write(
                     operation.request_key.session_id,
                     "parent",
-                    cast(dict[object, object], session.resolved_parents),
+                    cast(dict[object, object], session.declared_parents),
                     int(operation.op_id),
                 )
-                session.resolved_parents[int(operation.op_id)] = resolved_parent
+                session.declared_parents[int(operation.op_id)] = parent
                 session.last_op_id = operation.op_id
                 session.last_step_id = self.step_id
             for _store, transaction in self._store_transactions:

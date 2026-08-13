@@ -1,13 +1,14 @@
 """SGL kernel FlashAttention backend."""
+
 from __future__ import annotations
 
 import torch
 
-from ...forward import ForwardContext
+from ...execution.forward_batch import ForwardBatch
 from .base import AttentionCapabilities
 
 __all__ = [
-    'SglKernelAttentionBackend',
+    "SglKernelAttentionBackend",
 ]
 
 try:  # pragma: no cover - optional CUDA package.
@@ -31,8 +32,7 @@ class SglKernelAttentionBackend:
     def capabilities(self) -> AttentionCapabilities:
         return AttentionCapabilities(
             available=any(
-                value is not None
-                for value in (_flash_attn_varlen_func, _flash_attn_with_kvcache)
+                value is not None for value in (_flash_attn_varlen_func, _flash_attn_with_kvcache)
             ),
             segment_batched_cfg=False,
             mixed_mode=False,
@@ -51,7 +51,7 @@ class SglKernelAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         if _flash_attn_varlen_func is None:
             raise RuntimeError("sgl_kernel flash attention backend is not available")
@@ -73,15 +73,23 @@ class SglKernelAttentionBackend:
                 context=context,
             )
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-            raise ValueError("sgl_kernel flash attention expects q/k/v in [B,H,L,D] or [L,H,D] layout")
+            raise ValueError(
+                "sgl_kernel flash attention expects q/k/v in [B,H,L,D] or [L,H,D] layout"
+            )
         batch = int(q.shape[0])
         q_len = int(q.shape[2])
         k_len = int(k.shape[2])
         if k_len != int(v.shape[2]):
             raise ValueError("sgl_kernel flash attention requires matching K/V lengths")
-        q_flat = q.transpose(1, 2).contiguous().view(batch * q_len, int(q.shape[1]), int(q.shape[3]))
-        k_flat = k.transpose(1, 2).contiguous().view(batch * k_len, int(k.shape[1]), int(k.shape[3]))
-        v_flat = v.transpose(1, 2).contiguous().view(batch * k_len, int(v.shape[1]), int(v.shape[3]))
+        q_flat = (
+            q.transpose(1, 2).contiguous().view(batch * q_len, int(q.shape[1]), int(q.shape[3]))
+        )
+        k_flat = (
+            k.transpose(1, 2).contiguous().view(batch * k_len, int(k.shape[1]), int(k.shape[3]))
+        )
+        v_flat = (
+            v.transpose(1, 2).contiguous().view(batch * k_len, int(v.shape[1]), int(v.shape[3]))
+        )
         cu_q = torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=q.device)
         cu_k = torch.arange(0, (batch + 1) * k_len, k_len, dtype=torch.int32, device=q.device)
         out = self.forward_varlen(
@@ -110,7 +118,7 @@ class SglKernelAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if _flash_attn_with_kvcache is None:
@@ -174,7 +182,7 @@ class SglKernelAttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
-        context: ForwardContext | None = None,
+        context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del context
         if _flash_attn_varlen_func is None:
@@ -182,7 +190,9 @@ class SglKernelAttentionBackend:
         if block_table is not None:
             raise RuntimeError("sgl_kernel backend is only used for contiguous varlen prefill")
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-            raise ValueError("sgl_kernel varlen attention expects q/k/v in [total,heads,dim] layout")
+            raise ValueError(
+                "sgl_kernel varlen attention expects q/k/v in [total,heads,dim] layout"
+            )
         return _flash_attn_varlen_func(
             q.contiguous(),
             k.contiguous(),

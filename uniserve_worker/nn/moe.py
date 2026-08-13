@@ -1,14 +1,15 @@
 """Shared mixture-of-experts primitives."""
+
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from ..forward import MeshView
+from ..execution.forward_batch import MeshView
 
 __all__ = [
-    'TopK',
-    'FusedMoE',
+    "TopK",
+    "FusedMoE",
 ]
 
 

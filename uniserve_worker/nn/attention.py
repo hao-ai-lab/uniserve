@@ -7,9 +7,9 @@ from torch import nn
 
 import uniserve_worker.ops as ops
 
-from ..forward import (
+from ..execution.forward_batch import (
     EmptyKvView,
-    ForwardContext,
+    ForwardBatch,
     NoAttention,
     PackedAttentionPlan,
     PagedDecodePlan,
@@ -42,7 +42,7 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         *,
         causal: bool,
         scale: float | None = None,
@@ -85,7 +85,7 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         plan: PagedDecodePlan,
         causal: bool,
         scale: float,
@@ -119,7 +119,7 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         plan: PagedVarlenPlan,
         causal: bool,
         scale: float,
@@ -169,7 +169,7 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardContext,
+        context: ForwardBatch,
         plan: PackedAttentionPlan,
         scale: float,
     ) -> torch.Tensor:
