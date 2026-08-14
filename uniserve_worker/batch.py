@@ -68,8 +68,30 @@ class WorkVariant(StrEnum):
 
 
 class Domain(StrEnum):
-    UND = "und"
-    GEN = "gen"
+    PREFILL = "prefill"
+    DECODE = "decode"
+    FLOW = "flow"
+
+
+_DOMAIN_BY_WORK_VARIANT = {
+    WorkVariant.TOKEN_EXTEND: Domain.PREFILL,
+    WorkVariant.TOKEN_DECODE: Domain.DECODE,
+    WorkVariant.TOKEN_VERIFY: Domain.DECODE,
+    WorkVariant.DRAFT: Domain.DECODE,
+    WorkVariant.ENCODE_VISION: Domain.PREFILL,
+    WorkVariant.ENCODE_LATENT: Domain.PREFILL,
+    WorkVariant.TRANSFER_PRODUCT: Domain.PREFILL,
+    WorkVariant.TRANSFER_KV_PUBLISH: Domain.PREFILL,
+    WorkVariant.TRANSFER_KV_INSTALL: Domain.PREFILL,
+    WorkVariant.GEN_TRANSITION: Domain.FLOW,
+    WorkVariant.GEN_FLOW: Domain.FLOW,
+    WorkVariant.MATERIALIZE: Domain.FLOW,
+}
+
+
+def execution_domain(work: Work | WorkVariant) -> Domain:
+    variant = work if isinstance(work, WorkVariant) else work.variant
+    return _DOMAIN_BY_WORK_VARIANT[variant]
 
 
 class ExecutionCapability(StrEnum):
@@ -1194,6 +1216,8 @@ class Operation:
     def validate(self) -> None:
         if self.op_id < 1:
             raise invalid_descriptor("operation id must be positive")
+        if self.domain is not execution_domain(self.work):
+            raise invalid_descriptor("operation domain is inconsistent with its work variant")
         if self.advances_state != self.work.advances_state:
             raise invalid_descriptor(
                 "operation declares an advances_state inconsistent with its work variant"

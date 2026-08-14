@@ -58,17 +58,17 @@ def test_execution_lanes_are_typed_and_domain_disjoint() -> None:
             "--max-batch-tokens",
             "8192",
             "--lane",
-            '{"lane_id":"und","sm_budget":64,"domains":["und"]}',
+            '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',
             "--lane",
-            '{"lane_id":"gen","sm_budget":88,"domains":["gen"]}',
+            '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
         ]
     )
 
     assert tuple((lane.lane_id, lane.sm_budget) for lane in config.execution.lanes) == (
-        ("und", 64),
-        ("gen", 88),
+        ("decode", 64),
+        ("compute", 88),
     )
-    assert config.execution.lanes[0].domains == (Domain.UND,)
+    assert config.execution.lanes[0].domains == (Domain.DECODE,)
 
 
 def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
@@ -84,8 +84,8 @@ def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
                 "--max-batch-tokens",
                 "8192",
                 "--lane",
-                '{"lane_id":"a","sm_budget":64,"domains":["und"]}',
+                '{"lane_id":"a","sm_budget":64,"domains":["decode"]}',
                 "--lane",
-                '{"lane_id":"b","sm_budget":64,"domains":["und"]}',
+                '{"lane_id":"b","sm_budget":64,"domains":["decode"]}',
             ]
         )

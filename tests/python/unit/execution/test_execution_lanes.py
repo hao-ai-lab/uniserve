@@ -35,8 +35,8 @@ def _gb200_lanes() -> tuple[LaneConfig, LaneConfig]:
     if int(properties.multi_processor_count) != 152:
         pytest.skip("the exact 64/88 lane proof targets a 152-SM GB200")
     return (
-        LaneConfig("und", 64, (Domain.UND,)),
-        LaneConfig("gen", 88, (Domain.GEN,)),
+        LaneConfig("decode", 64, (Domain.DECODE,)),
+        LaneConfig("compute", 88, (Domain.PREFILL, Domain.FLOW)),
     )
 
 

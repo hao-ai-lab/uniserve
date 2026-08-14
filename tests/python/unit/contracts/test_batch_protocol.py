@@ -68,6 +68,7 @@ from uniserve_worker.batch import (
     decode_token_product_bytes,
     encode_sampling_state_bytes,
     encode_token_product_bytes,
+    execution_domain,
     protocol_layout_digest,
 )
 from uniserve_worker.foundation.errors import WorkerError
@@ -119,7 +120,7 @@ def _decode_operation(input_product: ProductRef | None = None) -> Operation:
         parent=_fixed_parent(),
         work=Work.token(TokenMode.DECODE),
         route=1,
-        domain=Domain.UND,
+        domain=Domain.DECODE,
         bounds=Bounds(max_points=1, max_tokens=1, max_kv_pages=1),
         inputs=(() if input_product is None else (input_product,)),
         outputs=(_token_output(),),
@@ -231,7 +232,7 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
                     partition_id=10 + index,
                     submission_group=20 + index,
                     collective_seq=30 + index,
-                    domain=Domain.UND,
+                    domain=Domain.DECODE,
                     route=operation.route,
                     execution=ExecutionCapability.DOMAIN_HOMOGENEOUS,
                     attention=AttentionRegime.CAUSAL,
@@ -288,23 +289,31 @@ def test_operation_round_trips_through_wire() -> None:
     assert Operation.from_wire(operation.to_wire()) == operation
 
 
+def test_operation_rejects_a_work_domain_mismatch() -> None:
+    operation = replace(_decode_operation(), domain=Domain.FLOW)
+    operation = replace(operation, plan_digest=operation.compute_plan_digest())
+    with pytest.raises(WorkerError, match="domain is inconsistent"):
+        operation.validate()
+
+
 def test_every_work_variant_round_trips() -> None:
     variants = [
-        (Work("token", "extend"), True),
-        (Work("token", "decode"), True),
-        (Work("token", "verify"), True),
-        (Work("draft", None), False),
-        (Work("encode", "vision"), False),
-        (Work("encode", "latent"), False),
-        (Work("transfer", "product"), False),
-        (Work("transfer", "kv_publish"), False),
-        (Work("transfer", "kv_install"), False),
-        (Work("gen", "transition"), True),
-        (Work("gen", "flow"), True),
-        (Work("materialize", None), False),
+        (Work("token", "extend"), True, Domain.PREFILL),
+        (Work("token", "decode"), True, Domain.DECODE),
+        (Work("token", "verify"), True, Domain.DECODE),
+        (Work("draft", None), False, Domain.DECODE),
+        (Work("encode", "vision"), False, Domain.PREFILL),
+        (Work("encode", "latent"), False, Domain.PREFILL),
+        (Work("transfer", "product"), False, Domain.PREFILL),
+        (Work("transfer", "kv_publish"), False, Domain.PREFILL),
+        (Work("transfer", "kv_install"), False, Domain.PREFILL),
+        (Work("gen", "transition"), True, Domain.FLOW),
+        (Work("gen", "flow"), True, Domain.FLOW),
+        (Work("materialize", None), False, Domain.FLOW),
     ]
-    for index, (work, advances) in enumerate(variants):
+    for index, (work, advances, domain) in enumerate(variants):
         assert work.advances_state is advances
+        assert execution_domain(work) is domain
         assert Work.from_wire(work.to_wire()) == work
         assert work.variant_index == index
 

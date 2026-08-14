@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -41,6 +42,8 @@ from uniserve_worker.runtime.execution_trace import (
 from .forward_batch import AttnPlan
 from .input_buffers import InputBuffers
 from .lane import ExecutionPartitionRuntime, LaneConfig, create_green_contexts
+
+logger = logging.getLogger(__name__)
 
 
 class RunPath(StrEnum):
@@ -237,13 +240,16 @@ class ModelRunner:
 
     def complete_startup(self) -> None:
         for partition in self._owned_partitions:
+            lane_id = partition.lane_id or "default"
+            logger.info("verifying CUDA graph catalog lane=%s", lane_id)
             try:
                 partition.graphs.complete_startup()
             except GraphExecutionError as error:
                 raise GraphExecutionError(
-                    f"execution partition {partition.lane_id or 'default'} failed startup"
+                    f"execution partition {lane_id} failed startup"
                 ) from error
             partition.verify_stream()
+            logger.info("verified CUDA graph catalog lane=%s", lane_id)
         signature = tuple(
             (
                 partition.lane_id,
@@ -254,10 +260,12 @@ class ModelRunner:
             for partition in self._owned_partitions
         )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
+            logger.info("verifying tensor-parallel execution partition agreement")
             gathered: list[object] = [None] * torch.distributed.get_world_size()
             torch.distributed.all_gather_object(gathered, signature)
             if any(value != signature for value in gathered):
                 raise GraphExecutionError("tensor-parallel execution partitions disagree")
+            logger.info("verified tensor-parallel execution partition agreement")
 
     def close(self) -> None:
         self._last_request_pool_indices = None
@@ -306,10 +314,20 @@ class ModelRunner:
             )
             for task in tasks
         )
+        task_domains = frozenset(
+            task_domain
+            for task in tasks
+            for task_domain in (getattr(task.operation, "domain", None),)
+            if task_domain is not None
+        )
+        if domain is None and len(task_domains) > 1:
+            raise ValueError("one unbound model call must contain one execution domain")
         resolved_domain = domain or (
-            Domain.GEN
-            if phase in {ModelPhase.ENCODE_LATENT, ModelPhase.DECODE_LATENT}
-            else Domain.UND
+            next(iter(task_domains))
+            if task_domains
+            else Domain.FLOW
+            if phase is ModelPhase.DENOISE
+            else Domain.PREFILL
         )
         partition = self._partitions.get((str(target), resolved_domain))
         if partition is None:
@@ -490,7 +508,7 @@ class ModelRunner:
 
         expected_calls = {
             RunPath.EAGER: 1,
-            RunPath.GRAPH_CAPTURE: 1,
+            RunPath.GRAPH_CAPTURE: 2,
             RunPath.GRAPH_REPLAY: 0,
         }
         if path in expected_calls and calls != expected_calls[path]:

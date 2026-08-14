@@ -113,7 +113,7 @@ fn canonical_operation() -> Operation {
         parent,
         Work::Token(TokenMode::Decode),
         RouteId(9),
-        Domain::Und,
+        Domain::Decode,
         Bounds {
             max_points: 1,
             max_tokens: 1,

@@ -1242,7 +1242,7 @@ mod tests {
             "0.5",
             "--trust-remote-code",
             "--lane",
-            r#"{"lane_id":"und","sm_budget":64,"domains":["und"]}"#,
+            r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
         ]);
 
         assert_eq!(runtime.worker_ranks, 2);

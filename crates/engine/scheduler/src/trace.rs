@@ -278,7 +278,7 @@ mod tests {
     fn stamps_reconstruct_one_operation_lifecycle_in_causal_order() {
         let mut trace = RequestTrace::new(RequestKey::new(1, RequestId(7), 2), TraceId(7));
         trace.mark_admitted(0);
-        let k = key(10, 1, Domain::Und);
+        let k = key(10, 1, Domain::Decode);
         for (offset, phase) in LifecyclePhase::ALL.into_iter().enumerate() {
             trace.stamp(k, Some("decode_und"), phase, offset as u64 * 10);
         }
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(trace.finish_reason, Some("eos"));
         let op = &trace.operations()[0];
         assert_eq!(op.key.op_id, OpId(10));
-        assert_eq!(op.key.domain, Domain::Und);
+        assert_eq!(op.key.domain, Domain::Decode);
         assert_eq!(op.op_kind, Some("decode_und"));
         assert!(op.is_ordered());
         assert_eq!(
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn a_reached_phase_is_never_rewritten() {
         let mut trace = RequestTrace::new(RequestKey::new(1, RequestId(7), 2), TraceId(7));
-        let k = key(10, 1, Domain::Und);
+        let k = key(10, 1, Domain::Decode);
         trace.stamp(k, Some("decode_und"), LifecyclePhase::Submitted, 100);
         trace.stamp(k, Some("decode_und"), LifecyclePhase::Submitted, 999);
         assert_eq!(
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn out_of_order_stamps_are_detected() {
         let mut trace = RequestTrace::new(RequestKey::new(1, RequestId(7), 2), TraceId(7));
-        let k = key(10, 1, Domain::Und);
+        let k = key(10, 1, Domain::Decode);
         trace.stamp(k, None, LifecyclePhase::Submitted, 100);
         trace.stamp(k, None, LifecyclePhase::CompletionObserved, 50);
         assert!(!trace.is_ordered());
@@ -325,9 +325,19 @@ mod tests {
     #[test]
     fn distinct_operations_keep_independent_lifecycles() {
         let mut trace = RequestTrace::new(RequestKey::new(1, RequestId(7), 2), TraceId(7));
-        trace.stamp(key(10, 1, Domain::Und), None, LifecyclePhase::Submitted, 10);
-        trace.stamp(key(11, 2, Domain::Gen), None, LifecyclePhase::Submitted, 20);
+        trace.stamp(
+            key(10, 1, Domain::Decode),
+            None,
+            LifecyclePhase::Submitted,
+            10,
+        );
+        trace.stamp(
+            key(11, 2, Domain::Flow),
+            None,
+            LifecyclePhase::Submitted,
+            20,
+        );
         assert_eq!(trace.operations().len(), 2);
-        assert_eq!(trace.operations()[1].key.domain, Domain::Gen);
+        assert_eq!(trace.operations()[1].key.domain, Domain::Flow);
     }
 }

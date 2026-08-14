@@ -260,7 +260,7 @@ def test_runner_reports_staging_and_model_output_failures():
     runner = _runner(model)
     task = _task(model, row=0, phase=ModelPhase.TEXT)
 
-    with pytest.raises(InputError, match="no 'und' execution partition"):
+    with pytest.raises(InputError, match="no 'prefill' execution partition"):
         runner.run(
             (task,),
             device="cuda:99",

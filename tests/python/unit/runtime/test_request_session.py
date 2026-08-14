@@ -57,7 +57,7 @@ def _verify_operation(request_key: RequestKey, parent: VersionRef, op_id: int = 
         parent=parent,
         work=Work.token(TokenMode.VERIFY),
         route=0,
-        domain=Domain.UND,
+        domain=Domain.DECODE,
         bounds=Bounds(max_points=4, max_tokens=4),
     )
 

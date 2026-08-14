@@ -487,9 +487,7 @@ pub trait Executor: Send {
 mod tests {
     use super::*;
     use uniserve_core::RequestId;
-    use uniserve_worker_wire::{
-        Bounds, Domain, OpId, RequestKey, RouteId, TokenMode, VersionRef, Work,
-    };
+    use uniserve_worker_wire::{Bounds, OpId, RequestKey, RouteId, TokenMode, VersionRef, Work};
 
     #[test]
     fn worker_kind_round_trips_and_maps_work() {
@@ -533,7 +531,7 @@ mod tests {
             VersionRef::admission_root(request_key, OpId(1), "0".repeat(64)),
             work,
             RouteId(0),
-            Domain::Und,
+            work.variant().domain(),
             Bounds::default(),
             Vec::new(),
             Vec::new(),

@@ -164,6 +164,20 @@ impl WorkVariant {
         )
     }
 
+    /// The device execution domain that owns this work leaf.
+    pub const fn domain(self) -> Domain {
+        match self {
+            Self::TokenDecode | Self::TokenVerify | Self::Draft => Domain::Decode,
+            Self::GenTransition | Self::GenFlow | Self::Materialize => Domain::Flow,
+            Self::TokenExtend
+            | Self::EncodeVision
+            | Self::EncodeLatent
+            | Self::TransferProduct
+            | Self::TransferKvPublish
+            | Self::TransferKvInstall => Domain::Prefill,
+        }
+    }
+
     pub const fn as_wire_str(self) -> &'static str {
         match self {
             Self::TokenExtend => "token_extend",
@@ -475,13 +489,14 @@ impl VersionRef {
 // Operation
 // ---------------------------------------------------------------------------
 
-/// Whether an operation belongs to the understanding or generation branch.
+/// The device execution class used for static lane binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Domain {
-    Und = 0,
-    Gen = 1,
+    Prefill = 0,
+    Decode = 1,
+    Flow = 2,
 }
 
 /// The physical execution contract for one scheduler batch partition.
@@ -634,6 +649,10 @@ impl Operation {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.op_id.0 > 0, "operation id must be positive");
+        anyhow::ensure!(
+            self.domain == self.work.variant().domain(),
+            "operation domain is inconsistent with its work variant"
+        );
         anyhow::ensure!(
             self.advances_state == self.work.advances_state(),
             "operation declares an advances_state inconsistent with its work variant"

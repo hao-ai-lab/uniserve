@@ -64,8 +64,8 @@ def test_worker_capability_wire_round_trips_exactly() -> None:
         base,
         lanes=(
             LaneCapabilities(
-                lane_id="und",
-                domains=(Domain.UND,),
+                lane_id="decode",
+                domains=(Domain.DECODE,),
                 resolved_sm_count=64,
                 kv_capacity_tokens=65_536,
                 latent_capacity_units=None,

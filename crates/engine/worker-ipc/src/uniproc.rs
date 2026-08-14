@@ -625,14 +625,19 @@ impl UniprocExecutor {
     fn wait_pending_response(&mut self, pending: &Pending, context: &str) -> anyhow::Result<Frame> {
         let started = Instant::now();
         let mut last_log = started;
+        let mut last_worker_check = started;
         loop {
-            if let Some(frame) = self
-                .client
-                .recv_response_timeout(pending, WORKER_CHECK_INTERVAL)?
-            {
+            // The worker may spend minutes materializing its startup catalog
+            // after this request is queued. Poll the request-response ring on
+            // the bounded cadence here instead of parking on a companion event
+            // whose notification can predate the worker's serving loop.
+            if let Some(frame) = self.client.try_recv_response(pending)? {
                 return Ok(frame);
             }
-            self.check_worker(context)?;
+            if last_worker_check.elapsed() >= WORKER_CHECK_INTERVAL {
+                self.check_worker(context)?;
+                last_worker_check = Instant::now();
+            }
             if last_log.elapsed() >= STARTUP_LOG_INTERVAL {
                 tracing::info!(
                     elapsed_secs = started.elapsed().as_secs(),
@@ -640,6 +645,7 @@ impl UniprocExecutor {
                 );
                 last_log = Instant::now();
             }
+            std::thread::sleep(RESPONSE_POLL_INTERVAL);
         }
     }
 

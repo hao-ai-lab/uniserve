@@ -105,11 +105,14 @@ class WorkerServeLoop:
 
     def run(self) -> None:
         # The loaded model and executor graph live for the worker's full
-        # lifetime. Excluding that initialized graph from later cyclic scans
-        # keeps request-time full collections proportional to request state;
-        # objects allocated while serving remain in the ordinary generations.
-        gc.collect()
-        gc.freeze()
+        # lifetime. Do not collect or freeze that initialized graph: both
+        # operations traverse every model, CUDA graph, and attention-wrapper
+        # object, making readiness scale with the resident graph catalog.
+        # Request state is ownership-structured and reference-counted, so keep
+        # cyclic scans off the serving path and restore the caller's GC mode at
+        # shutdown.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
         try:
             while True:
                 self._refill()
@@ -135,7 +138,8 @@ class WorkerServeLoop:
                     return
                 self._append_inflight(request, response)
         finally:
-            gc.unfreeze()
+            if gc_was_enabled:
+                gc.enable()
             self.worker_server.profiler.close()
             close = getattr(self.worker_server.worker, "close", None)
             if callable(close):

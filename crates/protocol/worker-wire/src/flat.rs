@@ -3063,16 +3063,19 @@ fn work_from_fb(variant: fbs::WorkVariant) -> anyhow::Result<WorkVariant> {
 
 fn domain_to_fb(domain: Domain) -> fbs::Domain {
     match domain {
-        Domain::Und => fbs::Domain::Und,
-        Domain::Gen => fbs::Domain::Gen,
+        Domain::Prefill => fbs::Domain::Prefill,
+        Domain::Decode => fbs::Domain::Decode,
+        Domain::Flow => fbs::Domain::Flow,
     }
 }
 
 fn domain_from_fb(domain: fbs::Domain) -> anyhow::Result<Domain> {
-    if domain == fbs::Domain::Und {
-        Ok(Domain::Und)
-    } else if domain == fbs::Domain::Gen {
-        Ok(Domain::Gen)
+    if domain == fbs::Domain::Prefill {
+        Ok(Domain::Prefill)
+    } else if domain == fbs::Domain::Decode {
+        Ok(Domain::Decode)
+    } else if domain == fbs::Domain::Flow {
+        Ok(Domain::Flow)
     } else {
         bail!("unknown domain {}", domain.0)
     }

@@ -114,6 +114,7 @@ class CudaGraphRunner:
         self.prefill_row_bucket = max(1, int(prefill_row_bucket))
         self.captures = 0
         self._states: dict[tuple[object, ...], _GraphState] = {}
+        self._equivalence_checks: list[tuple[str, torch.Tensor]] = []
         self._warmed: set[tuple[object, ...]] = set()
         self._warmed_exact: set[tuple[object, ...]] = set()
         self._covered_exact: set[tuple[object, ...]] = set()
@@ -157,6 +158,7 @@ class CudaGraphRunner:
                 "captured CUDA graph count does not match the advertised bucket catalog: "
                 f"captured={len(self._states)} advertised={self._expected_captures}"
             )
+        self._complete_equivalence_checks()
         if self.resident_bytes > self.memory_budget_bytes:
             raise GraphExecutionError("captured graph residency exceeds its startup budget")
         self._sealed = True
@@ -258,6 +260,9 @@ class CudaGraphRunner:
             if self.memory_budget_bytes == 0:
                 raise GraphExecutionError("configured CUDA graph residency has no memory budget")
             try:
+                eager = self._snapshot_output(
+                    _trim_output(self._eager(execution, forward), rows)
+                )
                 state = self._capture(
                     execution,
                     forward,
@@ -269,6 +274,11 @@ class CudaGraphRunner:
                 self._warmed_exact.discard(state_key)
                 self.captures += 1
                 self._replay(state, execution)
+                self._queue_equivalence_check(
+                    eager,
+                    _trim_output(state.output, rows),
+                    label=repr(state_key),
+                )
             except Exception as error:
                 removed = self._states.pop(state_key, None)
                 if removed is not None:
@@ -299,6 +309,7 @@ class CudaGraphRunner:
         self._warmed.clear()
         self._warmed_exact.clear()
         self._covered_exact.clear()
+        self._equivalence_checks.clear()
         for state in states:
             _release_state(state)
 
@@ -380,6 +391,43 @@ class CudaGraphRunner:
             ):
                 destination.copy_(source)
         return ForwardOutput(published.values[:rows])
+
+    def _snapshot_output(self, output: ForwardOutput) -> ForwardOutput:
+        context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+        with context:
+            return _clone_output(output)
+
+    def _queue_equivalence_check(
+        self,
+        reference: ForwardOutput,
+        candidate: ForwardOutput,
+        *,
+        label: str,
+    ) -> None:
+        context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+        with context:
+            check = _equivalence_check(reference, candidate)
+        self._equivalence_checks.append((label, check))
+
+    def _complete_equivalence_checks(self) -> None:
+        if not self._equivalence_checks:
+            return
+        context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+        with context:
+            complete = torch.stack(
+                tuple(check for _, check in self._equivalence_checks)
+            ).all()
+        if not bool(complete.item()):
+            failed = tuple(
+                label
+                for label, check in self._equivalence_checks
+                if not bool(check.item())
+            )
+            raise GraphExecutionError(
+                "CUDA graph output differs from direct execution for buckets: "
+                + ", ".join(failed)
+            )
+        self._equivalence_checks.clear()
 
     def _prepare_attention(
         self,
@@ -987,6 +1035,38 @@ def _private_pool_bytes(device: torch.device | None) -> int:
 
 def _trim_output(output: ForwardOutput, rows: int) -> ForwardOutput:
     return ForwardOutput(tuple(output.values[:rows]))
+
+
+def _clone_output(output: ForwardOutput) -> ForwardOutput:
+    return ForwardOutput(
+        tuple(value.detach().clone(memory_format=torch.preserve_format) for value in output.values)
+    )
+
+
+def _equivalence_check(reference: ForwardOutput, candidate: ForwardOutput) -> torch.Tensor:
+    if len(reference.values) != len(candidate.values):
+        raise GraphExecutionError("CUDA graph output count differs from eager execution")
+    checks: list[torch.Tensor] = []
+    for expected, actual in zip(reference.values, candidate.values, strict=True):
+        if expected.shape != actual.shape or expected.dtype != actual.dtype:
+            raise GraphExecutionError("CUDA graph output geometry differs from eager execution")
+        if not (expected.is_floating_point() or expected.is_complex()):
+            checks.append(torch.eq(expected, actual).all())
+            continue
+        tolerance = 0.01 if expected.element_size() <= 2 else 1e-5
+        checks.append(
+            torch.isclose(
+                actual,
+                expected,
+                rtol=tolerance,
+                atol=tolerance,
+                equal_nan=False,
+            ).all()
+        )
+    if not checks:
+        device = reference.values[0].device if reference.values else torch.device("cpu")
+        return torch.ones((), dtype=torch.bool, device=device)
+    return torch.stack(tuple(checks)).all()
 
 
 def _release_call(method: Callable[[int], object], binding: int) -> Callable[[], None]:

@@ -103,7 +103,7 @@ fn token_decode_operation() -> Operation {
         fixed_parent(),
         Work::Token(TokenMode::Decode),
         RouteId(1),
-        Domain::Und,
+        Domain::Decode,
         Bounds {
             max_points: 1,
             max_tokens: 1,
@@ -135,7 +135,7 @@ fn operation_for(work: Work, op_id: OpId, advances: bool) -> Operation {
         fixed_parent(),
         work,
         RouteId(1),
-        Domain::Und,
+        work.variant().domain(),
         Bounds {
             max_points: if advances { 1 } else { 0 },
             ..Bounds::default()
@@ -304,24 +304,41 @@ fn partition_report(
 #[test]
 fn every_work_variant_round_trips_through_the_wire() {
     let variants = [
-        (Work::Token(TokenMode::Extend), true),
-        (Work::Token(TokenMode::Decode), true),
-        (Work::Token(TokenMode::Verify), true),
-        (Work::Draft, false),
-        (Work::Encode(EncodeMode::Vision), false),
-        (Work::Encode(EncodeMode::Latent), false),
-        (Work::Transfer(TransferMode::Product), false),
-        (Work::Transfer(TransferMode::KvPublish), false),
-        (Work::Transfer(TransferMode::KvInstall), false),
-        (Work::Gen(GenMode::Transition), true),
-        (Work::Gen(GenMode::Flow), true),
-        (Work::Materialize, false),
+        (Work::Token(TokenMode::Extend), true, Domain::Prefill),
+        (Work::Token(TokenMode::Decode), true, Domain::Decode),
+        (Work::Token(TokenMode::Verify), true, Domain::Decode),
+        (Work::Draft, false, Domain::Decode),
+        (Work::Encode(EncodeMode::Vision), false, Domain::Prefill),
+        (Work::Encode(EncodeMode::Latent), false, Domain::Prefill),
+        (
+            Work::Transfer(TransferMode::Product),
+            false,
+            Domain::Prefill,
+        ),
+        (
+            Work::Transfer(TransferMode::KvPublish),
+            false,
+            Domain::Prefill,
+        ),
+        (
+            Work::Transfer(TransferMode::KvInstall),
+            false,
+            Domain::Prefill,
+        ),
+        (Work::Gen(GenMode::Transition), true, Domain::Flow),
+        (Work::Gen(GenMode::Flow), true, Domain::Flow),
+        (Work::Materialize, false, Domain::Flow),
     ];
-    for (index, (work, advances)) in variants.into_iter().enumerate() {
+    for (index, (work, advances, domain)) in variants.into_iter().enumerate() {
         assert_eq!(
             work.advances_state(),
             advances,
             "work table effect mismatch"
+        );
+        assert_eq!(
+            work.variant().domain(),
+            domain,
+            "work table domain mismatch"
         );
         let operation = operation_for(work, OpId(100 + index as u64), advances);
         let batch = execute_round_trip(batch_with_operations(
@@ -351,7 +368,7 @@ fn version_ref_device_point_round_trips() {
         device_parent.clone(),
         Work::Token(TokenMode::Decode),
         RouteId(1),
-        Domain::Und,
+        Domain::Decode,
         Bounds {
             max_points: 1,
             ..Bounds::default()
@@ -548,6 +565,14 @@ fn validation_rejects_a_forged_plan_digest() {
 fn validation_rejects_inconsistent_advances_state() {
     let mut operation = token_decode_operation();
     operation.advances_state = false;
+    operation.plan_digest = operation.compute_plan_digest();
+    assert!(operation.validate().is_err());
+}
+
+#[test]
+fn validation_rejects_a_work_domain_mismatch() {
+    let mut operation = token_decode_operation();
+    operation.domain = Domain::Flow;
     operation.plan_digest = operation.compute_plan_digest();
     assert!(operation.validate().is_err());
 }
@@ -940,11 +965,7 @@ fn comprehensive_batch() -> Batch {
                 },
             }
         };
-        let domain = if matches!(work, Work::Gen(_)) {
-            Domain::Gen
-        } else {
-            Domain::Und
-        };
+        let domain = work.variant().domain();
         operations.push(Operation::registered(
             key,
             op_id,
@@ -1151,8 +1172,8 @@ fn full_caps() -> WorkerCapabilities {
         model_identity: digest_string(0x21),
         weight_digest: digest_string(0x22),
         lanes: vec![LaneCapabilities {
-            lane_id: "und".into(),
-            domains: vec![Domain::Und],
+            lane_id: "decode".into(),
+            domains: vec![Domain::Decode],
             resolved_sm_count: 64,
             kv_capacity_tokens: Some(65_536),
             latent_capacity_units: None,
@@ -1474,7 +1495,7 @@ fn decode_step_batch(operations: usize) -> Batch {
                 VersionRef::admission_root(key, OpId(1), digest_string(0xaa)),
                 Work::Token(TokenMode::Decode),
                 RouteId(1),
-                Domain::Und,
+                Domain::Decode,
                 Bounds {
                     max_points: 1,
                     max_tokens: 1,

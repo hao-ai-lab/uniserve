@@ -993,7 +993,6 @@ pub(crate) enum TransitionIntent {
 /// scheduler-owned rather than flat-wire fields.
 struct Wire {
     work: Work,
-    domain: Domain,
     inputs: Vec<ProductRef>,
     outputs: Vec<ProductRef>,
     new_blocks: Vec<BlockId>,
@@ -1116,7 +1115,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Token(TokenMode::Extend),
-                        domain: Domain::Und,
                         inputs: Vec::new(),
                         outputs: token_outputs(
                             logprob_blob_bound(
@@ -1170,7 +1168,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work,
-                        domain: Domain::Und,
                         inputs: source_product.into_iter().collect(),
                         outputs: encode_outputs(step, 0, &request.resources)?,
                         new_blocks: Vec::new(),
@@ -1219,7 +1216,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Token(TokenMode::Extend),
-                        domain: Domain::Und,
                         inputs: vec![feature],
                         outputs: Vec::new(),
                         new_blocks,
@@ -1289,7 +1285,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Token(mode),
-                        domain: Domain::Und,
                         inputs: Vec::new(),
                         outputs: token_outputs(
                             logprob_blob_bound(&request.sampling, 0)?,
@@ -1327,7 +1322,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Transfer(TransferMode::KvPublish),
-                        domain: Domain::Und,
                         inputs: Vec::new(),
                         outputs: vec![output],
                         new_blocks: Vec::new(),
@@ -1358,7 +1352,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Gen(GenMode::Transition),
-                        domain: Domain::Gen,
                         inputs: vec![conditioning],
                         outputs: vec![
                             latent_output(0, &request.resources)?,
@@ -1395,7 +1388,6 @@ impl GenerationPlanner {
             } => (
                 Wire {
                     work: Work::Token(TokenMode::Extend),
-                    domain: Domain::Und,
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     new_blocks,
@@ -1435,7 +1427,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Gen(GenMode::Flow),
-                        domain: Domain::Gen,
                         inputs: vec![conditioning, latent],
                         outputs: vec![latent_output(0, &request.resources)?],
                         new_blocks: Vec::new(),
@@ -1471,7 +1462,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Materialize,
-                        domain: Domain::Gen,
                         inputs: vec![latent],
                         outputs: materialize_outputs(request, feedback)?,
                         new_blocks: Vec::new(),
@@ -1508,7 +1498,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work,
-                        domain: Domain::Und,
                         inputs: source.clone().into_iter().collect(),
                         outputs: encode_outputs(step, 0, &request.resources)?,
                         new_blocks: Vec::new(),
@@ -1577,7 +1566,6 @@ impl GenerationPlanner {
                 (
                     Wire {
                         work: Work::Token(TokenMode::Extend),
-                        domain: Domain::Und,
                         inputs: vec![feature],
                         outputs,
                         new_blocks,
@@ -1768,7 +1756,7 @@ impl GenerationPlanner {
         Ok(PlannedTransition {
             work: wire.work,
             route: ROUTE,
-            domain: wire.domain,
+            domain: operation_variant.domain(),
             bounds,
             inputs: wire.inputs,
             outputs: wire.outputs,

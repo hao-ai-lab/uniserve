@@ -67,7 +67,7 @@ def _installation_operation(
             parent=parent,
             work=Work("transfer", TransferMode.KV_INSTALL.value),
             route=0,
-            domain=Domain.GEN,
+            domain=Domain.PREFILL,
             bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
             inputs=(source,),
             outputs=(product,),

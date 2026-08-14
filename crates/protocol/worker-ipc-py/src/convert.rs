@@ -874,8 +874,9 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
 
 fn domain_py<'py>(py: Python<'py>, domain: Domain) -> &'py Bound<'py, PyString> {
     match domain {
-        Domain::Und => intern!(py, "und"),
-        Domain::Gen => intern!(py, "gen"),
+        Domain::Prefill => intern!(py, "prefill"),
+        Domain::Decode => intern!(py, "decode"),
+        Domain::Flow => intern!(py, "flow"),
     }
 }
 
@@ -1617,11 +1618,7 @@ mod tests {
             parent,
             work,
             uniserve_worker_wire::RouteId(seed as u32 % 4),
-            if seed.is_multiple_of(2) {
-                Domain::Und
-            } else {
-                Domain::Gen
-            },
+            work.variant().domain(),
             Bounds {
                 max_points: 4,
                 max_tokens: 16,
@@ -2215,7 +2212,7 @@ mod tests {
                     device_parent(seed),
                     Work::Token(TokenMode::Decode),
                     uniserve_worker_wire::RouteId(0),
-                    Domain::Und,
+                    Domain::Decode,
                     Bounds {
                         max_points: 1,
                         max_tokens: 1,

@@ -18,7 +18,7 @@ enum WorkVariant : ubyte {
   Materialize
 }
 
-enum Domain : ubyte { Und, Gen }
+enum Domain : ubyte { Prefill, Decode, Flow }
 enum ExecutionCapability : ubyte { DomainHomogeneous, TensorizedMixed }
 enum AttentionRegime : ubyte { None, Causal, Bidirectional, Hybrid }
 enum SamplingOwnership : ubyte { DesignatedRank, DeterministicSharded }

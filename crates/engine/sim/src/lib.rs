@@ -1077,7 +1077,7 @@ mod tests {
             parent,
             Work::Token(TokenMode::Extend),
             RouteId(0),
-            Domain::Und,
+            Domain::Prefill,
             Bounds {
                 max_points: 1,
                 max_tokens: 2,
@@ -1097,7 +1097,7 @@ mod tests {
                 partition_id: 1,
                 submission_group: 1,
                 collective_seq: step_id.max(1),
-                domain: Domain::Und,
+                domain: Domain::Prefill,
                 route: RouteId(0),
                 execution: ExecutionCapability::DomainHomogeneous,
                 attention: AttentionRegime::Causal,

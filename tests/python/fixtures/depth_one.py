@@ -50,6 +50,7 @@ from uniserve_worker.batch import (
     Work,
     WorkVariant,
     encode_token_product_bytes,
+    execution_domain,
 )
 from uniserve_worker.runtime.request_session import RequestSession
 
@@ -221,7 +222,7 @@ def execution_batch(
     for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
         domains = tuple(
             domain
-            for domain in (Domain.UND, Domain.GEN)
+            for domain in Domain
             if any(op.domain is domain for op in routed)
         )
         execution = (
@@ -506,7 +507,7 @@ def token_operation(
         parent=parent,
         work=Work.token(mode),
         route=0,
-        domain=Domain.UND,
+        domain=execution_domain(Work.token(mode)),
         bounds=Bounds(
             max_points=max_points,
             max_tokens=max(1, len(tokens)),
@@ -580,7 +581,7 @@ def encode_operation(
         parent=parent,
         work=Work("encode", mode.value),
         route=0,
-        domain=Domain.UND,
+        domain=Domain.PREFILL,
         bounds=Bounds(max_points=1, max_tokens=64, max_latent_bytes=8_192),
         inputs=(image_ref,),
         outputs=(output_ref,),
@@ -631,7 +632,7 @@ def gen_transition_operation(
         parent=parent,
         work=Work("gen", "transition"),
         route=0,
-        domain=Domain.GEN,
+        domain=Domain.FLOW,
         bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
         inputs=(conditioning,),
         outputs=(latent, ready),
@@ -674,7 +675,7 @@ def flow_operation(
         parent=parent,
         work=Work("gen", "flow"),
         route=0,
-        domain=Domain.GEN,
+        domain=Domain.FLOW,
         bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
         inputs=(conditioning, latent),
         outputs=(output,),
@@ -709,7 +710,7 @@ def kv_publication_operation(
         parent=parent,
         work=Work("transfer", TransferMode.KV_PUBLISH.value),
         route=0,
-        domain=Domain.UND,
+        domain=Domain.PREFILL,
         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
         outputs=(product,),
         kv_capacity_pages=capacity,
@@ -760,7 +761,7 @@ def materialize_operation(
         parent=parent,
         work=Work("materialize", None),
         route=0,
-        domain=Domain.GEN,
+        domain=Domain.FLOW,
         bounds=Bounds(
             max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,
@@ -815,7 +816,7 @@ def visual_state_operation(
         parent=parent,
         work=Work.token(TokenMode.EXTEND),
         route=0,
-        domain=Domain.UND,
+        domain=Domain.PREFILL,
         bounds=Bounds(max_points=1, max_tokens=max_tokens),
         inputs=(feature,),
         outputs=outputs,

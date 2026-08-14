@@ -74,6 +74,13 @@ from ..runtime.snapshot_store import SnapshotProvider
 logger = logging.getLogger(__name__)
 
 
+def _has_decode_flow_partition(lanes: tuple[LaneConfig, ...]) -> bool:
+    """Return whether one physical partition can run tensorized decode+flow."""
+
+    required = {Domain.DECODE, Domain.FLOW}
+    return not lanes or any(required <= set(lane.domains) for lane in lanes)
+
+
 def _warmup_batch(
     *,
     step_id: int,
@@ -350,34 +357,40 @@ class ModelWorker:
         # the nominal token budget. Keep the fixed sequence arena large enough
         # for that text span plus one exact CFG-expanded flow operation.
         max_staged_tokens = max_text_staged_tokens + max_flow_staged_tokens
-        und_lane = next(
-            (lane for lane in execution.lanes if Domain.UND in lane.domains),
+        decode_lane = next(
+            (lane for lane in execution.lanes if Domain.DECODE in lane.domains),
             None,
         )
-        gen_lane = next(
-            (lane for lane in execution.lanes if Domain.GEN in lane.domains),
+        prefill_lane = next(
+            (lane for lane in execution.lanes if Domain.PREFILL in lane.domains),
             None,
         )
-        und_max_operations = min(
+        flow_lane = next(
+            (lane for lane in execution.lanes if Domain.FLOW in lane.domains),
+            None,
+        )
+        decode_max_operations = min(
             max_rows,
-            max_rows if und_lane is None else int(und_lane.max_batch_operations or max_rows),
+            max_rows
+            if decode_lane is None
+            else int(decode_lane.max_batch_operations or max_rows),
         )
-        und_max_tokens = min(
+        prefill_max_tokens = min(
             int(self._capabilities.max_batch_tokens),
             (
                 int(self._capabilities.max_batch_tokens)
-                if und_lane is None
-                else int(und_lane.max_batch_tokens or self._capabilities.max_batch_tokens)
+                if prefill_lane is None
+                else int(prefill_lane.max_batch_tokens or self._capabilities.max_batch_tokens)
             ),
         )
-        gen_max_operations = min(
+        flow_max_operations = min(
             max_rows,
-            max_rows if gen_lane is None else int(gen_lane.max_batch_operations or max_rows),
+            max_rows if flow_lane is None else int(flow_lane.max_batch_operations or max_rows),
         )
         decode_graph_batch_sizes = tuple(
             value
             for value in execution.decode_graph_batch_sizes
-            if 0 < int(value) <= und_max_operations
+            if 0 < int(value) <= decode_max_operations
             and int(value) < int(self._capabilities.num_blocks)
         )
         prefill_capacity = min(
@@ -388,7 +401,7 @@ class ModelWorker:
         prefill_graph_token_sizes = tuple(
             value
             for value in execution.prefill_graph_token_sizes
-            if 0 < int(value) <= min(prefill_capacity, und_max_tokens)
+            if 0 < int(value) <= min(prefill_capacity, prefill_max_tokens)
         )
         flow_graph_buckets = (
             ()
@@ -397,7 +410,7 @@ class ModelWorker:
                 (int(batch_size), int(height), int(width))
                 for height, width in execution.flow_graph_shapes
                 for batch_size in execution.flow_graph_batch_sizes
-                if 0 < int(batch_size) <= gen_max_operations
+                if 0 < int(batch_size) <= flow_max_operations
                 and int(batch_size)
                 * flow.physical_tokens(int(height), int(width))
                 * int(flow.max_cfg_branches)
@@ -413,7 +426,11 @@ class ModelWorker:
         )
         mixed_text_batch_sizes = (
             ()
-            if not flow_graph_buckets or not model.tensorized_mixed
+            if (
+                not flow_graph_buckets
+                or not model.tensorized_mixed
+                or not _has_decode_flow_partition(execution.lanes)
+            )
             else tuple(
                 range(
                     1,
@@ -482,17 +499,17 @@ class ModelWorker:
                 tuple(
                     value for value in decode_graph_batch_sizes if int(value) <= lane_max_operations
                 )
-                if owns_model_compute and Domain.UND in domains
+                if owns_model_compute and Domain.DECODE in domains
                 else ()
             )
             lane_prefill_buckets = (
                 tuple(value for value in prefill_graph_token_sizes if int(value) <= lane_max_tokens)
-                if owns_model_compute and Domain.UND in domains
+                if owns_model_compute and Domain.PREFILL in domains
                 else ()
             )
             lane_flow_buckets = (
                 tuple(value for value in flow_graph_buckets if value[0] <= lane_max_operations)
-                if owns_model_compute and Domain.GEN in domains
+                if owns_model_compute and Domain.FLOW in domains
                 else ()
             )
             lane_mixed_flow_buckets = (
@@ -501,7 +518,7 @@ class ModelWorker:
                     for value in mixed_flow_graph_buckets
                     if value[0] + 1 <= lane_max_operations
                 )
-                if owns_model_compute and {Domain.UND, Domain.GEN} <= set(domains)
+                if owns_model_compute and {Domain.DECODE, Domain.FLOW} <= set(domains)
                 else ()
             )
             expected_captures = 0
@@ -520,7 +537,7 @@ class ModelWorker:
                     expected_captures += len(lane_flow_buckets)
                     if WorkVariant.TOKEN_DECODE in self._effective_work_variants:
                         expected_captures += len(lane_mixed_flow_buckets)
-                    if Domain.UND in domains:
+                    if Domain.FLOW in domains:
                         expected_captures += len(flow_prefix_graph_batches)
             output_slots = int(
                 (pipeline_depth if lane is None else lane.max_inflight or pipeline_depth) + 1
@@ -591,7 +608,7 @@ class ModelWorker:
                     int(lane.max_batch_tokens or self._capabilities.max_batch_tokens),
                 )
                 buckets: list[GraphBucketCapability] = []
-                if execution.cuda_graph and Domain.UND in lane.domains:
+                if execution.cuda_graph and Domain.DECODE in lane.domains:
                     buckets.extend(
                         GraphBucketCapability(
                             phase="text_decode",
@@ -605,41 +622,45 @@ class ModelWorker:
                         for batch_size in decode_graph_batch_sizes
                         if int(batch_size) <= max_operations
                     )
-                    if execution.prefill_cuda_graph:
-                        buckets.extend(
-                            GraphBucketCapability(
-                                phase="text_prefill",
-                                batch_size=8,
-                                token_bucket=int(token_size),
-                                attention_form="paged_varlen",
-                                height=0,
-                                width=0,
-                                cfg_branches=1,
-                            )
-                            for token_size in prefill_graph_token_sizes
-                            if int(token_size) <= max_tokens
-                        )
-                        buckets.extend(
-                            GraphBucketCapability(
-                                phase="text_prefill",
-                                batch_size=int(batch_size) * len(flow_prefix_lengths),
-                                token_bucket=int(batch_size) * sum(flow_prefix_lengths),
-                                attention_form="packed",
-                                height=0,
-                                width=0,
-                                cfg_branches=1,
-                                layout="flow_prefix",
-                            )
-                            for batch_size in flow_prefix_graph_batches
-                            if int(batch_size) * len(flow_prefix_lengths) <= max_operations
-                            and int(batch_size) * sum(flow_prefix_lengths) <= max_tokens
-                        )
                 if (
                     execution.cuda_graph
                     and execution.prefill_cuda_graph
-                    and Domain.GEN in lane.domains
+                    and Domain.PREFILL in lane.domains
+                ):
+                    buckets.extend(
+                        GraphBucketCapability(
+                            phase="text_prefill",
+                            batch_size=8,
+                            token_bucket=int(token_size),
+                            attention_form="paged_varlen",
+                            height=0,
+                            width=0,
+                            cfg_branches=1,
+                        )
+                        for token_size in prefill_graph_token_sizes
+                        if int(token_size) <= max_tokens
+                    )
+                if (
+                    execution.cuda_graph
+                    and execution.prefill_cuda_graph
+                    and Domain.FLOW in lane.domains
                     and flow is not None
                 ):
+                    buckets.extend(
+                        GraphBucketCapability(
+                            phase="text_prefill",
+                            batch_size=int(batch_size) * len(flow_prefix_lengths),
+                            token_bucket=int(batch_size) * sum(flow_prefix_lengths),
+                            attention_form="packed",
+                            height=0,
+                            width=0,
+                            cfg_branches=1,
+                            layout="flow_prefix",
+                        )
+                        for batch_size in flow_prefix_graph_batches
+                        if int(batch_size) * len(flow_prefix_lengths) <= max_operations
+                        and int(batch_size) * sum(flow_prefix_lengths) <= max_tokens
+                    )
                     buckets.extend(
                         GraphBucketCapability(
                             phase="denoise",
@@ -1015,8 +1036,11 @@ class ModelWorker:
 
         if torch.device(self.deployment.device).type == "cuda":
             self._warmup_sequence()
+            logger.info("completed token CUDA graph warmup")
             self._warmup_flow()
+            logger.info("completed flow CUDA graph warmup")
         self.runner.complete_startup()
+        logger.info("completed execution partition startup verification")
         self.executor.complete_startup()
 
     def _warmup_image_geometry(self) -> tuple[int, int]:
@@ -1131,7 +1155,7 @@ class ModelWorker:
                 parent=parent,
                 work=Work.token(TokenMode.EXTEND),
                 route=0,
-                domain=Domain.UND,
+                domain=Domain.PREFILL,
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
                 inputs=(token_ref,),
                 outputs=outputs,
@@ -1158,7 +1182,7 @@ class ModelWorker:
                 ),
                 work=Work.token(TokenMode.DECODE),
                 route=0,
-                domain=Domain.UND,
+                domain=Domain.DECODE,
                 bounds=Bounds(max_points=1, max_tokens=1),
                 outputs=outputs,
                 kv_capacity_pages=ceil_div(op_id, int(pool.block_size)),
@@ -1300,7 +1324,7 @@ class ModelWorker:
                     parent=VersionRef(rk, 0, FixedPoint(0, admission.digest)),
                     work=Work.token(TokenMode.EXTEND),
                     route=0,
-                    domain=Domain.UND,
+                    domain=Domain.PREFILL,
                     bounds=Bounds(max_points=1, max_tokens=token_count),
                     inputs=(token_ref,),
                     outputs=_warmup_token_outputs(rk, 1, 2),
@@ -1454,7 +1478,7 @@ class ModelWorker:
                         parent=root,
                         work=Work("transfer", TransferMode.KV_PUBLISH.value),
                         route=0,
-                        domain=Domain.UND,
+                        domain=Domain.PREFILL,
                         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
                         outputs=(conditioning,),
                     )
@@ -1498,7 +1522,7 @@ class ModelWorker:
                             ),
                             work=Work.token(TokenMode.EXTEND),
                             route=0,
-                            domain=Domain.UND,
+                            domain=Domain.PREFILL,
                             bounds=Bounds(max_points=1, max_tokens=1),
                             inputs=(token_ref,),
                             outputs=prompt_outputs,
@@ -1562,7 +1586,7 @@ class ModelWorker:
                             parent=root,
                             work=Work("gen", "transition"),
                             route=0,
-                            domain=Domain.GEN,
+                            domain=Domain.FLOW,
                             bounds=Bounds(
                                 max_points=1,
                                 max_tokens=1,
@@ -1620,7 +1644,7 @@ class ModelWorker:
                                 ),
                                 work=Work("gen", "flow"),
                                 route=0,
-                                domain=Domain.GEN,
+                                domain=Domain.FLOW,
                                 bounds=Bounds(
                                     max_points=1,
                                     max_tokens=1,
@@ -1674,7 +1698,7 @@ class ModelWorker:
                                     ),
                                     work=Work.token(TokenMode.DECODE),
                                     route=0,
-                                    domain=Domain.UND,
+                                    domain=Domain.DECODE,
                                     bounds=Bounds(max_points=1, max_tokens=1),
                                     outputs=token_outputs,
                                     kv_capacity_pages=ceil_div(
@@ -1721,7 +1745,7 @@ class ModelWorker:
                                     ),
                                     work=Work("gen", "flow"),
                                     route=0,
-                                    domain=Domain.GEN,
+                                    domain=Domain.FLOW,
                                     bounds=Bounds(
                                         max_points=1,
                                         max_tokens=1,

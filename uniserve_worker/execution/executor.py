@@ -23,7 +23,6 @@ from uniserve_worker.batch import (
     CompletionRecord,
     CompletionReport,
     DevicePoint,
-    Domain,
     DrawLayout,
     DType,
     EncodeMode,
@@ -2654,7 +2653,13 @@ class ModelExecutor:
         for operation in operations:
             device = (
                 deployment.generation_device
-                if operation.domain is Domain.GEN and deployment.generation_device is not None
+                if operation.work.variant
+                in {
+                    WorkVariant.GEN_TRANSITION,
+                    WorkVariant.GEN_FLOW,
+                    WorkVariant.MATERIALIZE,
+                }
+                and deployment.generation_device is not None
                 else deployment.device
             )
             if device not in selected:
@@ -2719,7 +2724,16 @@ class ModelExecutor:
                 scope.operation_writes.setdefault(operation_identity, write)
 
     def _operation_device(self, operation: Operation) -> torch.device:
-        return self._generation_device if operation.domain is Domain.GEN else self._device
+        return (
+            self._generation_device
+            if operation.work.variant
+            in {
+                WorkVariant.GEN_TRANSITION,
+                WorkVariant.GEN_FLOW,
+                WorkVariant.MATERIALIZE,
+            }
+            else self._device
+        )
 
     def _validate_completion_products(
         self,

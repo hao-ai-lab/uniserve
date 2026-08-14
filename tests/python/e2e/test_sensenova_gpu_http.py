@@ -84,6 +84,10 @@ def production_server(tmp_path: Path, model: Path) -> Iterator[str]:
         "true",
         "--tp-size",
         "2",
+        "--lane",
+        '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',
+        "--lane",
+        '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
         "--log-stats",
         "false",
     ]
