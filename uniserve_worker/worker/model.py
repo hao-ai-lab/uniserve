@@ -26,6 +26,7 @@ from ..batch import (
     LatentPlacement,
     Operation,
     OpStatus,
+    ProductKind,
     ProductPayload,
     ProductRef,
     RecoveryPlacement,
@@ -62,7 +63,7 @@ from ..runtime.arena_capacity import model_arena_capacity
 from ..runtime.cache_pool import CachePool
 from ..runtime.capabilities import resolve_capabilities
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..runtime.latent_store import LatentStore
+from ..runtime.latent_pool import LatentPool
 from ..runtime.mesh_store import MeshStore
 from ..runtime.mover import Mover
 from ..runtime.product_store import ProductStore
@@ -253,7 +254,10 @@ class ModelWorker:
             completion_payload_bytes=int(completion_payload_bytes),
             num_blocks=int(declared.num_blocks),
             scratch_capacity_tokens=int(declared.scratch_capacity_tokens),
-            latent_capacity_units=int(declared.latent_capacity_units),
+            request_pool_size=int(declared.max_request_pool_size),
+            num_latent_pages=int(declared.num_latent_pages),
+            latent_page_units=int(declared.latent_page_units),
+            latent_width=int(declared.latent_width),
             max_latent_feature_bytes=int(declared.max_latent_feature_bytes),
             max_vision_feature_bytes=int(declared.max_vision_feature_bytes),
             bytes_per_token=int(declared.bytes_per_token),
@@ -317,7 +321,33 @@ class ModelWorker:
             continuation_width=1,
             device=deployment.device,
         )
-        self.latents = LatentStore(capacity_bytes=arena.latent_bytes)
+        flow = model.generation
+        latent_dtype = getattr(
+            torch,
+            str(self._capabilities.latent_dtype).removeprefix("torch."),
+            None,
+        )
+        if flow is not None and not isinstance(latent_dtype, torch.dtype):
+            raise capability_mismatch(
+                f"unsupported latent dtype {self._capabilities.latent_dtype!r}"
+            )
+        if flow is None:
+            self.latent_pool = None
+        else:
+            assert isinstance(latent_dtype, torch.dtype)
+            self.latent_pool = LatentPool(
+                request_pool_size=int(self._capabilities.max_request_pool_size),
+                num_pages=int(self._capabilities.num_latent_pages),
+                page_units=int(self._capabilities.latent_page_units),
+                latent_width=int(self._capabilities.latent_width),
+                dtype=latent_dtype,
+                device=deployment.generation_device or deployment.device,
+            )
+        if (
+            self.latent_pool is not None
+            and self.latent_pool.persistent_bytes != arena.latent_pool_bytes
+        ):
+            raise RuntimeError("latent pool allocation disagrees with its exact capacity plan")
         self.products = ProductStore(
             encoder_cache_budget=model.resource_geometry.encoder_cache_entries,
             device_product_capacity=arena.device_products,
@@ -334,10 +364,7 @@ class ModelWorker:
             int(self._capabilities.max_batch_operations),
             int(self._capabilities.max_request_pool_size),
         )
-        flow = model.generation
-        max_staged_rows = max_rows * (
-            1 if flow is None else int(flow.max_cfg_branches)
-        )
+        max_staged_rows = max_rows * (1 if flow is None else int(flow.max_cfg_branches))
         max_text_staged_tokens = int(self._capabilities.max_batch_tokens)
         max_flow_staged_tokens = (
             0
@@ -371,9 +398,7 @@ class ModelWorker:
         )
         decode_max_operations = min(
             max_rows,
-            max_rows
-            if decode_lane is None
-            else int(decode_lane.max_batch_operations or max_rows),
+            max_rows if decode_lane is None else int(decode_lane.max_batch_operations or max_rows),
         )
         prefill_max_tokens = min(
             int(self._capabilities.max_batch_tokens),
@@ -417,11 +442,9 @@ class ModelWorker:
                 <= max_staged_tokens
                 and flow.image_tokens(int(height), int(width))
                 <= int(self._capabilities.latent_capacity_units)
-                and int(batch_size)
-                * math.prod(flow.latent_shape(int(height), int(width)))
-                * torch.empty((), dtype=cache_dtype).element_size()
-                * 2
-                <= int(self.latents.capacity_bytes)
+                and self.latent_pool is not None
+                and int(batch_size) * flow.image_tokens(int(height), int(width))
+                <= int(self.latent_pool.capacity_units)
             )
         )
         mixed_text_batch_sizes = (
@@ -569,9 +592,6 @@ class ModelWorker:
                 int(deployment.block_size),
             ),
         )
-        max_latent_pages_per_row = (
-            0 if flow is None else ceil_div(int(flow.max_latent_tokens), int(deployment.block_size))
-        )
         devices = (
             (deployment.device,)
             if deployment.generation_device is None
@@ -585,7 +605,6 @@ class ModelWorker:
             max_tokens=max_staged_tokens,
             max_text_tokens=max_text_staged_tokens,
             max_blocks_per_row=max_blocks_per_row,
-            max_latent_pages_per_row=max_latent_pages_per_row,
             hidden_size=int(model.hidden_size),
             devices=devices,
             lanes=execution.lanes,
@@ -698,7 +717,7 @@ class ModelWorker:
             sessions=self.sessions,
             runtime_states=self.runtime_states,
             cache_pool=self.cache_pool,
-            latents=self.latents,
+            latent_pool=self.latent_pool,
             products=self.products,
             replay=self.replay,
             weights=self.weights,
@@ -716,6 +735,7 @@ class ModelWorker:
         )
         self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
         self._warmup_scratch_pages: dict[RequestKey, list[int]] = {}
+        self._warmup_latent_pages: dict[RequestKey, list[int]] = {}
         self._warmup_step_id = 0
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:
@@ -730,12 +750,18 @@ class ModelWorker:
                     "block_size": caps.block_size,
                     "num_blocks": caps.num_blocks,
                     "num_layers": caps.num_layers,
+                    "max_request_pool_size": caps.max_request_pool_size,
+                    "latent_page_units": caps.latent_page_units,
+                    "num_latent_pages": caps.num_latent_pages,
+                    "latent_width": caps.latent_width,
+                    "latent_dtype": caps.latent_dtype,
+                    "latent_downsample": caps.latent_downsample,
                 },
                 device=deployment.device,
                 sessions=self.sessions,
                 cache_pool=self.cache_pool,
                 cache_publications=self.executor.cache_publications,
-                latents=self.latents,
+                latent_pool=self.latent_pool,
                 products=self.products,
                 replay=self.replay,
                 transport=self.mover.transport,
@@ -909,21 +935,38 @@ class ModelWorker:
         )
         page_units = int(self._capabilities.latent_page_units)
         latent_page_count = (latent_units + page_units - 1) // page_units if page_units > 0 else 0
+        occupied_latent_pages = {
+            page for pages in self._warmup_latent_pages.values() for page in pages
+        }
         for operation in operations:
             if operation.work.variant not in {
                 WorkVariant.GEN_TRANSITION,
                 WorkVariant.GEN_FLOW,
-                WorkVariant.MATERIALIZE,
-            }:
+            } and not any(product.kind is ProductKind.LATENT for product in operation.inputs):
                 continue
+            page_table = self._warmup_latent_pages.setdefault(operation.request_key, [])
+            missing = latent_page_count - len(page_table)
+            if missing < 0:
+                raise invalid_descriptor("warmup latent placement regresses its physical extent")
+            allocated = tuple(
+                page
+                for page in range(1, int(self._capabilities.num_latent_pages))
+                if page not in occupied_latent_pages
+            )[:missing]
+            if len(allocated) != missing:
+                raise invalid_descriptor("warmup latent placement exceeds resident capacity")
+            page_table.extend(allocated)
+            occupied_latent_pages.update(allocated)
+            session = self.sessions.peek(int(operation.request_key.session_id))
+            start_step = 0 if session is None else int(session.flow_step)
             latent_placements[(operation.request_key, operation.op_id)] = LatentPlacement(
                 request_key=operation.request_key,
                 op_id=operation.op_id,
-                page_table=tuple(range(1, latent_page_count + 1)),
+                page_table=tuple(page_table),
                 latent_units=latent_units,
                 height=height,
                 width=width,
-                start_step=0,
+                start_step=start_step,
                 step_count=(
                     int(operation.bounds.max_tokens)
                     if operation.work.variant is WorkVariant.GEN_FLOW
@@ -1661,12 +1704,6 @@ class ModelWorker:
                             image_geometry=(height, width),
                         )
                     )
-                    released_latents = tuple(
-                        (reference.request_key, int(reference.producer_op_id))
-                        for reference in current_latents
-                    )
-                    self.latents.release_operations(released_latents)
-                    self.products.device_products.release_operations(released_latents)
                     current_latents = tuple(outputs)
                     flow_predecessors.update(zip(session_ids, flows, strict=True))
                 flow_op_id = 5
@@ -1774,12 +1811,6 @@ class ModelWorker:
                             )
                         )
                         text_predecessors.update(zip(selected_text, text_operations, strict=True))
-                        released_latents = tuple(
-                            (reference.request_key, int(reference.producer_op_id))
-                            for reference in current_latents
-                        )
-                        self.latents.release_operations(released_latents)
-                        self.products.device_products.release_operations(released_latents)
                         current_latents = tuple(flow_outputs)
                         flow_predecessors.update(zip(session_ids, flow_operations, strict=True))
             finally:
@@ -1792,13 +1823,15 @@ class ModelWorker:
         self.executor.drop_session(session_id)
         self._release_records(self.products.session_records(session_id))
         self.products.drop(session_id)
-        self.latents.drop_session(session_id)
+        if session is not None and self.latent_pool is not None:
+            self.latent_pool.release_slots((int(session.request_pool_idx),))
         self.replay.drop_session(session_id)
         self.sessions.drop(session_id)
         if session is not None:
             for group_id in range(self.cache_pool.group_count):
                 self._warmup_kv_pages.pop((session.request_key, group_id), None)
             self._warmup_scratch_pages.pop(session.request_key, None)
+            self._warmup_latent_pages.pop(session.request_key, None)
         if self.snapshot_provider is not None:
             self.snapshot_provider.drop_session(session_id)
         if session is not None:
@@ -1834,6 +1867,7 @@ class ModelWorker:
     def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         if self.snapshot_provider is None:
             raise capability_mismatch("this worker has no configured snapshot provider")
+        self.runner.synchronize()
         return self.snapshot_provider.snapshot_session(placement)
 
     def restore_session(
@@ -1843,6 +1877,7 @@ class ModelWorker:
     ) -> None:
         if self.snapshot_provider is None:
             raise capability_mismatch("this worker has no configured snapshot provider")
+        self.runner.synchronize()
         self.snapshot_provider.restore(reference, placement)
         session = self.sessions.get(placement.request_key.session_id)
         valid_cache_length = max(
@@ -1859,11 +1894,15 @@ class ModelWorker:
     def resource_pressure(self) -> list[dict[str, object]]:
         caps = self._capabilities
         counts = {
-            "image_latent": self.latents.resident_byte_count(),
+            "image_latent": (
+                0 if self.latent_pool is None else self.latent_pool.resident_byte_count()
+            ),
             "encoder_output": self.products.encoder_output_count(),
         }
         totals = {
-            "image_latent": int(self.latents.capacity_bytes),
+            "image_latent": (
+                0 if self.latent_pool is None else int(self.latent_pool.capacity_bytes)
+            ),
             "encoder_output": int(caps.encoder_cache_budget),
         }
         return [
@@ -1876,7 +1915,8 @@ class ModelWorker:
         self.runner.synchronize()
         self.executor.close()
         self.mover.close()
-        self.latents.close()
+        if self.latent_pool is not None:
+            self.latent_pool.close()
         self.products.close()
         self.runner.close()
 

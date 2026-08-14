@@ -58,7 +58,7 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, String)> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor has no kind"))?;
     anyhow::ensure!(
-        matches!(kind, "tensor" | "kv")
+        matches!(kind, "tensor" | "latent" | "kv")
             && object
                 .get("value")
                 .is_some_and(serde_json::Value::is_object),

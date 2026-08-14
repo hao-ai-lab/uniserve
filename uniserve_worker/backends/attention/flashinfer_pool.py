@@ -686,7 +686,7 @@ def _should_use_tensor_cores(
     if override is not None:
         return override
     try:
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels  # type: ignore
+        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
         return not bool(_grouped_size_compiled_for_decode_kernels(num_q_heads, num_kv_heads))
     except (ImportError, AttributeError):

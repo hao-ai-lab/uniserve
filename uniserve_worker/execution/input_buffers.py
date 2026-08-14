@@ -38,21 +38,19 @@ class InputBuffers:
         max_tokens: int,
         max_text_tokens: int | None = None,
         max_blocks_per_row: int,
-        max_latent_pages_per_row: int,
         hidden_size: int,
         device: torch.device | str,
     ) -> None:
         if min(max_rows, max_tokens, max_blocks_per_row) < 1:
             raise ValueError("input-buffer row, token, and block bounds must be positive")
-        if max_latent_pages_per_row < 0 or hidden_size < 0:
-            raise ValueError("input-buffer latent and hidden bounds must not be negative")
+        if hidden_size < 0:
+            raise ValueError("input-buffer hidden bound must not be negative")
         self.max_rows = int(max_rows)
         self.max_tokens = int(max_tokens)
         self.max_text_tokens = int(max_tokens if max_text_tokens is None else max_text_tokens)
         if self.max_text_tokens < 1 or self.max_text_tokens > self.max_tokens:
             raise ValueError("input-buffer text-token capacity is invalid")
         self.max_blocks_per_row = int(max_blocks_per_row)
-        self.max_latent_pages_per_row = int(max_latent_pages_per_row)
         self.hidden_size = int(hidden_size)
         self.device = torch.device(device)
 

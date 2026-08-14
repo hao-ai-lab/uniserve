@@ -138,7 +138,7 @@ def encode_transfer_descriptor(
     value: dict[str, object],
     producer_plan_digest: str,
 ) -> bytes:
-    if kind not in {"tensor", "kv"}:
+    if kind not in {"tensor", "kv", "latent"}:
         raise invalid_descriptor("transport entry kind is invalid")
     if not _is_sha256(producer_plan_digest):
         raise invalid_descriptor("transport entry producer plan digest is invalid")
@@ -172,7 +172,7 @@ def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object], str]
     }:
         raise invalid_descriptor("transport entry has an invalid shape")
     kind = value["kind"]
-    if kind not in {"tensor", "kv"}:
+    if kind not in {"tensor", "kv", "latent"}:
         raise invalid_descriptor("transport entry kind is invalid")
     digest = value["producer_plan_digest"]
     if not isinstance(digest, str) or not _is_sha256(digest):

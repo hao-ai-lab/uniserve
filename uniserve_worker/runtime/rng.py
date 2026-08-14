@@ -102,11 +102,17 @@ def normal_noise(
     seed: int,
     device: torch.device,
     dtype: torch.dtype,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Draw explicit normal noise from a generator local to one semantic seed."""
 
     generator = torch.Generator(device=device)
     generator.manual_seed(int(seed))
+    if out is not None:
+        expected = tuple(int(value) for value in shape)
+        if out.device != device or out.dtype != dtype or tuple(out.shape) != expected:
+            raise ValueError("normal-noise output disagrees with the requested tensor")
+        return out.normal_(generator=generator)
     return torch.randn(
         tuple(int(value) for value in shape),
         device=device,

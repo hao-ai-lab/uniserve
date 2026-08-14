@@ -110,7 +110,6 @@ class ModelRunner:
         max_tokens: int,
         max_text_tokens: int | None = None,
         max_blocks_per_row: int,
-        max_latent_pages_per_row: int,
         hidden_size: int,
         devices: tuple[torch.device | str, ...],
         lanes: tuple[LaneConfig, ...] = (),
@@ -139,7 +138,6 @@ class ModelRunner:
                 max_tokens=max_tokens,
                 max_text_tokens=max_text_tokens,
                 max_blocks_per_row=max_blocks_per_row,
-                max_latent_pages_per_row=max_latent_pages_per_row,
                 hidden_size=hidden_size,
                 device=device,
             )

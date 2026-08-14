@@ -1049,23 +1049,38 @@ fn encode_outputs(
 fn latent_output(
     output_index: u16,
     resources: &uniserve_core::GenerationResourceBounds,
+    dtype: DType,
 ) -> Result<ProductRef, PlanningError> {
     Ok(bounded_product(
         output_index,
         ProductKind::Latent,
         StorageClass::LatentArena,
-        DType::BF16,
-        dynamic_element_bound(resources.max_image_latent_bytes, DType::BF16)?,
+        dtype,
+        dynamic_element_bound(resources.max_image_latent_bytes, dtype)?,
     ))
 }
 
 /// Side-effect-free planner for scheduler-local worker transitions.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct GenerationPlanner;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GenerationPlanner {
+    latent_dtype: Option<DType>,
+}
 
 impl GenerationPlanner {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(latent_dtype: Option<DType>) -> Self {
+        Self { latent_dtype }
+    }
+
+    fn latent_output(
+        self,
+        output_index: u16,
+        resources: &uniserve_core::GenerationResourceBounds,
+    ) -> Result<ProductRef, PlanningError> {
+        latent_output(
+            output_index,
+            resources,
+            self.latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
+        )
     }
 
     pub(crate) fn plan(
@@ -1354,7 +1369,7 @@ impl GenerationPlanner {
                         work: Work::Gen(GenMode::Transition),
                         inputs: vec![conditioning],
                         outputs: vec![
-                            latent_output(0, &request.resources)?,
+                            self.latent_output(0, &request.resources)?,
                             output_product(
                                 1,
                                 ProductKind::Completion,
@@ -1428,7 +1443,7 @@ impl GenerationPlanner {
                     Wire {
                         work: Work::Gen(GenMode::Flow),
                         inputs: vec![conditioning, latent],
-                        outputs: vec![latent_output(0, &request.resources)?],
+                        outputs: vec![self.latent_output(0, &request.resources)?],
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: usize::from(step_count),
@@ -1924,6 +1939,7 @@ pub(crate) enum PlanningError {
     FeedbackDisabled,
     MissingImageInput,
     MissingProductBound,
+    MissingLatentDType,
     ProductBoundExceedsProtocol { bytes: u64 },
     ProductGenerationExhausted,
 }
@@ -2691,7 +2707,7 @@ mod tests {
     }
 
     fn prefill_transition() -> PlannedTransition {
-        GenerationPlanner::new()
+        GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request(9, vec![11, 12]),
                 CursorProjection {
@@ -2767,7 +2783,7 @@ mod tests {
         let feature = encode_outputs(ImageIngestStep::VitEncode, 0, &request.resources)
             .expect("bounded vision feature")
             .remove(0);
-        let transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request,
                 CursorProjection {
@@ -2813,7 +2829,7 @@ mod tests {
         );
         conditioning.generation = 7;
 
-        let transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request,
                 CursorProjection {
@@ -2843,7 +2859,7 @@ mod tests {
 
     #[test]
     fn planner_declares_a_device_finish_product_for_a_finish_candidate() {
-        let transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request(15, vec![11, 12]),
                 CursorProjection {
@@ -2883,7 +2899,7 @@ mod tests {
         request.sampling.return_prompt_logprobs = true;
         request.sampling.n_prompt_logprobs = 4;
         request.sampling.logprob_token_ids = vec![17, 19, 17];
-        let transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request,
                 CursorProjection {
@@ -2930,7 +2946,7 @@ mod tests {
 
     #[test]
     fn transition_validates_the_token_selected_under_its_branch_state() {
-        let transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request(13, vec![11, 12]),
                 CursorProjection {
@@ -3040,7 +3056,7 @@ mod tests {
             physical_kv_len: 2,
             replayability: Replayability::Replayable,
         };
-        let closure = GenerationPlanner::new()
+        let closure = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request,
                 cursor,
@@ -3058,7 +3074,7 @@ mod tests {
         assert!(closure.outputs.is_empty());
         assert_eq!(closure.resources.kv_target_tokens, Some(3));
 
-        let publication = GenerationPlanner::new()
+        let publication = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request,
                 CursorProjection {
@@ -3094,9 +3110,9 @@ mod tests {
         request.behavior =
             GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
         request.resources.max_image_latent_bytes = 128;
-        let latent = latent_output(0, &request.resources).expect("bounded latent");
+        let latent = latent_output(0, &request.resources, DType::BF16).expect("bounded latent");
 
-        let transition = GenerationPlanner::new()
+        let transition = GenerationPlanner::new(Some(DType::BF16))
             .plan(
                 &request,
                 CursorProjection {

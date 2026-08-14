@@ -11,7 +11,11 @@ import torch
 from ..execution.forward_batch import FlowPatches
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..nn.diffusion.cfg import Branch, CfgRecipe
-from ..nn.diffusion.schedule import FlowMatchSchedule, ScheduleDirection, ScheduleShiftDomain
+from ..nn.diffusion.schedule import (
+    ScheduleDirection,
+    ScheduleShiftDomain,
+    flow_match_coordinate,
+)
 from ..nn.vision.patching import patchify_batch, unpatchify_batch
 from .runtime import PositionLayout
 
@@ -155,13 +159,30 @@ class GenerationPipeline:
         ):
             raise invalid_descriptor("generation geometry must be positive")
 
-    def schedule(self, steps: int, requested_shift: float) -> FlowMatchSchedule:
-        return FlowMatchSchedule(
-            num_steps=int(steps),
-            shift=float(requested_shift if requested_shift > 0 else self.timestep_shift or 1.0),
-            direction=self.schedule_direction,
-            shift_domain=self.schedule_shift_domain,
+    def schedule_pair(
+        self,
+        steps: int,
+        requested_shift: float,
+        index: int,
+    ) -> tuple[float, float]:
+        """Return one immutable analytical schedule pair for fixed tensor staging."""
+
+        shift = float(requested_shift if requested_shift > 0 else self.timestep_shift or 1.0)
+        current = flow_match_coordinate(
+            int(steps),
+            shift,
+            self.schedule_direction,
+            self.schedule_shift_domain,
+            int(index),
         )
+        following = flow_match_coordinate(
+            int(steps),
+            shift,
+            self.schedule_direction,
+            self.schedule_shift_domain,
+            int(index) + 1,
+        )
+        return current, following
 
     def branch_source(self, branch: Branch) -> BranchSource:
         if branch is Branch.COND:
@@ -241,6 +262,22 @@ class GenerationPipeline:
             height=int(height),
             width=int(width),
             channels=self.latent_channels,
+        )
+
+    def materialization_latent(
+        self,
+        latent: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Project canonical page rows into the model's materialization layout."""
+
+        if self.latent_layout is LatentLayout.PATCH_TOKENS:
+            return latent
+        return self.stored_latent(
+            latent.reshape(1, self.image_tokens(height, width), -1),
+            height,
+            width,
         )
 
     def conditioning(

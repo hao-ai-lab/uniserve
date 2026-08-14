@@ -59,6 +59,8 @@ def execution_worker(
         request_pages=worker.cache_pool.request_pages,
         scratch_pages=worker.cache_pool.scratch_pages,
         max_cfg_branches=worker.capabilities.max_cfg_branches,
+        latent_page_units=worker.capabilities.latent_page_units,
+        latent_downsample=worker.capabilities.latent_downsample,
     )
     return worker
 

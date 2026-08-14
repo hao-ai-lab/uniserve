@@ -694,6 +694,86 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     );
 }
 
+#[test]
+fn cancellation_releases_latent_admission_for_a_waiting_image() {
+    use uniserve_worker_wire::ResourceClass;
+
+    let mut sim = SimEngine::new();
+    sim.set_pipeline_depth(4);
+    sim.mut_caps_for_test().resource_classes = vec![ResourceClass::ImageLatent];
+    sim.mut_caps_for_test().latent_page_units = 64;
+    sim.mut_caps_for_test().num_latent_pages = 17;
+    sim.mut_caps_for_test().latent_downsample = 16;
+    sim.mut_caps_for_test().max_batch_operations = 1024;
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let thread = thread::spawn(move || scheduler.run(rx));
+
+    let mut first = handle
+        .submit(generation_request(
+            RequestId(1),
+            text_context(vec![4, 5, 6]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: ImageParams::MAX_STEPS,
+                ..Default::default()
+            },
+            GenerationConstraint::GenOnly,
+            0,
+        ))
+        .unwrap();
+    let begin_deadline = Instant::now() + Duration::from_secs(10);
+    let mut began = false;
+    while !began && Instant::now() < begin_deadline {
+        match first.try_recv() {
+            Ok(GenEvent::ImageBegin { .. }) => began = true,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(began, "resident image did not enter generation");
+
+    let mut second = handle
+        .submit(generation_request(
+            RequestId(2),
+            text_context(vec![4, 5, 6]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 2,
+                ..Default::default()
+            },
+            GenerationConstraint::GenOnly,
+            0,
+        ))
+        .unwrap();
+    handle.cancel(RequestId(1));
+
+    let mut reasons = HashMap::new();
+    let mut second_images = 0;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while reasons.len() < 2 && Instant::now() < deadline {
+        for (id, receiver) in [(RequestId(1), &mut first), (RequestId(2), &mut second)] {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    GenEvent::ImageDone { .. } if id == RequestId(2) => second_images += 1,
+                    GenEvent::Finished { reason, .. } => {
+                        reasons.insert(id, reason);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.shutdown();
+    let _ = thread.join();
+
+    assert_eq!(reasons.get(&RequestId(1)), Some(&FinishReason::Cancelled));
+    assert!(reasons.contains_key(&RequestId(2)));
+    assert_eq!(second_images, 1);
+}
+
 /// The flow phase runs exactly `image.steps` denoise quanta and then commits —
 /// never `image.steps + 1`. The worker signals no flow-completion, so
 /// termination is host-driven off the committed step count; this guards the

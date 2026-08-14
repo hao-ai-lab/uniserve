@@ -27,7 +27,6 @@ from ..foundation.errors import capability_mismatch, unsupported_control
 from ..runtime.arena_capacity import operation_window, system_arena_capacity
 from ..runtime.cache_pool import CachePool
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..runtime.latent_store import LatentStore
 from ..runtime.mover import Mover
 from ..runtime.product_store import ProductRecord, ProductStore
 from ..runtime.replay import ReplayStore
@@ -133,7 +132,6 @@ class SystemWorker:
             device=device,
             dtype=torch.bfloat16,
         )
-        self.latents = LatentStore()
         self.products = ProductStore(
             device_product_capacity=arena.device_products,
             device_product_byte_capacity=arena.device_product_bytes,
@@ -154,7 +152,7 @@ class SystemWorker:
             sessions=self.sessions,
             runtime_states=None,
             cache_pool=self.cache_pool,
-            latents=self.latents,
+            latent_pool=None,
             products=self.products,
             replay=self.replay,
             weights=None,
@@ -185,7 +183,7 @@ class SystemWorker:
                 sessions=self.sessions,
                 cache_pool=self.cache_pool,
                 cache_publications=self.executor.cache_publications,
-                latents=self.latents,
+                latent_pool=None,
                 products=self.products,
                 replay=self.replay,
                 transport=self.mover.transport,
@@ -206,7 +204,6 @@ class SystemWorker:
         session = self.sessions.peek(session_id)
         self._release_records(self.products.session_records(session_id))
         self.products.drop(session_id)
-        self.latents.drop_session(session_id)
         self.replay.drop_session(session_id)
         self.sessions.drop(session_id)
         if self.snapshot_provider is not None:

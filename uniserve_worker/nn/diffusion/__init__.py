@@ -13,7 +13,12 @@ from .cfg import (
 from .fm_modules import ConvDecoder, FlowMatchingHead
 from .integrator import euler_step
 from .noise import init_latent
-from .schedule import FlowMatchSchedule, ScheduleDirection, ScheduleShiftDomain, x_pred_to_velocity
+from .schedule import (
+    ScheduleDirection,
+    ScheduleShiftDomain,
+    flow_match_coordinate,
+    x_pred_to_velocity,
+)
 from .timestep import TimestepEmbedder, timestep_embedding
 
 __all__ = [
@@ -21,7 +26,6 @@ __all__ = [
     "CfgParams",
     "CfgPlan",
     "CfgRecipe",
-    "FlowMatchSchedule",
     "ConvDecoder",
     "FlowMatchingHead",
     "RenormKind",
@@ -32,6 +36,7 @@ __all__ = [
     "combine_cfg",
     "combine_text_image_cfg",
     "euler_step",
+    "flow_match_coordinate",
     "init_latent",
     "timestep_embedding",
     "x_pred_to_velocity",

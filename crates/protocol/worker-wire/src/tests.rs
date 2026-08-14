@@ -237,10 +237,11 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 .filter(|operation| {
                     matches!(
                         operation.work.variant(),
-                        WorkVariant::GenTransition
-                            | WorkVariant::GenFlow
-                            | WorkVariant::Materialize
-                    )
+                        WorkVariant::GenTransition | WorkVariant::GenFlow
+                    ) || operation
+                        .inputs
+                        .iter()
+                        .any(|reference| reference.kind == ProductKind::Latent)
                 })
                 .map(|operation| LatentPlacement {
                     request_key: operation.request_key,
@@ -1093,6 +1094,7 @@ fn recovery_placement_fixture() -> RecoveryPlacement {
             page_ids: vec![BlockId(5), BlockId(6)],
             length: 17,
         }],
+        latent_page_table: vec![7, 8],
     }
 }
 

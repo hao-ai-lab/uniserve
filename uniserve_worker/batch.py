@@ -367,7 +367,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "pages_to_zero",
     ),
     ("group_id", "page_ids", "length"),
-    ("request_key", "request_pool_idx", "cache_groups"),
+    ("request_key", "request_pool_idx", "cache_groups", "latent_page_table"),
     ("group_id", "source_page", "destination_page"),
     (
         "request_key",
@@ -2163,10 +2163,16 @@ class RecoveryPlacement:
     request_key: RequestKey
     request_pool_idx: int
     cache_groups: tuple[CacheGroupPlacement, ...]
+    latent_page_table: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         groups = tuple(group.group_id for group in self.cache_groups)
-        if self.request_pool_idx < 1 or len(set(groups)) != len(groups):
+        if (
+            self.request_pool_idx < 1
+            or len(set(groups)) != len(groups)
+            or any(page < 1 for page in self.latent_page_table)
+            or len(set(self.latent_page_table)) != len(self.latent_page_table)
+        ):
             raise invalid_descriptor("recovery placement identity is invalid")
 
     @classmethod
@@ -2188,6 +2194,10 @@ class RecoveryPlacement:
                     _seq(data.get("cache_groups", ()), f"{where}.cache_groups")
                 )
             ),
+            latent_page_table=_uints(
+                data.get("latent_page_table", ()),
+                f"{where}.latent_page_table",
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -2195,6 +2205,7 @@ class RecoveryPlacement:
             "request_key": self.request_key.to_wire(),
             "request_pool_idx": self.request_pool_idx,
             "cache_groups": [group.to_wire() for group in self.cache_groups],
+            "latent_page_table": list(self.latent_page_table),
         }
 
 
@@ -2367,11 +2378,14 @@ class BatchPartition:
                 raise invalid_descriptor("KV branch placements overlap physical pages")
             branch_pages.update(placement.block_table)
         latent_ids: set[tuple[RequestKey, int]] = set()
-        latent_variants = {
-            WorkVariant.GEN_TRANSITION,
-            WorkVariant.GEN_FLOW,
-            WorkVariant.MATERIALIZE,
-        }
+        latent_pages: set[int] = set()
+
+        def addresses_trajectory(operation: Operation) -> bool:
+            return operation.work.variant in {
+                WorkVariant.GEN_TRANSITION,
+                WorkVariant.GEN_FLOW,
+            } or any(reference.kind is ProductKind.LATENT for reference in operation.inputs)
+
         for latent_placement in self.latent_placements:
             latent_identity = (latent_placement.request_key, latent_placement.op_id)
             if latent_identity in latent_ids:
@@ -2380,12 +2394,15 @@ class BatchPartition:
             operation = operations.get(latent_identity)
             if operation is None:
                 raise invalid_descriptor("latent placement does not name a partition operation")
-            if operation.work.variant not in latent_variants:
+            if not addresses_trajectory(operation):
                 raise invalid_descriptor(
                     "latent placement names an operation that does not address a trajectory"
                 )
+            if not latent_pages.isdisjoint(latent_placement.page_table):
+                raise invalid_descriptor("latent placements overlap physical pages")
+            latent_pages.update(latent_placement.page_table)
         if any(
-            operation.work.variant in latent_variants
+            addresses_trajectory(operation)
             and (operation.request_key, operation.op_id) not in latent_ids
             for operation in self.operations
         ):
@@ -2459,7 +2476,7 @@ class BatchPartition:
             for name, item in fields.items():
                 object.__setattr__(partition, name, item)
             return partition
-        return cls(**fields)
+        return cls(**cast(Any, fields))
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -2510,6 +2527,10 @@ class Batch:
         for partition in self.partitions:
             groups.setdefault(partition.submission_group, []).append(partition)
         for partitions in groups.values():
+            if sum(bool(partition.latent_placements) for partition in partitions) > 1:
+                raise invalid_descriptor(
+                    "a physical submission group has multiple latent staging partitions"
+                )
             execution = partitions[0].execution
             collective_seq = partitions[0].collective_seq
             attention = partitions[0].attention

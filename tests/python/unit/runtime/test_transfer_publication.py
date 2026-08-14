@@ -22,13 +22,13 @@ from uniserve_worker.runtime.transfer import (
 
 def test_transfer_descriptor_round_trips_exact_canonical_provenance() -> None:
     digest = "a" * 64
-    encoded = encode_transfer_descriptor("tensor", {"height": 16, "width": 24}, digest)
-
-    assert decode_transfer_descriptor(encoded) == (
-        "tensor",
-        {"height": 16, "width": 24},
-        digest,
-    )
+    for kind in ("tensor", "kv", "latent"):
+        encoded = encode_transfer_descriptor(kind, {"height": 16, "width": 24}, digest)
+        assert decode_transfer_descriptor(encoded) == (
+            kind,
+            {"height": 16, "width": 24},
+            digest,
+        )
 
 
 def test_transfer_descriptor_rejects_noncanonical_or_unbounded_frames() -> None:

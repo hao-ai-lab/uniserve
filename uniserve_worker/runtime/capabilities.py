@@ -19,6 +19,7 @@ from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_tot
 from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment, active_latent_capacity_tokens
 from .arena_capacity import operation_window
+from .latent_capacity import latent_pool_capacity_bytes
 
 __all__ = ["resolve_capabilities"]
 
@@ -39,7 +40,7 @@ def resolve_capabilities(
     flow = model.generation
     if flow is not None and not isinstance(flow, GenerationPipeline):
         raise invalid_descriptor("model generation behavior has an invalid type")
-    latent_capacity_units = (
+    requested_latent_units = (
         active_latent_capacity_tokens(
             int(flow.max_latent_tokens),
             deployment.kv_token_capacity,
@@ -47,10 +48,30 @@ def resolve_capabilities(
         if flow is not None
         else 0
     )
+    latent_page_units = int(deployment.block_size) if flow is not None else 0
+    num_latent_pages = (
+        ceil_div(requested_latent_units, latent_page_units) + 1 if flow is not None else 0
+    )
+    latent_capacity_units = (num_latent_pages - 1) * latent_page_units if flow is not None else 0
+    latent_width = (
+        int(flow.latent_channels) * int(flow.latent_patch_size) ** 2 if flow is not None else 0
+    )
+    model_dtype_bytes = _model_dtype_bytes(deployment.model_dtype)
+    latent_pool_bytes = (
+        latent_pool_capacity_bytes(
+            request_pool_size=int(deployment.max_request_pool_size),
+            num_pages=num_latent_pages,
+            page_units=latent_page_units,
+            latent_width=latent_width,
+            dtype_bytes=model_dtype_bytes,
+        )
+        if flow is not None
+        else 0
+    )
     cache = model.cache_geometry
     max_vit_grid_tokens = int(getattr(model, "max_vit_grid_tokens", 0))
     hidden_elements = int(cache.num_attention_heads) * int(cache.head_dim)
-    max_vision_feature_bytes = max_vit_grid_tokens * hidden_elements * 2
+    max_vision_feature_bytes = max_vit_grid_tokens * hidden_elements * model_dtype_bytes
     max_latent_feature_bytes = (
         0
         if flow is None
@@ -59,7 +80,7 @@ def resolve_capabilities(
             * int(flow.latent_channels)
             * int(flow.latent_patch_size)
             * int(flow.latent_patch_size)
-            * 2
+            * model_dtype_bytes
         )
     )
     resident_copies, co_resident_blocks = _kv_residency_shape(
@@ -67,6 +88,9 @@ def resolve_capabilities(
         resources,
         latent_capacity_units=latent_capacity_units,
         bytes_per_token=bytes_per_token,
+        co_resident_bytes=(
+            latent_pool_bytes if deployment.generation_device in {None, deployment.device} else 0
+        ),
     )
     capacity = derive_runtime_kv_capacity(
         block_size=int(deployment.block_size),
@@ -105,15 +129,9 @@ def resolve_capabilities(
         head_dim=int(cache.head_dim),
         scratch_capacity_tokens=scratch_capacity,
         supported_work=supported_work,
-        latent_page_units=(int(deployment.block_size) if flow is not None else 0),
-        num_latent_pages=(
-            latent_capacity_units // int(deployment.block_size) + 1 if flow is not None else 0
-        ),
-        latent_width=(
-            int(flow.latent_channels) * int(flow.latent_patch_size) * int(flow.latent_patch_size)
-            if flow is not None
-            else 0
-        ),
+        latent_page_units=latent_page_units,
+        num_latent_pages=num_latent_pages,
+        latent_width=latent_width,
         latent_dtype=deployment.model_dtype if flow is not None else "",
         latent_downsample=int(flow.latent_downsample) if flow is not None else 1,
         bytes_per_token=bytes_per_token,
@@ -154,6 +172,17 @@ def _kv_dtype(model: ExecutionModel, deployment: WorkerDeployment) -> str:
     return str(override).removeprefix("torch.")
 
 
+def _model_dtype_bytes(dtype: str) -> int:
+    width = {
+        "float16": 2,
+        "bfloat16": 2,
+        "float32": 4,
+    }.get(str(dtype).removeprefix("torch.").lower())
+    if width is None:
+        raise ValueError(f"unsupported model dtype {dtype!r}")
+    return width
+
+
 def _kv_bytes_per_token(model: ExecutionModel, deployment: WorkerDeployment) -> int:
     width = {
         "float8_e4m3fn": 1,
@@ -173,6 +202,7 @@ def _kv_residency_shape(
     *,
     latent_capacity_units: int,
     bytes_per_token: int,
+    co_resident_bytes: int,
 ) -> tuple[int, int]:
     """Describe every KV pool that shares the deployment memory budget.
 
@@ -191,15 +221,20 @@ def _kv_residency_shape(
         graph_memory_budget_bytes(device_total_bytes(deployment.device)),
         block_size * max(1, int(bytes_per_token)),
     )
+    fixed_owner_blocks = ceil_div(
+        max(0, int(co_resident_bytes)),
+        block_size * max(1, int(bytes_per_token)),
+    )
     scratch = getattr(resources, "scratch", None)
     if scratch is None:
-        return 1, padding_blocks + graph_blocks
+        return 1, padding_blocks + graph_blocks + fixed_owner_blocks
     fixed_blocks = ceil_div(int(scratch.fixed_tokens), block_size)
     latent_blocks = ceil_div(latent_capacity_units * int(scratch.latent_copies), block_size)
     return (
         2 if scratch.mirror_kv else 1,
         2 * padding_blocks
         + graph_blocks
+        + fixed_owner_blocks
         + max(int(scratch.minimum_blocks), fixed_blocks + latent_blocks),
     )
 

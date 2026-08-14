@@ -143,7 +143,6 @@ def _runner(model: nn.Module) -> ModelRunner:
         max_rows=4,
         max_tokens=16,
         max_blocks_per_row=4,
-        max_latent_pages_per_row=2,
         hidden_size=4,
         devices=("cpu",),
     )
@@ -307,7 +306,6 @@ def test_decode_graph_bucket_replays_smaller_batches_and_faults_on_a_covered_mis
         max_rows=4,
         max_tokens=4,
         max_blocks_per_row=1,
-        max_latent_pages_per_row=1,
         hidden_size=4,
         devices=(device,),
     )
@@ -427,7 +425,6 @@ def test_exact_flow_graph_replays_fresh_operation_inputs_after_startup():
         max_rows=1,
         max_tokens=4,
         max_blocks_per_row=1,
-        max_latent_pages_per_row=1,
         hidden_size=4,
         devices=(device,),
     )

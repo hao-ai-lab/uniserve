@@ -63,8 +63,11 @@ _IMAGE_PARAMS: dict[RequestKey, ImageParams] = {}
 _OP_KV_LENGTHS: dict[tuple[RequestKey, int], tuple[int, int, int, int]] = {}
 _OP_KV_RESULTS: dict[tuple[RequestKey, int], int] = {}
 _OP_KV_VERIFY_BASES: dict[tuple[RequestKey, int], int] = {}
+_LATENT_STEPS: dict[ProductRef, int] = {}
 _SCRATCH_PAGES: tuple[int, ...] = ()
 _MAX_CFG_BRANCHES = 1
+_LATENT_PAGE_UNITS = 1
+_LATENT_DOWNSAMPLE = 1
 
 
 def configure_physical_pool(
@@ -72,10 +75,14 @@ def configure_physical_pool(
     request_pages: int,
     scratch_pages: int,
     max_cfg_branches: int,
+    latent_page_units: int,
+    latent_downsample: int,
 ) -> None:
-    global _SCRATCH_PAGES, _MAX_CFG_BRANCHES
+    global _SCRATCH_PAGES, _MAX_CFG_BRANCHES, _LATENT_PAGE_UNITS, _LATENT_DOWNSAMPLE
     _SCRATCH_PAGES = tuple(range(int(request_pages), int(request_pages) + int(scratch_pages)))
     _MAX_CFG_BRANCHES = max(1, int(max_cfg_branches))
+    _LATENT_PAGE_UNITS = max(1, int(latent_page_units))
+    _LATENT_DOWNSAMPLE = max(1, int(latent_downsample))
 
 
 def _reset_request(rk: RequestKey) -> None:
@@ -86,6 +93,8 @@ def _reset_request(rk: RequestKey) -> None:
     for table in (_PAGES_TO_ZERO, _OP_KV_LENGTHS, _OP_KV_RESULTS, _OP_KV_VERIFY_BASES):
         for identity in tuple(identity for identity in table if identity[0] == rk):
             table.pop(identity, None)
+    for product in tuple(product for product in _LATENT_STEPS if product.request_key == rk):
+        _LATENT_STEPS.pop(product, None)
     _OP_KV_RESULTS[(rk, 0)] = 0
 
 
@@ -95,8 +104,16 @@ def _kv_page(value: int) -> int:
 
 def _latent_placement(operation: Operation) -> LatentPlacement:
     image = _IMAGE_PARAMS[operation.request_key]
-    latent_units = max(1, (int(image.height) // 16) * (int(image.width) // 16))
-    page_count = (latent_units + 15) // 16
+    latent_units = max(
+        1,
+        (int(image.height) // _LATENT_DOWNSAMPLE) * (int(image.width) // _LATENT_DOWNSAMPLE),
+    )
+    page_count = (latent_units + _LATENT_PAGE_UNITS - 1) // _LATENT_PAGE_UNITS
+    latent_input = next(
+        (product for product in operation.inputs if product.kind is ProductKind.LATENT),
+        None,
+    )
+    start_step = 0 if latent_input is None else _LATENT_STEPS.get(latent_input, 0)
     return LatentPlacement(
         request_key=operation.request_key,
         op_id=operation.op_id,
@@ -104,7 +121,7 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
         latent_units=latent_units,
         height=int(image.height),
         width=int(image.width),
-        start_step=0,
+        start_step=start_step,
         step_count=(
             int(operation.bounds.max_tokens)
             if operation.work.variant is WorkVariant.GEN_FLOW
@@ -220,11 +237,7 @@ def execution_batch(
 
     partition_id = 1
     for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
-        domains = tuple(
-            domain
-            for domain in Domain
-            if any(op.domain is domain for op in routed)
-        )
+        domains = tuple(domain for domain in Domain if any(op.domain is domain for op in routed))
         execution = (
             ExecutionCapability.TENSORIZED_MIXED
             if len(domains) > 1
@@ -284,11 +297,8 @@ def execution_batch(
                         _latent_placement(operation)
                         for operation in domain_operations
                         if operation.work.variant
-                        in {
-                            WorkVariant.GEN_TRANSITION,
-                            WorkVariant.GEN_FLOW,
-                            WorkVariant.MATERIALIZE,
-                        }
+                        in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}
+                        or any(product.kind is ProductKind.LATENT for product in operation.inputs)
                     ),
                 )
             )
@@ -644,6 +654,7 @@ def gen_transition_operation(
         ),
         control_seq=control_seq,
     )
+    _LATENT_STEPS[latent] = 0
     return operation, latent
 
 
@@ -682,6 +693,7 @@ def flow_operation(
         kv_capacity_pages=capacity,
         control_seq=control_seq,
     )
+    _LATENT_STEPS[output] = _LATENT_STEPS.get(latent, 0) + int(steps)
     return operation, output
 
 

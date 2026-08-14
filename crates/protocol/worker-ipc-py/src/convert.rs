@@ -853,6 +853,10 @@ fn recovery_placement_to_py<'py>(
             cache_group_placement_to_py(py, group)
         })?,
     )?;
+    dict.set_item(
+        intern!(py, "latent_page_table"),
+        u32_list(py, &placement.latent_page_table)?,
+    )?;
     Ok(dict)
 }
 
@@ -1878,6 +1882,7 @@ mod tests {
                         length: 8,
                     },
                 ],
+                latent_page_table: vec![10, 11],
             });
             assert_matches_pythonize(py, &request);
         });

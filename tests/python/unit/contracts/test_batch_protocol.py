@@ -22,6 +22,7 @@ from uniserve_worker.batch import (
     Batch,
     BatchPartition,
     Bounds,
+    CacheGroupPlacement,
     Close,
     CloseReason,
     Commit,
@@ -38,6 +39,7 @@ from uniserve_worker.batch import (
     FinishFlags,
     FixedPoint,
     KvPlacement,
+    LatentPlacement,
     LogicalLengths,
     Operation,
     OpStatus,
@@ -46,6 +48,7 @@ from uniserve_worker.batch import (
     ProductKind,
     ProductPayload,
     ProductRef,
+    RecoveryPlacement,
     RegistrationAck,
     Release,
     RequestKey,
@@ -61,6 +64,7 @@ from uniserve_worker.batch import (
     VersionRef,
     Work,
     WorkerForwardStats,
+    WorkVariant,
     control_content_digest,
     control_from_wire,
     control_to_wire,
@@ -155,6 +159,89 @@ def _partition(*operations: Operation) -> BatchPartition:
                 resulting_length=1,
             )
             for operation in operations
+        ),
+    )
+
+
+def _latent_product(
+    request_key: RequestKey,
+    *,
+    producer_op_id: int,
+    generation: int,
+) -> ProductRef:
+    return ProductRef(
+        request_key=request_key,
+        producer_op_id=producer_op_id,
+        output_index=0,
+        generation=generation,
+        kind=ProductKind.LATENT,
+        storage_class=StorageClass.LATENT_ARENA,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(3), StaticDim(2))),
+        point_range=PointRange(base_point=0, max_points=1),
+    )
+
+
+def _trajectory_operation(request_key: RequestKey, work: Work, *, op_id: int) -> Operation:
+    input_product = _latent_product(
+        request_key,
+        producer_op_id=op_id - 1,
+        generation=1,
+    )
+    outputs = (
+        (_latent_product(request_key, producer_op_id=op_id, generation=2),)
+        if work.variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}
+        else ()
+    )
+    inputs = () if work.variant is WorkVariant.GEN_TRANSITION else (input_product,)
+    return Operation.registered(
+        request_key=request_key,
+        op_id=op_id,
+        parent=VersionRef(
+            request_key=request_key,
+            producer_op_id=1,
+            point=FixedPoint(point_index=0, semantic_digest="aa" * 32),
+        ),
+        work=work,
+        route=1,
+        domain=execution_domain(work),
+        bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=24),
+        inputs=inputs,
+        outputs=outputs,
+        kv_capacity_pages=0,
+    )
+
+
+def _trajectory_partition(
+    operation: Operation,
+    *,
+    partition_id: int,
+    submission_group: int,
+    pages: tuple[int, ...],
+    execution: ExecutionCapability = ExecutionCapability.DOMAIN_HOMOGENEOUS,
+) -> BatchPartition:
+    return BatchPartition(
+        partition_id=partition_id,
+        submission_group=submission_group,
+        collective_seq=submission_group,
+        domain=operation.domain,
+        route=operation.route,
+        execution=execution,
+        attention=AttentionRegime.NONE,
+        shape_class=0,
+        operations=(operation,),
+        request_pool_indices=(int(operation.request_key.session_id),),
+        latent_placements=(
+            LatentPlacement(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                page_table=pages,
+                latent_units=3,
+                height=16,
+                width=48,
+                start_step=(0 if operation.work.variant is WorkVariant.GEN_TRANSITION else 1),
+                step_count=(1 if operation.work.variant is WorkVariant.GEN_FLOW else 0),
+            ),
         ),
     )
 
@@ -287,6 +374,101 @@ def test_protocol_layout_digest_matches_rust() -> None:
 def test_operation_round_trips_through_wire() -> None:
     operation = _decode_operation()
     assert Operation.from_wire(operation.to_wire()) == operation
+
+
+def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() -> None:
+    first_key = _request_key()
+    first = _trajectory_operation(first_key, Work("gen", "transition"), op_id=20)
+    with pytest.raises(WorkerError, match="has no latent placement"):
+        BatchPartition(
+            partition_id=1,
+            submission_group=1,
+            collective_seq=1,
+            domain=Domain.FLOW,
+            route=1,
+            execution=ExecutionCapability.DOMAIN_HOMOGENEOUS,
+            attention=AttentionRegime.NONE,
+            shape_class=0,
+            operations=(first,),
+            request_pool_indices=(8,),
+        )
+
+    valid = _trajectory_partition(
+        first,
+        partition_id=1,
+        submission_group=1,
+        pages=(3, 4),
+    )
+    assert BatchPartition.from_wire(valid.to_wire()) == valid
+
+    second_key = RequestKey(authority_id=4, session_id=9, epoch=2)
+    second = _trajectory_operation(second_key, Work("gen", "transition"), op_id=21)
+    first_placement = valid.latent_placements[0]
+    with pytest.raises(WorkerError, match="overlap"):
+        BatchPartition(
+            partition_id=2,
+            submission_group=2,
+            collective_seq=2,
+            domain=Domain.FLOW,
+            route=1,
+            execution=ExecutionCapability.DOMAIN_HOMOGENEOUS,
+            attention=AttentionRegime.NONE,
+            shape_class=0,
+            operations=(first, second),
+            request_pool_indices=(8, 9),
+            latent_placements=(
+                first_placement,
+                replace(
+                    first_placement,
+                    request_key=second_key,
+                    op_id=second.op_id,
+                    page_table=(4, 5),
+                ),
+            ),
+        )
+
+
+def test_submission_group_has_one_fixed_latent_staging_partition() -> None:
+    flow_operation = _trajectory_operation(
+        _request_key(),
+        Work("materialize", None),
+        op_id=20,
+    )
+    transfer_operation = _trajectory_operation(
+        RequestKey(authority_id=4, session_id=9, epoch=2),
+        Work("transfer", "product"),
+        op_id=21,
+    )
+    partitions = (
+        _trajectory_partition(
+            flow_operation,
+            partition_id=1,
+            submission_group=7,
+            pages=(3, 4),
+            execution=ExecutionCapability.TENSORIZED_MIXED,
+        ),
+        _trajectory_partition(
+            transfer_operation,
+            partition_id=2,
+            submission_group=7,
+            pages=(5, 6),
+            execution=ExecutionCapability.TENSORIZED_MIXED,
+        ),
+    )
+    with pytest.raises(WorkerError, match="multiple latent staging partitions"):
+        Batch(step_id=1, partitions=partitions)
+
+
+def test_recovery_placement_round_trip_preserves_the_latent_page_table() -> None:
+    placement = RecoveryPlacement(
+        request_key=_request_key(),
+        request_pool_idx=8,
+        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(1, 2), length=17),),
+        latent_page_table=(7, 8),
+    )
+    assert RecoveryPlacement.from_wire(placement.to_wire()) == placement
+    with pytest.raises(WorkerError, match="identity"):
+        replace(placement, latent_page_table=(7, 7))
 
 
 def test_operation_rejects_a_work_domain_mismatch() -> None:

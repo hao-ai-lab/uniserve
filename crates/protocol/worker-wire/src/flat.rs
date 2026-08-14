@@ -1087,6 +1087,10 @@ fn recovery_placement_from_table(
                     .collect()
             })
             .unwrap_or_default(),
+        latent_page_table: placement
+            .latent_page_table()
+            .map(|pages| pages.iter().collect())
+            .unwrap_or_default(),
     };
     placement.validate()?;
     Ok(placement)
@@ -1632,6 +1636,7 @@ fn recovery_placement_to_fb(placement: &RecoveryPlacement) -> fbs::RecoveryPlace
                 })
                 .collect(),
         ),
+        latent_page_table: Some(placement.latent_page_table.clone()),
     }
 }
 
@@ -1657,6 +1662,7 @@ fn recovery_placement_from_fb(
                 length: group.length,
             })
             .collect(),
+        latent_page_table: placement.latent_page_table.unwrap_or_default(),
     };
     placement.validate()?;
     Ok(placement)

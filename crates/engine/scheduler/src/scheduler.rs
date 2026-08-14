@@ -844,6 +844,15 @@ fn now() -> f64 {
     uniserve_core::now_unix_secs()
 }
 
+fn worker_float_dtype(value: &str) -> Option<uniserve_worker_wire::DType> {
+    match value {
+        "float16" => Some(uniserve_worker_wire::DType::F16),
+        "bfloat16" => Some(uniserve_worker_wire::DType::BF16),
+        "float32" => Some(uniserve_worker_wire::DType::F32),
+        _ => None,
+    }
+}
+
 fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMap<String, u64>) {
     if delta.is_empty() {
         return;
@@ -1188,6 +1197,7 @@ impl Scheduler {
                 },
             }));
         }
+        let latent_dtype = worker_float_dtype(&caps.latent_dtype);
         Self {
             executor,
             caps,
@@ -1224,7 +1234,7 @@ impl Scheduler {
             fatal: false,
             decisions: crate::policy::DecisionLog::default(),
             latency: crate::policy::LatencyHistory::new(),
-            planner: GenerationPlanner::new(),
+            planner: GenerationPlanner::new(latent_dtype),
             batch_started: HashMap::new(),
             batch_partitions: HashMap::new(),
             pending_controls: VecDeque::new(),
@@ -4435,8 +4445,12 @@ impl Scheduler {
             }
             if matches!(
                 operation.work.variant(),
-                WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
-            ) {
+                WorkVariant::GenTransition | WorkVariant::GenFlow
+            ) || operation
+                .inputs
+                .iter()
+                .any(|reference| reference.kind == uniserve_worker_wire::ProductKind::Latent)
+            {
                 let Some(state) = self.running.get(&request_id) else {
                     self.fatal = true;
                     return;
@@ -4450,8 +4464,7 @@ impl Scheduler {
                         ..
                     } => (u32::from(*start_step), u32::from(*step_count)),
                     TransitionDelta::TransitionGen { .. } => (0, 0),
-                    TransitionDelta::CommitGen { .. } => (u32::from(state.image_gen.steps_done), 0),
-                    _ => unreachable!("latent work has latent scheduler metadata"),
+                    _ => (u32::from(state.image_gen.steps_done), 0),
                 };
                 latent_placements.insert(
                     (operation.request_key, operation.op_id),
@@ -6822,7 +6835,7 @@ mod tests {
         cursor: CursorProjection,
         intent: TransitionIntent,
     ) -> PlannedTransition {
-        GenerationPlanner::new()
+        GenerationPlanner::new(Some(uniserve_worker_wire::DType::BF16))
             .plan(req, cursor, intent)
             .expect("plan transition")
     }

@@ -204,8 +204,43 @@ def _transition_generation(
         seed=seed,
         image_index=image_index,
     )
-    worker.execute(execution_batch(step_id=step_id, operations=(transition,)))
+    report = worker.execute(execution_batch(step_id=step_id, operations=(transition,)))
+    assert report.completions[0].status is OpStatus.OK
     return latent, commit_resolved(worker.sessions.get(admission.request_key.session_id))
+
+
+def _materialized_artifact(
+    worker: object,
+    admission: Admission,
+    latent: ProductRef,
+    *,
+    op_id: int,
+    step_id: int,
+) -> bytes:
+    commit = commit_resolved(worker.sessions.get(admission.request_key.session_id))
+    operation = materialize_operation(
+        admission.request_key,
+        op_id=op_id,
+        parent=commit.selected,
+        latent=latent,
+        control_seq=commit.control_seq,
+    )
+    report = worker.execute(
+        execution_batch(step_id=step_id, operations=(operation,), controls=(commit,))
+    )
+    deadline = time.monotonic() + 5.0
+    while not completion_report_ready(report) and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert completion_report_ready(report)
+    report = finalize_completion_report(report)
+    assert report.completions[0].status is OpStatus.OK
+    artifacts = tuple(
+        product.payload
+        for product in report.products
+        if product.product.kind is ProductKind.ARTIFACT
+    )
+    assert len(artifacts) == 1
+    return artifacts[0]
 
 
 def test_extend_then_decode_commit_the_serial_oracle_tokens():
@@ -373,7 +408,7 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         parent=root_parent(flow_admission),
         step_id=2,
     )
-    flow, _mixed_output_latent = flow_operation(
+    flow, mixed_output_latent = flow_operation(
         flow_admission.request_key,
         op_id=12,
         parent=mixed_transition_commit.selected,
@@ -411,7 +446,7 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         parent=root_parent(flow_admission),
         step_id=2,
     )
-    split_flow, _split_output_latent = flow_operation(
+    split_flow, split_output_latent = flow_operation(
         flow_admission.request_key,
         op_id=12,
         parent=split_transition_commit.selected,
@@ -447,11 +482,18 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         == sequence_result.completions[0].semantic_digest
     )
     assert mixed_result.completions[1].semantic_digest == flow_result.completions[0].semantic_digest
-    torch.testing.assert_close(
-        mixed.latents.require(mixed.sessions.get(2).latent_product).value,
-        split.latents.require(split.sessions.get(2).latent_product).value,
-        rtol=0,
-        atol=0,
+    assert _materialized_artifact(
+        mixed,
+        flow_admission,
+        mixed_output_latent,
+        op_id=13,
+        step_id=4,
+    ) == _materialized_artifact(
+        split,
+        flow_admission,
+        split_output_latent,
+        op_id=13,
+        step_id=5,
     )
 
 
@@ -712,10 +754,9 @@ def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
     assert result.completions[0].logical_lengths.kv_visible_len == 3
 
 
-def test_failed_flow_reclaims_state_and_a_new_operation_repeats_the_same_input():
-    model = _ObservedModel()
-    worker = execution_worker(model)
-    admission = gen_admission(5, ImageParams(steps=2, height=16, width=16, seed=29))
+def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact():
+    worker = execution_worker(StubModel(), block_size=4)
+    admission = gen_admission(5, ImageParams(steps=2, height=64, width=64, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=40, step_id=12)
     latent, transition_commit = _transition_generation(
         worker,
@@ -735,21 +776,36 @@ def test_failed_flow_reclaims_state_and_a_new_operation_repeats_the_same_input()
         control_seq=transition_commit.control_seq,
     )
     worker.execute(execution_batch(step_id=14, controls=(transition_commit,)))
-    batch = execution_batch(
+    valid_batch = execution_batch(
         step_id=15,
         admissions=(),
         operations=(flow,),
         input_products=(),
     )
-    model.fault = "raise"
+    batch = replace(
+        valid_batch,
+        partitions=tuple(
+            replace(
+                partition,
+                kv_branch_placements=tuple(
+                    replace(
+                        placement,
+                        block_table=placement.block_table[:1],
+                        pages_to_zero=placement.pages_to_zero[:1],
+                    )
+                    for placement in partition.kv_branch_placements
+                ),
+            )
+            for partition in valid_batch.partitions
+        ),
+    )
 
     failed = worker.execute(batch)
 
-    first_input = model.flow_inputs[-1]
     assert failed.completions[0].status is OpStatus.ERROR
-    assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
+    assert failed.completions[0].error_code is ErrorCode.INVALID_OPERATION
+    assert failed.completions[0].logical_lengths.latent_len == 0
 
-    model.fault = None
     replacement, _replacement_latent = flow_operation(
         admission.request_key,
         op_id=43,
@@ -759,11 +815,53 @@ def test_failed_flow_reclaims_state_and_a_new_operation_repeats_the_same_input()
         steps=2,
         control_seq=transition_commit.control_seq,
     )
-    worker.execute(execution_batch(step_id=16, operations=(replacement,)))
+    recovered = worker.execute(execution_batch(step_id=16, operations=(replacement,)))
+    assert recovered.completions[0].status is OpStatus.OK
+    assert recovered.completions[0].logical_lengths.latent_len == 2
+    recovered_artifact = _materialized_artifact(
+        worker,
+        admission,
+        _replacement_latent,
+        op_id=44,
+        step_id=17,
+    )
 
-    torch.testing.assert_close(model.flow_inputs[-1], first_input, rtol=0, atol=0)
-    assert worker.sessions.get(5).version == 1
-    assert worker.latents.require(worker.sessions.get(5).latent_product).step == 2
+    reference = execution_worker(StubModel(), block_size=4)
+    reference_conditioning = _publish_conditioning(reference, admission, op_id=40, step_id=12)
+    reference_latent, reference_transition_commit = _transition_generation(
+        reference,
+        admission,
+        reference_conditioning,
+        op_id=41,
+        parent=root_parent(admission),
+        step_id=13,
+    )
+    reference_flow, reference_output = flow_operation(
+        admission.request_key,
+        op_id=43,
+        parent=reference_transition_commit.selected,
+        conditioning=reference_conditioning,
+        latent=reference_latent,
+        steps=2,
+        control_seq=reference_transition_commit.control_seq,
+    )
+    reference_result = reference.execute(
+        execution_batch(
+            step_id=14,
+            operations=(reference_flow,),
+            controls=(reference_transition_commit,),
+        )
+    )
+    assert reference_result.completions[0].status is OpStatus.OK
+    reference_artifact = _materialized_artifact(
+        reference,
+        admission,
+        reference_output,
+        op_id=44,
+        step_id=15,
+    )
+    assert recovered_artifact == reference_artifact
+    reference.close()
 
 
 def test_mixed_partition_descriptor_failure_does_not_rollback_the_other_domain():
@@ -878,10 +976,9 @@ def test_mixed_partition_completion_pressure_is_contained_to_one_domain():
 
 def test_initial_flow_noise_is_stable_across_operation_schedules():
     admission = gen_admission(5, ImageParams(steps=1, height=16, width=16, seed=29))
-    observed: list[torch.Tensor] = []
+    artifacts: list[bytes] = []
     for op_id in (41, 109):
-        model = _ObservedModel()
-        worker = execution_worker(model)
+        worker = execution_worker(StubModel())
         conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
         latent, transition_commit = _transition_generation(
             worker,
@@ -893,7 +990,7 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
             seed=29,
             image_index=3,
         )
-        flow, _output_latent = flow_operation(
+        flow, output_latent = flow_operation(
             admission.request_key,
             op_id=op_id + 1,
             parent=transition_commit.selected,
@@ -911,9 +1008,94 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
                 input_products=(),
             )
         )
-        observed.append(model.flow_inputs[0])
+        artifacts.append(
+            _materialized_artifact(
+                worker,
+                admission,
+                output_latent,
+                op_id=op_id + 2,
+                step_id=4,
+            )
+        )
+        worker.close()
 
-    torch.testing.assert_close(observed[1], observed[0], rtol=0, atol=0)
+    assert artifacts[1] == artifacts[0]
+
+
+@pytest.mark.parametrize(
+    ("height", "width", "cfg_text_scale", "cfg_img_scale"),
+    (
+        (16, 16, 1.0, 1.0),
+        (16, 32, 4.0, 1.0),
+        (32, 32, 4.0, 2.0),
+    ),
+)
+def test_multi_step_quantum_matches_the_serial_model_artifact(
+    height: int,
+    width: int,
+    cfg_text_scale: float,
+    cfg_img_scale: float,
+) -> None:
+    def run(step_quantum: int) -> bytes:
+        worker = execution_worker(StubModel())
+        admission = gen_admission(
+            76,
+            ImageParams(
+                steps=4,
+                height=height,
+                width=width,
+                seed=31,
+                cfg_text_scale=cfg_text_scale,
+                cfg_img_scale=cfg_img_scale,
+            ),
+        )
+        conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
+        latent, commit = _transition_generation(
+            worker,
+            admission,
+            conditioning,
+            op_id=2,
+            parent=root_parent(admission),
+            step_id=2,
+            seed=31,
+        )
+        step = 0
+        op_id = 3
+        while step < 4:
+            count = min(step_quantum, 4 - step)
+            operation, successor = flow_operation(
+                admission.request_key,
+                op_id=op_id,
+                parent=commit.selected,
+                conditioning=conditioning,
+                latent=latent,
+                steps=count,
+                control_seq=commit.control_seq,
+            )
+            report = worker.execute(
+                execution_batch(
+                    step_id=op_id,
+                    operations=(operation,),
+                    controls=(commit,),
+                )
+            )
+            assert report.completions[0].status is OpStatus.OK
+            step += count
+            assert report.completions[0].logical_lengths.latent_len == step
+            latent = successor
+            commit = commit_resolved(worker.sessions.get(admission.request_key.session_id))
+            op_id += 1
+        artifact = _materialized_artifact(
+            worker,
+            admission,
+            latent,
+            op_id=op_id,
+            step_id=op_id,
+        )
+        worker.close()
+        return artifact
+
+    assert run(4) == run(1)
 
 
 def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
@@ -1033,8 +1215,8 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
     assert second_report.completions[0].logical_lengths.latent_len == 2
 
 
-def test_exact_latent_chain_reclaims_committed_ancestors_and_rejects_a_stale_reference():
-    worker = execution_worker(_ObservedModel())
+def test_trajectory_advances_across_many_generations_and_rejects_a_stale_reference():
+    worker = execution_worker(StubModel())
     admission = gen_admission(71, ImageParams(steps=50, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
     current, commit = _transition_generation(
@@ -1098,12 +1280,12 @@ def test_exact_latent_chain_reclaims_committed_ancestors_and_rejects_a_stale_ref
     assert stale_report.completions[0].status is OpStatus.ERROR
 
 
-def test_snapshot_restore_rebinds_the_exact_committed_latent_product(tmp_path) -> None:
+def test_snapshot_restore_preserves_an_active_trajectory_and_final_artifact(tmp_path) -> None:
     snapshot_dir = str(tmp_path / "worker-state")
-    worker = execution_worker(_ObservedModel(), snapshot_dir=snapshot_dir)
+    worker = execution_worker(StubModel(), snapshot_dir=snapshot_dir)
     admission = gen_admission(72, ImageParams(steps=2, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
-    latent, commit = _transition_generation(
+    latent, transition_commit = _transition_generation(
         worker,
         admission,
         conditioning,
@@ -1111,34 +1293,82 @@ def test_snapshot_restore_rebinds_the_exact_committed_latent_product(tmp_path) -
         parent=root_parent(admission),
         step_id=2,
     )
-    worker.execute(execution_batch(step_id=3, controls=(commit,)))
+    first_flow, partial_latent = flow_operation(
+        admission.request_key,
+        op_id=3,
+        parent=transition_commit.selected,
+        conditioning=conditioning,
+        latent=latent,
+        steps=1,
+        control_seq=transition_commit.control_seq,
+    )
+    first = worker.execute(
+        execution_batch(
+            step_id=3,
+            operations=(first_flow,),
+            controls=(transition_commit,),
+        )
+    )
+    assert first.completions[0].status is OpStatus.OK
+    assert first.completions[0].logical_lengths.latent_len == 1
+    partial_commit = commit_resolved(worker.sessions.get(admission.request_key.session_id))
+    worker.execute(execution_batch(step_id=4, controls=(partial_commit,)))
     placement = RecoveryPlacement(
         request_key=admission.request_key,
         request_pool_idx=admission.request_pool_idx,
         cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(), length=0),),
+        latent_page_table=(1,),
     )
     reference = worker.snapshot_session(placement)
-    worker.close()
+
+    source_continuation, source_final_latent = flow_operation(
+        admission.request_key,
+        op_id=4,
+        parent=reference.version,
+        conditioning=conditioning,
+        latent=partial_latent,
+        steps=1,
+        control_seq=partial_commit.control_seq,
+    )
+    source_report = worker.execute(execution_batch(step_id=5, operations=(source_continuation,)))
+    assert source_report.completions[0].status is OpStatus.OK
+    assert source_report.completions[0].logical_lengths.latent_len == 2
+    source_artifact = _materialized_artifact(
+        worker,
+        admission,
+        source_final_latent,
+        op_id=5,
+        step_id=6,
+    )
 
     restored = execution_worker(
-        _ObservedModel(),
+        StubModel(),
         snapshot_dir=snapshot_dir,
     )
     restored.restore_session(reference, placement)
-    continuation, _successor = flow_operation(
+    continuation, successor = flow_operation(
         admission.request_key,
-        op_id=3,
+        op_id=4,
         parent=reference.version,
         conditioning=conditioning,
-        latent=latent,
+        latent=partial_latent,
         steps=1,
-        control_seq=commit.control_seq,
+        control_seq=partial_commit.control_seq,
     )
 
-    report = restored.execute(execution_batch(step_id=4, operations=(continuation,)))
+    report = restored.execute(execution_batch(step_id=5, operations=(continuation,)))
 
     assert report.completions[0].status is OpStatus.OK
-    assert report.completions[0].logical_lengths.latent_len == 1
+    assert report.completions[0].logical_lengths.latent_len == 2
+    restored_artifact = _materialized_artifact(
+        restored,
+        admission,
+        successor,
+        op_id=5,
+        step_id=6,
+    )
+    assert restored_artifact == source_artifact
+    worker.close()
     restored.close()
 
 
@@ -1268,6 +1498,87 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
     finally:
         producer.close()
         consumer.close()
+
+
+def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() -> None:
+    producer = execution_worker(StubModel(), transfer_backend="shm")
+    consumer = execution_worker(StubModel(), transfer_backend="shm")
+    admission = gen_admission(75, ImageParams(steps=1, height=16, width=16, seed=29))
+    conditioning = _publish_conditioning(producer, admission, op_id=1, step_id=1)
+    initial_latent, transition_commit = _transition_generation(
+        producer,
+        admission,
+        conditioning,
+        op_id=2,
+        parent=root_parent(admission),
+        step_id=2,
+    )
+    flow, final_latent = flow_operation(
+        admission.request_key,
+        op_id=3,
+        parent=transition_commit.selected,
+        conditioning=conditioning,
+        latent=initial_latent,
+        steps=1,
+        control_seq=transition_commit.control_seq,
+    )
+    produced = producer.execute(
+        execution_batch(
+            step_id=3,
+            operations=(flow,),
+            controls=(transition_commit,),
+        )
+    )
+    deadline = time.monotonic() + 5.0
+    while not completion_report_ready(produced) and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert completion_report_ready(produced)
+    produced = finalize_completion_report(produced)
+    transferred = tuple(product for product in produced.products if product.product == final_latent)
+    assert len(transferred) == 1
+    assert transferred[0].payload.startswith(TRANSFER_DESCRIPTOR_PREFIX)
+
+    source_artifact = _materialized_artifact(
+        producer,
+        admission,
+        final_latent,
+        op_id=4,
+        step_id=4,
+    )
+    materialize = materialize_operation(
+        admission.request_key,
+        op_id=4,
+        parent=root_parent(admission),
+        latent=final_latent,
+    )
+    batch = execution_batch(
+        step_id=4,
+        admissions=(admission,),
+        operations=(materialize,),
+        input_products=transferred,
+    )
+    prepared = consumer.prepare_execute(batch)
+    assert prepared is not None
+    deadline = time.monotonic() + 5.0
+    while not prepared.ready() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert prepared.ready()
+    received = consumer.execute_prepared(prepared)
+    deadline = time.monotonic() + 5.0
+    while not completion_report_ready(received) and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert completion_report_ready(received)
+    received = finalize_completion_report(received)
+    assert received.completions[0].status is OpStatus.OK
+    assert received.completions[0].logical_lengths.latent_len == 0
+    received_artifacts = tuple(
+        product.payload
+        for product in received.products
+        if product.product.kind is ProductKind.ARTIFACT
+    )
+    assert received_artifacts == (source_artifact,)
+    producer.close()
+    consumer.close()
 
 
 def test_encode_publishes_an_immutable_feature_without_advancing_state():
@@ -1478,8 +1789,34 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         control_seq=feedback_commit.control_seq,
         image_index=2,
     )
-    assert worker.sessions.get(6).latent_product == next_latent
-    assert worker.latents.require(next_latent).step == 0
+    next_flow, next_completed_latent = flow_operation(
+        admission.request_key,
+        op_id=10,
+        parent=_next_transition_commit.selected,
+        conditioning=next_conditioning,
+        latent=next_latent,
+        steps=2,
+        control_seq=_next_transition_commit.control_seq,
+    )
+    next_report = worker.execute(
+        execution_batch(
+            step_id=10,
+            operations=(next_flow,),
+            controls=(_next_transition_commit,),
+        )
+    )
+    assert next_report.completions[0].status is OpStatus.OK
+    assert next_report.completions[0].logical_lengths.latent_len == 2
+    assert base64.b64decode(
+        _materialized_artifact(
+            worker,
+            admission,
+            next_completed_latent,
+            op_id=11,
+            step_id=11,
+        ).decode("ascii"),
+        validate=True,
+    ).startswith(_PNG_MAGIC)
 
     artifacts = [p for p in materialize_report.products if p.product.kind is ProductKind.ARTIFACT]
     assert len(artifacts) == 1

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment
-from .latent_capacity import latent_store_capacity_bytes
+from .latent_capacity import latent_pool_capacity_bytes, latent_trajectory_bytes
 from .product_capacity import device_product_arena_bytes
 
 _PRODUCTS_PER_OPERATION = 5
@@ -16,7 +16,7 @@ _CPU_TASKS = 256
 
 @dataclass(frozen=True, slots=True)
 class ArenaCapacity:
-    latent_bytes: int
+    latent_pool_bytes: int
     device_products: int
     device_product_bytes: int
     transfer_bytes: int
@@ -40,7 +40,10 @@ def model_arena_capacity(
     completion_payload_bytes: int,
     num_blocks: int,
     scratch_capacity_tokens: int,
-    latent_capacity_units: int,
+    request_pool_size: int,
+    num_latent_pages: int,
+    latent_page_units: int,
+    latent_width: int,
     max_latent_feature_bytes: int,
     max_vision_feature_bytes: int,
     bytes_per_token: int,
@@ -54,26 +57,41 @@ def model_arena_capacity(
     slots = depth * max_operations
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(deployment.block_size)
+    flow = model.generation
+    if flow is not None and not isinstance(flow, GenerationPipeline):
+        raise ValueError("model generation behavior has an invalid type")
+    latent_pool_bytes = 0
+    latent_transfer_bytes = 0
+    artifact_bytes = 0
+    if flow is not None:
+        dtype_bytes = {
+            "float16": 2,
+            "bfloat16": 2,
+            "float32": 4,
+        }.get(str(deployment.model_dtype).removeprefix("torch.").lower())
+        if dtype_bytes is None:
+            raise ValueError(f"unsupported latent dtype {deployment.model_dtype!r}")
+        latent_pool_bytes = latent_pool_capacity_bytes(
+            request_pool_size=int(request_pool_size),
+            num_pages=int(num_latent_pages),
+            page_units=int(latent_page_units),
+            latent_width=int(latent_width),
+            dtype_bytes=dtype_bytes,
+        )
+        latent_transfer_bytes = latent_trajectory_bytes(
+            int(flow.max_latent_tokens),
+            int(latent_width),
+            dtype_bytes,
+        )
+        raw_image_bytes = int(flow.max_vae_grid_tokens) * int(flow.latent_downsample) ** 2 * 3
+        artifact_bytes = ((2 * raw_image_bytes + (1 << 20) + 2) // 3) * 4
     max_transfer_bytes = max(
         int(num_blocks) * block_size * int(bytes_per_token),
+        latent_transfer_bytes,
         int(max_latent_feature_bytes),
         int(max_vision_feature_bytes),
         1,
     )
-
-    flow = model.generation
-    if flow is not None and not isinstance(flow, GenerationPipeline):
-        raise ValueError("model generation behavior has an invalid type")
-    latent_bytes = 0
-    artifact_bytes = 0
-    if flow is not None:
-        latent_bytes = latent_store_capacity_bytes(
-            int(latent_capacity_units),
-            int(flow.latent_channels),
-            int(flow.latent_patch_size),
-        )
-        raw_image_bytes = int(flow.max_vae_grid_tokens) * int(flow.latent_downsample) ** 2 * 3
-        artifact_bytes = ((2 * raw_image_bytes + (1 << 20) + 2) // 3) * 4
     max_product_bytes = max(
         1,
         artifact_bytes,
@@ -95,7 +113,7 @@ def model_arena_capacity(
     )
 
     return ArenaCapacity(
-        latent_bytes=latent_bytes,
+        latent_pool_bytes=latent_pool_bytes,
         device_products=device_products,
         device_product_bytes=device_product_bytes,
         transfer_bytes=max_transfer_bytes * transfer_tickets,
@@ -117,7 +135,7 @@ def system_arena_capacity(
         raise ValueError("system arena sizing requires positive runtime bounds")
     slots = depth * operations
     return ArenaCapacity(
-        latent_bytes=0,
+        latent_pool_bytes=0,
         device_products=1,
         device_product_bytes=(1 << 20) * _PRODUCTS_PER_OPERATION * slots,
         transfer_bytes=(1 << 20) * slots,

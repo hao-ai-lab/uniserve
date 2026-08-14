@@ -556,6 +556,7 @@ table RecoveryPlacement {
   request_key:RequestKey;
   request_pool_idx:uint;
   cache_groups:[CacheGroupPlacement];
+  latent_page_table:[uint];
 }
 
 table WorkerRequest {

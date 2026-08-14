@@ -31,6 +31,7 @@ from uniserve_worker.batch import (
     FixedPoint,
     GenMode,
     ImageParams,
+    LatentPlacement,
     LogicalLengths,
     Operation,
     OpStatus,
@@ -124,7 +125,13 @@ from uniserve_worker.runtime.image_utils import (
     quantize_image_hwc,
     uint8_image_to_png_base64_bytes,
 )
-from uniserve_worker.runtime.latent_store import LatentRecord, LatentStore, LatentTxn
+from uniserve_worker.runtime.latent_pool import (
+    LatentPool,
+    LatentPublication,
+    LatentRelease,
+    LatentSnapshot,
+    LatentStaging,
+)
 from uniserve_worker.runtime.mesh_store import MeshStore
 from uniserve_worker.runtime.product_store import (
     DeviceProductRead,
@@ -921,6 +928,9 @@ class _PreparedTransferInput:
     payload_kind: ProductKind | None
     height: int | None
     width: int | None
+    latent_units: int | None
+    step: int | None
+    generation: int | None
     snapshot: CachePublication | None
 
     def ready(self) -> bool:
@@ -1469,13 +1479,19 @@ class _PartitionLayout:
             raise RuntimeError("partition layout columns are not aligned")
 
 
+@dataclass(frozen=True, slots=True)
+class _LatentExecution:
+    placement: LatentPlacement
+    request_pool_idx: int
+    staging: LatentStaging
+
+
 @dataclass(slots=True)
 class _ExecutionScope:
     partition: BatchPartition
     started_ns: int
     transaction: StepTxn
     completion: CompletionLease
-    latents: LatentTxn
     products: ProductTxn
     product_view: ProductView
     cache_rows: dict[tuple[RequestKey, int, int], CacheRow] = field(default_factory=dict)
@@ -1514,6 +1530,10 @@ class _ExecutionScope:
     runtime_cache_lengths: dict[int, int | torch.Tensor] = field(default_factory=dict)
     registration_visible: bool = False
     cpu_tasks: dict[_OperationIdentity, CpuTaskReservation] = field(default_factory=dict)
+    latent_rows: dict[_OperationIdentity, _LatentExecution] = field(default_factory=dict)
+    latent_publications: list[LatentPublication] = field(default_factory=list)
+    latent_releases: list[LatentRelease] = field(default_factory=list)
+    latent_import_slots: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1576,7 +1596,7 @@ class ModelExecutor:
         sessions: SessionStore,
         runtime_states: RuntimeStates | None,
         cache_pool: CachePool,
-        latents: LatentStore,
+        latent_pool: LatentPool | None,
         products: ProductStore,
         replay: ReplayStore,
         weights: WeightSet | None,
@@ -1624,7 +1644,7 @@ class ModelExecutor:
         self.runtime_states = runtime_states
         self.cache_pool = cache_pool
         self.cache_publications = CachePublications(cache_pool)
-        self.latents = latents
+        self.latent_pool = latent_pool
         self.products = products
         self.replay = replay
         self.weights = weights
@@ -1694,6 +1714,9 @@ class ModelExecutor:
             payload_kind: ProductKind | None = None
             height: int | None = None
             width: int | None = None
+            latent_units: int | None = None
+            step: int | None = None
+            generation: int | None = None
             snapshot: CachePublication | None = None
             if kind == "tensor":
                 if set(value) != {
@@ -1728,13 +1751,64 @@ class ModelExecutor:
                 payload_kind = ProductKind(raw_payload_kind)
                 height = raw_height
                 width = raw_width
-            else:
+            elif kind == "latent":
+                if set(value) != {
+                    "generation",
+                    "height",
+                    "latent_units",
+                    "locator",
+                    "step",
+                    "width",
+                }:
+                    raise invalid_descriptor("latent transfer entry has an invalid shape")
+                raw_locator = value["locator"]
+                if not isinstance(raw_locator, dict):
+                    raise invalid_descriptor("latent transfer entry locator is invalid")
+                main = Locator.from_wire(raw_locator)
+                locators = (main,)
+                height = _metadata_uint(value, "height", 0)
+                width = _metadata_uint(value, "width", 0)
+                latent_units = _metadata_uint(value, "latent_units", 0)
+                step = _metadata_uint(value, "step", 0)
+                generation = _metadata_uint(value, "generation", 0)
+                pool = self.latent_pool
+                expected_dtype = "" if pool is None else str(pool.dtype).removeprefix("torch.")
+                expected_nbytes = (
+                    0
+                    if pool is None
+                    else latent_units * int(pool.latent_width) * int(pool.storage.element_size())
+                )
+                metadata = {
+                    "generation": generation,
+                    "height": height,
+                    "latent_units": latent_units,
+                    "step": step,
+                    "width": width,
+                }
+                if (
+                    entry.product.kind is not ProductKind.LATENT
+                    or entry.product.storage_class is not StorageClass.LATENT_ARENA
+                    or pool is None
+                    or min(height, width, latent_units, generation) < 1
+                    or generation != int(entry.product.generation)
+                    or tuple(main.shape) != (latent_units, int(pool.latent_width))
+                    or main.dtype != expected_dtype
+                    or int(main.nbytes) != expected_nbytes
+                    or int(main.nbytes) > int(entry.product.max_bytes)
+                    or math.prod(main.shape) > int(entry.product.shape_bound.max_elements)
+                    or any(main.meta.get(name) != member for name, member in metadata.items())
+                ):
+                    raise invalid_descriptor("latent transfer metadata exceeds its product bounds")
+                payload_kind = ProductKind.LATENT
+            elif kind == "kv":
                 if set(value) != {"snapshot"}:
                     raise invalid_descriptor("KV transfer entry has an invalid shape")
                 snapshot = CachePublication.from_wire(value["snapshot"])
                 if entry.product.kind is not ProductKind.KV:
                     raise invalid_descriptor("KV transfer entry names a non-KV product")
                 locators = tuple(Locator.from_wire_json(raw) for raw in snapshot.locators)
+            else:
+                raise invalid_descriptor("cross-stage transfer entry has an unknown kind")
             transfers.append(
                 _PreparedTransferInput(
                     product=entry.product,
@@ -1745,6 +1819,9 @@ class ModelExecutor:
                     payload_kind=payload_kind,
                     height=height,
                     width=width,
+                    latent_units=latent_units,
+                    step=step,
+                    generation=generation,
                     snapshot=snapshot,
                 )
             )
@@ -2033,7 +2110,7 @@ class ModelExecutor:
             transaction = self.sessions.begin_step(
                 batch.step_id,
                 operations,
-                (self.latents, self.products),
+                (self.products,),
             )
         except BaseException as error:
             completion.abandon()
@@ -2044,14 +2121,14 @@ class ModelExecutor:
                 error=error,
             )
             raise
+        product_transaction = cast(ProductTxn, transaction.store_transaction(self.products))
         scope = _ExecutionScope(
             partition=partition,
             started_ns=started,
             transaction=transaction,
             completion=completion,
-            latents=cast(LatentTxn, transaction.store_transaction(self.latents)),
-            products=cast(ProductTxn, transaction.store_transaction(self.products)),
-            product_view=cast(ProductTxn, transaction.store_transaction(self.products)).view(),
+            products=product_transaction,
+            product_view=product_transaction.view(),
             prepared_transfers={
                 transfer.product: transfer
                 for transfer in prepared
@@ -2098,6 +2175,7 @@ class ModelExecutor:
                 weights=tuple(self._weights() for _ in aligned_sessions),
                 identities=tuple(_operation_identity(operation) for operation in operations),
             )
+            self._bind_latent_rows(partition, scope)
             self._reserve_outputs(operations, scope)
             self._stage_input_products(input_products, scope)
             self._consume_predicates(operations, scope)
@@ -2173,6 +2251,14 @@ class ModelExecutor:
         self._finish_device_reads(scope)
         self._publish_predicates(scope)
         self.products.device_products.validate_writes(tuple(scope.device_writes))
+        if self.latent_pool is None:
+            if scope.latent_publications or scope.latent_releases:
+                raise RuntimeError("latent publication has no physical pool")
+        else:
+            self.latent_pool.validate_commit(
+                scope.latent_publications,
+                scope.latent_releases,
+            )
         scope.completion.seal()
         records: list[CompletionRecord] = []
         committed: dict[int, VersionRef] = {}
@@ -2274,6 +2360,11 @@ class ModelExecutor:
                 publish=publish,
             ),
         )
+        if self.latent_pool is not None:
+            self.latent_pool.apply_commit(
+                scope.latent_publications,
+                scope.latent_releases,
+            )
         self.cache_publications.apply_commit(cache_commit)
         for identity, locators in scope.stage_publications.items():
             existing = self._transport_publications.get(identity)
@@ -2355,6 +2446,8 @@ class ModelExecutor:
         scope.transaction.rollback()
         scope.completion.abandon()
         self.products.device_products.abandon_writes(tuple(scope.device_writes))
+        if self.latent_pool is not None and scope.latent_import_slots:
+            self.latent_pool.release_slots(tuple(scope.latent_import_slots))
         self._release_locators(scope.published)
         self.trace.emit(
             ExecutionPhase.ROLLBACK,
@@ -2892,7 +2985,6 @@ class ModelExecutor:
             if isinstance(control, Release)
         )
         self.products.device_products.release_operations(releases)
-        self.latents.release_operations(releases)
         self.cache_publications.release_operations(releases)
         if self.transport is not None:
             for identity in releases:
@@ -2921,6 +3013,100 @@ class ModelExecutor:
         )
         for identity in selected:
             self._release_locators(self._transport_publications.pop(identity))
+
+    def _bind_latent_rows(
+        self,
+        partition: BatchPartition,
+        scope: _ExecutionScope,
+    ) -> None:
+        if not partition.latent_placements:
+            return
+        pool = self.latent_pool
+        if pool is None:
+            raise capability_mismatch("scheduler latent placement has no worker physical pool")
+        operations = {
+            _operation_identity(operation): (operation, int(request_pool_idx))
+            for operation, request_pool_idx in zip(
+                partition.operations,
+                partition.request_pool_indices,
+                strict=True,
+            )
+        }
+        rows: list[tuple[_OperationIdentity, LatentPlacement, int]] = []
+        for placement in partition.latent_placements:
+            identity = (placement.request_key, int(placement.op_id))
+            selected = operations.get(identity)
+            if selected is None:
+                raise invalid_descriptor(
+                    "latent placement names an operation outside its partition"
+                )
+            operation, slot = selected
+            session = self.sessions.get(operation.request_key.session_id)
+            image = session.image
+            if image is None:
+                raise invalid_descriptor("latent placement has no admitted image geometry")
+            flow = self._generation()
+            expected_units = int(flow.image_tokens(int(placement.height), int(placement.width)))
+            if (
+                int(placement.height) != int(image.height)
+                or int(placement.width) != int(image.width)
+                or int(placement.latent_units) != expected_units
+            ):
+                raise invalid_descriptor("latent placement disagrees with admitted model geometry")
+            transferred = next(
+                (
+                    scope.prepared_transfers[reference]
+                    for reference in operation.inputs
+                    if reference in scope.prepared_transfers
+                    and scope.prepared_transfers[reference].kind == "latent"
+                ),
+                None,
+            )
+            committed_step = (
+                int(session.flow_step) if transferred is None else int(cast(int, transferred.step))
+            )
+            if operation.work.variant is WorkVariant.GEN_TRANSITION:
+                if int(placement.start_step) != 0 or int(placement.step_count) != 0:
+                    raise invalid_descriptor(
+                        "generation transition placement carries denoise steps"
+                    )
+            elif operation.work.variant is WorkVariant.GEN_FLOW:
+                if (
+                    int(placement.start_step) != committed_step
+                    or int(placement.step_count) < 1
+                    or int(placement.start_step) + int(placement.step_count) > int(image.steps)
+                    or (
+                        int(operation.bounds.max_tokens) > 0
+                        and int(placement.step_count) > int(operation.bounds.max_tokens)
+                    )
+                ):
+                    raise invalid_descriptor(
+                        "generation flow placement exceeds its committed schedule"
+                    )
+            elif int(placement.start_step) != committed_step or int(placement.step_count) != 0:
+                raise invalid_descriptor(
+                    "latent reader placement disagrees with committed step state"
+                )
+            rows.append((identity, placement, slot))
+        staged = pool.stage(
+            tuple(placement.page_table for _identity, placement, _slot in rows),
+            tuple(int(placement.latent_units) for _identity, placement, _slot in rows),
+        )
+        scope.latent_rows = {
+            identity: _LatentExecution(
+                placement=placement,
+                request_pool_idx=slot,
+                staging=value,
+            )
+            for (identity, placement, slot), value in zip(rows, staged, strict=True)
+        }
+
+    @staticmethod
+    def _latent_row(operation: Operation, scope: _ExecutionScope) -> _LatentExecution:
+        row = scope.latent_rows.get(_operation_identity(operation))
+        if row is None:
+            raise invalid_descriptor("trajectory operation has no staged latent placement")
+        return row
 
     def _bind_cache_rows(
         self,
@@ -3168,6 +3354,62 @@ class ModelExecutor:
                         )
                     scope.cache_publication_inputs[product] = snapshot
                     continue
+                if transfer.kind == "latent":
+                    tensors = transfer.tensors()
+                    if len(tensors) != 1:
+                        raise invalid_descriptor("latent transfer produced an invalid tensor set")
+                    consumers = tuple(
+                        operation
+                        for operation in scope.partition.operations
+                        if product in operation.inputs
+                    )
+                    if len(consumers) != 1:
+                        raise invalid_descriptor("latent transfer must have one partition consumer")
+                    row = self._latent_row(consumers[0], scope)
+                    latent_units = transfer.latent_units
+                    height = transfer.height
+                    width = transfer.width
+                    step = transfer.step
+                    generation = transfer.generation
+                    if (
+                        latent_units is None
+                        or height is None
+                        or width is None
+                        or step is None
+                        or generation is None
+                    ):
+                        raise RuntimeError("prepared latent transfer lost validated metadata")
+                    if (
+                        int(latent_units) != int(row.placement.latent_units)
+                        or int(height) != int(row.placement.height)
+                        or int(width) != int(row.placement.width)
+                        or int(step) != int(row.placement.start_step)
+                        or int(generation) != int(product.generation)
+                    ):
+                        raise invalid_descriptor(
+                            "latent transfer disagrees with its scheduler placement"
+                        )
+                    session = self.sessions.get(product.request_key.session_id)
+                    if session.latent_product is not None or int(session.flow_step) != 0:
+                        raise invalid_descriptor(
+                            "latent transfer destination already owns a trajectory"
+                        )
+                    self._latent_pool().restore(
+                        LatentSnapshot(
+                            generation=int(generation),
+                            step=int(step),
+                            latent_units=int(latent_units),
+                            height=int(height),
+                            width=int(width),
+                            value=tensors[0],
+                        ),
+                        request_pool_idx=row.request_pool_idx,
+                        page_table=row.placement.page_table,
+                    )
+                    scope.latent_import_slots.append(row.request_pool_idx)
+                    session.latent_product = product
+                    session.flow_step = int(step)
+                    continue
                 tensors = transfer.tensors()
                 if not tensors:
                     raise invalid_descriptor("tensor transfer produced no resident value")
@@ -3284,14 +3526,16 @@ class ModelExecutor:
         sessions = layout.sessions
         starts.extend(int(session.logical_position) for session in sessions)
         position_values = torch.tensor(starts, dtype=torch.long)
-        for row_index, (operation, session, entry, weights, current) in enumerate(zip(
-            operations,
-            sessions,
-            layout.cache_rows,
-            layout.weights,
-            current_tokens,
-            strict=True,
-        )):
+        for row_index, (operation, session, entry, weights, current) in enumerate(
+            zip(
+                operations,
+                sessions,
+                layout.cache_rows,
+                layout.weights,
+                current_tokens,
+                strict=True,
+            )
+        ):
             if session.sampling is None:
                 raise invalid_descriptor("sequence operation has no admitted sampling state")
             tasks.append(
@@ -3930,6 +4174,11 @@ class ModelExecutor:
         if not isinstance(value, GenerationPipeline):
             raise invalid_descriptor("operation requires model generation behavior")
         return value
+
+    def _latent_pool(self) -> LatentPool:
+        if self.latent_pool is None:
+            raise capability_mismatch("operation requires a physical latent pool")
+        return self.latent_pool
 
     def _image_processor(self) -> ImageProcessor:
         value = self._model().image_processor
@@ -5071,21 +5320,43 @@ class ModelExecutor:
         output = latent_outputs[0]
         if int(output.generation) < 1:
             raise invalid_descriptor("generation transition latent has no logical generation")
-        initial = self._initial_latent(operation, image.height, image.width, session)
-        write = _bound_device_write(scope, output)
-        resident = self.products.device_products.publish_write(write, initial)
-        scope.operation_writes[_operation_identity(operation)] = write
-        scope.latents.write(
-            LatentRecord(
-                reference=output,
-                producer_plan_digest=operation.plan_digest,
-                value=resident,
+        row = self._latent_row(operation, scope)
+        pool = self._latent_pool()
+        row.staging.value.zero_()
+        initial = row.staging.value[: int(row.placement.latent_units)]
+        self._initial_latent(
+            operation,
+            int(row.placement.height),
+            int(row.placement.width),
+            initial,
+        )
+        pool.initialize(
+            row.request_pool_idx,
+            row.staging,
+            latent_units=int(row.placement.latent_units),
+        )
+        scope.latent_publications.append(
+            LatentPublication(
+                request_pool_idx=row.request_pool_idx,
+                page_table=row.placement.page_table,
+                expected_generation=0,
+                expected_step=0,
+                generation=int(output.generation),
                 step=0,
-                height=image.height,
-                width=image.width,
+                latent_units=int(row.placement.latent_units),
+                height=int(row.placement.height),
+                width=int(row.placement.width),
             )
         )
         session.latent_product = output
+        products = self._publish_latent_transfer(
+            operation,
+            output,
+            initial,
+            row,
+            step=0,
+            scope=scope,
+        )
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1,
@@ -5098,6 +5369,7 @@ class ModelExecutor:
             token_span=TokenSpan(base=session.logical_position, len=0),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
+            products=products,
         )
 
     def _flow_driver(
@@ -5143,41 +5415,29 @@ class ModelExecutor:
             raise invalid_descriptor("flow latent generations are invalid")
         if session.latent_product != latent_input:
             raise invalid_descriptor("flow operation does not name the current latent generation")
-        latent_read = self.products.device_products.consume(
-            latent_input,
-            consumer_op_id=operation.op_id,
-            device=self._operation_device(operation),
-        )
-        scope.device_reads.append(latent_read)
-        start_step = session.flow_step
-        remaining = int(image.steps) - start_step
-        step_count = (
-            remaining
-            if operation.bounds.max_tokens <= 0
-            else min(int(operation.bounds.max_tokens), remaining)
-        )
-        if step_count < 0 or start_step + step_count > image.steps:
-            raise invalid_descriptor("flow operation exceeds the declared schedule")
+        row = self._latent_row(operation, scope)
+        pool = self._latent_pool()
+        start_step = int(row.placement.start_step)
+        step_count = int(row.placement.step_count)
         conditioning_position = session.logical_position
         image_prompt = image.image_prompts[0] if image.image_prompts else ""
-        record = scope.latents.read(latent_input)
-        if record is None:
-            raise invalid_descriptor("flow continuation references a missing latent generation")
-        if record.reference.request_key.session_id != session_id:
-            raise invalid_descriptor("flow latent belongs to another session")
-        if record.step != start_step or session.flow_step != start_step:
-            raise invalid_descriptor("flow operation start step does not match committed state")
-
-        schedule = flow.schedule(int(image.steps), float(image.timestep_shift))
-        current = latent_read.tensor
+        current = pool.gather_current(
+            row.request_pool_idx,
+            row.staging,
+            step=start_step,
+            generation=int(latent_input.generation),
+            latent_units=int(row.placement.latent_units),
+            height=int(row.placement.height),
+            width=int(row.placement.width),
+        )
         entries: dict[Branch, CacheRow] = {}
         for step in range(start_step, start_step + step_count):
-            t, t_next = schedule.pair(
+            host_t, host_t_next = flow.schedule_pair(
+                int(image.steps),
+                float(image.timestep_shift),
                 step,
-                device=current.device,
-                dtype=torch.float32,
             )
-            host_t = schedule.scalar(step)
+            t, t_next = pool.stage_timestep(row.request_pool_idx, host_t, host_t_next)
             use_cfg = float(image.cfg_interval[0]) <= host_t <= float(image.cfg_interval[1])
             guide = build_flow_cfg_plan(
                 cfg_text_scale=float(image.cfg_text_scale),
@@ -5205,7 +5465,10 @@ class ModelExecutor:
                 )
                 if entry is None:
                     raise invalid_descriptor("flow branch has no scheduler scratch placement")
-                query = self._flow_physical_tokens(record.height, record.width)
+                query = self._flow_physical_tokens(
+                    int(row.placement.height),
+                    int(row.placement.width),
+                )
                 prefix_length = cache_row.length if copy_conditioning else len(prefix)
                 if prefix_length + query > entry.capacity:
                     raise invalid_descriptor("flow branch exceeds scheduler scratch placement")
@@ -5250,8 +5513,8 @@ class ModelExecutor:
                     entries[branch],
                     current,
                     t,
-                    record.height,
-                    record.width,
+                    int(row.placement.height),
+                    int(row.placement.width),
                     scope,
                 )
                 for branch in guide.branches
@@ -5263,27 +5526,43 @@ class ModelExecutor:
             }
             velocity = guide.combine(predictions)
             if flow.prediction in {"x", "x_prediction", "x_pred"}:
-                neural_latent = self._flow_neural_latent(current, record.height, record.width)
-                velocity = x_pred_to_velocity(velocity, neural_latent, t)
+                velocity = x_pred_to_velocity(velocity, current, t)
             elif flow.prediction != "velocity":
                 raise invalid_descriptor(f"unsupported flow prediction {flow.prediction!r}")
-            neural_current = self._flow_neural_latent(current, record.height, record.width)
-            updated = euler_step(neural_current, velocity, t, t_next)
-            current = self._flow_store_latent(updated, record.height, record.width)
-            record = replace(record, value=current, step=step + 1)
+            current.copy_(euler_step(current, velocity, t, t_next))
             session.flow_step = step + 1
-        write = _bound_device_write(scope, latent_output)
-        resident = self.products.device_products.publish_write(write, current)
-        scope.operation_writes[_operation_identity(operation)] = write
-        scope.latents.write(
-            replace(
-                record,
-                reference=latent_output,
-                producer_plan_digest=operation.plan_digest,
-                value=resident,
+        pool.write_inactive(
+            row.request_pool_idx,
+            row.staging,
+            expected_step=start_step,
+            expected_generation=int(latent_input.generation),
+            latent_units=int(row.placement.latent_units),
+            height=int(row.placement.height),
+            width=int(row.placement.width),
+        )
+        final_step = start_step + step_count
+        scope.latent_publications.append(
+            LatentPublication(
+                request_pool_idx=row.request_pool_idx,
+                page_table=row.placement.page_table,
+                expected_generation=int(latent_input.generation),
+                expected_step=start_step,
+                generation=int(latent_output.generation),
+                step=final_step,
+                latent_units=int(row.placement.latent_units),
+                height=int(row.placement.height),
+                width=int(row.placement.width),
             )
         )
         session.latent_product = latent_output
+        products = self._publish_latent_transfer(
+            operation,
+            latent_output,
+            current,
+            row,
+            step=final_step,
+            scope=scope,
+        )
         return _Outcome(
             status=OpStatus.OK,
             selected_point=1,
@@ -5291,33 +5570,76 @@ class ModelExecutor:
                 operation,
                 session,
                 cache_row,
-                latent_len=record.step,
+                latent_len=final_step,
             ),
             token_span=TokenSpan(base=session.logical_position, len=0),
             finish_flags=FinishFlags(),
             product_generations=_output_generations(operation),
+            products=products,
         )
+
+    def _publish_latent_transfer(
+        self,
+        operation: Operation,
+        product: ProductRef,
+        value: torch.Tensor,
+        row: _LatentExecution,
+        *,
+        step: int,
+        scope: _ExecutionScope,
+    ) -> tuple[ProductPayload, ...]:
+        """Publish a committed-candidate trajectory for an exact staged consumer."""
+
+        transport = self.transport
+        if (
+            transport is None
+            or transport.name == "local"
+            or (self.deployment is not None and int(self.deployment.tp_rank) != 0)
+        ):
+            return ()
+        locator = transport.publish_async(value.detach().contiguous())
+        metadata = {
+            "generation": int(product.generation),
+            "height": int(row.placement.height),
+            "latent_units": int(row.placement.latent_units),
+            "step": int(step),
+            "width": int(row.placement.width),
+        }
+        locator = replace(locator, meta={**locator.meta, **metadata})
+        scope.published.append(locator)
+        scope.stage_publications[_operation_identity(operation)] = (locator,)
+        descriptor = _CompletionTransferPayload(
+            "latent",
+            {"locator": locator.to_wire(), **metadata},
+            (locator,),
+            operation.plan_digest,
+            transport,
+        )
+        return (ProductPayload(product=product, payload=cast(bytes, descriptor)),)
 
     def _initial_latent(
         self,
         operation: Operation,
         height: int,
         width: int,
-        session: RequestSession,
-    ) -> torch.Tensor:
-        del session
+        target: torch.Tensor,
+    ) -> None:
         flow = self._generation()
-        device = self._device
-        dtype = _torch_dtype(self._model().serving_dtype)
         rng = operation.rng
         assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
         seed = flow_noise_seed(int(rng.seed), int(rng.semantic_index_base))
-        return normal_noise(
-            flow.latent_shape(height, width),
+        raw = target.reshape(flow.latent_shape(height, width))
+        normal_noise(
+            tuple(int(value) for value in raw.shape),
             seed=seed,
-            device=device,
-            dtype=dtype,
-        ) * flow.noise_scale(height, width)
+            device=target.device,
+            dtype=target.dtype,
+            out=raw,
+        )
+        raw.mul_(flow.noise_scale(height, width))
+        neural = flow.neural_latent(raw)
+        if neural.data_ptr() != target.data_ptr() or tuple(neural.shape) != tuple(target.shape):
+            target.copy_(neural.reshape_as(target))
 
     def _noise_scale(self, height: int, width: int) -> float:
         return self._generation().noise_scale(height, width)
@@ -5380,7 +5702,6 @@ class ModelExecutor:
     ) -> _ForwardTask:
         session = self.sessions.get(operation.request_key.session_id)
         flow = self._generation()
-        neural_latent = self._flow_neural_latent(latent, height, width)
         image_tokens = self._flow_query_tokens(latent, height, width)
         text_local: tuple[int, ...]
         if flow.latent_layout is LatentLayout.PATCH_TOKENS:
@@ -5420,7 +5741,7 @@ class ModelExecutor:
             flow_conditioning=conditioning,
             positions=latent_positions,
             timestep=timestep.reshape(1),
-            latent=neural_latent,
+            latent=latent,
             image_tokens=query_tokens,
             image_height=height,
             image_width=width,
@@ -5449,22 +5770,6 @@ class ModelExecutor:
     def _flow_physical_tokens(self, height: int, width: int) -> int:
         return self._generation().physical_tokens(height, width)
 
-    def _flow_neural_latent(
-        self,
-        latent: torch.Tensor,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        return self._generation().neural_latent(latent)
-
-    def _flow_store_latent(
-        self,
-        latent: torch.Tensor,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        return self._generation().stored_latent(latent, height, width)
-
     def _flow_conditioning(
         self,
         latent: torch.Tensor,
@@ -5472,8 +5777,9 @@ class ModelExecutor:
         width: int,
     ) -> FlowPatches | None:
         transform = self._image_processor().vit
-        return self._generation().conditioning(
-            latent,
+        generation = self._generation()
+        return generation.conditioning(
+            generation.materialization_latent(latent, height, width),
             height,
             width,
             patch_size=(
@@ -5663,21 +5969,27 @@ class ModelExecutor:
         latent_input = latent_inputs[0]
         if int(latent_input.generation) < 1 or session.latent_product != latent_input:
             raise invalid_descriptor("materialization does not name the current latent generation")
-        latent_read = self.products.device_products.consume(
-            latent_input,
-            consumer_op_id=operation.op_id,
-            device=self._operation_device(operation),
-        )
-        scope.device_reads.append(latent_read)
         flow = self._generation()
-        latent_record = scope.latents.read(latent_input)
-        if latent_record is None or latent_record.reference.request_key.session_id != session_id:
-            raise invalid_descriptor("materialization latent is not resident for this session")
         image_params = session.image
         if image_params is None:
             raise invalid_descriptor("image materialization has no admitted image parameters")
-        if latent_record.step != image_params.steps:
+        row = self._latent_row(operation, scope)
+        if int(row.placement.start_step) != int(image_params.steps):
             raise invalid_descriptor("image materialization requires a completed latent trajectory")
+        current = self._latent_pool().gather_current(
+            row.request_pool_idx,
+            row.staging,
+            step=int(row.placement.start_step),
+            generation=int(latent_input.generation),
+            latent_units=int(row.placement.latent_units),
+            height=int(row.placement.height),
+            width=int(row.placement.width),
+        )
+        materialization_latent = flow.materialization_latent(
+            current,
+            int(row.placement.height),
+            int(row.placement.width),
+        )
 
         if flow.materialization is Materialization.DECODE_ROUTE:
             task = _ForwardTask(
@@ -5685,15 +5997,15 @@ class ModelExecutor:
                 session=session,
                 weights=self._weights(),
                 phase=ModelPhase.DECODE_LATENT,
-                latent=latent_read.tensor,
-                image_height=latent_record.height,
-                image_width=latent_record.width,
+                latent=materialization_latent,
+                image_height=int(row.placement.height),
+                image_width=int(row.placement.width),
             )
             outputs = yield (task,)
             image_tensor = _decoded_tensor(outputs[0]).detach()
             image_range = ImageRange.UNIT
         elif flow.materialization is Materialization.RGB_LATENT:
-            image_tensor = latent_read.tensor.detach()
+            image_tensor = materialization_latent.detach()
             image_range = ImageRange.SIGNED_UNIT
         else:
             raise invalid_descriptor("model declares an unknown image materialization kind")
@@ -5728,8 +6040,8 @@ class ModelExecutor:
                     session_id=session_id,
                     payload=ImageTensorProduct(
                         image=resident_image,
-                        height=latent_record.height,
-                        width=latent_record.width,
+                        height=int(row.placement.height),
+                        width=int(row.placement.width),
                         value_range=image_range,
                     ),
                 )
@@ -5745,6 +6057,17 @@ class ModelExecutor:
         )
         session.latent_product = None
         session.flow_step = 0
+        scope.latent_releases.append(
+            LatentRelease(
+                request_pool_idx=row.request_pool_idx,
+                page_table=row.placement.page_table,
+                generation=int(latent_input.generation),
+                step=int(row.placement.start_step),
+                latent_units=int(row.placement.latent_units),
+                height=int(row.placement.height),
+                width=int(row.placement.width),
+            )
+        )
         products = (
             ProductPayload(
                 product=artifact,
@@ -6262,6 +6585,29 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> tuple[torch.Tensor, Mapping[str, object]]:
         for reference in operation.inputs:
+            if reference.kind is ProductKind.LATENT:
+                session = self.sessions.get(operation.request_key.session_id)
+                if session.latent_product != reference:
+                    raise invalid_descriptor(
+                        "latent transfer does not name the committed trajectory"
+                    )
+                row = self._latent_row(operation, scope)
+                value = self._latent_pool().gather_current(
+                    row.request_pool_idx,
+                    row.staging,
+                    step=int(row.placement.start_step),
+                    generation=int(reference.generation),
+                    latent_units=int(row.placement.latent_units),
+                    height=int(row.placement.height),
+                    width=int(row.placement.width),
+                )
+                return value, {
+                    "payload_kind": ProductKind.LATENT.value,
+                    "height": int(row.placement.height),
+                    "width": int(row.placement.width),
+                    "step": int(row.placement.start_step),
+                    "generation": int(reference.generation),
+                }
             if reference.storage_class is StorageClass.DEVICE_TENSOR:
                 read = self.products.device_products.consume(
                     reference,
@@ -7864,7 +8210,6 @@ def _requires_device_product_binding(reference: ProductRef) -> bool:
         and reference.kind
         in {
             ProductKind.ARTIFACT,
-            ProductKind.LATENT,
             ProductKind.LATENT_FEATURE,
             ProductKind.VISION_FEATURE,
         }

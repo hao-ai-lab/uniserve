@@ -1225,6 +1225,7 @@ pub struct RecoveryPlacement {
     pub request_key: RequestKey,
     pub request_pool_idx: u32,
     pub cache_groups: Vec<CacheGroupPlacement>,
+    pub latent_page_table: Vec<u32>,
 }
 
 /// One exact in-pool cache page copy.
@@ -1259,6 +1260,12 @@ impl RecoveryPlacement {
             );
             group.validate()?;
         }
+        anyhow::ensure!(
+            self.latent_page_table.iter().all(|page| *page > 0)
+                && self.latent_page_table.iter().collect::<HashSet<_>>().len()
+                    == self.latent_page_table.len(),
+            "recovery latent page table repeats a page or carries page zero"
+        );
         Ok(())
     }
 }
@@ -1467,6 +1474,7 @@ impl BatchPartition {
             );
         }
         let mut latent_ids = HashSet::with_capacity(self.latent_placements.len());
+        let mut latent_pages = HashSet::new();
         for placement in &self.latent_placements {
             placement.validate()?;
             let identity = (placement.request_key, placement.op_id);
@@ -1477,19 +1485,33 @@ impl BatchPartition {
             let operation = operations.get(&identity).ok_or_else(|| {
                 anyhow::anyhow!("latent placement does not name a partition operation")
             })?;
+            let addresses_trajectory = matches!(
+                operation.work.variant(),
+                WorkVariant::GenTransition | WorkVariant::GenFlow
+            ) || operation
+                .inputs
+                .iter()
+                .any(|reference| reference.kind == ProductKind::Latent);
             anyhow::ensure!(
-                matches!(
-                    operation.work.variant(),
-                    WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
-                ),
+                addresses_trajectory,
                 "latent placement names an operation that does not address a trajectory"
+            );
+            anyhow::ensure!(
+                placement
+                    .page_table
+                    .iter()
+                    .all(|page| latent_pages.insert(*page)),
+                "latent placements overlap physical pages"
             );
         }
         for operation in &self.operations {
             let needs_latent = matches!(
                 operation.work.variant(),
-                WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
-            );
+                WorkVariant::GenTransition | WorkVariant::GenFlow
+            ) || operation
+                .inputs
+                .iter()
+                .any(|reference| reference.kind == ProductKind::Latent);
             anyhow::ensure!(
                 !needs_latent || latent_ids.contains(&(operation.request_key, operation.op_id)),
                 "operation that addresses a trajectory has no latent placement"
@@ -1568,6 +1590,14 @@ impl Batch {
                 .push(partition);
         }
         for partitions in submission_groups.values() {
+            anyhow::ensure!(
+                partitions
+                    .iter()
+                    .filter(|partition| !partition.latent_placements.is_empty())
+                    .count()
+                    <= 1,
+                "a physical submission group has multiple latent staging partitions"
+            );
             let execution = partitions[0].execution;
             let collective_seq = partitions[0].collective_seq;
             let attention = partitions[0].attention;
@@ -2489,7 +2519,12 @@ pub fn protocol_layout_digest() -> Digest {
             "pages_to_zero",
         ],
         &["group_id", "page_ids", "length"],
-        &["request_key", "request_pool_idx", "cache_groups"],
+        &[
+            "request_key",
+            "request_pool_idx",
+            "cache_groups",
+            "latent_page_table",
+        ],
         &["group_id", "source_page", "destination_page"],
         &[
             "request_key",
