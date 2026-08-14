@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
@@ -95,6 +96,18 @@ if triton is not None:
         tl.store(cache_lengths_ptr + indices, cache + 1, mask=mask)
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeStateSnapshot:
+    valid_cache_length: int
+    logical_length: int
+    sampling_position: int
+    future_input_tokens: torch.Tensor
+    penalty_counts: torch.Tensor
+    predicate: bool
+    selected_point: int
+    prompt_logits: torch.Tensor | None
+
+
 class RuntimeStates:
     """Own graph-safe token continuation state for every request slot.
 
@@ -109,6 +122,7 @@ class RuntimeStates:
         vocab_size: int,
         continuation_width: int,
         device: torch.device | str,
+        logits_dtype: torch.dtype = torch.float32,
     ) -> None:
         if request_pool_size < 1 or vocab_size < 1 or continuation_width < 1:
             raise ValueError("runtime-state geometry must be positive")
@@ -116,6 +130,9 @@ class RuntimeStates:
         self.vocab_size = int(vocab_size)
         self.continuation_width = int(continuation_width)
         self.device = torch.device(device)
+        if not logits_dtype.is_floating_point:
+            raise ValueError("runtime prompt-logit dtype must be floating point")
+        self.logits_dtype = logits_dtype
         rows = self.request_pool_size + 1
         self.valid_cache_lengths = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.logical_lengths = torch.zeros(rows, dtype=torch.int32, device=self.device)
@@ -125,6 +142,9 @@ class RuntimeStates:
         )
         self.penalty_counts = torch.zeros(
             (rows, self.vocab_size), dtype=torch.int32, device=self.device
+        )
+        self.prompt_logits = torch.empty(
+            (rows, self.vocab_size), dtype=self.logits_dtype, device=self.device
         )
         self.predicates = torch.zeros(rows, dtype=torch.bool, device=self.device)
         self.selected_points = torch.zeros(rows, dtype=torch.int32, device=self.device)
@@ -194,6 +214,64 @@ class RuntimeStates:
 
     def release(self, request_pool_indices: torch.Tensor | Sequence[int]) -> None:
         self.reset(request_pool_indices)
+
+    def snapshot_rows(
+        self,
+        request_pool_indices: Sequence[int],
+        *,
+        prompt_logits_ready: Sequence[bool],
+    ) -> tuple[RuntimeStateSnapshot, ...]:
+        rows = tuple(int(value) for value in request_pool_indices)
+        flags = tuple(bool(value) for value in prompt_logits_ready)
+        self._validate_host_indices(rows)
+        if len(rows) != len(flags):
+            raise ValueError("runtime-state snapshot columns are not aligned")
+        return tuple(
+            RuntimeStateSnapshot(
+                valid_cache_length=int(self.valid_cache_lengths[row]),
+                logical_length=int(self.logical_lengths[row]),
+                sampling_position=int(self.sampling_positions[row]),
+                future_input_tokens=self.future_input_tokens[row].detach().cpu().contiguous(),
+                penalty_counts=self.penalty_counts[row].detach().cpu().contiguous(),
+                predicate=bool(self.predicates[row]),
+                selected_point=int(self.selected_points[row]),
+                prompt_logits=(
+                    self.prompt_logits[row].detach().cpu().contiguous() if ready else None
+                ),
+            )
+            for row, ready in zip(rows, flags, strict=True)
+        )
+
+    def restore_rows(
+        self,
+        rows: Sequence[tuple[int, RuntimeStateSnapshot]],
+    ) -> None:
+        for raw_index, snapshot in rows:
+            index = int(raw_index)
+            self._validate_host_indices((index,))
+            if tuple(snapshot.future_input_tokens.shape) != (self.continuation_width,):
+                raise ValueError("runtime-state continuation snapshot has an invalid shape")
+            if tuple(snapshot.penalty_counts.shape) != (self.vocab_size,):
+                raise ValueError("runtime-state penalty snapshot has an invalid shape")
+            if snapshot.prompt_logits is not None and tuple(snapshot.prompt_logits.shape) != (
+                self.vocab_size,
+            ):
+                raise ValueError("runtime-state prompt-logit snapshot has an invalid shape")
+            self.future_input_tokens[index].copy_(
+                snapshot.future_input_tokens.to(self.device, dtype=torch.int64)
+            )
+            self.penalty_counts[index].copy_(
+                snapshot.penalty_counts.to(self.device, dtype=torch.int32)
+            )
+            self.predicates[index] = snapshot.predicate
+            self.selected_points[index] = snapshot.selected_point
+            self.valid_cache_lengths[index] = snapshot.valid_cache_length
+            self.logical_lengths[index] = snapshot.logical_length
+            self.sampling_positions[index] = snapshot.sampling_position
+            if snapshot.prompt_logits is not None:
+                self.prompt_logits[index].copy_(
+                    snapshot.prompt_logits.to(self.device, dtype=self.logits_dtype)
+                )
 
     def publish_sampling(
         self,
@@ -407,4 +485,4 @@ class RuntimeStates:
         target[indices] = source
 
 
-__all__ = ["RuntimeStates"]
+__all__ = ["RuntimeStateSnapshot", "RuntimeStates"]

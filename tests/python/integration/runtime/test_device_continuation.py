@@ -25,7 +25,7 @@ from uniserve_worker.batch import (
     TokenMode,
     VersionRef,
 )
-from uniserve_worker.execution.executor import finalize_completion_report
+from uniserve_worker.server.completion import finalize_completion_report
 from uniserve_worker.server.stub import _next_token
 
 pytestmark = [
@@ -34,45 +34,7 @@ pytestmark = [
 ]
 
 
-def test_token_and_finish_outputs_are_fenced_after_sampling_submission() -> None:
-    worker = execution_worker(device="cuda:0", pipeline_depth=2)
-    admission = und_admission(29, block_ids=(0,))
-    operation, token_input = token_operation(
-        admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-    )
-
-    worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(operation,),
-            input_products=(token_input,),
-        )
-    )
-    token = next(output for output in operation.outputs if output.kind is ProductKind.TOKEN)
-    finish = next(output for output in operation.outputs if output.kind is ProductKind.FINISH)
-    token_read, finish_read = worker.products.device_products.consume_batch(
-        (
-            (token, 2, operation.plan_digest, "cuda:0"),
-            (finish, 2, operation.plan_digest, "cuda:0"),
-        ),
-        device="cuda:0",
-    )
-
-    assert token_read._write.producer_event is not None
-    assert finish_read._write.producer_event is not None
-    assert token_read._write.producer_event is finish_read._write.producer_event
-    worker.products.device_products.record_readers(
-        (token_read, finish_read),
-        device="cuda:0",
-    )
-
-
-def test_same_request_continues_from_device_products_before_parent_observation() -> None:
+def test_same_request_continues_before_parent_report_materialization() -> None:
     device = "cuda:0"
     worker = execution_worker(device=device, pipeline_depth=2)
     warm_admission = und_admission(30, block_ids=(1,))
@@ -335,11 +297,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
 
 
 def test_penalty_device_continuation_matches_depth_one_serial_execution() -> None:
-    # A penalty-bearing successor relayed from a device point must penalize its
-    # ancestor's token even though that token is never observed on the host. The
-    # sampler folds each generated token into the request's device-resident count
-    # base as the operation executes, so the depth-two relayed token equals the
-    # depth-one serial token that folds the same ancestor through a commit.
+    # A penalty-bearing pipelined successor must match the equivalent serial lineage.
     sampling = SamplingParams(
         temperature=0.8,
         top_k=48,

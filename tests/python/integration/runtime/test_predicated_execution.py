@@ -22,7 +22,7 @@ from uniserve_worker.batch import (
     TokenMode,
     VersionRef,
 )
-from uniserve_worker.execution.executor import finalize_completion_report
+from uniserve_worker.server.completion import finalize_completion_report
 from uniserve_worker.server.stub import _next_token
 
 

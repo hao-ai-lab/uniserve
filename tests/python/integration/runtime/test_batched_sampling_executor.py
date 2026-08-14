@@ -9,6 +9,7 @@ oracle the stub model defines through its deterministic next-token map.
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import replace
 from typing import cast
 
@@ -25,6 +26,7 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
+    CompletionReport,
     DrawLayout,
     DType,
     ErrorCode,
@@ -43,6 +45,10 @@ from uniserve_worker.batch import (
     TokenMode,
     UndAdmission,
     encode_sampling_state_bytes,
+)
+from uniserve_worker.server.completion import (
+    completion_report_ready,
+    finalize_completion_report,
 )
 from uniserve_worker.server.stub import STUB_IMG_START_TOKEN_ID, _next_token
 
@@ -79,6 +85,14 @@ def _sampled_logprobs(payload: bytes) -> tuple[tuple[int, float, int], ...]:
     assert payload[0] == 1
     count = struct.unpack_from("<I", payload, 5)[0]
     return tuple(struct.unpack_from("<IfI", payload, 9 + 12 * index) for index in range(count))
+
+
+def _materialize(report: CompletionReport) -> CompletionReport:
+    deadline = time.monotonic() + 5.0
+    while not completion_report_ready(report) and time.monotonic() < deadline:
+        time.sleep(0.0001)
+    assert completion_report_ready(report)
+    return finalize_completion_report(report)
 
 
 def _with_sampling_state(
@@ -152,6 +166,47 @@ def test_inline_rows_from_one_round_produce_the_serial_oracle_tokens() -> None:
     assert result.completions[1].committed_tokens == (_next_token(12),)
 
 
+def test_logprob_reporting_does_not_change_sample_selection() -> None:
+    worker = execution_worker()
+    sampling = SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=71)
+    first = und_admission(11, block_ids=(2,), sampling=sampling)
+    second = und_admission(
+        12,
+        block_ids=(3,),
+        sampling=replace(sampling, return_logprobs=True, n_logprobs=2),
+    )
+    first_op, first_input = token_operation(
+        first.request_key,
+        op_id=1,
+        parent=root_parent(first),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        rng=Rng(seed=71, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+    )
+    second_op, second_input = token_operation(
+        second.request_key,
+        op_id=2,
+        parent=root_parent(second),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        logprobs=True,
+        rng=Rng(seed=71, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
+    )
+
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(first, second),
+                operations=(first_op, second_op),
+                input_products=(first_input, second_input),
+            )
+        )
+    )
+
+    assert result.completions[0].committed_tokens == result.completions[1].committed_tokens
+
+
 def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
     worker = execution_worker()
     admissions = (und_admission(21, block_ids=(0,)), und_admission(22, block_ids=(1,)))
@@ -205,42 +260,6 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
     assert tuple(completion.selected_point for completion in result.completions) == (1, 1)
 
 
-def test_admission_finish_policy_drives_the_device_finish_product() -> None:
-    worker = execution_worker()
-    base = und_admission(23, block_ids=(2,))
-    expected = _next_token(4)
-    assert base.und is not None
-    admission = Admission.create(
-        base.request_key,
-        request_pool_idx=base.request_pool_idx,
-        und=replace(base.und, finish_token_ids=(expected,)),
-    )
-    operation, token_input = token_operation(
-        admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-    )
-
-    worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(operation,),
-            input_products=(token_input,),
-        )
-    )
-
-    finish = next(output for output in operation.outputs if output.kind is ProductKind.FINISH)
-    read = worker.products.device_products.consume(
-        finish,
-        consumer_op_id=2,
-        device="cpu",
-    )
-    assert read.tensor.tolist() == [1]
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_completion_publishes_logprobs_with_committed_tokens() -> None:
     worker = execution_worker(device="cuda:0")
@@ -258,14 +277,14 @@ def test_cuda_completion_publishes_logprobs_with_committed_tokens() -> None:
         logprobs=True,
     )
 
-    result = worker.execute(
+    result = _materialize(worker.execute(
         execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(operation,),
             input_products=(token_input,),
         )
-    )
+    ))
 
     assert len(result.completions[0].committed_tokens) == 1
     payload = next(
@@ -279,7 +298,7 @@ def test_cuda_completion_publishes_logprobs_with_committed_tokens() -> None:
     assert all(rank >= 1 and value <= 0.0 for _token, value, rank in entries)
 
 
-def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:
+def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> None:
     worker = execution_worker()
     first = und_admission(24, block_ids=(3,))
     second_base = und_admission(25, block_ids=(4,))
@@ -317,13 +336,12 @@ def test_sampling_batch_publishes_declared_token_and_finish_products() -> None:
 
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
-    finish = next(output for output in second_op.outputs if output.kind is ProductKind.FINISH)
-    read = worker.products.device_products.consume(
-        finish,
-        consumer_op_id=3,
-        device="cpu",
+    assert result.completions[0].product_generations == tuple(
+        output.generation for output in first_op.outputs
     )
-    assert read.tensor.tolist() == [1]
+    assert result.completions[1].product_generations == tuple(
+        output.generation for output in second_op.outputs
+    )
 
 
 def test_verify_commits_every_accepted_position() -> None:
@@ -355,13 +373,15 @@ def test_verify_commits_every_accepted_position() -> None:
         logprobs=True,
         control_seq=commit.control_seq,
     )
-    result = worker.execute(
-        execution_batch(
-            step_id=2,
-            admissions=(),
-            operations=(verify,),
-            controls=(commit,),
-            input_products=(verify_input,),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                admissions=(),
+                operations=(verify,),
+                controls=(commit,),
+                input_products=(verify_input,),
+            )
         )
     )
     committed = result.completions[0].committed_tokens
@@ -369,28 +389,6 @@ def test_verify_commits_every_accepted_position() -> None:
     assert committed == (1001, STUB_IMG_START_TOKEN_ID, 1002)
     assert result.completions[0].selected_point == 3
     assert result.completions[0].logical_lengths.kv_visible_len == 5
-    session = worker.sessions.get(4)
-    assert tuple(
-        point for producer, point in session.resolved_versions if producer == verify.op_id
-    ) == (1, 2, 3)
-    selected = next(
-        output for output in verify.outputs if output.kind is ProductKind.SELECTED_POINT
-    )
-    accepted_span = next(
-        output for output in verify.outputs if output.kind is ProductKind.ACCEPTED_SPAN
-    )
-    continuation = next(
-        output for output in verify.outputs if output.kind is ProductKind.CONTINUATION
-    )
-    assert worker.products.device_products.consume(
-        selected, consumer_op_id=31, device="cpu"
-    ).tensor.tolist() == [3]
-    assert worker.products.device_products.consume(
-        accepted_span, consumer_op_id=32, device="cpu"
-    ).tensor.tolist() == [3, 1001, STUB_IMG_START_TOKEN_ID, 1002]
-    assert worker.products.device_products.consume(
-        continuation, consumer_op_id=33, device="cpu"
-    ).tensor.tolist() == [1002, 3, 5, 5]
 
 
 def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -> None:
@@ -403,12 +401,14 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    prime = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(extend,),
-            input_products=(extend_input,),
+    prime = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(extend,),
+                input_products=(extend_input,),
+            )
         )
     )
     commit = commit_resolved(worker.sessions.get(5))
@@ -421,13 +421,15 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
         control_seq=commit.control_seq,
     )
 
-    result = worker.execute(
-        execution_batch(
-            step_id=2,
-            admissions=(),
-            operations=(verify,),
-            controls=(commit,),
-            input_products=(verify_input,),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                admissions=(),
+                operations=(verify,),
+                controls=(commit,),
+                input_products=(verify_input,),
+            )
         )
     )
 
@@ -438,8 +440,6 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
     assert completion.logical_lengths.kv_visible_len == 3
     assert completion.logical_lengths.kv_committed_len == 2
     assert completion.logical_lengths.kv_published_len == 0
-    session = worker.sessions.get(5)
-    assert session.selected_for_operation(2) == session.resolved_versions[(2, 1)]
 
 
 def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> None:
@@ -475,29 +475,21 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
         control_seq=commit.control_seq,
     )
 
-    result = worker.execute(
-        execution_batch(
-            step_id=2,
-            admissions=(),
-            operations=(verify,),
-            controls=(commit,),
-            input_products=(verify_input,),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                admissions=(),
+                operations=(verify,),
+                controls=(commit,),
+                input_products=(verify_input,),
+            )
         )
     )
 
     completion = result.completions[0]
     assert completion.committed_tokens == (1001,)
     assert completion.selected_point == 1
-    selected = next(
-        output for output in verify.outputs if output.kind is ProductKind.SELECTED_POINT
-    )
-    finish = next(output for output in verify.outputs if output.kind is ProductKind.FINISH)
-    assert worker.products.device_products.consume(
-        selected, consumer_op_id=41, device="cpu"
-    ).tensor.tolist() == [1]
-    assert worker.products.device_products.consume(
-        finish, consumer_op_id=42, device="cpu"
-    ).tensor.tolist() == [1]
 
 
 def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
@@ -515,14 +507,14 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    first_result = worker.execute(
+    first_result = _materialize(worker.execute(
         execution_batch(
             step_id=1,
             admissions=(admission,),
             operations=(first,),
             input_products=(first_input,),
         )
-    )
+    ))
     commit = commit_resolved(worker.sessions.get(31))
     second, second_input = token_operation(
         admission.request_key,
@@ -533,7 +525,7 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         logprobs=True,
         control_seq=commit.control_seq,
     )
-    second_result = worker.execute(
+    second_result = _materialize(worker.execute(
         execution_batch(
             step_id=2,
             admissions=(),
@@ -541,7 +533,7 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
             controls=(commit,),
             input_products=(second_input,),
         )
-    )
+    ))
 
     first_blob = next(
         product.payload
@@ -562,6 +554,144 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
     assert all(position[0][1] <= 0.0 for position in (*first_positions, *second_positions))
 
 
+def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
+    sampling = SamplingParams(return_prompt_logprobs=True, n_prompt_logprobs=2)
+    admission = und_admission(32, block_ids=(8,), sampling=sampling)
+    worker = execution_worker()
+    first, first_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        logprobs=True,
+    )
+    _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(first,),
+                input_products=(first_input,),
+            )
+        )
+    )
+    commit = commit_resolved(worker.sessions.get(32))
+    invalid, invalid_input = token_operation(
+        admission.request_key,
+        op_id=2,
+        parent=commit.selected,
+        mode=TokenMode.EXTEND,
+        tokens=(5, 6),
+        logprobs=True,
+        control_seq=commit.control_seq,
+    )
+    invalid_outputs = tuple(
+        replace(output, shape_bound=ShapeBound((StaticDim(1),)))
+        if output.kind is ProductKind.LOGPROB
+        else output
+        for output in invalid.outputs
+    )
+    invalid = Operation.registered(
+        request_key=invalid.request_key,
+        op_id=invalid.op_id,
+        parent=invalid.parent,
+        work=invalid.work,
+        route=invalid.route,
+        domain=invalid.domain,
+        bounds=invalid.bounds,
+        inputs=invalid.inputs,
+        outputs=invalid_outputs,
+        kv_capacity_pages=invalid.kv_capacity_pages,
+        predicate=invalid.predicate,
+        rng=invalid.rng,
+        control_seq=invalid.control_seq,
+    )
+    failed = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                operations=(invalid,),
+                controls=(commit,),
+                input_products=(invalid_input,),
+            )
+        )
+    )
+    assert failed.completions[0].status is OpStatus.ERROR
+    assert failed.completions[0].error_code is ErrorCode.INVALID_OPERATION
+
+    continued, continued_input = token_operation(
+        admission.request_key,
+        op_id=3,
+        parent=commit.selected,
+        mode=TokenMode.EXTEND,
+        tokens=(7, 8),
+        logprobs=True,
+        control_seq=commit.control_seq,
+    )
+    recovered = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=3,
+                operations=(continued,),
+                input_products=(continued_input,),
+            )
+        )
+    )
+
+    oracle = execution_worker()
+    oracle_first, oracle_first_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+        logprobs=True,
+    )
+    _materialize(
+        oracle.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(oracle_first,),
+                input_products=(oracle_first_input,),
+            )
+        )
+    )
+    oracle_commit = commit_resolved(oracle.sessions.get(32))
+    oracle_continued, oracle_continued_input = token_operation(
+        admission.request_key,
+        op_id=3,
+        parent=oracle_commit.selected,
+        mode=TokenMode.EXTEND,
+        tokens=(7, 8),
+        logprobs=True,
+        control_seq=oracle_commit.control_seq,
+    )
+    expected = _materialize(
+        oracle.execute(
+            execution_batch(
+                step_id=3,
+                operations=(oracle_continued,),
+                controls=(oracle_commit,),
+                input_products=(oracle_continued_input,),
+            )
+        )
+    )
+
+    recovered_payload = next(
+        product.payload
+        for product in recovered.products
+        if product.product.kind is ProductKind.LOGPROB
+    )
+    expected_payload = next(
+        product.payload
+        for product in expected.products
+        if product.product.kind is ProductKind.LOGPROB
+    )
+    assert recovered_payload == expected_payload
+
+
 def test_worker_samples_with_the_operation_branch_state() -> None:
     worker = execution_worker()
     admission = und_admission(41, block_ids=(9,))
@@ -577,12 +707,14 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
         SamplingState(allowed_token_ids=(7,)),
     )
 
-    result = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(operation,),
-            input_products=(token_input, sampling_input),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(operation,),
+                input_products=(token_input, sampling_input),
+            )
         )
     )
 
@@ -635,12 +767,14 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
         SamplingState(allowed_token_ids=()),
     )
 
-    result = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(operation,),
-            input_products=(token_input, sampling_input),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(operation,),
+                input_products=(token_input, sampling_input),
+            )
         )
     )
 

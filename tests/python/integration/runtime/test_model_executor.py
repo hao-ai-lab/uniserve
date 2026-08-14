@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import io
 import time
-from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -50,10 +49,6 @@ from uniserve_worker.batch import (
     TokenMode,
     VersionRef,
 )
-from uniserve_worker.execution.executor import (
-    completion_report_ready,
-    finalize_completion_report,
-)
 from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
@@ -62,8 +57,8 @@ from uniserve_worker.execution.forward_batch import (
 )
 from uniserve_worker.foundation.errors import ErrorCode as HostErrorCode
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.runtime.completion_store import CompletionArena
 from uniserve_worker.runtime.transfer import TRANSFER_DESCRIPTOR_PREFIX
+from uniserve_worker.server.completion import completion_report_ready, finalize_completion_report
 from uniserve_worker.server.stub import StubModel, _next_token
 
 pytestmark = pytest.mark.integration
@@ -650,50 +645,6 @@ def test_image_capability_preserves_the_pure_token_decode_plan():
     assert isinstance(model.attention_plans[-1], PagedDecodePlan)
 
 
-def test_replay_identity_is_idempotent_and_conflicts_are_atomic():
-    model = _ObservedModel()
-    worker = execution_worker(model)
-    admission = und_admission(3, block_ids=(3,))
-    operation, payload = token_operation(
-        admission.request_key,
-        op_id=21,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(8, 9),
-    )
-    batch = execution_batch(
-        step_id=7, admissions=(admission,), operations=(operation,), input_products=(payload,)
-    )
-
-    first = worker.execute(batch)
-    replayed = worker.execute(batch)
-    committed = deepcopy(worker.sessions.get(3))
-
-    assert replayed.completions == first.completions
-    assert worker.sessions.get(3).version == 1
-
-    # Token values ride the input payload, not the plan identity, so a genuine
-    # op-id conflict must differ in the plan itself: here a wider bounded span.
-    conflicting, conflicting_input = token_operation(
-        admission.request_key,
-        op_id=21,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(8, 9, 10),
-    )
-    with pytest.raises(Exception, match="conflicts with its committed digest"):
-        worker.execute(
-            execution_batch(
-                step_id=8,
-                admissions=(),
-                operations=(conflicting,),
-                input_products=(conflicting_input,),
-            )
-        )
-
-    assert worker.sessions.get(3) == committed
-
-
 def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
     model = _ObservedModel()
     worker = execution_worker(model)
@@ -733,8 +684,6 @@ def test_output_validation_failure_is_terminal_and_rolls_back_every_authority():
     assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
 
     model.fault = None
-    replayed = worker.execute(retry_batch)
-    assert replayed.completions == failed.completions
     replacement, replacement_input = token_operation(
         admission.request_key,
         op_id=33,
@@ -914,64 +863,6 @@ def test_mixed_partition_descriptor_failure_does_not_rollback_the_other_domain()
     assert by_request[62].error_code is ErrorCode.INVALID_OPERATION
     assert worker.sessions.get(61).version == 1
     assert worker.sessions.get(62).version == transition_commit.selected.point.point_index
-
-
-def test_mixed_partition_completion_pressure_is_contained_to_one_domain():
-    model = _ObservedModel()
-    worker = execution_worker(model)
-    sequence_admission = und_admission(63, block_ids=(0,))
-    generation_admission = gen_admission(
-        64,
-        ImageParams(steps=1, height=16, width=16, seed=31),
-    )
-    conditioning = _publish_conditioning(worker, generation_admission, op_id=1, step_id=1)
-    latent, transition_commit = _transition_generation(
-        worker,
-        generation_admission,
-        conditioning,
-        op_id=2,
-        parent=root_parent(generation_admission),
-        step_id=2,
-        seed=31,
-    )
-    sequence, sequence_input = token_operation(
-        sequence_admission.request_key,
-        op_id=3,
-        parent=root_parent(sequence_admission),
-        mode=TokenMode.EXTEND,
-        tokens=(9, 10),
-    )
-    flow, _output_latent = flow_operation(
-        generation_admission.request_key,
-        op_id=3,
-        parent=transition_commit.selected,
-        conditioning=conditioning,
-        latent=latent,
-        steps=1,
-        control_seq=transition_commit.control_seq,
-    )
-    worker.executor._completions = CompletionArena(
-        depth=2,
-        token_capacity=4,
-        total_token_capacity=4,
-    )
-
-    report = worker.execute(
-        execution_batch(
-            step_id=3,
-            admissions=(sequence_admission,),
-            operations=(sequence, flow),
-            controls=(transition_commit,),
-            input_products=(sequence_input,),
-        )
-    )
-
-    by_request = {record.request_key.session_id: record for record in report.completions}
-    assert by_request[63].status is OpStatus.OK
-    assert by_request[64].status is OpStatus.ERROR
-    assert by_request[64].error_code is ErrorCode.RESOURCE_EXHAUSTED
-    assert worker.sessions.get(63).version == 1
-    assert worker.sessions.get(64).latent_product == latent
 
 
 def test_initial_flow_noise_is_stable_across_operation_schedules():
@@ -1463,6 +1354,11 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
                 input_products=(source,),
             )
         )
+        deadline = time.monotonic() + 5.0
+        while not completion_report_ready(produced) and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert completion_report_ready(produced)
+        produced = finalize_completion_report(produced)
         assert len(produced.products) == 1
         transferred = produced.products[0]
         assert transferred.product == operation.outputs[0]

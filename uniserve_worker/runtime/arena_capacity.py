@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment
+from .device_products import device_product_capacity_bytes
 from .latent_capacity import latent_pool_capacity_bytes, latent_trajectory_bytes
-from .product_capacity import device_product_arena_bytes
 
 _PRODUCTS_PER_OPERATION = 5
 _MAX_TRANSFER_ENTRIES = 256
@@ -95,8 +95,6 @@ def model_arena_capacity(
     max_product_bytes = max(
         1,
         artifact_bytes,
-        int(max_latent_feature_bytes),
-        int(max_vision_feature_bytes),
     )
     device_products = _PRODUCTS_PER_OPERATION * slots
     device_count = len(
@@ -105,11 +103,11 @@ def model_arena_capacity(
             str(deployment.generation_device or deployment.device),
         }
     )
-    device_product_bytes = device_product_arena_bytes(
+    device_product_bytes = device_product_capacity_bytes(
         device_products,
         device_count,
         selected_points_per_operation=1,
-        max_product_bytes=max_product_bytes,
+        max_value_bytes=max_product_bytes,
     )
 
     return ArenaCapacity(
@@ -134,10 +132,16 @@ def system_arena_capacity(
     if depth < 1 or operations < 1 or payload_bytes < 1:
         raise ValueError("system arena sizing requires positive runtime bounds")
     slots = depth * operations
+    device_products = _PRODUCTS_PER_OPERATION * slots
     return ArenaCapacity(
         latent_pool_bytes=0,
-        device_products=1,
-        device_product_bytes=(1 << 20) * _PRODUCTS_PER_OPERATION * slots,
+        device_products=device_products,
+        device_product_bytes=device_product_capacity_bytes(
+            device_products,
+            1,
+            selected_points_per_operation=1,
+            max_value_bytes=1 << 20,
+        ),
         transfer_bytes=(1 << 20) * slots,
         transfer_tickets=slots,
         cpu_tasks=_CPU_TASKS,

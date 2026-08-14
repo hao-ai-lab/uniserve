@@ -69,6 +69,9 @@ def _request_session_ids(request: Mapping[str, Any]) -> frozenset[int]:
 
 def _response_session_ids(response: Mapping[str, Any]) -> frozenset[int]:
     report = response.get("completion_report")
+    session_ids = getattr(report, "session_ids", None)
+    if isinstance(session_ids, frozenset):
+        return frozenset(int(session_id) for session_id in session_ids)
     completions = getattr(report, "completions", ())
     return frozenset(int(completion.request_key.session_id) for completion in completions)
 

@@ -26,13 +26,15 @@ from ..execution import ModelExecutor
 from ..foundation.errors import capability_mismatch, unsupported_control
 from ..runtime.arena_capacity import operation_window, system_arena_capacity
 from ..runtime.cache_pool import CachePool
+from ..runtime.cpu_tasks import BoundedCpuTaskPool
+from ..runtime.device_events import DeviceEventPool
+from ..runtime.device_products import DeviceProducts
+from ..runtime.encoder_cache import EncoderCache
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.mover import Mover
-from ..runtime.product_store import ProductRecord, ProductStore
-from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.snapshot_store import SnapshotProvider
-from ..runtime.transfer import Locator
+from ..server.completion import CompletionArena, completion_word_capacity
 
 _MAX_OPERATIONS = 1024
 
@@ -132,11 +134,33 @@ class SystemWorker:
             device=device,
             dtype=torch.bfloat16,
         )
-        self.products = ProductStore(
-            device_product_capacity=arena.device_products,
-            device_product_byte_capacity=arena.device_product_bytes,
+        self.device_events = DeviceEventPool()
+        self.device_products = DeviceProducts(
+            capacity=arena.device_products,
+            byte_capacity=arena.device_product_bytes,
+            event_pool=self.device_events,
         )
-        self.replay = ReplayStore()
+        self.encoder_cache = EncoderCache(
+            entry_capacity=0,
+            max_entry_bytes=1,
+            devices=(device,),
+            event_pool=self.device_events,
+        )
+        completion_words = completion_word_capacity(
+            int(self._capabilities.max_batch_operations),
+            int(completion_payload_bytes),
+        )
+        self.completion_arena = CompletionArena(
+            depth=int(pipeline_depth) * int(self._capabilities.max_batch_operations),
+            token_capacity=completion_words,
+            total_token_capacity=int(pipeline_depth) * completion_words,
+            devices=(device,),
+            event_pool=self.device_events,
+        )
+        self.cpu_tasks = BoundedCpuTaskPool(
+            capacity=int(arena.cpu_tasks),
+            workers=min(4, int(arena.cpu_tasks)),
+        )
         self.mover = Mover(
             transfer_backend=transfer_backend,
             transfer_byte_capacity=arena.transfer_bytes,
@@ -153,8 +177,10 @@ class SystemWorker:
             runtime_states=None,
             cache_pool=self.cache_pool,
             latent_pool=None,
-            products=self.products,
-            replay=self.replay,
+            device_products=self.device_products,
+            encoder_cache=self.encoder_cache,
+            completion_arena=self.completion_arena,
+            cpu_tasks=self.cpu_tasks,
             weights=None,
             mesh=None,
             transport=self.mover.transport,
@@ -163,9 +189,6 @@ class SystemWorker:
             weight_digest=None,
             allowed_work_variants=allowed_work_variants,
             trace=self.trace,
-            pipeline_depth=pipeline_depth,
-            completion_payload_bytes=completion_payload_bytes,
-            cpu_task_capacity=arena.cpu_tasks,
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:
@@ -184,8 +207,9 @@ class SystemWorker:
                 cache_pool=self.cache_pool,
                 cache_publications=self.executor.cache_publications,
                 latent_pool=None,
-                products=self.products,
-                replay=self.replay,
+                device_products=self.device_products,
+                encoder_cache=self.encoder_cache,
+                runtime_states=None,
                 transport=self.mover.transport,
             )
 
@@ -202,9 +226,8 @@ class SystemWorker:
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
         session = self.sessions.peek(session_id)
-        self._release_records(self.products.session_records(session_id))
-        self.products.drop(session_id)
-        self.replay.drop_session(session_id)
+        self.executor.drop_session(session_id)
+        self.device_products.drop_session(session_id)
         self.sessions.drop(session_id)
         if self.snapshot_provider is not None:
             self.snapshot_provider.drop_session(session_id)
@@ -226,12 +249,9 @@ class SystemWorker:
         raise unsupported_control(RequestKind.COPY_KV.value)
 
     def release_products(self, handles: tuple[int, ...]) -> None:
-        records = tuple(
-            record for handle in handles if (record := self.products.get(int(handle))) is not None
-        )
-        self._release_records(records)
-        self.products.release(tuple(int(handle) for handle in handles))
-        self.sessions.discard_product_handles({int(handle) for handle in handles})
+        generations = tuple(int(handle) for handle in handles)
+        self.device_products.release_generations(generations)
+        self.encoder_cache.release_generations(generations)
 
     def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         if self.snapshot_provider is None:
@@ -248,8 +268,8 @@ class SystemWorker:
         self.snapshot_provider.restore(reference, placement)
 
     def resource_pressure(self) -> list[dict[str, object]]:
-        total = int(self.products.encoder_cache_budget)
-        used = self.products.encoder_output_count()
+        total = int(self._capabilities.encoder_cache_budget)
+        used = self.encoder_cache.resident_entries
         if used > total:
             raise RuntimeError("system product residency exceeds its declared capacity")
         return [
@@ -264,12 +284,12 @@ class SystemWorker:
 
     def close(self) -> None:
         self.executor.close()
+        self.cpu_tasks.close()
+        self.completion_arena.close()
         self.mover.close()
-
-    def _release_records(self, records: tuple[ProductRecord, ...]) -> None:
-        for record in records:
-            if record.locator:
-                self.mover.transport.release(Locator.from_wire_json(record.locator))
+        self.encoder_cache.close()
+        self.device_products.close()
+        self.device_events.close()
 
 
 __all__ = ["SystemWorker"]

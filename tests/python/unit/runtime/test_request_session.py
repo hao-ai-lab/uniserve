@@ -65,14 +65,14 @@ def _verify_operation(request_key: RequestKey, parent: VersionRef, op_id: int = 
 def test_step_rollback_restores_scalar_and_prefix_ledgers() -> None:
     sessions = SessionStore()
     admission, session = _admit(sessions)
-    session.product_handles.update({11, 13})
+    session.prompt_logits_ready = True
     operation = _verify_operation(admission.request_key, session.committed_version())
     selected = _version(admission.request_key, 11, 2, "b")
     prefixes = (
         (_version(admission.request_key, 11, 1, "a"), _runtime(1)),
         (selected, _runtime(2)),
     )
-    transaction = sessions.begin_step(1, (operation,), ())
+    transaction = sessions.begin_step(1, (operation,))
 
     def fail_publish() -> None:
         raise RuntimeError("publication failed")
@@ -87,7 +87,7 @@ def test_step_rollback_restores_scalar_and_prefix_ledgers() -> None:
 
     restored = sessions.get(7)
     assert restored.resolved_version() == session.committed_version()
-    assert restored.product_handles == {11, 13}
+    assert restored.prompt_logits_ready
 
 
 def test_commit_selects_any_contiguous_prefix_with_its_exact_kv_extent() -> None:
@@ -100,7 +100,7 @@ def test_commit_selects_any_contiguous_prefix_with_its_exact_kv_extent() -> None
         for point, byte in ((1, "a"), (2, "b"), (3, "c"))
     )
     selected = prefixes[-1][0]
-    transaction = sessions.begin_step(1, (operation,), ())
+    transaction = sessions.begin_step(1, (operation,))
     transaction.commit(
         {7: selected},
         {7: prefixes[-1][1]},
@@ -137,7 +137,7 @@ def test_close_retracts_to_one_exact_resolved_prefix() -> None:
         (_version(admission.request_key, 11, point, byte), _runtime(point))
         for point, byte in ((1, "a"), (2, "b"), (3, "c"))
     )
-    transaction = sessions.begin_step(1, (operation,), ())
+    transaction = sessions.begin_step(1, (operation,))
     transaction.commit(
         {7: prefixes[-1][0]},
         {7: prefixes[-1][1]},
@@ -176,7 +176,7 @@ def test_commit_requires_the_selected_operation_to_name_the_current_parent() -> 
     root = session.committed_version()
     operation = _verify_operation(admission.request_key, root)
     selected = _version(admission.request_key, 11, 1, "a")
-    transaction = sessions.begin_step(1, (operation,), ())
+    transaction = sessions.begin_step(1, (operation,))
     transaction.commit(
         {7: selected},
         {7: _runtime(1)},

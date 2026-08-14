@@ -43,7 +43,6 @@ from ..capabilities import (
 )
 from ..execution import ModelExecutor, ModelRunner
 from ..execution.cuda_graph import CudaGraphRunner
-from ..execution.executor import completion_report_ready, finalize_completion_report
 from ..execution.forward_batch import AttentionSelection
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
@@ -62,15 +61,23 @@ from ..nn.mesh import DeviceMesh
 from ..runtime.arena_capacity import model_arena_capacity
 from ..runtime.cache_pool import CachePool
 from ..runtime.capabilities import resolve_capabilities
+from ..runtime.cpu_tasks import BoundedCpuTaskPool
+from ..runtime.device_events import DeviceEventPool
+from ..runtime.device_products import DeviceProducts
+from ..runtime.encoder_cache import EncoderCache
 from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.latent_pool import LatentPool
 from ..runtime.mesh_store import MeshStore
 from ..runtime.mover import Mover
-from ..runtime.product_store import ProductStore
-from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.runtime_states import RuntimeStates
 from ..runtime.snapshot_store import SnapshotProvider
+from ..server.completion import (
+    CompletionArena,
+    completion_report_ready,
+    completion_word_capacity,
+    finalize_completion_report,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -315,11 +322,19 @@ class ModelWorker:
             ),
         )
         self.sessions = SessionStore()
+        torch_dtype = getattr(
+            torch,
+            str(deployment.model_dtype).removeprefix("torch."),
+            None,
+        )
+        if not isinstance(torch_dtype, torch.dtype):
+            raise capability_mismatch(f"unsupported model dtype {deployment.model_dtype!r}")
         self.runtime_states = RuntimeStates(
             request_pool_size=int(self._capabilities.max_request_pool_size),
             vocab_size=int(model.vocab_size),
             continuation_width=1,
             device=deployment.device,
+            logits_dtype=torch_dtype,
         )
         flow = model.generation
         latent_dtype = getattr(
@@ -348,12 +363,45 @@ class ModelWorker:
             and self.latent_pool.persistent_bytes != arena.latent_pool_bytes
         ):
             raise RuntimeError("latent pool allocation disagrees with its exact capacity plan")
-        self.products = ProductStore(
-            encoder_cache_budget=model.resource_geometry.encoder_cache_entries,
-            device_product_capacity=arena.device_products,
-            device_product_byte_capacity=arena.device_product_bytes,
+        owner_devices = tuple(
+            dict.fromkeys(
+                (
+                    deployment.device,
+                    deployment.generation_device or deployment.device,
+                )
+            )
         )
-        self.replay = ReplayStore()
+        self.device_events = DeviceEventPool()
+        self.device_products = DeviceProducts(
+            capacity=arena.device_products,
+            byte_capacity=arena.device_product_bytes,
+            event_pool=self.device_events,
+        )
+        self.encoder_cache = EncoderCache(
+            entry_capacity=int(model.resource_geometry.encoder_cache_entries),
+            max_entry_bytes=max(
+                1,
+                int(self._capabilities.max_latent_feature_bytes),
+                int(self._capabilities.max_vision_feature_bytes),
+            ),
+            devices=owner_devices,
+            event_pool=self.device_events,
+        )
+        completion_words = completion_word_capacity(
+            int(self._capabilities.max_batch_operations),
+            int(completion_payload_bytes),
+        )
+        self.completion_arena = CompletionArena(
+            depth=int(pipeline_depth) * int(self._capabilities.max_batch_operations),
+            token_capacity=completion_words,
+            total_token_capacity=int(pipeline_depth) * completion_words,
+            devices=owner_devices,
+            event_pool=self.device_events,
+        )
+        self.cpu_tasks = BoundedCpuTaskPool(
+            capacity=int(arena.cpu_tasks),
+            workers=min(4, int(arena.cpu_tasks)),
+        )
         self.mover = Mover(
             transfer_backend=transfer_backend,
             transfer_byte_capacity=arena.transfer_bytes,
@@ -718,8 +766,10 @@ class ModelWorker:
             runtime_states=self.runtime_states,
             cache_pool=self.cache_pool,
             latent_pool=self.latent_pool,
-            products=self.products,
-            replay=self.replay,
+            device_products=self.device_products,
+            encoder_cache=self.encoder_cache,
+            completion_arena=self.completion_arena,
+            cpu_tasks=self.cpu_tasks,
             weights=self.weights,
             mesh=MeshStore(mesh),
             transport=self.mover.transport,
@@ -728,10 +778,7 @@ class ModelWorker:
             weight_digest=self.weight_digest,
             allowed_work_variants=self._effective_work_variants,
             trace=self.trace,
-            pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
-            completion_payload_bytes=completion_payload_bytes,
-            cpu_task_capacity=arena.cpu_tasks,
         )
         self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
         self._warmup_scratch_pages: dict[RequestKey, list[int]] = {}
@@ -762,8 +809,9 @@ class ModelWorker:
                 cache_pool=self.cache_pool,
                 cache_publications=self.executor.cache_publications,
                 latent_pool=self.latent_pool,
-                products=self.products,
-                replay=self.replay,
+                device_products=self.device_products,
+                encoder_cache=self.encoder_cache,
+                runtime_states=self.runtime_states,
                 transport=self.mover.transport,
             )
 
@@ -828,7 +876,7 @@ class ModelWorker:
             if completion.status is OpStatus.ERROR
         )
         if failures or not retain_device_outputs:
-            self.products.release(device_generations)
+            self.release_products(device_generations)
         if failures:
             details = ", ".join(
                 f"session={completion.request_key.session_id} op={completion.op_id} "
@@ -1269,7 +1317,7 @@ class ModelWorker:
                         ),
                         retain_device_outputs=True,
                     )
-                    self.products.release(
+                    self.release_products(
                         tuple(
                             int(output.generation)
                             for sid in selected
@@ -1802,7 +1850,7 @@ class ModelWorker:
                             ),
                             retain_device_outputs=True,
                         )
-                        self.products.release(
+                        self.release_products(
                             tuple(
                                 int(output.generation)
                                 for session_id in selected_text
@@ -1821,11 +1869,9 @@ class ModelWorker:
         session_id = int(session_id)
         session = self.sessions.peek(session_id)
         self.executor.drop_session(session_id)
-        self._release_records(self.products.session_records(session_id))
-        self.products.drop(session_id)
+        self.device_products.drop_session(session_id)
         if session is not None and self.latent_pool is not None:
             self.latent_pool.release_slots((int(session.request_pool_idx),))
-        self.replay.drop_session(session_id)
         self.sessions.drop(session_id)
         if session is not None:
             for group_id in range(self.cache_pool.group_count):
@@ -1857,12 +1903,9 @@ class ModelWorker:
             )
 
     def release_products(self, handles: tuple[int, ...]) -> None:
-        records = tuple(
-            record for handle in handles if (record := self.products.get(int(handle))) is not None
-        )
-        self._release_records(records)
-        self.products.release(tuple(int(handle) for handle in handles))
-        self.sessions.discard_product_handles({int(handle) for handle in handles})
+        generations = tuple(int(handle) for handle in handles)
+        self.device_products.release_generations(generations)
+        self.encoder_cache.release_generations(generations)
 
     def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         if self.snapshot_provider is None:
@@ -1879,17 +1922,6 @@ class ModelWorker:
             raise capability_mismatch("this worker has no configured snapshot provider")
         self.runner.synchronize()
         self.snapshot_provider.restore(reference, placement)
-        session = self.sessions.get(placement.request_key.session_id)
-        valid_cache_length = max(
-            (int(group.length) for group in placement.cache_groups),
-            default=0,
-        )
-        self.runtime_states.reset(
-            (int(session.request_pool_idx),),
-            valid_cache_lengths=(valid_cache_length,),
-            logical_lengths=(int(session.logical_position),),
-            sampling_positions=(int(session.rng_counter),),
-        )
 
     def resource_pressure(self) -> list[dict[str, object]]:
         caps = self._capabilities
@@ -1897,7 +1929,7 @@ class ModelWorker:
             "image_latent": (
                 0 if self.latent_pool is None else self.latent_pool.resident_byte_count()
             ),
-            "encoder_output": self.products.encoder_output_count(),
+            "encoder_output": self.encoder_cache.resident_entries,
         }
         totals = {
             "image_latent": (
@@ -1914,19 +1946,15 @@ class ModelWorker:
     def close(self) -> None:
         self.runner.synchronize()
         self.executor.close()
+        self.cpu_tasks.close()
+        self.completion_arena.close()
         self.mover.close()
         if self.latent_pool is not None:
             self.latent_pool.close()
-        self.products.close()
+        self.encoder_cache.close()
+        self.device_products.close()
+        self.device_events.close()
         self.runner.close()
-
-    def _release_records(self, records: tuple[object, ...]) -> None:
-        from ..runtime.product_store import ProductRecord
-        from ..runtime.transfer import Locator
-
-        for record in records:
-            if isinstance(record, ProductRecord) and record.locator:
-                self.mover.transport.release(Locator.from_wire_json(record.locator))
 
 
 def _pressure(resource_class: str, used: int, total: int) -> dict[str, object]:

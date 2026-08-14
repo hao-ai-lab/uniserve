@@ -1,11 +1,11 @@
-"""Transactional storage and event-safe device-product lifetimes."""
+"""Bounded immutable device values with generation-safe stream lifetimes."""
 
 from __future__ import annotations
 
 import math
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 from threading import RLock
 from typing import Final, cast
@@ -14,17 +14,15 @@ import torch
 
 from ..batch import (
     DType,
+    ProductKind,
     ProductRef,
     RequestKey,
     StaticDim,
     StorageClass,
-    TokenMode,
 )
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
-from ..foundation.profiling import profile_range
 from .device_events import DeviceEventPool
 from .host_staging import canonical_device
-from .product_capacity import device_product_storage
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
@@ -37,15 +35,62 @@ _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.BF16: torch.bfloat16,
     DType.F32: torch.float32,
 }
-_TORCH_DTYPE_BYTES: Final[dict[torch.dtype, int]] = {
-    torch_dtype: device_product_storage(dtype)[1] for dtype, torch_dtype in _DEVICE_DTYPES.items()
-}
-if any(
-    str(torch_dtype).removeprefix("torch.") != device_product_storage(dtype)[0]
-    or int(torch.empty((), dtype=torch_dtype).element_size()) != device_product_storage(dtype)[1]
+_PROTOCOL_STORAGE: Final[dict[DType, tuple[str, int]]] = {
+    dtype: (
+        str(torch_dtype).removeprefix("torch."),
+        int(torch.empty((), dtype=torch_dtype).element_size()),
+    )
     for dtype, torch_dtype in _DEVICE_DTYPES.items()
-):
-    raise RuntimeError("device-product storage geometry disagrees with torch")
+}
+_TORCH_DTYPE_BYTES: Final[dict[torch.dtype, int]] = {
+    torch_dtype: int(torch.empty((), dtype=torch_dtype).element_size())
+    for torch_dtype in frozenset(_DEVICE_DTYPES.values())
+}
+_DEVICE_PRODUCT_KINDS: Final[frozenset[ProductKind]] = frozenset(
+    {
+        ProductKind.TOKEN,
+        ProductKind.DRAFT,
+        ProductKind.ARTIFACT,
+        ProductKind.COMPLETION,
+        ProductKind.FINISH,
+        ProductKind.SELECTED_POINT,
+        ProductKind.ACCEPTED_SPAN,
+        ProductKind.CONTINUATION,
+    }
+)
+
+
+def device_product_storage(dtype: DType) -> tuple[str, int]:
+    """Return the concrete tensor storage used for one protocol dtype."""
+
+    return _PROTOCOL_STORAGE[DType(dtype)]
+
+
+def device_product_capacity_bytes(
+    slot_capacity: int,
+    device_count: int,
+    *,
+    selected_points_per_operation: int,
+    max_value_bytes: int,
+) -> int:
+    """Return the fixed backing bound for one ``DeviceProducts`` owner."""
+
+    slots = int(slot_capacity)
+    devices = int(device_count)
+    points = int(selected_points_per_operation)
+    value_bytes = int(max_value_bytes)
+    if min(slots, devices, points, value_bytes) < 1:
+        raise ValueError("device-product geometry must be positive")
+    scalar_bytes = slots * devices * sum(
+        dict(_PROTOCOL_STORAGE.values()).values()
+    )
+    accepted_span_bytes = (points + 1) * device_product_storage(DType.U32)[1]
+    continuation_bytes = 4 * device_product_storage(DType.I64)[1]
+    return scalar_bytes + slots * devices * max(
+        value_bytes,
+        accepted_span_bytes,
+        continuation_bytes,
+    )
 
 
 def _invariant(message: str) -> WorkerError:
@@ -94,6 +139,18 @@ def _resolved_device(device: torch.device | str) -> torch.device:
     return canonical_device(device)
 
 
+def _validate_owner(reference: ProductRef) -> None:
+    if reference.kind not in _DEVICE_PRODUCT_KINDS:
+        raise invalid_descriptor("product kind does not belong to DeviceProducts")
+    expected = (
+        StorageClass.LATENT_ARENA
+        if reference.kind is ProductKind.ARTIFACT
+        else StorageClass.DEVICE_TENSOR
+    )
+    if reference.storage_class is not expected:
+        raise invalid_descriptor("device product has an incompatible storage class")
+
+
 @dataclass(slots=True)
 class _DeviceSlot:
     index: int
@@ -103,6 +160,33 @@ class _DeviceSlot:
     tensor: torch.Tensor | None = None
     shape: tuple[int, ...] | None = None
     dtype: torch.dtype | None = None
+
+
+class ImageRange(StrEnum):
+    SIGNED_UNIT = "signed_unit"
+    UNIT = "unit"
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceProductMetadata:
+    height: int = 0
+    width: int = 0
+    value_range: ImageRange | None = None
+
+    def __post_init__(self) -> None:
+        if self.height < 0 or self.width < 0:
+            raise ValueError("device-product image geometry must be non-negative")
+        if (self.height == 0) != (self.width == 0):
+            raise ValueError("device-product image geometry must be complete")
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceProductSnapshot:
+    reference: ProductRef
+    producer_plan_digest: str
+    value: torch.Tensor
+    device: str
+    metadata: DeviceProductMetadata | None
 
 
 @dataclass(slots=True)
@@ -123,7 +207,7 @@ class DeviceProductWrite:
     _indexed: bool = True
     actual_extent: int = 0
     actual_shape: tuple[int, ...] = ()
-    inflight_read_batches: int = 0
+    metadata: DeviceProductMetadata | None = None
     _scalar_batch: DeviceProductScalarBatch | None = field(
         default=None,
         repr=False,
@@ -152,6 +236,10 @@ class DeviceProductRead:
     def physical_generation(self) -> int:
         return self._write.physical_generation
 
+    @property
+    def metadata(self) -> DeviceProductMetadata | None:
+        return self._write.metadata
+
 
 @dataclass(slots=True)
 class DeviceProductScalarBatch:
@@ -173,7 +261,7 @@ class DeviceProductBindingBatch:
     scalar: DeviceProductScalarBatch | None = None
 
 
-class DeviceProductTable:
+class DeviceProducts:
     """Bounded physical slots for generation-tagged device products.
 
     Registration, lookup, stream waits, reader recording, release, and
@@ -291,19 +379,74 @@ class DeviceProductTable:
             self.abandon_writes(batch.writes)
             raise
 
+    def snapshot_entries(self, session_ids: set[int]) -> tuple[DeviceProductSnapshot, ...]:
+        selected = {int(value) for value in session_ids}
+        with self._lock:
+            snapshots: list[DeviceProductSnapshot] = []
+            for entry in self._entries.values():
+                if (
+                    int(entry.reference.request_key.session_id) not in selected
+                    or entry.released
+                    or not entry.producer_recorded
+                ):
+                    continue
+                storage = entry.slot.tensor
+                if storage is None:
+                    raise _invariant("published device product has no physical tensor")
+                value = (
+                    storage
+                    if entry.actual_shape == entry.slot.shape
+                    else storage.reshape(-1)[: entry.actual_extent].reshape(entry.actual_shape)
+                )
+                snapshots.append(
+                    DeviceProductSnapshot(
+                        reference=entry.reference,
+                        producer_plan_digest=entry.producer_plan_digest,
+                        value=value.detach().cpu().contiguous(),
+                        device=entry.slot.device_name,
+                        metadata=entry.metadata,
+                    )
+                )
+            return tuple(snapshots)
+
+    def restore_entries(
+        self,
+        session_ids: set[int],
+        snapshots: tuple[DeviceProductSnapshot, ...],
+    ) -> None:
+        selected = {int(value) for value in session_ids}
+        if any(int(item.reference.request_key.session_id) not in selected for item in snapshots):
+            raise invalid_descriptor("device-product snapshot contains an undeclared session")
+        for session_id in selected:
+            self.drop_session(session_id)
+        batch = self.bind_output_batch(
+            tuple(
+                (item.reference, item.producer_plan_digest, item.device)
+                for item in snapshots
+            )
+        )
+        try:
+            for write, item in zip(batch.writes, snapshots, strict=True):
+                self.publish_write(
+                    write,
+                    item.value.to(write.slot.device_name),
+                    metadata=item.metadata,
+                )
+        except BaseException:
+            self.abandon_writes(batch.writes)
+            raise
+
     def bind_output_batch(
         self,
         bindings: tuple[tuple[ProductRef, str, torch.device | str], ...],
     ) -> DeviceProductBindingBatch:
         """Atomically bind outputs and retain their direct scalar range."""
 
-        device_bindings = tuple(
-            binding
-            for binding in bindings
-            if binding[0].storage_class in {StorageClass.DEVICE_TENSOR, StorageClass.LATENT_ARENA}
-        )
+        device_bindings = bindings
         if not device_bindings:
             return DeviceProductBindingBatch(())
+        for reference, _plan_digest, _device in device_bindings:
+            _validate_owner(reference)
         first_reference, _first_digest, first_raw_device = device_bindings[0]
         first_device_object = _resolved_device(first_raw_device)
         first_shape = _device_shape(first_reference)
@@ -680,10 +823,13 @@ class DeviceProductTable:
         value: torch.Tensor,
         *,
         producer_event: torch.cuda.Event | None = None,
+        metadata: DeviceProductMetadata | None = None,
     ) -> torch.Tensor:
         with self._lock:
             entry = self._require_write_locked(write)
-            return self._publish_locked(entry, value, producer_event=producer_event)
+            result = self._publish_locked(entry, value, producer_event=producer_event)
+            entry.metadata = metadata
+            return result
 
     def _publish_locked(
         self,
@@ -1929,7 +2075,6 @@ class DeviceProductTable:
             if (
                 entry.released
                 and entry.logical_references == 0
-                and entry.inflight_read_batches == 0
                 and ready(entry.producer_event)
                 and readers_ready(entry)
             ):
@@ -1958,458 +2103,15 @@ class DeviceProductTable:
         return reclaimed
 
 
-@dataclass(frozen=True, slots=True)
-class VisionFeatureProduct:
-    features: torch.Tensor
-    height: int
-    width: int
-    source_base64: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class LatentFeatureProduct:
-    latent: torch.Tensor
-    height: int
-    width: int
-    source_base64: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class LogitsProduct:
-    logits: torch.Tensor
-    source_mode: TokenMode
-    draft_token_ids: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.source_mode not in {
-            TokenMode.EXTEND,
-            TokenMode.DECODE,
-            TokenMode.VERIFY,
-        }:
-            raise ValueError("logits product source mode is invalid")
-        if self.source_mode is not TokenMode.VERIFY and self.draft_token_ids:
-            raise ValueError("only verify logits may carry draft token ids")
-
-
-class ImageRange(StrEnum):
-    SIGNED_UNIT = "signed_unit"
-    UNIT = "unit"
-
-
-@dataclass(frozen=True, slots=True)
-class ImageTensorProduct:
-    image: torch.Tensor
-    height: int
-    width: int
-    value_range: ImageRange
-
-
-@dataclass(frozen=True, slots=True)
-class EncodedImageProduct:
-    base64: str
-
-    def __post_init__(self) -> None:
-        if not self.base64:
-            raise ValueError("encoded image product must not be empty")
-
-
-@dataclass(frozen=True, slots=True)
-class FrameCollectionProduct:
-    frames: tuple[EncodedImageProduct, ...]
-
-    def __post_init__(self) -> None:
-        if not self.frames:
-            raise ValueError("frame collection must contain at least one frame")
-
-
-ProductPayload = (
-    VisionFeatureProduct
-    | LatentFeatureProduct
-    | LogitsProduct
-    | ImageTensorProduct
-    | EncodedImageProduct
-    | FrameCollectionProduct
-)
-
-
-@dataclass(frozen=True, slots=True)
-class ProductRecord:
-    handle: int
-    session_id: int
-    payload: ProductPayload
-    locator: str = ""
-
-    def __post_init__(self) -> None:
-        if self.handle < 1:
-            raise ValueError("product handle must be positive")
-        if not isinstance(
-            self.payload,
-            (
-                VisionFeatureProduct,
-                LatentFeatureProduct,
-                LogitsProduct,
-                ImageTensorProduct,
-                EncodedImageProduct,
-                FrameCollectionProduct,
-            ),
-        ):
-            raise TypeError("product record payload is not a closed product variant")
-        dimensions = (
-            (self.payload.height, self.payload.width)
-            if isinstance(
-                self.payload,
-                (VisionFeatureProduct, LatentFeatureProduct, ImageTensorProduct),
-            )
-            else None
-        )
-        if dimensions is not None and min(dimensions) < 1:
-            raise ValueError("product image geometry must be positive")
-
-
-class ProductStore:
-    """Own session products and scheduler-managed encoder-cache products.
-
-    Encoder feature handles belong to the scheduler's cross-session encoder
-    cache once published. They remain resident across session cleanup and are
-    reclaimed only through ``release``. Every other product follows its
-    originating session's lifetime.
-    """
-
-    def __init__(
-        self,
-        *,
-        encoder_cache_budget: int = 0,
-        device_product_capacity: int = 1,
-        device_product_byte_capacity: int,
-    ) -> None:
-        self.encoder_cache_budget = int(encoder_cache_budget)
-        self.device_events = DeviceEventPool()
-        self.device_products = DeviceProductTable(
-            capacity=device_product_capacity,
-            byte_capacity=device_product_byte_capacity,
-            event_pool=self.device_events,
-        )
-        self._records: dict[int, ProductRecord] = {}
-        self._session_handles: dict[int, set[int]] = {}
-        self._revisions: dict[int, int] = {}
-        self._next_revision = 1
-        self._lock = RLock()
-
-    def get(self, handle: int) -> ProductRecord | None:
-        with self._lock:
-            return self._records.get(int(handle))
-
-    def close(self) -> None:
-        self.device_products.close()
-        with self._lock:
-            self._records.clear()
-            self._session_handles.clear()
-        self.device_events.close()
-
-    def require(self, handle: int) -> ProductRecord:
-        value = self.get(handle)
-        if value is None:
-            raise KeyError(f"unknown product handle {handle}")
-        return value
-
-    def encoder_output_count(self) -> int:
-        """Return committed encoder products in the scheduler's handle unit."""
-
-        with self._lock:
-            return sum(
-                isinstance(record.payload, (VisionFeatureProduct, LatentFeatureProduct))
-                for record in self._records.values()
-            )
-
-    def release(self, handles: tuple[int, ...]) -> None:
-        self.device_products.release_generations(handles)
-        with self._lock:
-            for raw in handles:
-                handle = int(raw)
-                record = self._records.pop(handle, None)
-                if record is not None:
-                    self._session_handles.get(record.session_id, set()).discard(handle)
-                    self._revisions[handle] = self._revision()
-
-    def append_encoded_frame(self, session_id: int, handle: int, base64_value: str) -> None:
-        """Publish one completed CPU encoding under the session's frame handle."""
-
-        encoded = EncodedImageProduct(base64_value)
-        with self._lock:
-            existing = self._records.get(int(handle))
-            if existing is not None and existing.session_id != int(session_id):
-                raise RuntimeError("frame handle belongs to a different session")
-            frames = (
-                existing.payload.frames
-                if existing is not None and isinstance(existing.payload, FrameCollectionProduct)
-                else ()
-            )
-            record = ProductRecord(
-                handle=int(handle),
-                session_id=int(session_id),
-                payload=FrameCollectionProduct((*frames, encoded)),
-            )
-            self._records[int(handle)] = record
-            self._session_handles.setdefault(int(session_id), set()).add(int(handle))
-            self._revisions[int(handle)] = self._revision()
-
-    def session_records(self, session_id: int) -> tuple[ProductRecord, ...]:
-        with self._lock:
-            return tuple(
-                self._records[handle]
-                for handle in self._session_handles.get(int(session_id), set())
-                if handle in self._records
-            )
-
-    def rewrite_locators(self, session_ids: set[int], replacements: dict[str, str]) -> None:
-        requested = {int(value) for value in session_ids}
-        if not replacements:
-            return
-        with self._lock:
-            for handle, record in tuple(self._records.items()):
-                replacement = replacements.get(record.locator)
-                if record.session_id in requested and replacement is not None:
-                    self._records[handle] = replace(record, locator=replacement)
-
-    def drop(self, session_id: int) -> None:
-        with self._lock:
-            handles = self._session_handles.pop(int(session_id), set())
-            retained = frozenset(
-                handle
-                for handle in handles
-                if (record := self._records.get(handle)) is not None
-                and isinstance(
-                    record.payload,
-                    (VisionFeatureProduct, LatentFeatureProduct),
-                )
-            )
-            for handle in handles:
-                record = self._records.get(handle)
-                if record is not None and isinstance(
-                    record.payload,
-                    (VisionFeatureProduct, LatentFeatureProduct),
-                ):
-                    continue
-                self._records.pop(handle, None)
-                self._revisions[handle] = self._revision()
-        with profile_range("uniserve.product_store.drop_session"):
-            self.device_products.drop_session(
-                session_id,
-                retained_generations=retained,
-            )
-
-    def snapshot_records(self, session_ids: set[int]) -> tuple[ProductRecord, ...]:
-        requested = {int(value) for value in session_ids}
-        with self._lock:
-            return tuple(
-                replace(record, payload=_snapshot_payload(record.payload))
-                for record in self._records.values()
-                if record.session_id in requested
-            )
-
-    def restore_records(
-        self,
-        session_ids: set[int],
-        records: tuple[ProductRecord, ...],
-    ) -> None:
-        requested = {int(value) for value in session_ids}
-        staged = {int(record.handle): record for record in records}
-        if len(staged) != len(records):
-            raise ValueError("product snapshot repeats a handle")
-        if any(record.session_id not in requested for record in staged.values()):
-            raise ValueError("product snapshot contains an undeclared session")
-        with self._lock:
-            projected = {
-                handle: record
-                for handle, record in self._records.items()
-                if record.session_id not in requested
-            }
-            if set(projected) & set(staged):
-                raise ValueError("product snapshot handle conflicts with another session")
-            projected.update(staged)
-            used = sum(
-                isinstance(record.payload, (VisionFeatureProduct, LatentFeatureProduct))
-                for record in projected.values()
-            )
-            if used > self.encoder_cache_budget:
-                raise ValueError(
-                    "product snapshot exceeds encoder-output capacity "
-                    f"({used}>{self.encoder_cache_budget})"
-                )
-            replaced = [
-                handle for handle, record in self._records.items() if record.session_id in requested
-            ]
-            self._records = projected
-            self._session_handles = {}
-            for handle, record in projected.items():
-                self._session_handles.setdefault(record.session_id, set()).add(handle)
-            for handle in (*replaced, *staged):
-                self._revisions[handle] = self._revision()
-
-    def begin_step(self, request_ids: set[int]) -> ProductTxn:
-        return ProductTxn(self, frozenset(int(value) for value in request_ids))
-
-    def _revision(self) -> int:
-        value = self._next_revision
-        self._next_revision += 1
-        return value
-
-
-class ProductTxn:
-    def __init__(self, store: ProductStore, session_ids: frozenset[int]) -> None:
-        self._store = store
-        self._session_ids = session_ids
-        self._staged: dict[int, ProductRecord] = {}
-        self._bases: dict[int, int] = {}
-        self._prior: dict[int, ProductRecord | None] = {}
-        self._published: dict[int, int] = {}
-        self._lock_held = False
-        self._closed = False
-
-    def view(self) -> ProductView:
-        self._require_open()
-        return ProductView(self)
-
-    def stage(self, record: ProductRecord) -> None:
-        self._require_open()
-        if record.session_id not in self._session_ids:
-            raise ValueError("product belongs to a session outside this step")
-        if record.handle not in self._bases:
-            with self._store._lock:
-                self._bases[record.handle] = self._store._revisions.get(record.handle, 0)
-        self._staged[record.handle] = record
-
-    def read(self, handle: int) -> ProductRecord | None:
-        self._require_open()
-        if int(handle) in self._staged:
-            return self._staged[int(handle)]
-        return self._store.get(int(handle))
-
-    def prepare(self) -> None:
-        self._require_open()
-        with self._store._lock:
-            self._validate()
-
-    def publish(self) -> None:
-        self._require_open()
-        self._store._lock.acquire()
-        self._lock_held = True
-        try:
-            self._validate()
-            for handle, record in self._staged.items():
-                self._prior[handle] = self._store._records.get(handle)
-                self._store._records[handle] = record
-                self._store._session_handles.setdefault(record.session_id, set()).add(handle)
-                revision = self._store._revision()
-                self._store._revisions[handle] = revision
-                self._published[handle] = revision
-        except BaseException:
-            self._lock_held = False
-            self._store._lock.release()
-            raise
-
-    def rollback(self) -> None:
-        if self._closed:
-            return
-        try:
-            if self._published:
-                with self._store._lock:
-                    for handle, revision in self._published.items():
-                        if self._store._revisions.get(handle) != revision:
-                            raise RuntimeError("published product changed before rollback")
-                        record = self._store._records.get(handle)
-                        if record is not None:
-                            self._store._session_handles.get(record.session_id, set()).discard(
-                                handle
-                            )
-                        prior = self._prior[handle]
-                        if prior is None:
-                            self._store._records.pop(handle, None)
-                        else:
-                            self._store._records[handle] = prior
-                            self._store._session_handles.setdefault(prior.session_id, set()).add(
-                                handle
-                            )
-                        self._store._revisions[handle] = self._store._revision()
-        finally:
-            self._release()
-
-    def finalize(self) -> None:
-        self._require_open()
-        self._release()
-
-    def _validate(self) -> None:
-        for handle, revision in self._bases.items():
-            if self._store._revisions.get(handle, 0) != revision:
-                raise RuntimeError("product changed during step execution")
-        projected = dict(self._store._records)
-        projected.update(self._staged)
-        used = sum(
-            isinstance(record.payload, (VisionFeatureProduct, LatentFeatureProduct))
-            for record in projected.values()
-        )
-        if used > self._store.encoder_cache_budget:
-            raise RuntimeError(
-                "encoder-output residency exceeds capacity "
-                f"({used}>{self._store.encoder_cache_budget})"
-            )
-
-    def _release(self) -> None:
-        if self._lock_held:
-            self._lock_held = False
-            self._store._lock.release()
-        self._closed = True
-
-    def _require_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("product transaction is closed")
-
-
-class ProductView:
-    def __init__(self, transaction: ProductTxn) -> None:
-        self._transaction = transaction
-
-    def put(self, record: ProductRecord) -> None:
-        self._transaction.stage(record)
-
-    def get(self, handle: int) -> ProductRecord | None:
-        return self._transaction.read(handle)
-
-    def require(self, handle: int) -> ProductRecord:
-        record = self.get(handle)
-        if record is None:
-            raise KeyError(f"unknown product handle {handle}")
-        return record
-
-
-def _snapshot_payload(payload: ProductPayload) -> ProductPayload:
-    if isinstance(payload, VisionFeatureProduct):
-        return replace(
-            payload,
-            features=payload.features.detach().cpu().contiguous(),
-        )
-    if isinstance(payload, LatentFeatureProduct):
-        return replace(payload, latent=payload.latent.detach().cpu().contiguous())
-    if isinstance(payload, LogitsProduct):
-        return replace(payload, logits=payload.logits.detach().cpu().contiguous())
-    if isinstance(payload, ImageTensorProduct):
-        return replace(payload, image=payload.image.detach().cpu().contiguous())
-    return payload
-
-
 __all__ = [
     "DeviceProductRead",
-    "DeviceProductTable",
-    "EncodedImageProduct",
-    "FrameCollectionProduct",
+    "DeviceProductSnapshot",
+    "DeviceProducts",
+    "DeviceProductScalarBatch",
+    "DeviceProductBindingBatch",
+    "DeviceProductMetadata",
+    "DeviceProductWrite",
     "ImageRange",
-    "ImageTensorProduct",
-    "LatentFeatureProduct",
-    "LogitsProduct",
-    "ProductRecord",
-    "ProductPayload",
-    "ProductStore",
-    "ProductTxn",
-    "ProductView",
-    "VisionFeatureProduct",
+    "device_product_capacity_bytes",
+    "device_product_storage",
 ]

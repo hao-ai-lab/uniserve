@@ -2784,6 +2784,7 @@ pub struct WorkerMetrics {
     pub control_ok: BTreeMap<String, u64>,
     pub control_err: BTreeMap<String, u64>,
     pub error_counts: BTreeMap<String, u64>,
+    pub replay_counts: BTreeMap<String, u64>,
     pub cuda_graph_captures: u64,
     pub cuda_graph_replays: u64,
     pub cuda_graph_misses: u64,

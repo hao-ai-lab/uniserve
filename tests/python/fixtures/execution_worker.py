@@ -24,12 +24,18 @@ def execution_worker(
     execution: ExecutionConfig | None = None,
     max_batch_tokens: int = 8192,
     max_request_pool_size: int = 128,
+    max_batch_operations: int | None = None,
 ) -> ModelWorker:
     ready = StubModel() if model is None else model
     deployment = replace(
         stub_deployment(block_size, max_batch_tokens=max_batch_tokens),
         device=device,
         max_request_pool_size=max_request_pool_size,
+        **(
+            {}
+            if max_batch_operations is None
+            else {"max_batch_operations": int(max_batch_operations)}
+        ),
     )
     worker = ModelWorker(
         ready,

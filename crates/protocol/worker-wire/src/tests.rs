@@ -1334,6 +1334,7 @@ fn full_metrics() -> WorkerMetrics {
         control_ok: map("control_ok", 59),
         control_err: map("control_err", 61),
         error_counts: map("error_counts", 63),
+        replay_counts: map("replay_counts", 75),
         cuda_graph_captures: 65,
         cuda_graph_replays: 66,
         cuda_graph_misses: 67,

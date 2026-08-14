@@ -536,6 +536,7 @@ table WorkerMetrics {
   control_ok:[StringU64Pair];
   control_err:[StringU64Pair];
   error_counts:[StringU64Pair];
+  replay_counts:[StringU64Pair];
   cuda_graph_captures:ulong;
   cuda_graph_replays:ulong;
   cuda_graph_misses:ulong;

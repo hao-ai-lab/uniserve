@@ -55,6 +55,7 @@ class MetricsService:
         self.control_ok: dict[str, int] = defaultdict(int)
         self.control_err: dict[str, int] = defaultdict(int)
         self.error_counts: dict[str, int] = defaultdict(int)
+        self.replay_counts: dict[str, int] = defaultdict(int)
         self.pipeline_ns: dict[str, int] = defaultdict(int)
         self.pipeline_counts: dict[str, int] = defaultdict(int)
         self.forward: dict[str, int | dict[str, int]] = {
@@ -81,6 +82,9 @@ class MetricsService:
 
     def record_error(self, code: str) -> None:
         self.error_counts[str(code)] += 1
+
+    def record_replay(self, outcome: str) -> None:
+        self.replay_counts[str(outcome)] += 1
 
     def record_pipeline(self, stage: str, duration_ns: int) -> None:
         self.pipeline_ns[str(stage)] += max(0, int(duration_ns))
@@ -132,6 +136,7 @@ class MetricsService:
             "control_ok": dict(self.control_ok),
             "control_err": dict(self.control_err),
             "error_counts": dict(self.error_counts),
+            "replay_counts": dict(self.replay_counts),
             "forbidden_sync_detections": sync_detector().detections,
             **graph_scalars,
             "cuda_graph_runtime_mode_counts": dict(runtime_modes),

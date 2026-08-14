@@ -16,12 +16,12 @@ from uniserve_worker.execution.executor import (
     _semantic_sampling_draws,
 )
 from uniserve_worker.foundation.sync_detector import SyncDetector
-from uniserve_worker.runtime.completion_store import CompletionArena
 from uniserve_worker.runtime.rng import (
     DRAW_LAYOUT_TARGET,
     sampling_key,
     sampling_uniform,
 )
+from uniserve_worker.server.completion import CompletionArena
 
 pytestmark = [
     pytest.mark.integration,
@@ -152,33 +152,6 @@ def test_supported_device_sampling_returns_before_any_host_scalar_observation(
     assert entries[0][0] == tokens[2]
     for row in range(len(tasks)):
         lease.observe(row, lease.generation)
-
-
-def test_top_k_fast_path_and_logprob_path_use_the_same_inverse_cdf_order() -> None:
-    device = torch.device("cuda:0")
-    logits = torch.tensor([0.2, 2.4, 0.7, 1.5, -0.1, 1.9], device=device)
-    fast = _task(
-        logits,
-        SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=71),
-        17,
-    )
-    with_logprobs = _task(
-        logits,
-        SamplingParams(
-            temperature=0.8,
-            top_k=4,
-            top_p=0.9,
-            seed=71,
-            return_logprobs=True,
-            n_logprobs=2,
-        ),
-        17,
-    )
-
-    fast_result = _sample_task_batch((fast,))[0]
-    logprob_result = _sample_task_batch((with_logprobs,))[0]
-
-    assert int(fast_result.token_id) == int(logprob_result.token_id)
 
 
 def test_sync_detector_observes_a_real_synchronizing_operation() -> None:

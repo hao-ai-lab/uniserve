@@ -6,7 +6,7 @@ import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import Protocol, TypeAlias, cast
+from typing import TypeAlias, cast
 
 from ..batch import (
     Admission,
@@ -25,28 +25,6 @@ from ..batch import (
 )
 from ..foundation.errors import invalid_descriptor
 
-
-class SnapshotStore(Protocol):
-    def snapshot_requests(self, request_ids: set[int]) -> object: ...
-
-    def restore_requests(self, request_ids: set[int], snapshot: object) -> None: ...
-
-
-class StoreTxn(Protocol):
-    def prepare(self) -> None: ...
-
-    def publish(self) -> None: ...
-
-    def rollback(self) -> None: ...
-
-    def finalize(self) -> None: ...
-
-
-class ScratchStore(Protocol):
-    def begin_step(self, request_ids: set[int]) -> StoreTxn: ...
-
-
-TransactionalStore: TypeAlias = SnapshotStore | ScratchStore
 MAX_SESSION_HISTORY_POINTS = 262_144
 
 
@@ -137,8 +115,7 @@ class RequestSession:
     declared_parents: dict[int, VersionRef] = field(default_factory=dict)
     terminal_cutoff: VersionRef | None = None
     latent_product: ProductRef | None = None
-    product_handles: set[int] = field(default_factory=set)
-    prompt_logits_handle: int | None = None
+    prompt_logits_ready: bool = False
     logical_position: int = 0
     flow_step: int = 0
     rng_counter: int = 0
@@ -597,13 +574,11 @@ class SessionStore:
         self,
         step_id: int,
         operations: tuple[Operation, ...],
-        stores: Sequence[TransactionalStore],
     ) -> StepTxn:
         return StepTxn(
             sessions=self,
             step_id=step_id,
             operations=operations,
-            stores=stores,
         )
 
     def drop(self, session_id: int) -> None:
@@ -707,23 +682,6 @@ class SessionStore:
             for lock in reversed(locks):
                 lock.release()
 
-    def discard_product_handles(self, handles: set[int]) -> set[int]:
-        requested = {int(value) for value in handles}
-        affected: set[int] = set()
-        for session_id in self.session_ids():
-            lock = self._lock(session_id)
-            with lock:
-                session = self._sessions.get(session_id)
-                if session is None:
-                    continue
-                removed = session.product_handles & requested
-                if removed:
-                    session.product_handles.difference_update(removed)
-                    if session.prompt_logits_handle in removed:
-                        session.prompt_logits_handle = None
-                    affected.add(session_id)
-        return affected
-
     def _lock(self, session_id: int) -> RLock:
         with self._index_lock:
             return self._locks.setdefault(int(session_id), RLock())
@@ -750,8 +708,7 @@ _SessionValues: TypeAlias = tuple[
     int,
     str,
     ProductRef | None,
-    set[int],
-    int | None,
+    bool,
     int,
     int,
     int,
@@ -761,14 +718,12 @@ _SessionValues: TypeAlias = tuple[
 
 
 class StepTxn:
-    """Atomic register-before-submit scope across every touched authority.
+    """Atomic register-before-submit scope for request lineage state.
 
-    Registration binds and validates before the operation is runnable: the
-    operations' declared parents are checked against the applicable committed
-    or device-resolved state and every touched store opens its transaction. Only
-    after device work resolves does :meth:`commit` advance each request's
-    resolved point. A rejection at any point leaves no registered product,
-    storage entry, or resolved version.
+    Registration validates declared parents before an operation is runnable.
+    Device work publishes through its concrete resource owner, then
+    :meth:`commit` advances the corresponding request lineage. A rejected step
+    leaves no resolved version.
     """
 
     def __init__(
@@ -777,7 +732,6 @@ class StepTxn:
         sessions: SessionStore,
         step_id: int,
         operations: tuple[Operation, ...],
-        stores: Sequence[TransactionalStore],
     ) -> None:
         self.sessions = sessions
         self.step_id = int(step_id)
@@ -799,28 +753,11 @@ class StepTxn:
         self._snapshots = {
             session_id: self._snapshot(session_id) for session_id in self.request_ids
         }
-        self._store_snapshots: list[tuple[SnapshotStore, object]] = []
-        self._store_transactions: list[tuple[ScratchStore, StoreTxn]] = []
         self._history_undo: dict[
             tuple[int, str, object],
             tuple[dict[object, object], object, bool, object | None],
         ] = {}
-        for store in stores:
-            begin = getattr(store, "begin_step", None)
-            if callable(begin):
-                scratch = cast(ScratchStore, store)
-                self._store_transactions.append((scratch, begin(self.request_ids)))
-            else:
-                typed = cast_snapshot_store(store)
-                self._store_snapshots.append((typed, typed.snapshot_requests(self.request_ids)))
         self._closed = False
-
-    def store_transaction(self, store: ScratchStore) -> StoreTxn:
-        self._require_open()
-        for candidate, transaction in self._store_transactions:
-            if candidate is store:
-                return transaction
-        raise RuntimeError("store is not part of this step transaction")
 
     def aligned_sessions(self) -> tuple[RequestSession, ...]:
         """Return sessions in the transaction's canonical operation order."""
@@ -876,8 +813,6 @@ class StepTxn:
                     f"session {operation.request_key.session_id} changed outside its transaction"
                 )
         try:
-            for _store, transaction in self._store_transactions:
-                transaction.prepare()
             for operation, session in zip(self.operations, operation_sessions, strict=True):
                 parent = operation.parent
                 selected = committed[operation.request_key.session_id]
@@ -951,12 +886,8 @@ class StepTxn:
                 session.declared_parents[int(operation.op_id)] = parent
                 session.last_op_id = operation.op_id
                 session.last_step_id = self.step_id
-            for _store, transaction in self._store_transactions:
-                transaction.publish()
             if publish is not None:
                 publish()
-            for _store, transaction in self._store_transactions:
-                transaction.finalize()
         except BaseException:
             self.rollback()
             raise
@@ -966,8 +897,6 @@ class StepTxn:
         if self._closed:
             return
         try:
-            for _store, transaction in reversed(self._store_transactions):
-                transaction.rollback()
             for mapping, key, existed, value in reversed(tuple(self._history_undo.values())):
                 if existed:
                     mapping[key] = value
@@ -983,17 +912,13 @@ class StepTxn:
                         session.resolved_op_id,
                         session.resolved_digest,
                         session.latent_product,
-                        product_handles,
-                        session.prompt_logits_handle,
+                        session.prompt_logits_ready,
                         session.logical_position,
                         session.flow_step,
                         session.rng_counter,
                         session.last_op_id,
                         session.last_step_id,
                     ) = session_snapshot.values
-                    session.product_handles = product_handles
-            for store, store_snapshot in reversed(self._store_snapshots):
-                store.restore_requests(self.request_ids, store_snapshot)
         finally:
             self._close()
 
@@ -1009,8 +934,7 @@ class StepTxn:
                     session.resolved_op_id,
                     session.resolved_digest,
                     session.latent_product,
-                    set(session.product_handles),
-                    session.prompt_logits_handle,
+                    session.prompt_logits_ready,
                     session.logical_position,
                     session.flow_step,
                     session.rng_counter,
@@ -1043,16 +967,10 @@ class StepTxn:
         if self._closed:
             raise RuntimeError("step transaction is closed")
 
-
-def cast_snapshot_store(value: object) -> SnapshotStore:
-    return cast(SnapshotStore, value)
-
-
 __all__ = [
     "MAX_SESSION_HISTORY_POINTS",
     "RequestSession",
     "ResolvedRuntimeState",
     "SessionStore",
     "StepTxn",
-    "TransactionalStore",
 ]
