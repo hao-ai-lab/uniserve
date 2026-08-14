@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
@@ -31,20 +32,32 @@ from ..batch import (
     ProductRef,
     RecoveryPlacement,
     RequestKey,
+    SamplingOwnership,
     SnapshotRef,
     StorageClass,
     WorkVariant,
 )
+from ..bootstrap.capabilities import resolve_capabilities
+from ..bootstrap.capacity import (
+    model_arena_capacity,
+    operation_window,
+    system_arena_capacity,
+)
 from ..capabilities import (
     GraphBucketCapability,
     LaneCapabilities,
+    RankInfo,
     RequestKind,
+    ResourceClass,
     WorkerCapabilities,
+    configured_work_variants,
 )
-from ..execution import ModelExecutor, ModelRunner
+from ..execution import ModelRunner, PreparedExecution
 from ..execution.cuda_graph import CudaGraphRunner
 from ..execution.forward_batch import AttentionSelection
-from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..execution.model_invocation import _ModelInvocation
+from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
+from ..foundation.errors import capability_mismatch, invalid_descriptor, unsupported_control
 from ..foundation.runtime_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
 from ..foundation.sizing import ceil_div, device_total_bytes
 from ..foundation.sync_detector import (
@@ -58,28 +71,25 @@ from ..models.identity import ModelIdentity, architecture_identity
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..nn.mesh import DeviceMesh
-from ..runtime.arena_capacity import model_arena_capacity
+from ..recovery.snapshot import SnapshotRecovery
 from ..runtime.cache_pool import CachePool
-from ..runtime.capabilities import resolve_capabilities
-from ..runtime.cpu_tasks import BoundedCpuTaskPool
 from ..runtime.device_events import DeviceEventPool
 from ..runtime.device_products import DeviceProducts
 from ..runtime.encoder_cache import EncoderCache
-from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..runtime.latent_pool import LatentPool
-from ..runtime.mesh_store import MeshStore
-from ..runtime.mover import Mover
-from ..runtime.request_session import SessionStore
 from ..runtime.runtime_states import RuntimeStates
-from ..runtime.snapshot_store import SnapshotProvider
 from ..server.completion import (
     CompletionArena,
     completion_report_ready,
     completion_word_capacity,
     finalize_completion_report,
 )
+from ..server.cpu_tasks import BoundedCpuTaskPool
+from ..server.request_state import RequestTable
+from ..transfer.connector import TransferConnector
 
 logger = logging.getLogger(__name__)
+_SYSTEM_OPERATION_CAPACITY = 1024
 
 
 def _has_decode_flow_partition(lanes: tuple[LaneConfig, ...]) -> bool:
@@ -208,8 +218,227 @@ def _warmup_token_outputs(
     )
 
 
-class ModelWorker:
-    """Own one ready model and all system authorities around its raw forward."""
+class Worker:
+    """Own one configured process and its sole model execution root."""
+
+    model: ExecutionModel | None
+    deployment: WorkerDeployment | None
+    weights: WeightSet | None
+    runtime_states: RuntimeStates | None
+    latent_pool: LatentPool | None
+    snapshot_recovery: SnapshotRecovery | None
+    _warmup_kv_pages: dict[tuple[RequestKey, int], list[int]]
+    _warmup_scratch_pages: dict[RequestKey, list[int]]
+    _warmup_latent_pages: dict[RequestKey, list[int]]
+
+    @classmethod
+    def system(
+        cls,
+        *,
+        allowed_work_variants: frozenset[WorkVariant],
+        block_size: int,
+        max_batch_tokens: int,
+        transfer_backend: str,
+        pipeline_depth: int,
+        completion_payload_bytes: int,
+        device: str,
+        snapshot_dir: str | None = None,
+    ) -> Worker:
+        worker = cls.__new__(cls)
+        worker._initialize_system(
+            allowed_work_variants=allowed_work_variants,
+            block_size=block_size,
+            max_batch_tokens=max_batch_tokens,
+            transfer_backend=transfer_backend,
+            pipeline_depth=pipeline_depth,
+            completion_payload_bytes=completion_payload_bytes,
+            device=device,
+            snapshot_dir=snapshot_dir,
+        )
+        return worker
+
+    def _initialize_system(
+        self,
+        *,
+        allowed_work_variants: frozenset[WorkVariant],
+        block_size: int,
+        max_batch_tokens: int,
+        transfer_backend: str,
+        pipeline_depth: int,
+        completion_payload_bytes: int,
+        device: str,
+        snapshot_dir: str | None,
+    ) -> None:
+        supported = frozenset({WorkVariant.MATERIALIZE})
+        if not allowed_work_variants <= supported:
+            raise ValueError("system execution received a model-backed work variant")
+        if not allowed_work_variants:
+            raise capability_mismatch("worker implements none of the requested work variants")
+        if int(pipeline_depth) <= 0:
+            raise capability_mismatch("worker pipeline depth must be positive")
+        if int(completion_payload_bytes) < 1:
+            raise ValueError("completion payload capacity must be positive")
+        controls: tuple[RequestKind, ...] = (
+            RequestKind.DROP_SESSION,
+            RequestKind.RELEASE_PRODUCTS,
+        )
+        if snapshot_dir is not None:
+            controls = (
+                *controls,
+                RequestKind.SNAPSHOT_SESSION,
+                RequestKind.RESTORE_SESSION,
+            )
+        advertised_work = configured_work_variants(
+            tuple(value for value in WorkVariant if value in allowed_work_variants)
+        )
+        window = operation_window(int(pipeline_depth), _SYSTEM_OPERATION_CAPACITY)
+        self._capabilities = WorkerCapabilities(
+            block_size=int(block_size),
+            num_blocks=2,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            scratch_capacity_tokens=0,
+            supported_work=advertised_work,
+            latent_page_units=0,
+            num_latent_pages=0,
+            latent_width=0,
+            latent_dtype="",
+            latent_downsample=1,
+            max_vae_grid_tokens=0,
+            max_vit_grid_tokens=0,
+            max_latent_feature_bytes=0,
+            max_vision_feature_bytes=0,
+            commit_marker_tokens=2,
+            gen_rope_advance=2,
+            max_cfg_branches=1,
+            bytes_per_token=1,
+            groups=(),
+            kv_dtype="bfloat16",
+            model_dtype="bfloat16",
+            attention_backend="auto",
+            quantization=None,
+            rank=RankInfo(),
+            pipeline_depth=int(pipeline_depth),
+            encoder_cache_budget=0,
+            supported_controls=controls,
+            max_batch_operations=_SYSTEM_OPERATION_CAPACITY,
+            max_batch_tokens=int(max_batch_tokens),
+            max_request_pool_size=_SYSTEM_OPERATION_CAPACITY,
+            max_unresolved_window=window,
+            incremental_kv_publication=True,
+            tensorized_mixed=False,
+            sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
+            resource_classes=(ResourceClass.ENCODER_OUTPUT,),
+            model_identity="",
+            weight_digest="",
+        )
+        arena = system_arena_capacity(
+            pipeline_depth=int(pipeline_depth),
+            max_operations=_SYSTEM_OPERATION_CAPACITY,
+            completion_payload_bytes=int(completion_payload_bytes),
+        )
+        self._system_only = True
+        self.model = None
+        self.deployment = None
+        self.weights = None
+        self.weight_digest = ""
+        self._effective_work_variants = allowed_work_variants
+        self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
+        self.cache_pool = CachePool(
+            num_layers=1,
+            request_pages=int(self._capabilities.num_blocks),
+            scratch_pages=0,
+            page_size=int(self._capabilities.block_size),
+            num_kv_heads=1,
+            head_dim=1,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        self.latent_pool = None
+        self.runtime_states = None
+        self.device_events = DeviceEventPool()
+        self.device_products = DeviceProducts(
+            capacity=arena.device_products,
+            byte_capacity=arena.device_product_bytes,
+            event_pool=self.device_events,
+        )
+        self.encoder_cache = EncoderCache(
+            entry_capacity=0,
+            max_entry_bytes=1,
+            devices=(device,),
+            event_pool=self.device_events,
+        )
+        completion_words = completion_word_capacity(
+            int(self._capabilities.max_batch_operations),
+            int(completion_payload_bytes),
+        )
+        self.completion_arena = CompletionArena(
+            depth=int(pipeline_depth) * int(self._capabilities.max_batch_operations),
+            token_capacity=completion_words,
+            total_token_capacity=int(pipeline_depth) * completion_words,
+            devices=(device,),
+            event_pool=self.device_events,
+        )
+        self.cpu_tasks = BoundedCpuTaskPool(
+            capacity=int(arena.cpu_tasks),
+            workers=min(4, int(arena.cpu_tasks)),
+        )
+        self.transfers = TransferConnector(
+            backend=transfer_backend,
+            byte_capacity=arena.transfer_bytes,
+            ticket_capacity=arena.transfer_tickets,
+            cross_process=True,
+        )
+        self.trace = ExecutionTrace(hashlib.sha256(b"uniserve-system-worker").hexdigest())
+        self.runner = ModelRunner(
+            model=None,
+            deployment=None,
+            model_invocation=None,
+            attention=None,
+            requests=self.requests,
+            runtime_states=None,
+            cache_pool=self.cache_pool,
+            latent_pool=None,
+            device_products=self.device_products,
+            encoder_cache=self.encoder_cache,
+            completion_arena=self.completion_arena,
+            cpu_tasks=self.cpu_tasks,
+            weights=None,
+            mesh=None,
+            transport=self.transfers.transport,
+            tokenizer=None,
+            architecture_digest=None,
+            weight_digest=None,
+            allowed_work_variants=allowed_work_variants,
+            trace=self.trace,
+        )
+        self._warmup_kv_pages = {}
+        self._warmup_scratch_pages = {}
+        self._warmup_latent_pages = {}
+        self._warmup_step_id = 0
+        self.snapshot_recovery = None
+        if snapshot_dir is not None:
+            caps = self._capabilities
+            self.snapshot_recovery = SnapshotRecovery(
+                snapshot_dir,
+                model_identity=self.trace.candidate_digest,
+                weight_digest="",
+                topology={
+                    "rank": caps.rank.to_wire(),
+                    "supported_work": [value.value for value in caps.supported_work],
+                    "block_size": caps.block_size,
+                },
+                device=device,
+                requests=self.requests,
+                cache_pool=self.cache_pool,
+                cache_publications=self.runner.cache_publications,
+                latent_pool=None,
+                device_products=self.device_products,
+                encoder_cache=self.encoder_cache,
+                runtime_states=None,
+                transport=self.transfers.transport,
+            )
 
     def __init__(
         self,
@@ -236,10 +465,12 @@ class ModelWorker:
             )
         if not isinstance(deployment, WorkerDeployment):
             raise capability_mismatch("model worker requires a worker deployment")
+        self._system_only = False
         self.model = model
         self.deployment = deployment
-        self.weights = WeightSet.from_module(model, digest=weight_digest)
-        self.weight_digest = self.weights.digest
+        weights = WeightSet.from_module(model, digest=weight_digest)
+        self.weights = weights
+        self.weight_digest = weights.digest
         self.identity = ModelIdentity(
             architecture=model.architecture,
             architecture_digest=architecture_digest
@@ -321,7 +552,7 @@ class ModelWorker:
                 else None
             ),
         )
-        self.sessions = SessionStore()
+        self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
         torch_dtype = getattr(
             torch,
             str(deployment.model_dtype).removeprefix("torch."),
@@ -402,10 +633,10 @@ class ModelWorker:
             capacity=int(arena.cpu_tasks),
             workers=min(4, int(arena.cpu_tasks)),
         )
-        self.mover = Mover(
-            transfer_backend=transfer_backend,
-            transfer_byte_capacity=arena.transfer_bytes,
-            transfer_ticket_capacity=arena.transfer_tickets,
+        self.transfers = TransferConnector(
+            backend=transfer_backend,
+            byte_capacity=arena.transfer_bytes,
+            ticket_capacity=arena.transfer_tickets,
             cross_process=bool(cross_process),
         )
         max_rows = min(
@@ -645,7 +876,7 @@ class ModelWorker:
             if deployment.generation_device is None
             else (deployment.device, deployment.generation_device)
         )
-        self.runner = ModelRunner(
+        model_invocation = _ModelInvocation(
             model,
             None,
             self.trace,
@@ -662,7 +893,7 @@ class ModelWorker:
         if execution.lanes:
             lane_by_id = {lane.lane_id: lane for lane in execution.lanes}
             lane_capabilities: list[LaneCapabilities] = []
-            for partition in self.runner.partitions:
+            for partition in model_invocation.partitions:
                 if partition.lane_id is None:
                     continue
                 lane = lane_by_id[partition.lane_id]
@@ -757,12 +988,12 @@ class ModelWorker:
                     )
                 )
             self._capabilities = replace(self._capabilities, lanes=tuple(lane_capabilities))
-        self.executor = ModelExecutor(
+        self.runner = ModelRunner(
             model=model,
             deployment=deployment,
-            runner=self.runner,
+            model_invocation=model_invocation,
             attention=attention,
-            sessions=self.sessions,
+            requests=self.requests,
             runtime_states=self.runtime_states,
             cache_pool=self.cache_pool,
             latent_pool=self.latent_pool,
@@ -771,8 +1002,8 @@ class ModelWorker:
             completion_arena=self.completion_arena,
             cpu_tasks=self.cpu_tasks,
             weights=self.weights,
-            mesh=MeshStore(mesh),
-            transport=self.mover.transport,
+            mesh=mesh,
+            transport=self.transfers.transport,
             tokenizer=tokenizer,
             architecture_digest=self.identity.architecture_digest,
             weight_digest=self.weight_digest,
@@ -780,14 +1011,14 @@ class ModelWorker:
             trace=self.trace,
             defer_sampling=defer_sampling,
         )
-        self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
-        self._warmup_scratch_pages: dict[RequestKey, list[int]] = {}
-        self._warmup_latent_pages: dict[RequestKey, list[int]] = {}
+        self._warmup_kv_pages = {}
+        self._warmup_scratch_pages = {}
+        self._warmup_latent_pages = {}
         self._warmup_step_id = 0
-        self.snapshot_provider: SnapshotProvider | None = None
+        self.snapshot_recovery = None
         if snapshot_dir is not None:
             caps = self._capabilities
-            self.snapshot_provider = SnapshotProvider(
+            self.snapshot_recovery = SnapshotRecovery(
                 snapshot_dir,
                 model_identity=self.identity.architecture_digest,
                 weight_digest=self.weight_digest,
@@ -805,44 +1036,54 @@ class ModelWorker:
                     "latent_downsample": caps.latent_downsample,
                 },
                 device=deployment.device,
-                sessions=self.sessions,
+                requests=self.requests,
                 cache_pool=self.cache_pool,
-                cache_publications=self.executor.cache_publications,
+                cache_publications=self.runner.cache_publications,
                 latent_pool=self.latent_pool,
                 device_products=self.device_products,
                 encoder_cache=self.encoder_cache,
                 runtime_states=self.runtime_states,
-                transport=self.mover.transport,
+                transport=self.transfers.transport,
             )
 
     @property
     def capabilities(self) -> WorkerCapabilities:
         return self._capabilities
 
+    def _require_model(self) -> ExecutionModel:
+        model = self.model
+        if model is None:
+            raise RuntimeError("system-only worker has no model")
+        return model
+
+    def _require_deployment(self) -> WorkerDeployment:
+        deployment = self.deployment
+        if deployment is None:
+            raise RuntimeError("system-only worker has no model deployment")
+        return deployment
+
     def _decode_context_blocks(self) -> int:
-        max_tokens = int(self.model.text_max_tokens)
+        model = self._require_model()
+        deployment = self._require_deployment()
+        max_tokens = int(model.text_max_tokens)
         if max_tokens < 1:
             return 0
-        blocks = (max_tokens + int(self.deployment.block_size) - 1) // int(
-            self.deployment.block_size
-        )
+        blocks = (max_tokens + int(deployment.block_size) - 1) // int(deployment.block_size)
         return min(blocks, max(0, int(self.cache_pool.request_pages) - 1))
 
     def execute(self, batch: Batch) -> CompletionReport:
         with self._sync_guard("execute"):
-            return self.executor.execute(batch)
+            return self.runner.execute(batch)
 
     def prepare_execute(self, batch: Batch) -> object | None:
         with self._sync_guard("prepare"):
-            return self.executor.prepare(batch)
+            return self.runner.prepare(batch)
 
     def execute_prepared(self, prepared: object) -> CompletionReport:
-        from ..execution.executor import PreparedExecution
-
         if not isinstance(prepared, PreparedExecution):
             raise invalid_descriptor("prepared execution has an invalid type")
         with self._sync_guard("execute_prepared"):
-            return self.executor.execute_prepared(prepared)
+            return self.runner.execute_prepared(prepared)
 
     def _sync_guard(self, label: str):
         """Run a steady-state execute region under the forbidden-sync detector.
@@ -860,7 +1101,7 @@ class ModelWorker:
         *,
         retain_device_outputs: bool = False,
     ) -> CompletionReport:
-        report = self.executor.execute_startup(batch)
+        report = self.runner.execute_startup(batch)
         while not completion_report_ready(report):
             time.sleep(0.00005)
         finalized = finalize_completion_report(report)
@@ -903,7 +1144,7 @@ class ModelWorker:
         kv_branch_placements: dict[tuple[RequestKey, int], tuple[KvBranchPlacement, ...]] = {}
         latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
         for operation in operations:
-            session = self.sessions.peek(int(operation.request_key.session_id))
+            session = self.requests.peek(int(operation.request_key.session_id))
             admission = admissions_by_key.get(operation.request_key)
             if session is None and admission is None:
                 raise invalid_descriptor("warmup operation has no request-pool binding")
@@ -932,7 +1173,7 @@ class ModelWorker:
                 raise invalid_descriptor("warmup KV admission requires an empty prefix")
             visible = 0
             if session is not None:
-                runtime = self.executor._parent_runtime(operation, session)
+                runtime = self.runner.parent_runtime(operation, session)
                 visible = int(runtime.kv_visible_len)
             input_length = (
                 int(operation.bounds.max_tokens)
@@ -1005,7 +1246,7 @@ class ModelWorker:
                 raise invalid_descriptor("warmup latent placement exceeds resident capacity")
             page_table.extend(allocated)
             occupied_latent_pages.update(allocated)
-            session = self.sessions.peek(int(operation.request_key.session_id))
+            session = self.requests.peek(int(operation.request_key.session_id))
             start_step = 0 if session is None else int(session.flow_step)
             latent_placements[(operation.request_key, operation.op_id)] = LatentPlacement(
                 request_key=operation.request_key,
@@ -1043,9 +1284,9 @@ class ModelWorker:
         height: int,
         width: int,
     ) -> tuple[KvBranchPlacement, ...]:
-        session = self.sessions.get(operation.request_key.session_id)
+        session = self.requests.get(operation.request_key.session_id)
         image = session.image
-        generation = self.model.generation
+        generation = self._require_model().generation
         if image is None or generation is None:
             raise invalid_descriptor("generation warmup has no admitted image runtime")
         guide = build_flow_cfg_plan(
@@ -1056,7 +1297,7 @@ class ModelWorker:
             renorm_min=float(image.cfg_renorm_min),
             use_cfg=True,
         )
-        runtime = self.executor._parent_runtime(operation, session)
+        runtime = self.runner.parent_runtime(operation, session)
         query = generation.physical_tokens(height, width)
         image_prompt = image.image_prompts[0] if image.image_prompts else ""
         prefix_lengths = []
@@ -1066,7 +1307,7 @@ class ModelWorker:
                 image_prompt=image_prompt,
                 negative_prompt=image.negative_prompt,
                 negative_token_ids=session.negative_token_ids,
-                tokenizer=self.executor.tokenizer,
+                tokenizer=self.runner.tokenizer,
             )
             prefix_lengths.append(int(runtime.kv_visible_len) if copy_conditioning else len(prefix))
         widths = tuple(
@@ -1123,16 +1364,19 @@ class ModelWorker:
         private collective identities are retired.
         """
 
+        if self._system_only:
+            self.runner.complete_startup()
+            return
+
         import torch
 
-        if torch.device(self.deployment.device).type == "cuda":
+        if torch.device(self._require_deployment().device).type == "cuda":
             self._warmup_sequence()
             logger.info("completed token CUDA graph warmup")
             self._warmup_flow()
             logger.info("completed flow CUDA graph warmup")
         self.runner.complete_startup()
         logger.info("completed execution partition startup verification")
-        self.executor.complete_startup()
 
     def _warmup_image_geometry(self) -> tuple[int, int]:
         """Largest square image whose latent grid fits the declared capacity."""
@@ -1187,7 +1431,7 @@ class ModelWorker:
         if WorkVariant.TOKEN_EXTEND not in variants:
             return
         pool = self.cache_pool
-        if self.sessions.session_ids():
+        if self.requests.request_ids():
             return
         if self._execution.cuda_graph and self._execution.prefill_cuda_graph:
             self._warmup_prefill_graphs()
@@ -1327,7 +1571,7 @@ class ModelWorker:
                     )
                     predecessors.update(zip(selected, operations, strict=True))
         finally:
-            device = torch.device(self.deployment.device)
+            device = torch.device(self._require_deployment().device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             for sid in session_ids:
@@ -1361,9 +1605,9 @@ class ModelWorker:
         )
 
         pool = self.cache_pool
-        if self.sessions.session_ids():
+        if self.requests.request_ids():
             return
-        max_route_tokens = int(self.model.text_max_tokens)
+        max_route_tokens = int(self._require_model().text_max_tokens)
         capacity = min(
             max_route_tokens,
             max(0, int(pool.request_pages) - 1) * int(pool.block_size),
@@ -1471,14 +1715,13 @@ class ModelWorker:
             encode_token_product_bytes,
         )
 
+        generation = self._require_model().generation
         if not {
             WorkVariant.GEN_TRANSITION,
             WorkVariant.GEN_FLOW,
-        }.issubset(self._effective_work_variants) or not isinstance(
-            self.model.generation, GenerationPipeline
-        ):
+        }.issubset(self._effective_work_variants) or not isinstance(generation, GenerationPipeline):
             return
-        if self.sessions.session_ids():
+        if self.requests.request_ids():
             return
         configured: tuple[tuple[int, int, int], ...]
         if not self._execution.cuda_graph:
@@ -1640,7 +1883,7 @@ class ModelWorker:
                     text_predecessors.update(zip(text_session_ids, prompt_operations, strict=True))
                 max_latent_elements = max(
                     1,
-                    math.prod(self.model.generation.latent_shape(height, width)),
+                    math.prod(generation.latent_shape(height, width)),
                 )
                 initial_latents: list[ProductRef] = []
                 transitions: list[Operation] = []
@@ -1867,19 +2110,19 @@ class ModelWorker:
 
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
-        session = self.sessions.peek(session_id)
-        self.executor.drop_session(session_id)
+        session = self.requests.peek(session_id)
+        self.runner.drop_session(session_id)
         self.device_products.drop_session(session_id)
         if session is not None and self.latent_pool is not None:
             self.latent_pool.release_slots((int(session.request_pool_idx),))
-        self.sessions.drop(session_id)
+        self.requests.drop(session_id)
         if session is not None:
             for group_id in range(self.cache_pool.group_count):
                 self._warmup_kv_pages.pop((session.request_key, group_id), None)
             self._warmup_scratch_pages.pop(session.request_key, None)
             self._warmup_latent_pages.pop(session.request_key, None)
-        if self.snapshot_provider is not None:
-            self.snapshot_provider.drop_session(session_id)
+        if self.snapshot_recovery is not None:
+            self.snapshot_recovery.drop_session(session_id)
         if session is not None:
             self.trace.emit(
                 ExecutionPhase.CLEANUP,
@@ -1894,6 +2137,8 @@ class ModelWorker:
             )
 
     def copy_kv(self, copies: tuple[CacheCopy, ...]) -> None:
+        if self._system_only:
+            raise unsupported_control(RequestKind.COPY_KV.value)
         for group_id in {copy.group_id for copy in copies}:
             selected = tuple(copy for copy in copies if copy.group_id == group_id)
             self.cache_pool.copy_pages(
@@ -1908,20 +2153,24 @@ class ModelWorker:
         self.encoder_cache.release_generations(generations)
 
     def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
-        if self.snapshot_provider is None:
-            raise capability_mismatch("this worker has no configured snapshot provider")
+        if self.snapshot_recovery is None:
+            if self._system_only:
+                raise unsupported_control(RequestKind.SNAPSHOT_SESSION.value)
+            raise capability_mismatch("this worker has no configured snapshot recovery")
         self.runner.synchronize()
-        return self.snapshot_provider.snapshot_session(placement)
+        return self.snapshot_recovery.snapshot_session(placement)
 
     def restore_session(
         self,
         reference: SnapshotRef,
         placement: RecoveryPlacement,
     ) -> None:
-        if self.snapshot_provider is None:
-            raise capability_mismatch("this worker has no configured snapshot provider")
+        if self.snapshot_recovery is None:
+            if self._system_only:
+                raise unsupported_control(RequestKind.RESTORE_SESSION.value)
+            raise capability_mismatch("this worker has no configured snapshot recovery")
         self.runner.synchronize()
-        self.snapshot_provider.restore(reference, placement)
+        self.snapshot_recovery.restore(reference, placement)
 
     def resource_pressure(self) -> list[dict[str, object]]:
         caps = self._capabilities
@@ -1945,16 +2194,15 @@ class ModelWorker:
 
     def close(self) -> None:
         self.runner.synchronize()
-        self.executor.close()
+        self.runner.close()
         self.cpu_tasks.close()
         self.completion_arena.close()
-        self.mover.close()
+        self.transfers.close()
         if self.latent_pool is not None:
             self.latent_pool.close()
         self.encoder_cache.close()
         self.device_products.close()
         self.device_events.close()
-        self.runner.close()
 
 
 def _pressure(resource_class: str, used: int, total: int) -> dict[str, object]:
@@ -1971,4 +2219,4 @@ def _pressure(resource_class: str, used: int, total: int) -> dict[str, object]:
     }
 
 
-__all__ = ["ModelWorker"]
+__all__ = ["Worker"]

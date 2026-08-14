@@ -56,6 +56,7 @@ def test_feature_value_geometry_and_cross_request_read_are_immutable() -> None:
     value = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
     (write,) = cache.bind_outputs(((reference, "ab" * 32, "cpu"),))
     cache.publish(write, value, metadata)
+    cache.commit_writes((write,))
 
     read = cache.consume(
         reference,
@@ -83,6 +84,7 @@ def test_release_and_reuse_preserve_exact_feature_identity() -> None:
     )
     cache.publish(writes[0], torch.full((2, 3), 3.0, dtype=torch.bfloat16), EncoderMetadata(8, 8))
     cache.publish(writes[1], torch.full((2, 3), 5.0, dtype=torch.bfloat16), EncoderMetadata(8, 8))
+    cache.commit_writes(writes)
 
     cache.release_generations((first.generation,))
     replacement = _feature(session_id=3, op_id=33, generation=9)
@@ -94,6 +96,7 @@ def test_release_and_reuse_preserve_exact_feature_identity() -> None:
         torch.full((2, 3), 7.0, dtype=torch.bfloat16),
         EncoderMetadata(8, 8),
     )
+    cache.commit_writes((replacement_write,))
 
     assert cache.consume(retained, consumer_op_id=34).tensor[0, 0].item() == 5.0
     assert cache.consume(replacement, consumer_op_id=35).tensor[0, 0].item() == 7.0
@@ -110,6 +113,7 @@ def test_feature_generation_and_producer_digest_are_exact() -> None:
     reference = _feature(session_id=1, op_id=41, generation=10)
     (write,) = cache.bind_outputs(((reference, "ab" * 32, "cpu"),))
     cache.publish(write, torch.ones((2, 3), dtype=torch.bfloat16), EncoderMetadata(4, 4))
+    cache.commit_writes((write,))
 
     with pytest.raises(WorkerError, match="stale encoder feature generation"):
         cache.consume(replace(reference, generation=11), consumer_op_id=42)

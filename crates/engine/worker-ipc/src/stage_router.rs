@@ -58,7 +58,7 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, String)> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor has no kind"))?;
     anyhow::ensure!(
-        matches!(kind, "tensor" | "latent" | "kv")
+        matches!(kind, "encoder" | "device_product" | "latent" | "kv")
             && object
                 .get("value")
                 .is_some_and(serde_json::Value::is_object),
@@ -1126,15 +1126,21 @@ mod tests {
 
     fn transfer_descriptor(plan_digest: &str) -> Vec<u8> {
         let value = serde_json::json!({
-            "kind": "tensor",
+            "kind": "encoder",
             "producer_plan_digest": plan_digest,
             "value": {
+                "generation": 41,
                 "height": 16,
                 "locator": {
                     "device": "cuda:0",
                     "dtype": "float32",
                     "handle_b64": "",
-                    "meta": {},
+                    "meta": {
+                        "generation": 41,
+                        "height": 16,
+                        "payload_kind": "vision_feature",
+                        "width": 16
+                    },
                     "nbytes": 16,
                     "session": "producer",
                     "shape": [4],

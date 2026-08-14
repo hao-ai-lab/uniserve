@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve_worker.runtime.rng import (
+from uniserve_worker.execution.rng import (
     DRAW_LAYOUT_PROPOSAL,
     DRAW_LAYOUT_TARGET,
     sampling_key,

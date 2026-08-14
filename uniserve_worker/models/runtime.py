@@ -1,4 +1,4 @@
-"""Imperative model/executor boundary and worker-local runtime geometry."""
+"""Imperative model-runner boundary and worker-local runtime geometry."""
 
 from __future__ import annotations
 

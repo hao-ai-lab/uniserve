@@ -14,7 +14,7 @@ import json
 import struct
 from pathlib import Path
 
-from uniserve_worker.runtime.rng import (
+from uniserve_worker.execution.rng import (
     philox4x32_10,
     sampling_key,
     sampling_uniform,

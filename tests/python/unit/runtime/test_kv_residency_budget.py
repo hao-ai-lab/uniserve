@@ -5,13 +5,13 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
+from uniserve_worker.bootstrap import capabilities as capabilities_module
+from uniserve_worker.bootstrap.capabilities import resolve_capabilities
 from uniserve_worker.foundation.runtime_config import (
     graph_memory_budget_bytes,
     graph_padding_block_count,
 )
 from uniserve_worker.models.runtime import CacheGeometry, ScratchGeometry
-from uniserve_worker.runtime import capabilities as capabilities_module
-from uniserve_worker.runtime.capabilities import resolve_capabilities
 from uniserve_worker.server.stub import StubModel
 
 pytestmark = pytest.mark.unit

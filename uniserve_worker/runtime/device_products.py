@@ -20,9 +20,9 @@ from ..batch import (
     StaticDim,
     StorageClass,
 )
+from ..foundation.device import canonical_device
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
 from .device_events import DeviceEventPool
-from .host_staging import canonical_device
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
@@ -204,7 +204,7 @@ class DeviceProductWrite:
     reader_events: torch.cuda.Event | list[torch.cuda.Event] | None = None
     logical_references: int = 1
     released: bool = False
-    _indexed: bool = True
+    _indexed: bool = False
     actual_extent: int = 0
     actual_shape: tuple[int, ...] = ()
     metadata: DeviceProductMetadata | None = None
@@ -289,6 +289,7 @@ class DeviceProducts:
         self._scalar_arenas: dict[tuple[str, torch.dtype], torch.Tensor] = {}
         self.event_pool = DeviceEventPool() if event_pool is None else event_pool
         self._entries: dict[_ReferenceKey, DeviceProductWrite] = {}
+        self._candidates: dict[int, DeviceProductWrite] = {}
         self._operation_writes: dict[
             _OperationKey,
             DeviceProductWrite | list[DeviceProductWrite],
@@ -305,6 +306,7 @@ class DeviceProducts:
     def close(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._candidates.clear()
             self._operation_writes.clear()
             self._scalar_arenas.clear()
             self._slots.clear()
@@ -367,7 +369,7 @@ class DeviceProducts:
             )
         )
         try:
-            return tuple(
+            values = tuple(
                 self.publish_write(write, value)
                 for write, (_reference, _digest, value, _device) in zip(
                     batch.writes,
@@ -375,6 +377,8 @@ class DeviceProducts:
                     strict=True,
                 )
             )
+            self.commit_writes(batch.writes)
+            return values
         except BaseException:
             self.abandon_writes(batch.writes)
             raise
@@ -432,6 +436,7 @@ class DeviceProducts:
                     item.value.to(write.slot.device_name),
                     metadata=item.metadata,
                 )
+            self.commit_writes(batch.writes)
         except BaseException:
             self.abandon_writes(batch.writes)
             raise
@@ -480,6 +485,9 @@ class DeviceProducts:
         if len(set(keys)) != len(keys):
             raise invalid_descriptor("device-product registration repeats an output identity")
         with self._lock:
+            candidate_keys = {
+                _reference_key(candidate.reference) for candidate in self._candidates.values()
+            }
             for (reference, _digest, _device, _shape, _dtype), key in zip(
                 requested, keys, strict=True
             ):
@@ -492,6 +500,8 @@ class DeviceProducts:
                     if existing.reference != reference:
                         raise invalid_descriptor("stale device-product logical generation")
                     raise invalid_descriptor("device-product output is already registered")
+                if key in candidate_keys:
+                    raise invalid_descriptor("device-product output already has a candidate")
             planned_slots: list[_DeviceSlot | None] = [None] * len(requested)
             reclaimed = False
             by_device: dict[
@@ -531,7 +541,6 @@ class DeviceProducts:
                     slot for slot in planned_slots if slot is not None
                 )
                 raise
-            registered: list[_ReferenceKey] = []
             writes: list[DeviceProductWrite] = []
             try:
                 for request_index, (
@@ -559,30 +568,16 @@ class DeviceProducts:
                     self._occupied_slots[slot.device_name] = (
                         self._occupied_slots.get(slot.device_name, 0) + 1
                     )
-                    self._entries[key] = write
-                    operation_key = (
-                        reference.request_key,
-                        int(reference.producer_op_id),
-                    )
-                    operation_writes = self._operation_writes.get(operation_key)
-                    if operation_writes is None:
-                        self._operation_writes[operation_key] = write
-                    elif isinstance(operation_writes, list):
-                        operation_writes.append(write)
-                    else:
-                        self._operation_writes[operation_key] = [
-                            operation_writes,
-                            write,
-                        ]
-                    registered.append(key)
+                    self._candidates[write.binding_id] = write
                     writes.append(write)
             except BaseException:
-                for key in reversed(registered):
-                    entry = self._entries.pop(key)
-                    self._detach_write_locked(entry)
+                for entry in reversed(writes):
+                    self._candidates.pop(entry.binding_id, None)
                     self._return_slot_locked(entry.slot)
                 self._restore_planned_slots_locked(
-                    slot for slot in planned_slots if slot is not None
+                    slot
+                    for slot in planned_slots[len(writes) :]
+                    if slot is not None
                 )
                 raise
             return DeviceProductBindingBatch(tuple(writes))
@@ -635,10 +630,11 @@ class DeviceProducts:
         device: torch.device,
         shape: tuple[int, ...],
         dtype: torch.dtype,
-        *,
-        index_operations: bool = True,
     ) -> DeviceProductBindingBatch:
         with self._lock:
+            candidate_keys = {
+                _reference_key(candidate.reference) for candidate in self._candidates.values()
+            }
             keys: list[_ReferenceKey] = []
             seen: set[_ReferenceKey] = set()
             for reference, _digest, _device in bindings:
@@ -658,6 +654,8 @@ class DeviceProducts:
                     if existing.reference != reference:
                         raise invalid_descriptor("stale device-product logical generation")
                     raise invalid_descriptor("device-product output is already registered")
+                if key in candidate_keys:
+                    raise invalid_descriptor("device-product output already has a candidate")
             slots, _reclaimed = self._plan_slots_locked(
                 str(device),
                 len(bindings),
@@ -668,7 +666,6 @@ class DeviceProducts:
             except BaseException:
                 self._restore_planned_slots_locked(slots)
                 raise
-            registered: list[_ReferenceKey] = []
             writes: list[DeviceProductWrite] = []
             owned_slots: list[_DeviceSlot] = []
             device_name = str(device)
@@ -687,28 +684,11 @@ class DeviceProducts:
                         slot=slot,
                         physical_generation=slot.generation,
                         binding_id=self._next_binding_id,
-                        _indexed=index_operations,
                     )
                     self._next_binding_id += 1
                     owned_slots.append(slot)
                     slot.owner = write.binding_id
-                    self._entries[key] = write
-                    registered.append(key)
-                    if index_operations:
-                        operation_key = (
-                            reference.request_key,
-                            int(reference.producer_op_id),
-                        )
-                        operation_writes = self._operation_writes.get(operation_key)
-                        if operation_writes is None:
-                            self._operation_writes[operation_key] = write
-                        elif isinstance(operation_writes, list):
-                            operation_writes.append(write)
-                        else:
-                            self._operation_writes[operation_key] = [
-                                operation_writes,
-                                write,
-                            ]
+                    self._candidates[write.binding_id] = write
                     writes.append(write)
                 bound_writes = tuple(writes)
                 first_slot = bound_writes[0].slot
@@ -731,9 +711,8 @@ class DeviceProducts:
                         write._scalar_batch = scalar
                 return DeviceProductBindingBatch(bound_writes, scalar)
             except BaseException:
-                for key in reversed(registered):
-                    entry = self._entries.pop(key)
-                    self._detach_write_locked(entry)
+                for entry in reversed(writes):
+                    self._candidates.pop(entry.binding_id, None)
                 for slot in owned_slots:
                     slot.owner = None
                 self._occupied_slots[device_name] = occupied_before
@@ -1205,6 +1184,51 @@ class DeviceProducts:
     ) -> DeviceProductRead:
         return self.consume_batch(((reference, consumer_op_id, producer_plan_digest, device),))[0]
 
+    def consume_candidate(
+        self,
+        write: DeviceProductWrite,
+        *,
+        consumer_op_id: int,
+        producer_plan_digest: str | None = None,
+        device: torch.device | str | None = None,
+    ) -> DeviceProductRead:
+        """Read one unpublished candidate inside its producing partition."""
+
+        with self._lock:
+            entry = self._require_write_locked(write)
+            if self._candidates.get(entry.binding_id) is not entry:
+                raise _invariant("device-product candidate is not live")
+            if not entry.producer_recorded:
+                raise invalid_descriptor("device product was consumed before producer readiness")
+            if (
+                producer_plan_digest is not None
+                and entry.producer_plan_digest != producer_plan_digest
+            ):
+                raise invalid_descriptor("device product plan digest does not match its producer")
+            storage = entry.slot.tensor
+            if storage is None:
+                raise _invariant("device product has no physical tensor")
+            target = storage.device if device is None else _resolved_device(device)
+            if target != storage.device:
+                raise invalid_descriptor("device product consumer names a different device")
+            if target.type == "cuda":
+                event = entry.producer_event
+                if event is None:
+                    raise _invariant("CUDA device product has no producer event")
+                stream = torch.cuda.current_stream(target)
+                if entry.producer_stream != int(stream.cuda_stream):
+                    stream.wait_event(event)
+            tensor = (
+                storage
+                if entry.actual_shape == entry.slot.shape
+                else storage.reshape(-1)[: entry.actual_extent].reshape(entry.actual_shape)
+            )
+            return DeviceProductRead(
+                tensor=tensor,
+                consumer_op_id=int(consumer_op_id),
+                _write=entry,
+            )
+
     def consume_batch(
         self,
         requests: tuple[
@@ -1633,8 +1657,43 @@ class DeviceProducts:
         with self._lock:
             for write in writes:
                 entry = self._require_write_locked(write)
+                if self._candidates.get(entry.binding_id) is not entry:
+                    raise _invariant("device-product candidate is not live")
                 if not entry.producer_recorded:
                     raise _invariant("completion packing found an unpublished device product")
+
+    def commit_writes(self, writes: tuple[DeviceProductWrite, ...]) -> None:
+        """Make a validated set of produced candidate generations addressable."""
+
+        if not writes:
+            return
+        with self._lock:
+            entries = tuple(self._require_write_locked(write) for write in writes)
+            keys = tuple(_reference_key(entry.reference) for entry in entries)
+            if len(set(keys)) != len(keys):
+                raise _invariant("device-product publication repeats a product identity")
+            for key, entry in zip(keys, entries, strict=True):
+                if self._candidates.get(entry.binding_id) is not entry:
+                    raise _invariant("device-product candidate is not live")
+                if not entry.producer_recorded:
+                    raise _invariant("device-product candidate has no producer readiness")
+                if key in self._entries:
+                    raise _invariant("device-product publication identity is already resident")
+            for key, entry in zip(keys, entries, strict=True):
+                self._entries[key] = entry
+                operation_key = (
+                    entry.reference.request_key,
+                    int(entry.reference.producer_op_id),
+                )
+                operation_writes = self._operation_writes.get(operation_key)
+                if operation_writes is None:
+                    self._operation_writes[operation_key] = entry
+                elif isinstance(operation_writes, list):
+                    operation_writes.append(entry)
+                else:
+                    self._operation_writes[operation_key] = [operation_writes, entry]
+                entry._indexed = True
+                self._candidates.pop(entry.binding_id)
 
     def _require_locked(self, reference: ProductRef) -> DeviceProductWrite:
         key = _reference_key(reference)
@@ -2086,6 +2145,28 @@ class DeviceProducts:
                     raise _invariant("device-product reclamation found a stale physical generation")
                 self._entries.pop(key)
                 self._detach_write_locked(entry)
+                if entry._scalar_batch is not None:
+                    entry._scalar_batch._valid = False
+                self._return_slot_locked(entry.slot)
+                if entry.producer_event is not None:
+                    release_event(entry.producer_event)
+                reader_events = entry.reader_events
+                if isinstance(reader_events, list):
+                    for event in reader_events:
+                        release_event(event)
+                elif reader_events is not None:
+                    release_event(reader_events)
+                reclaimed += 1
+        for binding_id, entry in tuple(self._candidates.items()):
+            if (
+                entry.released
+                and entry.logical_references == 0
+                and ready(entry.producer_event)
+                and readers_ready(entry)
+            ):
+                if self._candidates.get(binding_id) is not entry:
+                    raise _invariant("device-product reclamation lost its candidate generation")
+                self._candidates.pop(binding_id)
                 if entry._scalar_batch is not None:
                     entry._scalar_batch._valid = False
                 self._return_slot_locked(entry.slot)

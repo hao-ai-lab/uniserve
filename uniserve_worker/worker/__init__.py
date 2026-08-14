@@ -1,5 +1,5 @@
-"""Concrete execution workers hosted by the worker server."""
+"""Configured worker process root."""
 
-from .protocol import Worker
+from .worker import Worker
 
 __all__ = ["Worker"]

@@ -1,4 +1,4 @@
-"""Explicit-page KV publication and installation."""
+"""Worker transport ownership and explicit-page KV publication."""
 
 from __future__ import annotations
 
@@ -11,9 +11,44 @@ from ..batch import FixedPoint, ProductKind, ProductRef, RequestKey, VersionRef
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.sizing import ceil_div
 from ..runtime.cache_pool import CachePool, CacheRow
-from ..runtime.transfer import Locator, Transport, fetch_locator
+from .tickets import Locator, Transport, fetch_locator, make_transport
 
-__all__ = ["CachePublication", "CachePublicationState", "CachePublications"]
+__all__ = [
+    "CachePublication",
+    "CachePublicationState",
+    "CachePublications",
+    "TransferConnector",
+]
+
+
+class TransferConnector:
+    """Own the worker's bounded transfer tickets and transport regions."""
+
+    def __init__(
+        self,
+        *,
+        backend: str,
+        byte_capacity: int,
+        ticket_capacity: int,
+        cross_process: bool = False,
+    ) -> None:
+        selected = str(backend)
+        if bool(cross_process) and selected in {"", "local"}:
+            raise capability_mismatch(
+                f"cross-process transfer requires a shared transport, got {selected!r}"
+            )
+        if int(byte_capacity) < 1:
+            raise capability_mismatch("transfer byte capacity must be positive")
+        if int(ticket_capacity) < 1:
+            raise capability_mismatch("transfer ticket capacity must be positive")
+        self.transport = make_transport(
+            selected,
+            byte_capacity=int(byte_capacity),
+            ticket_capacity=int(ticket_capacity),
+        )
+
+    def close(self) -> None:
+        self.transport.close()
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,7 +9,7 @@ from uniserve_worker.foundation.runtime_config import ExecutionConfig, FlashInfe
 from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.server.stub import StubModel, stub_deployment
-from uniserve_worker.worker.model import ModelWorker
+from uniserve_worker.worker import Worker
 
 
 def execution_worker(
@@ -25,7 +25,7 @@ def execution_worker(
     max_batch_tokens: int = 8192,
     max_request_pool_size: int = 128,
     max_batch_operations: int | None = None,
-) -> ModelWorker:
+) -> Worker:
     ready = StubModel() if model is None else model
     deployment = replace(
         stub_deployment(block_size, max_batch_tokens=max_batch_tokens),
@@ -37,7 +37,7 @@ def execution_worker(
             else {"max_batch_operations": int(max_batch_operations)}
         ),
     )
-    worker = ModelWorker(
+    worker = Worker(
         ready,
         mesh=DeviceMesh.trivial(device),
         deployment=deployment,

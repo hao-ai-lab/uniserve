@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.depth_one import (
-    commit_resolved,
+    commit_for_completion,
     execution_batch,
     root_parent,
     token_operation,
@@ -270,7 +270,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
     torch.cuda.synchronize()
     serial_parent_report = finalize_completion_report(serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
-    commit = commit_resolved(serial_worker.sessions.get(41))
+    commit = commit_for_completion(serial_parent, serial_parent_report)
     serial_successor, serial_successor_input = token_operation(
         serial.request_key,
         op_id=12,
@@ -371,7 +371,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
     torch.cuda.synchronize()
     serial_parent_report = finalize_completion_report(serial_parent_report)
     serial_first = serial_parent_report.completions[0].committed_tokens[0]
-    commit = commit_resolved(serial_worker.sessions.get(57))
+    commit = commit_for_completion(serial_parent, serial_parent_report)
     serial_successor, serial_successor_input = token_operation(
         serial.request_key,
         op_id=12,

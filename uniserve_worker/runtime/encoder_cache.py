@@ -11,9 +11,9 @@ from typing import Final
 import torch
 
 from ..batch import DType, ProductKind, ProductRef, RequestKey, StaticDim, StorageClass
+from ..foundation.device import canonical_device
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
 from .device_events import DeviceEventPool
-from .host_staging import canonical_device
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DTYPES: Final[dict[DType, torch.dtype]] = {
@@ -149,6 +149,7 @@ class EncoderCache:
             str(device): deque(range(self.entry_capacity)) for device in self.devices
         }
         self._entries: dict[_ReferenceKey, EncoderWrite] = {}
+        self._candidates: dict[int, EncoderWrite] = {}
         self._operations: dict[_OperationKey, list[EncoderWrite]] = {}
         self._next_binding_id = 1
         self._lock = RLock()
@@ -176,7 +177,7 @@ class EncoderCache:
             return ()
         with self._lock:
             self._reclaim_ready_locked()
-            if len(self._entries) + len(bindings) > self.entry_capacity:
+            if len(self._entries) + len(self._candidates) + len(bindings) > self.entry_capacity:
                 raise resource_error("encoder cache has no query-ready entry capacity")
             keys = tuple(_reference_key(reference) for reference, _digest, _device in bindings)
             if len(set(keys)) != len(keys):
@@ -201,6 +202,11 @@ class EncoderCache:
                     if existing.reference != reference:
                         raise invalid_descriptor("stale encoder feature generation")
                     raise invalid_descriptor("encoder feature is already registered")
+                if any(
+                    _reference_key(candidate.reference) == key
+                    for candidate in self._candidates.values()
+                ):
+                    raise invalid_descriptor("encoder feature already has a candidate")
                 device = canonical_device(raw_device)
                 free = self._free.get(str(device))
                 if free is None:
@@ -233,15 +239,11 @@ class EncoderCache:
                         physical_generation=slot.generation,
                         binding_id=binding_id,
                     )
-                    self._entries[key] = write
-                    self._operations.setdefault(
-                        (reference.request_key, int(reference.producer_op_id)), []
-                    ).append(write)
+                    self._candidates[write.binding_id] = write
                     writes.append(write)
             except BaseException:
                 for write in writes:
-                    self._detach_locked(write)
-                    self._entries.pop(_reference_key(write.reference), None)
+                    self._candidates.pop(write.binding_id, None)
                     write.slot.owner = 0
                     self._free[str(write.slot.device)].appendleft(write.slot.index)
                 for _reference, _digest, device, slot in reversed(prepared[len(writes) :]):
@@ -312,6 +314,44 @@ class EncoderCache:
                 _write=entry,
             )
 
+    def consume_candidate(
+        self,
+        write: EncoderWrite,
+        *,
+        consumer_op_id: int,
+        producer_plan_digest: str | None = None,
+        device: torch.device | str | None = None,
+    ) -> EncoderRead:
+        """Read one unpublished feature inside its consuming partition."""
+
+        with self._lock:
+            entry = self._require_write_locked(write)
+            if self._candidates.get(entry.binding_id) is not entry:
+                raise _invariant("encoder feature candidate is not live")
+            if not entry.published or entry.tensor is None or entry.metadata is None:
+                raise invalid_descriptor("encoder feature was consumed before producer readiness")
+            if (
+                producer_plan_digest is not None
+                and entry.producer_plan_digest != producer_plan_digest
+            ):
+                raise invalid_descriptor("encoder feature plan digest does not match its producer")
+            target = entry.tensor.device if device is None else canonical_device(device)
+            if target != entry.tensor.device:
+                raise invalid_descriptor("encoder feature consumer names a different device")
+            if target.type == "cuda":
+                event = entry.producer_event
+                if event is None:
+                    raise _invariant("CUDA encoder feature has no producer event")
+                stream = torch.cuda.current_stream(target)
+                if int(stream.cuda_stream) != entry.producer_stream:
+                    stream.wait_event(event)
+            return EncoderRead(
+                tensor=entry.tensor,
+                metadata=entry.metadata,
+                consumer_op_id=int(consumer_op_id),
+                _write=entry,
+            )
+
     def record_readers(self, reads: tuple[EncoderRead, ...]) -> None:
         if not reads:
             return
@@ -337,8 +377,34 @@ class EncoderCache:
         with self._lock:
             for write in writes:
                 entry = self._require_write_locked(write)
+                if self._candidates.get(entry.binding_id) is not entry:
+                    raise _invariant("encoder feature candidate is not live")
                 if not entry.published:
                     raise _invariant("completion found an unpublished encoder feature")
+
+    def commit_writes(self, writes: tuple[EncoderWrite, ...]) -> None:
+        """Make validated candidate feature generations addressable."""
+
+        if not writes:
+            return
+        with self._lock:
+            entries = tuple(self._require_write_locked(write) for write in writes)
+            keys = tuple(_reference_key(entry.reference) for entry in entries)
+            if len(set(keys)) != len(keys):
+                raise _invariant("encoder publication repeats a product identity")
+            for key, entry in zip(keys, entries, strict=True):
+                if self._candidates.get(entry.binding_id) is not entry:
+                    raise _invariant("encoder feature candidate is not live")
+                if not entry.published:
+                    raise _invariant("encoder feature candidate has no producer readiness")
+                if key in self._entries:
+                    raise _invariant("encoder publication identity is already resident")
+            for key, entry in zip(keys, entries, strict=True):
+                self._entries[key] = entry
+                self._operations.setdefault(
+                    (entry.reference.request_key, int(entry.reference.producer_op_id)), []
+                ).append(entry)
+                self._candidates.pop(entry.binding_id)
 
     def release_generations(self, generations: Iterable[int]) -> None:
         selected = {int(value) for value in generations}
@@ -425,6 +491,7 @@ class EncoderCache:
         try:
             for write, item in zip(writes, snapshots, strict=True):
                 self.publish(write, item.value.to(write.slot.device), item.metadata)
+            self.commit_writes(writes)
         except BaseException:
             self.abandon_writes(writes)
             raise
@@ -436,6 +503,7 @@ class EncoderCache:
     def close(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._candidates.clear()
             self._operations.clear()
             self._free.clear()
             self._slots.clear()
@@ -491,6 +559,19 @@ class EncoderCache:
                 continue
             self._entries.pop(key)
             self._detach_locked(entry)
+            if entry.producer_event is not None:
+                release(entry.producer_event)
+            for event in entry.reader_events:
+                release(event)
+            entry.slot.owner = 0
+            self._free[str(entry.slot.device)].append(entry.slot.index)
+            reclaimed += 1
+        for binding_id, entry in tuple(self._candidates.items()):
+            if not entry.released or not ready(entry.producer_event) or not all(
+                ready(event) for event in entry.reader_events
+            ):
+                continue
+            self._candidates.pop(binding_id)
             if entry.producer_event is not None:
                 release(entry.producer_event)
             for event in entry.reader_events:

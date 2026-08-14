@@ -15,6 +15,8 @@ from typing import Protocol, TypeAlias, runtime_checkable
 
 import torch
 
+from ..nn.mesh import CollectiveAxisTransport, DeviceMesh, PeerAxisTransport
+
 
 @runtime_checkable
 class KvView(Protocol):
@@ -121,7 +123,7 @@ class EmptyKvView:
 
 @runtime_checkable
 class LatentView(Protocol):
-    """Transaction-bounded latent scratch access."""
+    """Partition-bounded latent scratch access."""
 
     def read(self, handle: int) -> torch.Tensor: ...
 
@@ -187,6 +189,61 @@ class EmptyMeshView:
         return value.to(target) if value.device != target else value
 
 
+class RouteMeshView:
+    """Expose only the mesh axes declared by one physical model route."""
+
+    def __init__(self, mesh: DeviceMesh, axes: tuple[str, ...]) -> None:
+        self._mesh = mesh
+        self._axes = frozenset(axes)
+        if any(not axis for axis in self._axes):
+            raise ValueError("mesh axis names must not be empty")
+
+    def all_reduce(self, value: torch.Tensor, axis: str) -> torch.Tensor:
+        transport = self._transport(axis)
+        if transport is None:
+            return value
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(f"mesh axis {axis!r} does not support all-reduce")
+        return transport.all_reduce(value)
+
+    def all_gather(self, value: torch.Tensor, axis: str, dimension: int) -> torch.Tensor:
+        transport = self._transport(axis)
+        if transport is None:
+            return value
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(f"mesh axis {axis!r} does not support all-gather")
+        return transport.all_gather(value, dimension)
+
+    def dispatch(self, value: torch.Tensor, axis: str, coordinate: int) -> torch.Tensor:
+        transport = self._transport(axis)
+        if transport is None:
+            return value
+        if not isinstance(transport, PeerAxisTransport):
+            raise RuntimeError(f"mesh axis {axis!r} does not support peer dispatch")
+        return transport.copy_to(value, coord=int(coordinate))
+
+    def combine(
+        self,
+        value: torch.Tensor,
+        axis: str,
+        coordinate: int,
+        target: torch.device,
+    ) -> torch.Tensor:
+        self._require_axis(axis)
+        del coordinate
+        return value if value.device == target else value.to(target, non_blocking=True)
+
+    def _transport(self, axis: str):
+        self._require_axis(axis)
+        if self._mesh.is_trivial(axis):
+            return None
+        return self._mesh.transport(axis)
+
+    def _require_axis(self, axis: str) -> None:
+        if axis not in self._axes:
+            raise RuntimeError(f"mesh axis {axis!r} is outside this forward route")
+
+
 @dataclass(frozen=True, slots=True)
 class WrittenRange:
     """A validated span written through an :class:`OutputView`."""
@@ -202,7 +259,7 @@ class WrittenRange:
 
 @runtime_checkable
 class OutputView(Protocol):
-    """Bounded transaction scratch for large model outputs."""
+    """Bounded execution scratch for large model outputs."""
 
     def write(self, slot: int, value: torch.Tensor) -> WrittenRange: ...
 
@@ -480,6 +537,7 @@ __all__ = [
     "PackedAttentionPlan",
     "PagedDecodePlan",
     "PagedVarlenPlan",
+    "RouteMeshView",
     "ModelPhase",
     "TokenSelection",
     "WrittenRange",

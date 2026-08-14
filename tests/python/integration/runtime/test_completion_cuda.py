@@ -5,8 +5,8 @@ import time
 import pytest
 import torch
 
-from uniserve_worker.runtime.image_utils import quantize_image_hwc
 from uniserve_worker.server.completion import CompletionArena
+from uniserve_worker.server.image_codec import quantize_image_hwc
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

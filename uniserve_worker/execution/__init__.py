@@ -1,6 +1,5 @@
-"""Canonical system-owned model execution boundary."""
+"""Canonical model execution boundary."""
 
-from .executor import ModelExecutor
-from .model_runner import ModelRunner
+from .model_runner import ModelRunner, PreparedExecution
 
-__all__ = ["ModelExecutor", "ModelRunner"]
+__all__ = ["ModelRunner", "PreparedExecution"]

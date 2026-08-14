@@ -6,12 +6,47 @@ from dataclasses import dataclass
 
 from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment
-from .device_products import device_product_capacity_bytes
-from .latent_capacity import latent_pool_capacity_bytes, latent_trajectory_bytes
+from ..runtime.device_products import device_product_capacity_bytes
 
 _PRODUCTS_PER_OPERATION = 5
 _MAX_TRANSFER_ENTRIES = 256
 _CPU_TASKS = 256
+
+
+def latent_trajectory_bytes(
+    latent_units: int,
+    latent_width: int,
+    dtype_bytes: int,
+) -> int:
+    units = int(latent_units)
+    width = int(latent_width)
+    element_bytes = int(dtype_bytes)
+    if units < 0 or width < 1 or element_bytes < 1:
+        raise ValueError("latent trajectory geometry is invalid")
+    return units * width * element_bytes
+
+
+def latent_pool_capacity_bytes(
+    *,
+    request_pool_size: int,
+    num_pages: int,
+    page_units: int,
+    latent_width: int,
+    dtype_bytes: int,
+) -> int:
+    slots = int(request_pool_size)
+    pages = int(num_pages)
+    units = int(page_units)
+    width = int(latent_width)
+    element_bytes = int(dtype_bytes)
+    if min(slots, units, width, element_bytes) < 1 or pages < 2:
+        raise ValueError("latent pool geometry is invalid")
+    usable_pages = pages - 1
+    storage = 2 * pages * units * width * element_bytes
+    step_buffer = usable_pages * units * width * element_bytes
+    page_table = usable_pages * 8
+    timestep_pairs = (slots + 1) * 2 * 4
+    return storage + step_buffer + page_table + timestep_pairs
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +185,8 @@ def system_arena_capacity(
 
 __all__ = [
     "ArenaCapacity",
+    "latent_pool_capacity_bytes",
+    "latent_trajectory_bytes",
     "model_arena_capacity",
     "operation_window",
     "system_arena_capacity",

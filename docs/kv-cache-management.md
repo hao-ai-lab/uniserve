@@ -1,89 +1,89 @@
 # KV cache management
 
-UniServe uses one physical KV address space from scheduler allocation through model execution. The Rust engine is the sole authority for request slots, request KV pages, prefix sharing, generation scratch pages, copy commands, recovery destinations, and release order. Each Python worker owns fixed K/V tensors at those addresses and applies only the explicit physical commands carried by the protocol.
+UniServe uses one scheduler-authored KV address space from allocation through model execution. The Rust scheduler allocates request slots and KV pages, while each Python worker owns the fixed tensors stored at those addresses. A batch carries complete physical placement, so the worker validates and executes an allocation decision without deriving another page map.
 
-## Authority boundary
+## Ownership
 
-| State or decision | Authority | Canonical representation |
+| Concern | Owner | Canonical representation |
 | --- | --- | --- |
-| Request slots, KV page leases, cache groups, prefix hashes, sharing, eviction, and ordered release | Rust engine | Scheduler resource managers |
-| Request lineage, operation identity, committed cursor, and logical lengths | Rust scheduler and worker protocol | `Admission`, `Operation`, ordered controls, and completion records |
-| Complete operation block tables, zero commands, and logical KV extents | Rust scheduler and worker protocol | `BatchPartition.kv_placements` |
-| Generation branch block tables and zero commands | Rust scheduler and worker protocol | `BatchPartition.kv_branch_placements` |
-| Page-copy source and destination addresses | Rust scheduler and worker protocol | `CacheCopy` |
-| Recovery request slot, cache groups, page tables, and extents | Rust scheduler and worker protocol | `RecoveryPlacement` |
-| Fixed K/V tensors and quantization metadata | Python worker | `CachePool` |
-| Operation-local extent cursors | Python worker | `CacheRow` |
-| Model-visible cache access | Python worker | `CacheBatchView` through `ForwardContext.kv` |
-| Durable state serialization | Python worker | `SnapshotProvider` |
+| Request slots, page leases, prefix sharing, eviction, and release order | Rust scheduler | Scheduler resource managers |
+| Request lineage, committed cursor, and logical KV lengths | Scheduler protocol and worker request table | `Admission`, `Operation`, ordered controls, completion records, and fixed `RequestRow` values |
+| Operation block tables, pages to zero, and KV extents | Rust scheduler | `BatchPartition.kv_placements` |
+| Generation branch tables and pages to zero | Rust scheduler | `BatchPartition.kv_branch_placements` |
+| Physical key/value tensors and quantization metadata | Python worker | `CachePool` |
+| Operation-local extent cursors | `ModelRunner` | `CacheRow` |
+| Model-visible access | `ModelRunner` | `CacheBatchView` through `ForwardBatch.kv` |
+| Cross-stage KV publication and installation | Worker transfer layer | `TransferConnector`, bounded tickets, and `CachePublication` |
+| Administrative state serialization | Worker recovery layer | `SnapshotRecovery` |
 
-A model receives only the bounded cache view and immutable attention plan for its current `ForwardBatch`. It cannot allocate pages, change block tables, advance committed lengths, perform prefix-cache policy, or choose recovery addresses.
+A model receives an immutable attention plan and a bounded cache view for the current `ForwardBatch`. Page allocation, block-table construction, prefix policy, committed-length changes, and recovery placement remain outside the model interface.
 
 ## Physical address space
 
-Each worker creates `CachePool` once from the model cache geometry and scheduler-advertised capacity. Key and value tensors have shape:
+`CachePool` is created once from model cache geometry and the worker deployment capacity. Key and value tensors use this logical shape:
 
 ```text
 [layer, physical_page, page_token, kv_head, head_dimension]
 ```
 
-Page `0` is the immutable zero sentinel used for padded graph rows and block-table tails. Request pages occupy the positive range below `scratch_page_offset`; generation scratch pages occupy the range from `scratch_page_offset` to `num_pages - 1`. Cache-group ranges partition the request-page axis, and every command must name the group that owns its global page IDs. A physical page ID is interpreted directly on every tensor-parallel rank.
+Page `0` is the permanent zero sentinel for padded graph rows and block-table tails. Positive request pages occupy the range below `scratch_page_offset`; generation scratch pages occupy the remaining range. Cache-group ranges partition the request-page axis, and every command names the group that owns its global page IDs. The same page ID addresses the corresponding rank-local storage on every tensor-parallel rank.
 
-The pool validates cache groups, page ranges, request-versus-scratch regions, repeated real pages, layer indices, tensor geometry, and token spans before mutation. It provides explicit zero, copy, read, write, page-view, and restore operations. It has no allocation, eviction, sharing, lease, or reclamation API.
+The pool validates group ownership, page ranges, request and scratch regions, repeated real pages, layer indices, tensor geometry, and token spans before mutation. Its operations are physical: zero, copy, read, write, page view, and restore. Scheduler decisions determine which pages are assigned and when they may be reused.
 
-Optional FP8 storage uses group-, layer-, and page-indexed scale tables. Zeroing a page clears its values and resets its scale state. The first subsequent write establishes the page scale, and later appends use the established scale. Paged-attention providers are selected only when the model-facing view declares that its storage representation is directly consumable.
+Optional FP8 storage uses group-, layer-, and page-indexed scale tables. Zeroing clears both values and scale state. The first subsequent write establishes the page scale, and later appends use that scale. An attention provider is selected only when it can consume the declared storage representation directly.
 
-## Placement and execution
+## Request and operation placement
+
+`Admission` binds a request key to one stable `request_pool_idx`. Each token operation carries a finite KV capacity, and its aligned `KvPlacement` identifies the complete block table, exact `pages_to_zero`, prefix length, input length, visible length, and resulting length. Placement remains execution metadata and does not contribute to admission, plan, semantic, or control identity.
 
 ```mermaid
 flowchart LR
-    S["Scheduler allocation and prefix policy"] --> P["Physical placement sidecars"]
-    P --> V["Validate addresses and extents"]
-    V --> Z["Apply declared zero and copy commands"]
-    Z --> R["Create operation-local CacheRow values"]
-    R --> F["Build bounded CacheBatchView and attention plan"]
-    F --> M["Model forward"]
-    M --> C["Validate and commit logical effects"]
+    S["Scheduler allocation and prefix policy"] --> P["Batch placement sidecars"]
+    P --> V["ModelRunner validates identities, pages, and extents"]
+    V --> Z["CachePool applies declared zero and copy commands"]
+    Z --> R["ModelRunner creates candidate request and CacheRow values"]
+    R --> F["ForwardBatch exposes a bounded cache view"]
+    F --> M["Model execution"]
+    M --> C["Validate the complete partition outcome"]
+    C --> U["Publish resource-specific state"]
 ```
 
-`Admission` establishes the stable request-pool row and logical prefix state. Each token operation declares a finite KV page capacity in its semantic operation record. Its `KvPlacement` sidecar binds `(request_key, op_id, group_id)` to the complete physical block table, exact pages to zero, prefix length, input length, visible length, and resulting length. Physical placement is execution metadata and does not contribute to admission, plan, semantic, or control identity.
+Before device mutation, `ModelRunner` validates every placement against the operation, fixed pool geometry, request slot, capacity, and logical parent state. It zeroes exactly the declared pages and constructs `CacheRow` values whose reserved, initialized, visible, committed, and published extents are bounded by the supplied block table.
 
-Before any page mutation, `ModelExecutor` validates every placement against the operation, fixed pool geometry, request region, capacity, and logical parent state. It then zeroes exactly `pages_to_zero` and constructs a `CacheRow` whose reserved, initialized, visible, committed, and published extents are bounded by the scheduler block table. Registration or staging failure cannot publish an operation or session transition.
+`CacheBatchView` derives block tables, cache sequence lengths, packed write coordinates, and layer tensors from those rows. Fixed, ragged, and packed append operations validate row alignment and write only declared spans. Model code writes K/V values; `ModelRunner` advances logical extents after validating model output and postprocessing results.
 
-`CacheBatchView` derives block tables, cache sequence lengths, packed write coordinates, and layer cache tensors from the operation-local rows. Fixed, ragged, and packed append methods validate row alignment and write only the declared physical spans. The model can append K/V values but cannot change the row cursor; the executor advances and commits logical extents after validating the model and postprocessing results.
+## Prefix reuse and page hygiene
 
-## Allocation, prefix reuse, and zeroing
+The scheduler partitions each cache group into fixed-size pages. Release decrements scheduler references, and an unreferenced page becomes eligible for reuse after ordered worker retirement.
 
-The engine partitions each cache group into fixed-size physical pages. Allocation takes pages from the group free queue. Release decrements references and makes an unreferenced page eligible for reuse only after ordered worker retirement.
+Full prompt pages may be indexed by chained hashes containing the preceding hash, cache group, modality tag, token count, and exact tokens. Lookup walks from the start of the prompt and stops at the first miss. A hit is accepted only after exact token verification. Shared prefix holders use the same physical page IDs, while writable suffix pages remain exclusive.
 
-Full prompt pages may be published under chained hashes containing the preceding hash, cache group, modality tag, token count, and exact tokens. Lookup walks from the beginning and stops at the first miss. A candidate hit is accepted only after exact token verification. Shared prefix holders therefore receive the same physical page IDs, while writable suffix pages remain exclusive.
+Every page assigned to unrelated content appears in `pages_to_zero`. The worker clears every layer, key, value, and quantization field for that page before the operation writes it. Prefix-hit pages retain their published content.
 
-Every page assigned to unrelated content is included in `pages_to_zero`. The worker clears all layer, key, value, and quantization state for that physical page before the operation can write it. Prefix hits are not zeroed.
+## Candidate publication
 
-## Semantic identity
+Each partition builds isolated request-row candidates and resource-specific candidates. Validation covers all operation outcomes, completion bounds, KV extents, products, encoder entries, latent state, runtime-state rows, and branch rows before publication begins.
 
-The operation plan digest covers the exact parent, work, route, domain, state effect, finite bounds, ordered products, logical KV capacity, predicate, RNG coordinates, and control sequence. It excludes physical page IDs, request-pool indices, batch and partition position, completion slots, streams, events, topology order, and transport allocation.
-
-The completion semantic digest binds the parent semantic digest, plan digest, selected point, status, committed logical lengths, token span and values, finish flags, and product generations. Batching, placement, pipeline depth, topology submission order, and completion observation order cannot change semantic identity.
+KV writes target scheduler-reserved pages beyond the live logical extent. Successful partition publication assigns the complete request-row candidate and exposes the validated extents. On an ordinary failure, candidate rows and product bindings are discarded, latent imports are released, prepared transport locators are retired, and bytes outside the preceding published extent remain unreachable. A failure after publication begins is an invariant violation because ordinary request faults are required to resolve during prevalidation.
 
 ## Sequence and generation work
 
-Sequence extend, decode, and verify operations declare their input span, finite KV growth bound, exact capacity, and physical placement. The executor checks that each operation starts at its parent cursor, creates the attention plan, runs the model, validates row-aligned output, applies sampling or verification, and advances only by the selected token effect.
+Extend, decode, and verify operations declare their input span, finite growth bound, exact capacity, and physical placement. `ModelRunner` verifies the parent cursor, builds the attention plan, invokes the model, validates row-aligned output, applies sampling or verification, and advances by the selected token effect.
 
-Generation branches receive `KvBranchPlacement` records in the scratch region. Conditional state is copied from the request table to a named branch table only through explicit physical page copies. Text-unconditional and image-unconditional branches use disjoint scheduler assignments and may participate in one packed forward. Scratch tables are operation-scoped and never become request allocation state.
+Generation branches receive `KvBranchPlacement` records in the scratch region. Conditional state reaches a named branch only through explicit physical page copies. Text-unconditional and image-unconditional branches use disjoint scheduler assignments and can participate in one packed forward. Scratch rows are operation-scoped and never become request allocation state.
 
-## Publication and transfer
+## Transfer
 
-KV publication records bind an exact fixed semantic version and extent to a destination, cache group, storage identity, and source page prefix. The worker publishes only the suffix after the destination's installed base. Installation writes prepared transfer tensors into the consuming operation's scheduler-assigned block table and records the local physical pages in the installed publication.
+KV publication binds an exact product generation, fixed semantic version, source extent, destination, cache group, storage identity, and source-page prefix. Incremental publication sends only the suffix beyond the installed destination base. The descriptor carries the exact generation and a `CachePublication`; every referenced locator carries dtype, shape, byte count, and transport identity.
 
-Publication and installation metadata are prepared within the execution scope. They become resident only after completion validation and the session/replay transaction succeeds. Failed staging or execution releases prepared transport locators and cannot advance the installed or published base.
+The consumer prepares bounded asynchronous tickets, validates every locator before execution, and installs bytes into the scheduler-assigned destination pages. Destination metadata becomes visible only with the successful partition. Transfer readiness is observed by query, and ticket or byte exhaustion returns bounded backpressure.
 
-## Copy and recovery
+## Recovery
 
-`CacheCopy` names one cache group and aligned source and destination page sequences. The worker validates the complete command before copying all K/V and quantization fields. It does not infer either side from request lineage.
+Snapshot and restore are administrative operations. `SnapshotRecovery` serializes the committed request row and exact bytes selected by a scheduler-supplied `RecoveryPlacement`. Restore validates the model identity, weight identity, snapshot digest, format, dtype, shape, byte count, and pool geometry before writing.
 
-Snapshots serialize committed session state together with the exact cache bytes selected by a scheduler-supplied `RecoveryPlacement`. Restore requires another explicit placement covering every cache group with the committed logical extent. The worker writes the serialized bytes into those destination pages and rebinds the session to the supplied request slot. Worker replacement starts with empty physical state; affected sessions remain terminated until the scheduler supplies a valid recovery operation.
+Physical request slots and page IDs are placement rather than durable identity. The scheduler allocates destination slots and pages for recovery, and the worker restores bytes directly into those locations. A restored request becomes executable only after its complete request row and concrete owner state are installed.
 
 ## Graph execution
 
-Captured attention receives request-variable state only through fixed pool bases and staged physical indices. Block-table padding repeats page `0`, and graph replay overwrites live table entries, sequence lengths, write coordinates, and padded tails before execution. Physical placement remains outside semantic identity, so one qualified graph shape can execute different requests without embedding request ownership in the capture.
+Captured attention receives request-variable state through fixed pool bases and staged physical indices. Block-table padding repeats page `0`; each replay overwrites live entries, sequence lengths, write coordinates, and padded tails before execution. Since physical placement remains outside semantic identity, one qualified graph shape can execute different requests without embedding ownership in the capture.

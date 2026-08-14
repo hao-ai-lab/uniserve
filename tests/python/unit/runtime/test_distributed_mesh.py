@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from uniserve_worker.execution.forward_batch import RouteMeshView
 from uniserve_worker.nn.mesh import (
     CollectiveAxisTransport,
     CollectiveTransport,
@@ -12,7 +13,6 @@ from uniserve_worker.nn.mesh import (
     PeerAxisTransport,
 )
 from uniserve_worker.nn.placement import Replicate, Shard, Sharding, reshard
-from uniserve_worker.runtime.mesh_store import MeshStore
 from uniserve_worker.server.distributed import build_device_mesh
 
 pytestmark = pytest.mark.unit
@@ -54,9 +54,10 @@ def test_mesh_view_rejects_collectives_on_a_routing_axis():
         devices=(torch.device("cpu"), torch.device("cpu")),
         _coord=0,
     )
-    view = MeshStore(
-        DeviceMesh.of(MeshAxis("tower", 2, 0, peer), device="cpu")
-    ).view(("tower",))
+    view = RouteMeshView(
+        DeviceMesh.of(MeshAxis("tower", 2, 0, peer), device="cpu"),
+        ("tower",),
+    )
 
     with pytest.raises(RuntimeError, match="does not support all-reduce"):
         view.all_reduce(torch.ones(1), "tower")

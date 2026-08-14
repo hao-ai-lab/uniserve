@@ -59,6 +59,7 @@ def test_feature_consumer_waits_for_its_producer_stream() -> None:
             torch.full((2, 3), 7.0, dtype=torch.bfloat16, device=device),
             EncoderMetadata(16, 16),
         )
+        cache.commit_writes((write,))
     with torch.cuda.stream(consumer):
         read = cache.consume(
             reference,
@@ -90,6 +91,7 @@ def test_feature_reuse_waits_for_the_last_reader() -> None:
             torch.full((2, 3), 11.0, dtype=torch.bfloat16, device=device),
             EncoderMetadata(8, 8),
         )
+        cache.commit_writes((write,))
     with torch.cuda.stream(delayed_consumer):
         read = cache.consume(first, consumer_op_id=22, device=device)
         observed = read.tensor.clone()
@@ -110,6 +112,7 @@ def test_feature_reuse_waits_for_the_last_reader() -> None:
             torch.full((2, 3), 13.0, dtype=torch.bfloat16, device=device),
             EncoderMetadata(8, 8),
         )
+        cache.commit_writes((second_write,))
     producer.synchronize()
 
     torch.testing.assert_close(observed, torch.full_like(observed, 11.0))

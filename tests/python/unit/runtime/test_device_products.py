@@ -64,6 +64,7 @@ def test_exact_generation_release_reclaims_only_the_selected_product() -> None:
         )
     )
     products.publish_writes(writes, torch.tensor((41, 53), dtype=torch.long))
+    products.commit_writes(writes)
 
     reads = products.consume_batch(
         (
@@ -80,6 +81,7 @@ def test_exact_generation_release_reclaims_only_the_selected_product() -> None:
         ((replacement, "ef" * 32, "cpu"),)
     )
     products.publish_write(replacement_write, torch.tensor([67], dtype=torch.long))
+    products.commit_writes((replacement_write,))
 
     assert products.consume(retained, consumer_op_id=23).tensor.item() == 53
     assert products.consume(replacement, consumer_op_id=24).tensor.item() == 67
@@ -92,6 +94,7 @@ def test_logical_generation_and_producer_digest_are_exact() -> None:
     reference = _reference(session_id=7, op_id=31, generation=9)
     (write,) = products.bind_outputs(((reference, "ab" * 32, "cpu"),))
     products.publish_write(write, torch.tensor([73], dtype=torch.long))
+    products.commit_writes((write,))
 
     stale = replace(reference, generation=reference.generation + 1)
     with pytest.raises(WorkerError, match="stale device-product logical generation"):
@@ -128,6 +131,7 @@ def test_resident_artifact_preserves_image_geometry() -> None:
     )
     (write,) = products.bind_outputs(((reference, "ab" * 32, "cpu"),))
     products.publish_write(write, value, metadata=metadata)
+    products.commit_writes((write,))
 
     read = products.consume(reference, consumer_op_id=42)
     assert read.metadata == metadata
@@ -175,6 +179,7 @@ def test_byte_and_slot_exhaustion_return_bounded_backpressure() -> None:
     resident = _reference(session_id=7, op_id=62, generation=13)
     (write,) = products.bind_outputs(((resident, "ab" * 32, "cpu"),))
     products.publish_write(write, torch.tensor([1], dtype=torch.long))
+    products.commit_writes((write,))
     blocked = _reference(session_id=8, op_id=63, generation=14)
     with pytest.raises(ResourceError, match="no query-ready free generation"):
         products.bind_outputs(((blocked, "cd" * 32, "cpu"),))

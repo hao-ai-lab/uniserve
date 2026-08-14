@@ -6,7 +6,7 @@ from threading import Event
 import pytest
 
 from uniserve_worker.foundation.errors import ResourceError
-from uniserve_worker.runtime.cpu_tasks import BoundedCpuTaskPool
+from uniserve_worker.server.cpu_tasks import BoundedCpuTaskPool
 
 pytestmark = pytest.mark.unit
 

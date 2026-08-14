@@ -24,7 +24,7 @@ from ..foundation.errors import (
     unsupported_control,
 )
 from ..foundation.profiling import profile_range
-from ..worker.protocol import Worker
+from ..worker import Worker
 from .metrics import MetricsService
 from .process import WorkerIpcTransport
 from .profiler import WorkerProfiler

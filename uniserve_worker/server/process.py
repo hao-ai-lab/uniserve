@@ -107,7 +107,7 @@ class WorkerServeLoop:
         ) | _response_session_ids(response)
 
     def run(self) -> None:
-        # The loaded model and executor graph live for the worker's full
+        # The loaded model and model-runner graph live for the worker's full
         # lifetime. Do not collect or freeze that initialized graph: both
         # operations traverse every model, CUDA graph, and attention-wrapper
         # object, making readiness scale with the resident graph catalog.

@@ -1,4 +1,4 @@
-"""Executor integration for round-level sampling tasks through the real forward.
+"""Model-runner integration for round-level sampling tasks through the real forward.
 
 Sampling is device postprocessing inside the token modes, so inline rows from
 one submission round share a single batched sampling task, and a verifier
@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.depth_one import (
-    commit_resolved,
+    commit_for_completion,
     execution_batch,
     root_parent,
     token_operation,
@@ -210,6 +210,7 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
 def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
     worker = execution_worker()
     admissions = (und_admission(21, block_ids=(0,)), und_admission(22, block_ids=(1,)))
+    primed: list[tuple[Operation, CompletionReport]] = []
     for index, admission in enumerate(admissions):
         extend, extend_input = token_operation(
             admission.request_key,
@@ -218,7 +219,7 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
             mode=TokenMode.EXTEND,
             tokens=(3, 4),
         )
-        worker.execute(
+        report = worker.execute(
             execution_batch(
                 step_id=1 + index,
                 admissions=(admission,),
@@ -226,13 +227,13 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
                 input_products=(extend_input,),
             )
         )
+        primed.append((extend, report))
 
     decode_ops = []
     decode_inputs = []
     commits = []
-    for index, admission in enumerate(admissions):
-        session_id = admission.request_key.session_id
-        commit = commit_resolved(worker.sessions.get(session_id))
+    for index, (admission, (extend, report)) in enumerate(zip(admissions, primed, strict=True)):
+        commit = commit_for_completion(extend, report)
         operation, payload = token_operation(
             admission.request_key,
             op_id=3 + index,
@@ -358,12 +359,12 @@ def test_verify_commits_every_accepted_position() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    worker.execute(
+    prime = worker.execute(
         execution_batch(
             step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
         )
     )
-    commit = commit_resolved(worker.sessions.get(4))
+    commit = commit_for_completion(extend, prime)
     verify, verify_input = token_operation(
         admission.request_key,
         op_id=2,
@@ -411,7 +412,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
             )
         )
     )
-    commit = commit_resolved(worker.sessions.get(5))
+    commit = commit_for_completion(extend, prime)
     verify, verify_input = token_operation(
         admission.request_key,
         op_id=2,
@@ -457,7 +458,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    worker.execute(
+    prime = worker.execute(
         execution_batch(
             step_id=1,
             admissions=(admission,),
@@ -465,7 +466,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
             input_products=(extend_input,),
         )
     )
-    commit = commit_resolved(worker.sessions.get(6))
+    commit = commit_for_completion(extend, prime)
     verify, verify_input = token_operation(
         admission.request_key,
         op_id=2,
@@ -515,7 +516,7 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
             input_products=(first_input,),
         )
     ))
-    commit = commit_resolved(worker.sessions.get(31))
+    commit = commit_for_completion(first, first_result)
     second, second_input = token_operation(
         admission.request_key,
         op_id=2,
@@ -566,7 +567,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    _materialize(
+    first_result = _materialize(
         worker.execute(
             execution_batch(
                 step_id=1,
@@ -576,7 +577,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
             )
         )
     )
-    commit = commit_resolved(worker.sessions.get(32))
+    commit = commit_for_completion(first, first_result)
     invalid, invalid_input = token_operation(
         admission.request_key,
         op_id=2,
@@ -648,7 +649,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    _materialize(
+    oracle_result = _materialize(
         oracle.execute(
             execution_batch(
                 step_id=1,
@@ -658,7 +659,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
             )
         )
     )
-    oracle_commit = commit_resolved(oracle.sessions.get(32))
+    oracle_commit = commit_for_completion(oracle_first, oracle_result)
     oracle_continued, oracle_continued_input = token_operation(
         admission.request_key,
         op_id=3,

@@ -8,8 +8,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ..foundation.device import fill_cpu_ints
 from ..foundation.errors import invalid_descriptor
-from .host_staging import fill_cpu_ints
 
 
 @dataclass(frozen=True, slots=True)

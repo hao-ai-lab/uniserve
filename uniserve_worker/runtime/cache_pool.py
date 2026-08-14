@@ -9,6 +9,13 @@ from typing import cast
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
+from ..foundation.device import (
+    TensorStagingSlot,
+    copy_cpu_to_device,
+    cpu_int_staging_buffer,
+    fill_cpu_ints,
+    is_pinned,
+)
 from ..foundation.errors import capability_mismatch, compute_error, invalid_descriptor
 from ..foundation.sizing import bucketed_page_count
 from ..nn.quant.kv_cache import (
@@ -17,13 +24,6 @@ from ..nn.quant.kv_cache import (
     is_fp8_kv_dtype,
     resolve_kv_store_dtype,
     scale_for_fp8_block,
-)
-from .host_staging import (
-    TensorStagingSlot,
-    copy_cpu_to_device,
-    cpu_int_staging_buffer,
-    fill_cpu_ints,
-    is_pinned,
 )
 
 __all__ = ["CacheBatchView", "CacheExtents", "CachePool", "CacheRow"]

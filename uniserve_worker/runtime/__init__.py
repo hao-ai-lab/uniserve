@@ -1,1 +1,1 @@
-"""L3 per-request mutable state and KV/cache substrate."""
+"""Physical device resource owners and query-ready synchronization primitives."""

@@ -2,12 +2,12 @@
 
 Each builder produces the records the scheduler supplies at depth one: an
 :class:`Admission`, an :class:`Operation` whose ``parent`` names committed state,
-and — for token work — the input token :class:`ProductPayload` the worker decodes
-into its durable token store before running the forward.
+and the host-staged token payload consumed by token work.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 
 from uniserve_worker.batch import (
@@ -17,6 +17,7 @@ from uniserve_worker.batch import (
     BatchPartition,
     Bounds,
     Commit,
+    CompletionReport,
     Control,
     DeviceDim,
     Disposition,
@@ -33,6 +34,7 @@ from uniserve_worker.batch import (
     KvPlacement,
     LatentPlacement,
     Operation,
+    OpStatus,
     PointRange,
     ProductKind,
     ProductPayload,
@@ -52,7 +54,10 @@ from uniserve_worker.batch import (
     encode_token_product_bytes,
     execution_domain,
 )
-from uniserve_worker.runtime.request_session import RequestSession
+from uniserve_worker.server.completion import (
+    completion_report_ready,
+    finalize_completion_report,
+)
 
 AUTHORITY = 0
 _BLOCK_TABLES: dict[RequestKey, list[int]] = {}
@@ -199,7 +204,7 @@ def execution_batch(
     controls: Sequence[Control] = (),
     kv_placements: Sequence[KvPlacement] = (),
 ) -> Batch:
-    """Build the explicit physical partitions used by executor behavior tests."""
+    """Build the explicit physical partitions used by ModelRunner behavior tests."""
 
     for admission in admissions:
         if admission.gen_admission is not None:
@@ -362,18 +367,46 @@ def root_parent(admission: Admission) -> VersionRef:
     return VersionRef(admission.request_key, 0, FixedPoint(0, admission.digest))
 
 
-def commit_resolved(session: RequestSession, *, public_event_limit: int = 0) -> Commit:
-    expected_parent = session.committed_version()
-    selected = session.resolved_version()
-    runtime = session.runtime_for(selected)
-    if runtime is not None:
-        _OP_KV_RESULTS[(session.request_key, int(selected.producer_op_id))] = int(
-            runtime.kv_visible_len
-        )
+def finalized_report(report: CompletionReport) -> CompletionReport:
+    deadline = time.monotonic() + 10.0
+    while not completion_report_ready(report):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("worker completion did not become query-ready")
+        time.sleep(0.00005)
+    return finalize_completion_report(report)
+
+
+def commit_for_completion(
+    operation: Operation,
+    report: CompletionReport,
+    *,
+    expected_parent: VersionRef | None = None,
+    control_seq: int | None = None,
+    public_event_limit: int = 0,
+) -> Commit:
+    if not operation.advances_state:
+        raise ValueError("only a state-advancing completion can be committed")
+    resolved = finalized_report(report)
+    matches = tuple(
+        record
+        for record in resolved.completions
+        if record.request_key == operation.request_key and int(record.op_id) == int(operation.op_id)
+    )
+    if len(matches) != 1 or matches[0].status is not OpStatus.OK:
+        raise ValueError("operation has no unique successful completion")
+    record = matches[0]
+    selected = VersionRef(
+        operation.request_key,
+        int(operation.op_id),
+        FixedPoint(int(record.selected_point), str(record.semantic_digest)),
+    )
+    _OP_KV_RESULTS[(operation.request_key, int(operation.op_id))] = int(
+        record.logical_lengths.kv_visible_len
+    )
     return Commit(
-        request_key=session.request_key,
-        control_seq=session.applied_control_seq + 1,
-        expected_parent=expected_parent,
+        request_key=operation.request_key,
+        control_seq=(int(operation.control_seq) + 1 if control_seq is None else int(control_seq)),
+        expected_parent=operation.parent if expected_parent is None else expected_parent,
         selected=selected,
         public_event_limit=public_event_limit,
         disposition=Disposition.PUBLISH,
@@ -840,9 +873,10 @@ def visual_state_operation(
 __all__ = [
     "AUTHORITY",
     "bind_request_placement",
-    "commit_resolved",
+    "commit_for_completion",
     "encode_operation",
     "execution_batch",
+    "finalized_report",
     "flow_operation",
     "gen_transition_operation",
     "gen_admission",

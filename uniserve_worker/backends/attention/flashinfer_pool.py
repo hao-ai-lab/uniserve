@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import weakref
+from importlib import import_module
 from typing import Any, NamedTuple
 
 import torch
@@ -686,10 +687,14 @@ def _should_use_tensor_cores(
     if override is not None:
         return override
     try:
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
-        return not bool(_grouped_size_compiled_for_decode_kernels(num_q_heads, num_kv_heads))
-    except (ImportError, AttributeError):
+        compiled_group_size = getattr(
+            import_module("flashinfer.decode"),
+            "_grouped_size_compiled_for_decode_kernels",
+            None,
+        )
+        if callable(compiled_group_size):
+            return not bool(compiled_group_size(num_q_heads, num_kv_heads))
+    except ImportError:
         pass
     fp8_dtypes = tuple(
         getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, name)

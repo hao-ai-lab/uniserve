@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
-import hashlib
 import json
 import pickle
 import queue
@@ -27,7 +26,6 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_error
@@ -47,7 +45,6 @@ __all__ = [
     "ShmTransport",
     "CudaIpcTransport",
     "fetch_locator",
-    "restore_durable_tensor",
     "make_transport",
     "TransportKind",
     "TRANSPORTS",
@@ -138,7 +135,7 @@ def encode_transfer_descriptor(
     value: dict[str, object],
     producer_plan_digest: str,
 ) -> bytes:
-    if kind not in {"tensor", "kv", "latent"}:
+    if kind not in {"encoder", "device_product", "kv", "latent"}:
         raise invalid_descriptor("transport entry kind is invalid")
     if not _is_sha256(producer_plan_digest):
         raise invalid_descriptor("transport entry producer plan digest is invalid")
@@ -172,7 +169,7 @@ def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object], str]
     }:
         raise invalid_descriptor("transport entry has an invalid shape")
     kind = value["kind"]
-    if kind not in {"tensor", "kv", "latent"}:
+    if kind not in {"encoder", "device_product", "kv", "latent"}:
         raise invalid_descriptor("transport entry kind is invalid")
     digest = value["producer_plan_digest"]
     if not isinstance(digest, str) or not _is_sha256(digest):
@@ -184,90 +181,9 @@ def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object], str]
 
 
 def fetch_locator(transport: "Transport", locator: Locator) -> "torch.Tensor":
-    """Resolve a live transport locator with no durable fallback.
-
-    Steady-state reads use this: they materialize the live region or surface the
-    transport's own error. The durable-snapshot fallback lives only in
-    :func:`restore_durable_tensor`, reachable only from the administrative
-    snapshot store.
-    """
+    """Resolve a live transport locator."""
 
     return transport.fetch(locator)
-
-
-def restore_durable_tensor(transport: "Transport", locator: Locator) -> "torch.Tensor":
-    """Resolve a locator for the snapshot store, falling back to its durable copy.
-
-    The administrative snapshot/restore path uses this: it prefers the live
-    transport region and, once that region is gone, reconstructs the verified
-    durable tensor recorded in ``locator.meta['durable_snapshot']``.
-    """
-
-    try:
-        return transport.fetch(locator)
-    except Exception as transport_error:
-        descriptor = locator.meta.get("durable_snapshot")
-        if not isinstance(descriptor, dict):
-            raise
-        try:
-            return _load_durable_tensor(locator, descriptor)
-        except Exception as snapshot_error:
-            raise invalid_descriptor(
-                "runtime locator and durable snapshot fallback are both unavailable: "
-                f"runtime={transport_error}; snapshot={snapshot_error}"
-            ) from snapshot_error
-
-
-def _load_durable_tensor(locator: Locator, descriptor: dict[str, Any]) -> "torch.Tensor":
-    import torch
-    from safetensors.torch import load_file
-
-    if set(descriptor) != {"format_version", "root", "object", "tensor"}:
-        raise invalid_descriptor("durable locator descriptor has an invalid shape")
-    if descriptor.get("format_version") != 1:
-        raise invalid_descriptor("durable locator format is unsupported")
-    root_text = descriptor.get("root")
-    object_digest = descriptor.get("object")
-    tensor_key = descriptor.get("tensor")
-    if not isinstance(root_text, str) or not Path(root_text).is_absolute():
-        raise invalid_descriptor("durable locator root must be absolute")
-    if not isinstance(object_digest, str) or not _is_sha256(object_digest):
-        raise invalid_descriptor("durable locator object digest is invalid")
-    if not isinstance(tensor_key, str) or not tensor_key.startswith("assets."):
-        raise invalid_descriptor("durable locator tensor key is invalid")
-    object_root = Path(root_text) / "objects" / object_digest
-    manifest_path = object_root / "manifest.json"
-    tensor_path = object_root / "tensors.safetensors"
-    if not object_root.is_dir() or not manifest_path.is_file() or not tensor_path.is_file():
-        raise invalid_descriptor("durable locator object is incomplete")
-    raw_manifest = manifest_path.read_bytes()
-    try:
-        manifest = json.loads(raw_manifest)
-    except json.JSONDecodeError as error:
-        raise invalid_descriptor(f"durable locator manifest is invalid: {error}") from error
-    if not isinstance(manifest, dict) or _canonical_json(manifest) != raw_manifest:
-        raise invalid_descriptor("durable locator manifest is not canonical")
-    if _snapshot_digest(raw_manifest, tensor_path) != object_digest:
-        raise invalid_descriptor("durable locator object failed content verification")
-    assets = manifest.get("assets")
-    if (
-        not isinstance(assets, list)
-        or sum(isinstance(asset, dict) and asset.get("tensor") == tensor_key for asset in assets)
-        != 1
-    ):
-        raise invalid_descriptor("durable locator asset is not declared exactly once")
-    tensors = load_file(str(tensor_path), device="cpu")
-    value = tensors.get(tensor_key)
-    if value is None:
-        raise invalid_descriptor("durable locator tensor is missing")
-    expected_dtype = _dtype_from_str(locator.dtype)
-    if (
-        tuple(value.shape) != locator.shape
-        or value.dtype != expected_dtype
-        or _nbytes(value) != locator.nbytes
-    ):
-        raise invalid_descriptor("durable locator tensor metadata does not match its descriptor")
-    return value.to(torch.device(locator.device))
 
 
 def _canonical_json(value: object) -> bytes:
@@ -278,16 +194,6 @@ def _canonical_json(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-
-
-def _snapshot_digest(manifest: bytes, tensor_path: Path) -> str:
-    digest = hashlib.sha256(b"uniserve-worker-snapshot-v1\0")
-    digest.update(len(manifest).to_bytes(8, "little"))
-    digest.update(manifest)
-    with tensor_path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _is_sha256(value: str) -> bool:

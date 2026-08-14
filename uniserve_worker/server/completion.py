@@ -22,18 +22,18 @@ from ..batch import (
     VersionRef,
 )
 from ..batch import ErrorCode as ProtocolErrorCode
+from ..foundation.device import canonical_device
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
-from ..runtime.cpu_tasks import CpuTaskReservation
 from ..runtime.device_events import DeviceEventPool
-from ..runtime.host_staging import canonical_device
-from ..runtime.image_utils import uint8_image_to_png_base64_bytes
-from ..runtime.request_session import ResolvedRuntimeState
-from ..runtime.transfer import (
+from ..transfer.tickets import (
     TRANSFER_DESCRIPTOR_PREFIX,
     Locator,
     Transport,
     encode_transfer_descriptor,
 )
+from .cpu_tasks import CpuTaskReservation
+from .image_codec import uint8_image_to_png_base64_bytes
+from .request_state import RequestRuntime
 
 __all__ = [
     "CompletionArena",
@@ -1161,7 +1161,7 @@ class _PendingDigest:
         plan_digest: str,
         lease: CompletionLease,
         row: int,
-        predicated_parent: Callable[[], tuple[VersionRef, ResolvedRuntimeState]],
+        predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]],
         resolved_callback: Callable[[CompletionRecord, str, str], None] | None = None,
         completion_tasks: tuple[_CompletionImagePayload | _CompletionLogprobPayload, ...] = (),
     ) -> None:
@@ -1176,11 +1176,11 @@ class _PendingDigest:
         self._observed = False
         self._invalid_sampling = False
         self._predicated = False
-        self._predicated_parent: Callable[[], tuple[VersionRef, ResolvedRuntimeState]] | None = (
+        self._predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]] | None = (
             predicated_parent
         )
         self._selected_point = record.selected_point
-        self._selected_runtime: ResolvedRuntimeState | None = None
+        self._selected_runtime: RequestRuntime | None = None
         self._resolved_callback = resolved_callback
         self._completion_tasks = completion_tasks
         self._completion_error = False
@@ -1279,7 +1279,7 @@ class _PendingDigest:
         return int(self._selected_point)
 
     @property
-    def selected_runtime(self) -> ResolvedRuntimeState:
+    def selected_runtime(self) -> RequestRuntime:
         self.resolve()
         if self._selected_runtime is None:
             raise RuntimeError("predicated operation lost its selected runtime state")
@@ -1447,7 +1447,7 @@ def _completion_error_record(record: CompletionRecord) -> CompletionRecord:
 def _predicated_record(
     record: CompletionRecord,
     selected_point: int,
-    runtime: ResolvedRuntimeState,
+    runtime: RequestRuntime,
 ) -> CompletionRecord:
     return replace(
         record,

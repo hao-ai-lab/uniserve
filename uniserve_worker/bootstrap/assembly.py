@@ -18,9 +18,9 @@ def assemble_worker(config: WorkerLaunchConfig):
 
     plan = resolve_worker_plan(config.worker_kind)
     if plan.implementation is WorkerImplementation.SYSTEM:
-        from ..worker.system import SystemWorker
+        from ..worker import Worker
 
-        return SystemWorker(
+        return Worker.system(
             allowed_work_variants=plan.allowed_work_variants,
             block_size=config.resources.block_size,
             max_batch_tokens=config.resources.max_batch_tokens,
@@ -112,7 +112,7 @@ def assemble_worker(config: WorkerLaunchConfig):
 
     place_towers(model, mesh)
 
-    from ..worker.model import ModelWorker
+    from ..worker import Worker
 
     attention = resolve_attention_selection(
         deployment.attention_backend or "auto",
@@ -120,7 +120,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         block_size=deployment.block_size,
     )
 
-    return ModelWorker(
+    return Worker(
         model,
         mesh=mesh,
         deployment=deployment,

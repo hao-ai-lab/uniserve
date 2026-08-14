@@ -4,8 +4,9 @@ import time
 from dataclasses import replace
 
 from tests.python.fixtures.depth_one import (
-    commit_resolved,
+    commit_for_completion,
     execution_batch,
+    finalized_report,
     root_parent,
     token_operation,
     und_admission,
@@ -34,12 +35,12 @@ from uniserve_worker.batch import (
     VersionRef,
     Work,
 )
-from uniserve_worker.runtime.transfer import (
+from uniserve_worker.transfer.connector import CachePublication
+from uniserve_worker.transfer.tickets import (
     Locator,
     decode_transfer_descriptor,
     encode_transfer_descriptor,
 )
-from uniserve_worker.transfer.cache import CachePublication
 
 
 def _installation_operation(
@@ -101,7 +102,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    worker.execute(
+    first_result = worker.execute(
         execution_batch(
             step_id=1,
             admissions=(admission,),
@@ -109,7 +110,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
             input_products=(extend_input,),
         )
     )
-    first_commit = commit_resolved(worker.sessions.get(41))
+    first_commit = commit_for_completion(extend, first_result)
     closure_template, closure_input = token_operation(
         admission.request_key,
         op_id=2,
@@ -145,21 +146,21 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     assert closure_record.logical_lengths.kv_visible_len == 3
     assert closure_record.logical_lengths.kv_initialized_len == 3
 
-    second_commit = commit_resolved(worker.sessions.get(41))
+    second_commit = commit_for_completion(closure, closure_result)
     publication, publication_product = _publication_operation(
         admission.request_key,
         op_id=3,
         parent=second_commit.selected,
         control_seq=second_commit.control_seq,
     )
-    publication_result = worker.execute(
+    publication_result = finalized_report(worker.execute(
         execution_batch(
             step_id=3,
             admissions=(),
             operations=(publication,),
             controls=(second_commit,),
         )
-    )
+    ))
 
     assert publication_result.completions[0].selected_point == 0
     assert publication_result.completions[0].logical_lengths.kv_published_len == 3
@@ -204,21 +205,21 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     )
     assert suffix_result.completions[0].logical_lengths.kv_visible_len == 4
 
-    suffix_commit = commit_resolved(worker.sessions.get(41))
+    suffix_commit = commit_for_completion(suffix_closure, suffix_result)
     incremental, incremental_product = _publication_operation(
         admission.request_key,
         op_id=5,
         parent=suffix_commit.selected,
         control_seq=suffix_commit.control_seq,
     )
-    incremental_result = worker.execute(
+    incremental_result = finalized_report(worker.execute(
         execution_batch(
             step_id=5,
             admissions=(),
             operations=(incremental,),
             controls=(suffix_commit,),
         )
-    )
+    ))
     incremental_payload = incremental_result.products[0]
     kind, descriptor, producer_plan_digest = decode_transfer_descriptor(incremental_payload.payload)
     assert kind == "kv"
@@ -244,7 +245,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         tokens=(3, 4),
     )
     try:
-        producer.execute(
+        extended = producer.execute(
             execution_batch(
                 step_id=1,
                 admissions=(admission,),
@@ -252,20 +253,20 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
                 input_products=(extend_input,),
             )
         )
-        commit = commit_resolved(producer.sessions.get(42))
+        commit = commit_for_completion(extend, extended)
         publication, source = _publication_operation(
             admission.request_key,
             op_id=2,
             parent=commit.selected,
             control_seq=commit.control_seq,
         )
-        published = producer.execute(
+        published = finalized_report(producer.execute(
             execution_batch(
                 step_id=2,
                 operations=(publication,),
                 controls=(commit,),
             )
-        )
+        ))
         assert len(published.products) == 1
         installation, installed = _installation_operation(
             admission,
@@ -324,7 +325,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
         released_consumer.close()
 
 
-def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination() -> None:
+def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> None:
     producer = execution_worker(transfer_backend="shm")
     consumer = execution_worker(transfer_backend="shm")
     admission = und_admission(43, block_ids=(0,))
@@ -336,7 +337,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
         tokens=(7, 8),
     )
     try:
-        producer.execute(
+        extended = producer.execute(
             execution_batch(
                 step_id=1,
                 admissions=(admission,),
@@ -344,15 +345,17 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
                 input_products=(extend_input,),
             )
         )
-        commit = commit_resolved(producer.sessions.get(43))
+        commit = commit_for_completion(extend, extended)
         publication, source = _publication_operation(
             admission.request_key,
             op_id=2,
             parent=commit.selected,
             control_seq=commit.control_seq,
         )
-        published = producer.execute(
-            execution_batch(step_id=2, operations=(publication,), controls=(commit,))
+        published = finalized_report(
+            producer.execute(
+                execution_batch(step_id=2, operations=(publication,), controls=(commit,))
+            )
         ).products[0]
         kind, value, producer_digest = decode_transfer_descriptor(published.payload)
         snapshot = CachePublication.from_wire(value["snapshot"])
@@ -366,7 +369,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_rolls_back_destination(
             product=published.product,
             payload=encode_transfer_descriptor(
                 kind,
-                {"snapshot": broken.to_wire()},
+                {"generation": value["generation"], "snapshot": broken.to_wire()},
                 producer_digest,
             ),
         )

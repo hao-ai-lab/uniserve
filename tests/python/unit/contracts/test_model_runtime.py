@@ -8,12 +8,11 @@ import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL
 from uniserve_worker.batch import WorkVariant
+from uniserve_worker.bootstrap.capabilities import resolve_capabilities
+from uniserve_worker.bootstrap.capacity import latent_trajectory_bytes, model_arena_capacity
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.sizing import ceil_div
 from uniserve_worker.models.identity import ModelIdentity, architecture_identity
-from uniserve_worker.runtime.arena_capacity import model_arena_capacity
-from uniserve_worker.runtime.capabilities import resolve_capabilities
-from uniserve_worker.runtime.latent_capacity import latent_trajectory_bytes
 
 pytestmark = pytest.mark.unit
 

@@ -5,7 +5,7 @@ embeds tokens, runs the decoder stack (single-axis RoPE via
 ``RotaryEmbedding.cos_sin_1d``, full ``head_dim`` QK-norm, the fused
 QK-norm+RoPE kernel), and calls :class:`RadixAttention` per layer. It owns **no**
 KV pool, builds **no** attention metadata, captures **no** CUDA graphs, and never
-advances KV length. The executor, runner, and stores own those behaviors.
+advances KV length. The model runner and stores own those behaviors.
 """
 
 from __future__ import annotations

@@ -18,8 +18,7 @@ from ..foundation.runtime_config import (
 from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
 from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment, active_latent_capacity_tokens
-from .arena_capacity import operation_window
-from .latent_capacity import latent_pool_capacity_bytes
+from .capacity import latent_pool_capacity_bytes, operation_window
 
 __all__ = ["resolve_capabilities"]
 

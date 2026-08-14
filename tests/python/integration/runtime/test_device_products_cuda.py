@@ -50,6 +50,7 @@ def test_consumer_stream_observes_the_exact_producer_generation() -> None:
     with torch.cuda.stream(producer):
         torch.cuda._sleep(50_000_000)
         products.publish_write(write, torch.tensor([73], dtype=torch.long, device=device))
+        products.commit_writes((write,))
     with torch.cuda.stream(consumer):
         read = products.consume(
             reference,
@@ -73,6 +74,7 @@ def test_reuse_waits_until_every_consumer_stream_retires() -> None:
     (write,) = products.bind_outputs(((first, "cd" * 32, device),))
     with torch.cuda.stream(producer):
         products.publish_write(write, torch.tensor([17], dtype=torch.long, device=device))
+        products.commit_writes((write,))
     with torch.cuda.stream(delayed_consumer):
         read = products.consume(first, consumer_op_id=22, device=device)
         observed = read.tensor.clone()
@@ -92,6 +94,7 @@ def test_reuse_waits_until_every_consumer_stream_retires() -> None:
             second_write,
             torch.tensor([29], dtype=torch.long, device=device),
         )
+        products.commit_writes((second_write,))
     producer.synchronize()
 
     assert observed.item() == 17

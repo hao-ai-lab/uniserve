@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import time
 from multiprocessing import shared_memory
-from threading import Event
 
 import pytest
 import torch
@@ -12,9 +10,9 @@ from uniserve_worker.foundation.product_transfer import (
     MAX_TRANSFER_DESCRIPTOR_BYTES,
     TRANSFER_DESCRIPTOR_PREFIX,
 )
-from uniserve_worker.runtime.transfer import (
+from uniserve_worker.transfer.tickets import (
+    LocalTransport,
     ShmTransport,
-    _BoundedTransferPool,
     decode_transfer_descriptor,
     encode_transfer_descriptor,
 )
@@ -22,7 +20,7 @@ from uniserve_worker.runtime.transfer import (
 
 def test_transfer_descriptor_round_trips_exact_canonical_provenance() -> None:
     digest = "a" * 64
-    for kind in ("tensor", "kv", "latent"):
+    for kind in ("encoder", "device_product", "kv", "latent"):
         encoded = encode_transfer_descriptor(kind, {"height": 16, "width": 24}, digest)
         assert decode_transfer_descriptor(encoded) == (
             kind,
@@ -43,76 +41,21 @@ def test_transfer_descriptor_rejects_noncanonical_or_unbounded_frames() -> None:
         decode_transfer_descriptor(oversized)
     with pytest.raises(WorkerError, match="descriptor bound"):
         encode_transfer_descriptor(
-            "tensor", {"payload": "x" * MAX_TRANSFER_DESCRIPTOR_BYTES}, digest
+            "device_product", {"payload": "x" * MAX_TRANSFER_DESCRIPTOR_BYTES}, digest
         )
 
 
-def test_transfer_entry_capacity_is_nonblocking_and_reclaimable() -> None:
-    release = Event()
-    pool = _BoundedTransferPool(
-        workers=1,
-        capacity=2,
-        byte_capacity=16,
-        name="transfer-entry-test",
-    )
-
-    def blocked(value: int) -> torch.Tensor:
-        assert release.wait(timeout=5.0)
-        return torch.tensor([value])
-
+def test_local_transport_capacity_is_atomic_and_reclaimable() -> None:
+    transport = LocalTransport(byte_capacity=16)
     try:
-        first = pool.submit(blocked, 1, nbytes=8)
-        second = pool.submit(blocked, 2, nbytes=8)
-        with pytest.raises(ResourceError):
-            pool.submit(blocked, 3, nbytes=1)
-        release.set()
-        deadline = time.monotonic() + 5.0
-        while not (first.ready() and second.ready()) and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert first.ready() and second.ready()
-        assert first.result().tolist() == [1]
-        assert second.result().tolist() == [2]
-        successor = pool.submit(blocked, 3, nbytes=8)
-        deadline = time.monotonic() + 5.0
-        while not successor.ready() and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert successor.ready()
-        assert successor.result().tolist() == [3]
-    finally:
-        release.set()
-        pool.close()
-
-
-def test_transfer_byte_capacity_is_atomic_and_reclaimable() -> None:
-    release = Event()
-    pool = _BoundedTransferPool(
-        workers=1,
-        capacity=3,
-        byte_capacity=16,
-        name="transfer-byte-test",
-    )
-
-    def blocked() -> torch.Tensor:
-        assert release.wait(timeout=5.0)
-        return torch.tensor([1])
-
-    try:
-        first = pool.submit(blocked, nbytes=12)
+        first = transport.publish(torch.arange(3, dtype=torch.float32))
         with pytest.raises(ResourceError, match="byte capacity"):
-            pool.submit(blocked, nbytes=8)
-        release.set()
-        deadline = time.monotonic() + 5.0
-        while not first.ready() and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert first.ready()
-        successor = pool.submit(blocked, nbytes=16)
-        deadline = time.monotonic() + 5.0
-        while not successor.ready() and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert successor.ready()
+            transport.publish(torch.arange(2, dtype=torch.float32))
+        transport.release(first)
+        successor = transport.publish(torch.arange(4, dtype=torch.float32))
+        torch.testing.assert_close(transport.fetch(successor), torch.arange(4, dtype=torch.float32))
     finally:
-        release.set()
-        pool.close()
+        transport.close()
 
 
 def test_shm_async_publication_round_trips_cpu_storage() -> None:
