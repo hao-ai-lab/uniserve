@@ -7118,7 +7118,7 @@ def _run_fused_top_k_sampling(
         draws,
         penalty_token_ids,
         penalty_counts,
-        parameters,
+        provider.SamplingParameters.from_columns(parameters),
         int(top_k),
     )
     if (

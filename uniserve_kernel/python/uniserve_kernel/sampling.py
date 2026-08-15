@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import cast
 
@@ -15,15 +16,50 @@ _SamplingKernel = Callable[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ],
     tuple[torch.Tensor, torch.Tensor],
 ]
+
+
+@dataclass(frozen=True)
+class SamplingParameters:
+    temperature: torch.Tensor
+    top_p: torch.Tensor
+    min_p: torch.Tensor
+    repetition_penalty: torch.Tensor
+    frequency_penalty: torch.Tensor
+    presence_penalty: torch.Tensor
+
+    @classmethod
+    def from_columns(cls, values: torch.Tensor) -> "SamplingParameters":
+        if values.ndim != 2 or int(values.shape[-1]) != 6:
+            raise ValueError("sampling parameters must have six columns per row")
+        return cls(
+            temperature=values[:, 0],
+            top_p=values[:, 1],
+            min_p=values[:, 2],
+            repetition_penalty=values[:, 3],
+            frequency_penalty=values[:, 4],
+            presence_penalty=values[:, 5],
+        )
+
+
 def _sample_top_k_tensor(
     logits: torch.Tensor,
     draws: torch.Tensor,
     penalty_token_ids: torch.Tensor,
     penalty_counts: torch.Tensor,
-    parameters: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+    repetition_penalty: torch.Tensor,
+    frequency_penalty: torch.Tensor,
+    presence_penalty: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     work = logits.float()
@@ -40,9 +76,9 @@ def _sample_top_k_tensor(
         flat = work.flatten()
         values = flat.gather(0, penalty_indexes)
         counts = penalty_counts.flatten()
-        repetition = parameters[:, 3].unsqueeze(1).expand_as(penalty_counts).flatten()
-        frequency = parameters[:, 4].unsqueeze(1).expand_as(penalty_counts).flatten()
-        presence = parameters[:, 5].unsqueeze(1).expand_as(penalty_counts).flatten()
+        repetition = repetition_penalty.unsqueeze(1).expand_as(penalty_counts).flatten()
+        frequency = frequency_penalty.unsqueeze(1).expand_as(penalty_counts).flatten()
+        presence = presence_penalty.unsqueeze(1).expand_as(penalty_counts).flatten()
         adjusted = (
             torch.where(
                 values > 0.0,
@@ -62,11 +98,10 @@ def _sample_top_k_tensor(
             ),
         )
         work = flat.view_as(work)
-    temperatures = parameters[:, 0]
     divisors = torch.where(
-        temperatures > 0.0,
-        temperatures,
-        torch.ones_like(temperatures),
+        temperature > 0.0,
+        temperature,
+        torch.ones_like(temperature),
     )
     work = work / divisors.unsqueeze(1)
     candidates, token_indexes = torch.topk(
@@ -76,10 +111,9 @@ def _sample_top_k_tensor(
         sorted=True,
     )
     cumulative = torch.softmax(candidates, dim=-1).cumsum(dim=-1)
-    over = cumulative > parameters[:, 1].unsqueeze(1)
+    over = cumulative > top_p.unsqueeze(1)
     drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
     candidates = torch.where(drop, float("-inf"), candidates)
-    min_p = parameters[:, 2]
     min_threshold = candidates[:, 0] + torch.log(min_p)
     candidates = torch.where(
         (min_p.unsqueeze(1) <= 0.0) | (candidates >= min_threshold.unsqueeze(1)),
@@ -97,7 +131,7 @@ def _sample_top_k_tensor(
     )
     sampled = token_order.gather(1, sampled_order.unsqueeze(1))[:, 0]
     selected = torch.where(
-        temperatures > 0.0,
+        temperature > 0.0,
         sampled,
         torch.zeros_like(sampled),
     )
@@ -111,22 +145,30 @@ def _sample_top_k_tensor(
 
 
 @lru_cache(maxsize=256)
-def _compiled_sampling(top_k: int, has_penalties: bool) -> _SamplingKernel:
-    del has_penalties
-
+def _compiled_sampling(top_k: int) -> _SamplingKernel:
     def kernel(
         logits: torch.Tensor,
         draws: torch.Tensor,
         penalty_token_ids: torch.Tensor,
         penalty_counts: torch.Tensor,
-        parameters: torch.Tensor,
+        temperature: torch.Tensor,
+        top_p: torch.Tensor,
+        min_p: torch.Tensor,
+        repetition_penalty: torch.Tensor,
+        frequency_penalty: torch.Tensor,
+        presence_penalty: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return _sample_top_k_tensor(
             logits,
             draws,
             penalty_token_ids,
             penalty_counts,
-            parameters,
+            temperature,
+            top_p,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
             top_k,
         )
 
@@ -145,14 +187,21 @@ def sample_top_k(
     draws: torch.Tensor,
     penalty_token_ids: torch.Tensor,
     penalty_counts: torch.Tensor,
-    parameters: torch.Tensor,
+    parameters: SamplingParameters,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draw exact tokens from rows whose top-k candidate bound is at most 128."""
 
     if logits.ndim != 2 or draws.shape != logits.shape[:1]:
         raise ValueError("sampling provider draws must align with logits rows")
-    if parameters.shape != (logits.shape[0], 6):
+    if (
+        parameters.temperature.shape != logits.shape[:1]
+        or parameters.top_p.shape != logits.shape[:1]
+        or parameters.min_p.shape != logits.shape[:1]
+        or parameters.repetition_penalty.shape != logits.shape[:1]
+        or parameters.frequency_penalty.shape != logits.shape[:1]
+        or parameters.presence_penalty.shape != logits.shape[:1]
+    ):
         raise ValueError("sampling provider parameter vectors do not align with logits")
     if (
         penalty_token_ids.ndim != 2
@@ -162,20 +211,23 @@ def sample_top_k(
         raise ValueError("sampling provider penalty vectors do not align")
     if not 0 < int(top_k) <= 128 or int(top_k) >= int(logits.shape[1]):
         raise ValueError("sampling provider requires an exact top-k candidate bound")
-    if logits.device.type != "cuda":
-        return _sample_top_k_tensor(
-            logits,
-            draws,
-            penalty_token_ids,
-            penalty_counts,
-            parameters,
-            int(top_k),
-        )
-    implementation = _compiled_sampling(
+    args = (
+        logits,
+        draws,
+        penalty_token_ids,
+        penalty_counts,
+        parameters.temperature,
+        parameters.top_p,
+        parameters.min_p,
+        parameters.repetition_penalty,
+        parameters.frequency_penalty,
+        parameters.presence_penalty,
         int(top_k),
-        int(penalty_token_ids.shape[1]) > 0,
     )
-    return implementation(logits, draws, penalty_token_ids, penalty_counts, parameters)
+    if logits.device.type != "cuda":
+        return _sample_top_k_tensor(*args)
+    implementation = _compiled_sampling(int(top_k))
+    return implementation(*args[:-1])
 
 
-__all__ = ["sample_top_k"]
+__all__ = ["SamplingParameters", "sample_top_k"]

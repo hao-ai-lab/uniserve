@@ -52,6 +52,14 @@ class AttentionCapabilities:
     # avoid dispatching shapes the kernel would hard-reject. This is the single
     # authoritative source for that table.
     trunk_geometries: frozenset[tuple[int, int, int]] = field(default_factory=frozenset)
+    # Dense-forward constraints. ``cuda_only`` and ``min_cuda_capability`` also
+    # apply to every other regime; ``dense_ranks`` is the set of accepted q/k/v
+    # ndims for the contiguous dense path; ``accepts_dense_mask`` is whether
+    # ``DenseAttention.attn_mask`` may be non-None.
+    cuda_only: bool = False
+    min_cuda_capability: tuple[int, int] | None = None
+    dense_ranks: frozenset[int] = field(default_factory=lambda: frozenset({3, 4}))
+    accepts_dense_mask: bool = False
 
     def supports_trunk_geometry(self, q_head_dim: int, k_head_dim: int, v_head_dim: int) -> bool:
         """Whether the backend kernel accepts this exact ``(q, k, v)`` geometry.

@@ -1,20 +1,10 @@
 """Prefix-bound helpers for visible-end attention."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:  # pragma: no cover
-    import torch
-
-
-def _torch():
-    import torch
-
-    return torch
+import torch
 
 
 def _validate_visible_end(visible_end: torch.Tensor) -> tuple[int, int]:
-    torch = _torch()
     if visible_end.dtype != torch.int32:
         raise TypeError(f"visible_end must be int32, got {visible_end.dtype}")
     if visible_end.ndim != 2:
@@ -31,24 +21,18 @@ def compute_prefix_bounds(
 ) -> torch.Tensor:
     """Reduce ``visible_end[batch, seqlen_q]`` to per-Q-tile min/max bounds."""
 
-    torch = _torch()
     batch, seqlen_q = _validate_visible_end(visible_end)
-    q_tile_size = int(q_tile_size)
-    if q_tile_size <= 0:
-        raise ValueError("q_tile_size must be positive")
-    num_q_tiles = (seqlen_q + q_tile_size - 1) // q_tile_size
-    out = torch.zeros(
-        (batch, num_q_tiles, 2),
+    seqlens_q = torch.full(
+        (batch,),
+        seqlen_q,
         dtype=torch.int32,
         device=visible_end.device,
     )
-    for tile in range(num_q_tiles):
-        start = tile * q_tile_size
-        end = min(start + q_tile_size, seqlen_q)
-        values = visible_end[:, start:end]
-        out[:, tile, 0] = values.min(dim=-1).values
-        out[:, tile, 1] = values.max(dim=-1).values
-    return out.contiguous()
+    return compute_prefix_bounds_varlen(
+        visible_end,
+        seqlens_q,
+        q_tile_size=q_tile_size,
+    )
 
 
 def compute_prefix_bounds_varlen(
@@ -60,7 +44,6 @@ def compute_prefix_bounds_varlen(
 ) -> torch.Tensor:
     """Reduce padded ``visible_end`` rows using per-batch query lengths."""
 
-    torch = _torch()
     batch, max_q = _validate_visible_end(visible_end)
     if seqlens_q.ndim != 1 or int(seqlens_q.shape[0]) != batch:
         raise ValueError("seqlens_q must be a 1D tensor with one entry per batch row")

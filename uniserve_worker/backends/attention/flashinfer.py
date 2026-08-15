@@ -117,6 +117,8 @@ class FlashInferAttentionBackend(_WrapperPool):
             paged_block_size_multiple=1,
             min_head_dim=64,
             paged_decode_only=True,
+            cuda_only=True,
+            dense_ranks=frozenset({3}),
         )
 
     def forward(

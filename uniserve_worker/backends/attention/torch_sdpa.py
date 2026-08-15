@@ -25,6 +25,8 @@ class TorchSDPAAttentionBackend:
             varlen_paged_kv=True,
             visible_end=True,
             visible_end_cuda_graph=True,
+            dense_ranks=frozenset({3, 4}),
+            accepts_dense_mask=True,
         )
 
     def forward(

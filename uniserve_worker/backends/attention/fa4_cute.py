@@ -102,6 +102,8 @@ class Fa4CuteAttentionBackend:
             visible_end_cuda_graph=available,
             paged_block_size_multiple=1,
             trunk_geometries=_SUPPORTED_TRUNK_GEOMETRIES,
+            cuda_only=True,
+            dense_ranks=frozenset({4}),
         )
 
     def forward(

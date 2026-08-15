@@ -45,7 +45,6 @@ _EXPORTS: dict[str, str] = {
     "TopK": "moe",
     # norm
     "RMSNorm": "norm",
-    "try_triton_qk_rms_norm": "norm",
     # parameter and modality-tower placement
     "ShardPlan": "placement",
     "ShardSlot": "placement",
@@ -66,7 +65,6 @@ _EXPORTS: dict[str, str] = {
     "get_rope": "rope",
     "qk_norm_rope": "rope",
     "rotate_half": "rope",
-    "try_triton_qk_rms_norm_rope": "rope",
     # vae
     "AutoEncoder": "vae",
     "AutoEncoderParams": "vae",
@@ -138,8 +136,6 @@ __all__ = [
     "set_shard_plan",
     "set_tower_coord",
     "shard_spec",
-    "try_triton_qk_rms_norm",
-    "try_triton_qk_rms_norm_rope",
 ]
 
 # Single-source-of-truth guard: the lazy resolver map and the advertised surface
@@ -181,7 +177,7 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
         divide,
     )
     from .moe import FusedMoE, TopK
-    from .norm import RMSNorm, try_triton_qk_rms_norm
+    from .norm import RMSNorm
     from .placement import (
         ShardPlan,
         ShardSlot,
@@ -203,7 +199,6 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
         get_rope,
         qk_norm_rope,
         rotate_half,
-        try_triton_qk_rms_norm_rope,
     )
     from .vae import AutoEncoder, AutoEncoderParams, default_ae_params
     from .vision import MLPConnector, NeoVitEncoder, PatchEmbed, SiglipNavitEncoder, VisionEncoder

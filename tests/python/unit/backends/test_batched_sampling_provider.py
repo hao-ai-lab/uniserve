@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from uniserve_kernel.sampling import sample_top_k
+from uniserve_kernel.sampling import SamplingParameters, sample_top_k
 
 from uniserve_worker.backends.triton import configure_triton_toolchain
 
@@ -88,7 +88,15 @@ def _inputs(device: torch.device) -> tuple[torch.Tensor, ...]:
 def test_top_k_provider_matches_the_full_expression() -> None:
     inputs = _inputs(torch.device("cpu"))
 
-    tokens, valid = sample_top_k(*inputs, 4)
+    logits, draws, penalty_token_ids, penalty_counts, parameters = inputs
+    tokens, valid = sample_top_k(
+        logits,
+        draws,
+        penalty_token_ids,
+        penalty_counts,
+        SamplingParameters.from_columns(parameters),
+        4,
+    )
 
     assert valid.tolist() == [True, True]
     assert torch.equal(tokens, _reference(*inputs, 4))
@@ -100,12 +108,16 @@ def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
     assert configure_triton_toolchain()
     inputs = _inputs(torch.device("cuda"))
     expected = _reference(*inputs, 4)
-    sample_top_k(*inputs, 4)
+    logits, draws, penalty_token_ids, penalty_counts, parameters = inputs
+    packed = SamplingParameters.from_columns(parameters)
+    sample_top_k(logits, draws, penalty_token_ids, penalty_counts, packed, 4)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
 
     with torch.cuda.graph(graph):
-        captured, valid = sample_top_k(*inputs, 4)
+        captured, valid = sample_top_k(
+            logits, draws, penalty_token_ids, penalty_counts, packed, 4
+        )
     graph.replay()
     torch.cuda.synchronize()
 
@@ -146,7 +158,7 @@ def test_top_k_provider_accepts_every_serving_wave_row_count() -> None:
             draws,
             penalty_token_ids,
             penalty_counts,
-            parameters,
+            SamplingParameters.from_columns(parameters),
             1,
         )
 

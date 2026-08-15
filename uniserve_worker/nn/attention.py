@@ -60,14 +60,15 @@ class RadixAttention(nn.Module):
             if not isinstance(context.kv, EmptyKvView):
                 raise ValueError("dense attention must use an empty KV view")
             return ops.attention(
-                q,
-                k,
-                v,
-                regime=ops.AttentionRegime.DENSE,
-                causal=causal,
-                scale=effective_scale,
-                attn_mask=attn_mask,
-                ctx=context,
+                ops.DenseAttention(
+                    q=q,
+                    k=k,
+                    v=v,
+                    causal=causal,
+                    scale=effective_scale,
+                    attn_mask=attn_mask,
+                    ctx=context,
+                ),
                 selection=plan.backends,
             )
         if attn_mask is not None:
@@ -98,18 +99,19 @@ class RadixAttention(nn.Module):
             raise ValueError("paged decode query rows do not match its page table")
         k_cache, v_cache = context.kv.layer_kv(self.layer_id)
         out = ops.attention(
-            q.unsqueeze(2),
-            k_cache,
-            v_cache,
-            regime=ops.AttentionRegime.DECODE,
-            block_table=plan.block_table,
-            cache_seqlens=plan.cache_seqlens,
-            current_k=k.unsqueeze(2),
-            current_v=v.unsqueeze(2),
-            causal=causal,
-            scale=scale,
-            ctx=context,
-            kv_cache=context.kv,
+            ops.PagedDecodeAttention(
+                q=q.unsqueeze(2),
+                k=k_cache,
+                v=v_cache,
+                block_table=plan.block_table,
+                cache_seqlens=plan.cache_seqlens,
+                current_k=k.unsqueeze(2),
+                current_v=v.unsqueeze(2),
+                causal=causal,
+                scale=scale,
+                kv_cache=context.kv,
+                ctx=context,
+            ),
             selection=plan.backends,
         )
         return out.squeeze(2) if out.ndim == 4 else out
@@ -143,19 +145,20 @@ class RadixAttention(nn.Module):
         )
         k_cache, v_cache = context.kv.layer_kv(self.layer_id)
         out = ops.attention(
-            q_run,
-            k_cache,
-            v_cache,
-            regime=ops.AttentionRegime.EXTEND,
-            cu_seqlens_q=plan.cu_seqlens_q,
-            cu_seqlens_k=plan.cu_seqlens_k,
-            max_seqlen_q=plan.max_seqlen_q,
-            max_seqlen_k=plan.max_seqlen_k,
-            causal=causal,
-            scale=scale,
-            block_table=plan.block_table,
-            ctx=context,
-            kv_cache=context.kv,
+            ops.VarlenAttention(
+                q=q_run,
+                k=k_cache,
+                v=v_cache,
+                cu_seqlens_q=plan.cu_seqlens_q,
+                cu_seqlens_k=plan.cu_seqlens_k,
+                max_seqlen_q=plan.max_seqlen_q,
+                max_seqlen_k=plan.max_seqlen_k,
+                causal=causal,
+                scale=scale,
+                block_table=plan.block_table,
+                kv_cache=context.kv,
+                ctx=context,
+            ),
             selection=plan.backends,
         )
         if raw_tokens == int(q.shape[0]):
@@ -185,21 +188,21 @@ class RadixAttention(nn.Module):
         )
         k_cache, v_cache = context.kv.layer_kv(self.layer_id)
         return ops.attention(
-            q,
-            k_cache,
-            v_cache,
-            regime=ops.AttentionRegime.VISIBLE_END,
-            causal=False,
-            scale=scale,
-            ctx=context,
-            visible_end=plan.visible_end,
-            cu_seqlens_q=plan.cu_seqlens_q,
-            page_table=plan.page_table,
-            seqused_k=plan.seqused_k,
-            max_seqlen_q=plan.max_seqlen_q,
-            max_seqlen_k=plan.max_seqlen_k,
-            use_prefix_bounds=plan.use_prefix_bounds,
-            fully_visible=plan.fully_visible,
+            ops.VisibleEndAttention(
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                visible_end=plan.visible_end,
+                scale=scale,
+                cu_seqlens_q=plan.cu_seqlens_q,
+                page_table=plan.page_table,
+                seqused_k=plan.seqused_k,
+                max_seqlen_q=plan.max_seqlen_q,
+                max_seqlen_k=plan.max_seqlen_k,
+                use_prefix_bounds=plan.use_prefix_bounds,
+                fully_visible=plan.fully_visible,
+                ctx=context,
+            ),
             selection=plan.backends,
         )
 

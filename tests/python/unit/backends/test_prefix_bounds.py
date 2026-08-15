@@ -2,7 +2,19 @@ from __future__ import annotations
 
 import pytest
 import torch
-from uniserve_kernel._prefix_bounds import compute_prefix_bounds_varlen
+from uniserve_kernel._prefix_bounds import compute_prefix_bounds, compute_prefix_bounds_varlen
+
+
+def test_prefix_bounds_match_full_width_varlen() -> None:
+    visible_end = torch.tensor(((5, 6, 1, 8), (2, 3, 4, 0)), dtype=torch.int32)
+
+    actual = compute_prefix_bounds(visible_end, q_tile_size=2)
+    expected = compute_prefix_bounds_varlen(
+        visible_end,
+        torch.tensor((4, 4), dtype=torch.int32),
+        q_tile_size=2,
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_varlen_prefix_bounds_ignore_padded_query_values() -> None:

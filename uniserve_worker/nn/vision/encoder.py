@@ -60,11 +60,10 @@ class VisionSelfAttention(nn.Module):
         k = self.k_proj(x).view(n_tokens, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(n_tokens, self.num_heads, self.head_dim)
         cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
-        if ops.can_run_attention(
-            q,
-            k,
-            v,
-            regime=ops.AttentionRegime.EXTEND,
+        varlen = ops.VarlenAttention(
+            q=q,
+            k=k,
+            v=v,
             cu_seqlens_q=cu,
             cu_seqlens_k=cu,
             max_seqlen_q=max_seqlen,
@@ -72,25 +71,12 @@ class VisionSelfAttention(nn.Module):
             causal=False,
             scale=self.scale,
             ctx=context,
-            selection=context.attention.backends,
-        ):
+        )
+        if ops.can_run_attention(varlen, selection=context.attention.backends):
             # Single varlen attention call over the whole packed batch; the
             # per-image isolation is enforced by ``cu_seqlens`` instead of a
             # Python loop with one dense kernel launch per image.
-            out = ops.attention(
-                q,
-                k,
-                v,
-                regime=ops.AttentionRegime.EXTEND,
-                cu_seqlens_q=cu,
-                cu_seqlens_k=cu,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                causal=False,
-                scale=self.scale,
-                ctx=context,
-                selection=context.attention.backends,
-            )
+            out = ops.attention(varlen, selection=context.attention.backends)
             return self.out_proj(out.reshape(n_tokens, -1))
         # Portable fallback (e.g. CPU / SDPA-only backends without a varlen
         # kernel): attend each packed image segment independently, walking the

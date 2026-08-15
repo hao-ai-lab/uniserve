@@ -4,13 +4,12 @@ Models import this package instead of vendor kernels or backend registries.
 """
 from __future__ import annotations
 
-from .core import Dispatcher, Provider
+from .core import Dispatcher, Operator, Provider
 from .facade import (
     add_rms_norm,
     attention,
     can_run_attention,
     qk_norm,
-    qk_norm_packed_rope,
     qk_norm_rope,
     rms_norm,
     rope,
@@ -18,33 +17,47 @@ from .facade import (
 )
 from .requests import (
     AddRmsNormReq,
-    AttentionRegime,
     AttentionReq,
+    DenseAttention,
+    MultiAxisQKNormReq,
+    MultiAxisQKNormRopeReq,
     PackedRopeReq,
+    PagedDecodeAttention,
     QKNormReq,
     QKNormRopeReq,
     RmsNormReq,
     SiluAndMulReq,
+    VarlenAttention,
+    VisibleEndAttention,
 )
+from .rope import apply_rotary_emb, apply_rotary_pos_emb, rotate_half
 
 __all__ = [
     "AddRmsNormReq",
-    "AttentionRegime",
     "AttentionReq",
+    "DenseAttention",
     "Dispatcher",
+    "MultiAxisQKNormReq",
+    "MultiAxisQKNormRopeReq",
+    "Operator",
+    "PackedRopeReq",
+    "PagedDecodeAttention",
+    "Provider",
     "QKNormReq",
     "QKNormRopeReq",
-    "PackedRopeReq",
-    "Provider",
     "RmsNormReq",
     "SiluAndMulReq",
+    "VarlenAttention",
+    "VisibleEndAttention",
     "add_rms_norm",
+    "apply_rotary_emb",
+    "apply_rotary_pos_emb",
     "attention",
     "can_run_attention",
     "qk_norm",
-    "qk_norm_packed_rope",
     "qk_norm_rope",
-    "rope",
     "rms_norm",
+    "rope",
+    "rotate_half",
     "silu_and_mul",
 ]

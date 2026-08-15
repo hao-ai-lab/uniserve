@@ -38,6 +38,8 @@ class SglKernelAttentionBackend:
             varlen_attention=_flash_attn_varlen_func is not None,
             varlen_paged_kv=False,
             paged_block_size_multiple=256,
+            cuda_only=True,
+            dense_ranks=frozenset({3, 4}),
         )
 
     def forward(

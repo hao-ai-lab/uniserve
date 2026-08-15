@@ -1,4 +1,4 @@
-"""Backend/operator dispatch framework for worker compute ops."""
+"""Operator dispatch: one provider protocol and one selector."""
 from __future__ import annotations
 
 import os
@@ -20,11 +20,26 @@ class Provider(Protocol[ProviderReq, ProviderRes]):
 
     def run(self, req: ProviderReq) -> ProviderRes: ...
 
+    def launch_name(self, req: ProviderReq) -> str: ...
+
+
+class Operator:
+    """Shared provider identity; ``launch_name`` defaults to ``name``."""
+
+    def __init__(self, name: str, operator: str) -> None:
+        self.name = name
+        self.operator = operator
+
+    def launch_name(self, req: object) -> str:
+        del req
+        return self.name
+
+
 class Dispatcher(Generic[Req, Res]):
     """Run the first eligible provider for one operator.
 
-    Candidate order is explicit override first, then registered preference order,
-    with the eager provider as the terminal fallback.
+    Candidate order is an explicit override first, then registered preference
+    order. An empty, missing, or ``auto`` override leaves that order unchanged.
     """
 
     def __init__(
@@ -34,21 +49,20 @@ class Dispatcher(Generic[Req, Res]):
         *,
         env_override: str | None = None,
         signature: Callable[[Req], Any] | None = None,
-        fallback_names: tuple[str, ...] = ("eager",),
     ) -> None:
         if not providers:
             raise ValueError(f"operator {operator!r} needs at least one provider")
         self.operator = operator
         self._providers = list(providers)
+        self._by_name = {provider.name: provider for provider in self._providers}
+        if len(self._by_name) != len(self._providers):
+            raise ValueError(f"operator {operator!r} has duplicate provider names")
         self._env_override = env_override
         self._signature = signature
         self._memo: dict[tuple[str | None, Any], str] = {}
-        self._fallback_names = fallback_names
-        if not any(p.name in self._fallback_names for p in self._providers):
-            raise ValueError(f"operator {operator!r} has no terminal fallback provider")
 
     def provider_names(self) -> tuple[str, ...]:
-        return tuple(p.name for p in self._providers)
+        return tuple(provider.name for provider in self._providers)
 
     def ordered(self, override: str | None = None) -> tuple[Provider[Req, Res], ...]:
         return tuple(self._ordered(override))
@@ -62,72 +76,48 @@ class Dispatcher(Generic[Req, Res]):
         selected = str(selected).strip()
         if not selected or selected.lower() == "auto":
             return None
-        if selected.lower() in {"0", "false", "off"}:
-            return self._fallback_names[0]
-        if selected.lower() == "eager":
-            if any(provider.name == "eager" for provider in self._providers):
-                return "eager"
-            return self._fallback_names[0]
-        if selected.lower() in {"1", "true", "on"}:
-            return None
         return selected
-
-    def _raise_unknown_override(self, selected: str) -> None:
-        available = ", ".join(self.provider_names())
-        raise ValueError(
-            f"unknown provider override {selected!r} for operator {self.operator!r}; "
-            f"available providers: {available}"
-        )
 
     def _ordered(self, override: str | None) -> list[Provider[Req, Res]]:
         selected = self._resolve_override(override)
         if selected is None:
             return list(self._providers)
-        matches = [p for p in self._providers if p.name == selected]
-        rest = [p for p in self._providers if p.name != selected]
-        if not matches:
-            self._raise_unknown_override(selected)
-        return matches + rest
+        match = self._by_name.get(selected)
+        if match is None:
+            available = ", ".join(self.provider_names())
+            raise ValueError(
+                f"unknown provider override {selected!r} for operator {self.operator!r}; "
+                f"available providers: {available}"
+            )
+        return [match, *[provider for provider in self._providers if provider is not match]]
 
     def _observe(self, provider: Provider[Req, Res], req: Req) -> Res:
         stats = getattr(req, "stats", None)
         if stats is None:
+            ctx = getattr(req, "ctx", None)
+            stats = getattr(ctx, "stats", None) if ctx is not None else None
+        record = getattr(stats, "record_operator_launch", None) if stats is not None else None
+        if not callable(record):
             return provider.run(req)
         start = time.perf_counter_ns()
         try:
             return provider.run(req)
         finally:
-            elapsed_ns = time.perf_counter_ns() - start
-            if self.operator == "attention":
-                record_attention = getattr(stats, "record_attention_launch", None)
-                if callable(record_attention):
-                    display_name = getattr(provider, "display_name", None)
-                    name = display_name(req) if callable(display_name) else provider.name
-                    record_attention(name, elapsed_ns)
-                else:
-                    record = getattr(stats, "record_operator_launch", None)
-                    if callable(record):
-                        record(self.operator, provider.name, elapsed_ns)
-            else:
-                record = getattr(stats, "record_operator_launch", None)
-                if callable(record):
-                    record(self.operator, provider.name, elapsed_ns)
+            record(self.operator, provider.launch_name(req), time.perf_counter_ns() - start)
 
     def run(self, req: Req, *, override: str | None = None) -> Res:
         key = None
         if self._signature is not None:
-            try:
-                key = (self._resolve_override(override), self._signature(req))
-                memo_name = self._memo.get(key)
-                if memo_name is not None:
-                    for provider in self._ordered(memo_name):
-                        if provider.name == memo_name and provider.can_run(req):
-                            return self._observe(provider, req)
-            except Exception:
-                key = None
+            key = (self._resolve_override(override), self._signature(req))
+            memo_name = self._memo.get(key)
+            if memo_name is not None:
+                provider = self._by_name[memo_name]
+                if provider.can_run(req):
+                    return self._observe(provider, req)
         for provider in self._ordered(override):
             if provider.can_run(req):
                 if key is not None:
                     self._memo[key] = provider.name
                 return self._observe(provider, req)
-        raise RuntimeError(f"operator {self.operator!r} has no eligible provider; eager provider is broken")
+        names = ", ".join(self.provider_names())
+        raise RuntimeError(f"operator {self.operator!r} has no eligible provider among {names}")
