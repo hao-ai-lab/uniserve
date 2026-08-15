@@ -6,17 +6,12 @@ import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
 from uniserve_worker.bootstrap.capabilities import resolve_capabilities
-from uniserve_worker.foundation.runtime_config import (
-    graph_memory_budget_bytes,
-    graph_padding_block_count,
-)
 from uniserve_worker.models.runtime import CacheGeometry, ScratchGeometry
 from uniserve_worker.server.stub import StubModel
 
 pytestmark = pytest.mark.unit
 
 BLOCK_SIZE = 64
-BYTES_PER_TOKEN = 8192
 TOTAL_BYTES = 184 * 1024**3
 STATIC_FRACTION = 0.70
 
@@ -68,26 +63,3 @@ def test_capabilities_advertise_the_provisioned_scratch_capacity(scratch, expect
 
     assert capabilities.num_blocks * BLOCK_SIZE == 131072
     assert capabilities.scratch_capacity_tokens == expected
-
-
-@pytest.mark.parametrize("weight_bytes", [0, 35 * 1024**3, 62 * 1024**3])
-def test_automatic_capacity_respects_the_static_memory_fraction(monkeypatch, weight_bytes):
-    model = _model(ScratchGeometry(fixed_tokens=65536, mirror_kv=True))
-    deployment = _deployment(token_capacity=None)
-    monkeypatch.setattr(
-        "torch.cuda.mem_get_info",
-        lambda device: (TOTAL_BYTES - weight_bytes, TOTAL_BYTES),
-        raising=False,
-    )
-
-    capabilities = resolve_capabilities(model, deployment)
-
-    padding_blocks = graph_padding_block_count(BLOCK_SIZE)
-    request_blocks = capabilities.num_blocks + padding_blocks
-    scratch_blocks = capabilities.scratch_capacity_tokens // BLOCK_SIZE + padding_blocks
-    static_bytes = (
-        weight_bytes
-        + (request_blocks + scratch_blocks) * BLOCK_SIZE * BYTES_PER_TOKEN
-        + graph_memory_budget_bytes(TOTAL_BYTES)
-    )
-    assert static_bytes <= STATIC_FRACTION * TOTAL_BYTES

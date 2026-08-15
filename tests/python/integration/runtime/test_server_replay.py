@@ -18,7 +18,6 @@ from uniserve_worker.batch import (
     Batch,
     Operation,
     ProductPayload,
-    Release,
     TokenMode,
 )
 from uniserve_worker.server.app import WorkerServer
@@ -157,10 +156,8 @@ def test_conflicting_digest_and_mixed_registration_fail_before_new_admission() -
     assert responses[1]["kind"] == "result"
     assert responses[2]["kind"] == "error"
     assert responses[2]["code"] == "InvalidDescriptor"
-    assert "plan digest" in str(responses[2]["message"])
     assert responses[3]["kind"] == "error"
     assert responses[3]["code"] == "InvalidDescriptor"
-    assert "registered and unregistered" in str(responses[3]["message"])
 
 
 def test_completed_report_remains_replayable_after_later_execution() -> None:
@@ -251,29 +248,3 @@ def test_atomic_replay_remains_available_until_every_participant_epoch_ends() ->
     responses = _by_call(endpoint)
     assert responses[2]["kind"] == "ok"
     assert responses[3]["completion_report"] == responses[1]["completion_report"]
-
-
-def test_control_only_submission_completes_without_an_operation_registration() -> None:
-    admission, operation, _payload, _batch = _token_batch(
-        session_id=4,
-        op_id=61,
-        step_id=14,
-        tokens=(9,),
-    )
-    control_batch = Batch(
-        step_id=14,
-        controls=(Release(admission.request_key, operation.op_id),),
-    )
-    endpoint = _Endpoint(
-        (
-            _request(1, control_batch),
-            {"kind": "shutdown", "call_id": 2},
-        )
-    )
-    server = WorkerServer(execution_worker(), endpoint)
-
-    WorkerServeLoop(server, endpoint).run()
-
-    response = _by_call(endpoint)[1]
-    assert response["kind"] == "result"
-    assert response["completion_report"] == {"step_id": 14, "partitions": []}

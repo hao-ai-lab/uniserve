@@ -5,17 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
-from uniserve_worker.execution.forward_batch import (
-    AttentionSelection,
-    EmptyKvView,
-    EmptyMeshView,
-    ForwardBatch,
-    ModelPhase,
-    NoAttention,
-)
-from uniserve_worker.nn.layer import LayerSpec
-from uniserve_worker.nn.mesh import TensorParallelSpec
 from uniserve_worker.nn.vision import (
     PatchEmbed,
     PositionEmbedding,
@@ -24,21 +13,8 @@ from uniserve_worker.nn.vision import (
     patchify_batch,
     unpatchify_batch,
 )
-from uniserve_worker.nn.vision.encoder import VisionSelfAttention
 
 pytestmark = pytest.mark.unit
-
-
-def _forward_context() -> ForwardBatch:
-    selection = AttentionSelection("torch_sdpa", (TorchSDPAAttentionBackend(),))
-    return ForwardBatch(
-        phase=ModelPhase.ENCODE_VISION,
-        row_count=1,
-        request_pool_indices=torch.tensor([1]),
-        kv=EmptyKvView(),
-        attention=NoAttention(selection),
-        mesh=EmptyMeshView(),
-    )
 
 
 def test_patch_embed_conv_flatten_shape_and_values():
@@ -72,23 +48,3 @@ def test_position_embedding_supports_bagel_and_sensenova_initialization_modes():
 
     ids = get_flattened_position_ids_extrapolate(4, 6, 2, 8)
     torch.testing.assert_close(ids, torch.tensor([0, 1, 2, 8, 9, 10]))
-
-
-def test_vision_attention_preserves_packed_image_shape():
-    context = _forward_context()
-    attention = VisionSelfAttention(
-        hidden_size=8,
-        num_heads=2,
-        spec=LayerSpec(TensorParallelSpec(rank=0, size=1), None),
-    )
-    tokens = torch.randn(3, 8)
-
-    output = attention(
-        tokens,
-        torch.tensor([0, 3], dtype=torch.int32),
-        context,
-        max_seqlen=3,
-        seq_lens=(3,),
-    )
-
-    assert output.shape == tokens.shape

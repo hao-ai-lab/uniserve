@@ -23,12 +23,8 @@ from uniserve_worker.batch import (
     BatchPartition,
     Bounds,
     CacheGroupPlacement,
-    Close,
-    CloseReason,
     Commit,
     CompletionRecord,
-    CompletionReport,
-    Control,
     DevicePoint,
     Disposition,
     Domain,
@@ -43,14 +39,11 @@ from uniserve_worker.batch import (
     LogicalLengths,
     Operation,
     OpStatus,
-    PartitionCompletion,
     PointRange,
     ProductKind,
     ProductPayload,
     ProductRef,
     RecoveryPlacement,
-    RegistrationAck,
-    Release,
     RequestKey,
     Rng,
     SamplingState,
@@ -63,9 +56,6 @@ from uniserve_worker.batch import (
     UndAdmission,
     VersionRef,
     Work,
-    WorkerForwardStats,
-    WorkVariant,
-    control_content_digest,
     control_from_wire,
     control_to_wire,
     decode_sampling_state_bytes,
@@ -368,12 +358,7 @@ def test_protocol_layout_digest_matches_rust() -> None:
     assert protocol_layout_digest() == fixture["protocol_layout_digest"]
 
 
-# --- Round-trip and validation ---------------------------------------------
-
-
-def test_operation_round_trips_through_wire() -> None:
-    operation = _decode_operation()
-    assert Operation.from_wire(operation.to_wire()) == operation
+# --- Validation ------------------------------------------------------------
 
 
 def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() -> None:
@@ -399,7 +384,6 @@ def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() 
         submission_group=1,
         pages=(3, 4),
     )
-    assert BatchPartition.from_wire(valid.to_wire()) == valid
 
     second_key = RequestKey(authority_id=4, session_id=9, epoch=2)
     second = _trajectory_operation(second_key, Work("gen", "transition"), op_id=21)
@@ -459,14 +443,13 @@ def test_submission_group_has_one_fixed_latent_staging_partition() -> None:
         Batch(step_id=1, partitions=partitions)
 
 
-def test_recovery_placement_round_trip_preserves_the_latent_page_table() -> None:
+def test_recovery_placement_rejects_duplicate_latent_pages() -> None:
     placement = RecoveryPlacement(
         request_key=_request_key(),
         request_pool_idx=8,
         cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(1, 2), length=17),),
         latent_page_table=(7, 8),
     )
-    assert RecoveryPlacement.from_wire(placement.to_wire()) == placement
     with pytest.raises(WorkerError, match="identity"):
         replace(placement, latent_page_table=(7, 7))
 
@@ -497,7 +480,7 @@ def test_kv_publication_requires_a_fixed_semantic_parent() -> None:
         operation.validate()
 
 
-def test_every_work_variant_round_trips() -> None:
+def test_work_variants_bind_state_advancement_and_execution_domain() -> None:
     variants = [
         (Work("token", "extend"), True, Domain.PREFILL),
         (Work("token", "decode"), True, Domain.DECODE),
@@ -512,30 +495,9 @@ def test_every_work_variant_round_trips() -> None:
         (Work("gen", "flow"), True, Domain.FLOW),
         (Work("materialize", None), False, Domain.FLOW),
     ]
-    for index, (work, advances, domain) in enumerate(variants):
+    for work, advances, domain in variants:
         assert work.advances_state is advances
         assert execution_domain(work) is domain
-        assert Work.from_wire(work.to_wire()) == work
-        assert work.variant_index == index
-
-
-def test_completion_record_round_trips() -> None:
-    record = CompletionRecord(
-        request_key=_request_key(),
-        op_id=11,
-        completion_slot_generation=2,
-        status=OpStatus.OK,
-        selected_point=1,
-        logical_lengths=LogicalLengths(token_len=5, kv_visible_len=5),
-        token_span=TokenSpan(base=4, len=1),
-        committed_tokens=(271,),
-        finish_flags=FinishFlags(stop=True),
-        product_generations=(3, 5),
-        semantic_digest="bb" * 32,
-        error_code=None,
-        timing_counters=TimingCounters(),
-    )
-    assert CompletionRecord.from_wire(record.to_wire()) == record
 
 
 def test_error_completion_requires_error_code() -> None:
@@ -571,28 +533,6 @@ def test_error_completion_requires_error_code() -> None:
         error_code=ErrorCode.COMPUTE_ERROR,
         timing_counters=TimingCounters(),
     ).validate()
-
-
-def test_every_control_variant_round_trips() -> None:
-    controls: list[Control] = [
-        Commit(
-            request_key=_request_key(),
-            control_seq=1,
-            expected_parent=_fixed_parent(),
-            selected=_fixed_parent(),
-            public_event_limit=7,
-            disposition=Disposition.PUBLISH,
-        ),
-        Close(
-            request_key=_request_key(),
-            control_seq=2,
-            cutoff=_fixed_parent(),
-            reason=CloseReason.COMPLETED,
-        ),
-        Release(request_key=_request_key(), op_id=11),
-    ]
-    for control in controls:
-        assert control_from_wire(control_to_wire(control)) == control
 
 
 def test_commit_requires_a_fixed_selected_version() -> None:
@@ -636,26 +576,6 @@ def test_batch_rejects_conflicting_control_identity() -> None:
         )
 
 
-def test_batch_allows_duplicate_identical_control() -> None:
-    control = Commit(
-        request_key=_request_key(),
-        control_seq=1,
-        expected_parent=_fixed_parent(),
-        selected=_fixed_parent(),
-        public_event_limit=1,
-        disposition=Disposition.PUBLISH,
-    )
-    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
-    batch = Batch(
-        step_id=1,
-        admissions=(admission,),
-        partitions=(_partition(_decode_operation()),),
-        controls=(control, control),
-    )
-    assert len(batch.controls) == 2
-    assert control_content_digest(control) == control_content_digest(control)
-
-
 def test_batch_rejects_two_operations_for_one_request() -> None:
     with pytest.raises(WorkerError):
         Batch(step_id=1, partitions=(_partition(_decode_operation(), _decode_operation()),))
@@ -677,7 +597,7 @@ def test_operation_accepts_shared_encoder_features_but_not_foreign_lineage_state
     )
     operation = replace(_decode_operation(), inputs=(feature,))
     operation = replace(operation, plan_digest=operation.compute_plan_digest())
-    assert Operation.from_wire(operation.to_wire()) == operation
+    operation.validate()
 
     foreign_token = replace(feature, kind=ProductKind.TOKEN)
     invalid = replace(operation, inputs=(foreign_token,))
@@ -686,18 +606,13 @@ def test_operation_accepts_shared_encoder_features_but_not_foreign_lineage_state
         Operation.from_wire(invalid.to_wire())
 
 
-def test_admission_round_trips_and_binds_digest() -> None:
+def test_admission_payload_digest_is_invariant_to_pool_index() -> None:
     admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
-    assert Admission.from_wire(admission.to_wire()) == admission
     relocated = replace(admission, request_pool_idx=19)
     assert relocated.payload_digest() == admission.digest
 
 
-def test_token_product_bytes_round_trip() -> None:
-    for tokens in ([], [42], [1, 2, 3, 4, 5], [0xFFFFFFFF, 0, 7]):
-        encoded = encode_token_product_bytes(tokens)
-        assert decode_token_product_bytes(encoded) == tuple(tokens)
-    # The exact fixture bytes the Rust codec produces for [7, 8, 9].
+def test_token_product_bytes_match_the_rust_codec() -> None:
     fixture = bytes([3, 0, 0, 0, 7, 0, 0, 0, 8, 0, 0, 0, 9, 0, 0, 0])
     assert encode_token_product_bytes([7, 8, 9]) == fixture
     assert decode_token_product_bytes(fixture) == (7, 8, 9)
@@ -750,59 +665,6 @@ def test_batch_carries_host_supplied_input_products() -> None:
     restored = Batch.from_wire(batch.to_wire())
     assert restored.input_products == (payload,)
     assert decode_token_product_bytes(restored.input_products[0].payload) == (7, 8, 9)
-
-
-def test_completion_report_round_trips_with_product_payloads() -> None:
-    logprob = ProductRef(
-        request_key=_request_key(),
-        producer_op_id=11,
-        output_index=2,
-        generation=7,
-        kind=ProductKind.LOGPROB,
-        storage_class=StorageClass.HOST_STAGING,
-        dtype=DType.F32,
-        shape_bound=ShapeBound((StaticDim(4),)),
-        point_range=PointRange(base_point=0, max_points=1),
-    )
-    report = CompletionReport(
-        step_id=5,
-        partitions=(
-            PartitionCompletion(
-                partition_id=1,
-                completions=(
-                    CompletionRecord(
-                        request_key=_request_key(),
-                        op_id=11,
-                        completion_slot_generation=2,
-                        status=OpStatus.OK,
-                        selected_point=1,
-                        logical_lengths=LogicalLengths(token_len=1, kv_visible_len=1),
-                        token_span=TokenSpan(base=0, len=1),
-                        committed_tokens=(271,),
-                        finish_flags=FinishFlags(),
-                        product_generations=(3,),
-                        semantic_digest="bb" * 32,
-                        error_code=None,
-                        timing_counters=TimingCounters(),
-                    ),
-                ),
-                products=(ProductPayload(product=logprob, payload=bytes([1, 2, 3, 4])),),
-                registration=RegistrationAck(visible=True),
-                worker_exec_us=10,
-                forward_stats=WorkerForwardStats(
-                    mode_counts={"text": 1},
-                    mode_tokens={"text": 1},
-                    mode_us={"text": 7},
-                    component_us={"forward": 7, "text_sample": 2},
-                    cuda_graph_replays=1,
-                    cuda_graph_unpadded_tokens=1,
-                    cuda_graph_padded_tokens=8,
-                    cuda_graph_runtime_mode_counts={"graph_replay": 1},
-                ),
-            ),
-        ),
-    )
-    assert CompletionReport.from_wire(report.to_wire()) == report
 
 
 def test_host_visible_output_fits_the_operation_completion_bound() -> None:

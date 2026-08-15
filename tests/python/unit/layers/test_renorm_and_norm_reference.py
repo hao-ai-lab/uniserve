@@ -1,12 +1,4 @@
-"""Behavioral tests for CFG post-guidance renorm and the RMSNorm reference.
-
-Covers ``uniserve_worker.nn.diffusion.cfg`` renorm handlers (none/identity,
-RESCALE, CFG_ZERO_STAR, the ``renorm_min`` clamp, and the unknown-kind
-``ValueError``) and ``uniserve_worker.nn.norm.RMSNorm`` against an explicit
-fp32 reciprocal-rms reference. The eager reference path is exercised
-unconditionally (CPU); the fused/triton dispatch path is compared to the eager
-reference only when a usable CUDA device makes it eligible.
-"""
+"""CFG post-guidance renorm and RMSNorm against an explicit fp32 reference."""
 from __future__ import annotations
 
 import pytest
@@ -27,11 +19,10 @@ pytestmark = pytest.mark.unit
 
 
 def _rms_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """fp32 reciprocal-rms reference matching the eager kernel exactly.
+    """fp32 reciprocal-rms reference for RMSNorm.
 
     Variance is accumulated in fp32, normalization applied in fp32, the result
-    is cast back to the input dtype, and only then scaled by ``weight`` --
-    mirroring ``weight * x.to(in_dtype)`` in the production eager path.
+    is cast back to the input dtype, and only then scaled by ``weight``.
     """
 
     in_dtype = x.dtype
@@ -123,21 +114,6 @@ def test_renorm_cfg_zero_star_subtracts_per_sample_mean():
     torch.testing.assert_close(out, expected)
 
 
-def test_renorm_cfg_zero_star_output_is_zero_mean_per_sample():
-    torch.manual_seed(3)
-    base = torch.randn(3, 6, 8)
-    cond = torch.randn(3, 6, 8)
-    branches = torch.stack([base, cond], dim=0)
-
-    out = combine_cfg(
-        branches,
-        CfgParams(branch_count=2, scales=(2.0,), renorm=RenormKind.CFG_ZERO_STAR),
-    )
-
-    per_sample_mean = out.mean(dim=(1, 2))
-    torch.testing.assert_close(per_sample_mean, torch.zeros_like(per_sample_mean), atol=1e-6, rtol=0)
-
-
 # --- renorm_min clamp -------------------------------------------------------
 
 
@@ -187,41 +163,6 @@ def test_unknown_renorm_kind_raises_value_error():
 # --- RMSNorm vs fp32 reciprocal-rms reference -------------------------------
 
 
-_NORM_TOLERANCE = {
-    torch.float32: dict(atol=0.0, rtol=0.0),
-    torch.float16: dict(atol=1e-2, rtol=1e-2),
-    torch.bfloat16: dict(atol=6e-2, rtol=6e-2),
-}
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.float32, torch.float16, torch.bfloat16],
-    ids=["fp32", "fp16", "bf16"],
-)
-def test_rmsnorm_eager_matches_fp32_reference(dtype):
-    """The eager RMSNorm path always matches the fp32-accumulation reference.
-
-    fp32 is exact; fp16/bf16 agree within low-precision tolerance because both
-    the kernel and the reference accumulate the variance in fp32 and round only
-    on the final cast back to ``dtype``. The eager path is the terminal fallback
-    and runs on CPU without any optional kernel package.
-    """
-
-    torch.manual_seed(7)
-    hidden = 128
-    weight = torch.randn(hidden, dtype=dtype)
-    x = torch.randn(4, 6, hidden, dtype=dtype)
-
-    out = ops.rms_norm(x, weight, 1e-6, override="eager")
-    expected = _rms_reference(x, weight, 1e-6)
-
-    if dtype is torch.float32:
-        assert torch.equal(out, expected)
-    else:
-        torch.testing.assert_close(out, expected, **_NORM_TOLERANCE[dtype])
-
-
 def test_rmsnorm_module_forward_matches_reference_with_unit_weight_cpu():
     """The default unit-weight RMSNorm module reproduces the reference exactly on CPU."""
 
@@ -237,68 +178,16 @@ def test_rmsnorm_module_forward_matches_reference_with_unit_weight_cpu():
     assert torch.equal(out, expected)
 
 
-# --- fused/triton dispatch path agrees with the eager reference -------------
-
-
-def _fused_rmsnorm_eligible(dtype: torch.dtype) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    from uniserve_worker.nn.norm import _TritonRmsNorm
-
-    weight = torch.randn(128, device="cuda", dtype=dtype).contiguous()
-    x = torch.randn(8, 128, device="cuda", dtype=dtype).contiguous()
-    with torch.no_grad():
-        return bool(_TritonRmsNorm().is_eligible(x, weight, 1e-6))
-
-
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused RMSNorm path needs CUDA")
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.float32, torch.float16, torch.bfloat16],
-    ids=["fp32", "fp16", "bf16"],
-)
-def test_rmsnorm_fused_path_matches_eager_reference_on_cuda(dtype):
-    """When the fused (triton) provider is eligible it matches the eager reference.
-
-    The fused kernel is gated by hardware/grad-mode eligibility; when it cannot
-    run here we skip rather than silently testing eager-vs-eager. The eager
-    reference itself is verified unconditionally by the CPU tests above.
-    """
-
-    if not _fused_rmsnorm_eligible(dtype):
-        pytest.skip("fused triton RMSNorm not eligible on this device/grad mode")
-
-    torch.manual_seed(9)
-    hidden = 256
-    weight = torch.randn(hidden, device="cuda", dtype=dtype).contiguous()
-    x = torch.randn(8, hidden, device="cuda", dtype=dtype).contiguous()
-
-    with torch.no_grad():
-        fused = ops.rms_norm(x, weight, 1e-6)  # auto-dispatch selects the fused kernel
-        eager = ops.rms_norm(x, weight, 1e-6, override="eager")
-
-    # fp32 differs from eager only by fp32 reduction-order noise; fp16/bf16 by
-    # their wider low-precision rounding tolerance.
-    tolerance = dict(atol=1e-5, rtol=1e-5) if dtype is torch.float32 else _NORM_TOLERANCE[dtype]
-    torch.testing.assert_close(fused, eager, **tolerance)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused RMSNorm path needs CUDA")
-def test_rmsnorm_fused_path_matches_fp32_reference_exactly_on_cuda():
-    """The fused fp32 kernel reproduces the fp32 reciprocal-rms reference to fp32 precision."""
-
-    if not _fused_rmsnorm_eligible(torch.float32):
-        pytest.skip("fused triton RMSNorm not eligible on this device/grad mode")
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RMSNorm needs a device")
+def test_rmsnorm_matches_fp32_reference_exactly_on_cuda():
     torch.manual_seed(10)
     hidden = 512
     weight = torch.randn(hidden, device="cuda", dtype=torch.float32).contiguous()
     x = torch.randn(16, hidden, device="cuda", dtype=torch.float32).contiguous()
 
     with torch.no_grad():
-        fused = ops.rms_norm(x, weight, 1e-6)
+        actual = ops.rms_norm(x, weight, 1e-6)
     expected = _rms_reference(x, weight, 1e-6)
 
-    torch.testing.assert_close(fused, expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)

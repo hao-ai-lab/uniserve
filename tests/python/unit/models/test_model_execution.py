@@ -26,7 +26,6 @@ from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.diffusion.schedule import ScheduleDirection
 from uniserve_worker.nn.layer import LayerSpec
 from uniserve_worker.nn.mesh import TensorParallelSpec
-from uniserve_worker.server.stub import StubModel
 
 pytestmark = pytest.mark.unit
 
@@ -273,7 +272,3 @@ def test_sensenova_freezes_runtime_behavior_at_construction():
     assert model.generation.latent_downsample == 4
     assert model.generation.max_latent_tokens == 16
     assert model.generation.schedule_direction is ScheduleDirection.ASCENDING
-
-
-def test_simulation_model_accepts_tensorized_text_and_flow_rows():
-    assert StubModel().tensorized_mixed

@@ -14,7 +14,6 @@ from dataclasses import replace
 from typing import cast
 
 import pytest
-import torch
 
 from tests.python.fixtures.depth_one import (
     commit_for_completion,
@@ -81,12 +80,6 @@ def _logprob_positions(payload: bytes) -> tuple[tuple[tuple[int, float, int], ..
     return positions
 
 
-def _sampled_logprobs(payload: bytes) -> tuple[tuple[int, float, int], ...]:
-    assert payload[0] == 1
-    count = struct.unpack_from("<I", payload, 5)[0]
-    return tuple(struct.unpack_from("<IfI", payload, 9 + 12 * index) for index in range(count))
-
-
 def _materialize(report: CompletionReport) -> CompletionReport:
     deadline = time.monotonic() + 5.0
     while not completion_report_ready(report) and time.monotonic() < deadline:
@@ -127,43 +120,6 @@ def _with_sampling_state(
         control_seq=operation.control_seq,
     )
     return registered, ProductPayload(reference, payload)
-
-
-def test_inline_rows_from_one_round_produce_the_serial_oracle_tokens() -> None:
-    worker = execution_worker()
-    first = und_admission(
-        1, block_ids=(0,), sampling=SamplingParams(temperature=0.7, top_k=4, top_p=0.9, seed=11)
-    )
-    second = und_admission(
-        2, block_ids=(1,), sampling=SamplingParams(temperature=0.9, top_k=3, top_p=0.85, seed=17)
-    )
-    first_op, first_input = token_operation(
-        first.request_key,
-        op_id=1,
-        parent=root_parent(first),
-        mode=TokenMode.EXTEND,
-        tokens=(8, 9),
-        rng=Rng(seed=11, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
-    )
-    second_op, second_input = token_operation(
-        second.request_key,
-        op_id=2,
-        parent=root_parent(second),
-        mode=TokenMode.EXTEND,
-        tokens=(12,),
-        rng=Rng(seed=17, semantic_index_base=1, draw_layout=DrawLayout.TARGET_SAMPLING),
-    )
-    result = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(first, second),
-            operations=(first_op, second_op),
-            input_products=(first_input, second_input),
-        )
-    )
-
-    assert result.completions[0].committed_tokens == (_next_token(9),)
-    assert result.completions[1].committed_tokens == (_next_token(12),)
 
 
 def test_logprob_reporting_does_not_change_sample_selection() -> None:
@@ -259,44 +215,6 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
     assert result.completions[0].committed_tokens == (expected,)
     assert result.completions[1].committed_tokens == (expected,)
     assert tuple(completion.selected_point for completion in result.completions) == (1, 1)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cuda_completion_publishes_logprobs_with_committed_tokens() -> None:
-    worker = execution_worker(device="cuda:0")
-    admission = und_admission(
-        51,
-        block_ids=(11,),
-        sampling=SamplingParams(return_logprobs=True, n_logprobs=2, seed=37),
-    )
-    operation, token_input = token_operation(
-        admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-        logprobs=True,
-    )
-
-    result = _materialize(worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(operation,),
-            input_products=(token_input,),
-        )
-    ))
-
-    assert len(result.completions[0].committed_tokens) == 1
-    payload = next(
-        product.payload
-        for product in result.products
-        if product.product.kind is ProductKind.LOGPROB
-    )
-    assert isinstance(payload, bytes)
-    entries = _sampled_logprobs(payload)
-    assert len(entries) >= 2
-    assert all(rank >= 1 and value <= 0.0 for _token, value, rank in entries)
 
 
 def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> None:

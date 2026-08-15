@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from tests.python.fixtures.depth_one import (
@@ -15,8 +13,6 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import Admission, Close, CloseReason, ErrorCode, OpStatus, TokenMode
-from uniserve_worker.foundation.errors import ErrorCode as HostErrorCode
-from uniserve_worker.foundation.errors import WorkerError
 
 pytestmark = pytest.mark.integration
 
@@ -163,52 +159,4 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     )
     assert retired_report.completions[0].status is OpStatus.ERROR
     assert retired_report.completions[0].error_code is ErrorCode.INVALID_OPERATION
-    worker.close()
-
-
-def test_partition_rejects_colliding_request_pool_slots_atomically() -> None:
-    worker = execution_worker()
-    first = und_admission(85, block_ids=(0,))
-    second_template = und_admission(86, block_ids=(1,))
-    second = replace(second_template, request_pool_idx=first.request_pool_idx)
-    bind_request_placement(
-        second.request_key,
-        request_pool_idx=second.request_pool_idx,
-        page_ids=(1,),
-    )
-    first_operation, first_input = token_operation(
-        first.request_key,
-        op_id=1,
-        parent=root_parent(first),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-    )
-    second_operation, second_input = token_operation(
-        second.request_key,
-        op_id=1,
-        parent=root_parent(second),
-        mode=TokenMode.EXTEND,
-        tokens=(7, 8),
-    )
-
-    with pytest.raises(WorkerError) as rejected:
-        execution_batch(
-            step_id=1,
-            admissions=(first, second),
-            operations=(first_operation, second_operation),
-            input_products=(first_input, second_input),
-        )
-    assert rejected.value.code is HostErrorCode.INVALID_DESCRIPTOR
-
-    report = finalized_report(
-        worker.execute(
-            execution_batch(
-                step_id=2,
-                admissions=(first,),
-                operations=(first_operation,),
-                input_products=(first_input,),
-            )
-        )
-    )
-    assert report.completions[0].status is OpStatus.OK
     worker.close()

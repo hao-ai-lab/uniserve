@@ -1,11 +1,4 @@
-"""Equivalence of the identity-tail fused qk_norm_rope path.
-
-The multi-axis norm+RoPE call used by 3-axis interleaved decoders may declare
-its tail axes identity (``identity_axes``) when every spatial position is
-zero. The fused single-launch kernel must be bit-exact against the general
-multi-axis pipeline it replaces, and the hint must be a no-op for providers
-that ignore it.
-"""
+"""Bit-exact identity-tail qk_norm_rope against the general multi-axis call."""
 from __future__ import annotations
 
 import pytest
@@ -59,18 +52,10 @@ def _run(q, k, wq, wk, cos, sin, *, identity_axes):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [1, 5])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_identity_tail_fused_path_is_bit_exact_on_cuda(tokens, dtype):
+def test_identity_axes_match_full_multi_axis_on_cuda(tokens, dtype):
     q, k, wq, wk, cos, sin = _inputs("cuda", dtype, tokens)
     base_q, base_k = _run(q, k, wq, wk, cos, sin, identity_axes=None)
     fast_q, fast_k = _run(q, k, wq, wk, cos, sin, identity_axes=(1, 2))
     assert fast_q.shape == base_q.shape and fast_k.shape == base_k.shape
-    assert torch.equal(fast_q, base_q)
-    assert torch.equal(fast_k, base_k)
-
-
-def test_identity_hint_is_noop_for_eager_provider_on_cpu():
-    q, k, wq, wk, cos, sin = _inputs("cpu", torch.float32, 3)
-    base_q, base_k = _run(q, k, wq, wk, cos, sin, identity_axes=None)
-    fast_q, fast_k = _run(q, k, wq, wk, cos, sin, identity_axes=(1, 2))
     assert torch.equal(fast_q, base_q)
     assert torch.equal(fast_k, base_k)

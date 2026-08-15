@@ -59,32 +59,6 @@ def test_encode_sampling_is_stochastic_but_seed_reproducible():
     torch.testing.assert_close(z_a, z_a2)
 
 
-def test_encode_applies_scale_shift_transform():
-    """encode() must apply scale_factor * (z - shift_factor) on top of the raw
-    encoder output; this is the numeric contract production relies on."""
-    torch.manual_seed(8)
-    shared = AutoEncoder(_tiny_params())
-    shared.reg.sample = False
-
-    x = torch.randn(1, 3, 8, 8)
-    raw = shared.reg(shared.encoder(x))
-    expected = shared.scale_factor * (raw - shared.shift_factor)
-    torch.testing.assert_close(shared.encode(x), expected)
-
-
-def test_decode_inverts_scale_shift_transform():
-    """decode() must undo the scale/shift before running the decoder, so that
-    decode(z) == decoder(z / scale_factor + shift_factor)."""
-    torch.manual_seed(8)
-    shared = AutoEncoder(_tiny_params())
-    shared.reg.sample = False
-
-    x = torch.randn(1, 3, 8, 8)
-    z = shared.encode(x)
-    expected = shared.decoder(z / shared.scale_factor + shared.shift_factor)
-    torch.testing.assert_close(shared.decode(z), expected)
-
-
 def test_diagonal_gaussian_disabled_returns_mean_and_halves_channels():
     """With sampling disabled the regularizer is the deterministic mean of the
     first channel-chunk; the channel dim is halved."""

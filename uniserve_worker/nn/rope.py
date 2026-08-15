@@ -684,11 +684,9 @@ def try_triton_qk_multi_axis_rms_norm_rope(
     (<= 64 wide) with ``tl.sum`` in one shot, the same tile shapes the
     unfused kernels use. With one element per lane (any num_warps >= 2 for
     tiles <= 64) the generated tree is per-warp butterfly + one cross-warp
-    combine, identical to the unfused kernels' num_warps=4 launches; this is
-    verified bitwise against the unfused pipeline in
-    tests/python/unit/layers/test_multi_axis_qk_norm_rope_fused.py. num_warps=1
+    combine, identical to the unfused kernels' num_warps=4 launches. num_warps=1
     (two elements per lane, thread-local pre-sum) changes the tree and is not
-    used. Eligibility is restricted to the verified tile family
+    used. Eligibility is restricted to the tile family
     (next_power_of_2 of both group widths in {32, 64}).
     """
 

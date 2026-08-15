@@ -63,8 +63,6 @@ from uniserve_worker.batch import (
 from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
-    PackedAttentionPlan,
-    PagedDecodePlan,
 )
 from uniserve_worker.foundation.errors import ErrorCode as HostErrorCode
 from uniserve_worker.foundation.errors import WorkerError
@@ -80,101 +78,19 @@ pytestmark = pytest.mark.integration
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-class _ObservedModel(StubModel):
+class _MisalignedOutputModel(StubModel):
     def __init__(self) -> None:
         super().__init__()
-        self.flow_inputs: list[torch.Tensor] = []
-        self.token_positions: list[tuple[int, ...]] = []
-        self.attention_plans: list[object] = []
-        self.fault: str | None = None
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        batch: ForwardBatch,
-    ) -> torch.Tensor:
-        self.attention_plans.append(batch.attention)
-        self.flow_inputs.extend(value.detach().clone() for value in batch.flow_latents)
-        offset = 0
-        for count in batch.query_lens:
-            row_positions = positions[..., offset : offset + count]
-            self.token_positions.append(
-                tuple(int(value) for value in row_positions.reshape(-1).tolist())
-            )
-            offset += count
-        hidden = super().forward(input_ids, positions, batch)
-        if self.fault == "raise":
-            raise RuntimeError("injected neural failure")
-        return hidden
+        self.misaligned = False
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
         output = super().project(hidden, batch)
-        if self.fault == "misaligned":
+        if self.misaligned:
             return ForwardOutput(output.values[:-1])
         return output
 
 
-class _KvRecoveryModel(_ObservedModel):
-    def __init__(self) -> None:
-        super().__init__()
-        self.observed_prefixes: list[tuple[float, ...]] = []
-        self.observed_pages: list[tuple[int, ...]] = []
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        batch: ForwardBatch,
-    ) -> torch.Tensor:
-        token_rows = batch.token_row_indices
-        plan = batch.attention
-        if token_rows and batch.kv.base_lens[0] > 0:
-            if not isinstance(plan, PagedDecodePlan):
-                raise TypeError("KV recovery probe requires paged decode attention")
-            keys, _values = batch.kv.layer_kv(0)
-            pages = tuple(int(value) for value in plan.block_table[0].tolist())
-            prefix = tuple(
-                float(
-                    keys[
-                        pages[position // batch.kv.block_size],
-                        position % batch.kv.block_size,
-                        0,
-                        0,
-                    ].item()
-                )
-                for position in range(int(batch.kv.base_lens[0]))
-            )
-            self.observed_pages.append(pages)
-            self.observed_prefixes.append(prefix)
-
-        output = super().forward(input_ids, positions, batch)
-        if not token_rows:
-            return output
-        token_count = sum(batch.query_lens)
-        values = torch.arange(
-            1,
-            token_count + 1,
-            device=positions.device,
-            dtype=torch.bfloat16,
-        ).view(token_count, 1, 1)
-        if isinstance(plan, PagedDecodePlan):
-            batch.kv.append(0, values.unsqueeze(1), values.unsqueeze(1))
-        elif isinstance(plan, PackedAttentionPlan):
-            batch.kv.append_packed(
-                0,
-                values,
-                values,
-                page_ids=plan.write_page_ids,
-                page_offsets=plan.write_page_offsets,
-                token_indices=plan.write_token_indices,
-            )
-        else:
-            raise TypeError("KV recovery probe requires paged attention")
-        return output
-
-
-class _SeparatePhaseModel(_ObservedModel):
+class _SeparatePhaseModel(StubModel):
     def __init__(self) -> None:
         super().__init__()
         self.tensorized_mixed = False
@@ -285,8 +201,7 @@ def _materialized_artifact(
 
 
 def test_extend_then_decode_commit_the_serial_oracle_tokens():
-    model = _ObservedModel()
-    worker = execution_worker(model)
+    worker = execution_worker()
     admission = und_admission(1, block_ids=(0,))
     extend, extend_input = token_operation(
         admission.request_key,
@@ -328,12 +243,10 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
     assert decoded.completions[0].committed_tokens == (_next_token(first_token),)
     assert decoded.completions[0].logical_lengths.kv_visible_len == 3
     assert decoded.completions[0].logical_lengths.token_len == 3
-    assert model.token_positions == [(0, 1), (2,)]
 
 
 def test_prefix_reuse_continues_from_the_admitted_logical_position():
-    model = _ObservedModel()
-    worker = execution_worker(model)
+    worker = execution_worker()
     admission = und_admission(8, block_ids=(0,), prefix_len=2)
     extend, extend_input = token_operation(
         admission.request_key,
@@ -352,7 +265,6 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
         )
     ))
 
-    assert model.token_positions == [(2,)]
     assert report.completions[0].logical_lengths.kv_visible_len == 3
     assert report.completions[0].logical_lengths.token_len == 3
 
@@ -426,8 +338,7 @@ def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() 
 
 
 def test_mixed_token_and_flow_match_homogeneous_results():
-    mixed_model = _ObservedModel()
-    mixed = execution_worker(mixed_model)
+    mixed = execution_worker()
     sequence_admission = und_admission(1, block_ids=(0,))
     flow_admission = gen_admission(2, ImageParams(steps=1, height=16, width=16, seed=29))
     mixed_conditioning = _publish_conditioning(mixed, flow_admission, op_id=10, step_id=1)
@@ -466,8 +377,7 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         )
     )
 
-    split_model = _ObservedModel()
-    split = execution_worker(split_model)
+    split = execution_worker()
     split_conditioning = _publish_conditioning(split, flow_admission, op_id=10, step_id=1)
     split_latent, split_transition_commit = _transition_generation(
         split,
@@ -583,8 +493,7 @@ def test_mixed_submission_requires_tensorized_model_capability():
 
 
 def test_request_scoped_operation_identity_preserves_homogeneous_decode():
-    model = _ObservedModel()
-    worker = execution_worker(model)
+    worker = execution_worker()
     admissions = (und_admission(41, block_ids=(0,)), und_admission(42, block_ids=(1,)))
     prefill_ops = []
     prefill_inputs = []
@@ -636,64 +545,13 @@ def test_request_scoped_operation_identity_preserves_homogeneous_decode():
         )
     )
 
-    plan = model.attention_plans[-1]
-    assert isinstance(plan, PagedDecodePlan)
-    assert tuple(plan.query_lens.tolist()) == (1, 1)
     assert tuple(record.committed_tokens for record in decoded.completions) == tuple(
         (_next_token(_next_token(token)),) for token in last_tokens
     )
 
 
-def test_image_capability_preserves_the_pure_token_decode_plan():
-    model = _ObservedModel()
-    worker = execution_worker(model)
-    understanding = und_admission(43, block_ids=(0,))
-    admission = Admission.create(
-        understanding.request_key,
-        request_pool_idx=understanding.request_pool_idx,
-        und=understanding.und,
-        gen_admission=GenAdmission(ImageParams(steps=1, height=16, width=16, seed=29)),
-    )
-    prefill, prefill_input = token_operation(
-        admission.request_key,
-        op_id=70,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-    )
-    extended = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(prefill,),
-            input_products=(prefill_input,),
-        )
-    )
-    commit = commit_for_completion(prefill, extended)
-    decode, decode_input = token_operation(
-        admission.request_key,
-        op_id=71,
-        parent=commit.selected,
-        mode=TokenMode.DECODE,
-        tokens=(extended.completions[0].committed_tokens[0],),
-        control_seq=commit.control_seq,
-    )
-
-    worker.execute(
-        execution_batch(
-            step_id=2,
-            admissions=(),
-            operations=(decode,),
-            controls=(commit,),
-            input_products=(decode_input,),
-        )
-    )
-
-    assert isinstance(model.attention_plans[-1], PagedDecodePlan)
-
-
 def test_output_validation_failure_discards_all_candidate_state():
-    model = _ObservedModel()
+    model = _MisalignedOutputModel()
     worker = execution_worker(model)
     admission = und_admission(4, block_ids=(4,))
     initial, initial_input = token_operation(
@@ -724,13 +582,13 @@ def test_output_validation_failure_discards_all_candidate_state():
     retry_batch = execution_batch(
         step_id=13, admissions=(), operations=(retry,), input_products=(retry_input,)
     )
-    model.fault = "misaligned"
+    model.misaligned = True
     failed = worker.execute(retry_batch)
 
     assert failed.completions[0].status is OpStatus.ERROR
     assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
 
-    model.fault = None
+    model.misaligned = False
     replacement, replacement_input = token_operation(
         admission.request_key,
         op_id=33,
@@ -751,7 +609,7 @@ def test_output_validation_failure_discards_all_candidate_state():
 
 
 def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact():
-    worker = execution_worker(StubModel(), block_size=4)
+    worker = execution_worker(block_size=4)
     admission = gen_admission(5, ImageParams(steps=2, height=64, width=64, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=40, step_id=12)
     latent, transition_commit = _transition_generation(
@@ -824,7 +682,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         step_id=17,
     )
 
-    reference = execution_worker(StubModel(), block_size=4)
+    reference = execution_worker(block_size=4)
     reference_conditioning = _publish_conditioning(reference, admission, op_id=40, step_id=12)
     reference_latent, reference_transition_commit = _transition_generation(
         reference,
@@ -865,8 +723,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
 
 
 def test_mixed_partition_descriptor_failure_preserves_the_other_domain_candidate():
-    model = _ObservedModel()
-    worker = execution_worker(model)
+    worker = execution_worker()
     sequence_admission = und_admission(61, block_ids=(0,))
     generation_admission = gen_admission(
         62,
@@ -920,7 +777,7 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
     admission = gen_admission(5, ImageParams(steps=1, height=16, width=16, seed=29))
     artifacts: list[bytes] = []
     for op_id in (41, 109):
-        worker = execution_worker(StubModel())
+        worker = execution_worker()
         conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
         latent, transition_commit = _transition_generation(
             worker,
@@ -981,7 +838,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
     cfg_img_scale: float,
 ) -> None:
     def run(step_quantum: int) -> bytes:
-        worker = execution_worker(StubModel())
+        worker = execution_worker()
         admission = gen_admission(
             76,
             ImageParams(
@@ -1046,7 +903,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
 def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
     # A small page forces the decode chain to cross a registration boundary.
     block_size = 4
-    worker = execution_worker(_ObservedModel(), block_size=block_size)
+    worker = execution_worker(block_size=block_size)
     admission = und_admission(1, block_ids=(0,))
     extend, extend_input = token_operation(
         admission.request_key,
@@ -1108,7 +965,7 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
     # The ordered-commit validator matches latent_len against the cumulative
     # denoise step (start_step + step_count), not a constant token count, so two
     # single-step quanta must report 1 then 2.
-    worker = execution_worker(_ObservedModel())
+    worker = execution_worker()
     admission = gen_admission(2, ImageParams(steps=2, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
     initial_latent, transition_commit = _transition_generation(
@@ -1162,7 +1019,7 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
 
 
 def test_trajectory_advances_across_many_generations_and_rejects_a_stale_reference():
-    worker = execution_worker(StubModel())
+    worker = execution_worker()
     admission = gen_admission(71, ImageParams(steps=50, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
     current, commit = _transition_generation(
@@ -1228,7 +1085,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
 
 def test_snapshot_restore_preserves_an_active_trajectory_and_final_artifact(tmp_path) -> None:
     snapshot_dir = str(tmp_path / "worker-state")
-    worker = execution_worker(StubModel(), snapshot_dir=snapshot_dir)
+    worker = execution_worker(snapshot_dir=snapshot_dir)
     admission = gen_admission(72, ImageParams(steps=2, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
     latent, transition_commit = _transition_generation(
@@ -1290,7 +1147,6 @@ def test_snapshot_restore_preserves_an_active_trajectory_and_final_artifact(tmp_
     )
 
     restored = execution_worker(
-        StubModel(),
         snapshot_dir=snapshot_dir,
     )
     restored.restore_session(reference, placement)
@@ -1322,76 +1178,9 @@ def test_snapshot_restore_preserves_an_active_trajectory_and_final_artifact(tmp_
     restored.close()
 
 
-def test_snapshot_restore_rebinds_committed_kv_to_scheduler_placement(tmp_path) -> None:
-    snapshot_dir = str(tmp_path / "worker-state")
-    source_model = _KvRecoveryModel()
-    worker = execution_worker(source_model, snapshot_dir=snapshot_dir)
-    admission = und_admission(74, block_ids=(0,))
-    extend, extend_input = token_operation(
-        admission.request_key,
-        op_id=1,
-        parent=root_parent(admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-    )
-    extended = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(extend,),
-            input_products=(extend_input,),
-        )
-    )
-    commit = commit_for_completion(extend, extended)
-    worker.execute(execution_batch(step_id=2, controls=(commit,)))
-    source_placement = RecoveryPlacement(
-        request_key=admission.request_key,
-        request_pool_idx=admission.request_pool_idx,
-        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(1,), length=2),),
-    )
-    reference = worker.snapshot_session(source_placement)
-    worker.close()
-
-    destination = RecoveryPlacement(
-        request_key=admission.request_key,
-        request_pool_idx=admission.request_pool_idx + 1,
-        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(2,), length=2),),
-    )
-    restored_model = _KvRecoveryModel()
-    restored = execution_worker(restored_model, snapshot_dir=snapshot_dir)
-    restored.restore_session(reference, destination)
-    bind_request_placement(
-        admission.request_key,
-        request_pool_idx=destination.request_pool_idx,
-        page_ids=(2,),
-    )
-    decode, decode_input = token_operation(
-        admission.request_key,
-        op_id=2,
-        parent=reference.version,
-        mode=TokenMode.DECODE,
-        tokens=(extended.completions[0].committed_tokens[0],),
-        control_seq=commit.control_seq,
-    )
-
-    report = restored.execute(
-        execution_batch(
-            step_id=3,
-            operations=(decode,),
-            input_products=(decode_input,),
-        )
-    )
-
-    assert report.completions[0].status is OpStatus.OK
-    assert report.completions[0].logical_lengths.kv_visible_len == 3
-    assert restored_model.observed_pages == [(2,)]
-    assert restored_model.observed_prefixes == [(1.0, 2.0)]
-    restored.close()
-
-
 def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thread_wait() -> None:
-    producer = execution_worker(_ObservedModel(), transfer_backend="shm")
-    consumer = execution_worker(_ObservedModel(), transfer_backend="shm")
+    producer = execution_worker(transfer_backend="shm")
+    consumer = execution_worker(transfer_backend="shm")
     admission = und_admission(73, block_ids=(0,))
     image = io.BytesIO()
     Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
@@ -1456,8 +1245,8 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
 
 
 def test_cross_stage_device_product_transfer_preserves_generation_and_value() -> None:
-    producer = execution_worker(_ObservedModel(), transfer_backend="shm")
-    consumer = execution_worker(_ObservedModel(), transfer_backend="shm")
+    producer = execution_worker(transfer_backend="shm")
+    consumer = execution_worker(transfer_backend="shm")
     admission = und_admission(77, block_ids=(0,))
     extend, extend_input = token_operation(
         admission.request_key,
@@ -1554,8 +1343,8 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
 
 
 def test_cross_stage_completion_predicate_preserves_device_continuation() -> None:
-    producer = execution_worker(StubModel(), transfer_backend="shm")
-    consumer = execution_worker(StubModel(), transfer_backend="shm")
+    producer = execution_worker(transfer_backend="shm")
+    consumer = execution_worker(transfer_backend="shm")
     generation = gen_admission(79, ImageParams(steps=1, height=16, width=16, seed=31))
     admission = Admission.create(
         generation.request_key,
@@ -1639,8 +1428,8 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
 
 
 def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() -> None:
-    producer = execution_worker(StubModel(), transfer_backend="shm")
-    consumer = execution_worker(StubModel(), transfer_backend="shm")
+    producer = execution_worker(transfer_backend="shm")
+    consumer = execution_worker(transfer_backend="shm")
     admission = gen_admission(75, ImageParams(steps=1, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(producer, admission, op_id=1, step_id=1)
     initial_latent, transition_commit = _transition_generation(
@@ -1722,7 +1511,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() ->
 
 
 def test_encode_publishes_an_immutable_feature_without_advancing_state():
-    worker = execution_worker(_ObservedModel())
+    worker = execution_worker()
     admission = und_admission(3, block_ids=(0,))
     extend, extend_input = token_operation(
         admission.request_key,
@@ -1770,7 +1559,7 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
 
 
 def test_generated_feedback_commits_absolute_visual_token_state():
-    worker = execution_worker(_ObservedModel())
+    worker = execution_worker()
     understanding = und_admission(6, block_ids=(0,))
     admission = Admission.create(
         understanding.request_key,

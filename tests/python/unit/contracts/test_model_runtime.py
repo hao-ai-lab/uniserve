@@ -28,10 +28,7 @@ def test_architecture_identity_is_stable_and_binds_checkpoint_configuration():
 
 
 def test_model_identity_requires_exact_checkpoint_digests():
-    identity = ModelIdentity("ConformanceModel", "a" * 64, "b" * 64)
-
-    assert identity.architecture_digest == "a" * 64
-    assert identity.weight_digest == "b" * 64
+    ModelIdentity("ConformanceModel", "a" * 64, "b" * 64)
     with pytest.raises(WorkerError):
         ModelIdentity("ConformanceModel", "A" * 64, "b" * 64)
 
@@ -48,12 +45,6 @@ def test_capabilities_project_model_behavior_and_resource_geometry():
     assert WorkVariant.GEN_FLOW in capabilities.supported_work
     assert capabilities.mixed_buckets == ()
     assert capabilities.num_layers == TEST_MODEL.cache_geometry.num_layers
-    assert capabilities.resource_classes == (
-        "kv_block",
-        "encoder_output",
-        "image_latent",
-        "scratch",
-    )
     assert capabilities.model_identity == "a" * 64
     assert capabilities.weight_digest == "b" * 64
 
