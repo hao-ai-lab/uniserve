@@ -43,14 +43,11 @@ _TENSOR_POLICY_ATTRS = (
 
 
 class Fp8LoadPhase(Enum):
-    """FP8 module load lifecycle: each weight loader hook advances this so the
-    "scale before finalize" precondition checked in
-    ``process_weights_after_loading`` is structural rather than ad-hoc."""
+    """FP8 checkpoint materialization phase derived from recorded load state."""
 
     RAW = "raw"
     WEIGHT_LOADED = "weight_loaded"
     SCALE_LOADED = "scale_loaded"
-    FINALIZED = "finalized"
 
 
 # --- parameter policy flags -------------------------------------------------
@@ -97,13 +94,7 @@ def fp8_scale_loaded(module: torch.nn.Module) -> bool:
 
 
 def fp8_load_phase(module: torch.nn.Module) -> Fp8LoadPhase:
-    """Derive the load phase from the two recorded booleans.
-
-    ``RAW`` -> nothing loaded; ``WEIGHT_LOADED`` -> an offline fp8 weight was
-    placed but no scale yet; ``SCALE_LOADED`` -> the matching scale is present
-    (the precondition for finalize).  ``FINALIZED`` is not separately tracked
-    here because the finalize step is idempotent on an already-fp8 weight.
-    """
+    """Derive the current checkpoint materialization phase."""
     if fp8_scale_loaded(module):
         return Fp8LoadPhase.SCALE_LOADED
     if fp8_weight_loaded_offline(module):

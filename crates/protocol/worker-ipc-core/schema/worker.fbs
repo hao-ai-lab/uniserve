@@ -75,13 +75,12 @@ enum ReqKind : ubyte {
   Shutdown,
   CopyKv,
   ReleaseProducts,
-  GetMetrics,
   GetPressure,
   SnapshotSession,
   RestoreSession
 }
 
-enum RespKind : ubyte { Capabilities, Result, Ok, Error, Metrics, Pressure, Snapshot }
+enum RespKind : ubyte { Capabilities, Result, Ok, Error, Pressure, Snapshot }
 enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent, Scratch }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
 
@@ -149,10 +148,6 @@ table KvGroupSpec {
 table RankInfo {
   tp_rank:uint;
   tp_size:uint = 1;
-  pp_rank:uint;
-  pp_size:uint = 1;
-  dp_rank:uint;
-  dp_size:uint = 1;
 }
 
 table ResourcePressure {
@@ -172,6 +167,14 @@ table GraphBucketCapability {
   width:uint;
   cfg_branches:uint;
   layout:string;
+}
+
+table MixedExecutionCapability {
+  decode_rows:uint;
+  flow_rows:uint;
+  height:uint;
+  width:uint;
+  cfg_branches:uint;
 }
 
 table LaneCapabilities {
@@ -213,7 +216,6 @@ table WorkerCapabilities {
   kv_dtype:string;
   model_dtype:string;
   attention_backend:string;
-  quantization:string;
   rank:RankInfo;
   pipeline_depth:uint;
   encoder_cache_budget:uint;
@@ -223,7 +225,7 @@ table WorkerCapabilities {
   max_request_pool_size:uint;
   max_unresolved_window:uint = 1;
   incremental_kv_publication:bool;
-  tensorized_mixed:bool;
+  mixed_buckets:[MixedExecutionCapability];
   sampling_ownership:SamplingOwnership;
   resource_classes:[ResourceClass];
   model_identity:string;
@@ -526,27 +528,6 @@ table WorkerForwardStats {
   component_us:[StringU64Pair];
 }
 
-table WorkerMetrics {
-  executes:ulong;
-  operations_total:ulong;
-  exec_us_total:ulong;
-  last_exec_us:ulong;
-  operation_counts:[StringU64Pair];
-  operation_us:[StringU64Pair];
-  control_ok:[StringU64Pair];
-  control_err:[StringU64Pair];
-  error_counts:[StringU64Pair];
-  replay_counts:[StringU64Pair];
-  cuda_graph_captures:ulong;
-  cuda_graph_replays:ulong;
-  cuda_graph_misses:ulong;
-  cuda_graph_fallbacks:ulong;
-  cuda_graph_unpadded_tokens:ulong;
-  cuda_graph_padded_tokens:ulong;
-  cuda_graph_runtime_mode_counts:[StringU64Pair];
-  forward:WorkerForwardStats;
-}
-
 table CacheGroupPlacement {
   group_id:uint;
   page_ids:[uint];
@@ -582,7 +563,6 @@ table WorkerResponse {
   call_id:ulong = null;
   capabilities:WorkerCapabilities;
   completion_report:CompletionReport;
-  metrics:WorkerMetrics;
   pressure:[ResourcePressure];
   message:string;
   code:string;

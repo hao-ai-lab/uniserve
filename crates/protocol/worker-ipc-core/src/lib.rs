@@ -19,15 +19,7 @@ use uniserve_worker_wire::{RequestKind, ResponseKind, WorkerRequest, WorkerRespo
 mod events;
 use events::{ClientEvents, ServerEvents};
 pub use events::{
-    EVENT_DRIVEN_ENV, EVENT_WAIT_SAFETY_NET, EVT_COMMAND, EVT_DEATH, EVT_REQUEST, EVT_RESULT,
-    WakeEvents, WakeSender, event_driven_enabled,
-};
-
-pub mod transfer_agent;
-pub use transfer_agent::{
-    AgentConfig, InProcessAgent, LocalAddr, MemoryRegion, RegisteredRegion, RemoteAddr,
-    RemoteSegment, TransferAgent, TransferOp, TransferReq, TransferStatus, TransferTicket,
-    make_transfer_agent,
+    EVT_COMMAND, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT, WakeEvents, WakeSender,
 };
 
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
@@ -136,8 +128,7 @@ pub struct ClientEndpoint {
     _node: Node<IxService>,
     client: IxClient,
     connect_timeout: Duration,
-    /// Companion event ports for the event-driven boundary (None when polling).
-    events: Option<ClientEvents>,
+    events: ClientEvents,
 }
 
 impl ClientEndpoint {
@@ -145,22 +136,6 @@ impl ClientEndpoint {
         service: &str,
         initial_max_slice_len: usize,
         max_inflight: usize,
-    ) -> anyhow::Result<Self> {
-        Self::connect_with(
-            service,
-            initial_max_slice_len,
-            max_inflight,
-            event_driven_enabled(),
-        )
-    }
-
-    /// As [`Self::connect`], but with an explicit event-driven choice (the host
-    /// is authoritative: it spawns the worker with the matching setting).
-    pub fn connect_with(
-        service: &str,
-        initial_max_slice_len: usize,
-        max_inflight: usize,
-        event_driven: bool,
     ) -> anyhow::Result<Self> {
         let service_name = ServiceName::new(service)?;
         let node = NodeBuilder::new()
@@ -184,11 +159,8 @@ impl ClientEndpoint {
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .context("creating iceoryx2 client port")?;
-        let events = if event_driven {
-            Some(ClientEvents::open(&node, service).context("opening client event companions")?)
-        } else {
-            None
-        };
+        let events =
+            ClientEvents::open(&node, service).context("opening client event companions")?;
         Ok(Self {
             _node: node,
             client,
@@ -197,34 +169,32 @@ impl ClientEndpoint {
         })
     }
 
-    /// Whether the event-driven boundary is active on this endpoint.
-    pub fn is_event_driven(&self) -> bool {
-        self.events.is_some()
-    }
-
     /// Park for {result, command, death} until a wake fires or `timeout`
-    /// elapses. Returns which sources fired. Only valid on an event-driven
-    /// endpoint; pollers must use [`Self::try_recv_response`] on a deadline.
+    /// elapses. Returns which sources fired.
     pub fn wait_wake(&self, timeout: Duration) -> anyhow::Result<WakeEvents> {
-        match &self.events {
-            Some(ev) => ev.wait(timeout),
-            None => {
-                std::thread::sleep(timeout.min(EVENT_WAIT_SAFETY_NET));
-                Ok(WakeEvents::default())
-            }
-        }
+        self.events.wait(timeout)
     }
 
-    /// A cloneable wake source the command ingress fires after enqueuing a
-    /// command (None when polling).
-    pub fn command_wake(&self) -> Option<WakeSender> {
-        self.events.as_ref().map(ClientEvents::command_wake)
+    /// Drain queued wake ids after a composite executor parked on this
+    /// listener's descriptor.
+    pub fn drain_wakes(&self) -> anyhow::Result<WakeEvents> {
+        self.events.drain()
     }
 
-    /// A cloneable wake source the worker-death watcher fires on child exit
-    /// (None when polling).
-    pub fn death_wake(&self) -> Option<WakeSender> {
-        self.events.as_ref().map(ClientEvents::death_wake)
+    /// Native descriptor used by a composite executor's single multi-worker
+    /// park. It remains owned by this endpoint.
+    pub fn wake_file_descriptor(&self) -> i32 {
+        self.events.file_descriptor()
+    }
+
+    /// A cloneable wake source the command ingress fires after enqueuing a command.
+    pub fn command_wake(&self) -> WakeSender {
+        self.events.command_wake()
+    }
+
+    /// A cloneable wake source the worker-death watcher fires on child exit.
+    pub fn death_wake(&self) -> WakeSender {
+        self.events.death_wake()
     }
 
     pub fn send_request(&self, req: &WorkerRequest) -> anyhow::Result<Pending> {
@@ -264,9 +234,7 @@ impl ClientEndpoint {
         *request.user_header_mut() = header;
         let request = request.write_from_slice(payload);
         let pending = request.send().context("sending iceoryx2 request")?;
-        if let Some(events) = &self.events {
-            events.notify_request();
-        }
+        self.events.notify_request();
         Ok(pending)
     }
 
@@ -294,15 +262,7 @@ impl ClientEndpoint {
             if now >= deadline {
                 return Ok(None);
             }
-            let slice = (deadline - now).min(EVENT_WAIT_SAFETY_NET);
-            // Event-driven: park on the wake listener (wakes on a real response,
-            // falls back to the safety-net slice otherwise). Polling: sleep the slice.
-            match &self.events {
-                Some(events) => {
-                    events.wait(slice)?;
-                }
-                None => std::thread::sleep(slice),
-            }
+            self.events.wait(deadline - now)?;
         }
     }
 }
@@ -311,8 +271,7 @@ pub struct ServerEndpoint {
     _node: Node<IxService>,
     server: IxServer,
     active: VecDeque<(u64, IxActive)>,
-    /// Companion event ports for the event-driven boundary (None when polling).
-    events: Option<ServerEvents>,
+    events: ServerEvents,
 }
 
 impl ServerEndpoint {
@@ -320,22 +279,6 @@ impl ServerEndpoint {
         service: &str,
         initial_max_slice_len: usize,
         max_inflight: usize,
-    ) -> anyhow::Result<Self> {
-        Self::bind_with(
-            service,
-            initial_max_slice_len,
-            max_inflight,
-            event_driven_enabled(),
-        )
-    }
-
-    /// As [`Self::bind`], but with an explicit event-driven choice (so the
-    /// worker can be forced to match a host that disabled it).
-    pub fn bind_with(
-        service: &str,
-        initial_max_slice_len: usize,
-        max_inflight: usize,
-        event_driven: bool,
     ) -> anyhow::Result<Self> {
         let service_name = ServiceName::new(service)?;
         let node = NodeBuilder::new()
@@ -359,22 +302,14 @@ impl ServerEndpoint {
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .context("creating iceoryx2 server port")?;
-        let events = if event_driven {
-            Some(ServerEvents::open(&node, service).context("opening server event companions")?)
-        } else {
-            None
-        };
+        let events =
+            ServerEvents::open(&node, service).context("opening server event companions")?;
         Ok(Self {
             _node: node,
             server,
             active: VecDeque::new(),
             events,
         })
-    }
-
-    /// Whether the event-driven boundary is active on this endpoint.
-    pub fn is_event_driven(&self) -> bool {
-        self.events.is_some()
     }
 
     pub fn try_recv(&mut self) -> anyhow::Result<Option<Frame>> {
@@ -385,9 +320,7 @@ impl ServerEndpoint {
         else {
             return Ok(None);
         };
-        if let Some(events) = &self.events {
-            events.drain_requests()?;
-        }
+        self.events.drain_worker_wakes()?;
         let header = *active.user_header();
         let payload = active.payload().to_vec();
         verify_header_len(header, payload.len())?;
@@ -400,23 +333,19 @@ impl ServerEndpoint {
             if let Some(frame) = self.try_recv()? {
                 return Ok(frame);
             }
-            self.wait_incoming(EVENT_WAIT_SAFETY_NET)?;
+            self.wait_incoming(self.connect_timeout())?;
         }
     }
 
-    /// Park until an inbound request wake fires or `timeout` elapses. When the
-    /// event-driven boundary is enabled the server parks on its wake listener,
-    /// so an idle controller advances on notification rather than a sleep poll;
-    /// otherwise it falls back to the safety-net sleep. The caller re-checks the
-    /// transport after each return, so a spurious wake is harmless.
+    /// Park until an inbound request or asynchronous completion wake fires, or
+    /// `timeout` elapses. The caller re-checks all progress sources after return.
     pub fn wait_incoming(&self, timeout: Duration) -> anyhow::Result<()> {
-        match &self.events {
-            Some(events) => events.wait_request(timeout),
-            None => {
-                std::thread::sleep(timeout);
-                Ok(())
-            }
-        }
+        self.events.wait_request(timeout)
+    }
+
+    /// A thread-safe signal for device, transfer, and CPU completion callbacks.
+    pub fn completion_wake(&self) -> WakeSender {
+        self.events.completion_wake()
     }
 
     pub fn respond(&mut self, resp: &WorkerResponse) -> anyhow::Result<()> {
@@ -448,12 +377,13 @@ impl ServerEndpoint {
         *response.user_header_mut() = header;
         let response = response.write_from_slice(payload);
         response.send().context("sending iceoryx2 response")?;
-        // Wake the host the instant the response is queued, so its result wait
-        // returns from the event listener rather than the safety-net poll.
-        if let Some(events) = &self.events {
-            events.notify_response();
-        }
+        // Wake the host the instant the response is queued.
+        self.events.notify_response();
         Ok(())
+    }
+
+    fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(300)
     }
 }
 
@@ -531,10 +461,9 @@ fn request_kind_code(kind: RequestKind) -> u8 {
         RequestKind::Shutdown => 5,
         RequestKind::CopyKv => 6,
         RequestKind::ReleaseProducts => 7,
-        RequestKind::GetMetrics => 8,
-        RequestKind::GetPressure => 9,
-        RequestKind::SnapshotSession => 10,
-        RequestKind::RestoreSession => 11,
+        RequestKind::GetPressure => 8,
+        RequestKind::SnapshotSession => 9,
+        RequestKind::RestoreSession => 10,
     }
 }
 
@@ -544,9 +473,8 @@ fn response_kind_code(kind: ResponseKind) -> u8 {
         ResponseKind::Result => 2,
         ResponseKind::Ok => 3,
         ResponseKind::Error => 4,
-        ResponseKind::Metrics => 5,
-        ResponseKind::Pressure => 6,
-        ResponseKind::Snapshot => 7,
+        ResponseKind::Pressure => 5,
+        ResponseKind::Snapshot => 6,
     }
 }
 

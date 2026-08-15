@@ -59,7 +59,7 @@ def test_consumer_stream_observes_the_exact_producer_generation() -> None:
             device=device,
         )
         observed.copy_(read.tensor)
-        products.record_reader(read, device=device)
+        products.record_readers((read,), device=device)
 
     consumer.synchronize()
     assert observed.item() == 73
@@ -79,10 +79,10 @@ def test_reuse_waits_until_every_consumer_stream_retires() -> None:
         read = products.consume(first, consumer_op_id=22, device=device)
         observed = read.tensor.clone()
         torch.cuda._sleep(50_000_000)
-        products.record_reader(read, device=device)
+        products.record_readers((read,), device=device)
 
     producer.synchronize()
-    products.release_operation(first.request_key, first.producer_op_id)
+    products.release_operations(((first.request_key, first.producer_op_id),))
     second = _reference(23, 9)
     with pytest.raises(ResourceError, match="no query-ready free generation"):
         products.bind_outputs(((second, "ef" * 32, device),))
@@ -99,3 +99,44 @@ def test_reuse_waits_until_every_consumer_stream_retires() -> None:
 
     assert observed.item() == 17
     assert products.consume(second, consumer_op_id=24, device=device).tensor.item() == 29
+
+
+def test_recycled_scalar_outputs_preserve_each_published_value() -> None:
+    device = torch.device("cuda:0")
+    products = DeviceProducts(capacity=3, byte_capacity=1 << 20)
+    initial = tuple(_reference(op_id, op_id) for op_id in (31, 32, 33))
+    writes = products.bind_outputs(
+        tuple((reference, "ab" * 32, device) for reference in initial)
+    )
+    products.publish_writes(writes, torch.tensor((41, 43, 47), device=device))
+    products.commit_writes(writes)
+    torch.cuda.current_stream(device).synchronize()
+
+    products.release_operations(
+        tuple(
+            (reference.request_key, reference.producer_op_id)
+            for reference in (initial[0], initial[2])
+        )
+    )
+    replacements = tuple(_reference(op_id, op_id) for op_id in (34, 35))
+    replacement_writes = products.bind_outputs(
+        tuple((reference, "cd" * 32, device) for reference in replacements)
+    )
+    products.publish_writes(
+        replacement_writes,
+        torch.tensor((53, 59), device=device),
+    )
+    products.commit_writes(replacement_writes)
+
+    reads = products.consume_batch(
+        tuple(
+            (reference, 40 + index, None, device)
+            for index, reference in enumerate((initial[1], *replacements))
+        ),
+        device=device,
+    )
+    products.record_readers(reads, device=device)
+    observed = torch.cat(tuple(read.tensor for read in reads))
+    torch.cuda.current_stream(device).synchronize()
+
+    assert observed.tolist() == [43, 53, 59]

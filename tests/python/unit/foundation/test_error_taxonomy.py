@@ -112,7 +112,6 @@ def test_to_wire_emits_canonical_error_context():
         message="CUDA out of memory",
         retryable=True,
         fatal=False,
-        cleanup=True,
         req_id=42,
         op_id=7,
         op_kind="decode_und",

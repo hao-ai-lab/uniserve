@@ -40,7 +40,6 @@ class RequestKind(StrEnum):
     SHUTDOWN = "shutdown"
     COPY_KV = "copy_kv"
     RELEASE_PRODUCTS = "release_products"
-    GET_METRICS = "get_metrics"
     GET_PRESSURE = "get_pressure"
     SNAPSHOT_SESSION = "snapshot_session"
     RESTORE_SESSION = "restore_session"
@@ -51,7 +50,6 @@ class ResponseKind(StrEnum):
     RESULT = "result"
     OK = "ok"
     ERROR = "error"
-    METRICS = "metrics"
     PRESSURE = "pressure"
     SNAPSHOT = "snapshot"
 
@@ -104,17 +102,10 @@ class KvGroupSpec:
 class RankInfo:
     tp_rank: int = 0
     tp_size: int = 1
-    pp_rank: int = 0
-    pp_size: int = 1
-    dp_rank: int = 0
-    dp_size: int = 1
 
     def __post_init__(self) -> None:
-        for axis in ("tp", "pp", "dp"):
-            rank = getattr(self, f"{axis}_rank")
-            size = getattr(self, f"{axis}_size")
-            if size < 1 or not 0 <= rank < size:
-                raise invalid_descriptor(f"rank.{axis} must satisfy 0 <= rank < size")
+        if self.tp_size < 1 or not 0 <= self.tp_rank < self.tp_size:
+            raise invalid_descriptor("rank.tp must satisfy 0 <= rank < size")
 
     @classmethod
     def from_wire(cls, value: object, where: str = "rank") -> RankInfo:
@@ -122,20 +113,12 @@ class RankInfo:
         return cls(
             tp_rank=_uint(data.get("tp_rank", 0), f"{where}.tp_rank"),
             tp_size=_uint(data.get("tp_size", 1), f"{where}.tp_size"),
-            pp_rank=_uint(data.get("pp_rank", 0), f"{where}.pp_rank"),
-            pp_size=_uint(data.get("pp_size", 1), f"{where}.pp_size"),
-            dp_rank=_uint(data.get("dp_rank", 0), f"{where}.dp_rank"),
-            dp_size=_uint(data.get("dp_size", 1), f"{where}.dp_size"),
         )
 
     def to_wire(self) -> dict[str, int]:
         return {
             "tp_rank": self.tp_rank,
             "tp_size": self.tp_size,
-            "pp_rank": self.pp_rank,
-            "pp_size": self.pp_size,
-            "dp_rank": self.dp_rank,
-            "dp_size": self.dp_size,
         }
 
 
@@ -182,6 +165,45 @@ class GraphBucketCapability:
             "width": self.width,
             "cfg_branches": self.cfg_branches,
             "layout": self.layout,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MixedExecutionCapability:
+    decode_rows: int
+    flow_rows: int
+    height: int
+    width: int
+    cfg_branches: int
+
+    def __post_init__(self) -> None:
+        if min(
+            self.decode_rows,
+            self.flow_rows,
+            self.height,
+            self.width,
+            self.cfg_branches,
+        ) < 1:
+            raise invalid_descriptor("mixed execution capability dimensions must be positive")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str) -> MixedExecutionCapability:
+        data = _map(value, where)
+        return cls(
+            decode_rows=_uint(data.get("decode_rows"), f"{where}.decode_rows"),
+            flow_rows=_uint(data.get("flow_rows"), f"{where}.flow_rows"),
+            height=_uint(data.get("height"), f"{where}.height"),
+            width=_uint(data.get("width"), f"{where}.width"),
+            cfg_branches=_uint(data.get("cfg_branches"), f"{where}.cfg_branches"),
+        )
+
+    def to_wire(self) -> dict[str, int]:
+        return {
+            "decode_rows": self.decode_rows,
+            "flow_rows": self.flow_rows,
+            "height": self.height,
+            "width": self.width,
+            "cfg_branches": self.cfg_branches,
         }
 
 
@@ -297,7 +319,6 @@ class WorkerCapabilities:
     kv_dtype: str
     model_dtype: str
     attention_backend: str
-    quantization: str | None
     rank: RankInfo
     pipeline_depth: int
     encoder_cache_budget: int
@@ -307,7 +328,7 @@ class WorkerCapabilities:
     max_request_pool_size: int
     max_unresolved_window: int
     incremental_kv_publication: bool
-    tensorized_mixed: bool
+    mixed_buckets: tuple[MixedExecutionCapability, ...]
     sampling_ownership: SamplingOwnership
     resource_classes: tuple[ResourceClass, ...]
     model_identity: str
@@ -380,6 +401,13 @@ class WorkerCapabilities:
             raise invalid_descriptor("capabilities repeat a resource class")
         if len({lane.lane_id for lane in self.lanes}) != len(self.lanes):
             raise invalid_descriptor("capabilities repeat a lane id")
+        if len(set(self.mixed_buckets)) != len(self.mixed_buckets):
+            raise invalid_descriptor("capabilities repeat a mixed-execution bucket")
+        if any(
+            bucket.decode_rows + bucket.flow_rows > self.max_batch_operations
+            for bucket in self.mixed_buckets
+        ):
+            raise invalid_descriptor("mixed-execution bucket exceeds the operation bound")
         lane_domains = tuple(domain for lane in self.lanes for domain in lane.domains)
         if len(set(lane_domains)) != len(lane_domains):
             raise invalid_descriptor("capabilities repeat a lane domain binding")
@@ -469,11 +497,6 @@ class WorkerCapabilities:
             kv_dtype=_str(data.get("kv_dtype"), f"{where}.kv_dtype"),
             model_dtype=_str(data.get("model_dtype"), f"{where}.model_dtype"),
             attention_backend=_str(data.get("attention_backend"), f"{where}.attention_backend"),
-            quantization=(
-                None
-                if data.get("quantization") is None
-                else _str(data["quantization"], f"{where}.quantization")
-            ),
             rank=RankInfo.from_wire(data.get("rank"), f"{where}.rank"),
             pipeline_depth=_uint(data.get("pipeline_depth"), f"{where}.pipeline_depth"),
             encoder_cache_budget=_uint(
@@ -498,7 +521,12 @@ class WorkerCapabilities:
             incremental_kv_publication=_bool(
                 data.get("incremental_kv_publication"), f"{where}.incremental_kv_publication"
             ),
-            tensorized_mixed=_bool(data.get("tensorized_mixed"), f"{where}.tensorized_mixed"),
+            mixed_buckets=tuple(
+                MixedExecutionCapability.from_wire(item, f"{where}.mixed_buckets[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("mixed_buckets", ()), f"{where}.mixed_buckets")
+                )
+            ),
             sampling_ownership=_enum(
                 SamplingOwnership, data.get("sampling_ownership"), f"{where}.sampling_ownership"
             ),
@@ -542,7 +570,6 @@ class WorkerCapabilities:
             "kv_dtype": self.kv_dtype,
             "model_dtype": self.model_dtype,
             "attention_backend": self.attention_backend,
-            "quantization": self.quantization,
             "rank": self.rank.to_wire(),
             "pipeline_depth": self.pipeline_depth,
             "encoder_cache_budget": self.encoder_cache_budget,
@@ -552,7 +579,7 @@ class WorkerCapabilities:
             "max_request_pool_size": self.max_request_pool_size,
             "max_unresolved_window": self.max_unresolved_window,
             "incremental_kv_publication": self.incremental_kv_publication,
-            "tensorized_mixed": self.tensorized_mixed,
+            "mixed_buckets": [bucket.to_wire() for bucket in self.mixed_buckets],
             "sampling_ownership": self.sampling_ownership.value,
             "resource_classes": [value.value for value in self.resource_classes],
             "model_identity": self.model_identity,

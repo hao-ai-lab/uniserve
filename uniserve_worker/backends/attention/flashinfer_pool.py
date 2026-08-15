@@ -40,18 +40,12 @@ def _empty_mutable(
 
 
 class WrapperKey(NamedTuple):
-    """Identity of a cached flashinfer wrapper and its plan caches.
+    """Value identity shared by a wrapper and all of its plan caches.
 
-    This is the dict key for every per-wrapper cache (wrappers, graph buffers,
-    plan workspaces, plan keys, fast-plan signatures) and is embedded inside the
-    plan keys themselves. It stays a ``NamedTuple`` so it remains hashable and
-    compares by value like the positional tuple it replaced, while the
-    discriminating fields (``kind``, ``backend``) are read by name instead of by
-    index. ``kind`` is one of ``"decode"``, ``"decode_graph"`` or ``"prefill"``;
-    ``use_tensor_cores`` is ``None`` for prefill keys. ``batch_size`` and
-    ``max_indices`` define fixed CUDA-graph buffer capacities. ``scope`` is a
-    nonce isolating a graph-scoped *exclusive* prefill wrapper (one per captured
-    graph); the shared prefill wrapper keeps ``scope=None``.
+    ``kind`` is ``"decode"``, ``"decode_graph"``, or ``"prefill"``;
+    ``use_tensor_cores`` is unset for prefill keys. ``batch_size`` and
+    ``max_indices`` bound CUDA-graph buffers. ``scope`` isolates each captured
+    prefill graph while the shared eager prefill wrapper uses no scope.
     """
 
     kind: str

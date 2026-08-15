@@ -59,11 +59,12 @@ from uniserve_worker.batch import (
 from uniserve_worker.batch import (
     ErrorCode as ProtocolErrorCode,
 )
+from uniserve_worker.capabilities import MixedExecutionCapability
 from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
     AttnPlan,
     EmptyKvView,
-    EmptyMeshView,
+    ExpertRoute,
     FlowPatches,
     KvView,
     ModelPhase,
@@ -72,6 +73,7 @@ from uniserve_worker.execution.forward_batch import (
     PagedDecodePlan,
     PagedVarlenPlan,
     RouteMeshView,
+    RouteSpan,
     TokenSelection,
     packed_tensor_views,
 )
@@ -99,6 +101,7 @@ from uniserve_worker.foundation.errors import (
     should_capture_trace,
     unsupported_operation,
 )
+from uniserve_worker.foundation.profiling import profile_range
 from uniserve_worker.foundation.sizing import bucketed_length
 from uniserve_worker.foundation.triton_compat import triton_device_supported
 from uniserve_worker.loader.weight_set import WeightSet
@@ -147,6 +150,7 @@ from uniserve_worker.runtime.latent_pool import (
 from uniserve_worker.runtime.runtime_states import RuntimeStates
 from uniserve_worker.server.completion import (
     CompletionArena,
+    CompletionCapture,
     CompletionLease,
     _CompletionDerivedInteger,
     _CompletionImagePayload,
@@ -188,6 +192,7 @@ from ._inputs import (
     prepare_image,
     prepare_tensor_image,
 )
+from .cuda_graph import GraphExecutionError
 from .model_invocation import RunObservation, RunPath, _ModelInvocation
 
 logger = logging.getLogger(__name__)
@@ -195,6 +200,8 @@ logger = logging.getLogger(__name__)
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
+MIXED_SERVICE_SERIAL_NUMERATOR = 5
+MIXED_SERVICE_SERIAL_DENOMINATOR = 4
 
 
 @dataclass(slots=True)
@@ -256,6 +263,7 @@ class _SamplingRow:
     draw: float
     n_logprobs: int
     finish_token_ids: tuple[int, ...] = ()
+    transition_token_ids: tuple[int, ...] = ()
     force_finish: bool = False
 
 
@@ -272,7 +280,7 @@ class _SampleTask:
     terminal_draft_prefix: int | None = None
     token_product: DeviceProductWrite | None = None
     finish_product: DeviceProductWrite | None = None
-    continuation_product: DeviceProductWrite | None = None
+    transition_product: DeviceProductWrite | None = None
     predicate: torch.Tensor | None = None
     tagged_predicate: bool = False
     request_pool_index: torch.Tensor | None = None
@@ -366,13 +374,79 @@ class _PreparedTransferInput:
         return tensors
 
 
+@dataclass(slots=True)
+class _PreparedPredicateBatch:
+    lease: CompletionLease
+    entries: list[tuple[_OperationIdentity, CompletionCapture, int]]
+    transferred: tuple[tuple[_OperationIdentity, _PreparedTransferInput, int], ...]
+    sealed: bool
+    _values: dict[_OperationIdentity, bool] | None = None
+
+    def ready(self) -> bool:
+        if self._values is not None:
+            return True
+        if not self.sealed:
+            if not all(transfer.ready() for _, transfer, _ in self.transferred):
+                return False
+            try:
+                for identity, transfer, row in self.transferred:
+                    tensors = transfer.tensors()
+                    if len(tensors) != 1:
+                        raise invalid_descriptor(
+                            "transferred operation predicate has an invalid tensor set"
+                        )
+                    self.entries.append((identity, self.lease.capture(tensors[0]), row))
+                self.lease.seal()
+            except BaseException:
+                self.lease.abandon()
+                raise
+            self.sealed = True
+        return self.lease.ready()
+
+    def resolve(self) -> dict[_OperationIdentity, bool]:
+        if self._values is not None:
+            return self._values
+        if not self.lease.ready():
+            raise RuntimeError("prepared predicates were observed before readiness")
+        values: dict[_OperationIdentity, bool] = {}
+        generation = self.lease.generation
+        try:
+            for identity, capture, row in sorted(self.entries, key=lambda entry: entry[2]):
+                captured = capture.values()
+                if len(captured) != 1 or captured[0] not in {0, 1}:
+                    raise invalid_descriptor("operation predicate is not a canonical boolean")
+                values[identity] = bool(captured[0])
+                self.lease.observe(row, generation)
+        except BaseException:
+            self.lease.abandon()
+            raise
+        self._values = values
+        return values
+
+    def abandon(self) -> None:
+        if self._values is None:
+            self.lease.abandon()
+
+    def __del__(self) -> None:
+        try:
+            self.abandon()
+        except Exception:
+            pass
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedExecution:
     batch: Batch
     transfers: tuple[_PreparedTransferInput, ...]
+    predicates: _PreparedPredicateBatch | None = None
 
     def ready(self) -> bool:
-        return all(transfer.ready() for transfer in self.transfers)
+        return all(transfer.ready() for transfer in self.transfers) and (
+            self.predicates is None or self.predicates.ready()
+        )
+
+    def predicate_values(self) -> dict[_OperationIdentity, bool]:
+        return {} if self.predicates is None else self.predicates.resolve()
 
 
 _ModelTask: TypeAlias = _ForwardTask | _SampleTask
@@ -443,6 +517,7 @@ class _LatentExecution:
 class _ExecutionScope:
     partition: BatchPartition
     started_ns: int
+    graph_eligible: bool
     request_candidates: tuple[RequestRow, ...]
     request_bases: tuple[RequestRow | None, ...]
     request_rows: dict[int, RequestRow]
@@ -451,17 +526,11 @@ class _ExecutionScope:
     input_images: dict[ProductRef, str] = field(default_factory=dict)
     cache_rows: dict[tuple[RequestKey, int, int], CacheRow] = field(default_factory=dict)
     branch_rows: dict[tuple[RequestKey, int, int, int], CacheRow] = field(default_factory=dict)
-    branch_publications: dict[tuple[RequestKey, int, int], CacheRow] = field(
-        default_factory=dict
-    )
+    branch_publications: dict[tuple[RequestKey, int, int], CacheRow] = field(default_factory=dict)
     layout: _PartitionLayout | None = None
     prepared_transfers: dict[ProductRef, _PreparedTransferInput] = field(default_factory=dict)
-    transferred_device_products: dict[ProductRef, DeviceProductWrite] = field(
-        default_factory=dict
-    )
-    transferred_encoder_features: dict[ProductRef, EncoderWrite] = field(
-        default_factory=dict
-    )
+    transferred_device_products: dict[ProductRef, DeviceProductWrite] = field(default_factory=dict)
+    transferred_encoder_features: dict[ProductRef, EncoderWrite] = field(default_factory=dict)
     cache_publication_inputs: dict[ProductRef, CachePublication] = field(default_factory=dict)
     cache_publications: list[tuple[ProductRef, CachePublication]] = field(default_factory=list)
     cache_installations: list[tuple[ProductRef, ProductRef, CachePublication]] = field(
@@ -485,10 +554,14 @@ class _ExecutionScope:
         default_factory=dict
     )
     finish_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
-    continuation_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
+    transition_writes: dict[_OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
+    propagated_predicate_writes: dict[_OperationIdentity, tuple[DeviceProductWrite, ...]] = field(
+        default_factory=dict
+    )
     predicate_values: dict[_OperationIdentity, tuple[torch.Tensor, bool]] = field(
         default_factory=dict
     )
+    predicated_operations: frozenset[_OperationIdentity] = frozenset()
     sampling_states: dict[_OperationIdentity, SamplingState] = field(default_factory=dict)
     runtime_publications: list[_RuntimePublication | _DecodeRuntimePublication] = field(
         default_factory=list
@@ -557,52 +630,42 @@ class ModelRunner:
     def __init__(
         self,
         *,
-        model: ExecutionModel | None,
-        deployment: WorkerDeployment | None,
-        model_invocation: _ModelInvocation | None,
-        attention: AttentionSelection | None,
+        model: ExecutionModel,
+        deployment: WorkerDeployment,
+        model_invocation: _ModelInvocation,
+        attention: AttentionSelection,
         requests: RequestTable,
-        runtime_states: RuntimeStates | None,
+        runtime_states: RuntimeStates,
         cache_pool: CachePool,
         latent_pool: LatentPool | None,
         device_products: DeviceProducts,
         encoder_cache: EncoderCache,
         completion_arena: CompletionArena,
         cpu_tasks: BoundedCpuTaskPool,
-        weights: WeightSet | None,
-        mesh: DeviceMesh | None,
+        weights: WeightSet,
+        mesh: DeviceMesh,
         transport: Transport | None,
         tokenizer: Any | None,
-        architecture_digest: str | None,
-        weight_digest: str | None,
+        architecture_digest: str,
+        weight_digest: str,
         allowed_work_variants: frozenset[WorkVariant],
+        mixed_buckets: tuple[MixedExecutionCapability, ...],
         trace: ExecutionTrace,
-        defer_sampling: bool = False,
     ) -> None:
         if not allowed_work_variants:
             raise ValueError("model runner must accept at least one work variant")
-        if (model is None) != (deployment is None):
-            raise ValueError("model and worker deployment must be present together")
-        if model_invocation is not None and (model is None or weights is None):
-            raise ValueError("model execution requires a model and base weights")
-        if (model_invocation is None) != (attention is None):
-            raise ValueError("model invocation and attention selection must be provisioned together")
-        if (model_invocation is None) != (runtime_states is None):
-            raise ValueError("model invocation and request runtime states must be provisioned together")
-        if model is not None:
-            if architecture_digest is None or len(architecture_digest) != 64:
-                raise capability_mismatch("model runner identity is invalid")
-            if weight_digest is None or weights is None or weights.digest != weight_digest:
-                raise capability_mismatch(
-                    "model runner base-weight identity does not match its weight set"
-                )
-            unsupported = allowed_work_variants - model.supported_work
-            system_only = frozenset({WorkVariant.MATERIALIZE})
-            if unsupported - system_only:
-                raise capability_mismatch(
-                    "model runner work set exceeds the model implementation: "
-                    f"{sorted(value.value for value in unsupported - system_only)!r}"
-                )
+        if len(architecture_digest) != 64:
+            raise capability_mismatch("model runner identity is invalid")
+        if weights.digest != weight_digest:
+            raise capability_mismatch(
+                "model runner base-weight identity does not match its weight set"
+            )
+        unsupported = allowed_work_variants - model.supported_work
+        if unsupported:
+            raise capability_mismatch(
+                "model runner work set exceeds the model implementation: "
+                f"{sorted(value.value for value in unsupported)!r}"
+            )
         self.model = model
         self.deployment = deployment
         self._model_invocation = model_invocation
@@ -623,14 +686,13 @@ class ModelRunner:
         self.architecture_digest = architecture_digest
         self.weight_digest = weight_digest
         self.allowed_work_variants = allowed_work_variants
+        self.mixed_buckets = frozenset(mixed_buckets)
+        self._qualified_mixed_buckets: set[MixedExecutionCapability] = set()
         self.trace = trace
-        self.defer_sampling = bool(defer_sampling)
-        self._device = (
-            torch.device("cpu") if deployment is None else canonical_device(deployment.device)
-        )
+        self._device = canonical_device(deployment.device)
         self._generation_device = (
             self._device
-            if deployment is None or deployment.generation_device is None
+            if deployment.generation_device is None
             else canonical_device(deployment.generation_device)
         )
         self._collective_history: OrderedDict[int, str] = OrderedDict()
@@ -640,28 +702,26 @@ class ModelRunner:
     def close(self) -> None:
         self._collective_history.clear()
         self._transport_publications.clear()
-        if self._model_invocation is not None:
-            self._model_invocation.close()
+        self._qualified_mixed_buckets.clear()
+        self._model_invocation.close()
 
     def synchronize(self) -> None:
-        if self._model_invocation is not None:
-            self._model_invocation.synchronize()
+        self._model_invocation.synchronize()
 
     def prepare(self, batch: Batch) -> PreparedExecution | None:
-        """Submit every declared cross-stage read without waiting for it."""
+        """Submit bounded transfer and predicate observations without waiting."""
 
         entries = tuple(
             payload
             for payload in batch.input_products
             if payload.payload.startswith(TRANSFER_DESCRIPTOR_PREFIX)
         )
-        if not entries:
-            return None
         transport = self.transport
-        if transport is None:
+        if entries and transport is None:
             raise capability_mismatch("cross-stage input requires a configured transport")
         transfers: list[_PreparedTransferInput] = []
         for entry in entries:
+            assert transport is not None
             kind, value, producer_plan_digest = decode_transfer_descriptor(entry.payload)
             locators: tuple[Locator, ...]
             payload_kind: ProductKind | None = None
@@ -847,16 +907,110 @@ class ModelRunner:
                     snapshot=snapshot,
                 )
             )
-        return PreparedExecution(batch=batch, transfers=tuple(transfers))
+        predicates = self._prepare_predicates(
+            batch,
+            transfers=tuple(transfers),
+        )
+        if not transfers and predicates is None:
+            return None
+        return PreparedExecution(
+            batch=batch,
+            transfers=tuple(transfers),
+            predicates=predicates,
+        )
+
+    def _prepare_predicates(
+        self,
+        batch: Batch,
+        *,
+        transfers: tuple[_PreparedTransferInput, ...],
+    ) -> _PreparedPredicateBatch | None:
+        operations = tuple(
+            operation
+            for operation in batch.operations
+            if operation.predicate is not None
+            and operation.predicate.kind is ProductKind.COMPLETION
+        )
+        if not operations:
+            return None
+        transferred = {transfer.product: transfer for transfer in transfers}
+        lease = self._completions.reserve(
+            len(operations),
+            token_capacity=len(operations),
+            devices=tuple(self._operation_device(operation) for operation in operations),
+        )
+        captures: list[tuple[_OperationIdentity, CompletionCapture, int]] = []
+        pending: list[tuple[_OperationIdentity, _PreparedTransferInput, int]] = []
+        recorded: list[DeviceProductRead] = []
+        try:
+            grouped: dict[torch.device, list[Operation]] = defaultdict(list)
+            rows = {_operation_identity(operation): row for row, operation in enumerate(operations)}
+            for operation in operations:
+                transfer = transferred.get(cast(ProductRef, operation.predicate))
+                if transfer is None:
+                    grouped[self._operation_device(operation)].append(operation)
+                else:
+                    pending.append(
+                        (
+                            _operation_identity(operation),
+                            transfer,
+                            rows[_operation_identity(operation)],
+                        )
+                    )
+            for device, device_operations in grouped.items():
+                reads = self.device_products.consume_batch(
+                    tuple(
+                        (
+                            cast(ProductRef, operation.predicate),
+                            int(operation.op_id),
+                            None,
+                            device,
+                        )
+                        for operation in device_operations
+                    ),
+                    device=device,
+                )
+                recorded.extend(reads)
+                for operation, read in zip(device_operations, reads, strict=True):
+                    identity = _operation_identity(operation)
+                    captures.append((identity, lease.capture(read.tensor), rows[identity]))
+                self.device_products.record_readers(reads, device=device)
+            sealed = not pending
+            if sealed:
+                lease.seal()
+        except BaseException:
+            unrecorded = tuple(read for read in recorded if not read._recorded)
+            if unrecorded:
+                self.device_products.record_readers(unrecorded)
+            lease.abandon()
+            raise
+        return _PreparedPredicateBatch(
+            lease=lease,
+            entries=captures,
+            transferred=tuple(pending),
+            sealed=sealed,
+        )
 
     def execute_prepared(self, prepared: PreparedExecution) -> CompletionReport:
         if not prepared.ready():
             raise RuntimeError("prepared execution was observed before transfer readiness")
-        return self.execute(prepared.batch, prepared=prepared.transfers)
+        return self._execute(
+            prepared.batch,
+            prepared=prepared.transfers,
+            predicate_values=prepared.predicate_values(),
+            propagate_errors=False,
+            graph_eligible=True,
+        )
 
     def complete_startup(self) -> None:
         """Retire pre-admission collective identities before serving traffic."""
 
+        missing_mixed = self.mixed_buckets - self._qualified_mixed_buckets
+        if missing_mixed:
+            raise GraphExecutionError(
+                "mixed execution buckets lack a matched serving-path interference proof: "
+                f"{sorted(missing_mixed, key=repr)!r}"
+            )
         if self._model_invocation is not None:
             self._model_invocation.complete_startup()
         if self.requests.request_ids():
@@ -871,19 +1025,38 @@ class ModelRunner:
     ) -> CompletionReport:
         """Execute one canonical batch after server-side duplicate registration."""
 
-        return self._execute(batch, prepared=prepared, propagate_errors=False)
+        return self._execute(
+            batch,
+            prepared=prepared,
+            predicate_values={},
+            propagate_errors=False,
+            graph_eligible=True,
+        )
 
-    def execute_startup(self, batch: Batch) -> CompletionReport:
+    def execute_startup(
+        self,
+        batch: Batch,
+        *,
+        catalog_graphs: bool = True,
+    ) -> CompletionReport:
         """Execute pre-admission work with direct error propagation."""
 
-        return self._execute(batch, prepared=(), propagate_errors=True)
+        return self._execute(
+            batch,
+            prepared=(),
+            predicate_values={},
+            propagate_errors=True,
+            graph_eligible=bool(catalog_graphs),
+        )
 
     def _execute(
         self,
         batch: Batch,
         *,
         prepared: tuple[_PreparedTransferInput, ...],
+        predicate_values: Mapping[_OperationIdentity, bool],
         propagate_errors: bool,
+        graph_eligible: bool,
     ) -> CompletionReport:
         """Shared execution for startup and admitted traffic."""
 
@@ -905,6 +1078,16 @@ class ModelRunner:
             operations,
             duration_us=(time.perf_counter_ns() - validation_started) // 1000,
         )
+        required_predicates = {
+            _operation_identity(operation)
+            for operation in batch.operations
+            if operation.predicate is not None
+            and operation.predicate.kind is ProductKind.COMPLETION
+        }
+        if required_predicates != set(predicate_values):
+            raise invalid_descriptor(
+                "completion-predicated operations require exact prepared predicate values"
+            )
         self.requests.apply_controls(batch.controls)
         if not batch.operations:
             self._apply_release_controls(batch)
@@ -926,6 +1109,8 @@ class ModelRunner:
                             batch,
                             partition,
                             prepared,
+                            predicate_values,
+                            graph_eligible,
                         )
                     )
                 except BaseException as error:
@@ -948,7 +1133,10 @@ class ModelRunner:
             if not scopes:
                 continue
             try:
-                outcomes, execution_errors = self._execute_partition_group(tuple(scopes))
+                outcomes, execution_errors = self._execute_partition_group(
+                    tuple(scopes),
+                    qualify_mixed=propagate_errors,
+                )
             except BaseException as error:
                 classified = self._classify_partition_failure(
                     partitions[0],
@@ -1122,8 +1310,21 @@ class ModelRunner:
         batch: Batch,
         partition: BatchPartition,
         prepared: tuple[_PreparedTransferInput, ...],
+        predicate_values: Mapping[_OperationIdentity, bool],
+        graph_eligible: bool,
     ) -> _ExecutionScope:
         operations = partition.operations
+        predicated = frozenset(
+            identity
+            for operation in operations
+            if (identity := _operation_identity(operation)) in predicate_values
+            and not predicate_values[identity]
+        )
+        active_operations = tuple(
+            operation
+            for operation in operations
+            if _operation_identity(operation) not in predicated
+        )
         traced = _trace_envelopes(operations)
         started = time.perf_counter_ns()
         request_keys = {operation.request_key for operation in operations}
@@ -1131,6 +1332,9 @@ class ModelRunner:
             admission for admission in batch.admissions if admission.request_key in request_keys
         )
         declared_inputs = {reference for operation in operations for reference in operation.inputs}
+        declared_inputs.update(
+            operation.predicate for operation in operations if operation.predicate is not None
+        )
         input_products = tuple(
             payload for payload in batch.input_products if payload.product in declared_inputs
         )
@@ -1158,6 +1362,7 @@ class ModelRunner:
         scope = _ExecutionScope(
             partition=partition,
             started_ns=started,
+            graph_eligible=graph_eligible,
             request_candidates=candidates,
             request_bases=bases,
             request_rows={request.session_id: request for request in candidates},
@@ -1165,9 +1370,9 @@ class ModelRunner:
             prepared_transfers={
                 transfer.product: transfer
                 for transfer in prepared
-                if transfer.product
-                in {reference for operation in operations for reference in operation.inputs}
+                if transfer.product in declared_inputs
             },
+            predicated_operations=predicated,
         )
         self.trace.emit(
             ExecutionPhase.CANDIDATE_STAGE,
@@ -1183,8 +1388,10 @@ class ModelRunner:
                         if base is None
                     )
                 )
-            self._reserve_cpu_tasks(operations, scope)
-            self._bind_cache_rows(partition, scope)
+            self._reserve_cpu_tasks(active_operations, scope)
+            active_partition = self._active_partition(partition, active_operations)
+            if active_partition is not None:
+                self._bind_cache_rows(active_partition, scope)
             scope.layout = _PartitionLayout(
                 operations=operations,
                 requests=candidates,
@@ -1195,15 +1402,66 @@ class ModelRunner:
                 weights=tuple(self._weights() for _ in candidates),
                 identities=tuple(_operation_identity(operation) for operation in operations),
             )
-            self._bind_latent_rows(partition, scope)
+            if active_partition is not None:
+                self._bind_latent_rows(active_partition, scope)
             self._reserve_outputs(operations, scope)
-            self._stage_input_products(input_products, scope)
-            self._consume_predicates(operations, scope)
+            active_inputs = {
+                reference for operation in active_operations for reference in operation.inputs
+            }
+            active_inputs.update(
+                operation.predicate
+                for operation in active_operations
+                if operation.predicate is not None
+            )
+            self._stage_input_products(
+                tuple(payload for payload in input_products if payload.product in active_inputs),
+                scope,
+            )
+            self._consume_predicates(active_operations, scope)
+            self._publish_predicated_outputs(operations, scope)
             scope.registration_visible = True
             return scope
         except BaseException:
             self._discard_partition(scope)
             raise
+
+    @staticmethod
+    def _active_partition(
+        partition: BatchPartition,
+        operations: tuple[Operation, ...],
+    ) -> BatchPartition | None:
+        if not operations:
+            return None
+        identities = {_operation_identity(operation) for operation in operations}
+        indices = tuple(
+            request_pool_idx
+            for operation, request_pool_idx in zip(
+                partition.operations,
+                partition.request_pool_indices,
+                strict=True,
+            )
+            if _operation_identity(operation) in identities
+        )
+        return replace(
+            partition,
+            operations=operations,
+            request_pool_indices=indices,
+            kv_placements=tuple(
+                placement
+                for placement in partition.kv_placements
+                if (placement.request_key, int(placement.op_id)) in identities
+            ),
+            kv_branch_placements=tuple(
+                placement
+                for placement in partition.kv_branch_placements
+                if (placement.request_key, int(placement.op_id)) in identities
+            ),
+            latent_placements=tuple(
+                placement
+                for placement in partition.latent_placements
+                if (placement.request_key, int(placement.op_id)) in identities
+            ),
+        )
 
     @staticmethod
     def _partition_completion_words(operations: tuple[Operation, ...]) -> int:
@@ -1218,6 +1476,8 @@ class ModelRunner:
     def _execute_partition_group(
         self,
         scopes: tuple[_ExecutionScope, ...],
+        *,
+        qualify_mixed: bool,
     ) -> tuple[dict[int, tuple[_Outcome, ...]], dict[int, BaseException]]:
         if len(scopes) == 1:
             scope = scopes[0]
@@ -1230,16 +1490,34 @@ class ModelRunner:
                 },
                 {},
             )
+        for scope in scopes:
+            active = tuple(
+                operation
+                for operation in scope.partition.operations
+                if _operation_identity(operation) not in scope.predicated_operations
+            )
+            for device in self._completion_devices(active):
+                scope.completion.begin_device(device)
         drivers: list[tuple[int, int, _Driver, _ExecutionScope]] = []
-        for scope_index, scope in enumerate(scopes):
-            for operation_index, operation in enumerate(scope.partition.operations):
-                drivers.append(
-                    (scope_index, operation_index, self._driver(operation, scope), scope)
-                )
-        flat_outcomes, errors = self._drive_partitioned(tuple(drivers))
         grouped: list[list[_Outcome | None]] = [
             [None] * len(scope.partition.operations) for scope in scopes
         ]
+        for scope_index, scope in enumerate(scopes):
+            for operation_index, operation in enumerate(scope.partition.operations):
+                if _operation_identity(operation) in scope.predicated_operations:
+                    grouped[scope_index][operation_index] = self._predicated_outcome(
+                        operation,
+                        scope,
+                    )
+                    continue
+                drivers.append(
+                    (scope_index, operation_index, self._driver(operation, scope), scope)
+                )
+        flat_outcomes, errors = (
+            self._drive_partitioned(tuple(drivers), qualify_mixed=qualify_mixed)
+            if drivers
+            else ((), {})
+        )
         for (scope_index, operation_index, _driver, _scope), outcome in zip(
             drivers,
             flat_outcomes,
@@ -1298,7 +1576,7 @@ class ModelRunner:
             )
         ):
             self._validate_completion_products(operation, outcome.products)
-            if self.deployment is None or int(self.deployment.tp_rank) == 0:
+            if int(self.deployment.tp_rank) == 0:
                 report_products.extend(outcome.products)
             parent_semantic = _parent_semantic(operation, request)
             placeholder = CompletionRecord(
@@ -1346,7 +1624,10 @@ class ModelRunner:
                 )
                 pending_by_session[operation.request_key.session_id] = pending
             else:
-                selected_versions[operation.request_key.session_id] = operation.parent
+                selected = request.resolve_version(operation.parent)
+                if selected is None:
+                    raise RuntimeError("non-state operation lost its resolved parent")
+                selected_versions[operation.request_key.session_id] = selected
             resolved_runtime[operation.request_key.session_id] = RequestRuntime(
                 logical_position=request.logical_position,
                 rng_counter=request.rng_counter,
@@ -1383,13 +1664,6 @@ class ModelRunner:
             existing = self._transport_publications.get(identity)
             if existing is not None and existing != locators:
                 raise RuntimeError("committed transport publication identity was reused")
-        if self.runtime_states is None and (
-            scope.runtime_publications
-            or scope.prompt_logits_publications
-            or scope.runtime_cache_lengths
-        ):
-            raise RuntimeError("runtime state publication has no backing storage")
-
         scope.publication_started = True
         self.device_products.commit_writes(tuple(scope.device_writes))
         self.encoder_cache.commit_writes(tuple(scope.encoder_writes))
@@ -1559,20 +1833,17 @@ class ModelRunner:
         records: list[CompletionRecord] = []
         for operation in partition.operations:
             session = self.requests.peek(operation.request_key.session_id)
-            point = operation.parent.point
-            selected_point = (
-                point.point_index
-                if isinstance(point, FixedPoint)
-                else 0
+            selected_parent = (
+                operation.parent
+                if operation.parent.is_fixed()
+                else None
                 if session is None
-                else session.version
+                else session.resolve_version(operation.parent)
             )
+            point = None if selected_parent is None else selected_parent.point
+            selected_point = point.point_index if isinstance(point, FixedPoint) else 0
             parent_semantic: object = (
-                point.semantic_digest
-                if isinstance(point, FixedPoint)
-                else "0" * 64
-                if session is None
-                else session.resolved_digest
+                point.semantic_digest if isinstance(point, FixedPoint) else "0" * 64
             )
             lengths = (
                 LogicalLengths()
@@ -1705,16 +1976,13 @@ class ModelRunner:
         )
 
     def _validate_batch_identity(self, batch: Batch) -> None:
-        if (
-            self.deployment is not None
-            and len(batch.operations) > self.deployment.max_batch_operations
-        ):
+        if len(batch.operations) > self.deployment.max_batch_operations:
             raise invalid_descriptor("execution batch exceeds the deployment operation limit")
         for operation in batch.operations:
             variant = operation.work.variant
             if variant not in self.allowed_work_variants:
                 raise unsupported_operation(variant.value, operation.request_key.session_id)
-        if self.deployment is not None and any(
+        if any(
             index > self.deployment.max_request_pool_size
             for partition in batch.partitions
             for index in partition.request_pool_indices
@@ -1727,22 +1995,22 @@ class ModelRunner:
             first = partitions[0]
             if first.execution is not ExecutionCapability.TENSORIZED_MIXED:
                 continue
-            if self.model is None:
-                raise invalid_descriptor("tensorized mixed submission has no model")
             variants = {
                 operation.work.variant
                 for partition in partitions
                 for operation in partition.operations
             }
-            mixed_variants = {
-                WorkVariant.TOKEN_EXTEND,
+            if not self.model.tensorized_mixed or variants != {
                 WorkVariant.TOKEN_DECODE,
-                WorkVariant.TOKEN_VERIFY,
                 WorkVariant.GEN_FLOW,
-            }
-            if not self.model.tensorized_mixed or not variants <= mixed_variants:
+            }:
                 raise invalid_descriptor(
                     "tensorized mixed submission exceeds worker mixed-execution capabilities"
+                )
+            capability = self._mixed_capability(tuple(partitions))
+            if capability not in self.mixed_buckets:
+                raise invalid_descriptor(
+                    "tensorized mixed submission has no exact qualified capability bucket"
                 )
         group_identities: list[tuple[int, str]] = []
         for submission_group, partitions in groups.items():
@@ -1774,8 +2042,6 @@ class ModelRunner:
 
     def _completion_devices(self, operations: tuple[Operation, ...]) -> tuple[str, ...]:
         deployment = self.deployment
-        if deployment is None:
-            return ()
         selected: list[str] = []
         for operation in operations:
             device = (
@@ -1793,6 +2059,50 @@ class ModelRunner:
                 selected.append(device)
         return tuple(selected)
 
+    @staticmethod
+    def _mixed_capability(
+        partitions: tuple[BatchPartition, ...],
+    ) -> MixedExecutionCapability:
+        decode_rows = sum(
+            operation.work.variant is WorkVariant.TOKEN_DECODE
+            for partition in partitions
+            for operation in partition.operations
+        )
+        flow_operations = tuple(
+            operation
+            for partition in partitions
+            for operation in partition.operations
+            if operation.work.variant is WorkVariant.GEN_FLOW
+        )
+        flow_placements = {
+            (placement.request_key, int(placement.op_id)): placement
+            for partition in partitions
+            for placement in partition.latent_placements
+        }
+        branch_counts: dict[tuple[RequestKey, int], int] = defaultdict(int)
+        for partition in partitions:
+            for placement in partition.kv_branch_placements:
+                branch_counts[(placement.request_key, int(placement.op_id))] += 1
+        geometries = {
+            (
+                int(flow_placements[(operation.request_key, int(operation.op_id))].height),
+                int(flow_placements[(operation.request_key, int(operation.op_id))].width),
+                branch_counts[(operation.request_key, int(operation.op_id))],
+            )
+            for operation in flow_operations
+            if (operation.request_key, int(operation.op_id)) in flow_placements
+        }
+        if len(geometries) != 1 or len(flow_placements) != len(flow_operations):
+            raise invalid_descriptor("tensorized mixed flow rows disagree on physical geometry")
+        height, width, cfg_branches = next(iter(geometries))
+        return MixedExecutionCapability(
+            decode_rows=decode_rows,
+            flow_rows=len(flow_operations),
+            height=height,
+            width=width,
+            cfg_branches=cfg_branches,
+        )
+
     def _reserve_outputs(
         self,
         operations: tuple[Operation, ...],
@@ -1809,6 +2119,11 @@ class ModelRunner:
         for operation in operations:
             device = self._operation_device(operation)
             for output in operation.outputs:
+                if (
+                    _operation_identity(operation) in scope.predicated_operations
+                    and output.kind is not ProductKind.COMPLETION
+                ):
+                    continue
                 if (
                     operation.work.variant is WorkVariant.TRANSFER_PRODUCT
                     and _is_transferable_product(output)
@@ -1836,6 +2151,11 @@ class ModelRunner:
         scope.device_writes.extend(write for binding in bound_groups for write in binding.writes)
         scope.encoder_writes.extend(self.encoder_cache.bind_outputs(tuple(encoder_bindings)))
         operation_identities = {_operation_identity(operation) for operation in operations}
+        token_operation_identities = {
+            _operation_identity(operation)
+            for operation in operations
+            if operation.work.kind == "token"
+        }
         for write in scope.device_writes:
             operation_identity = _reference_operation_identity(write.reference)
             if operation_identity not in operation_identities:
@@ -1853,11 +2173,21 @@ class ModelRunner:
                 scope.finish_writes[operation_identity] = write
             elif (
                 write.reference.kind is ProductKind.COMPLETION
-                and int(write.reference.output_index) == 4
+                and operation_identity in token_operation_identities
+                and int(write.reference.output_index) in {4, 6}
             ):
-                scope.continuation_writes[operation_identity] = write
+                scope.transition_writes[operation_identity] = write
             else:
                 scope.operation_writes.setdefault(operation_identity, write)
+            if (
+                operation_identity in scope.predicated_operations
+                and write.reference.kind is ProductKind.COMPLETION
+            ):
+                scope.propagated_predicate_writes.setdefault(operation_identity, ())
+                scope.propagated_predicate_writes[operation_identity] = (
+                    *scope.propagated_predicate_writes[operation_identity],
+                    write,
+                )
 
     def _operation_device(self, operation: Operation) -> torch.device:
         return (
@@ -1926,24 +2256,13 @@ class ModelRunner:
             ],
         ] = {}
         for operation in operations:
-            operation_identity = _operation_identity(operation)
             point = operation.parent.point
             if isinstance(point, DevicePoint):
-                states = self.runtime_states
-                if states is None:
-                    raise capability_mismatch("device continuation has no request runtime state")
-                session = self._request_row(scope, operation.request_key.session_id)
-                slot = int(session.request_pool_idx)
                 selected = point.selected_point
                 if selected is not None and selected.kind is not ProductKind.SELECTED_POINT:
                     raise invalid_descriptor("device parent does not name a selected-point product")
-                if operation.predicate is not None:
-                    scope.predicate_values[operation_identity] = (
-                        states.predicates[slot : slot + 1],
-                        False,
-                    )
             predicate = operation.predicate
-            if predicate is None or operation_identity in scope.predicate_values:
+            if predicate is None:
                 continue
             device = self._operation_device(operation)
             grouped.setdefault(device, []).append(
@@ -1952,7 +2271,7 @@ class ModelRunner:
                     (
                         predicate,
                         int(operation.op_id),
-                        point.producer_plan_digest if isinstance(point, DevicePoint) else None,
+                        None,
                         device,
                     ),
                 )
@@ -1961,8 +2280,7 @@ class ModelRunner:
             resident_entries = tuple(
                 entry
                 for entry in entries
-                if cast(ProductRef, entry[0].predicate)
-                not in scope.transferred_device_products
+                if cast(ProductRef, entry[0].predicate) not in scope.transferred_device_products
             )
             reads = self.device_products.consume_batch(
                 tuple(request for _operation, request in resident_entries),
@@ -1993,11 +2311,18 @@ class ModelRunner:
         self,
         scope: _ExecutionScope,
     ) -> None:
+        producers = {_operation_identity(operation) for operation in scope.partition.operations}
+        transitions = {id(write) for write in scope.transition_writes.values()}
+        propagated = {
+            id(write) for writes in scope.propagated_predicate_writes.values() for write in writes
+        }
         writes = tuple(
             write
             for write in scope.device_writes
             if write.reference.kind is ProductKind.COMPLETION
-            and _reference_operation_identity(write.reference) not in scope.continuation_writes
+            and _reference_operation_identity(write.reference) in producers
+            and id(write) not in transitions
+            and id(write) not in propagated
         )
         if not writes:
             return
@@ -2016,6 +2341,18 @@ class ModelRunner:
                 device=first.device,
             ),
         )
+
+    def _publish_predicated_outputs(
+        self,
+        operations: tuple[Operation, ...],
+        scope: _ExecutionScope,
+    ) -> None:
+        declared = {_operation_identity(operation) for operation in operations}
+        for identity, writes in scope.propagated_predicate_writes.items():
+            if identity not in declared:
+                raise RuntimeError("predicated output has no operation in its partition")
+            for write in writes:
+                self.device_products.publish_scalar_write(write, False)
 
     def _finish_device_reads(
         self,
@@ -2314,7 +2651,9 @@ class ModelRunner:
         try:
             return scope.request_rows[int(session_id)]
         except KeyError:
-            raise invalid_descriptor(f"partition has no request row for session {session_id}") from None
+            raise invalid_descriptor(
+                f"partition has no request row for session {session_id}"
+            ) from None
 
     def _consume_device_product(
         self,
@@ -2372,19 +2711,12 @@ class ModelRunner:
         parent = operation.parent
         point = parent.point
         runtime = (
-            session.execution_runtime_for_operation(
-                parent.producer_op_id,
-                point.point_index,
-            )
+            session.execution_runtime_for_operation(parent.producer_op_id, point.point_index)
             if isinstance(point, DevicePoint) and point.selected_point is None
             else None
         )
         if runtime is None:
-            selected = (
-                parent
-                if parent.is_fixed()
-                else session.selected_for_operation(parent.producer_op_id)
-            )
+            selected = session.resolve_version(parent)
             runtime = None if selected is None else session.runtime_for(selected)
         if runtime is None:
             raise invalid_descriptor("operation parent has no resolved runtime state")
@@ -2530,7 +2862,7 @@ class ModelRunner:
                 consumers = tuple(
                     operation
                     for operation in scope.partition.operations
-                    if product in operation.inputs
+                    if product in operation.inputs or operation.predicate == product
                 )
                 if not consumers:
                     raise invalid_descriptor("transferred product has no partition consumer")
@@ -2557,10 +2889,14 @@ class ModelRunner:
                 width = transfer.width
                 if payload_kind is None or height is None or width is None:
                     raise RuntimeError("prepared encoder transfer has no validated geometry")
-                if payload_kind not in {
-                    ProductKind.VISION_FEATURE,
-                    ProductKind.LATENT_FEATURE,
-                } or product.kind is not payload_kind:
+                if (
+                    payload_kind
+                    not in {
+                        ProductKind.VISION_FEATURE,
+                        ProductKind.LATENT_FEATURE,
+                    }
+                    or product.kind is not payload_kind
+                ):
                     raise invalid_descriptor("encoder transfer payload geometry is invalid")
                 encoder_binding = self.encoder_cache.bind_outputs(
                     ((product, transfer.producer_plan_digest, device),)
@@ -2608,13 +2944,63 @@ class ModelRunner:
         operations: tuple[Operation, ...],
         scope: _ExecutionScope,
     ) -> tuple[_Outcome, ...]:
-        if all(
+        predicated = scope.predicated_operations
+        active = (
+            operations
+            if not predicated
+            else tuple(
+                operation
+                for operation in operations
+                if _operation_identity(operation) not in predicated
+            )
+        )
+        if not active:
+            return tuple(self._predicated_outcome(operation, scope) for operation in operations)
+        decode = all(
             operation.work.kind == "token" and operation.work.mode == TokenMode.DECODE.value
+            for operation in active
+        )
+        devices = (self._device,) if decode else self._completion_devices(active)
+        for device in devices:
+            scope.completion.begin_device(device)
+        if decode:
+            active_outcomes = self._decode_batch(active, scope)
+        else:
+            drivers = tuple(self._driver(operation, scope) for operation in active)
+            active_outcomes = self._drive(drivers, scope)
+        if active is operations:
+            return active_outcomes
+        resolved = dict(
+            zip(
+                (_operation_identity(operation) for operation in active),
+                active_outcomes,
+                strict=True,
+            )
+        )
+        return tuple(
+            self._predicated_outcome(operation, scope)
+            if _operation_identity(operation) in scope.predicated_operations
+            else resolved[_operation_identity(operation)]
             for operation in operations
-        ):
-            return self._decode_batch(operations, scope)
-        drivers = tuple(self._driver(operation, scope) for operation in operations)
-        return self._drive(drivers, scope)
+        )
+
+    def _predicated_outcome(
+        self,
+        operation: Operation,
+        scope: _ExecutionScope,
+    ) -> _Outcome:
+        request = self._request_row(scope, operation.request_key.session_id)
+        lengths = self._logical_lengths(operation, request, None)
+        point = operation.parent.point
+        selected_point = int(point.point_index)
+        return _Outcome(
+            status=OpStatus.PREDICATED,
+            selected_point=selected_point,
+            logical_lengths=lengths,
+            token_span=TokenSpan(base=int(lengths.token_len), len=0),
+            finish_flags=FinishFlags(),
+            product_generations=(),
+        )
 
     def _decode_batch(
         self,
@@ -2626,17 +3012,35 @@ class ModelRunner:
         tasks: list[_ForwardTask] = []
         current_tokens = self._resolve_decode_tokens(operations, scope)
         layout = scope.layout
-        if layout is None or layout.operations != operations:
+        if layout is None:
             raise RuntimeError("partition lost its aligned request-row view")
-        requests = layout.requests
+        if layout.operations == operations:
+            requests = layout.requests
+            cache_rows = layout.cache_rows
+            weights = layout.weights
+        else:
+            aligned = {
+                identity: (request, cache_row, weight)
+                for identity, request, cache_row, weight in zip(
+                    layout.identities,
+                    layout.requests,
+                    layout.cache_rows,
+                    layout.weights,
+                    strict=True,
+                )
+            }
+            selected = tuple(aligned[_operation_identity(operation)] for operation in operations)
+            requests = tuple(value[0] for value in selected)
+            cache_rows = tuple(value[1] for value in selected)
+            weights = tuple(value[2] for value in selected)
         starts.extend(int(request.logical_position) for request in requests)
         position_values = torch.tensor(starts, dtype=torch.long)
-        for row_index, (operation, session, entry, weights, current) in enumerate(
+        for row_index, (operation, session, entry, weight, current) in enumerate(
             zip(
                 operations,
                 requests,
-                layout.cache_rows,
-                layout.weights,
+                cache_rows,
+                weights,
                 current_tokens,
                 strict=True,
             )
@@ -2652,7 +3056,7 @@ class ModelRunner:
                     TokenSelection.LAST_LOGITS,
                     scope,
                     entry=entry,
-                    weights=weights,
+                    weights=weight,
                 )
             )
 
@@ -2698,7 +3102,7 @@ class ModelRunner:
         for operation, session, entry, start, sampled in zip(
             operations,
             requests,
-            layout.cache_rows,
+            cache_rows,
             starts,
             samples,
             strict=True,
@@ -2771,6 +3175,8 @@ class ModelRunner:
     def _drive_partitioned(
         self,
         drivers: tuple[tuple[int, int, _Driver, _ExecutionScope], ...],
+        *,
+        qualify_mixed: bool,
     ) -> tuple[tuple[_Outcome | None, ...], dict[int, BaseException]]:
         active: dict[int, tuple[_Driver, tuple[_ModelTask, ...], _ExecutionScope]] = {}
         completed: dict[int, _Outcome] = {}
@@ -2798,7 +3204,8 @@ class ModelRunner:
             if not flat:
                 raise RuntimeError("execution driver yielded an empty task wave")
             outputs, wave_errors = self._run_partitioned_task_wave(
-                tuple((task, scope) for _driver, _task, task, scope in flat)
+                tuple((task, scope) for _driver, _task, task, scope in flat),
+                qualify_mixed=qualify_mixed,
             )
             errors.update(wave_errors)
             by_driver: dict[int, list[Any | None]] = {
@@ -2842,6 +3249,8 @@ class ModelRunner:
     def _run_partitioned_task_wave(
         self,
         tasks: tuple[tuple[_ModelTask, _ExecutionScope], ...],
+        *,
+        qualify_mixed: bool,
     ) -> tuple[tuple[Any | None, ...], dict[int, BaseException]]:
         result: list[Any | None] = [None] * len(tasks)
         errors: dict[int, BaseException] = {}
@@ -2853,7 +3262,8 @@ class ModelRunner:
         if forward:
             indexes = tuple(index for index, _task, _scope in forward)
             outputs = self._run_partitioned_wave(
-                tuple((task, scope) for _index, task, scope in forward)
+                tuple((task, scope) for _index, task, scope in forward),
+                qualify_mixed=qualify_mixed,
             )
             for index, output in zip(indexes, outputs, strict=True):
                 result[index] = output
@@ -2888,9 +3298,9 @@ class ModelRunner:
     def _run_partitioned_wave(
         self,
         tasks: tuple[tuple[_ForwardTask, _ExecutionScope], ...],
+        *,
+        qualify_mixed: bool,
     ) -> tuple[torch.Tensor, ...]:
-        if self._model_invocation is None:
-            raise capability_mismatch("system-only runner received a neural operation")
         grouped: dict[
             tuple[object, ...],
             list[tuple[int, _ForwardTask, _ExecutionScope]],
@@ -2920,19 +3330,214 @@ class ModelRunner:
             target = self._phase_device(group_tasks[0].phase)
             for scope in _unique_scopes(group_scopes):
                 scope.completion.register_device(target)
-            output = self._run_forward_group(group_tasks, group_scopes[0])
-            observation = self._model_invocation.last_observation
-            if observation is None:
-                raise RuntimeError("model runner returned without an execution observation")
-            for scope in _unique_scopes(group_scopes):
-                scope.observations.append(observation)
-            if self._model_invocation.last_output_event is not None:
+            if qualify_mixed and len(kinds) > 1:
+                output, observation, mixed_us = self._run_startup_forward(
+                    group_tasks,
+                    group_scopes[0],
+                    target,
+                )
+                mixed_output = tuple(value.clone() for value in output)
+                homogeneous: dict[
+                    str,
+                    list[tuple[int, _ForwardTask, _ExecutionScope]],
+                ] = defaultdict(list)
+                for local_index, (_index, task, scope) in enumerate(group):
+                    homogeneous[task.kind].append((local_index, task, scope))
+                references: list[torch.Tensor | None] = [None] * len(group)
+                reference_observations: list[RunObservation] = []
+                homogeneous_us: list[int] = []
+                for members in homogeneous.values():
+                    reference, reference_observation, reference_us = self._run_startup_forward(
+                        tuple(task for _index, task, _scope in members),
+                        members[0][2],
+                        target,
+                        force_eager=observation.path is RunPath.EAGER,
+                    )
+                    reference_observations.append(reference_observation)
+                    homogeneous_us.append(reference_us)
+                    for (local_index, _task, _scope), value in zip(
+                        members,
+                        reference,
+                        strict=True,
+                    ):
+                        references[local_index] = value
+                if any(value is None for value in references):
+                    raise RuntimeError("mixed qualification lost a homogeneous output row")
+                self._assert_mixed_equivalence(
+                    mixed_output,
+                    tuple(cast(torch.Tensor, value) for value in references),
+                    group_tasks,
+                )
+                service_paths = {
+                    RunPath.EAGER,
+                    RunPath.GRAPH_REPLAY,
+                }
+                if observation.path in service_paths:
+                    if any(
+                        reference.path is not observation.path
+                        for reference in reference_observations
+                    ):
+                        raise GraphExecutionError(
+                            "mixed and homogeneous service paths do not match"
+                        )
+                    serial_us = sum(homogeneous_us)
+                    if (
+                        serial_us < 1
+                        or mixed_us * MIXED_SERVICE_SERIAL_DENOMINATOR
+                        > serial_us * MIXED_SERVICE_SERIAL_NUMERATOR
+                    ):
+                        raise GraphExecutionError(
+                            "mixed service exceeds the 5/4 serial homogeneous envelope: "
+                            f"mixed_us={mixed_us} homogeneous_us={tuple(homogeneous_us)!r}"
+                        )
+                    capability = self._mixed_capability(
+                        tuple(scope.partition for scope in _unique_scopes(group_scopes))
+                    )
+                    self._qualified_mixed_buckets.add(capability)
+                    logger.info(
+                        "qualified mixed execution bucket=%r mixed_us=%d homogeneous_us=%r "
+                        "serial_over_mixed=%.3f",
+                        capability,
+                        mixed_us,
+                        tuple(homogeneous_us),
+                        serial_us / mixed_us,
+                    )
+                output = mixed_output
+            else:
+                output = self._run_forward_group(group_tasks, group_scopes[0])
+                last_observation = self._model_invocation.last_observation
+                if last_observation is None:
+                    raise RuntimeError("model runner returned without an execution observation")
+                observation = last_observation
+            group_scopes[0].observations.append(observation)
+            if (
+                not (qualify_mixed and len(kinds) > 1)
+                and self._model_invocation.last_output_event is not None
+            ):
                 output_events.append((target, self._model_invocation.last_output_event))
             for index, value in zip(indexes, output, strict=True):
                 result[index] = value
         for device, event in output_events:
             torch.cuda.current_stream(device).wait_event(event)
         return tuple(cast(torch.Tensor, value) for value in result)
+
+    def _run_startup_forward(
+        self,
+        tasks: tuple[_ForwardTask, ...],
+        scope: _ExecutionScope,
+        target: torch.device,
+        *,
+        force_eager: bool = False,
+    ) -> tuple[tuple[torch.Tensor, ...], RunObservation, int]:
+        with profile_range("uniserve.startup.mixed_oracle_forward"):
+            if target.type != "cuda":
+                started = time.perf_counter_ns()
+                output = self._run_forward_group(tasks, scope, force_eager=force_eager)
+                elapsed_us = max(1, (time.perf_counter_ns() - started) // 1000)
+            else:
+                stream = torch.cuda.current_stream(target)
+                start = torch.cuda.Event(blocking=False, enable_timing=True)
+                end = torch.cuda.Event(blocking=False, enable_timing=True)
+                start.record(stream)
+                output = self._run_forward_group(tasks, scope, force_eager=force_eager)
+                output_event = self._model_invocation.last_output_event
+                if output_event is not None:
+                    stream.wait_event(output_event)
+                end.record(stream)
+                end.synchronize()
+                elapsed_us = max(1, round(float(start.elapsed_time(end)) * 1000.0))
+            observation = self._model_invocation.last_observation
+            if observation is None:
+                raise RuntimeError("model runner returned without an execution observation")
+            return output, observation, elapsed_us
+
+    def _assert_mixed_equivalence(
+        self,
+        mixed: tuple[torch.Tensor, ...],
+        homogeneous: tuple[torch.Tensor, ...],
+        tasks: tuple[_ForwardTask, ...],
+    ) -> None:
+        if len(mixed) != len(homogeneous) or len(mixed) != len(tasks):
+            raise RuntimeError("mixed and homogeneous forwards returned different row counts")
+        tolerances = {
+            torch.bfloat16: (1.6e-2, 1.0e-5),
+            torch.float16: (1.0e-3, 1.0e-5),
+            torch.float32: (1.3e-6, 1.0e-5),
+            torch.float64: (1.0e-7, 1.0e-7),
+        }
+        flow_rows: dict[_OperationIdentity, list[int]] = defaultdict(list)
+        for row, (actual, expected, task) in enumerate(zip(mixed, homogeneous, tasks, strict=True)):
+            if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                raise RuntimeError(f"mixed qualification row {row} changed output structure")
+            if task.kind == "token":
+                if not torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1)):
+                    raise RuntimeError(
+                        f"mixed qualification row {row} changed the committed greedy token"
+                    )
+                continue
+            if task.kind != "flow":
+                raise RuntimeError("mixed qualification contains an unsupported row kind")
+            flow_rows[_operation_identity(task.operation)].append(row)
+
+        flow = self._generation()
+        for identity, rows in flow_rows.items():
+            first = tasks[rows[0]]
+            image = first.request.image
+            timestep = first.timestep
+            latent = first.latent
+            if image is None or timestep is None or latent is None:
+                raise RuntimeError("mixed flow qualification lost its committed-state inputs")
+            host_t, host_t_next = flow.schedule_pair(
+                int(image.steps),
+                float(image.timestep_shift),
+                int(first.request.flow_step),
+            )
+            guide = build_flow_cfg_plan(
+                cfg_text_scale=float(image.cfg_text_scale),
+                cfg_img_scale=float(image.cfg_img_scale),
+                recipe=flow.cfg_recipe,
+                renorm=image.cfg_renorm_type,
+                renorm_min=float(image.cfg_renorm_min),
+                use_cfg=float(image.cfg_interval[0]) <= host_t <= float(image.cfg_interval[1]),
+            )
+            if len(guide.branches) != len(rows) or any(
+                _operation_identity(tasks[row].operation) != identity for row in rows
+            ):
+                raise RuntimeError("mixed flow qualification changed its CFG branch geometry")
+
+            def committed(values: tuple[torch.Tensor, ...]) -> torch.Tensor:
+                predictions = {
+                    branch: _flow_prediction(values[row])
+                    for branch, row in zip(guide.branches, rows, strict=True)
+                }
+                velocity = guide.combine(predictions)
+                if flow.prediction in {"x", "x_prediction", "x_pred"}:
+                    velocity = x_pred_to_velocity(velocity, latent, timestep)
+                elif flow.prediction != "velocity":
+                    raise invalid_descriptor(f"unsupported flow prediction {flow.prediction!r}")
+                next_timestep = timestep.new_tensor([host_t_next])
+                return euler_step(latent, velocity, timestep, next_timestep)
+
+            actual = committed(mixed)
+            expected = committed(homogeneous)
+            if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                raise RuntimeError("mixed flow qualification changed committed latent structure")
+            tolerance = tolerances.get(actual.dtype)
+            if tolerance is None:
+                if not torch.equal(actual, expected):
+                    raise RuntimeError("mixed flow qualification changed an exact committed latent")
+                continue
+            rtol, atol = tolerance
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+                msg=lambda message: (
+                    f"mixed flow qualification {identity!r} changed the committed latent: {message}"
+                ),
+            )
 
     def _run_task_wave(
         self,
@@ -2977,8 +3582,6 @@ class ModelRunner:
         tasks: tuple[_ForwardTask, ...],
         scope: _ExecutionScope,
     ) -> tuple[torch.Tensor, ...]:
-        if self._model_invocation is None:
-            raise capability_mismatch("system-only runner received a neural operation")
         grouped: dict[tuple[object, ...], list[tuple[int, _ForwardTask]]] = defaultdict(list)
         for index, task in enumerate(tasks):
             grouped[self._group_key(task)].append((index, task))
@@ -3016,7 +3619,7 @@ class ModelRunner:
         return tuple(cast(torch.Tensor, value) for value in result)
 
     def _broadcast_tp_selection(self, value: torch.Tensor) -> torch.Tensor:
-        if self.mesh is None or self.mesh.tp_size <= 1:
+        if self.mesh.tp_size <= 1:
             return value
         transport = self.mesh.transport("tp")
         if not isinstance(transport, BroadcastTransport):
@@ -3038,7 +3641,6 @@ class ModelRunner:
             (
                 ()
                 if self._model().tensorized_mixed
-                and self._model_invocation is not None
                 and not self._model_invocation.uses_lanes
                 else self._task_shape(task)
             ),
@@ -3049,9 +3651,9 @@ class ModelRunner:
         self,
         tasks: tuple[_ForwardTask, ...],
         scope: _ExecutionScope,
+        *,
+        force_eager: bool = False,
     ) -> tuple[torch.Tensor, ...]:
-        if self._model_invocation is None:
-            raise capability_mismatch("system-only runner received a neural operation")
         target = self._phase_device(tasks[0].phase)
         scope.completion.register_device(target)
         kv_tasks = tuple(task for task in tasks if task.write_kv)
@@ -3064,11 +3666,7 @@ class ModelRunner:
         else:
             kv_view = EmptyKvView()
             attention = NoAttention(backends=self._attention_selection())
-        mesh = (
-            EmptyMeshView()
-            if self.mesh is None
-            else RouteMeshView(self.mesh, self._phase_topology(tasks[0].phase))
-        )
+        mesh = RouteMeshView(self.mesh, self._phase_topology(tasks[0].phase))
         outputs = self._model_invocation.run(
             tasks,
             device=target,
@@ -3076,8 +3674,10 @@ class ModelRunner:
             attention=attention,
             mesh=mesh,
             graph_shape=self._group_graph_shape(tasks),
-            graph_eligible=all(
-                task.phase in {ModelPhase.TEXT, ModelPhase.DENOISE} for task in tasks
+            graph_eligible=(
+                scope.graph_eligible
+                and not force_eager
+                and all(task.phase in {ModelPhase.TEXT, ModelPhase.DENOISE} for task in tasks)
             ),
             domain=scope.partition.domain,
         )
@@ -3094,7 +3694,10 @@ class ModelRunner:
         scope: _ExecutionScope,
     ) -> tuple[KvView, PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan]:
         pure_token_decode = all(
-            task.token_ids is not None and task.query_tokens == 1 for task in tasks
+            task.operation.work.variant is WorkVariant.TOKEN_DECODE
+            and task.token_ids is not None
+            and task.query_tokens == 1
+            for task in tasks
         )
         if self._model().tensorized_mixed and not pure_token_decode:
             return self._packed_attention_plan(tasks, scope)
@@ -3208,9 +3811,24 @@ class ModelRunner:
         max_query = bucketed_length(max(query_lens))
         visible = torch.zeros((len(tasks), max_query), dtype=torch.int32)
         index_parts: list[torch.Tensor] = []
-        route_parts: list[torch.Tensor] = []
-        text_indices: list[int] = []
+        route_spans: list[RouteSpan] = []
         offset = 0
+
+        def append_span(route: ExpertRoute, count: int) -> None:
+            nonlocal offset
+            if count < 1:
+                return
+            if route_spans and route_spans[-1].route is route:
+                previous = route_spans[-1]
+                route_spans[-1] = RouteSpan(
+                    route,
+                    previous.token_start,
+                    previous.token_count + count,
+                )
+            else:
+                route_spans.append(RouteSpan(route, offset, count))
+            offset += count
+
         for row, (task, base, query) in enumerate(zip(tasks, base_lens, query_lens, strict=True)):
             if task.causal:
                 visible[row, :query] = torch.arange(
@@ -3226,14 +3844,27 @@ class ModelRunner:
             if tuple(indexes.shape) != (3, query):
                 raise invalid_descriptor("packed attention indexes must have shape [3, query]")
             index_parts.append(indexes.to(device="cpu", dtype=torch.long))
-            is_flow = task.latent is not None and task.image_tokens > 0
-            route_parts.append(torch.full((query,), is_flow, dtype=torch.bool))
             if task.token_ids is not None:
-                text_indices.extend(range(offset, offset + query))
+                append_span(ExpertRoute.TEXT, query)
             else:
-                text_indices.extend(offset + value for value in task.text_local_indices)
-            offset += query
-        text = torch.tensor(text_indices, dtype=torch.long)
+                local_text = tuple(int(value) for value in task.text_local_indices)
+                if local_text != tuple(sorted(set(local_text))) or any(
+                    value < 0 or value >= query for value in local_text
+                ):
+                    raise invalid_descriptor("packed text-local indexes are invalid")
+                cursor = 0
+                local_index = 0
+                while local_index < len(local_text):
+                    run_start = local_text[local_index]
+                    append_span(ExpertRoute.FLOW, run_start - cursor)
+                    run_end = run_start + 1
+                    local_index += 1
+                    while local_index < len(local_text) and local_text[local_index] == run_end:
+                        run_end += 1
+                        local_index += 1
+                    append_span(ExpertRoute.TEXT, run_end - run_start)
+                    cursor = run_end
+                append_span(ExpertRoute.FLOW, query - cursor)
         host = torch.device("cpu")
         write_page_ids, write_page_offsets, write_token_indices = view.write_plan(host)
         page_table = view.block_table(host)
@@ -3241,15 +3872,7 @@ class ModelRunner:
         attention = PackedAttentionPlan(
             backends=self._attention_selection(),
             indexes=torch.cat(index_parts, dim=1),
-            route_indicators=torch.cat(route_parts, dim=0),
-            text_indices=text,
-            has_text=bool(text_indices),
-            has_flow=any(
-                task.latent is not None
-                and task.image_tokens > 0
-                and len(task.text_local_indices) < task.query_tokens
-                for task in tasks
-            ),
+            route_spans=tuple(route_spans),
             visible_end=visible,
             cu_seqlens_q=_cumulative(query_lens),
             page_table=page_table,
@@ -3268,13 +3891,9 @@ class ModelRunner:
         return view, attention
 
     def _weights(self) -> WeightSet:
-        if self.weights is None:
-            raise RuntimeError("model route has no immutable weight authority")
         return self.weights
 
     def _model(self) -> ExecutionModel:
-        if self.model is None:
-            raise capability_mismatch("system-only runner received a neural operation")
         return self.model
 
     def _generation(self) -> GenerationPipeline:
@@ -3295,7 +3914,7 @@ class ModelRunner:
         return value
 
     def _phase_device(self, phase: ModelPhase) -> torch.device:
-        deployment = cast(WorkerDeployment, self.deployment)
+        deployment = self.deployment
         if phase in {ModelPhase.ENCODE_LATENT, ModelPhase.DECODE_LATENT}:
             return torch.device(deployment.generation_device or deployment.device)
         return torch.device(deployment.device)
@@ -3361,7 +3980,13 @@ class ModelRunner:
         session: RequestRow,
         scope: _ExecutionScope,
     ) -> _Driver:
-        tokens = self._operation_token_ids(operation, scope)
+        tokens: tuple[int | torch.Tensor, ...]
+        if isinstance(operation.parent.point, DevicePoint) and not any(
+            reference.kind is ProductKind.TOKEN for reference in operation.inputs
+        ):
+            tokens = (self._resolve_decode_token(operation, session, scope),)
+        else:
+            tokens = self._operation_token_ids(operation, scope)
         start = session.logical_position
         sampling = _require_sampling(session)
         scores_prompt = bool(sampling.return_prompt_logprobs or int(sampling.n_prompt_logprobs) > 0)
@@ -3399,7 +4024,7 @@ class ModelRunner:
                 prompt_logprobs=self._prompt_logprob_details(
                     session,
                     start,
-                    tokens,
+                    cast(torch.Tensor, task.token_ids),
                     logits,
                     scope,
                 ),
@@ -3432,14 +4057,15 @@ class ModelRunner:
         self,
         session: RequestRow,
         start: int,
-        tokens: tuple[int, ...],
+        tokens: torch.Tensor,
         logits: torch.Tensor,
         scope: _ExecutionScope,
     ) -> tuple[
         tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
         ...,
     ]:
-        if logits.ndim != 2 or int(logits.shape[0]) != len(tokens):
+        tokens = tokens.reshape(-1).to(device=logits.device, dtype=torch.long)
+        if logits.ndim != 2 or int(logits.shape[0]) != int(tokens.numel()):
             raise invalid_descriptor("prompt scoring logits do not align with input tokens")
         states = self.runtime_states
         if states is None:
@@ -3469,7 +4095,7 @@ class ModelRunner:
             _PromptLogitsPublication(slot=slot, logits=logits[-1].detach())
         )
         session.prompt_logits_ready = True
-        if not targets:
+        if int(targets.numel()) == 0:
             return ()
         sampling = _require_sampling(session)
         prompt_parameters = replace(
@@ -3486,26 +4112,21 @@ class ModelRunner:
                 draw=0.0,
                 n_logprobs=int(sampling.n_prompt_logprobs),
             )
-            for _ in targets
-        )
-        target_tensor = torch.tensor(
-            targets,
-            dtype=torch.long,
-            device=score_logits.device,
+            for _ in range(int(targets.numel()))
         )
         indexes = torch.arange(
-            len(targets),
+            int(targets.numel()),
             dtype=torch.long,
             device=score_logits.device,
         )
         details = _sample_logprob_details(
             score_logits.float(),
             indexes,
-            target_tensor,
+            targets,
             rows,
             scope.completion,
         )
-        return tuple(details[index][1] for index in range(len(targets)))
+        return tuple(details[index][1] for index in range(int(targets.numel())))
 
     def _visual_extend(
         self,
@@ -4259,6 +4880,7 @@ class ModelRunner:
                     allowed=row_allowed,
                     suppress=state.suppressed_token_ids,
                     finish_token_ids=finish_token_ids,
+                    transition_token_ids=state.transition_token_ids,
                     force_finish=state.force_finish,
                     draw=(sampling_uniform(draw_key, int(position)) if stochastic else 0.0),
                     n_logprobs=int(sampling.n_logprobs),
@@ -4286,7 +4908,7 @@ class ModelRunner:
             )
         token_product = scope.token_writes.get(operation_identity)
         finish_product = scope.finish_writes.get(operation_identity)
-        continuation_product = scope.continuation_writes.get(operation_identity)
+        transition_product = scope.transition_writes.get(operation_identity)
         predicate_value = scope.predicate_values.get(operation_identity)
         finish_set = set(descriptor_rows[0].finish_token_ids)
         terminal_draft_prefix = next(
@@ -4305,7 +4927,7 @@ class ModelRunner:
             terminal_draft_prefix=terminal_draft_prefix,
             token_product=token_product,
             finish_product=finish_product,
-            continuation_product=continuation_product,
+            transition_product=transition_product,
             predicate=None if predicate_value is None else predicate_value[0],
             tagged_predicate=False if predicate_value is None else predicate_value[1],
             request_pool_index=request_pool_index,
@@ -4362,8 +4984,7 @@ class ModelRunner:
         operation: Operation,
         scope: _ExecutionScope,
     ) -> _Driver:
-        if False:  # pragma: no cover - keeps the driver protocol uniform
-            yield ()
+        yield from ()
         self._generation()
         session_id = operation.request_key.session_id
         conditioning = tuple(
@@ -4724,9 +5345,6 @@ class ModelRunner:
         if neural.data_ptr() != target.data_ptr() or tuple(neural.shape) != tuple(target.shape):
             target.copy_(neural.reshape_as(target))
 
-    def _noise_scale(self, height: int, width: int) -> float:
-        return self._generation().noise_scale(height, width)
-
     def _branch_source(self, branch: Branch) -> BranchSource:
         return self._generation().branch_source(branch)
 
@@ -4977,7 +5595,7 @@ class ModelRunner:
         if (
             self.transport is not None
             and self.transport.name != "local"
-            and (self.deployment is None or int(self.deployment.tp_rank) == 0)
+            and int(self.deployment.tp_rank) == 0
         ):
             locator = self.transport.publish_async(resident)
             locator = replace(
@@ -5140,10 +5758,7 @@ class ModelRunner:
     ) -> _Driver:
         if self.transport is None:
             raise capability_mismatch("product transfer requires a configured transport")
-        # Every depth-one transfer resolves without a device wave; the guarded yield
-        # keeps this a generator so the shared drive loop can complete it in place.
-        if False:  # pragma: no cover - marks this driver a generator
-            yield ()
+        yield from ()
         session_id = operation.request_key.session_id
         mode = operation.work.mode
         if mode == TransferMode.KV_PUBLISH.value:
@@ -5210,8 +5825,12 @@ class ModelRunner:
                 scope,
                 products=(ProductPayload(product=outputs[0], payload=b""),),
             )
-        inputs = tuple(reference for reference in operation.inputs if _is_transferable_product(reference))
-        outputs = tuple(reference for reference in operation.outputs if _is_transferable_product(reference))
+        inputs = tuple(
+            reference for reference in operation.inputs if _is_transferable_product(reference)
+        )
+        outputs = tuple(
+            reference for reference in operation.outputs if _is_transferable_product(reference)
+        )
         if len(inputs) != 1 or len(outputs) != 1:
             raise invalid_descriptor("product transfer requires one physical input and one output")
         value, metadata = self._fetch_product_tensor(operation, scope)
@@ -5723,9 +6342,7 @@ class ModelRunner:
                             "height": metadata.height,
                             "width": metadata.width,
                             "value_range": (
-                                ""
-                                if metadata.value_range is None
-                                else metadata.value_range.value
+                                "" if metadata.value_range is None else metadata.value_range.value
                             ),
                         }
                     )
@@ -5845,21 +6462,6 @@ def _fixed_parent(operation: Operation) -> FixedPoint:
     return point
 
 
-def _parent_base_point(operation: Operation, session: RequestRow) -> int:
-    """The point index an operation advances from.
-
-    A fixed parent carries the host-observed point index directly. A device
-    parent (a device-relay successor rooted on its predecessor's not-yet-observed
-    selected point) carries no host point index; its base is the session's
-    latest resolved point.
-    """
-
-    point = operation.parent.point
-    if isinstance(point, FixedPoint):
-        return point.point_index
-    return session.version
-
-
 def _parent_semantic(operation: Operation, session: RequestRow) -> str:
     """The parent semantic digest a completion's own semantic digest chains from.
 
@@ -5867,10 +6469,10 @@ def _parent_semantic(operation: Operation, session: RequestRow) -> str:
     resolved semantic digest.
     """
 
-    point = operation.parent.point
-    if isinstance(point, FixedPoint):
-        return point.semantic_digest
-    return session.resolved_digest
+    selected = session.resolve_version(operation.parent)
+    if selected is None or not isinstance(selected.point, FixedPoint):
+        raise invalid_descriptor("operation parent has no resolved semantic state")
+    return selected.point.semantic_digest
 
 
 def _output_generations(operation: Operation) -> tuple[int, ...]:
@@ -5952,7 +6554,9 @@ def _forward_stats(
         fallbacks += observation.path is RunPath.GRAPH_FALLBACK
         graph_unpadded_tokens += int(observation.graph_unpadded_tokens)
         graph_padded_tokens += int(observation.graph_padded_tokens)
-    components = {"forward": sum(route_us.values())}
+    components: dict[str, int] = {}
+    if observations:
+        components["forward"] = sum(route_us.values())
     for name, value in (component_us or {}).items():
         components[str(name)] = components.get(str(name), 0) + max(0, int(value))
     return WorkerForwardStats(
@@ -6230,10 +6834,19 @@ def _sample_device_greedy_group(
     finish_batch: DeviceProductScalarBatch | None = None
     if finish_writes and device_products is not None:
         finish_batch = device_products.producer_scalar_batch(finish_writes)
+    transition_writes = tuple(
+        cast(DeviceProductWrite, task.transition_product)
+        for task in tasks
+        if task.transition_product is not None
+    )
+    transition_batch: DeviceProductScalarBatch | None = None
+    if transition_writes and device_products is not None:
+        transition_batch = device_products.producer_scalar_batch(transition_writes)
     grouped_publication = (
         product_table is not None
         and product_batch is not None
         and (not finish_writes or finish_batch is not None)
+        and (not transition_writes or transition_batch is not None)
     )
     if packed_output is None or int(packed_output.numel()) != len(tasks):
         device_tokens = torch.argmax(selection_logits, dim=-1)
@@ -6283,6 +6896,52 @@ def _sample_device_greedy_group(
             device_products,
             device_reads,
         )
+    resolved_transition_writes, transition_values = _sampled_transition_values(
+        tasks,
+        device_tokens,
+        valid,
+        active,
+        destination=(
+            transition_batch.tensor
+            if grouped_publication
+            and transition_batch is not None
+            and transition_batch.tensor.dtype is torch.bool
+            else None
+        ),
+    )
+    if len(resolved_transition_writes) != len(transition_writes) or any(
+        resolved is not expected
+        for resolved, expected in zip(
+            resolved_transition_writes,
+            transition_writes,
+            strict=True,
+        )
+    ):
+        raise RuntimeError("sampling transition publication lost its output alignment")
+    if transition_writes and device_products is None:
+        raise RuntimeError("sampling transition outputs have no device-product owner")
+    if grouped_publication and transition_batch is not None:
+        if transition_values is None:
+            raise RuntimeError("sampling transition publication lost its device values")
+        target = transition_batch.tensor.reshape(-1)
+        aliases_target = (
+            transition_values.device == target.device
+            and transition_values.dtype == target.dtype
+            and transition_values.untyped_storage().data_ptr()
+            == target.untyped_storage().data_ptr()
+            and int(transition_values.storage_offset()) == int(target.storage_offset())
+        )
+        if not aliases_target:
+            target.copy_(transition_values)
+    if transition_writes and not grouped_publication:
+        if transition_values is None:
+            raise RuntimeError("sampling transition publication lost its device values")
+        _publish_device_writes(
+            transition_writes,
+            transition_values,
+            cast(DeviceProducts, device_products),
+            device_reads,
+        )
     span = _capture_sample_span(
         valid,
         active,
@@ -6298,14 +6957,16 @@ def _sample_device_greedy_group(
     published = product_table is not None
     if product_table is not None:
         if grouped_publication:
-            side_batches: tuple[DeviceProductScalarBatch, ...] = ()
+            side_batches: tuple[DeviceProductScalarBatch, ...] = (
+                (transition_batch,) if transition_batch is not None else ()
+            )
             if finish_batch is not None:
                 if device_finish is None:
                     raise RuntimeError("grouped sampling has no device finish values")
                 finish_batch.tensor.copy_(
                     _select_device_values(device_finish, finish_indexes),
                 )
-                side_batches = (finish_batch,)
+                side_batches = (*side_batches, finish_batch)
             product_table.publish_scalar_group(
                 (*side_batches, cast(DeviceProductScalarBatch, product_batch)),
                 after_reads=device_reads,
@@ -6406,6 +7067,14 @@ def _sample_fused_top_k_group(
         valid,
         active,
         torch.zeros_like(active, dtype=torch.bool),
+        device_products,
+        device_reads,
+    )
+    _publish_sampled_transition_values(
+        tasks,
+        tokens,
+        valid,
+        active,
         device_products,
         device_reads,
     )
@@ -6561,6 +7230,14 @@ def _sample_task_group(
         task_valid,
         active,
         terminal_finish,
+        device_products,
+        device_reads,
+    )
+    _publish_sampled_transition_values(
+        tasks,
+        task_tokens,
+        task_valid,
+        active,
         device_products,
         device_reads,
     )
@@ -6804,6 +7481,102 @@ def _publish_sampled_device_values(
     return True
 
 
+def _publish_sampled_transition_values(
+    tasks: tuple[_SampleTask, ...],
+    device_tokens: torch.Tensor,
+    valid: torch.Tensor,
+    active: torch.Tensor,
+    device_products: DeviceProducts | None,
+    device_reads: tuple[DeviceProductRead, ...],
+) -> None:
+    writes, transitions = _sampled_transition_values(
+        tasks,
+        device_tokens,
+        valid,
+        active,
+    )
+    if not writes:
+        return
+    if device_products is None:
+        raise RuntimeError("sampling transition outputs have no device-product owner")
+    if transitions is None:
+        raise RuntimeError("sampling transition publication lost its device values")
+    _publish_device_writes(
+        writes,
+        transitions,
+        device_products,
+        device_reads,
+    )
+
+
+def _sampled_transition_values(
+    tasks: tuple[_SampleTask, ...],
+    device_tokens: torch.Tensor,
+    valid: torch.Tensor,
+    active: torch.Tensor,
+    *,
+    destination: torch.Tensor | None = None,
+) -> tuple[tuple[DeviceProductWrite, ...], torch.Tensor | None]:
+    selected = tuple(
+        (index, task, task.transition_product)
+        for index, task in enumerate(tasks)
+        if task.transition_product is not None
+    )
+    if not selected:
+        return (), None
+    tokens = device_tokens.reshape(-1)
+    eligibility = valid.reshape(-1).to(dtype=torch.bool) & active.reshape(-1).to(
+        dtype=torch.bool
+    )
+    if int(tokens.numel()) != len(tasks) or int(eligibility.numel()) != len(tasks):
+        raise RuntimeError("sampling transition vectors do not align")
+    indexes = tuple(index for index, _task, _write in selected)
+    writes = tuple(cast(DeviceProductWrite, write) for _index, _task, write in selected)
+    selected_tokens = _select_device_values(tokens, indexes)
+    selected_eligibility = _select_device_values(eligibility, indexes)
+    target: torch.Tensor | None = None
+    if destination is not None:
+        target = destination.reshape(-1)
+        if (
+            int(target.numel()) != len(selected)
+            or target.device != selected_tokens.device
+            or target.dtype is not torch.bool
+        ):
+            raise RuntimeError("sampling transition destination does not align")
+    transition_sets = tuple(
+        task.rows[0].transition_token_ids for _index, task, _write in selected
+    )
+    first = transition_sets[0]
+    if all(values == first for values in transition_sets[1:]):
+        if not first:
+            transitions = (
+                target.zero_()
+                if target is not None
+                else torch.zeros_like(selected_eligibility, dtype=torch.bool)
+            )
+        else:
+            if target is None:
+                transitions = selected_tokens == int(first[0])
+            else:
+                torch.eq(selected_tokens, int(first[0]), out=target)
+                transitions = target
+            for token_id in first[1:]:
+                transitions.logical_or_(selected_tokens == int(token_id))
+    else:
+        width = max(1, *(len(values) for values in transition_sets))
+        transition_ids = torch.tensor(
+            tuple((*values, *((-1,) * (width - len(values)))) for values in transition_sets),
+            dtype=selected_tokens.dtype,
+            device=selected_tokens.device,
+        )
+        transitions = selected_tokens.unsqueeze(1).eq(transition_ids).any(dim=1)
+        if target is not None:
+            target.copy_(transitions)
+            transitions = target
+    transitions.logical_and_(selected_eligibility)
+    return writes, transitions
+
+
 def _resolve_sampled_finish_values(
     tasks: tuple[_SampleTask, ...],
     device_tokens: torch.Tensor,
@@ -6817,13 +7590,6 @@ def _resolve_sampled_finish_values(
         terminal_finish.reshape(-1).to(dtype=torch.bool) & valid & active
     )
     continuation_values = active & valid & ~finish_values
-    _publish_sampled_device_values(
-        tasks,
-        "continuation_product",
-        continuation_values,
-        device_products,
-        device_reads,
-    )
     if device_products is None:
         return finish_values, continuation_values, None
     selected = tuple(
@@ -7345,13 +8111,6 @@ def _positions_as_three_axis(positions: torch.Tensor, query: int) -> torch.Tenso
     if positions.ndim == 2 and tuple(positions.shape) == (3, query):
         return positions
     raise invalid_descriptor("state positions do not align with their physical token row")
-
-
-def _torch_dtype(name: str) -> torch.dtype:
-    value = getattr(torch, str(name).removeprefix("torch."), None)
-    if not isinstance(value, torch.dtype):
-        raise invalid_descriptor(f"unsupported route dtype {name!r}")
-    return value
 
 
 __all__ = ["ModelRunner", "PreparedExecution"]

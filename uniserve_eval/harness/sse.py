@@ -1,17 +1,9 @@
-"""Shared Server-Sent-Events reader for the UniServe benchmark/e2e harnesses.
+"""Server-Sent Events framing for benchmark and end-to-end clients.
 
-Historically three near-identical "read a UniServe SSE stream into a list of
-event dicts" parsers existed (``tests/python/e2e/http_helpers.post_sse``,
-``uniserve_eval.harness.runner.BenchmarkRunner._post_sse`` and
-``mixed_batch_benchmark.read_sse``). They each reimplemented the same
-``data:`` framing/JSON-decode logic and slowly diverged. This module is the one
-place that logic lives; every reader routes its raw lines through
-:func:`iter_sse_events`.
+The framing rules are:
 
-The framing rules (matching the previous union of all three readers):
-
-* ``data:`` lines have the prefix stripped and a single optional leading space
-  removed (so ``data:{}`` and ``data: {}`` decode identically).
+* ``data:`` lines strip the prefix and at most one leading space, so
+  ``data:{}`` and ``data: {}`` decode identically.
 * Comment lines (``:`` prefix) and any non-``data:`` line are ignored.
 * A blank line flushes the accumulated ``data:`` lines as one event; multi-line
   ``data:`` blocks are joined with ``\n`` before decoding. The buffer is also
@@ -202,103 +194,6 @@ async def aiter_sse_events(
     return events
 
 
-async def aiter_sse_events_from_text(
-    chunks: AsyncIterable[str],
-    *,
-    stamp_time: bool = False,
-    on_parse_error: ParseErrorPolicy = "raise",
-    stop_on: Callable[[Any], bool] | frozenset[str] | None = None,
-) -> list[Any]:
-    """Decode SSE records from arbitrary text chunks.
-
-    Unlike ``httpx.Response.aiter_lines()``, this path can observe a final
-    terminal ``data:`` record that has been flushed as bytes but is not followed
-    by a newline or response EOF yet.
-    """
-    stop = _make_stop(stop_on)
-    events: list[Any] = []
-    data_lines: list[str] = []
-    line_buffer = ""
-
-    def flush() -> bool:
-        nonlocal data_lines
-        if not data_lines:
-            return False
-        data = "\n".join(data_lines)
-        data_lines = []
-        event = _decode_event(
-            data,
-            time.perf_counter(),
-            stamp_time=stamp_time,
-            on_parse_error=on_parse_error,
-        )
-        events.append(event)
-        return stop(event)
-
-    def process_line(line: str) -> bool:
-        nonlocal data_lines
-        if line.endswith("\r"):
-            line = line[:-1]
-        if line == "":
-            return flush()
-        if line.startswith(":") or not line.startswith("data:"):
-            return False
-        data = line.removeprefix("data:")
-        if data.startswith(" "):
-            data = data[1:]
-        data_lines.append(data)
-        if stop_on is None:
-            return False
-        event = _try_decode_complete_event(
-            "\n".join(data_lines),
-            time.perf_counter(),
-            stamp_time=stamp_time,
-        )
-        if event is _INCOMPLETE or not stop(event):
-            return False
-        data_lines = []
-        events.append(event)
-        return True
-
-    def process_pending_terminal() -> bool:
-        nonlocal data_lines, line_buffer
-        line = line_buffer[:-1] if line_buffer.endswith("\r") else line_buffer
-        if stop_on is None or not line.startswith("data:"):
-            return False
-        data = line.removeprefix("data:")
-        if data.startswith(" "):
-            data = data[1:]
-        event = _try_decode_complete_event(
-            "\n".join([*data_lines, data]),
-            time.perf_counter(),
-            stamp_time=stamp_time,
-        )
-        if event is _INCOMPLETE or not stop(event):
-            return False
-        data_lines = []
-        line_buffer = ""
-        events.append(event)
-        return True
-
-    async for chunk in chunks:
-        if not chunk:
-            continue
-        line_buffer += chunk
-        while True:
-            newline = line_buffer.find("\n")
-            if newline < 0:
-                break
-            line = line_buffer[:newline]
-            line_buffer = line_buffer[newline + 1 :]
-            if process_line(line):
-                return events
-        if process_pending_terminal():
-            return events
-
-    if line_buffer and process_line(line_buffer):
-        return events
-    flush()
-    return events
 
 
 def _make_stop(

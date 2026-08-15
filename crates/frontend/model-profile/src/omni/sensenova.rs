@@ -165,6 +165,28 @@ impl SenseNovaProfile {
         ingest.step_kv_tokens[0] = ImageKvEffect::Exact { tokens };
         Ok(ingest)
     }
+
+    pub fn generation_policy_for_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> assets::Result<GenerationPolicyDescriptor> {
+        let tokens = pixel_bound_tokens(width, height, 32, 262_144, 4_194_304, 32, 1)?;
+        let mut policy = self.generation_policy.clone();
+        let feedback = policy
+            .feedback
+            .as_mut()
+            .ok_or_else(|| assets::Error::message("SenseNova generation policy has no feedback"))?;
+        if feedback.ingest.steps.as_slice() != [ImageIngestStep::VitEncode]
+            || feedback.ingest.step_kv_tokens.len() != 1
+        {
+            return Err(assets::Error::message(
+                "SenseNova feedback recipe does not match its image processor",
+            ));
+        }
+        feedback.ingest.step_kv_tokens[0] = ImageKvEffect::Exact { tokens };
+        Ok(policy)
+    }
 }
 
 fn resolution_policy() -> ResolutionPolicy {

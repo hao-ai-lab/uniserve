@@ -34,8 +34,6 @@ class SglKernelAttentionBackend:
             available=any(
                 value is not None for value in (_flash_attn_varlen_func, _flash_attn_with_kvcache)
             ),
-            segment_batched_cfg=False,
-            mixed_mode=False,
             paged_kv=_flash_attn_with_kvcache is not None,
             varlen_attention=_flash_attn_varlen_func is not None,
             varlen_paged_kv=False,

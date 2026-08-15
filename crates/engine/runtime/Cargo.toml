@@ -6,12 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bytes.workspace = true
 crossbeam-channel.workspace = true
-serde.workspace = true
-thiserror-ext.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
-tokio-util.workspace = true
 tracing.workspace = true
 
 uniserve-engine-api.workspace = true
@@ -20,11 +15,6 @@ uniserve-scheduler.workspace = true
 uniserve-core.workspace = true
 uniserve-worker-wire.workspace = true
 uniserve-worker-ipc.workspace = true
-
-[dev-dependencies]
-futures.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

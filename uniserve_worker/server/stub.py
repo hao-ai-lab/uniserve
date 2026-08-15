@@ -18,7 +18,6 @@ from ..foundation.sizing import (
     DEFAULT_MAX_BATCH_OPS,
     DEFAULT_MAX_REQUEST_POOL_SIZE,
 )
-from ..loader.schema import WeightSpec
 from ..models.generation import BranchSource, GenerationPipeline, LatentLayout, Materialization
 from ..models.inputs import (
     FeatureInjection,
@@ -46,7 +45,6 @@ STUB_NUM_LAYERS = 1
 STUB_SCRATCH_TOKENS = 65536
 STUB_MAX_LATENT_SIZE = 1024
 STUB_LATENT_DOWNSAMPLE = 16
-STUB_BYTES_PER_TOKEN = 4
 _STUB_VOCAB_SIZE = STUB_IMG_START_TOKEN_ID + 1
 _STUB_HIDDEN_SIZE = 4
 
@@ -96,14 +94,12 @@ class StubModel(ExecutionModel):
             stride=16,
             max_pixels=512 * 512,
         )
-        self.weight_spec = WeightSpec()
         self.image_processor = ImageProcessor(
             vit=PatchTransform(
                 patch_size=16,
                 downsample_ratio=1.0,
                 min_pixels=16 * 16,
                 max_pixels=512 * 512,
-                multi_image_pixel_budget=512 * 512,
                 normalization="signed_unit",
             ),
             vae=TowerTransform(image_resize),

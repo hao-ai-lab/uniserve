@@ -68,18 +68,6 @@ class RequestRuntime:
         ):
             raise invalid_descriptor("resolved request KV extents are not contained")
 
-    @property
-    def kv_length(self) -> int:
-        return self.kv_visible_len
-
-
-@dataclass(frozen=True, slots=True)
-class KvControlUpdate:
-    session_id: int
-    visible_len: int
-    committed_len: int
-    rewind: bool
-
 
 @dataclass(frozen=True, slots=True)
 class _RequestAssignment:
@@ -157,7 +145,10 @@ class RequestRow:
         )
 
     def install_runtime(self, runtime: RequestRuntime) -> None:
-        if runtime.latent_product is not None and runtime.latent_product.request_key != self.request_key:
+        if (
+            runtime.latent_product is not None
+            and runtime.latent_product.request_key != self.request_key
+        ):
             raise invalid_descriptor("resolved request latent belongs to another request")
         self.logical_position = runtime.logical_position
         self.rng_counter = runtime.rng_counter
@@ -177,11 +168,10 @@ class RequestRow:
     def selected_for_operation(self, op_id: int) -> VersionRef | None:
         return self.resolved_operations.get(int(op_id))
 
-    def semantic_parent_for_operation(self, op_id: int) -> VersionRef | None:
-        parent = self.declared_parents.get(int(op_id))
-        if parent is None or parent.is_fixed():
-            return parent
-        return self.selected_for_operation(parent.producer_op_id)
+    def resolve_version(self, version: VersionRef) -> VersionRef | None:
+        if isinstance(version.point, FixedPoint):
+            return version
+        return self.selected_for_operation(version.producer_op_id)
 
     def execution_runtime_for_operation(
         self,
@@ -189,6 +179,10 @@ class RequestRow:
         point_index: int,
     ) -> RequestRuntime | None:
         return self.resolved_runtime.get((int(op_id), int(point_index)))
+
+    def semantic_parent_for_operation(self, op_id: int) -> VersionRef | None:
+        parent = self.declared_parents.get(int(op_id))
+        return None if parent is None else self.resolve_version(parent)
 
 
 class RequestTable:
@@ -218,10 +212,6 @@ class RequestTable:
     def peek(self, session_id: int) -> RequestRow | None:
         slot = self._slots_by_session.get(int(session_id))
         return None if slot is None else self._rows[slot]
-
-    def row_at(self, request_pool_idx: int) -> RequestRow | None:
-        slot = self._validate_slot(request_pool_idx)
-        return self._rows[slot]
 
     def request_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self._slots_by_session))
@@ -319,15 +309,16 @@ class RequestTable:
             if len(row.resolved_versions) + additions > self.history_capacity:
                 raise invalid_descriptor("request history capacity is exhausted")
             parent = operation.parent
+            resolved_parent = row.resolve_version(parent)
             parent_matches = (
                 row.committed_version() == parent
                 if parent.is_fixed()
-                else row.selected_for_operation(parent.producer_op_id) is not None
+                else resolved_parent is not None
             )
             if row.request_key != operation.request_key or not parent_matches:
                 raise RuntimeError(f"request {session_id} candidate has a stale parent")
-            if not parent.is_fixed() and row.selected_for_operation(parent.producer_op_id) is None:
-                raise RuntimeError("resolved request parent is missing")
+            if not operation.advances_state and selected != resolved_parent:
+                raise RuntimeError("non-state request publication changed its resolved parent")
             assignments.append(
                 _RequestAssignment(
                     operation=operation,
@@ -378,17 +369,12 @@ class RequestTable:
             row.last_op_id = int(operation.op_id)
             row.last_step_id = int(publication.step_id)
 
-    def apply_controls(self, controls: Sequence[Control]) -> tuple[KvControlUpdate, ...]:
-        updates: list[KvControlUpdate] = []
+    def apply_controls(self, controls: Sequence[Control]) -> None:
         for control in controls:
-            update: KvControlUpdate | None = None
             if isinstance(control, Commit):
-                update = self._apply_commit(control)
+                self._apply_commit(control)
             elif isinstance(control, Close):
-                update = self._apply_close(control)
-            if update is not None:
-                updates.append(update)
-        return tuple(updates)
+                self._apply_close(control)
 
     def finalize_predicated(
         self,
@@ -397,7 +383,7 @@ class RequestTable:
         parent: VersionRef,
     ) -> tuple[VersionRef, RequestRuntime]:
         row = self.get(session_id)
-        selected = parent if parent.is_fixed() else row.selected_for_operation(parent.producer_op_id)
+        selected = row.resolve_version(parent)
         runtime = None if selected is None else row.runtime_for(selected)
         if selected is None or runtime is None:
             raise invalid_descriptor(f"predicated operation {op_id} lost its resolved parent")
@@ -583,7 +569,7 @@ class RequestTable:
                 raise invalid_descriptor(
                     f"operation {operation.op_id} parent does not match committed state"
                 )
-        elif row.selected_for_operation(parent.producer_op_id) is None:
+        elif row.resolve_version(parent) is None:
             raise invalid_descriptor(
                 f"operation {operation.op_id} names an unresolved device parent"
             )
@@ -611,13 +597,13 @@ class RequestTable:
             )
         return False, identity, digest
 
-    def _apply_commit(self, control: Commit) -> KvControlUpdate | None:
+    def _apply_commit(self, control: Commit) -> None:
         row = self.get(control.request_key.session_id)
         if control.request_key != row.request_key:
             raise invalid_descriptor("commit control has a stale request key")
         duplicate, identity, digest = self._control_identity(row, control)
         if duplicate:
-            return None
+            return
         if row.terminal_cutoff is not None:
             raise invalid_descriptor("commit control targets a closed request")
         if control.expected_parent != row.committed_version():
@@ -629,8 +615,7 @@ class RequestTable:
             raise invalid_descriptor("commit control selected point was not resolved")
         if row.semantic_parent_for_operation(selected.producer_op_id) != control.expected_parent:
             raise invalid_descriptor("commit control selected point has a different parent")
-        runtime = row.runtime_for(selected)
-        if runtime is None:
+        if row.runtime_for(selected) is None:
             raise invalid_descriptor("commit control selected point lost its runtime")
         point = cast(FixedPoint, selected.point)
         if int(control.public_event_limit) < row.public_event_limit:
@@ -641,27 +626,22 @@ class RequestTable:
         row.public_event_limit = int(control.public_event_limit)
         row.applied_control_seq = int(control.control_seq)
         row.control_digests[identity] = digest
-        return KvControlUpdate(
-            session_id=row.session_id,
-            visible_len=runtime.kv_visible_len,
-            committed_len=runtime.kv_visible_len,
-            rewind=False,
-        )
 
-    def _apply_close(self, control: Close) -> KvControlUpdate | None:
+    def _apply_close(self, control: Close) -> None:
         row = self.get(control.request_key.session_id)
         if control.request_key != row.request_key:
             raise invalid_descriptor("close control has a stale request key")
         duplicate, identity, digest = self._control_identity(row, control)
         if duplicate:
-            return None
+            return
         cutoff = control.cutoff
         if not cutoff.is_fixed():
             raise invalid_descriptor("close control cutoff is not fixed")
         point = cast(FixedPoint, cutoff.point)
-        reachable = cutoff == row.committed_version() or row.resolved_versions.get(
-            row.point_key(cutoff)
-        ) == cutoff
+        reachable = (
+            cutoff == row.committed_version()
+            or row.resolved_versions.get(row.point_key(cutoff)) == cutoff
+        )
         if not reachable:
             raise invalid_descriptor("close control cutoff is not on the resolved lineage")
         runtime = row.runtime_for(cutoff)
@@ -682,17 +662,10 @@ class RequestTable:
         row.resolved_runtime = {key: runtime}
         row.resolved_operations = {int(cutoff.producer_op_id): cutoff}
         row.declared_parents = {int(cutoff.producer_op_id): cutoff}
-        return KvControlUpdate(
-            session_id=row.session_id,
-            visible_len=runtime.kv_visible_len,
-            committed_len=runtime.kv_visible_len,
-            rewind=True,
-        )
 
 
 __all__ = [
     "MAX_REQUEST_HISTORY_POINTS",
-    "KvControlUpdate",
     "RequestRow",
     "RequestRuntime",
     "RequestTable",

@@ -15,7 +15,6 @@ from uniserve_worker.worker import Worker
 def execution_worker(
     model: ExecutionModel | None = None,
     *,
-    defer_sampling: bool = False,
     block_size: int = 16,
     device: str = "cpu",
     pipeline_depth: int = 1,
@@ -31,12 +30,12 @@ def execution_worker(
         stub_deployment(block_size, max_batch_tokens=max_batch_tokens),
         device=device,
         max_request_pool_size=max_request_pool_size,
-        **(
-            {}
-            if max_batch_operations is None
-            else {"max_batch_operations": int(max_batch_operations)}
-        ),
     )
+    if max_batch_operations is not None:
+        deployment = replace(
+            deployment,
+            max_batch_operations=int(max_batch_operations),
+        )
     worker = Worker(
         ready,
         mesh=DeviceMesh.trivial(device),
@@ -47,13 +46,17 @@ def execution_worker(
             block_size=block_size,
         ),
         execution=(
-            ExecutionConfig(cuda_graph=False, prefill_cuda_graph=False)
+            ExecutionConfig(
+                cuda_graph=False,
+                prefill_cuda_graph=False,
+                flow_graph_batch_sizes=(1,),
+                flow_graph_shapes=((16, 16),),
+            )
             if execution is None
             else execution
         ),
         tokenizer=None,
         allowed_work_variants=ready.supported_work,
-        defer_sampling=defer_sampling,
         transfer_backend=transfer_backend,
         pipeline_depth=pipeline_depth,
         completion_payload_bytes=1 << 16,

@@ -85,6 +85,10 @@ class WorkerIpcTransport(Protocol):
 
     def wait_incoming(self, timeout_us: int) -> None: ...
 
+    def wake(self) -> None: ...
+
+    def wake_on_stream(self, stream: int) -> None: ...
+
 
 class WorkerServeLoop:
     """Launch a bounded request pipeline and finalize responses when ready."""
@@ -92,16 +96,22 @@ class WorkerServeLoop:
     def __init__(self, worker_server: WorkerServer, ipc_endpoint: WorkerIpcTransport) -> None:
         self.worker_server = worker_server
         self.ipc_endpoint = ipc_endpoint
-        self.inflight: deque[tuple[dict[str, Any], dict[str, Any]]] = deque()
+        self.inflight: deque[dict[str, Any]] = deque()
+        self.waiting: deque[tuple[dict[str, Any], frozenset[int]]] = deque()
         self._inflight_sessions: dict[int, frozenset[int]] = {}
-        self.shutdown: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self.shutdown: dict[str, Any] | None = None
+        wake = getattr(ipc_endpoint, "wake", None)
+        wake_on_stream = getattr(ipc_endpoint, "wake_on_stream", None)
+        install = getattr(worker_server.worker, "set_completion_wake", None)
+        if callable(wake) and callable(wake_on_stream) and callable(install):
+            install(wake, wake_on_stream)
 
     def _append_inflight(
         self,
         request: dict[str, Any],
         response: dict[str, Any],
     ) -> None:
-        self.inflight.append((request, response))
+        self.inflight.append(response)
         self._inflight_sessions[id(response)] = _request_session_ids(
             request
         ) | _response_session_ids(response)
@@ -118,28 +128,22 @@ class WorkerServeLoop:
         gc.disable()
         try:
             while True:
-                self._refill()
                 if self._respond_ready():
                     continue
-                if self.shutdown is not None and not self.inflight:
-                    self.worker_server.respond(self.shutdown[1])
-                    return
-                if self.inflight:
-                    # Device work is in flight but none is query-ready. Device
-                    # readiness carries no operating-system wake, so the
-                    # controller advances on query-only progress: it re-checks
-                    # readiness and picks up any inbound submission on the next
-                    # turn without yielding. Observing completion within the query
-                    # cadence keeps its host-side latency negligible against the
-                    # device step it completes; an idle controller (nothing in
-                    # flight) instead blocks on the command wake below.
+                if self._start_waiting():
                     continue
-                request = self._receive()
-                response = self.worker_server.handle(request)
-                if request.get("kind") == RequestKind.SHUTDOWN.value:
-                    self.worker_server.respond(response)
+                self._refill()
+                if self._start_waiting():
+                    continue
+                if self._respond_ready():
+                    continue
+                if self.shutdown is not None and not self.inflight and not self.waiting:
+                    self.worker_server.respond(self.shutdown)
                     return
-                self._append_inflight(request, response)
+                if self.inflight or self.waiting:
+                    self.ipc_endpoint.wait_incoming(60_000_000)
+                    continue
+                self._accept(self.ipc_endpoint.recv())
         finally:
             if gc_was_enabled:
                 gc.enable()
@@ -149,35 +153,55 @@ class WorkerServeLoop:
                 close()
 
     def _refill(self) -> None:
-        while self.shutdown is None and len(self.inflight) < self.worker_server.pipeline_depth:
-            started = self.worker_server.metrics.now_ns()
+        while (
+            self.shutdown is None
+            and len(self.inflight) + len(self.waiting) < self.worker_server.pipeline_depth
+        ):
             try_receive = getattr(self.ipc_endpoint, "try_recv", None)
             if not callable(try_receive):
                 return
             request = try_receive()
-            self.worker_server.metrics.record_pipeline(
-                "receive", self.worker_server.metrics.now_ns() - started
-            )
             if request is None:
                 return
+            self._accept(request)
+
+    def _accept(self, request: dict[str, Any]) -> None:
+        if request.get("kind") == RequestKind.SHUTDOWN.value:
+            self.shutdown = self.worker_server.handle(request)
+            return
+        self.waiting.append((request, _request_session_ids(request)))
+
+    def _start_waiting(self) -> bool:
+        from .app import _response_execution_complete
+
+        if not self.waiting:
+            return False
+        started = False
+        blocked_sessions: set[int] = set()
+        remaining: deque[tuple[dict[str, Any], frozenset[int]]] = deque()
+        while self.waiting:
+            request, sessions = self.waiting.popleft()
+            if blocked_sessions.intersection(sessions) or not all(
+                self._inflight_sessions[id(response)].isdisjoint(sessions)
+                or _response_execution_complete(response)
+                for response in self.inflight
+            ):
+                remaining.append((request, sessions))
+                blocked_sessions.update(sessions)
+                continue
             response = self.worker_server.handle(request)
-            if request.get("kind") == RequestKind.SHUTDOWN.value:
-                self.shutdown = (request, response)
-                return
             self._append_inflight(request, response)
+            started = True
+        self.waiting = remaining
+        return started
 
     def _respond_ready(self) -> bool:
         from .app import _response_ready
 
         earlier_sessions: set[int] = set()
-        for index, (request, response) in enumerate(self.inflight):
+        for index, response in enumerate(self.inflight):
             response_id = id(response)
-            request_sessions = self._inflight_sessions.get(response_id)
-            if request_sessions is None:
-                # Preserve direct test/debug injection into ``inflight`` while
-                # keeping the normal polling path allocation-free.
-                request_sessions = _request_session_ids(request) | _response_session_ids(response)
-                self._inflight_sessions[response_id] = request_sessions
+            request_sessions = self._inflight_sessions[response_id]
             lineage_ready = earlier_sessions.isdisjoint(request_sessions)
             if lineage_ready and _response_ready(response):
                 del self.inflight[index]
@@ -186,11 +210,3 @@ class WorkerServeLoop:
                 return True
             earlier_sessions.update(request_sessions)
         return False
-
-    def _receive(self) -> dict[str, Any]:
-        started = self.worker_server.metrics.now_ns()
-        request = self.ipc_endpoint.recv()
-        self.worker_server.metrics.record_pipeline(
-            "receive", self.worker_server.metrics.now_ns() - started
-        )
-        return request

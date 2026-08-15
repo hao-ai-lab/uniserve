@@ -1,19 +1,4 @@
-"""Device mesh and per-axis transports — the unified parallelism topology.
-
-This is the single topology object for every parallelism axis (``tp``, ``cp``,
-``dp``, ``pp``, ``ep``, ``tower``). Each axis carries a *transport* describing how its coordinates communicate:
-
-* :class:`CollectiveTransport` — a ``torch.distributed`` process group; coordinates
-  are ranks in separate processes (tensor parallelism today).
-* :class:`LocalP2PTransport` — coordinates are CUDA devices in *this* process;
-  "communication" is a device-to-device copy plus CUDA-event barriers (the
-  single-process modality/tower split).
-
-A trivial axis (``size <= 1``) never communicates, so the default single-device
-mesh makes every collective a no-op and the path is byte-identical to a
-single-rank worker. ``reshard`` (see :mod:`uniserve_worker.nn.placement`) is the
-only caller of the transport surface.
-"""
+"""Device mesh and transport boundaries for model parallelism."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -23,7 +8,6 @@ import torch
 
 __all__ = [
     'divide',
-    'ReduceOp',
     'AxisTransport',
     'BroadcastTransport',
     'CollectiveAxisTransport',
@@ -47,19 +31,6 @@ def divide(numerator: int, denominator: int) -> int:
     return numerator // denominator
 
 
-class ReduceOp:
-    """Reduction op identifiers for ``Partial`` placements (transport-agnostic)."""
-
-    SUM = "sum"
-    MAX = "max"
-    MIN = "min"
-
-
-# ---------------------------------------------------------------------------
-# Transports
-# ---------------------------------------------------------------------------
-
-
 @runtime_checkable
 class AxisTransport(Protocol):
     """Coordinate metadata common to every axis transport."""
@@ -74,10 +45,8 @@ class AxisTransport(Protocol):
 class CollectiveAxisTransport(AxisTransport, Protocol):
     """Collective operations implemented by a distributed process group."""
 
-    def all_reduce(self, t: torch.Tensor, op: str = ReduceOp.SUM) -> torch.Tensor: ...
+    def all_reduce(self, t: torch.Tensor) -> torch.Tensor: ...
     def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor: ...
-    def reduce_scatter(self, t: torch.Tensor, dim: int, op: str = ReduceOp.SUM) -> torch.Tensor: ...
-    def all_to_all(self, t: torch.Tensor, *, in_dim: int, out_dim: int) -> torch.Tensor: ...
 
 
 @runtime_checkable
@@ -85,8 +54,6 @@ class PeerAxisTransport(AxisTransport, Protocol):
     """Point-to-point movement implemented by an in-process or staged peer axis."""
 
     def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor: ...
-    def record_ready(self, coord: int | None = None) -> Any | None: ...
-    def wait_ready(self, event: Any | None, coord: int | None = None) -> None: ...
 
 
 @runtime_checkable
@@ -96,26 +63,12 @@ class BroadcastTransport(AxisTransport, Protocol):
     def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor: ...
 
 
-def _torch_reduce_op(op: str):
-    table = {
-        ReduceOp.SUM: torch.distributed.ReduceOp.SUM,
-        ReduceOp.MAX: torch.distributed.ReduceOp.MAX,
-        ReduceOp.MIN: torch.distributed.ReduceOp.MIN,
-    }
-    try:
-        return table[op]
-    except KeyError as exc:  # pragma: no cover - defensive
-        raise ValueError(f"unsupported reduce op {op!r}") from exc
-
-
 @dataclass(frozen=True)
 class CollectiveTransport:
     """A ``torch.distributed`` process group bound to one mesh axis.
 
-    ``group`` is ``None`` for the default world group. ``size``/``coord`` are this
-    axis's world size and this process's coordinate within it (== the rank inside
-    ``group``). Ports the world-size validation the standalone TP collectives
-    used so a mismatched default world still fails loudly.
+    ``group`` is ``None`` for the default world group. ``size`` and ``coord``
+    identify this process within the axis.
     """
 
     axis: str
@@ -146,9 +99,9 @@ class CollectiveTransport:
                 )
         return self.group
 
-    def all_reduce(self, t: torch.Tensor, op: str = ReduceOp.SUM) -> torch.Tensor:
+    def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
         group = self._require()
-        torch.distributed.all_reduce(t, op=_torch_reduce_op(op), group=group)
+        torch.distributed.all_reduce(t, group=group)
         return t
 
     def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -156,20 +109,6 @@ class CollectiveTransport:
         chunks = [torch.empty_like(t) for _ in range(self.size)]
         torch.distributed.all_gather(chunks, t.contiguous(), group=group)
         return torch.cat(chunks, dim=dim)
-
-    def reduce_scatter(self, t: torch.Tensor, dim: int, op: str = ReduceOp.SUM) -> torch.Tensor:
-        group = self._require()
-        pieces = list(torch.chunk(t.contiguous(), self.size, dim=dim))
-        out = torch.empty_like(pieces[self.coord])
-        torch.distributed.reduce_scatter(out, pieces, op=_torch_reduce_op(op), group=group)
-        return out
-
-    def all_to_all(self, t: torch.Tensor, *, in_dim: int, out_dim: int) -> torch.Tensor:
-        group = self._require()
-        send = list(torch.chunk(t.contiguous(), self.size, dim=in_dim))
-        recv = [torch.empty_like(send[self.coord]) for _ in range(self.size)]
-        torch.distributed.all_to_all(recv, send, group=group)
-        return torch.cat(recv, dim=out_dim)
 
     def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor:
         group = self._require()
@@ -182,11 +121,8 @@ class LocalP2PTransport:
 
     ``devices[i]`` is the device for coordinate ``i``; ``coord`` is this mesh
     view's home coordinate (the device shared/primary modules live on).
-    Movement is a direct device-to-device copy over NVLink; ordering across the
-    two device streams is enforced with CUDA events (``record_ready`` /
-    ``wait_ready``), which is the readiness-barrier discipline a modality
-    handoff needs. This transport intentionally exposes no collective surface:
-    a tower axis routes values and cannot silently stand in for a reduction.
+    Movement is a direct device-to-device copy. This transport exposes no
+    collective surface, so routing axes cannot be used for reductions.
     """
 
     axis: str
@@ -213,32 +149,6 @@ class LocalP2PTransport:
             raise ValueError(f"broadcast source {src} is outside axis {self.axis!r}")
         return t.to(self.devices[self.coord]) if t.device != self.devices[self.coord] else t
 
-    def record_ready(self, coord: int | None = None) -> Any | None:
-        # Record on ``coord``'s stream (the primary for B1; the gen coordinate
-        # for B2). Defaults to this view's home coordinate.
-        dev = self.devices[self.coord if coord is None else int(coord)]
-        if dev.type != "cuda" or not torch.cuda.is_available():
-            return None
-        event = torch.cuda.Event()
-        torch.cuda.current_stream(dev).record_event(event)
-        return event
-
-    def wait_ready(self, event: Any | None, coord: int | None = None) -> None:
-        # Make ``coord``'s stream wait on ``event``; the gen coordinate waits on
-        # the primary's B1 before the snapshot copy, and on B2 before its first read.
-        if event is None:
-            return
-        dev = self.devices[self.coord if coord is None else int(coord)]
-        if dev.type != "cuda" or not torch.cuda.is_available():
-            return
-        torch.cuda.current_stream(dev).wait_event(event)
-
-
-# ---------------------------------------------------------------------------
-# Mesh
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class MeshAxis:
     """One parallelism dimension of the mesh.
@@ -262,9 +172,7 @@ class MeshAxis:
                 f"mesh axis {self.name!r} coord must satisfy 0 <= coord < size "
                 f"(coord={self.coord}, size={self.size})"
             )
-        # A transport is required only to *communicate*; an axis may describe a
-        # sharding topology (sizes/coords for load-time narrowing) without a live
-        # transport. ``reshard`` raises if it must move data on a transportless axis.
+        # Load-time sharding can use axis coordinates without a live transport.
 
 
 @dataclass(frozen=True)
@@ -311,36 +219,11 @@ class DeviceMesh:
         return cls(axes={}, local_device=torch.device(device))
 
     @classmethod
-    def tp(
-        cls,
-        rank: int,
-        size: int,
-        *,
-        transport: AxisTransport | None = None,
-        device: torch.device | str = "cpu",
-    ) -> "DeviceMesh":
-        """A mesh with only a tensor-parallel axis. ``transport=None`` describes
-        the sharding topology for load-time narrowing without a live collective."""
-        if int(size) <= 1:
-            return cls.trivial(device)
-        ax = MeshAxis(name="tp", size=int(size), coord=int(rank), transport=transport)
-        return cls(axes={"tp": ax}, local_device=torch.device(device))
-
-    @classmethod
     def of(cls, *axes: MeshAxis, device: torch.device | str = "cpu") -> "DeviceMesh":
         return cls(
             axes={ax.name: ax for ax in axes if ax.size > 1},
             local_device=torch.device(device),
         )
-
-    def with_axis(self, ax: MeshAxis) -> "DeviceMesh":
-        merged = dict(self.axes)
-        if ax.size > 1:
-            merged[ax.name] = ax
-        else:
-            merged.pop(ax.name, None)
-        return DeviceMesh(axes=merged, local_device=self.local_device)
-
 
 @dataclass(frozen=True, slots=True)
 class TensorParallelSpec:

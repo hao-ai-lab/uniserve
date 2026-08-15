@@ -219,11 +219,14 @@ impl RequestTrace {
     /// post-submission phase (commit, release, reclaim) always follows the
     /// operation's registration, so no lifecycle is created here; an unknown
     /// `op_id` is a no-op.
-    pub fn stamp_existing(&mut self, op_id: OpId, phase: LifecyclePhase, at_us: u64) {
+    pub fn stamp_existing(&mut self, op_id: OpId, phase: LifecyclePhase, at_us: u64) -> bool {
         if let Some(index) = self.operation_indices.get(&op_id.0).copied() {
             let entry = &mut self.operations[index];
+            let reached = entry.reached(phase);
             entry.stamp(phase, at_us);
+            return !reached;
         }
+        false
     }
 
     /// Return one phase timestamp for a registered operation without scanning
@@ -231,6 +234,16 @@ impl RequestTrace {
     pub fn at(&self, op_id: OpId, phase: LifecyclePhase) -> Option<u64> {
         let index = *self.operation_indices.get(&op_id.0)?;
         self.operations[index].at(phase)
+    }
+
+    pub fn domain(&self, op_id: OpId) -> Option<Domain> {
+        let index = *self.operation_indices.get(&op_id.0)?;
+        Some(self.operations[index].key.domain)
+    }
+
+    pub fn span_us(&self, op_id: OpId, from: LifecyclePhase, to: LifecyclePhase) -> Option<u64> {
+        let index = *self.operation_indices.get(&op_id.0)?;
+        self.operations[index].span_us(from, to)
     }
 
     pub fn operations(&self) -> &[OperationLifecycle] {

@@ -33,7 +33,6 @@ class MetricDefinition:
 
 
 STREAM_TASKS = frozenset({TaskName.TEXT, TaskName.I2T, TaskName.INTERLEAVE})
-IMAGE_TASKS = frozenset({TaskName.T2I, TaskName.I2I})
 
 TASK_WIRES = {
     TaskName.TEXT: ("openai_chat",),

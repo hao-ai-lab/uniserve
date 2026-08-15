@@ -33,16 +33,6 @@ rust = "Decode"
 supported_operation_types = ["sequence_decode", "sequence_verify", "flow", "materialize_image", "transfer_kv"]
 
 [[kind]]
-token = "sampler"
-rust = "Sampler"
-supported_operation_types = ["sequence_sample"]
-
-[[kind]]
-token = "postprocess"
-rust = "PostProcess"
-supported_operation_types = ["materialize_frame"]
-
-[[kind]]
 token = "und"
 rust = "Und"
 supported_operation_types = [

@@ -12,8 +12,6 @@ class WorkerKind(StrEnum):
     ENCODER = "encoder"
     PREFILL = "prefill"
     DECODE = "decode"
-    SAMPLER = "sampler"
-    POSTPROCESS = "postprocess"
     UND = "und"
     GEN = "gen"
 
@@ -43,8 +41,6 @@ _ROUTES = {
             WorkVariant.TRANSFER_KV_INSTALL,
         }
     ),
-    WorkerKind.SAMPLER: frozenset(),
-    WorkerKind.POSTPROCESS: frozenset({WorkVariant.MATERIALIZE}),
     WorkerKind.UND: frozenset(
         {
             WorkVariant.TOKEN_EXTEND,

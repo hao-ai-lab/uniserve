@@ -85,14 +85,6 @@ def _by_call(endpoint: _Endpoint) -> dict[int, dict[str, object]]:
     }
 
 
-def _metrics(server: WorkerServer) -> dict[str, object]:
-    response = server.handle({"kind": "get_metrics"})
-    metrics = response.get("metrics")
-    assert response["kind"] == "metrics"
-    assert isinstance(metrics, dict)
-    return metrics
-
-
 def test_inflight_join_and_completed_replay_return_one_terminal_report() -> None:
     _admission, _operation, _payload, batch = _token_batch(
         session_id=11,
@@ -116,13 +108,6 @@ def test_inflight_join_and_completed_replay_return_one_terminal_report() -> None
     first = responses[1]["completion_report"]
     assert responses[2]["completion_report"] == first
     assert responses[3]["completion_report"] == first
-    metrics = _metrics(server)
-    assert metrics["executes"] == 1
-    assert metrics["replay_counts"] == {
-        "execute": 1,
-        "inflight_join": 1,
-        "completed_replay": 1,
-    }
 
 
 def test_conflicting_digest_and_mixed_registration_fail_before_new_admission() -> None:
@@ -176,10 +161,9 @@ def test_conflicting_digest_and_mixed_registration_fail_before_new_admission() -
     assert responses[3]["kind"] == "error"
     assert responses[3]["code"] == "InvalidDescriptor"
     assert "registered and unregistered" in str(responses[3]["message"])
-    assert _metrics(server)["executes"] == 1
 
 
-def test_completed_report_survives_completion_slot_reuse() -> None:
+def test_completed_report_remains_replayable_after_later_execution() -> None:
     _first_admission, first_operation, _first_payload, first_batch = _token_batch(
         session_id=5,
         op_id=41,
@@ -221,19 +205,9 @@ def test_completed_report_survives_completion_slot_reuse() -> None:
 
     responses = _by_call(endpoint)
     first = responses[1]["completion_report"]
-    second = responses[3]["completion_report"]
     replayed = responses[4]["completion_report"]
+    assert responses[3]["kind"] == "result"
     assert replayed == first
-    first_generation = first["partitions"][0]["completions"][0][
-        "completion_slot_generation"
-    ]
-    second_generation = second["partitions"][0]["completions"][0][
-        "completion_slot_generation"
-    ]
-    assert second_generation != first_generation
-    metrics = _metrics(server)
-    assert metrics["executes"] == 2
-    assert metrics["replay_counts"] == {"execute": 2, "completed_replay": 1}
 
 
 def test_atomic_replay_remains_available_until_every_participant_epoch_ends() -> None:
@@ -277,9 +251,6 @@ def test_atomic_replay_remains_available_until_every_participant_epoch_ends() ->
     responses = _by_call(endpoint)
     assert responses[2]["kind"] == "ok"
     assert responses[3]["completion_report"] == responses[1]["completion_report"]
-    metrics = _metrics(server)
-    assert metrics["executes"] == 1
-    assert metrics["replay_counts"] == {"execute": 1, "completed_replay": 1}
 
 
 def test_control_only_submission_completes_without_an_operation_registration() -> None:
@@ -306,6 +277,3 @@ def test_control_only_submission_completes_without_an_operation_registration() -
     response = _by_call(endpoint)[1]
     assert response["kind"] == "result"
     assert response["completion_report"] == {"step_id": 14, "partitions": []}
-    metrics = _metrics(server)
-    assert metrics["executes"] == 1
-    assert metrics["replay_counts"] == {}

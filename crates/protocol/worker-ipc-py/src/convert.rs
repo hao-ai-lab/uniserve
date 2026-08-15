@@ -1,21 +1,15 @@
-//! Hand-rolled conversions for the hot worker-IPC frames.
+//! Typed conversions for steady-state worker IPC frames.
 //!
 //! The serve loop crosses the FFI boundary once per direction per batch. The
-//! reflective `pythonize`/`depythonize` walk costs milliseconds at decode batch
-//! sizes, dominated by per-field `PyString` creation and serde dispatch. The
-//! converters here build the exact same Python values directly: every dict key
-//! and enum string is interned ([`pyo3::intern!`]), lists are preallocated at
-//! their known lengths, and byte payloads stay on the `bytes` fast path.
+//! typed converters materialize the canonical `execute` request and `result`
+//! response shapes directly: every dict key and enum string is interned
+//! ([`pyo3::intern!`]), lists are preallocated at their known lengths, and byte
+//! payloads stay on the `bytes` path.
 //!
-//! Contract: for an `execute` request, [`execute_request_to_py`] produces a
-//! Python object deep-equal (`==`) to `pythonize(&WorkerRequest)`; for a
-//! `result` response in the shape the Python worker emits,
-//! [`try_completion_response_from_py`] produces the same `WorkerResponse` as
-//! `depythonize`. Both properties are asserted field-exhaustively by the tests
-//! in this module. Anything outside those hot shapes keeps the reflective
-//! path: rare request kinds are still pythonized by the caller, and the
-//! response extractor returns `None` on any unexpected shape so the caller
-//! falls back to `depythonize` (identical values, identical errors).
+//! [`execute_request_to_py`] produces the mapping consumed by
+//! `Batch.from_wire`. [`try_completion_response_from_py`] accepts the exact
+//! completion-report mapping emitted by the Python worker. Administrative frame
+//! kinds are handled by the schema-derived converter in the caller.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -39,9 +33,7 @@ use uniserve_worker_wire::{
 // Request -> Python (recv hot path)
 // ---------------------------------------------------------------------------
 
-/// Convert an `execute` [`WorkerRequest`] into the exact Python object
-/// `pythonize` would produce. Total over the wire types (they are closed), so
-/// the caller only needs the reflective fallback for other request kinds.
+/// Convert an `execute` [`WorkerRequest`] into the canonical Python wire mapping.
 pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
@@ -869,7 +861,6 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
         RequestKind::Shutdown => intern!(py, "shutdown"),
         RequestKind::CopyKv => intern!(py, "copy_kv"),
         RequestKind::ReleaseProducts => intern!(py, "release_products"),
-        RequestKind::GetMetrics => intern!(py, "get_metrics"),
         RequestKind::GetPressure => intern!(py, "get_pressure"),
         RequestKind::SnapshotSession => intern!(py, "snapshot_session"),
         RequestKind::RestoreSession => intern!(py, "restore_session"),
@@ -958,11 +949,9 @@ fn draw_layout_py<'py>(py: Python<'py>, layout: DrawLayout) -> &'py Bound<'py, P
 // ---------------------------------------------------------------------------
 
 /// Extract a `result` [`WorkerResponse`] from the dict shape the Python worker
-/// emits (`app.py::_response` + `CompletionReport.to_wire`). Returns `None` on
-/// any shape outside that contract; the caller then falls back to
-/// `depythonize`, which reproduces the reflective values and errors exactly.
-/// Where this extractor is stricter than `depythonize` (bools must be `bool`,
-/// ints must not be `bool`), the fallback — not a panic — decides the outcome.
+/// emits (`app.py::_response` + `CompletionReport.to_wire`). Returns `None` for
+/// every other response kind or mapping shape so the caller can invoke its
+/// schema-derived decoder.
 pub(crate) fn try_completion_response_from_py(
     response: &Bound<'_, PyAny>,
 ) -> Option<WorkerResponse> {
@@ -972,11 +961,9 @@ pub(crate) fn try_completion_response_from_py(
     if kind.to_str().ok()? != "result" {
         return None;
     }
-    // Fields a `result` response never populates: accept only absent/None so
-    // anything unexpected falls back to the reflective path.
+    // Result reports reserve these fields for their respective response kinds.
     for key in [
         intern!(py, "capabilities"),
-        intern!(py, "metrics"),
         intern!(py, "pressure"),
         intern!(py, "snapshot"),
     ] {
@@ -999,7 +986,6 @@ pub(crate) fn try_completion_response_from_py(
         call_id: opt_u64(dict, intern!(py, "call_id"))?,
         capabilities: None,
         completion_report: report,
-        metrics: None,
         pressure: None,
         message: opt_string(dict, intern!(py, "message"))?,
         code: opt_string(dict, intern!(py, "code"))?,
@@ -1346,8 +1332,8 @@ fn str_field<'py>(
 }
 
 fn u64_of(value: &Bound<'_, PyAny>) -> Option<u64> {
-    // `depythonize` rejects bools for integer fields; extracting them as 0/1
-    // here would silently diverge, so route them to the reflective fallback.
+    // Protocol integer fields reject Python booleans instead of coercing them
+    // to zero or one.
     if value.cast::<PyBool>().is_ok() {
         return None;
     }
@@ -1420,499 +1406,185 @@ fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Opt
 }
 
 // ---------------------------------------------------------------------------
-// Equality proofs and micro-benchmarks
+// Native boundary qualification
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use pythonize::{depythonize, pythonize};
+    use std::time::{Duration, SystemTime};
+
+    use pythonize::pythonize;
     use uniserve_core::{BlockId, RequestId};
-    use uniserve_worker_wire::{CacheCopy, ResourcePressure, WorkVariant, WorkerMetrics};
+    use uniserve_worker_ipc_core::ClientEndpoint;
 
     use super::*;
 
-    const PRODUCT_KINDS: [ProductKind; 14] = [
-        ProductKind::Token,
-        ProductKind::Logprob,
-        ProductKind::Draft,
-        ProductKind::VisionFeature,
-        ProductKind::LatentFeature,
-        ProductKind::Kv,
-        ProductKind::Latent,
-        ProductKind::Artifact,
-        ProductKind::Completion,
-        ProductKind::SamplingState,
-        ProductKind::Finish,
-        ProductKind::SelectedPoint,
-        ProductKind::AcceptedSpan,
-        ProductKind::Continuation,
-    ];
-    const STORAGE_CLASSES: [StorageClass; 5] = [
-        StorageClass::DeviceTensor,
-        StorageClass::PagedKv,
-        StorageClass::LatentArena,
-        StorageClass::HostStaging,
-        StorageClass::CompletionArena,
-    ];
-    const DTYPES: [DType; 8] = [
-        DType::U8,
-        DType::U16,
-        DType::U32,
-        DType::I32,
-        DType::I64,
-        DType::F16,
-        DType::BF16,
-        DType::F32,
-    ];
-    const DRAW_LAYOUTS: [DrawLayout; 3] = [
-        DrawLayout::TargetSampling,
-        DrawLayout::SpeculativeProposal,
-        DrawLayout::FlowNoise,
-    ];
-
-    fn digest(seed: u64) -> String {
-        format!("{seed:064x}")
-    }
-
-    fn request_key(seed: u64) -> RequestKey {
-        RequestKey::new(1_000 + seed, RequestId(2_000 + seed), seed % 3)
-    }
-
-    fn request_pool_idx(request_key: RequestKey) -> u32 {
-        u32::try_from(request_key.session_id.0 - 1_999).unwrap()
-    }
-
-    fn product_ref(seed: u64) -> ProductRef {
-        let dims = match seed % 3 {
-            0 => vec![
-                DimBound::Static(4),
-                DimBound::Device {
-                    max: 64 + seed as u32,
+    fn execute_request() -> WorkerRequest {
+        let request_key = RequestKey::new(1, RequestId(2), 1);
+        let admission = Admission::new(
+            request_key,
+            1,
+            Some(UndAdmission {
+                sampling: SamplingParams {
+                    temperature: 0.0,
+                    ignore_eos: true,
+                    ..SamplingParams::default()
                 },
-            ],
-            1 => vec![DimBound::Static(seed as u32)],
-            _ => Vec::new(),
-        };
-        ProductRef {
-            request_key: request_key(seed),
-            producer_op_id: OpId(300 + seed),
-            output_index: (seed % 7) as u16,
-            generation: (seed % 5) as u32 + 1,
-            kind: PRODUCT_KINDS[seed as usize % PRODUCT_KINDS.len()],
-            storage_class: STORAGE_CLASSES[seed as usize % STORAGE_CLASSES.len()],
-            dtype: DTYPES[seed as usize % DTYPES.len()],
-            shape_bound: ShapeBound { dims },
-            point_range: PointRange {
-                base_point: seed as u32,
-                max_points: 4 + seed as u32 % 3,
-            },
-        }
-    }
-
-    fn fixed_parent(seed: u64) -> VersionRef {
-        VersionRef {
-            request_key: request_key(seed),
-            producer_op_id: OpId(400 + seed),
-            point: Point::Fixed {
-                point_index: seed as u32,
-                semantic_digest: digest(seed),
-            },
-        }
-    }
-
-    fn device_parent(seed: u64) -> VersionRef {
-        let producer_op_id = OpId(500 + seed);
-        let mut selected_point = product_ref(seed);
-        selected_point.producer_op_id = producer_op_id;
-        VersionRef {
-            request_key: request_key(seed),
-            producer_op_id,
-            point: Point::Device {
-                point_index: 0,
-                selected_point: Some(selected_point),
-                producer_plan_digest: digest(seed + 1),
-            },
-        }
-    }
-
-    fn full_sampling() -> SamplingParams {
-        SamplingParams {
-            temperature: 0.7,
-            top_k: 40,
-            top_p: 0.95,
-            ignore_eos: true,
-            seed: Some(u64::MAX),
-            min_p: 0.05,
-            repetition_penalty: 1.1,
-            frequency_penalty: 0.25,
-            presence_penalty: -0.5,
-            logit_bias: vec![(11, 1.5), (u32::MAX, -100.0)],
-            min_tokens: 3,
-            return_logprobs: true,
-            n_logprobs: 5,
-            return_prompt_logprobs: true,
-            n_prompt_logprobs: 2,
-            logprob_token_ids: vec![7, 8, 9],
-            bad_words_ids: vec![vec![1, 2], vec![3]],
-            allowed_token_ids: Some(vec![4, 5, 6]),
-            typical_p: 0.9,
-            forced_token_ids: vec![15, 16],
-        }
-    }
-
-    fn full_image() -> ImageParams {
-        ImageParams {
-            steps: 28,
-            cfg_text_scale: 4.0,
-            cfg_img_scale: 1.5,
-            cfg_renorm_type: "global".to_owned(),
-            cfg_renorm_min: 0.125,
-            cfg_interval: (0.4, 1.0),
-            timestep_shift: 3.0,
-            height: 1024,
-            width: 512,
-            seed: Some(42),
-            negative_prompt: "blurry, low quality".to_owned(),
-            max_images: 2,
-            image_prompts: vec!["a cat".to_owned(), "on a mat".to_owned()],
-            retain_images: false,
-        }
-    }
-
-    fn operation(seed: u64, work: Work) -> Operation {
-        let key = request_key(seed);
-        let op_id = OpId(600 + seed);
-        let mut inputs = match seed % 3 {
-            0 => vec![product_ref(seed + 10), product_ref(seed + 11)],
-            1 => vec![product_ref(seed + 12)],
-            _ => Vec::new(),
-        };
-        for input in &mut inputs {
-            input.request_key = key;
-            if input.storage_class == StorageClass::HostStaging {
-                input.producer_op_id = op_id;
-            }
-        }
-        let parent = if seed.is_multiple_of(2) {
-            fixed_parent(seed)
-        } else {
-            device_parent(seed)
-        };
-        let rng = (seed.is_multiple_of(2)).then(|| Rng {
-            seed: 900 + seed,
-            semantic_index_base: seed * 17,
-            draw_layout: DRAW_LAYOUTS[seed as usize % DRAW_LAYOUTS.len()],
-        });
-        let predicate = (seed.is_multiple_of(4)).then(|| {
-            let mut predicate = product_ref(seed + 20);
-            predicate.kind = ProductKind::Completion;
-            predicate.storage_class = StorageClass::DeviceTensor;
-            predicate.request_key = key;
-            predicate
-        });
-        let mut outputs = vec![product_ref(seed + 30), product_ref(seed + 31)];
-        for output in &mut outputs {
-            output.request_key = key;
-            output.producer_op_id = op_id;
-            output.point_range.max_points = 4;
-        }
-        Operation::registered(
-            key,
-            op_id,
-            parent,
-            work,
-            uniserve_worker_wire::RouteId(seed as u32 % 4),
-            work.variant().domain(),
-            Bounds {
-                max_points: 4,
-                max_tokens: 16,
-                max_kv_pages: 2,
-                max_latent_bytes: 1 << 20,
-                max_completion_bytes: 4096,
-                max_transfer_bytes: 1 << 22,
-            },
-            inputs,
-            outputs,
-            2,
-            predicate,
-            rng,
-            seed,
+                negative_token_ids: Vec::new(),
+                finish_token_ids: Vec::new(),
+                kv: KvAdmission::default(),
+            }),
+            None,
         )
-    }
-
-    fn partition(operations: Vec<Operation>) -> BatchPartition {
-        let first = operations.first().expect("partition needs operations");
-        let kv_placements = operations
-            .iter()
-            .map(|operation| uniserve_worker_wire::KvPlacement {
-                request_key: operation.request_key,
-                op_id: operation.op_id,
-                group_id: 0,
-                block_table: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
-                pages_to_zero: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
-                prefix_length: 0,
-                input_length: 0,
-                visible_length: 0,
-                resulting_length: 0,
-            })
-            .collect();
-        let latent_placements = operations
-            .iter()
-            .filter(|operation| {
-                matches!(
-                    operation.work.variant(),
-                    WorkVariant::GenTransition | WorkVariant::GenFlow | WorkVariant::Materialize
-                )
-            })
-            .map(|operation| uniserve_worker_wire::LatentPlacement {
-                request_key: operation.request_key,
-                op_id: operation.op_id,
-                page_table: vec![1],
-                latent_units: 1,
-                height: 1,
-                width: 1,
-                start_step: 0,
-                step_count: u32::from(operation.work.variant() == WorkVariant::GenFlow),
-            })
-            .collect();
-        BatchPartition {
+        .unwrap();
+        let input = ProductRef {
+            request_key,
+            producer_op_id: OpId(1),
+            output_index: u16::MAX,
+            generation: 1,
+            kind: ProductKind::Token,
+            storage_class: StorageClass::HostStaging,
+            dtype: DType::U32,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(2)],
+            },
+            point_range: PointRange::default(),
+        };
+        let token = ProductRef {
+            request_key,
+            producer_op_id: OpId(1),
+            output_index: 0,
+            generation: 5,
+            kind: ProductKind::Token,
+            storage_class: StorageClass::DeviceTensor,
+            dtype: DType::U32,
+            shape_bound: ShapeBound::default(),
+            point_range: PointRange {
+                base_point: 0,
+                max_points: 1,
+            },
+        };
+        let finish = ProductRef {
+            request_key,
+            producer_op_id: OpId(1),
+            output_index: 1,
+            generation: 6,
+            kind: ProductKind::Finish,
+            storage_class: StorageClass::DeviceTensor,
+            dtype: DType::U8,
+            shape_bound: ShapeBound::default(),
+            point_range: PointRange::default(),
+        };
+        let operation = Operation::registered(
+            request_key,
+            OpId(1),
+            VersionRef::admission_root(request_key, OpId(0), admission.digest.clone()),
+            Work::Token(TokenMode::Extend),
+            uniserve_worker_wire::RouteId(0),
+            Domain::Prefill,
+            Bounds {
+                max_points: 1,
+                max_tokens: 2,
+                max_kv_pages: 1,
+                ..Bounds::default()
+            },
+            vec![input.clone()],
+            vec![token, finish],
+            1,
+            None,
+            None,
+            0,
+        );
+        let partition = BatchPartition {
             partition_id: 1,
             submission_group: 1,
             collective_seq: 1,
-            domain: first.domain,
-            route: first.route,
+            domain: Domain::Prefill,
+            route: uniserve_worker_wire::RouteId(0),
             execution: ExecutionCapability::DomainHomogeneous,
-            attention: AttentionRegime::Hybrid,
+            attention: AttentionRegime::Causal,
             shape_class: 0,
-            request_pool_indices: operations
-                .iter()
-                .map(|operation| request_pool_idx(operation.request_key))
-                .collect(),
-            operations,
-            kv_placements,
+            operations: vec![operation],
+            request_pool_indices: vec![1],
+            kv_placements: vec![KvPlacement {
+                request_key,
+                op_id: OpId(1),
+                group_id: 0,
+                block_table: vec![BlockId(1)],
+                pages_to_zero: vec![BlockId(1)],
+                prefix_length: 0,
+                input_length: 2,
+                visible_length: 0,
+                resulting_length: 2,
+            }],
             kv_branch_placements: Vec::new(),
-            latent_placements,
-        }
-    }
-
-    /// A batch exercising every closed wire variant: all 12 work variants over
-    /// fixed and device parents, und+gen admissions with every sampling and
-    /// image field populated, all three control kinds across every disposition
-    /// and close reason, and input products with non-trivial bytes.
-    fn comprehensive_batch() -> Batch {
-        let admissions = vec![
-            Admission::new(
-                request_key(0),
-                request_pool_idx(request_key(0)),
-                Some(UndAdmission {
-                    sampling: full_sampling(),
-                    negative_token_ids: vec![100, 200],
-                    finish_token_ids: vec![2, 7],
-                    kv: KvAdmission {
-                        prefix_len: 64,
-                        group_id: 1,
-                    },
-                }),
-                None,
-            )
-            .unwrap(),
-            Admission::new(
-                request_key(1),
-                request_pool_idx(request_key(1)),
-                None,
-                Some(GenAdmission {
-                    image: full_image(),
-                }),
-            )
-            .unwrap(),
-            Admission::new(
-                request_key(2),
-                request_pool_idx(request_key(2)),
-                Some(UndAdmission {
-                    sampling: SamplingParams::default(),
-                    negative_token_ids: Vec::new(),
-                    finish_token_ids: vec![3],
-                    kv: KvAdmission::default(),
-                }),
-                Some(GenAdmission {
-                    image: full_image(),
-                }),
-            )
-            .unwrap(),
-        ];
-        let operations = WorkVariant::ALL
-            .iter()
-            .enumerate()
-            .map(|(index, variant)| operation(index as u64, Work::from_variant(*variant)))
-            .collect::<Vec<_>>();
-        let input_products = operations
-            .iter()
-            .flat_map(|operation| operation.inputs.iter())
-            .filter(|product| product.storage_class == StorageClass::HostStaging)
-            .enumerate()
-            .map(|(index, product)| ProductPayload {
-                product: product.clone(),
-                bytes: if product.kind == ProductKind::Token {
-                    uniserve_worker_wire::encode_token_product_bytes(&[index as u32])
-                } else {
-                    vec![index as u8]
+            latent_placements: Vec::new(),
+        };
+        let mut request = WorkerRequest::execute(
+            Batch::new(11, vec![admission], vec![partition]).with_input_products(vec![
+                ProductPayload {
+                    product: input,
+                    bytes: uniserve_worker_wire::encode_token_product_bytes(&[7, 8]),
                 },
-            })
-            .collect();
-        let mut controls = vec![Control::Release {
-            request_key: request_key(3),
-            op_id: OpId(77),
-        }];
-        for (index, disposition) in [
-            Disposition::Publish,
-            Disposition::Retain,
-            Disposition::Discard,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            controls.push(Control::Commit {
-                request_key: request_key(index as u64),
-                control_seq: 10 + index as u64,
-                // Device points stay covered through operation parents; a
-                // commit must select a fixed version to be protocol-valid.
-                expected_parent: device_parent(index as u64),
-                selected: fixed_parent(index as u64 + 1),
-                public_event_limit: 1 << 30,
-                disposition,
-            });
-        }
-        for (index, reason) in [
-            CloseReason::Completed,
-            CloseReason::Cancelled,
-            CloseReason::Error,
-            CloseReason::Preempted,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            controls.push(Control::Close {
-                request_key: request_key(index as u64),
-                control_seq: 20 + index as u64,
-                cutoff: fixed_parent(index as u64 + 2),
-                reason,
-            });
-        }
-        let partitions = operations
-            .into_iter()
-            .enumerate()
-            .map(|(index, operation)| {
-                let mut partition = partition(vec![operation]);
-                partition.partition_id = index as u32 + 1;
-                partition.submission_group = index as u32 + 1;
-                partition.collective_seq = index as u64 + 1;
-                partition
-            })
-            .collect();
-        Batch::new(11, admissions, partitions)
-            .with_controls(controls)
-            .with_input_products(input_products)
-    }
-
-    fn assert_matches_pythonize(py: Python<'_>, request: &WorkerRequest) {
-        let reflective = pythonize(py, request).unwrap();
-        let hand_rolled = execute_request_to_py(py, request).unwrap();
-        assert!(
-            hand_rolled.eq(&reflective).unwrap(),
-            "hand-rolled dict diverges from pythonize:\n hand: {hand_rolled}\n refl: {reflective}",
+            ]),
         );
+        request.call_id = Some(9);
+        request
     }
 
-    #[test]
-    fn execute_request_matches_pythonize() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut request = WorkerRequest::execute(comprehensive_batch());
-            request.call_id = Some(u64::MAX);
-            assert_matches_pythonize(py, &request);
-        });
-    }
-
-    #[test]
-    fn execute_request_matches_pythonize_with_every_side_field() {
-        Python::initialize();
-        Python::attach(|py| {
-            // Production execute frames leave these None; the converter is
-            // still total over the WorkerRequest struct.
-            let mut request = WorkerRequest::execute(comprehensive_batch());
-            request.call_id = Some(3);
-            request.session_id = Some(RequestId(u64::MAX));
-            request.copies = Some(vec![
-                CacheCopy {
-                    group_id: 0,
-                    source_page: BlockId(1),
-                    destination_page: BlockId(2),
-                },
-                CacheCopy {
-                    group_id: 1,
-                    source_page: BlockId(3),
-                    destination_page: BlockId(4),
-                },
-            ]);
-            request.product_handles = Some(vec![1, u64::MAX]);
-            request.snapshot = Some(SnapshotRef {
-                version: VersionRef {
-                    request_key: RequestKey::new(1, RequestId(6), 7),
-                    producer_op_id: OpId(8),
-                    point: Point::Fixed {
-                        point_index: 8,
-                        semantic_digest: digest(8),
+    fn result_response() -> WorkerResponse {
+        let request_key = RequestKey::new(1, RequestId(2), 1);
+        let mut response = WorkerResponse::completion_report(CompletionReport {
+            step_id: 11,
+            partitions: vec![PartitionCompletion {
+                partition_id: 1,
+                completions: vec![CompletionRecord {
+                    request_key,
+                    op_id: OpId(1),
+                    completion_slot_generation: 1,
+                    status: OpStatus::Ok,
+                    selected_point: 1,
+                    logical_lengths: LogicalLengths {
+                        token_len: 2,
+                        kv_visible_len: 2,
+                        latent_len: 0,
+                        kv_reserved_len: 2,
+                        kv_initialized_len: 2,
+                        kv_committed_len: 2,
+                        kv_published_len: 2,
                     },
-                },
-                digest: digest(9),
-                locator: digest(9),
-            });
-            request.recovery_placement = Some(RecoveryPlacement {
-                request_key: RequestKey::new(1, RequestId(6), 7),
-                request_pool_idx: 5,
-                cache_groups: vec![
-                    CacheGroupPlacement {
-                        group_id: 0,
-                        page_ids: vec![BlockId(7), BlockId(8)],
-                        length: 17,
-                    },
-                    CacheGroupPlacement {
-                        group_id: 1,
-                        page_ids: vec![BlockId(9)],
-                        length: 8,
-                    },
-                ],
-                latent_page_table: vec![10, 11],
-            });
-            assert_matches_pythonize(py, &request);
+                    token_span: TokenSpan { base: 0, len: 1 },
+                    committed_tokens: vec![42],
+                    finish_flags: FinishFlags::default(),
+                    product_generations: vec![5, 6],
+                    semantic_digest: "b".repeat(64),
+                    error_code: None,
+                    timing_counters: TimingCounters::default(),
+                }],
+                products: Vec::new(),
+                registration: RegistrationAck { visible: true },
+                worker_exec_us: Some(12),
+                forward_stats: None,
+            }],
         });
+        response.call_id = Some(9);
+        response
     }
 
     #[test]
-    fn execute_request_matches_pythonize_when_bare() {
+    fn native_execute_and_result_round_trip_preserves_protocol_values() {
         Python::initialize();
-        Python::attach(|py| {
-            let mut request = WorkerRequest::execute(Batch::new(
-                0,
-                Vec::new(),
-                vec![partition(vec![operation(
-                    1,
-                    Work::Token(TokenMode::Extend),
-                )])],
-            ));
-            assert_matches_pythonize(py, &request);
-            request.batch = None;
-            assert_matches_pythonize(py, &request);
-        });
-    }
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let service = format!("uniserve/ipc-py-contract-{}-{nonce}", std::process::id());
+        let server = crate::PyServer::new(&service, 1 << 20, 2).unwrap();
+        let client = ClientEndpoint::connect(&service, 1 << 20, 2).unwrap();
+        let request = execute_request();
+        let pending = client.send_request(&request).unwrap();
+        let expected = result_response();
 
-    /// The hand-rolled dict must be consumable by the worker's real decoder
-    /// after the native boundary attaches its process-local validation
-    /// provenance. This closes the loop across the actual language boundary
-    /// contract, not just against `pythonize`.
-    #[test]
-    fn validated_hand_rolled_dict_feeds_worker_from_wire() {
-        Python::initialize();
         Python::attach(|py| {
             let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../..")
@@ -1924,401 +1596,34 @@ mod tests {
                 .unwrap()
                 .call_method1("insert", (0, repo_root.to_str().unwrap()))
                 .unwrap();
-            let batch_type = py
+            let native_request = server.recv(py).unwrap();
+            let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
+            let wire_batch = request_dict.get_item("batch").unwrap().unwrap();
+            let decoded = py
                 .import("uniserve_worker.batch")
                 .unwrap()
                 .getattr("Batch")
-                .unwrap();
-            let request = WorkerRequest::execute(comprehensive_batch());
-            let dict = execute_request_to_py(py, &request).unwrap();
-            crate::mark_validated_batch(py, &dict, request.batch.as_ref()).unwrap();
-            let wire_batch = dict.get_item("batch").unwrap().unwrap();
-            let decoded = batch_type
+                .unwrap()
                 .call_method1("from_wire", (wire_batch,))
-                .unwrap_or_else(|err| panic!("worker rejected the hand-rolled batch: {err}"));
-            let step_id: u64 = decoded.getattr("step_id").unwrap().extract().unwrap();
-            assert_eq!(step_id, 11);
-            let operations = decoded.getattr("operations").unwrap();
-            assert_eq!(operations.len().unwrap(), WorkVariant::ALL.len());
-        });
-    }
-
-    fn completion_record(seed: u64, status: OpStatus) -> CompletionRecord {
-        CompletionRecord {
-            request_key: request_key(seed),
-            op_id: OpId(700 + seed),
-            completion_slot_generation: seed as u32 % 4 + 1,
-            status,
-            selected_point: seed as u32 % 3,
-            logical_lengths: LogicalLengths {
-                token_len: 100 + seed as u32,
-                kv_visible_len: 200 + seed as u32,
-                latent_len: seed as u32 % 2,
-                kv_reserved_len: 256 + seed as u32,
-                kv_initialized_len: 201 + seed as u32,
-                kv_committed_len: 200 + seed as u32,
-                kv_published_len: 199 + seed as u32,
-            },
-            token_span: TokenSpan {
-                base: 100 + seed as u32,
-                len: 1,
-            },
-            committed_tokens: vec![10_000 + seed as u32],
-            finish_flags: FinishFlags {
-                eos: seed.is_multiple_of(2),
-                length: seed.is_multiple_of(3),
-                stop: seed.is_multiple_of(5),
-            },
-            product_generations: vec![seed as u32, seed as u32 + 1],
-            semantic_digest: digest(800 + seed),
-            error_code: (status == OpStatus::Error).then_some(ErrorCode::ComputeError),
-            timing_counters: TimingCounters {
-                queued_us: seed,
-                device_us: 2 * seed,
-                copy_us: 3 * seed,
-                host_us: u64::MAX - seed,
-            },
-        }
-    }
-
-    fn completion_response(records: usize) -> WorkerResponse {
-        let error_codes = [
-            ErrorCode::InvalidOperation,
-            ErrorCode::ResourceExhausted,
-            ErrorCode::ComputeError,
-            ErrorCode::Cancelled,
-            ErrorCode::Internal,
-        ];
-        let completions = (0..records)
-            .map(|index| {
-                let status = match index % 3 {
-                    0 => OpStatus::Ok,
-                    1 => OpStatus::Predicated,
-                    _ => OpStatus::Error,
-                };
-                let mut record = completion_record(index as u64, status);
-                if status == OpStatus::Error {
-                    record.error_code = Some(error_codes[index % error_codes.len()]);
-                }
-                record
-            })
-            .collect();
-        let mut response = WorkerResponse::completion_report(CompletionReport {
-            step_id: 42,
-            partitions: vec![PartitionCompletion {
-                partition_id: 1,
-                completions,
-                products: vec![
-                    ProductPayload {
-                        product: product_ref(95),
-                        bytes: vec![1, 2, 3, 254, 255],
-                    },
-                    ProductPayload {
-                        product: product_ref(96),
-                        bytes: Vec::new(),
-                    },
-                ],
-                registration: RegistrationAck { visible: true },
-                worker_exec_us: Some(1234),
-                forward_stats: Some(WorkerForwardStats {
-                    mode_counts: BTreeMap::from([("text".to_owned(), 1)]),
-                    mode_tokens: BTreeMap::from([("text".to_owned(), records as u64)]),
-                    mode_us: BTreeMap::from([("text".to_owned(), 789)]),
-                    component_us: BTreeMap::from([
-                        ("forward".to_owned(), 789),
-                        ("text_sample".to_owned(), 23),
-                    ]),
-                    cuda_graph_replays: 1,
-                    cuda_graph_unpadded_tokens: records as u64,
-                    cuda_graph_padded_tokens: 64,
-                    cuda_graph_runtime_mode_counts: BTreeMap::from([(
-                        "graph_replay".to_owned(),
-                        1,
-                    )]),
-                    ..WorkerForwardStats::default()
-                }),
-            }],
-        });
-        response.call_id = Some(9);
-        response
-    }
-
-    #[test]
-    fn result_extractor_matches_depythonize() {
-        Python::initialize();
-        Python::attach(|py| {
-            for response in [
-                completion_response(6),
-                WorkerResponse::completion_report(CompletionReport {
-                    step_id: 0,
-                    partitions: Vec::new(),
-                }),
-            ] {
-                let dict = pythonize(py, &response).unwrap();
-                let reflective: WorkerResponse = depythonize(&dict).unwrap();
-                let extracted = try_completion_response_from_py(&dict)
-                    .expect("extractor must accept the worker's result shape");
-                assert_eq!(extracted, reflective);
-                assert_eq!(extracted, response);
-            }
-        });
-    }
-
-    #[test]
-    fn result_extractor_accepts_report_none() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut response = WorkerResponse::ok();
-            response.kind = ResponseKind::Result;
-            let dict = pythonize(py, &response).unwrap();
-            let reflective: WorkerResponse = depythonize(&dict).unwrap();
-            let extracted = try_completion_response_from_py(&dict).unwrap();
-            assert_eq!(extracted, reflective);
-        });
-    }
-
-    #[test]
-    fn extractor_falls_back_on_non_result_kinds() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut error = WorkerResponse::ok();
-            error.kind = ResponseKind::Error;
-            error.message = Some("boom".to_owned());
-            error.code = Some("internal".to_owned());
-            error.retryable = Some(false);
-            error.fatal = Some(true);
-            error.phase = Some("execute".to_owned());
-            error.route = Some("decode".to_owned());
-            error.operations = vec![ErrorOperationIdentity {
-                request_key: request_key(1),
-                op_id: OpId(5),
-            }];
-            let mut metrics = WorkerResponse::ok();
-            metrics.kind = ResponseKind::Metrics;
-            metrics.metrics = Some(WorkerMetrics::default());
-            let mut pressure = WorkerResponse::ok();
-            pressure.kind = ResponseKind::Pressure;
-            pressure.pressure = Some(vec![ResourcePressure {
-                class: uniserve_worker_wire::ResourceClass::KvBlock,
-                total: 10,
-                used: 5,
-                evictable: 3,
-                free: 2,
-            }]);
-            for response in [error, WorkerResponse::ok(), metrics, pressure] {
-                let dict = pythonize(py, &response).unwrap();
-                assert!(try_completion_response_from_py(&dict).is_none());
-                // The reflective fallback still round-trips the value.
-                let reflective: WorkerResponse = depythonize(&dict).unwrap();
-                assert_eq!(reflective, response);
-            }
-        });
-    }
-
-    #[test]
-    fn extractor_falls_back_on_unexpected_shapes() {
-        Python::initialize();
-        Python::attach(|py| {
-            let response = completion_response(2);
-
-            fn first_completion_record<'py>(dict: &Bound<'py, PyAny>) -> Bound<'py, PyDict> {
-                dict.cast::<PyDict>()
-                    .unwrap()
-                    .get_item("completion_report")
-                    .unwrap()
-                    .unwrap()
-                    .cast_into::<PyDict>()
-                    .unwrap()
-                    .get_item("partitions")
-                    .unwrap()
-                    .unwrap()
-                    .cast_into::<PyList>()
-                    .unwrap()
-                    .get_item(0)
-                    .unwrap()
-                    .cast_into::<PyDict>()
-                    .unwrap()
-                    .get_item("completions")
-                    .unwrap()
-                    .unwrap()
-                    .cast_into::<PyList>()
-                    .unwrap()
-                    .get_item(0)
-                    .unwrap()
-                    .cast_into::<PyDict>()
-                    .unwrap()
-            }
-
-            // A bool where an integer belongs is never silently coerced by
-            // the extractor.
-            let dict = pythonize(py, &response).unwrap();
-            let record = first_completion_record(&dict);
-            record
-                .set_item("committed_tokens", PyList::new(py, [true]).unwrap())
                 .unwrap();
-            assert!(try_completion_response_from_py(&dict).is_none());
-            // The reflective fallback decides the outcome for that shape: it
-            // extracts `True` as token 1, so falling back (rather than
-            // coercing here) preserves depythonize's semantics exactly.
-            let reflective: WorkerResponse = depythonize(&dict).unwrap();
-            let report = reflective.completion_report.unwrap();
             assert_eq!(
-                report.completions().next().unwrap().committed_tokens,
-                vec![1]
+                decoded
+                    .getattr("step_id")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                11
             );
+            assert_eq!(decoded.getattr("operations").unwrap().len().unwrap(), 1);
 
-            // A shape both paths reject: a string where tokens belong.
-            let dict = pythonize(py, &response).unwrap();
-            let record = first_completion_record(&dict);
-            record
-                .set_item("committed_tokens", PyList::new(py, ["x"]).unwrap())
-                .unwrap();
-            assert!(try_completion_response_from_py(&dict).is_none());
-            assert!(depythonize::<WorkerResponse>(&dict).is_err());
-
-            // A populated field a result never carries goes reflective.
-            let dict = pythonize(py, &response).unwrap();
-            dict.cast::<PyDict>()
-                .unwrap()
-                .set_item("metrics", PyDict::new(py))
-                .unwrap();
-            assert!(try_completion_response_from_py(&dict).is_none());
-
-            // A missing required key goes reflective (which then errors).
-            let dict = pythonize(py, &response).unwrap();
-            dict.cast::<PyDict>()
-                .unwrap()
-                .del_item("operations")
-                .unwrap();
-            assert!(try_completion_response_from_py(&dict).is_none());
-            assert!(depythonize::<WorkerResponse>(&dict).is_err());
-
-            // Non-dict input goes reflective.
-            let list = PyList::new(py, [1, 2]).unwrap();
-            assert!(try_completion_response_from_py(list.as_any()).is_none());
+            let response = pythonize(py, &expected).unwrap();
+            server.respond(py, &response).unwrap();
         });
-    }
 
-    /// A steady-state r16 decode step: 35 token-decode operations over device
-    /// parents, a couple of controls, and small forced-token input payloads.
-    fn decode_batch_request(ops: u64) -> WorkerRequest {
-        let operations: Vec<Operation> = (0..ops)
-            .map(|index| {
-                let seed = 1 + index;
-                let key = request_key(seed);
-                let mut outputs = vec![product_ref(seed + 30), product_ref(seed + 31)];
-                for output in &mut outputs {
-                    output.request_key = key;
-                    output.producer_op_id = OpId(600 + seed);
-                }
-                Operation::registered(
-                    key,
-                    OpId(600 + seed),
-                    device_parent(seed),
-                    Work::Token(TokenMode::Decode),
-                    uniserve_worker_wire::RouteId(0),
-                    Domain::Decode,
-                    Bounds {
-                        max_points: 1,
-                        max_tokens: 1,
-                        max_kv_pages: 1,
-                        max_latent_bytes: 0,
-                        max_completion_bytes: 4096,
-                        max_transfer_bytes: 0,
-                    },
-                    Vec::new(),
-                    outputs,
-                    1,
-                    None,
-                    Some(Rng {
-                        seed,
-                        semantic_index_base: seed * 3,
-                        draw_layout: DrawLayout::TargetSampling,
-                    }),
-                    seed,
-                )
-            })
-            .collect();
-        let controls = vec![
-            Control::Commit {
-                request_key: request_key(1),
-                control_seq: 5,
-                expected_parent: fixed_parent(1),
-                selected: fixed_parent(2),
-                public_event_limit: 128,
-                disposition: Disposition::Publish,
-            },
-            Control::Release {
-                request_key: request_key(2),
-                op_id: OpId(11),
-            },
-        ];
-        let input_products = (0..4)
-            .map(|index| ProductPayload {
-                product: product_ref(80 + index),
-                bytes: vec![0xAB; 8],
-            })
-            .collect();
-        WorkerRequest::execute(
-            Batch::new(77, Vec::new(), vec![partition(operations)])
-                .with_controls(controls)
-                .with_input_products(input_products),
-        )
-    }
-
-    /// Micro-benchmark for the 35-op decode shapes. Run explicitly:
-    /// `cargo test -p uniserve-ipc-py --release -- bench_35 --ignored --nocapture`
-    #[test]
-    #[ignore = "micro-benchmark; run with --release --ignored --nocapture"]
-    fn bench_35_op_decode_shapes() {
-        const OPS: u64 = 35;
-        const ITERS: u32 = 400;
-        Python::initialize();
-        Python::attach(|py| {
-            let request = decode_batch_request(OPS);
-            assert_matches_pythonize(py, &request);
-            let response = completion_response(OPS as usize);
-            let response_dict = pythonize(py, &response).unwrap();
-            assert_eq!(
-                try_completion_response_from_py(&response_dict).unwrap(),
-                depythonize::<WorkerResponse>(&response_dict).unwrap()
-            );
-
-            let time = |label: &str, mut run: Box<dyn FnMut() + '_>| {
-                for _ in 0..ITERS / 4 {
-                    run();
-                }
-                let started = std::time::Instant::now();
-                for _ in 0..ITERS {
-                    run();
-                }
-                let nanos = started.elapsed().as_nanos() / u128::from(ITERS);
-                println!("{label}: {nanos} ns/conversion");
-            };
-            time(
-                "recv  pythonize (reflective)",
-                Box::new(|| {
-                    pythonize(py, &request).unwrap();
-                }),
-            );
-            time(
-                "recv  hand-rolled",
-                Box::new(|| {
-                    execute_request_to_py(py, &request).unwrap();
-                }),
-            );
-            time(
-                "send  depythonize (reflective)",
-                Box::new(|| {
-                    depythonize::<WorkerResponse>(&response_dict).unwrap();
-                }),
-            );
-            time(
-                "send  hand-rolled extractor",
-                Box::new(|| {
-                    try_completion_response_from_py(&response_dict).unwrap();
-                }),
-            );
-        });
+        let response = client
+            .recv_response_timeout(&pending, Duration::from_secs(5))
+            .unwrap()
+            .expect("native result response");
+        assert_eq!(response.decode_response().unwrap(), expected);
     }
 }

@@ -45,15 +45,20 @@ from uniserve_worker.batch import (
     OpStatus,
     PointRange,
     ProductKind,
+    ProductPayload,
     ProductRef,
     RecoveryPlacement,
     Release,
+    SamplingState,
     ShapeBound,
+    StaticDim,
     StorageClass,
     TokenMode,
     TransferMode,
+    UndAdmission,
     VersionRef,
     Work,
+    encode_sampling_state_bytes,
 )
 from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
@@ -211,6 +216,42 @@ def _transition_generation(
     report = worker.execute(execution_batch(step_id=step_id, operations=(transition,)))
     assert report.completions[0].status is OpStatus.OK
     return latent, commit_for_completion(transition, report)
+
+
+def _prepare_decode(
+    worker: object,
+    admission: Admission,
+    *,
+    op_id: int,
+    step_id: int,
+    tokens: tuple[int, ...],
+):
+    prefill, payload = token_operation(
+        admission.request_key,
+        op_id=op_id,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=tokens,
+    )
+    report = worker.execute(
+        execution_batch(
+            step_id=step_id,
+            admissions=(admission,),
+            operations=(prefill,),
+            input_products=(payload,),
+        )
+    )
+    resolved = finalized_report(report)
+    commit = commit_for_completion(prefill, resolved)
+    decode, decode_input = token_operation(
+        admission.request_key,
+        op_id=op_id + 1,
+        parent=commit.selected,
+        mode=TokenMode.DECODE,
+        tokens=(resolved.completions[0].committed_tokens[0],),
+        control_seq=commit.control_seq,
+    )
+    return decode, decode_input, commit
 
 
 def _materialized_artifact(
@@ -389,13 +430,6 @@ def test_mixed_token_and_flow_match_homogeneous_results():
     mixed = execution_worker(mixed_model)
     sequence_admission = und_admission(1, block_ids=(0,))
     flow_admission = gen_admission(2, ImageParams(steps=1, height=16, width=16, seed=29))
-    sequence, sequence_input = token_operation(
-        sequence_admission.request_key,
-        op_id=11,
-        parent=root_parent(sequence_admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-    )
     mixed_conditioning = _publish_conditioning(mixed, flow_admission, op_id=10, step_id=1)
     mixed_latent, mixed_transition_commit = _transition_generation(
         mixed,
@@ -414,26 +448,26 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         steps=1,
         control_seq=mixed_transition_commit.control_seq,
     )
+    sequence, sequence_input, sequence_control = _prepare_decode(
+        mixed,
+        sequence_admission,
+        op_id=10,
+        step_id=3,
+        tokens=(3, 4),
+    )
 
     mixed_result = mixed.execute(
         execution_batch(
-            step_id=3,
-            admissions=(sequence_admission,),
+            step_id=4,
+            admissions=(),
             operations=(sequence, flow),
-            controls=(mixed_transition_commit,),
+            controls=(mixed_transition_commit, sequence_control),
             input_products=(sequence_input,),
         )
     )
 
     split_model = _ObservedModel()
     split = execution_worker(split_model)
-    split_sequence, split_sequence_input = token_operation(
-        sequence_admission.request_key,
-        op_id=11,
-        parent=root_parent(sequence_admission),
-        mode=TokenMode.EXTEND,
-        tokens=(3, 4),
-    )
     split_conditioning = _publish_conditioning(split, flow_admission, op_id=10, step_id=1)
     split_latent, split_transition_commit = _transition_generation(
         split,
@@ -452,17 +486,25 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         steps=1,
         control_seq=split_transition_commit.control_seq,
     )
+    split_sequence, split_sequence_input, split_sequence_control = _prepare_decode(
+        split,
+        sequence_admission,
+        op_id=10,
+        step_id=3,
+        tokens=(3, 4),
+    )
     sequence_result = split.execute(
         execution_batch(
-            step_id=3,
-            admissions=(sequence_admission,),
+            step_id=4,
+            admissions=(),
             operations=(split_sequence,),
+            controls=(split_sequence_control,),
             input_products=(split_sequence_input,),
         )
     )
     flow_result = split.execute(
         execution_batch(
-            step_id=4,
+            step_id=5,
             admissions=(),
             operations=(split_flow,),
             controls=(split_transition_commit,),
@@ -487,14 +529,14 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         mixed_output_latent,
         mixed_flow_commit,
         op_id=13,
-        step_id=4,
+        step_id=5,
     ) == _materialized_artifact(
         split,
         flow_admission,
         split_output_latent,
         split_flow_commit,
         op_id=13,
-        step_id=5,
+        step_id=6,
     )
 
 
@@ -839,11 +881,11 @@ def test_mixed_partition_descriptor_failure_preserves_the_other_domain_candidate
         parent=root_parent(generation_admission),
         step_id=2,
     )
-    sequence, sequence_input = token_operation(
-        sequence_admission.request_key,
-        op_id=3,
-        parent=root_parent(sequence_admission),
-        mode=TokenMode.EXTEND,
+    sequence, sequence_input, sequence_control = _prepare_decode(
+        worker,
+        sequence_admission,
+        op_id=2,
+        step_id=3,
         tokens=(7, 8),
     )
     missing_latent = replace(latent, generation=latent.generation + 1000)
@@ -858,10 +900,10 @@ def test_mixed_partition_descriptor_failure_preserves_the_other_domain_candidate
     )
     report = worker.execute(
         execution_batch(
-            step_id=3,
-            admissions=(sequence_admission,),
+            step_id=4,
+            admissions=(),
             operations=(sequence, flow),
-            controls=(transition_commit,),
+            controls=(transition_commit, sequence_control),
             input_products=(sequence_input,),
         )
     )
@@ -871,7 +913,7 @@ def test_mixed_partition_descriptor_failure_preserves_the_other_domain_candidate
     assert by_request[62].status is OpStatus.ERROR
     assert by_request[62].error_code is ErrorCode.INVALID_OPERATION
     sequence_commit = commit_for_completion(sequence, report)
-    worker.execute(execution_batch(step_id=4, controls=(sequence_commit,)))
+    worker.execute(execution_batch(step_id=5, controls=(sequence_commit,)))
 
 
 def test_initial_flow_noise_is_stable_across_operation_schedules():
@@ -1511,6 +1553,91 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         consumer.close()
 
 
+def test_cross_stage_completion_predicate_preserves_device_continuation() -> None:
+    producer = execution_worker(StubModel(), transfer_backend="shm")
+    consumer = execution_worker(StubModel(), transfer_backend="shm")
+    generation = gen_admission(79, ImageParams(steps=1, height=16, width=16, seed=31))
+    admission = Admission.create(
+        generation.request_key,
+        request_pool_idx=generation.request_pool_idx,
+        und=UndAdmission(),
+        gen_admission=generation.gen_admission,
+    )
+    bind_request_placement(
+        admission.request_key,
+        request_pool_idx=admission.request_pool_idx,
+        page_ids=(1,),
+    )
+    try:
+        conditioning = _publish_conditioning(producer, admission, op_id=1, step_id=1)
+        transition, _latent = gen_transition_operation(
+            admission.request_key,
+            op_id=2,
+            parent=root_parent(admission),
+            conditioning=conditioning,
+            seed=31,
+        )
+        transitioned = finalized_report(
+            producer.execute(execution_batch(step_id=2, operations=(transition,)))
+        )
+        transition_commit = commit_for_completion(transition, transitioned)
+        source = next(
+            output for output in transition.outputs if output.kind is ProductKind.COMPLETION
+        )
+        transferred = replace(source, producer_op_id=3, generation=903)
+        transfer = Operation.registered(
+            request_key=admission.request_key,
+            op_id=3,
+            parent=transition_commit.selected,
+            work=Work("transfer", TransferMode.PRODUCT.value),
+            route=0,
+            domain=Domain.FLOW,
+            bounds=Bounds(max_transfer_bytes=source.max_bytes),
+            inputs=(source,),
+            outputs=(transferred,),
+            control_seq=transition_commit.control_seq,
+        )
+        transfer_report = finalized_report(
+            producer.execute(
+                execution_batch(
+                    step_id=3,
+                    operations=(transfer,),
+                    controls=(transition_commit,),
+                )
+            )
+        )
+        payload = next(
+            product for product in transfer_report.products if product.product == transferred
+        )
+        consume, consume_input = token_operation(
+            admission.request_key,
+            op_id=4,
+            parent=root_parent(admission),
+            mode=TokenMode.EXTEND,
+            tokens=(9,),
+            predicate=transferred,
+        )
+        prepared = consumer.prepare_execute(
+            execution_batch(
+                step_id=4,
+                admissions=(admission,),
+                operations=(consume,),
+                input_products=(consume_input, payload),
+            )
+        )
+        assert prepared is not None
+        deadline = time.monotonic() + 5.0
+        while not prepared.ready() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert prepared.ready()
+        consumed = finalized_report(consumer.execute_prepared(prepared))
+        assert consumed.completions[0].status is OpStatus.OK
+        assert consumed.completions[0].logical_lengths.kv_visible_len == 1
+    finally:
+        producer.close()
+        consumer.close()
+
+
 def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() -> None:
     producer = execution_worker(StubModel(), transfer_backend="shm")
     consumer = execution_worker(StubModel(), transfer_backend="shm")
@@ -1760,12 +1887,72 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         max_tokens=2,
         control_seq=commit.control_seq,
     )
+    next_token = _next_token(1007)
+    sampling_bytes = encode_sampling_state_bytes(
+        SamplingState(
+            finish_token_ids=(next_token + 1,),
+            transition_token_ids=(next_token,),
+        )
+    )
+    sampling_product = ProductRef(
+        request_key=admission.request_key,
+        producer_op_id=state.op_id,
+        output_index=0xFFFF,
+        generation=state.op_id * 8 + 7,
+        kind=ProductKind.SAMPLING_STATE,
+        storage_class=StorageClass.HOST_STAGING,
+        dtype=DType.U8,
+        shape_bound=ShapeBound((StaticDim(len(sampling_bytes)),)),
+        point_range=PointRange(),
+    )
+    finish_product = ProductRef(
+        request_key=admission.request_key,
+        producer_op_id=state.op_id,
+        output_index=2,
+        generation=state.op_id * 8 + 8,
+        kind=ProductKind.FINISH,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.U8,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(),
+    )
+    transition_product = ProductRef(
+        request_key=admission.request_key,
+        producer_op_id=state.op_id,
+        output_index=4,
+        generation=state.op_id * 8 + 9,
+        kind=ProductKind.COMPLETION,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.U8,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(),
+    )
+    state = Operation.registered(
+        request_key=state.request_key,
+        op_id=state.op_id,
+        parent=state.parent,
+        work=state.work,
+        route=state.route,
+        domain=state.domain,
+        bounds=state.bounds,
+        inputs=(*state.inputs, sampling_product),
+        outputs=(*state.outputs, finish_product, transition_product),
+        kv_capacity_pages=state.kv_capacity_pages,
+        predicate=state.predicate,
+        rng=state.rng,
+        control_seq=state.control_seq,
+    )
     report = worker.execute(
-        execution_batch(step_id=7, admissions=(), operations=(state,), input_products=())
+        execution_batch(
+            step_id=7,
+            admissions=(),
+            operations=(state,),
+            input_products=(ProductPayload(sampling_product, sampling_bytes),),
+        )
     )
 
     completion = report.completions[0]
-    assert completion.committed_tokens == (_next_token(1007),)
+    assert completion.committed_tokens == (next_token,)
     assert completion.token_span.base == 2
     assert completion.token_span.len == 1
     assert completion.logical_lengths.token_len == 4

@@ -17,15 +17,15 @@ use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
 use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{
-    ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
+    CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
 };
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{
     Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, ErrorCode,
-    FinishFlags, GenMode, LogicalLengths, OpStatus, Operation, PartitionCompletion, Point,
-    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, ResourceClass,
-    SamplingState, TimingCounters, TokenMode, TokenSpan, TransferMode, Work, WorkVariant,
-    WorkerCapabilities, decode_sampling_state_bytes,
+    FinishFlags, GenMode, LogicalLengths, MixedExecutionCapability, OpStatus, Operation,
+    PartitionCompletion, Point, ProductKind, ProductPayload, ProductRef, RegistrationAck,
+    RequestKind, ResourceClass, SamplingState, TimingCounters, TokenMode, TokenSpan, TransferMode,
+    Work, WorkVariant, WorkerCapabilities, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -46,6 +46,8 @@ pub struct SimExecutor {
     depth: usize,
     to_worker: Sender<Job>,
     from_worker: Receiver<anyhow::Result<CompletionReport>>,
+    progress_tx: Sender<()>,
+    progress_rx: Receiver<()>,
     in_flight: usize,
     next_call_id: u64,
     handle: Option<JoinHandle<()>>,
@@ -62,6 +64,8 @@ impl SimExecutor {
         let depth = depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
+        let (progress_tx, progress_rx) = crossbeam_channel::bounded(1);
+        let worker_progress = progress_tx.clone();
         let handle = std::thread::Builder::new()
             .name("uniserve-sim-executor".into())
             .spawn(move || {
@@ -71,6 +75,7 @@ impl SimExecutor {
                             if results_tx.send(engine.execute(batch)).is_err() {
                                 break;
                             }
+                            let _ = worker_progress.try_send(());
                         }
                         Job::Drop(session_id) => {
                             let _ = engine.drop_session(session_id);
@@ -85,6 +90,8 @@ impl SimExecutor {
             depth,
             to_worker,
             from_worker,
+            progress_tx,
+            progress_rx,
             in_flight: 0,
             next_call_id: 1,
             handle: Some(handle),
@@ -146,6 +153,22 @@ impl Executor for SimExecutor {
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 Err(anyhow::anyhow!("sim executor thread disconnected"))
             }
+        }
+    }
+
+    fn command_waker(&self) -> CommandWaker {
+        let progress = self.progress_tx.clone();
+        CommandWaker::new(move || {
+            let _ = progress.try_send(());
+        })
+    }
+
+    fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        match self.progress_rx.recv_timeout(timeout) {
+            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(()),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "sim executor progress channel disconnected"
+            )),
         }
     }
 
@@ -333,7 +356,17 @@ impl SimEngine {
             ],
             max_batch_operations: 1024,
             max_unresolved_window: 2,
-            tensorized_mixed: true,
+            mixed_buckets: (1..=128)
+                .flat_map(|decode_rows| {
+                    (1..=3).map(move |cfg_branches| MixedExecutionCapability {
+                        decode_rows,
+                        flow_rows: 1,
+                        height: DEFAULT_IMAGE_HW.0,
+                        width: DEFAULT_IMAGE_HW.1,
+                        cfg_branches,
+                    })
+                })
+                .collect(),
             resource_classes: vec![ResourceClass::ImageLatent, ResourceClass::Scratch],
             model_identity: "0".repeat(64),
             weight_digest: "1".repeat(64),
@@ -565,6 +598,20 @@ impl SimEngine {
                             .predicate_values
                             .insert(token_product.clone(), continuation);
                     }
+                    let transition = sampling_state.as_ref().is_some_and(|state| {
+                        state
+                            .transition_token_ids
+                            .binary_search(&output.token)
+                            .is_ok()
+                    });
+                    for completion in operation.outputs.iter().filter(|candidate| {
+                        candidate.kind == ProductKind::Completion
+                            && matches!(candidate.output_index, 4 | 6)
+                    }) {
+                        session
+                            .predicate_values
+                            .insert(completion.clone(), transition);
+                    }
                     record.token_span = TokenSpan {
                         base: index as u32,
                         len: 1,
@@ -638,7 +685,7 @@ impl SimEngine {
             }
             Work::Gen(GenMode::Transition) => {}
             Work::Gen(GenMode::Flow) => {
-                let steps = operation.bounds.max_points.max(1) as u16;
+                let steps = operation.bounds.max_tokens.max(1) as u16;
                 session.flow_step = session.flow_step.saturating_add(steps);
                 let total = session
                     .image()
@@ -664,6 +711,17 @@ impl SimEngine {
                     });
                 }
             }
+        }
+
+        for completion in operation
+            .outputs
+            .iter()
+            .filter(|output| output.kind == ProductKind::Completion)
+        {
+            session
+                .predicate_values
+                .entry(completion.clone())
+                .or_insert(true);
         }
 
         // Every declared output surfaces as a resolvable product for the host.
@@ -716,8 +774,7 @@ impl SimEngine {
             error_code: None,
             timing_counters: TimingCounters::default(),
         };
-        record.semantic_digest =
-            record.compute_semantic_digest(&session.committed_semantic, &operation.plan_digest);
+        record.semantic_digest = session.committed_semantic.clone();
         record
     }
 
@@ -959,6 +1016,13 @@ impl ModelEngine for SimEngine {
                             )
                         })?;
                     if !predicate_value {
+                        for completion in operation
+                            .outputs
+                            .iter()
+                            .filter(|output| output.kind == ProductKind::Completion)
+                        {
+                            session.predicate_values.insert(completion.clone(), false);
+                        }
                         let completion = Self::predicated_completion(&operation, &session);
                         session.terminal.insert(
                             operation.op_id.0,

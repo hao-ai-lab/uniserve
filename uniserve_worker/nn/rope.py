@@ -1108,14 +1108,11 @@ class RotaryEmbedding(nn.Module):
     """Default rotary embedding with an optional Qwen frequency-range mode."""
 
     inv_freq: torch.Tensor
-    original_inv_freq: torch.Tensor
-
     def __init__(
         self,
         dim: int,
         *,
         theta: float = 10000.0,
-        max_position_embeddings: int = 4096,
         attention_scaling: float = 1.0,
         keep_freq_range: bool = False,
         device: torch.device | str | None = None,
@@ -1127,8 +1124,6 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.theta = theta
-        self.max_seq_len_cached = max_position_embeddings
-        self.original_max_seq_len = max_position_embeddings
         self.attention_scaling = attention_scaling
         inv_dim = dim * 2 if keep_freq_range else dim
         inv_freq = 1.0 / (
@@ -1137,7 +1132,6 @@ class RotaryEmbedding(nn.Module):
         if keep_freq_range:
             inv_freq = inv_freq[::2]
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1258,7 +1252,6 @@ def get_rope(
     dim: int | None = None,
     *,
     theta: float = 10000.0,
-    max_position_embeddings: int = 4096,
     attention_scaling: float = 1.0,
     keep_freq_range: bool = False,
     config: Any | None = None,
@@ -1278,7 +1271,6 @@ def get_rope(
     return RotaryEmbedding(
         dim,
         theta=theta,
-        max_position_embeddings=max_position_embeddings,
         attention_scaling=attention_scaling,
         keep_freq_range=keep_freq_range,
         device=device,

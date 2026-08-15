@@ -38,12 +38,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         default="local",
         help="data-plane backend: local, shm, or cuda_ipc",
     )
-    parser.add_argument(
-        "--defer-sampling",
-        action="store_true",
-        default=False,
-        help="publish logits for a separate sampler worker",
-    )
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     parser.add_argument("--max-batch-tokens", type=int, required=True)
@@ -51,16 +45,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-dtype", default=None)
     parser.add_argument("--kv-memory-fraction", type=float, default=0.70)
     parser.add_argument("--model-dtype", default="bfloat16")
-    parser.add_argument(
-        "--transformers-trust-remote-code",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--transformers-attn-implementation",
-        default="uniserve",
-    )
-    parser.add_argument("--disable-model-arch", action="append", default=[])
     parser.add_argument(
         "--tp-rank",
         type=int,
@@ -95,12 +79,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-graph-token-sizes", default=None)
     parser.add_argument("--flow-graph-batch-sizes", default=None)
     parser.add_argument("--flow-graph-shapes", default=None)
-    parser.add_argument("--mixed-text-max-tokens", type=int, default=8192)
-    parser.add_argument(
-        "--varlen-prefill",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument(
         "--flashinfer-workspace-size",
         type=int,

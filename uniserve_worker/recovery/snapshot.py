@@ -222,14 +222,6 @@ class SnapshotRecovery:
             self._restore_image(image, {session_id: placement})
             self._current_refs[session_id] = reference
 
-    def available_snapshots(self) -> tuple[SnapshotRef, ...]:
-        with self._lock:
-            entries = cast(dict[str, object], self._read_catalog()["requests"])
-            return tuple(
-                SnapshotRef.from_wire(value, f"catalog.requests[{key}]")
-                for key, value in sorted(entries.items(), key=lambda item: int(item[0]))
-            )
-
     def drop_session(self, session_id: int) -> None:
         with self._lock:
             self._current_refs.pop(int(session_id), None)
@@ -1457,10 +1449,6 @@ def _string(value: object, where: str) -> str:
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     return value
-
-
-def _optional_string(value: object, where: str) -> str | None:
-    return None if value is None else _string(value, where)
 
 
 def _uint(value: object, where: str) -> int:

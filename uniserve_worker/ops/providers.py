@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from functools import lru_cache
 from importlib import import_module
 
 import torch
 
 from ..execution.forward_batch import PagedDecodePlan
-from ..foundation.env import env_flag
-from .core import Capabilities, CommDispatcher, Dispatcher, Handoff
+from .core import Dispatcher
 from .requests import (
     AddRmsNormReq,
     AttentionRegime,
@@ -20,7 +18,6 @@ from .requests import (
     QKNormRopeReq,
     RmsNormReq,
     SiluAndMulReq,
-    TpAllReduceReq,
 )
 
 _SGL_ALIGNMENT_BYTES = 16
@@ -53,29 +50,10 @@ def _sgl_silu_and_mul_kernel():
     return silu_and_mul
 
 
-@lru_cache(maxsize=1)
-def weak_ref_tensor_provider():
-    try:  # pragma: no cover - optional SGLang kernel package.
-        from sgl_kernel import weak_ref_tensor
-
-        return weak_ref_tensor
-    except Exception:
-        try:  # pragma: no cover - optional NPU runtime.
-            from torch_npu._C import _weak_ref_tensor as weak_ref_tensor
-
-            return weak_ref_tensor
-        except Exception:
-            return None
-
-
 class _ProviderBase:
     def __init__(self, name: str, operator: str) -> None:
         self.name = name
         self.operator = operator
-
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({self.name, self.operator}))
-
 
 class _RmsNormKernelProvider(_ProviderBase):
     def __init__(self, name: str, kernel) -> None:
@@ -309,9 +287,6 @@ class _TritonQKNormProvider:
     name = "triton"
     operator = "qk_norm"
 
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({"triton", "qk_norm"}))
-
     def can_run(self, req: QKNormReq) -> bool:
         if req.axis_dims is not None:
             return False
@@ -351,9 +326,6 @@ class _TritonQKNormProvider:
 class _EagerQKNormProvider:
     name = "eager"
     operator = "qk_norm"
-
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({"eager", "qk_norm"}))
 
     def can_run(self, req: QKNormReq) -> bool:
         return True
@@ -401,9 +373,6 @@ def qk_norm_dispatcher():
 class _TritonQKNormRopeProvider:
     name = "triton"
     operator = "qk_norm_rope"
-
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({"triton", "qk_norm_rope"}))
 
     def can_run(self, req: QKNormRopeReq) -> bool:
         if req.axis_dims is not None:
@@ -857,17 +826,8 @@ class _EagerQKNormRopeProvider:
     name = "eager"
     operator = "qk_norm_rope"
 
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({"eager", "qk_norm_rope"}))
-
     def can_run(self, req: QKNormRopeReq) -> bool:
         return True
-
-    @staticmethod
-    def _validate_multi_axis(req: QKNormRopeReq) -> None:
-        import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.validate_multi_axis(
-            req
-        )
 
     @staticmethod
     def _shared_norm_group_end(req: QKNormReq | QKNormRopeReq, start: int) -> int:
@@ -1009,26 +969,8 @@ class _AttentionBackendProvider:
         self.backend = backend
         self.name = backend.name
 
-    def capabilities(self) -> Capabilities:
-        caps = self.backend.capabilities()
-        return Capabilities(
-            tags=frozenset({self.name, "attention"}),
-            attrs={
-                "paged_kv": bool(getattr(caps, "paged_kv", False)),
-                "varlen_attention": bool(getattr(caps, "varlen_attention", False)),
-                "varlen_paged_kv": bool(getattr(caps, "varlen_paged_kv", False)),
-                "requires_paged_varlen": bool(getattr(caps, "requires_paged_varlen", False)),
-                "visible_end": bool(getattr(caps, "visible_end", False)),
-                "trunk_geometries": getattr(caps, "trunk_geometries", frozenset()),
-                "paged_block_size_multiple": int(
-                    getattr(caps, "paged_block_size_multiple", 1) or 1
-                ),
-                "min_head_dim": int(getattr(caps, "min_head_dim", 1) or 1),
-                "paged_decode_only": bool(getattr(caps, "paged_decode_only", False)),
-                "paged_varlen_cuda_graph": bool(getattr(caps, "paged_varlen_cuda_graph", False)),
-                "visible_end_cuda_graph": bool(getattr(caps, "visible_end_cuda_graph", False)),
-            },
-        )
+    def capabilities(self):
+        return self.backend.capabilities()
 
     def display_name(self, req: AttentionReq) -> str:
         if (
@@ -1232,190 +1174,3 @@ def run_attention(selection, req: AttentionReq) -> torch.Tensor:
             return provider.run(req)
     names = tuple(backend.name for backend in selection.providers)
     raise RuntimeError(f"no provisioned attention backend can execute this request: {names!r}")
-
-
-logger = logging.getLogger(__name__)
-
-
-class _SymmMemTpAllReduceProvider:
-    """One-shot NVLink all-reduce over torch symmetric memory for small payloads.
-
-    Per-token decode under tensor parallelism issues ~2 all-reduces per layer on
-    tiny (hidden-size) activations, where NCCL's ring protocol is pure latency.
-    A one-shot symmetric-memory reduce (each rank reads its peers' buffers over
-    NVLink and reduces locally) halves that latency and is CUDA-graph
-    capturable. Large payloads (prefill/denoise activations) fall through to
-    the standard provider, whose bandwidth-optimal ring wins there.
-
-    The staging buffers are rendezvoused collectively, so eligibility must be
-    rank-deterministic: it depends only on the request shape/dtype/op and
-    process-wide state that is identical across SPMD ranks. Buffers are created
-    eagerly on first eligible use (warmup runs precede any graph capture);
-    inside an active capture a missing buffer falls back to the standard
-    provider, which NCCL captures correctly.
-    """
-
-    name = "symm_mem"
-    operator = "tp_all_reduce"
-
-    # One-shot reads (world-1) x payload over NVLink; past ~half a megabyte the
-    # bandwidth-optimal ring catches up, so stay in the latency regime only.
-    _MAX_BYTES = 512 * 1024
-    # Distinct payload sizes worth pinning symmetric buffers for. Decode uses
-    # one (hidden) size per model; refuse pathological diversity.
-    _MAX_POOL_ENTRIES = 8
-    _DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-
-    def __init__(self) -> None:
-        self._buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
-        self._disabled = False
-
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({self.name, self.operator, "cuda_graph"}))
-
-    @staticmethod
-    def _runtime():
-        try:
-            import torch.distributed._symmetric_memory as symm_mem
-        except ImportError:
-            return None
-        if not hasattr(torch.ops, "symm_mem"):
-            return None
-        return symm_mem
-
-    @staticmethod
-    def _group_name(transport) -> str | None:
-        group = getattr(transport, "group", None)
-        if group is None:
-            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-                return None
-            group = torch.distributed.group.WORLD
-        return getattr(group, "group_name", None)
-
-    def can_dispatch(self, req: TpAllReduceReq, *, mesh=None) -> bool:
-        del mesh
-        if self._disabled or env_flag("UNISERVE_DISABLE_SYMM_ALLREDUCE"):
-            return False
-        transport = getattr(req.axis, "transport", None)
-        if transport is None or not hasattr(transport, "group"):
-            return False
-        if int(getattr(transport, "size", 1)) <= 1:
-            return False
-        tensor = req.tensor
-        if str(req.op).lower() != "sum" or not tensor.is_cuda:
-            return False
-        if tensor.dtype not in self._DTYPES:
-            return False
-        if tensor.numel() * tensor.element_size() > self._MAX_BYTES:
-            return False
-        if self._runtime() is None:
-            return False
-        if self._group_name(transport) is None:
-            return False
-        key = (str(tensor.device), tensor.dtype, int(tensor.numel()))
-        if key not in self._buffers:
-            if len(self._buffers) >= self._MAX_POOL_ENTRIES:
-                return False
-            # Buffer creation involves a collective rendezvous, which cannot run
-            # inside an active CUDA graph capture. SPMD lockstep makes this
-            # check rank-deterministic (all ranks capture the same step).
-            if torch.cuda.is_current_stream_capturing():
-                return False
-        return True
-
-    def dispatch(self, req: TpAllReduceReq, *, mesh=None) -> Handoff:
-        del mesh
-        symm_mem = self._runtime()
-        transport = getattr(req.axis, "transport", None)
-        if transport is None:
-            raise RuntimeError("symmetric-memory all-reduce requires an axis transport")
-        group_name = self._group_name(transport)
-        tensor = req.tensor
-        key = (str(tensor.device), tensor.dtype, int(tensor.numel()))
-        buffer = self._buffers.get(key)
-        if buffer is None:
-            # ``dispatch`` can first run under torch.inference_mode() during
-            # graph warmup/capture. Cached communication buffers are mutated on
-            # every later call, including non-inference setup paths, so allocate
-            # them as normal tensors regardless of the caller's current mode.
-            with torch.inference_mode(False):
-                buffer = symm_mem.empty(
-                    int(tensor.numel()), dtype=tensor.dtype, device=tensor.device
-                )
-            handle = symm_mem.rendezvous(buffer, group=group_name)
-            if handle is None:
-                # Rendezvous declined (unsupported topology). Downgrade loudly,
-                # once, and answer this call via the standard transport so the
-                # forward still completes; SPMD ranks decline together because
-                # rendezvous is itself collective.
-                self._disabled = True
-                logger.warning(
-                    "symmetric-memory rendezvous unavailable; tp_all_reduce stays on the standard transport"
-                )
-                return Handoff(
-                    format="tensor",
-                    payload=transport.all_reduce(tensor, req.op),
-                    metadata={"axis": getattr(req.axis, "name", "tp"), "op": req.op},
-                )
-            self._buffers[key] = buffer
-            logger.info(
-                "symmetric-memory one-shot tp_all_reduce active: %s x %s on %s",
-                int(tensor.numel()),
-                tensor.dtype,
-                tensor.device,
-            )
-        buffer.copy_(tensor.reshape(-1))
-        reduced = torch.ops.symm_mem.one_shot_all_reduce(buffer, "sum", group_name)
-        return Handoff(
-            format="tensor",
-            payload=reduced.view(tensor.shape),
-            metadata={"axis": getattr(req.axis, "name", "tp"), "op": req.op},
-        )
-
-    def can_combine(self, handoff: Handoff, *, mesh=None) -> bool:
-        del mesh
-        return handoff.format == "tensor"
-
-    def combine(self, handoff: Handoff, *, mesh=None):
-        del mesh
-        return handoff.payload
-
-
-class _StandardTpAllReduceProvider:
-    name = "standard"
-    operator = "tp_all_reduce"
-
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({self.name, self.operator}))
-
-    def can_dispatch(self, req: TpAllReduceReq, *, mesh=None) -> bool:
-        del mesh
-        return getattr(req.axis, "transport", None) is not None
-
-    def dispatch(self, req: TpAllReduceReq, *, mesh=None) -> Handoff:
-        del mesh
-        transport = getattr(req.axis, "transport", None)
-        if transport is None:
-            raise RuntimeError("tp_all_reduce requires a transport-bound mesh axis")
-        return Handoff(
-            format="tensor",
-            payload=transport.all_reduce(req.tensor, req.op),
-            metadata={"axis": getattr(req.axis, "name", "tp"), "op": req.op},
-        )
-
-    def can_combine(self, handoff: Handoff, *, mesh=None) -> bool:
-        del mesh
-        return handoff.format == "tensor"
-
-    def combine(self, handoff: Handoff, *, mesh=None):
-        del mesh
-        return handoff.payload
-
-
-@lru_cache(maxsize=1)
-def tp_all_reduce_dispatcher():
-    return CommDispatcher(
-        "tp_all_reduce",
-        [_SymmMemTpAllReduceProvider(), _StandardTpAllReduceProvider()],
-        env_override="UNISERVE_TP_ALLREDUCE_PROVIDER",
-    )

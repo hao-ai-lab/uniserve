@@ -478,6 +478,25 @@ def test_operation_rejects_a_work_domain_mismatch() -> None:
         operation.validate()
 
 
+def test_kv_publication_requires_a_fixed_semantic_parent() -> None:
+    operation = Operation.registered(
+        request_key=_request_key(),
+        op_id=12,
+        parent=VersionRef(
+            request_key=_request_key(),
+            producer_op_id=9,
+            point=DevicePoint(1, None, "cc" * 32),
+        ),
+        work=Work("transfer", "kv_publish"),
+        route=1,
+        domain=Domain.PREFILL,
+        bounds=Bounds(),
+    )
+
+    with pytest.raises(WorkerError, match="fixed semantic parent"):
+        operation.validate()
+
+
 def test_every_work_variant_round_trips() -> None:
     variants = [
         (Work("token", "extend"), True, Domain.PREFILL),
@@ -694,6 +713,7 @@ def test_sampling_state_bytes_preserve_branch_local_processor_semantics() -> Non
             allowed_token_ids=(),
             suppressed_token_ids=(7, 2, 7),
             finish_token_ids=(11, 5, 11),
+            transition_token_ids=(29, 13, 29),
             force_finish=True,
         )
     )
@@ -702,6 +722,7 @@ def test_sampling_state_bytes_preserve_branch_local_processor_semantics() -> Non
         allowed_token_ids=(),
         suppressed_token_ids=(2, 7),
         finish_token_ids=(5, 11),
+        transition_token_ids=(13, 29),
         force_finish=True,
     )
 

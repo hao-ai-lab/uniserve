@@ -643,16 +643,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "core-foundation"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1220,21 +1210,6 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
-name = "foreign-types"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
-dependencies = [
- "foreign-types-shared",
-]
-
-[[package]]
-name = "foreign-types-shared"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "form_urlencoded"
@@ -2437,23 +2412,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "native-tls"
-version = "0.2.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "465500e14ea162429d264d44189adc38b199b62b1c21eea9f69e4b73cb03bbf2"
-dependencies = [
- "libc",
- "log",
- "openssl",
- "openssl-probe",
- "openssl-sys",
- "schannel",
- "security-framework",
- "security-framework-sys",
- "tempfile",
-]
-
-[[package]]
 name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2584,59 +2542,6 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
-
-[[package]]
-name = "openssl"
-version = "0.10.80"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
-dependencies = [
- "bitflags",
- "cfg-if",
- "foreign-types",
- "libc",
- "openssl-macros",
- "openssl-sys",
-]
-
-[[package]]
-name = "openssl-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "openssl-probe"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "openssl-src"
-version = "300.6.0+3.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8e8cbfd3a4a8c8f089147fd7aaa33cf8c7450c4d09f8f80698a0cf093abeff4"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "openssl-sys"
-version = "0.9.116"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f28a22dc7140cda5f096e5e7724a6962ca81a7f8bfd2979f9b18c11af56318c4"
-dependencies = [
- "cc",
- "libc",
- "openssl-src",
- "pkg-config",
- "vcpkg",
-]
 
 [[package]]
 name = "option-ext"
@@ -3398,15 +3303,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "schannel"
-version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "schemars"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3443,29 +3339,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5f0e40a01b94e35d1dacbcfbe5bfd3d31e37d9590b2e6d86a82b0e87bd4f551"
 dependencies = [
  "saa",
-]
-
-[[package]]
-name = "security-framework"
-version = "3.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
-dependencies = [
- "bitflags",
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "libc",
- "security-framework-sys",
-]
-
-[[package]]
-name = "security-framework-sys"
-version = "2.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
-dependencies = [
- "core-foundation-sys",
- "libc",
 ]
 
 [[package]]
@@ -3840,7 +3713,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
 dependencies = [
  "bitflags",
- "core-foundation 0.9.4",
+ "core-foundation",
  "system-configuration-sys",
 ]
 
@@ -4134,7 +4007,6 @@ version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
 dependencies = [
- "indexmap 2.14.0",
  "serde_core",
  "serde_spanned",
  "toml_datetime 0.7.5+spec-1.1.0",
@@ -4388,9 +4260,7 @@ dependencies = [
  "anyhow",
  "clap",
  "educe",
- "futures",
  "mimalloc",
- "native-tls",
  "serde",
  "serde_json",
  "thiserror-ext",
@@ -4424,9 +4294,7 @@ version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
- "sha2",
  "thiserror 2.0.18",
- "toml",
 ]
 
 [[package]]
@@ -4485,15 +4353,8 @@ name = "uniserve-engine-runtime"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "bytes",
  "crossbeam-channel",
- "futures",
- "serde",
- "thiserror-ext",
- "tokio",
- "tokio-util",
  "tracing",
- "tracing-subscriber",
  "uniserve-core",
  "uniserve-engine-api",
  "uniserve-executor",
@@ -4532,7 +4393,6 @@ name = "uniserve-executor"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "toml",
  "uniserve-core",
  "uniserve-worker-wire",
 ]
@@ -4542,6 +4402,8 @@ name = "uniserve-ipc-py"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "libloading",
  "pyo3",
  "pythonize",
  "uniserve-core",
@@ -4563,7 +4425,6 @@ name = "uniserve-managed-engine"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "expect-test",
  "libc",
  "tokio",
  "tracing",
@@ -4616,7 +4477,6 @@ version = "0.2.0"
 dependencies = [
  "asynk-strim-attr",
  "axum",
- "expect-test",
  "futures",
  "itertools 0.14.0",
  "llm-multimodal",
@@ -4624,7 +4484,6 @@ dependencies = [
  "serde_json",
  "serde_with",
  "thiserror-ext",
- "tokio",
  "tracing",
  "uniserve-serving",
  "validator",
@@ -4637,11 +4496,11 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "crossbeam-channel",
+ "libc",
  "png",
  "serde",
  "serde_json",
  "sha2",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "uniserve-core",
@@ -4659,7 +4518,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
- "futures",
  "http-body",
  "libc",
  "serde",
@@ -4668,7 +4526,6 @@ dependencies = [
  "thiserror-ext",
  "tokio",
  "tokio-util",
- "tower",
  "tower-http",
  "tracing",
  "tracing-futures",
@@ -4707,7 +4564,6 @@ dependencies = [
  "serde-json-fmt",
  "serde_json",
  "serde_with",
- "sha2",
  "subenum",
  "tempfile",
  "thiserror 2.0.18",
@@ -4730,7 +4586,6 @@ dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
  "png",
- "tokio",
  "uniserve-core",
  "uniserve-engine-api",
  "uniserve-executor",
@@ -4761,7 +4616,6 @@ dependencies = [
  "anyhow",
  "iceoryx2",
  "iceoryx2-bb-elementary-traits",
- "tracing",
  "uniserve-worker-wire",
 ]
 
@@ -4777,7 +4631,6 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2",
- "toml",
  "uniserve-core",
 ]
 
@@ -4927,12 +4780,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

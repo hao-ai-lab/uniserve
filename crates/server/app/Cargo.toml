@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-futures.workspace = true
 http-body.workspace = true
 libc.workspace = true
 serde.workspace = true
@@ -33,11 +32,6 @@ uniserve-sim.workspace = true
 uniserve-worker-ipc.workspace = true
 uuid.workspace = true
 validator.workspace = true
-
-[dev-dependencies]
-anyhow.workspace = true
-futures.workspace = true
-tower.workspace = true
 
 [lints]
 workspace = true

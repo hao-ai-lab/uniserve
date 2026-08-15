@@ -1,8 +1,8 @@
 //! Prometheus recording for engine-reported scheduler statistics.
 
 use uniserve_observability::{
-    EngineBackendLabels, EngineComponentLabels, EngineLabels, EngineModeLabels, EnginePathLabels,
-    SchedulerMetrics, WaitingReasonLabels,
+    EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::SchedulerStats;
@@ -56,6 +56,86 @@ pub fn record_scheduler_stats(
         .scheduler_queue_wait_max_us
         .get_or_create(&labels)
         .set(stats.max_queue_wait_us);
+    for domain in &stats.domain_stats {
+        let domain_labels = EngineDomainLabels {
+            model_name: model_name.clone(),
+            engine,
+            domain: domain.domain.clone(),
+        };
+        metrics
+            .scheduler_domain_active_credits
+            .get_or_create(&domain_labels)
+            .set(domain.active_credits);
+        metrics
+            .scheduler_domain_peak_credits
+            .get_or_create(&domain_labels)
+            .set(domain.peak_credits);
+        for (kind, value) in [
+            ("launched", domain.launched_operations),
+            ("completed", domain.completed_operations),
+            ("predicated", domain.predicated_operations),
+            ("error", domain.error_operations),
+        ] {
+            metrics
+                .scheduler_domain_operations
+                .get_or_create(&EngineDomainKindLabels {
+                    model_name: model_name.clone(),
+                    engine,
+                    domain: domain.domain.clone(),
+                    kind: kind.to_string(),
+                })
+                .inc_by(value);
+        }
+        metrics
+            .scheduler_domain_backpressure
+            .get_or_create(&domain_labels)
+            .inc_by(domain.backpressure_events);
+        metrics
+            .scheduler_domain_reclaimed_credits
+            .get_or_create(&domain_labels)
+            .inc_by(domain.reclaimed_credits);
+        metrics
+            .scheduler_domain_completed_partitions
+            .get_or_create(&domain_labels)
+            .inc_by(domain.completed_partitions);
+        for (kind, value) in [
+            ("semantic", domain.semantic_commits),
+            ("public", domain.public_commits),
+        ] {
+            metrics
+                .scheduler_domain_commits
+                .get_or_create(&EngineDomainKindLabels {
+                    model_name: model_name.clone(),
+                    engine,
+                    domain: domain.domain.clone(),
+                    kind: kind.to_string(),
+                })
+                .inc_by(value);
+        }
+        for (kind, value) in [
+            ("queue", domain.queue_us),
+            ("launch", domain.launch_us),
+            ("device", domain.device_us),
+            ("completion", domain.completion_us),
+            ("semantic_commit", domain.semantic_commit_us),
+            ("public_commit", domain.public_commit_us),
+            ("co_resident", domain.co_resident_us),
+        ] {
+            metrics
+                .scheduler_domain_time_us
+                .get_or_create(&EngineDomainKindLabels {
+                    model_name: model_name.clone(),
+                    engine,
+                    domain: domain.domain.clone(),
+                    kind: kind.to_string(),
+                })
+                .inc_by(value);
+        }
+        metrics
+            .scheduler_domain_co_resident_partitions
+            .get_or_create(&domain_labels)
+            .inc_by(domain.co_resident_partitions);
+    }
 
     // Prefix-cache counters, including the connector-backed external cache path.
     metrics
@@ -293,5 +373,61 @@ pub fn record_scheduler_stats(
                 kv_block_reuse_gap_seconds.observe(*reuse_gap_seconds);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uniserve_engine_wire::stats::DomainSchedulerStats;
+    use uniserve_observability::Metrics;
+
+    #[test]
+    fn domain_accounting_reaches_openmetrics() {
+        let metrics = Metrics::new();
+        let stats = SchedulerStats {
+            domain_stats: vec![DomainSchedulerStats {
+                domain: "decode".to_string(),
+                active_credits: 2,
+                peak_credits: 5,
+                launched_operations: 7,
+                completed_operations: 6,
+                error_operations: 1,
+                backpressure_events: 3,
+                reclaimed_credits: 6,
+                completed_partitions: 4,
+                semantic_commits: 5,
+                public_commits: 4,
+                co_resident_partitions: 2,
+                queue_us: 11,
+                launch_us: 13,
+                device_us: 17,
+                completion_us: 19,
+                semantic_commit_us: 23,
+                public_commit_us: 29,
+                co_resident_us: 31,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        record_scheduler_stats(&metrics.scheduler, "model", 0, &stats);
+        let rendered = metrics.render().expect("metrics render");
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("uniserve:scheduler_domain_active_credits")
+                && line.contains("domain=\"decode\"")
+                && line.ends_with(" 2")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("uniserve:scheduler_domain_operations_total")
+                && line.contains("domain=\"decode\"")
+                && line.contains("kind=\"error\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("uniserve:scheduler_domain_time_us_total")
+                && line.contains("domain=\"decode\"")
+                && line.contains("kind=\"co_resident\"")
+                && line.ends_with(" 31")
+        }));
     }
 }

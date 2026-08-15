@@ -69,6 +69,8 @@ def _invariant(message: str) -> WorkerError:
 @dataclass(slots=True)
 class _CompletionSlot:
     host_tokens: torch.Tensor
+    start_events: dict[str, torch.cuda.Event]
+    producer_events: dict[str, torch.cuda.Event]
     events: dict[str, torch.cuda.Event]
     devices: set[torch.device] | None = None
     generation: int = 0
@@ -77,6 +79,9 @@ class _CompletionSlot:
     observed: set[int] | None = None
     sealed: bool = False
     abandoned: bool = False
+    reserved_ns: int = 0
+    device_started_ns: int = 0
+    copy_started_ns: int = 0
     sealed_ns: int = 0
     ready_ns: int = 0
     token_offset: int = 0
@@ -129,6 +134,7 @@ class CompletionLease:
         "_token_cursor",
         "_byte_cursor",
         "_token_cache",
+        "_timing",
     )
 
     def __init__(
@@ -147,6 +153,7 @@ class CompletionLease:
         self._token_cursor = 0
         self._byte_cursor = 0
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
+        self._timing: tuple[int, int, int, int] | None = None
 
     @property
     def generation(self) -> int:
@@ -169,23 +176,39 @@ class CompletionLease:
             raise _invariant("completion slot has no device readiness set")
         slot.devices.add(target)
 
-    def device_event(self, device: torch.device | str) -> torch.cuda.Event | None:
-        """Return this generation's completion fence before it is recorded."""
+    def begin_device(self, device: torch.device | str) -> None:
+        """Record this generation's first device-work boundary."""
 
         slot = self._arena._require_slot(self)
         if slot.sealed:
-            raise _invariant("completion event was requested after its slot was sealed")
+            raise _invariant("completion device timing began after its slot was sealed")
         target = canonical_device(device)
+        if slot.device_started_ns == 0:
+            slot.device_started_ns = time.perf_counter_ns()
         if target.type != "cuda":
-            return None
+            return
         self.register_device(target)
         device_name = str(target)
-        event = slot.events.get(device_name)
-        if event is None:
-            event = self._arena.event_pool.acquire(target)
-            self._arena.event_pool.retain(event, target)
-            slot.events[device_name] = event
-        return event
+        if device_name in slot.start_events:
+            return
+        event = self._arena.event_pool.acquire(target, timing=True)
+        self._arena.event_pool.retain(event, target)
+        self._arena.event_pool.record(event, target)
+        slot.start_events[device_name] = event
+
+    def _mark_copy_started(self, device: torch.device) -> None:
+        slot = self._arena._require_slot(self)
+        if slot.copy_started_ns == 0:
+            slot.copy_started_ns = time.perf_counter_ns()
+        device_name = str(device)
+        if device_name in slot.producer_events:
+            return
+        if device_name not in slot.start_events:
+            self.begin_device(device)
+        event = self._arena.event_pool.acquire(device, timing=True)
+        self._arena.event_pool.retain(event, device)
+        self._arena.event_pool.record(event, device)
+        slot.producer_events[device_name] = event
 
     def capture(self, tokens: torch.Tensor) -> CompletionCapture:
         flat = tokens.reshape(-1).to(dtype=torch.long)
@@ -205,6 +228,7 @@ class CompletionLease:
                 raise _invariant("completion slot has no device readiness set")
             device = canonical_device(flat.device)
             self.register_device(device)
+            self._mark_copy_started(device)
             host.copy_(flat, non_blocking=True)
         else:
             host.copy_(flat.to(device="cpu"))
@@ -235,6 +259,7 @@ class CompletionLease:
                 raise _invariant("CUDA completion byte copy targets pageable host storage")
             device = canonical_device(flat.device)
             self.register_device(device)
+            self._mark_copy_started(device)
             host.copy_(flat, non_blocking=True)
         else:
             host.copy_(flat.to(device="cpu"))
@@ -251,12 +276,18 @@ class CompletionLease:
         if slot.sealed:
             return
         for device in slot.devices or ():
-            event = slot.events.get(str(device))
+            device_name = str(device)
+            if device_name not in slot.start_events:
+                self.begin_device(device)
+            if device_name not in slot.producer_events:
+                self._mark_copy_started(device)
+            event = slot.events.get(device_name)
             if event is None:
-                event = self._arena.event_pool.acquire(device)
+                event = self._arena.event_pool.acquire(device, timing=True)
                 self._arena.event_pool.retain(event, device)
-                slot.events[str(device)] = event
+                slot.events[device_name] = event
             self._arena.event_pool.record(event, device)
+            self._arena.schedule_completion_wake(device, event)
         slot.sealed = True
         slot.sealed_ns = time.perf_counter_ns()
 
@@ -303,7 +334,20 @@ class CompletionLease:
         return slot.host_tokens.view(torch.uint8)[capture.offset : end].view(capture.shape)
 
     def observe(self, row: int, generation: int) -> tuple[int, int]:
-        return self._arena._observe(self, row, generation)
+        timing = self._arena._observe(
+            self,
+            row,
+            generation,
+            timing=self._timing,
+        )
+        if self._timing is None:
+            self._timing = timing
+        return timing[2], timing[3]
+
+    def timing(self) -> tuple[int, int, int, int]:
+        if self._timing is None:
+            raise _invariant("completion timing was read before observation")
+        return self._timing
 
     def discard(self, row: int, generation: int) -> None:
         self._arena._discard(self, row, generation)
@@ -356,6 +400,8 @@ class CompletionArena:
         self._slots = [
             _CompletionSlot(
                 host_tokens=self._host_tokens[:0],
+                start_events={},
+                producer_events={},
                 events={},
                 devices=set(),
             )
@@ -365,14 +411,44 @@ class CompletionArena:
         self._cursor = 0
         self._next_owner = 1
         self._closed = False
+        self._wake_on_stream: Callable[[int], None] | None = None
+        self._wake_streams: dict[str, torch.cuda.Stream] = {}
+
+    def set_completion_wake(self, wake_on_stream: Callable[[int], None]) -> None:
+        self._wake_on_stream = wake_on_stream
+
+    def schedule_completion_wake(
+        self,
+        device: torch.device,
+        event: torch.cuda.Event,
+    ) -> None:
+        wake_on_stream = self._wake_on_stream
+        if wake_on_stream is None:
+            return
+        device_name = str(device)
+        stream = self._wake_streams.get(device_name)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._wake_streams[device_name] = stream
+        stream.wait_event(event)
+        wake_on_stream(int(stream.cuda_stream))
 
     def close(self) -> None:
         if self._closed:
             return
+        for stream in self._wake_streams.values():
+            stream.synchronize()
+        self._wake_streams.clear()
         for slot in self._slots:
-            for event in slot.events.values():
+            for event in (
+                *slot.start_events.values(),
+                *slot.producer_events.values(),
+                *slot.events.values(),
+            ):
                 if bool(event.query()):
                     self.event_pool.release(event)
+            slot.start_events.clear()
+            slot.producer_events.clear()
             slot.events.clear()
         self._slots.clear()
         self._free_token_ranges.clear()
@@ -428,6 +504,9 @@ class CompletionArena:
             slot.devices = selected_devices
             slot.sealed = False
             slot.abandoned = False
+            slot.reserved_ns = time.perf_counter_ns()
+            slot.device_started_ns = 0
+            slot.copy_started_ns = 0
             slot.sealed_ns = 0
             slot.ready_ns = 0
             slot.token_offset = token_offset
@@ -471,7 +550,14 @@ class CompletionArena:
             raise _invariant("stale completion-slot generation")
         return slot
 
-    def _observe(self, lease: CompletionLease, row: int, generation: int) -> tuple[int, int]:
+    def _observe(
+        self,
+        lease: CompletionLease,
+        row: int,
+        generation: int,
+        *,
+        timing: tuple[int, int, int, int] | None,
+    ) -> tuple[int, int, int, int]:
         slot = self._require_slot(lease)
         index = int(row)
         if int(generation) != slot.generation:
@@ -484,12 +570,37 @@ class CompletionArena:
         if observed is None:
             raise _invariant("completion slot has no observation state")
         observed_ns = time.perf_counter_ns()
-        copy_us = max(0, slot.ready_ns - slot.sealed_ns) // 1000
-        ready_to_observed_us = max(0, observed_ns - slot.ready_ns) // 1000
+        if timing is None:
+            queued_us = (
+                max(0, slot.device_started_ns - slot.reserved_ns) // 1000
+                if slot.device_started_ns > 0
+                else 0
+            )
+            device_us = 0
+            copy_us = 0
+            for device_name, end_event in slot.events.items():
+                start_event = slot.start_events.get(device_name)
+                producer_event = slot.producer_events.get(device_name)
+                if start_event is None or producer_event is None:
+                    raise _invariant("completion timing events are incomplete")
+                device_us = max(
+                    device_us,
+                    max(0, round(float(start_event.elapsed_time(producer_event)) * 1000.0)),
+                )
+                copy_us = max(
+                    copy_us,
+                    max(0, round(float(producer_event.elapsed_time(end_event)) * 1000.0)),
+                )
+            if not slot.events and slot.device_started_ns > 0:
+                copy_started_ns = slot.copy_started_ns or slot.sealed_ns
+                device_us = max(0, copy_started_ns - slot.device_started_ns) // 1000
+                copy_us = max(0, slot.sealed_ns - copy_started_ns) // 1000
+            ready_to_observed_us = max(0, observed_ns - slot.ready_ns) // 1000
+            timing = (queued_us, device_us, copy_us, ready_to_observed_us)
         observed.add(index)
         if len(observed) == slot.rows:
             self._release(slot)
-        return copy_us, ready_to_observed_us
+        return timing
 
     def _abandon(self, lease: CompletionLease) -> None:
         try:
@@ -521,8 +632,14 @@ class CompletionArena:
             slot.abandoned = True
 
     def _release(self, slot: _CompletionSlot) -> None:
-        for event in slot.events.values():
+        for event in (
+            *slot.start_events.values(),
+            *slot.producer_events.values(),
+            *slot.events.values(),
+        ):
             self.event_pool.release(event)
+        slot.start_events.clear()
+        slot.producer_events.clear()
         slot.events.clear()
         slot.owner = 0
         slot.rows = 0
@@ -530,6 +647,9 @@ class CompletionArena:
         slot.devices = None
         slot.sealed = False
         slot.abandoned = False
+        slot.reserved_ns = 0
+        slot.device_started_ns = 0
+        slot.copy_started_ns = 0
         slot.sealed_ns = 0
         slot.ready_ns = 0
         self._release_tokens(slot.token_offset, slot.token_capacity)
@@ -1171,11 +1291,11 @@ class _PendingDigest:
         self._lease: CompletionLease | None = lease
         self._row = int(row)
         self._generation = int(record.completion_slot_generation)
-        self._completion_timing: tuple[int, int] | None = None
+        self._completion_timing: tuple[int, int, int, int] | None = None
         self._value: str | None = None
         self._observed = False
         self._invalid_sampling = False
-        self._predicated = False
+        self._predicated = record.status is OpStatus.PREDICATED
         self._predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]] | None = (
             predicated_parent
         )
@@ -1204,59 +1324,69 @@ class _PendingDigest:
             parent = (
                 self._parent.resolve() if isinstance(self._parent, _PendingDigest) else self._parent
             )
-            try:
-                for task in self._completion_tasks:
-                    task.finalize()
-            except Exception:
-                self._completion_error = True
-                self._value = _completion_error_record(self._record).compute_semantic_digest(
-                    parent_semantic=cast(str, parent),
-                    plan_digest=self._plan_digest,
-                )
+            if self._predicated:
+                self._resolve_predicated(cast(str, parent))
             else:
                 try:
-                    # The digest packs each committed token via ``__index__``, which
-                    # finalizes a deferred token exactly as ``int(value)`` would, so
-                    # the record is hashed in place without a concrete-token copy.
-                    value = self._record.compute_semantic_digest(
+                    for task in self._completion_tasks:
+                        task.finalize()
+                except Exception:
+                    self._completion_error = True
+                    self._value = _completion_error_record(self._record).compute_semantic_digest(
                         parent_semantic=cast(str, parent),
                         plan_digest=self._plan_digest,
                     )
-                    if self._resolved_callback is not None:
-                        self._resolved_callback(self._record, value, cast(str, parent))
-                    self._value = value
-                except _PredicatedOperation:
-                    self._predicated = True
-                    self._value = cast(str, parent)
-                    predicated_parent = self._predicated_parent
-                    if predicated_parent is None:
-                        raise RuntimeError("predicated completion lost its parent resolver")
-                    selected, runtime = predicated_parent()
-                    point = selected.point
-                    if not isinstance(point, FixedPoint):
-                        raise RuntimeError("predicated operation selected a non-fixed parent")
-                    self._selected_point = int(point.point_index)
-                    self._selected_runtime = runtime
-                except _InvalidSamplingDistribution:
-                    self._invalid_sampling = True
-                    self._value = _invalid_sampling_record(self._record).compute_semantic_digest(
-                        parent_semantic=cast(str, parent),
-                        plan_digest=self._plan_digest,
-                    )
+                else:
+                    try:
+                        # The digest packs each committed token via ``__index__``, which
+                        # finalizes a deferred token exactly as ``int(value)`` would, so
+                        # the record is hashed in place without a concrete-token copy.
+                        digest = self._record.compute_semantic_digest(
+                            parent_semantic=cast(str, parent),
+                            plan_digest=self._plan_digest,
+                        )
+                        if self._resolved_callback is not None:
+                            self._resolved_callback(self._record, digest, cast(str, parent))
+                        self._value = digest
+                    except _PredicatedOperation:
+                        self._predicated = True
+                        self._resolve_predicated(cast(str, parent))
+                    except _InvalidSamplingDistribution:
+                        self._invalid_sampling = True
+                        self._value = _invalid_sampling_record(self._record).compute_semantic_digest(
+                            parent_semantic=cast(str, parent),
+                            plan_digest=self._plan_digest,
+                        )
             lease = self._lease
             if lease is None:
                 raise RuntimeError("completion digest lost its arena lease")
-            self._completion_timing = lease.observe(self._row, self._generation)
+            lease.observe(self._row, self._generation)
+            self._completion_timing = lease.timing()
             self._observed = True
             self._lease = None
-        return self._value
+        resolved = self._value
+        if resolved is None:
+            raise RuntimeError("completion digest resolved without a value")
+        return resolved
+
+    def _resolve_predicated(self, parent: str) -> None:
+        self._value = parent
+        predicated_parent = self._predicated_parent
+        if predicated_parent is None:
+            raise RuntimeError("predicated completion lost its parent resolver")
+        selected, runtime = predicated_parent()
+        point = selected.point
+        if not isinstance(point, FixedPoint):
+            raise RuntimeError("predicated operation selected a non-fixed parent")
+        self._selected_point = int(point.point_index)
+        self._selected_runtime = runtime
 
     def __str__(self) -> str:
         return self.resolve()
 
-    def completion_timing(self) -> tuple[int, int]:
+    def completion_timing(self) -> tuple[int, int, int, int]:
         self.resolve()
-        return self._completion_timing or (0, 0)
+        return self._completion_timing or (0, 0, 0, 0)
 
     @property
     def invalid_sampling(self) -> bool:
@@ -1374,8 +1504,14 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
         return replace(record, semantic_digest=digest.resolve())
     if isinstance(digest, _PendingDigest):
         resolved = digest.resolve()
-        copy_us, host_us = digest.completion_timing()
-        timing = replace(record.timing_counters, copy_us=copy_us, host_us=host_us)
+        queued_us, device_us, copy_us, host_us = digest.completion_timing()
+        timing = replace(
+            record.timing_counters,
+            queued_us=queued_us,
+            device_us=device_us,
+            copy_us=copy_us,
+            host_us=host_us,
+        )
         if digest.completion_error:
             return replace(
                 _completion_error_record(record),

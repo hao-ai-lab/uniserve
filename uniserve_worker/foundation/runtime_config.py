@@ -224,13 +224,8 @@ class FlashInferTuningConfig:
 @dataclass(frozen=True)
 class ExecutionConfig:
     model_dtype: str = "bfloat16"
-    transformers_trust_remote_code: bool = False
-    transformers_attn_implementation: str = "uniserve"
-    disabled_model_archs: tuple[str, ...] = ()
     kv_cache_dtype: str | None = None
     kv_memory_fraction: float = 0.70
-    tp_backend: str | None = None
-    tp_init_method: str | None = None
     lanes: tuple[LaneConfig, ...] = ()
     cuda_graph: bool = True
     decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
@@ -238,24 +233,17 @@ class ExecutionConfig:
     prefill_graph_token_sizes: tuple[int, ...] = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     flow_graph_batch_sizes: tuple[int, ...] = (1, 2, 3, 4)
     flow_graph_shapes: tuple[tuple[int, int], ...] = ((1152, 2048), (2048, 1152))
-    mixed_text_max_tokens: int = 8192
-    varlen_prefill: bool = True
     flashinfer: FlashInferTuningConfig = FlashInferTuningConfig()
 
 
 def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
     return ExecutionConfig(
         model_dtype=str(namespace.model_dtype),
-        transformers_trust_remote_code=bool(namespace.transformers_trust_remote_code),
-        transformers_attn_implementation=str(namespace.transformers_attn_implementation),
-        disabled_model_archs=tuple(str(value) for value in (namespace.disable_model_arch or ())),
         kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
         kv_memory_fraction=_bounded_fraction(
             float(namespace.kv_memory_fraction),
             "kv-memory-fraction",
         ),
-        tp_backend=_none_if_empty(namespace.tp_backend),
-        tp_init_method=_none_if_empty(namespace.tp_init_method),
         lanes=_parse_lanes(getattr(namespace, "lane", ())),
         cuda_graph=bool(namespace.cuda_graph),
         decode_graph_batch_sizes=_parse_positive_int_csv(
@@ -272,8 +260,6 @@ def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
             default=(1, 2, 3, 4),
         ),
         flow_graph_shapes=_parse_image_shapes(namespace.flow_graph_shapes),
-        mixed_text_max_tokens=max(0, int(namespace.mixed_text_max_tokens)),
-        varlen_prefill=bool(namespace.varlen_prefill),
         flashinfer=FlashInferTuningConfig(
             workspace_size=max(
                 1,

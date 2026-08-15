@@ -155,39 +155,10 @@ def model_arena_capacity(
     )
 
 
-def system_arena_capacity(
-    *,
-    pipeline_depth: int,
-    max_operations: int,
-    completion_payload_bytes: int,
-) -> ArenaCapacity:
-    depth = int(pipeline_depth)
-    operations = int(max_operations)
-    payload_bytes = int(completion_payload_bytes)
-    if depth < 1 or operations < 1 or payload_bytes < 1:
-        raise ValueError("system arena sizing requires positive runtime bounds")
-    slots = depth * operations
-    device_products = _PRODUCTS_PER_OPERATION * slots
-    return ArenaCapacity(
-        latent_pool_bytes=0,
-        device_products=device_products,
-        device_product_bytes=device_product_capacity_bytes(
-            device_products,
-            1,
-            selected_points_per_operation=1,
-            max_value_bytes=1 << 20,
-        ),
-        transfer_bytes=(1 << 20) * slots,
-        transfer_tickets=slots,
-        cpu_tasks=_CPU_TASKS,
-    )
-
-
 __all__ = [
     "ArenaCapacity",
     "latent_pool_capacity_bytes",
     "latent_trajectory_bytes",
     "model_arena_capacity",
     "operation_window",
-    "system_arena_capacity",
 ]

@@ -18,9 +18,15 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import ctypes
+import errno
 import json
+import mmap
+import os
 import pickle
 import queue
+import selectors
+import socket
 import threading
 import uuid
 from abc import ABC, abstractmethod
@@ -255,19 +261,14 @@ class Transport(ABC):
 
         return True
 
-    def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
-        """Write-driven: write ``tensor`` to the remote buffer ``locator`` names.
-
-        Used by the KV edge. Optional; transports that support only the read
-        direction raise ``NotImplementedError``.
-        """
-        raise NotImplementedError(f"{self.name} transport does not support write-driven push")
-
     def release(self, locator: Locator) -> None:
         """Deregister the producer buffer behind ``locator`` (idempotent)."""
 
     def close(self) -> None:
         """Tear down the transport (engine, segments)."""
+
+    def set_completion_wake(self, wake: Any) -> None:
+        """Connect asynchronous ticket completion to the worker controller."""
 
 
 class TransferTicket(ABC):
@@ -334,6 +335,84 @@ class _ByteCapacity:
             self.used -= value
 
 
+class _NamedSemaphore:
+    """Process-shared completion signal for a POSIX shared-memory publication."""
+
+    _libc = ctypes.CDLL(None, use_errno=True)
+    _libc.sem_open.restype = ctypes.c_void_p
+    _failed = ctypes.c_void_p(-1).value
+
+    def __init__(self, name: str, handle: int) -> None:
+        self.name = name
+        self._handle = ctypes.c_void_p(handle)
+        self._closed = False
+
+    @classmethod
+    def create(cls) -> "_NamedSemaphore":
+        name = f"/uniserve-{uuid.uuid4().hex}"
+        handle = cls._libc.sem_open(
+            name.encode(),
+            os.O_CREAT | os.O_EXCL,
+            0o600,
+            0,
+        )
+        if handle == cls._failed:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), name)
+        return cls(name, int(handle))
+
+    @classmethod
+    def open(cls, name: str) -> "_NamedSemaphore":
+        handle = cls._libc.sem_open(name.encode(), 0, 0, 0)
+        if handle == cls._failed:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), name)
+        return cls(name, int(handle))
+
+    def wait(self) -> None:
+        while self._libc.sem_wait(self._handle) != 0:
+            error = ctypes.get_errno()
+            if error != errno.EINTR:
+                raise OSError(error, os.strerror(error), self.name)
+
+    def post(self) -> None:
+        if self._libc.sem_post(self._handle) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), self.name)
+
+    def close(self, *, unlink: bool = False) -> None:
+        if not self._closed:
+            if self._libc.sem_close(self._handle) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), self.name)
+            self._closed = True
+        if unlink and self._libc.sem_unlink(self.name.encode()) != 0:
+            error = ctypes.get_errno()
+            if error != errno.ENOENT:
+                raise OSError(error, os.strerror(error), self.name)
+
+
+_SHM_LIBC = ctypes.CDLL(None, use_errno=True)
+_SHM_LIBC.shm_open.restype = ctypes.c_int
+
+
+def _open_shared_memory(name: str, size: int) -> mmap.mmap:
+    canonical_name = name if name.startswith("/") else f"/{name}"
+    descriptor = _SHM_LIBC.shm_open(canonical_name.encode(), os.O_RDONLY)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), canonical_name)
+    try:
+        return mmap.mmap(
+            descriptor,
+            int(size),
+            flags=mmap.MAP_SHARED,
+            prot=mmap.PROT_READ,
+        )
+    finally:
+        os.close(descriptor)
+
+
 class _BoundedTransferPool:
     def __init__(
         self,
@@ -353,6 +432,10 @@ class _BoundedTransferPool:
             if isinstance(byte_capacity, _ByteCapacity)
             else _ByteCapacity(byte_capacity)
         )
+        self._completion_wake: Any = None
+
+    def set_completion_wake(self, wake: Any) -> None:
+        self._completion_wake = wake
 
     def submit(self, operation: Any, *args: Any, nbytes: int) -> TransferTicket:
         if not self._entries.acquire(blocking=False):
@@ -371,6 +454,9 @@ class _BoundedTransferPool:
         def release(_future: object) -> None:
             self._bytes.release(nbytes)
             self._entries.release()
+            wake = self._completion_wake
+            if wake is not None:
+                wake()
 
         future.add_done_callback(release)
         return _FutureTransferTicket(future)
@@ -426,16 +512,6 @@ class LocalTransport(Transport):
     def fetch_async(self, locator: Locator) -> TransferTicket:
         return _ImmediateTransferTicket(self.fetch(locator))
 
-    def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
-        if locator.session != self._session:
-            raise invalid_descriptor("local locator belongs to another transport session")
-        key = int(locator.handle.decode())
-        with self._lock:
-            dst = self._table.get(key)
-        if dst is None:
-            raise invalid_descriptor(f"local locator {key} not registered")
-        dst.copy_(tensor)
-
     def release(self, locator: Locator) -> None:
         if locator.session != self._session:
             return
@@ -453,47 +529,31 @@ class LocalTransport(Transport):
 
 
 class _ShmReadTicket(TransferTicket):
-    """A shared-memory read whose readiness is query-only until the copy runs.
-
-    The consumer polls :meth:`ready`, which observes the producer's completion
-    header without waiting. Only once the region is readable — or terminally
-    unavailable — is the bounded byte copy submitted, so neither a request thread
-    nor a pool thread ever spins on a producer that has not yet completed.
-    """
+    """A shared-memory read owned by the bounded transfer executor."""
 
     def __init__(self, transport: "ShmTransport", locator: Locator) -> None:
-        self._transport = transport
-        self._locator = locator
-        self._inner: TransferTicket | None = None
+        self._inner = transport._reads.submit(
+            transport.fetch,
+            locator,
+            nbytes=locator.nbytes,
+        )
 
     def ready(self) -> bool:
-        if self._inner is None:
-            if not self._transport._read_gate(self._locator):
-                return False
-            self._inner = self._transport._reads.submit(
-                self._transport.fetch,
-                self._locator,
-                nbytes=self._locator.nbytes,
-            )
         return self._inner.ready()
 
     def result(self) -> "torch.Tensor":
-        if self._inner is None or not self._inner.ready():
+        if not self._inner.ready():
             raise RuntimeError("transfer ticket was observed before readiness")
         return self._inner.result()
 
 
 class ShmTransport(Transport):
-    """Same-node host transport over POSIX shared memory.
+    """Same-node snapshot transport over producer-owned POSIX shared memory.
 
-    This is a *snapshot* transport: each ``publish`` copies the tensor's current
-    bytes into a FRESH named segment. (register-once-by-pointer would be wrong
-    here — a producer reuses a logits/scratch buffer across steps with new data
-    each time, so a pointer-keyed cache returns stale bytes; the register-once
-    optimization is for the live-buffer CUDA IPC transport.) A bounded LRU
-    of recent segments is kept alive so a consumer can still map them; older
-    segments are unlinked once the producer is well past them, and ``release``
-    reclaims promptly."""
+    Every publication copies the tensor value into a distinct bounded segment.
+    Asynchronous CUDA publication exposes a readiness byte and named semaphore;
+    consumers use read-only mappings, while the producer owns unlink lifetime.
+    """
 
     name = "shm"
     supports_async_publication = True
@@ -505,6 +565,7 @@ class ShmTransport(Transport):
 
         self._segments: "OrderedDict[str, Any]" = OrderedDict()  # name -> SharedMemory (LRU)
         self._pending: dict[str, tuple[Any, Any, threading.Event]] = {}
+        self._semaphores: dict[str, _NamedSemaphore] = {}
         self._release_pending: set[str] = set()
         self._publication_bytes: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -515,6 +576,10 @@ class ShmTransport(Transport):
         self._publication_queue: queue.Queue[
             tuple[str, Any, int, Any, Any, threading.Event] | None
         ] = queue.Queue()
+        self._publication_control_rx, self._publication_control_tx = socket.socketpair()
+        self._publication_control_rx.setblocking(False)
+        self._publication_control_tx.setblocking(False)
+        self._completion_wake: Any = None
         self._publication_worker = threading.Thread(
             target=self._complete_publications,
             name="uniserve-shm-publication",
@@ -528,32 +593,48 @@ class ShmTransport(Transport):
             name="uniserve-shm-read",
         )
 
+    def set_completion_wake(self, wake: Any) -> None:
+        self._completion_wake = wake
+        self._reads.set_completion_wake(wake)
+
     def _complete_publications(self) -> None:
         import torch
 
-        pending: list[tuple[str, Any, int, Any, Any, threading.Event]] = []
+        selector = selectors.DefaultSelector()
+        selector.register(self._publication_control_rx, selectors.EVENT_READ)
         closing = False
-        while pending or not closing:
-            try:
-                item = self._publication_queue.get(timeout=0.001)
+        while not closing or len(selector.get_map()) > 1:
+            for key, _events in selector.select():
+                if key.fileobj is self._publication_control_rx:
+                    while True:
+                        try:
+                            if not self._publication_control_rx.recv(4096):
+                                closing = True
+                                break
+                        except BlockingIOError:
+                            break
+                    while True:
+                        try:
+                            item = self._publication_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is None:
+                            closing = True
+                            continue
+                        signal = item[4]
+                        selector.register(signal, selectors.EVENT_READ, item)
+                    continue
+                item = key.data
                 if item is None:
-                    closing = True
-                else:
-                    pending.append(item)
-            except queue.Empty:
-                pass
-            deferred: list[tuple[str, Any, int, Any, Any, threading.Event]] = []
-            for name, shm, nbytes, host, event, completed in pending:
+                    raise RuntimeError("shared-memory publication selector lost its entry")
+                name, shm, nbytes, host, signal, completed = item
+                selector.unregister(signal)
                 try:
-                    ready = bool(event.query())
+                    signal.consume()
                 except BaseException:
-                    ready = True
                     succeeded = False
                 else:
                     succeeded = True
-                if not ready:
-                    deferred.append((name, shm, nbytes, host, event, completed))
-                    continue
                 try:
                     if succeeded:
                         raw = host.view(torch.uint8).reshape(-1)
@@ -561,6 +642,9 @@ class ShmTransport(Transport):
                 except BaseException:
                     succeeded = False
                 shm.buf[0] = 1 if succeeded else 2
+                semaphore = self._semaphores.get(name)
+                if semaphore is not None:
+                    semaphore.post()
                 completed.set()
                 with self._lock:
                     self._pending.pop(name, None)
@@ -571,12 +655,28 @@ class ShmTransport(Transport):
                         released_bytes = self._publication_bytes.pop(name, 0)
                 if release:
                     self._bytes.release(released_bytes)
+                    semaphore = self._semaphores.pop(name, None)
+                    if semaphore is not None:
+                        semaphore.close(unlink=True)
                     shm.close()
                     try:
                         shm.unlink()
                     except FileNotFoundError:
                         pass
-            pending = deferred
+                wake = self._completion_wake
+                if wake is not None:
+                    wake()
+        selector.close()
+
+    def _queue_publication(
+        self,
+        item: tuple[str, Any, int, Any, Any, threading.Event] | None,
+    ) -> None:
+        self._publication_queue.put(item)
+        try:
+            self._publication_control_tx.send(b"\x01")
+        except BlockingIOError:
+            pass
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
         from multiprocessing import shared_memory
@@ -628,11 +728,19 @@ class ShmTransport(Transport):
         nbytes = _nbytes(source)
         host = torch.empty(tuple(source.shape), dtype=source.dtype, device="cpu", pin_memory=True)
         host.copy_(source, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(source.device))
+        from .._uniserve_ipc import StreamSignal
+
+        signal = StreamSignal()
         shm = shared_memory.SharedMemory(create=True, size=max(1, nbytes + 1))
+        try:
+            semaphore = _NamedSemaphore.create()
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
         shm_buffer = shm.buf
         if shm_buffer is None:
+            semaphore.close(unlink=True)
             shm.close()
             shm.unlink()
             raise RuntimeError("shared-memory segment has no writable buffer")
@@ -640,6 +748,7 @@ class ShmTransport(Transport):
         try:
             self._bytes.acquire(nbytes)
         except BaseException:
+            semaphore.close(unlink=True)
             shm.close()
             shm.unlink()
             raise
@@ -647,14 +756,29 @@ class ShmTransport(Transport):
         completed = threading.Event()
         with self._lock:
             if len(self._segments) >= self._MAX_LIVE_SEGMENTS:
+                semaphore.close(unlink=True)
                 shm.close()
                 shm.unlink()
                 self._bytes.release(nbytes)
                 raise resource_error("shared-memory transport publication capacity is exhausted")
             self._segments[shm.name] = shm
             self._publication_bytes[shm.name] = nbytes
-            self._pending[shm.name] = (host, event, completed)
-        self._publication_queue.put((shm.name, shm, nbytes, host, event, completed))
+            self._pending[shm.name] = (host, signal, completed)
+            self._semaphores[shm.name] = semaphore
+        try:
+            signal.schedule(int(torch.cuda.current_stream(source.device).cuda_stream))
+        except BaseException:
+            with self._lock:
+                self._pending.pop(shm.name, None)
+                self._segments.pop(shm.name, None)
+                self._publication_bytes.pop(shm.name, None)
+                self._semaphores.pop(shm.name, None)
+            self._bytes.release(nbytes)
+            semaphore.close(unlink=True)
+            shm.close()
+            shm.unlink()
+            raise
+        self._queue_publication((shm.name, shm, nbytes, host, signal, completed))
         return Locator(
             transport="shm",
             session=self.name,
@@ -663,29 +787,21 @@ class ShmTransport(Transport):
             shape=tuple(source.shape),
             device=str(source.device),
             handle=shm.name.encode(),
-            meta={"ready_header_bytes": 1},
+            meta={"ready_header_bytes": 1, "ready_semaphore": semaphore.name},
         )
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
-        from multiprocessing import shared_memory
-
         import torch
 
         name = locator.handle.decode()
-        shm = shared_memory.SharedMemory(name=name)
+        header = int(locator.meta.get("ready_header_bytes", 0))
+        shm = _open_shared_memory(name, header + int(locator.nbytes))
         try:
-            shm_buffer = shm.buf
-            if shm_buffer is None:
-                raise RuntimeError("shared-memory segment has no readable buffer")
-            header = int(locator.meta.get("ready_header_bytes", 0))
-            if header and shm_buffer[0] == 0:
-                self._await_publication(name)
-            if header and shm_buffer[0] != 1:
+            if header and shm[0] == 0:
+                self._await_publication(locator)
+            if header and shm[0] != 1:
                 raise capability_mismatch("shared-memory publication did not complete")
-            try:
-                buf = bytearray(memoryview(shm_buffer)[header : header + locator.nbytes])
-            finally:
-                shm_buffer.release()
+            buf = bytearray(shm[header : header + locator.nbytes])
         finally:
             shm.close()
         out = (
@@ -702,52 +818,31 @@ class ShmTransport(Transport):
         header = int(locator.meta.get("ready_header_bytes", 0))
         if header == 0:
             return True
-        from multiprocessing import shared_memory
-
         try:
-            shm = shared_memory.SharedMemory(name=locator.handle.decode())
+            shm = _open_shared_memory(locator.handle.decode(), header)
         except FileNotFoundError:
             return False
         try:
-            return bool(shm.buf is not None and int(shm.buf[0]) != 0)
+            return bool(shm[0] != 0)
         finally:
             shm.close()
 
-    def _await_publication(self, name: str) -> None:
-        """Wait on the producer's completion event instead of a Python sleep loop.
-
-        A same-process consumer holds the publication's completion event and
-        blocks on it directly. A foreign-process consumer never arrives here: its
-        reads are gated by the query-only :meth:`_read_gate` before any byte copy,
-        so the header is already set by the time the copy runs.
-        """
-
+    def _await_publication(self, locator: Locator) -> None:
+        name = locator.handle.decode()
         with self._lock:
             pending = self._pending.get(name)
         if pending is not None:
             pending[2].wait()
-
-    def _read_gate(self, locator: Locator) -> bool:
-        """Whether a consumer read may run now: producer complete or terminally gone.
-
-        This is the query-only readiness a consumer polls before submitting the
-        bounded byte copy. A missing segment is terminal (the copy will fail
-        deterministically), so it reports ready rather than stalling forever.
-        """
-
-        header = int(locator.meta.get("ready_header_bytes", 0))
-        if header == 0:
-            return True
-        from multiprocessing import shared_memory
-
+            return
+        semaphore_name = locator.meta.get("ready_semaphore")
+        if not isinstance(semaphore_name, str) or not semaphore_name:
+            raise invalid_descriptor("shared-memory publication has no completion signal")
+        semaphore = _NamedSemaphore.open(semaphore_name)
         try:
-            shm = shared_memory.SharedMemory(name=locator.handle.decode())
-        except FileNotFoundError:
-            return True
-        try:
-            return bool(shm.buf is not None and int(shm.buf[0]) != 0)
+            semaphore.wait()
+            semaphore.post()
         finally:
-            shm.close()
+            semaphore.close()
 
     def fetch_async(self, locator: Locator) -> TransferTicket:
         return _ShmReadTicket(self, locator)
@@ -764,6 +859,9 @@ class ShmTransport(Transport):
             return
         if shm is not None:
             self._bytes.release(released_bytes)
+            semaphore = self._semaphores.pop(name, None)
+            if semaphore is not None:
+                semaphore.close(unlink=True)
             shm.close()
             try:
                 shm.unlink()
@@ -771,16 +869,23 @@ class ShmTransport(Transport):
                 pass
 
     def close(self) -> None:
-        self._publication_queue.put(None)
+        self._queue_publication(None)
         self._publication_worker.join()
+        self._publication_control_rx.close()
+        self._publication_control_tx.close()
         self._reads.close()
         with self._lock:
             segs = list(self._segments.items())
             self._segments.clear()
             publication_bytes = self._publication_bytes
             self._publication_bytes = {}
+            semaphores = self._semaphores
+            self._semaphores = {}
         for name, shm in segs:
             self._bytes.release(publication_bytes.get(name, 0))
+            semaphore = semaphores.get(name)
+            if semaphore is not None:
+                semaphore.close(unlink=True)
             shm.close()
             try:
                 shm.unlink()
@@ -867,9 +972,6 @@ class CudaIpcTransport(Transport):
     def fetch_async(self, locator: Locator) -> TransferTicket:
         return _ImmediateTransferTicket(self.fetch(locator))
 
-    def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
-        self._open(locator).copy_(tensor.detach())
-
     def release(self, locator: Locator) -> None:
         publication_id = locator.meta.get("publication_id")
         if not isinstance(publication_id, str):
@@ -888,8 +990,7 @@ class CudaIpcTransport(Transport):
 
 
 def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
-    """Select the worker's single Tier-2 transport (mirrors Rust
-    ``make_transfer_agent``)."""
+    """Construct the worker's configured bounded product transport."""
     raw_name = (str(name or TransportKind.LOCAL)).strip()
     try:
         kind = TransportKind(raw_name)

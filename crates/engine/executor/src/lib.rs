@@ -22,9 +22,8 @@ pub trait ModelEngine: Send {
 /// implementation that executes those operations, and its device profile. The
 /// control plane routes on the closed operation union and its nested mode.
 ///
-/// `Full` holds the whole model and runs
-/// every model op in one mixed-batch forward. The other kinds are stages peeled
-/// off `Full` (encoder / prefill / decode / sampler / post-process).
+/// `Full` holds the whole model and runs every model op. The other kinds are
+/// model-backed stages with explicit weight-materialization scopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WorkerKind {
     /// Whole model; runs ALL model ops in one mixed-batch forward.
@@ -33,13 +32,8 @@ pub enum WorkerKind {
     Encoder,
     /// Prefill phase only — `prefill_und`; KV handoff to a Decode pool.
     Prefill,
-    /// Decode/generation phase — `decode_und`/`target_verify_und`/`denoise_gen`/
-    /// `commit_gen`.
+    /// Decode/generation phase.
     Decode,
-    /// Sampler only — `sample`; logits→token, CPU data-parallel.
-    Sampler,
-    /// Post-process only — `encode_frame`; FFmpeg, CPU.
-    PostProcess,
     /// Understanding tower — text + vision-encode + sampling. The und half of
     /// the local MoT understanding/generation stage split; routes
     /// every non-generation model op so a `--workers und:1,gen:1` topology
@@ -56,19 +50,16 @@ const PREFILL_WORK: &[WorkVariant] = &[WorkVariant::TokenExtend];
 const DECODE_WORK: &[WorkVariant] = &[
     WorkVariant::TokenDecode,
     WorkVariant::TokenVerify,
-    WorkVariant::Draft,
+    WorkVariant::GenTransition,
     WorkVariant::GenFlow,
     WorkVariant::Materialize,
     WorkVariant::TransferKvPublish,
     WorkVariant::TransferKvInstall,
 ];
-const SAMPLER_WORK: &[WorkVariant] = &[WorkVariant::Draft];
-const POSTPROCESS_WORK: &[WorkVariant] = &[WorkVariant::Materialize];
 const UND_WORK: &[WorkVariant] = &[
     WorkVariant::TokenExtend,
     WorkVariant::TokenDecode,
     WorkVariant::TokenVerify,
-    WorkVariant::Draft,
     WorkVariant::EncodeVision,
     WorkVariant::EncodeLatent,
     WorkVariant::TransferKvPublish,
@@ -88,8 +79,6 @@ impl WorkerKind {
             Self::Encoder => "encoder",
             Self::Prefill => "prefill",
             Self::Decode => "decode",
-            Self::Sampler => "sampler",
-            Self::PostProcess => "postprocess",
             Self::Und => "und",
             Self::Gen => "gen",
         }
@@ -102,8 +91,6 @@ impl WorkerKind {
             "encoder" => Self::Encoder,
             "prefill" => Self::Prefill,
             "decode" => Self::Decode,
-            "sampler" => Self::Sampler,
-            "postprocess" => Self::PostProcess,
             "und" => Self::Und,
             "gen" => Self::Gen,
             _ => return None,
@@ -117,8 +104,6 @@ impl WorkerKind {
             Self::Encoder => ENCODER_WORK,
             Self::Prefill => PREFILL_WORK,
             Self::Decode => DECODE_WORK,
-            Self::Sampler => SAMPLER_WORK,
-            Self::PostProcess => POSTPROCESS_WORK,
             Self::Und => UND_WORK,
             Self::Gen => GEN_WORK,
         }
@@ -160,7 +145,7 @@ impl WorkersSpec {
         }
     }
 
-    /// Parse `--workers`, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4,sampler:4`.
+    /// Parse `--workers`, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// Each entry is `kind[:count[:tp=N]]`; `count` and `tp` default to 1.
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         let mut pools = Vec::new();
@@ -247,48 +232,6 @@ impl TransferSpec {
     }
 }
 
-/// Semantic class of a data-plane tensor. The Host routes on it (e.g.
-/// `Embedding`→Prefill, `Logits`→Sampler).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TensorKind {
-    Embedding,
-    KvPages,
-    Logits,
-    Image,
-    VideoFrame,
-}
-
-/// A control-plane reference to a data-plane tensor. The Host routes by
-/// `id`+`kind` and forwards `locator` verbatim, never parsing it — only the
-/// consumer worker's `TransferAgent` interprets the locator. The locator is a
-/// small (tens of bytes) opaque descriptor encoding `(segment, offset, length,
-/// device, dtype, shape, rkey, …)`, so carrying it on the control plane stays
-/// descriptor-only (not a tensor payload). With the in-process direct-reference
-/// in-process direct-reference data plane the locator is empty and `id` is the
-/// existing worker-local handle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorHandle {
-    /// Globally unique id; the control plane routes / dedups / lifetimes by it.
-    pub id: u64,
-    /// Tensor semantic class; the control plane routes by it.
-    pub kind: TensorKind,
-    /// Opaque locator produced by the producer worker's `TransferAgent`. The
-    /// Host passes it through unparsed; empty in the in-process backend.
-    pub locator: Vec<u8>,
-}
-
-impl TensorHandle {
-    /// A locator-less handle (in-process data plane / degenerate worker-local
-    /// reference such as today's `encoder_handle`).
-    pub fn local(id: u64, kind: TensorKind) -> Self {
-        Self {
-            id,
-            kind,
-            locator: Vec::new(),
-        }
-    }
-}
-
 /// One typed control operation carried over the executor control plane.
 #[derive(Debug, Clone)]
 pub enum ControlOp {
@@ -352,8 +295,12 @@ pub struct ControlAck {
 ///
 /// The typed taxonomy and execution context cross the wire together so failure
 /// policy and diagnostics use the same operation identity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerExecError {
+    /// Physical submission whose response carried this error. Composite
+    /// executors use it to join the same terminal outcome across ranks before
+    /// returning the failure to the scheduler.
+    pub step_id: Option<u64>,
     pub fatal: bool,
     /// Whether retrying the same op could succeed (e.g. transient OOM).
     /// Defaults to `false` when the worker did not classify the error.
@@ -369,10 +316,12 @@ impl std::fmt::Display for WorkerExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "worker execute error [{}{}{}; phase={}; route={}; operations={}]: {}",
+            "worker execute error [{}{}{}; step={}; phase={}; route={}; operations={}]: {}",
             self.code.as_deref().unwrap_or("unclassified"),
             if self.fatal { ", fatal" } else { ", non-fatal" },
             if self.retryable { ", retryable" } else { "" },
+            self.step_id
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
             self.phase.as_deref().unwrap_or("unknown"),
             self.route.as_deref().unwrap_or("unknown"),
             self.operations.len(),
@@ -411,10 +360,10 @@ pub trait Executor: Send {
     fn submit(&mut self, batch: Batch) -> anyhow::Result<()>;
     fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>>;
 
-    /// Whether a producer's resident device products are directly addressable
-    /// by the worker that executes the consumer. A staged executor returns
-    /// `false` across pool boundaries until an explicit `Transfer(Product)`
-    /// produces a destination-owned reference.
+    /// Whether the executor can preserve an exact device product from the
+    /// producer through registration of the consumer. A local staged executor
+    /// may satisfy this contract by retaining the consumer until the producing
+    /// pool publishes its bounded transfer descriptor.
     fn device_products_reachable(&self, _producer: WorkVariant, _consumer: WorkVariant) -> bool {
         true
     }
@@ -433,25 +382,23 @@ pub trait Executor: Send {
         Ok(())
     }
 
-    /// Whether this executor drives an event-driven boundary: a single park
-    /// over {result-ready, command, worker-death} instead of fixed-interval poll.
-    /// When `true`, the scheduler parks via [`Executor::park_for_event`] and
-    /// uses [`Executor::command_waker`] to wake on new commands.
-    fn event_driven(&self) -> bool {
-        false
-    }
-
     /// Cloneable waker the command ingress fires after enqueuing a command.
-    /// Default is a no-op for polling executors.
+    /// In-process test executors may retain the default when they never drive
+    /// the threaded scheduler loop.
     fn command_waker(&self) -> CommandWaker {
         CommandWaker::noop()
     }
 
+    /// Native progress descriptors included in a composite executor's single
+    /// park. Production process executors return one descriptor per worker.
+    fn wake_file_descriptors(&self) -> Vec<i32> {
+        Vec::new()
+    }
+
     /// Block until a result may be ready, a command may have arrived, the worker
-    /// died, or `timeout` elapses — without consuming any result. Only called
-    /// when [`Executor::event_driven`] is `true`.
+    /// died, or `timeout` elapses, without consuming a result.
     fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
-        std::thread::sleep(timeout.min(Duration::from_millis(1)));
+        std::thread::park_timeout(timeout);
         Ok(())
     }
 
@@ -470,7 +417,7 @@ pub trait Executor: Send {
             if now >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+            self.park_for_event(deadline.saturating_duration_since(now))?;
         }
     }
     fn next_result(&mut self) -> anyhow::Result<CompletionReport>;
@@ -487,7 +434,9 @@ pub trait Executor: Send {
 mod tests {
     use super::*;
     use uniserve_core::RequestId;
-    use uniserve_worker_wire::{Bounds, OpId, RequestKey, RouteId, TokenMode, VersionRef, Work};
+    use uniserve_worker_wire::{
+        Bounds, GenMode, OpId, RequestKey, RouteId, TokenMode, VersionRef, Work,
+    };
 
     #[test]
     fn worker_kind_round_trips_and_maps_work() {
@@ -496,8 +445,6 @@ mod tests {
             WorkerKind::Encoder,
             WorkerKind::Prefill,
             WorkerKind::Decode,
-            WorkerKind::Sampler,
-            WorkerKind::PostProcess,
             WorkerKind::Und,
             WorkerKind::Gen,
         ] {
@@ -506,16 +453,15 @@ mod tests {
         }
         let extend = op(Work::Token(TokenMode::Extend));
         let decode = op(Work::Token(TokenMode::Decode));
-        let draft = op(Work::Draft);
+        let transition = op(Work::Gen(GenMode::Transition));
         let materialize = op(Work::Materialize);
 
         assert!(WorkerKind::Full.handles(&extend));
         assert!(WorkerKind::Prefill.handles(&extend));
         assert!(!WorkerKind::Prefill.handles(&decode));
         assert!(WorkerKind::Decode.handles(&decode));
-        assert!(WorkerKind::Sampler.handles(&draft));
+        assert!(WorkerKind::Decode.handles(&transition));
         assert!(WorkerKind::Decode.handles(&materialize));
-        assert!(WorkerKind::PostProcess.handles(&materialize));
         assert!(WorkerKind::Und.handles(&decode));
         assert!(!WorkerKind::Und.handles(&materialize));
         assert!(WorkerKind::Gen.handles(&materialize));
@@ -545,8 +491,8 @@ mod tests {
     #[test]
     fn workers_spec_parses_topologies() {
         assert!(WorkersSpec::single_full(4).is_single_full());
-        let epd = WorkersSpec::parse("encoder:2,prefill:1:tp=4,decode:1:tp=4,sampler:4").unwrap();
-        assert_eq!(epd.pools.len(), 4);
+        let epd = WorkersSpec::parse("encoder:2,prefill:1:tp=4,decode:1:tp=4").unwrap();
+        assert_eq!(epd.pools.len(), 3);
         assert_eq!(
             epd.pools[0],
             PoolSpec {
@@ -564,14 +510,14 @@ mod tests {
             }
         );
         assert_eq!(
-            epd.pools[3],
+            epd.pools[2],
             PoolSpec {
-                kind: WorkerKind::Sampler,
-                count: 4,
-                tp: 1
+                kind: WorkerKind::Decode,
+                count: 1,
+                tp: 4
             }
         );
-        assert_eq!(epd.total_pools(), 8);
+        assert_eq!(epd.total_pools(), 4);
         assert!(!epd.is_single_full());
         assert!(WorkersSpec::parse("full:1").unwrap().is_single_full());
         assert!(WorkersSpec::parse("bogus:1").is_err());
@@ -597,7 +543,7 @@ mod tests {
         );
         // Unconfigured edge falls back to the in-process backend.
         assert_eq!(
-            t.backend_for(WorkerKind::Sampler, WorkerKind::Full),
+            t.backend_for(WorkerKind::Decode, WorkerKind::Full),
             "inproc"
         );
         assert!(TransferSpec::parse("bad-entry").is_err());

@@ -118,7 +118,6 @@ def resolve_capabilities(
         RequestKind.RELEASE_PRODUCTS,
     ]
     supported_work = configured_work_variants(model.supported_work)
-    tensorized_mixed = bool(model.tensorized_mixed)
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
     return WorkerCapabilities(
         block_size=int(deployment.block_size),
@@ -140,7 +139,7 @@ def resolve_capabilities(
         max_request_pool_size=int(deployment.max_request_pool_size),
         max_unresolved_window=unresolved_window,
         incremental_kv_publication=True,
-        tensorized_mixed=tensorized_mixed,
+        mixed_buckets=(),
         sampling_ownership=sampling_ownership,
         resource_classes=tuple(ResourceClass(value) for value in resources.classes()),
         attention_backend=deployment.attention_backend or "auto",
@@ -157,7 +156,6 @@ def resolve_capabilities(
         rank=RankInfo(tp_rank=int(deployment.tp_rank), tp_size=int(deployment.tp_size)),
         pipeline_depth=int(pipeline_depth),
         groups=(),
-        quantization=None,
         model_identity=architecture_digest or "",
         weight_digest=weight_digest or "",
     )

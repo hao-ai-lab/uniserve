@@ -59,7 +59,6 @@ class RunObservation:
     row_count: int
     row_kind_counts: tuple[tuple[str, int], ...]
     path: RunPath
-    model_forward_calls: int
     duration_us: int
     graph_unpadded_tokens: int
     graph_padded_tokens: int
@@ -522,7 +521,6 @@ class _ModelInvocation:
             row_count=len(tasks),
             row_kind_counts=tuple(sorted(counts.items())),
             path=path,
-            model_forward_calls=calls,
             duration_us=duration_us,
             graph_unpadded_tokens=graph_run.row_count if path is not RunPath.EAGER else 0,
             graph_padded_tokens=(

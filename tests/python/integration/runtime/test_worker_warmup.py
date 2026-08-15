@@ -18,7 +18,7 @@ def test_warmup_is_a_safe_noop_off_cuda() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_prefill_graph_startup_reuses_released_request_slots() -> None:
+def test_graph_startup_qualifies_prefill_and_flow_catalogs() -> None:
     worker = execution_worker(
         device="cuda:0",
         max_batch_tokens=2048,
@@ -26,8 +26,10 @@ def test_prefill_graph_startup_reuses_released_request_slots() -> None:
         execution=ExecutionConfig(
             cuda_graph=True,
             prefill_cuda_graph=True,
-            decode_graph_batch_sizes=(),
+            decode_graph_batch_sizes=(1,),
             prefill_graph_token_sizes=(1, 2, 3, 4),
+            flow_graph_batch_sizes=(1,),
+            flow_graph_shapes=((16, 16),),
         ),
     )
 

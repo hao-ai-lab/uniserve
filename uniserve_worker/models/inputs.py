@@ -30,7 +30,6 @@ class PatchTransform:
     downsample_ratio: float
     min_pixels: int
     max_pixels: int
-    multi_image_pixel_budget: int
     normalization: str = "imagenet"
 
 

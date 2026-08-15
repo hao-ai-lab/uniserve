@@ -30,6 +30,7 @@ def _invariant(message: str) -> WorkerError:
 class _EventState:
     event: torch.cuda.Event
     device_name: str
+    timing: bool
     references: int = 0
     stream: torch.cuda.Stream | None = None
     stream_id: int | None = None
@@ -40,21 +41,35 @@ class DeviceEventPool:
     """Own CUDA events until every store reference is query-ready and released."""
 
     def __init__(self) -> None:
-        self._available: dict[str, deque[torch.cuda.Event]] = {}
+        self._available: dict[tuple[str, bool], deque[torch.cuda.Event]] = {}
         self._active: dict[int, _EventState] = {}
         self._lock = RLock()
 
-    def acquire(self, device: torch.device | str) -> torch.cuda.Event:
+    def acquire(
+        self,
+        device: torch.device | str,
+        *,
+        timing: bool = False,
+    ) -> torch.cuda.Event:
         target = _resolved_device(device)
         if target.type != "cuda":
             raise _invariant("device event requires a CUDA device")
         device_name = str(target)
+        key = (device_name, bool(timing))
         with self._lock:
-            available = self._available.get(device_name)
-            event = available.pop() if available else torch.cuda.Event(blocking=False)
+            available = self._available.get(key)
+            event = (
+                available.pop()
+                if available
+                else torch.cuda.Event(blocking=False, enable_timing=bool(timing))
+            )
             if id(event) in self._active:
                 raise _invariant("device event was reused while still referenced")
-            self._active[id(event)] = _EventState(event=event, device_name=device_name)
+            self._active[id(event)] = _EventState(
+                event=event,
+                device_name=device_name,
+                timing=bool(timing),
+            )
             return event
 
     def declare_stream(
@@ -125,12 +140,7 @@ class DeviceEventPool:
             if not state.recorded or not bool(event.query()):
                 raise _invariant("device event was released before it became query-ready")
             self._active.pop(id(event))
-            self._available.setdefault(state.device_name, deque()).append(event)
-
-    def is_recorded(self, event: torch.cuda.Event) -> bool:
-        with self._lock:
-            state = self._active.get(id(event))
-            return state is not None and state.event is event and state.recorded
+            self._available.setdefault((state.device_name, state.timing), deque()).append(event)
 
     def close(self) -> None:
         with self._lock:

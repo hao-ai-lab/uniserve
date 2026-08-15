@@ -46,7 +46,7 @@ def test_capabilities_project_model_behavior_and_resource_geometry():
 
     assert WorkVariant.TOKEN_EXTEND in capabilities.supported_work
     assert WorkVariant.GEN_FLOW in capabilities.supported_work
-    assert capabilities.tensorized_mixed
+    assert capabilities.mixed_buckets == ()
     assert capabilities.num_layers == TEST_MODEL.cache_geometry.num_layers
     assert capabilities.resource_classes == (
         "kv_block",

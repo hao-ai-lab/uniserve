@@ -15,7 +15,7 @@ from ..batch import (
     SnapshotRef,
 )
 from ..capabilities import RequestKind, ResponseKind
-from ..foundation.env import env_int
+from ..foundation.env import env_int, env_optional_int
 from ..foundation.errors import (
     WorkerError,
     classify,
@@ -25,7 +25,6 @@ from ..foundation.errors import (
 )
 from ..foundation.profiling import profile_range
 from ..worker import Worker
-from .metrics import MetricsService
 from .process import WorkerIpcTransport
 from .profiler import WorkerProfiler
 from .replay import CompletionDelivery, ReplayCoordinator
@@ -40,15 +39,9 @@ class _PendingExecution:
         self,
         worker: Worker,
         prepared: object,
-        variant_labels: list[str],
-        metrics: MetricsService,
-        started: int,
     ) -> None:
         self.worker = worker
         self.prepared = prepared
-        self.variant_labels = variant_labels
-        self.metrics = metrics
-        self.started = started
 
     def ready(self) -> bool:
         query = getattr(self.prepared, "ready", None)
@@ -65,15 +58,10 @@ class _PendingExecution:
         result = execute(self.prepared)
         if not isinstance(result, CompletionReport):
             raise RuntimeError("prepared worker execution returned an invalid report")
-        self.metrics.record_execute(
-            self.metrics.now_ns() - self.started,
-            self.variant_labels,
-        )
         return result
 
     def record_failure(self, error: BaseException) -> WorkerError:
         classified = classify(error, context="execute")
-        self.metrics.record_error(str(classified.code))
         include_trace = should_capture_trace(str(classified.code))
         log = logger.exception if include_trace else logger.warning
         log(
@@ -93,7 +81,6 @@ def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
         "call_id": None,
         "capabilities": None,
         "completion_report": None,
-        "metrics": None,
         "pressure": None,
         "message": None,
         "code": None,
@@ -131,16 +118,6 @@ def _integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
     return value
 
 
-def _string(request: Mapping[str, Any], field: str, kind: RequestKind) -> str:
-    value = _required(request, field, kind)
-    if not isinstance(value, str) or not value:
-        raise invalid_descriptor(
-            f"request {kind.value!r} field {field!r} must be a non-empty string",
-            op_kind=kind.value,
-        )
-    return value
-
-
 def _integers(request: Mapping[str, Any], field: str, kind: RequestKind) -> tuple[int, ...]:
     value = _required(request, field, kind)
     if not isinstance(value, (list, tuple)) or any(
@@ -166,7 +143,6 @@ def _request_kind(request: Mapping[str, Any]) -> RequestKind:
 def _execute(
     worker: Worker,
     request: Mapping[str, Any],
-    metrics: MetricsService,
     replay: ReplayCoordinator,
 ) -> dict[str, Any]:
     raw_batch = _required(request, "batch", RequestKind.EXECUTE)
@@ -183,19 +159,14 @@ def _execute(
             f"execution batch contains work variants outside worker capabilities: {names!r}"
         )
     if not batch.operations:
-        started = metrics.now_ns()
         result = worker.execute(batch)
-        metrics.record_execute(metrics.now_ns() - started, ())
         return _response(ResponseKind.RESULT, completion_report=result)
     registration = replay.register(batch)
-    metrics.record_replay(registration.outcome)
     if not registration.execute:
         return _response(
             ResponseKind.RESULT,
             completion_report=registration.delivery,
         )
-    started = metrics.now_ns()
-    variant_labels = [operation.work.variant.value for operation in batch.operations]
     try:
         prepare = getattr(worker, "prepare_execute", None)
         prepared = prepare(batch) if callable(prepare) else None
@@ -203,13 +174,9 @@ def _execute(
             source: object = _PendingExecution(
                 worker,
                 prepared,
-                variant_labels,
-                metrics,
-                started,
             )
         else:
             source = worker.execute(batch)
-            metrics.record_execute(metrics.now_ns() - started, variant_labels)
         replay.attach(registration, source)
     except BaseException as error:
         replay.abort(registration, error)
@@ -233,22 +200,45 @@ def _response_ready(response: dict[str, Any]) -> bool:
         try:
             return result.ready()
         except BaseException as error:
-            source = result.source
-            classified = (
-                source.record_failure(error)
-                if isinstance(source, _PendingExecution)
-                else classify(error, context="completion materialization")
-            )
-            fields = classified.to_wire()
-            fields.pop("kind", None)
-            call_id = response.get("call_id")
-            response.clear()
-            response.update(_response(ResponseKind.ERROR, **fields))
-            response["call_id"] = call_id
+            _record_delivery_failure(response, result, error)
             return True
     if isinstance(result, CompletionReport):
         return True
     return True
+
+
+def _response_execution_complete(response: dict[str, Any]) -> bool:
+    """Advance a response source until its request-state publication point."""
+
+    if response.get("kind") == ResponseKind.ERROR.value:
+        return False
+    result = response.get("completion_report")
+    if not isinstance(result, CompletionDelivery):
+        return True
+    try:
+        return result.execution_complete()
+    except BaseException as error:
+        _record_delivery_failure(response, result, error)
+        return False
+
+
+def _record_delivery_failure(
+    response: dict[str, Any],
+    result: CompletionDelivery,
+    error: BaseException,
+) -> None:
+    source = result.source
+    classified = (
+        source.record_failure(error)
+        if isinstance(source, _PendingExecution)
+        else classify(error, context="completion materialization")
+    )
+    fields = classified.to_wire()
+    fields.pop("kind", None)
+    call_id = response.get("call_id")
+    response.clear()
+    response.update(_response(ResponseKind.ERROR, **fields))
+    response["call_id"] = call_id
 
 
 def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
@@ -305,12 +295,10 @@ def _control(
 def dispatch(
     worker: Worker,
     request: Mapping[str, Any],
-    metrics: MetricsService | None = None,
     replay: ReplayCoordinator | None = None,
 ) -> dict[str, Any]:
     """Dispatch one validated worker-protocol request without performing transport I/O."""
 
-    service = metrics or MetricsService()
     kind = _request_kind(request)
     if kind is RequestKind.GET_CAPABILITIES:
         return _response(
@@ -320,11 +308,9 @@ def dispatch(
     if kind is RequestKind.EXECUTE:
         if replay is None:
             raise invalid_descriptor("execution dispatch requires a server replay coordinator")
-        return _execute(worker, request, service, replay)
+        return _execute(worker, request, replay)
     if kind is RequestKind.POLL_COMPLETIONS:
         raise invalid_descriptor("completion polling is owned by the worker server")
-    if kind is RequestKind.GET_METRICS:
-        return _response(ResponseKind.METRICS, metrics=service.snapshot())
     if kind is RequestKind.GET_PRESSURE:
         return _response(ResponseKind.PRESSURE, pressure=worker.resource_pressure())
     if kind is RequestKind.SHUTDOWN:
@@ -340,16 +326,17 @@ class WorkerServer:
         self,
         worker: Worker,
         ipc_endpoint: WorkerIpcTransport | None,
-        metrics: MetricsService | None = None,
         *,
         replay_capacity: int | None = None,
     ) -> None:
         self.worker = worker
         self.ipc_endpoint = ipc_endpoint
-        self.metrics = metrics or MetricsService()
         self.profiler = WorkerProfiler.from_env()
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
+        self._terminate_rank = env_optional_int("UNISERVE_STUB_DIE_RANK")
+        if self._terminate_rank is not None and self._terminate_rank < 0:
+            raise ValueError("UNISERVE_STUB_DIE_RANK must be non-negative")
         self.pipeline_depth = max(1, int(worker.capabilities.pipeline_depth))
         max_operations = max(1, int(worker.capabilities.max_batch_operations))
         completed_capacity = (
@@ -373,7 +360,15 @@ class WorkerServer:
 
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         raw_kind = request.get("kind")
-        if raw_kind == RequestKind.EXECUTE.value and self._terminate_after:
+        terminate_this_rank = self._terminate_rank in {
+            None,
+            int(self.worker.capabilities.rank.tp_rank),
+        }
+        if (
+            raw_kind == RequestKind.EXECUTE.value
+            and self._terminate_after
+            and terminate_this_rank
+        ):
             self._execute_count += 1
             if self._execute_count > self._terminate_after:
                 os._exit(1)
@@ -383,7 +378,6 @@ class WorkerServer:
                     response = dispatch(
                         self.worker,
                         request,
-                        self.metrics,
                         self.replay,
                     )
             else:
@@ -412,23 +406,8 @@ class WorkerServer:
                         response = dispatch(
                             self.worker,
                             request,
-                            self.metrics,
                             self.replay,
                         )
-            try:
-                kind = RequestKind(str(raw_kind))
-            except ValueError:
-                kind = None
-            if kind not in {
-                None,
-                RequestKind.GET_CAPABILITIES,
-                RequestKind.EXECUTE,
-                RequestKind.POLL_COMPLETIONS,
-                RequestKind.GET_METRICS,
-                RequestKind.GET_PRESSURE,
-                RequestKind.SHUTDOWN,
-            }:
-                self.metrics.record_control(kind.value, True)
         except WorkerError as error:
             self._record_failure(raw_kind, error)
             fields = error.to_wire()
@@ -452,21 +431,6 @@ class WorkerServer:
         *,
         unexpected: bool = False,
     ) -> None:
-        try:
-            kind = RequestKind(str(raw_kind))
-        except ValueError:
-            kind = None
-        if kind not in {
-            None,
-            RequestKind.GET_CAPABILITIES,
-            RequestKind.EXECUTE,
-            RequestKind.POLL_COMPLETIONS,
-            RequestKind.GET_METRICS,
-            RequestKind.GET_PRESSURE,
-            RequestKind.SHUTDOWN,
-        }:
-            self.metrics.record_control(kind.value, False)
-        self.metrics.record_error(str(error.code))
         include_trace = unexpected or should_capture_trace(str(error.code))
         log = logger.exception if include_trace else logger.warning
         log(
@@ -501,11 +465,9 @@ class WorkerServer:
                 self._pending_completion_reports.pop(result.step_id, None)
             response = dict(response)
             response["completion_report"] = ready
-        started = self.metrics.now_ns()
         with profile_range("uniserve.worker.finalize_response"):
             finalized = _finalize_response(response)
         self.ipc_endpoint.respond(finalized)
-        self.metrics.record_pipeline("send", self.metrics.now_ns() - started)
 
     def serve(self) -> None:
         from .process import WorkerServeLoop

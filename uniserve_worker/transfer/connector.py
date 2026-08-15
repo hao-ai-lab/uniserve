@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import torch
@@ -49,6 +49,9 @@ class TransferConnector:
 
     def close(self) -> None:
         self.transport.close()
+
+    def set_completion_wake(self, wake: Callable[[], None]) -> None:
+        self.transport.set_completion_wake(wake)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,19 +130,6 @@ class CachePublication:
             group_id=int(value.get("group_id", 0)),
             scale_identity=str(value.get("scale_identity", "")),
         )
-
-    def for_tensor_rank(self, rank: int, size: int) -> CachePublication:
-        rank_id = int(rank)
-        rank_count = int(size)
-        if rank_count < 1 or rank_id < 0 or rank_id >= rank_count:
-            raise invalid_descriptor("KV publication tensor-parallel rank is invalid")
-        if not self.locators:
-            return self
-        if len(self.locators) % rank_count:
-            raise invalid_descriptor("KV publication locators do not divide across ranks")
-        width = len(self.locators) // rank_count
-        start = rank_id * width
-        return replace(self, locators=self.locators[start : start + width])
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,13 +416,6 @@ class CachePublications:
         self._destination_bases = commit.destination_bases
         self._installed_bases = commit.installed_bases
         self._locators = commit.locators
-
-    def validate_installed(self, session_id: int, product: ProductRef) -> CachePublication:
-        publication = self.publication(product)
-        installed = self._installed_bases.get((int(session_id), publication.destination))
-        if installed != (publication.source_version, publication.published_extent):
-            raise invalid_descriptor("KV input is not the installed publication")
-        return publication
 
     def release_operations(self, releases: Sequence[tuple[RequestKey, int]]) -> None:
         identities = {(key, int(op_id)) for key, op_id in releases}

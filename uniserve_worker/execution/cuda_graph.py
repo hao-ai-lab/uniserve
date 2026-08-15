@@ -92,7 +92,7 @@ class CudaGraphRunner:
         prefill_row_bucket: int = 8,
         stream: torch.cuda.Stream | None = None,
         expected_context: int | None = None,
-        expected_captures: int | None = None,
+        expected_resident_executables: int | None = None,
         output_slot_count: int = 2,
     ) -> None:
         if not weight_digest or block_size < 1 or memory_budget_bytes < 0 or output_slot_count < 1:
@@ -124,8 +124,10 @@ class CudaGraphRunner:
         self._sealed = False
         self._stream = stream
         self._expected_context = expected_context
-        self._expected_captures = (
-            None if expected_captures is None else max(0, int(expected_captures))
+        self._expected_resident_executables = (
+            None
+            if expected_resident_executables is None
+            else max(0, int(expected_resident_executables))
         )
         self._output_slot_count = int(output_slot_count)
 
@@ -153,10 +155,14 @@ class CudaGraphRunner:
         self._warmed_exact.clear()
         if self._warmed:
             raise GraphExecutionError("startup left configured graph buckets uncaptured")
-        if self._expected_captures is not None and len(self._states) != self._expected_captures:
+        if (
+            self._expected_resident_executables is not None
+            and len(self._states) != self._expected_resident_executables
+        ):
             raise GraphExecutionError(
-                "captured CUDA graph count does not match the advertised bucket catalog: "
-                f"captured={len(self._states)} advertised={self._expected_captures}"
+                "resident CUDA graph count does not match the physical executable catalog: "
+                f"resident={len(self._states)} "
+                f"expected={self._expected_resident_executables}"
             )
         self._complete_equivalence_checks()
         if self.resident_bytes > self.memory_budget_bytes:
@@ -260,9 +266,7 @@ class CudaGraphRunner:
             if self.memory_budget_bytes == 0:
                 raise GraphExecutionError("configured CUDA graph residency has no memory budget")
             try:
-                eager = self._snapshot_output(
-                    _trim_output(self._eager(execution, forward), rows)
-                )
+                eager = self._snapshot_output(_trim_output(self._eager(execution, forward), rows))
                 state = self._capture(
                     execution,
                     forward,
@@ -297,9 +301,7 @@ class CudaGraphRunner:
         except Exception as error:
             raise GraphExecutionError("CUDA graph replay failed") from error
         output = (
-            _trim_output(state.output, rows)
-            if borrow_output
-            else self._publish_output(state, rows)
+            _trim_output(state.output, rows) if borrow_output else self._publish_output(state, rows)
         )
         return GraphRun(output, "graph_replay", rows, padded_rows)
 
@@ -414,18 +416,13 @@ class CudaGraphRunner:
             return
         context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
         with context:
-            complete = torch.stack(
-                tuple(check for _, check in self._equivalence_checks)
-            ).all()
+            complete = torch.stack(tuple(check for _, check in self._equivalence_checks)).all()
         if not bool(complete.item()):
             failed = tuple(
-                label
-                for label, check in self._equivalence_checks
-                if not bool(check.item())
+                label for label, check in self._equivalence_checks if not bool(check.item())
             )
             raise GraphExecutionError(
-                "CUDA graph output differs from direct execution for buckets: "
-                + ", ".join(failed)
+                "CUDA graph output differs from direct execution for buckets: " + ", ".join(failed)
             )
         self._equivalence_checks.clear()
 

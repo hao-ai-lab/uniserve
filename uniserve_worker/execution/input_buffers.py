@@ -100,8 +100,6 @@ class InputBuffers:
         self.attention_indexes = torch.zeros(
             (3, self.max_tokens), dtype=torch.int64, device=self.device
         )
-        self.route_indicators = torch.zeros(self.max_tokens, dtype=torch.bool, device=self.device)
-        self.text_indices = torch.zeros(self.max_tokens, dtype=torch.int64, device=self.device)
         self.visible_end = torch.zeros(
             (self.max_rows, self.max_tokens), dtype=torch.int64, device=self.device
         )
@@ -334,8 +332,6 @@ class InputBuffers:
         return replace(
             attention,
             indexes=self._copy_matrix(self.attention_indexes, attention.indexes),
-            route_indicators=self._copy_vector(self.route_indicators, attention.route_indicators),
-            text_indices=self._copy_vector(self.text_indices, attention.text_indices),
             visible_end=self._copy_matrix(self.visible_end, attention.visible_end),
             cu_seqlens_q=self._copy_vector(self.cumulative_query_lengths, attention.cu_seqlens_q),
             page_table=self._copy_matrix(self.block_tables, attention.page_table),
@@ -371,8 +367,6 @@ class InputBuffers:
             self.output_indices.zero_()
         elif isinstance(attention, PackedAttentionPlan):
             self.attention_indexes.zero_()
-            self.route_indicators.zero_()
-            self.text_indices.zero_()
             self.visible_end.zero_()
             self.cumulative_query_lengths.zero_()
             self.seqused_k.zero_()

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -32,7 +32,6 @@ from ..batch import (
     ProductRef,
     RecoveryPlacement,
     RequestKey,
-    SamplingOwnership,
     SnapshotRef,
     StorageClass,
     WorkVariant,
@@ -40,24 +39,20 @@ from ..batch import (
 from ..bootstrap.capabilities import resolve_capabilities
 from ..bootstrap.capacity import (
     model_arena_capacity,
-    operation_window,
-    system_arena_capacity,
 )
 from ..capabilities import (
     GraphBucketCapability,
     LaneCapabilities,
-    RankInfo,
+    MixedExecutionCapability,
     RequestKind,
-    ResourceClass,
     WorkerCapabilities,
-    configured_work_variants,
 )
-from ..execution import ModelRunner, PreparedExecution
 from ..execution.cuda_graph import CudaGraphRunner
 from ..execution.forward_batch import AttentionSelection
 from ..execution.model_invocation import _ModelInvocation
+from ..execution.model_runner import ModelRunner, PreparedExecution
 from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..foundation.errors import capability_mismatch, invalid_descriptor, unsupported_control
+from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
 from ..foundation.sizing import ceil_div, device_total_bytes
 from ..foundation.sync_detector import (
@@ -89,7 +84,77 @@ from ..server.request_state import RequestTable
 from ..transfer.connector import TransferConnector
 
 logger = logging.getLogger(__name__)
-_SYSTEM_OPERATION_CAPACITY = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _FlowGraphBucket:
+    rows: int
+    height: int
+    width: int
+    cfg_branches: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FlowPrefixGraphBucket:
+    rows: int
+    cfg_branches: int
+    prefix_lengths: tuple[int, ...]
+
+
+def _flow_graph_executable(bucket: _FlowGraphBucket) -> tuple[object, ...]:
+    return (
+        "flow",
+        bucket.rows * bucket.cfg_branches,
+        bucket.height,
+        bucket.width,
+    )
+
+
+def _flow_prefix_graph_executable(bucket: _FlowPrefixGraphBucket) -> tuple[object, ...]:
+    return (
+        "flow_prefix",
+        bucket.prefix_lengths * bucket.rows,
+    )
+
+
+def _mixed_flow_graph_executable(
+    bucket: MixedExecutionCapability,
+) -> tuple[object, ...]:
+    return (
+        "decode_flow",
+        bucket.decode_rows,
+        bucket.flow_rows * bucket.cfg_branches,
+        bucket.height,
+        bucket.width,
+    )
+
+
+def _startup_image_parameters(
+    cfg_branches: int,
+    *,
+    steps: int,
+    height: int,
+    width: int,
+) -> ImageParams:
+    scales = {
+        1: (1.0, 1.0),
+        2: (4.0, 1.0),
+        3: (4.0, 2.0),
+    }
+    try:
+        text_scale, image_scale = scales[int(cfg_branches)]
+    except KeyError as error:
+        raise invalid_descriptor(
+            "flow CFG branch geometry exceeds the concrete branch set"
+        ) from error
+    return ImageParams(
+        steps=int(steps),
+        cfg_text_scale=text_scale,
+        cfg_img_scale=image_scale,
+        height=int(height),
+        width=int(width),
+        seed=0,
+    )
 
 
 def _has_decode_flow_partition(lanes: tuple[LaneConfig, ...]) -> bool:
@@ -221,224 +286,15 @@ def _warmup_token_outputs(
 class Worker:
     """Own one configured process and its sole model execution root."""
 
-    model: ExecutionModel | None
-    deployment: WorkerDeployment | None
-    weights: WeightSet | None
-    runtime_states: RuntimeStates | None
+    model: ExecutionModel
+    deployment: WorkerDeployment
+    weights: WeightSet
+    runtime_states: RuntimeStates
     latent_pool: LatentPool | None
     snapshot_recovery: SnapshotRecovery | None
     _warmup_kv_pages: dict[tuple[RequestKey, int], list[int]]
     _warmup_scratch_pages: dict[RequestKey, list[int]]
     _warmup_latent_pages: dict[RequestKey, list[int]]
-
-    @classmethod
-    def system(
-        cls,
-        *,
-        allowed_work_variants: frozenset[WorkVariant],
-        block_size: int,
-        max_batch_tokens: int,
-        transfer_backend: str,
-        pipeline_depth: int,
-        completion_payload_bytes: int,
-        device: str,
-        snapshot_dir: str | None = None,
-    ) -> Worker:
-        worker = cls.__new__(cls)
-        worker._initialize_system(
-            allowed_work_variants=allowed_work_variants,
-            block_size=block_size,
-            max_batch_tokens=max_batch_tokens,
-            transfer_backend=transfer_backend,
-            pipeline_depth=pipeline_depth,
-            completion_payload_bytes=completion_payload_bytes,
-            device=device,
-            snapshot_dir=snapshot_dir,
-        )
-        return worker
-
-    def _initialize_system(
-        self,
-        *,
-        allowed_work_variants: frozenset[WorkVariant],
-        block_size: int,
-        max_batch_tokens: int,
-        transfer_backend: str,
-        pipeline_depth: int,
-        completion_payload_bytes: int,
-        device: str,
-        snapshot_dir: str | None,
-    ) -> None:
-        supported = frozenset({WorkVariant.MATERIALIZE})
-        if not allowed_work_variants <= supported:
-            raise ValueError("system execution received a model-backed work variant")
-        if not allowed_work_variants:
-            raise capability_mismatch("worker implements none of the requested work variants")
-        if int(pipeline_depth) <= 0:
-            raise capability_mismatch("worker pipeline depth must be positive")
-        if int(completion_payload_bytes) < 1:
-            raise ValueError("completion payload capacity must be positive")
-        controls: tuple[RequestKind, ...] = (
-            RequestKind.DROP_SESSION,
-            RequestKind.RELEASE_PRODUCTS,
-        )
-        if snapshot_dir is not None:
-            controls = (
-                *controls,
-                RequestKind.SNAPSHOT_SESSION,
-                RequestKind.RESTORE_SESSION,
-            )
-        advertised_work = configured_work_variants(
-            tuple(value for value in WorkVariant if value in allowed_work_variants)
-        )
-        window = operation_window(int(pipeline_depth), _SYSTEM_OPERATION_CAPACITY)
-        self._capabilities = WorkerCapabilities(
-            block_size=int(block_size),
-            num_blocks=2,
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=1,
-            scratch_capacity_tokens=0,
-            supported_work=advertised_work,
-            latent_page_units=0,
-            num_latent_pages=0,
-            latent_width=0,
-            latent_dtype="",
-            latent_downsample=1,
-            max_vae_grid_tokens=0,
-            max_vit_grid_tokens=0,
-            max_latent_feature_bytes=0,
-            max_vision_feature_bytes=0,
-            commit_marker_tokens=2,
-            gen_rope_advance=2,
-            max_cfg_branches=1,
-            bytes_per_token=1,
-            groups=(),
-            kv_dtype="bfloat16",
-            model_dtype="bfloat16",
-            attention_backend="auto",
-            quantization=None,
-            rank=RankInfo(),
-            pipeline_depth=int(pipeline_depth),
-            encoder_cache_budget=0,
-            supported_controls=controls,
-            max_batch_operations=_SYSTEM_OPERATION_CAPACITY,
-            max_batch_tokens=int(max_batch_tokens),
-            max_request_pool_size=_SYSTEM_OPERATION_CAPACITY,
-            max_unresolved_window=window,
-            incremental_kv_publication=True,
-            tensorized_mixed=False,
-            sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
-            resource_classes=(ResourceClass.ENCODER_OUTPUT,),
-            model_identity="",
-            weight_digest="",
-        )
-        arena = system_arena_capacity(
-            pipeline_depth=int(pipeline_depth),
-            max_operations=_SYSTEM_OPERATION_CAPACITY,
-            completion_payload_bytes=int(completion_payload_bytes),
-        )
-        self._system_only = True
-        self.model = None
-        self.deployment = None
-        self.weights = None
-        self.weight_digest = ""
-        self._effective_work_variants = allowed_work_variants
-        self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
-        self.cache_pool = CachePool(
-            num_layers=1,
-            request_pages=int(self._capabilities.num_blocks),
-            scratch_pages=0,
-            page_size=int(self._capabilities.block_size),
-            num_kv_heads=1,
-            head_dim=1,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        self.latent_pool = None
-        self.runtime_states = None
-        self.device_events = DeviceEventPool()
-        self.device_products = DeviceProducts(
-            capacity=arena.device_products,
-            byte_capacity=arena.device_product_bytes,
-            event_pool=self.device_events,
-        )
-        self.encoder_cache = EncoderCache(
-            entry_capacity=0,
-            max_entry_bytes=1,
-            devices=(device,),
-            event_pool=self.device_events,
-        )
-        completion_words = completion_word_capacity(
-            int(self._capabilities.max_batch_operations),
-            int(completion_payload_bytes),
-        )
-        self.completion_arena = CompletionArena(
-            depth=int(pipeline_depth) * int(self._capabilities.max_batch_operations),
-            token_capacity=completion_words,
-            total_token_capacity=int(pipeline_depth) * completion_words,
-            devices=(device,),
-            event_pool=self.device_events,
-        )
-        self.cpu_tasks = BoundedCpuTaskPool(
-            capacity=int(arena.cpu_tasks),
-            workers=min(4, int(arena.cpu_tasks)),
-        )
-        self.transfers = TransferConnector(
-            backend=transfer_backend,
-            byte_capacity=arena.transfer_bytes,
-            ticket_capacity=arena.transfer_tickets,
-            cross_process=True,
-        )
-        self.trace = ExecutionTrace(hashlib.sha256(b"uniserve-system-worker").hexdigest())
-        self.runner = ModelRunner(
-            model=None,
-            deployment=None,
-            model_invocation=None,
-            attention=None,
-            requests=self.requests,
-            runtime_states=None,
-            cache_pool=self.cache_pool,
-            latent_pool=None,
-            device_products=self.device_products,
-            encoder_cache=self.encoder_cache,
-            completion_arena=self.completion_arena,
-            cpu_tasks=self.cpu_tasks,
-            weights=None,
-            mesh=None,
-            transport=self.transfers.transport,
-            tokenizer=None,
-            architecture_digest=None,
-            weight_digest=None,
-            allowed_work_variants=allowed_work_variants,
-            trace=self.trace,
-        )
-        self._warmup_kv_pages = {}
-        self._warmup_scratch_pages = {}
-        self._warmup_latent_pages = {}
-        self._warmup_step_id = 0
-        self.snapshot_recovery = None
-        if snapshot_dir is not None:
-            caps = self._capabilities
-            self.snapshot_recovery = SnapshotRecovery(
-                snapshot_dir,
-                model_identity=self.trace.candidate_digest,
-                weight_digest="",
-                topology={
-                    "rank": caps.rank.to_wire(),
-                    "supported_work": [value.value for value in caps.supported_work],
-                    "block_size": caps.block_size,
-                },
-                device=device,
-                requests=self.requests,
-                cache_pool=self.cache_pool,
-                cache_publications=self.runner.cache_publications,
-                latent_pool=None,
-                device_products=self.device_products,
-                encoder_cache=self.encoder_cache,
-                runtime_states=None,
-                transport=self.transfers.transport,
-            )
 
     def __init__(
         self,
@@ -450,7 +306,6 @@ class Worker:
         execution: ExecutionConfig,
         tokenizer: object | None,
         allowed_work_variants: frozenset[WorkVariant],
-        defer_sampling: bool = False,
         transfer_backend: str = "local",
         cross_process: bool = False,
         architecture_digest: str | None = None,
@@ -465,7 +320,6 @@ class Worker:
             )
         if not isinstance(deployment, WorkerDeployment):
             raise capability_mismatch("model worker requires a worker deployment")
-        self._system_only = False
         self.model = model
         self.deployment = deployment
         weights = WeightSet.from_module(model, digest=weight_digest)
@@ -623,9 +477,10 @@ class Worker:
             int(completion_payload_bytes),
         )
         self.completion_arena = CompletionArena(
-            depth=int(pipeline_depth) * int(self._capabilities.max_batch_operations),
+            depth=int(pipeline_depth) * (int(self._capabilities.max_batch_operations) + 1),
             token_capacity=completion_words,
-            total_token_capacity=int(pipeline_depth) * completion_words,
+            total_token_capacity=int(pipeline_depth)
+            * (completion_words + int(self._capabilities.max_batch_operations)),
             devices=owner_devices,
             event_pool=self.device_events,
         )
@@ -707,17 +562,45 @@ class Worker:
             for value in execution.prefill_graph_token_sizes
             if 0 < int(value) <= min(prefill_capacity, prefill_max_tokens)
         )
+        flow_cfg_branches: tuple[int, ...] = ()
+        if flow is not None:
+            branch_counts: list[int] = []
+            for cfg_branches in range(1, int(flow.max_cfg_branches) + 1):
+                image = _startup_image_parameters(
+                    cfg_branches,
+                    steps=1,
+                    height=16,
+                    width=16,
+                )
+                guide = build_flow_cfg_plan(
+                    cfg_text_scale=float(image.cfg_text_scale),
+                    cfg_img_scale=float(image.cfg_img_scale),
+                    recipe=flow.cfg_recipe,
+                    renorm=image.cfg_renorm_type,
+                    renorm_min=float(image.cfg_renorm_min),
+                    use_cfg=True,
+                )
+                if len(guide.branches) != cfg_branches:
+                    raise invalid_descriptor(
+                        "flow CFG startup parameters do not realize their branch geometry"
+                    )
+                branch_counts.append(cfg_branches)
+            flow_cfg_branches = tuple(branch_counts)
         flow_graph_buckets = (
             ()
             if flow is None
             else tuple(
-                (int(batch_size), int(height), int(width))
+                _FlowGraphBucket(
+                    rows=int(batch_size),
+                    height=int(height),
+                    width=int(width),
+                    cfg_branches=cfg_branches,
+                )
                 for height, width in execution.flow_graph_shapes
                 for batch_size in execution.flow_graph_batch_sizes
+                for cfg_branches in flow_cfg_branches
                 if 0 < int(batch_size) <= flow_max_operations
-                and int(batch_size)
-                * flow.physical_tokens(int(height), int(width))
-                * int(flow.max_cfg_branches)
+                and int(batch_size) * flow.physical_tokens(int(height), int(width)) * cfg_branches
                 <= max_staged_tokens
                 and flow.image_tokens(int(height), int(width))
                 <= int(self._capabilities.latent_capacity_units)
@@ -726,61 +609,113 @@ class Worker:
                 <= int(self.latent_pool.capacity_units)
             )
         )
+        shared_mixed_limit = (
+            max_rows
+            if not execution.lanes
+            else max(
+                (
+                    min(
+                        max_rows,
+                        int(lane.max_batch_operations or max_rows),
+                    )
+                    for lane in execution.lanes
+                    if {Domain.DECODE, Domain.FLOW} <= set(lane.domains)
+                ),
+                default=0,
+            )
+        )
         mixed_text_batch_sizes = (
             ()
             if (
                 not flow_graph_buckets
                 or not model.tensorized_mixed
                 or not _has_decode_flow_partition(execution.lanes)
+                or not {
+                    WorkVariant.TOKEN_DECODE,
+                    WorkVariant.GEN_FLOW,
+                }.issubset(self._effective_work_variants)
             )
             else tuple(
                 range(
                     1,
-                    max(int(batch_size) for batch_size in execution.flow_graph_batch_sizes) + 1,
+                    min(
+                        decode_max_operations,
+                        shared_mixed_limit - 1,
+                        max(int(batch_size) for batch_size in execution.flow_graph_batch_sizes),
+                    )
+                    + 1,
                 )
             )
         )
         mixed_flow_graph_buckets = tuple(
-            (text_batch_size, height, width)
-            for batch_size, height, width in flow_graph_buckets
-            if batch_size == 1
+            MixedExecutionCapability(
+                decode_rows=text_batch_size,
+                flow_rows=1,
+                height=bucket.height,
+                width=bucket.width,
+                cfg_branches=bucket.cfg_branches,
+            )
+            for bucket in flow_graph_buckets
+            if bucket.rows == 1
             for text_batch_size in mixed_text_batch_sizes
         )
-        flow_prefix_lengths: tuple[int, ...] = ()
+        flow_prefix_lengths: dict[int, tuple[int, ...]] = {}
         if flow is not None and model.tensorized_mixed and flow_graph_buckets:
-            image = ImageParams()
-            guide = build_flow_cfg_plan(
-                cfg_text_scale=float(image.cfg_text_scale),
-                cfg_img_scale=float(image.cfg_img_scale),
-                recipe=flow.cfg_recipe,
-                renorm=image.cfg_renorm_type,
-                renorm_min=float(image.cfg_renorm_min),
-                use_cfg=True,
-            )
-            flow_prefix_lengths = tuple(
-                len(prefix)
-                for branch in guide.branches
-                for prefix, copy_conditioning in (
-                    flow.prefix(
-                        flow.branch_source(branch),
-                        image_prompt="",
-                        negative_prompt=image.negative_prompt,
-                        negative_token_ids=(),
-                        tokenizer=tokenizer,
-                    ),
+            for cfg_branches in flow_cfg_branches:
+                image = _startup_image_parameters(
+                    cfg_branches,
+                    steps=1,
+                    height=16,
+                    width=16,
                 )
-                if prefix and not copy_conditioning
+                guide = build_flow_cfg_plan(
+                    cfg_text_scale=float(image.cfg_text_scale),
+                    cfg_img_scale=float(image.cfg_img_scale),
+                    recipe=flow.cfg_recipe,
+                    renorm=image.cfg_renorm_type,
+                    renorm_min=float(image.cfg_renorm_min),
+                    use_cfg=True,
+                )
+                flow_prefix_lengths[cfg_branches] = tuple(
+                    len(prefix)
+                    for branch in guide.branches
+                    for prefix, copy_conditioning in (
+                        flow.prefix(
+                            flow.branch_source(branch),
+                            image_prompt="",
+                            negative_prompt=image.negative_prompt,
+                            negative_token_ids=(),
+                            tokenizer=tokenizer,
+                        ),
+                    )
+                    if prefix and not copy_conditioning
+                )
+        flow_prefix_graph_buckets = tuple(
+            _FlowPrefixGraphBucket(
+                rows=rows,
+                cfg_branches=cfg_branches,
+                prefix_lengths=flow_prefix_lengths[cfg_branches],
             )
-        flow_prefix_graph_batches = tuple(
-            batch_size
-            for batch_size in sorted({bucket[0] for bucket in flow_graph_buckets})
-            if flow_prefix_lengths
-            and sum(1 for candidate in flow_graph_buckets if candidate[0] == batch_size) > 1
+            for rows, cfg_branches in sorted(
+                {(bucket.rows, bucket.cfg_branches) for bucket in flow_graph_buckets}
+            )
+            if flow_prefix_lengths.get(cfg_branches)
+            and sum(
+                1
+                for candidate in flow_graph_buckets
+                if candidate.rows == rows and candidate.cfg_branches == cfg_branches
+            )
+            > 1
         )
         self._decode_graph_batch_sizes = decode_graph_batch_sizes
         self._prefill_graph_token_sizes = prefill_graph_token_sizes
+        self._flow_cfg_branches = flow_cfg_branches
         self._flow_graph_buckets = flow_graph_buckets
         self._mixed_flow_graph_buckets = mixed_flow_graph_buckets
+        self._capabilities = replace(
+            self._capabilities,
+            mixed_buckets=mixed_flow_graph_buckets,
+        )
         graph_budget = graph_memory_budget_bytes(device_total_bytes(deployment.device))
 
         def graph_factory(
@@ -810,7 +745,7 @@ class Worker:
                 else ()
             )
             lane_flow_buckets = (
-                tuple(value for value in flow_graph_buckets if value[0] <= lane_max_operations)
+                tuple(value for value in flow_graph_buckets if value.rows <= lane_max_operations)
                 if owns_model_compute and Domain.FLOW in domains
                 else ()
             )
@@ -818,29 +753,50 @@ class Worker:
                 tuple(
                     value
                     for value in mixed_flow_graph_buckets
-                    if value[0] + 1 <= lane_max_operations
+                    if value.decode_rows + value.flow_rows <= lane_max_operations
                 )
                 if owns_model_compute and {Domain.DECODE, Domain.FLOW} <= set(domains)
                 else ()
             )
-            expected_captures = 0
+            lane_flow_prefix_buckets = (
+                tuple(
+                    value
+                    for value in flow_prefix_graph_buckets
+                    if value.rows <= lane_max_operations
+                    and value.rows * sum(value.prefix_lengths) <= lane_max_tokens
+                )
+                if owns_model_compute and Domain.FLOW in domains
+                else ()
+            )
+            expected_resident_executables = 0
             if execution.cuda_graph:
                 if WorkVariant.TOKEN_DECODE in self._effective_work_variants:
-                    expected_captures += len(lane_decode_buckets)
+                    expected_resident_executables += len(lane_decode_buckets)
                 if (
                     execution.prefill_cuda_graph
                     and WorkVariant.TOKEN_EXTEND in self._effective_work_variants
                 ):
-                    expected_captures += len(lane_prefill_buckets)
+                    expected_resident_executables += len(lane_prefill_buckets)
                 if execution.prefill_cuda_graph and {
                     WorkVariant.GEN_TRANSITION,
                     WorkVariant.GEN_FLOW,
                 }.issubset(self._effective_work_variants):
-                    expected_captures += len(lane_flow_buckets)
+                    expected_resident_executables += len(
+                        {_flow_graph_executable(bucket) for bucket in lane_flow_buckets}
+                    )
                     if WorkVariant.TOKEN_DECODE in self._effective_work_variants:
-                        expected_captures += len(lane_mixed_flow_buckets)
-                    if Domain.FLOW in domains:
-                        expected_captures += len(flow_prefix_graph_batches)
+                        expected_resident_executables += len(
+                            {
+                                _mixed_flow_graph_executable(bucket)
+                                for bucket in lane_mixed_flow_buckets
+                            }
+                        )
+                    expected_resident_executables += len(
+                        {
+                            _flow_prefix_graph_executable(bucket)
+                            for bucket in lane_flow_prefix_buckets
+                        }
+                    )
             output_slots = int(
                 (pipeline_depth if lane is None else lane.max_inflight or pipeline_depth) + 1
             )
@@ -854,10 +810,10 @@ class Worker:
                 decode_batch_sizes=lane_decode_buckets,
                 decode_context_blocks=self._decode_context_blocks(),
                 packed_context_blocks=max_blocks_per_row,
-                prefill_token_sizes=lane_prefill_buckets,
+                prefill_token_sizes=(() if model.tensorized_mixed else lane_prefill_buckets),
                 stream=stream,
                 expected_context=expected_context,
-                expected_captures=expected_captures,
+                expected_resident_executables=expected_resident_executables,
                 output_slot_count=output_slots,
             )
 
@@ -928,9 +884,9 @@ class Worker:
                     buckets.extend(
                         GraphBucketCapability(
                             phase="text_prefill",
-                            batch_size=8,
+                            batch_size=1 if model.tensorized_mixed else 8,
                             token_bucket=int(token_size),
-                            attention_form="paged_varlen",
+                            attention_form=("packed" if model.tensorized_mixed else "paged_varlen"),
                             height=0,
                             width=0,
                             cfg_branches=1,
@@ -947,31 +903,50 @@ class Worker:
                     buckets.extend(
                         GraphBucketCapability(
                             phase="text_prefill",
-                            batch_size=int(batch_size) * len(flow_prefix_lengths),
-                            token_bucket=int(batch_size) * sum(flow_prefix_lengths),
+                            batch_size=bucket.rows * len(bucket.prefix_lengths),
+                            token_bucket=bucket.rows * sum(bucket.prefix_lengths),
                             attention_form="packed",
                             height=0,
                             width=0,
-                            cfg_branches=1,
+                            cfg_branches=bucket.cfg_branches,
                             layout="flow_prefix",
                         )
-                        for batch_size in flow_prefix_graph_batches
-                        if int(batch_size) * len(flow_prefix_lengths) <= max_operations
-                        and int(batch_size) * sum(flow_prefix_lengths) <= max_tokens
+                        for bucket in flow_prefix_graph_buckets
+                        if bucket.rows <= max_operations
+                        and bucket.rows * sum(bucket.prefix_lengths) <= max_tokens
                     )
                     buckets.extend(
                         GraphBucketCapability(
                             phase="denoise",
-                            batch_size=int(batch_size),
+                            batch_size=bucket.rows,
                             token_bucket=0,
-                            attention_form="none",
-                            height=int(height),
-                            width=int(width),
-                            cfg_branches=int(flow.max_cfg_branches),
+                            attention_form="packed",
+                            height=bucket.height,
+                            width=bucket.width,
+                            cfg_branches=bucket.cfg_branches,
+                            layout="flow",
                         )
-                        for batch_size, height, width in flow_graph_buckets
-                        if batch_size <= max_operations
+                        for bucket in flow_graph_buckets
+                        if bucket.rows <= max_operations
                     )
+                    if WorkVariant.TOKEN_DECODE in self._effective_work_variants and {
+                        Domain.DECODE,
+                        Domain.FLOW,
+                    } <= set(lane.domains):
+                        buckets.extend(
+                            GraphBucketCapability(
+                                phase="denoise",
+                                batch_size=bucket.decode_rows + bucket.flow_rows,
+                                token_bucket=bucket.decode_rows,
+                                attention_form="packed",
+                                height=bucket.height,
+                                width=bucket.width,
+                                cfg_branches=bucket.cfg_branches,
+                                layout="decode_flow",
+                            )
+                            for bucket in mixed_flow_graph_buckets
+                            if bucket.decode_rows + bucket.flow_rows <= max_operations
+                        )
                 lane_capabilities.append(
                     LaneCapabilities(
                         lane_id=lane.lane_id,
@@ -1008,8 +983,8 @@ class Worker:
             architecture_digest=self.identity.architecture_digest,
             weight_digest=self.weight_digest,
             allowed_work_variants=self._effective_work_variants,
+            mixed_buckets=self._capabilities.mixed_buckets,
             trace=self.trace,
-            defer_sampling=defer_sampling,
         )
         self._warmup_kv_pages = {}
         self._warmup_scratch_pages = {}
@@ -1050,21 +1025,9 @@ class Worker:
     def capabilities(self) -> WorkerCapabilities:
         return self._capabilities
 
-    def _require_model(self) -> ExecutionModel:
-        model = self.model
-        if model is None:
-            raise RuntimeError("system-only worker has no model")
-        return model
-
-    def _require_deployment(self) -> WorkerDeployment:
-        deployment = self.deployment
-        if deployment is None:
-            raise RuntimeError("system-only worker has no model deployment")
-        return deployment
-
     def _decode_context_blocks(self) -> int:
-        model = self._require_model()
-        deployment = self._require_deployment()
+        model = self.model
+        deployment = self.deployment
         max_tokens = int(model.text_max_tokens)
         if max_tokens < 1:
             return 0
@@ -1100,8 +1063,9 @@ class Worker:
         batch: Batch,
         *,
         retain_device_outputs: bool = False,
+        catalog_graphs: bool = True,
     ) -> CompletionReport:
-        report = self.runner.execute_startup(batch)
+        report = self.runner.execute_startup(batch, catalog_graphs=catalog_graphs)
         while not completion_report_ready(report):
             time.sleep(0.00005)
         finalized = finalize_completion_report(report)
@@ -1286,7 +1250,7 @@ class Worker:
     ) -> tuple[KvBranchPlacement, ...]:
         session = self.requests.get(operation.request_key.session_id)
         image = session.image
-        generation = self._require_model().generation
+        generation = self.model.generation
         if image is None or generation is None:
             raise invalid_descriptor("generation warmup has no admitted image runtime")
         guide = build_flow_cfg_plan(
@@ -1364,17 +1328,21 @@ class Worker:
         private collective identities are retired.
         """
 
-        if self._system_only:
-            self.runner.complete_startup()
-            return
-
         import torch
 
-        if torch.device(self._require_deployment().device).type == "cuda":
+        product_devices = (
+            self.deployment.device,
+            self.deployment.generation_device or self.deployment.device,
+        )
+        self.device_products.warmup_scattered_publication(product_devices)
+        if torch.device(self.deployment.device).type == "cuda":
             self._warmup_sequence()
             logger.info("completed token CUDA graph warmup")
             self._warmup_flow()
             logger.info("completed flow CUDA graph warmup")
+        elif self._capabilities.mixed_buckets:
+            self._warmup_flow()
+            logger.info("completed mixed execution warmup")
         self.runner.complete_startup()
         logger.info("completed execution partition startup verification")
 
@@ -1571,7 +1539,7 @@ class Worker:
                     )
                     predecessors.update(zip(selected, operations, strict=True))
         finally:
-            device = torch.device(self._require_deployment().device)
+            device = torch.device(self.deployment.device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             for sid in session_ids:
@@ -1607,7 +1575,7 @@ class Worker:
         pool = self.cache_pool
         if self.requests.request_ids():
             return
-        max_route_tokens = int(self._require_model().text_max_tokens)
+        max_route_tokens = int(self.model.text_max_tokens)
         capacity = min(
             max_route_tokens,
             max(0, int(pool.request_pages) - 1) * int(pool.block_size),
@@ -1694,7 +1662,6 @@ class Worker:
             DType,
             FixedPoint,
             GenAdmission,
-            ImageParams,
             KvAdmission,
             Operation,
             PointRange,
@@ -1715,7 +1682,7 @@ class Worker:
             encode_token_product_bytes,
         )
 
-        generation = self._require_model().generation
+        generation = self.model.generation
         if not {
             WorkVariant.GEN_TRANSITION,
             WorkVariant.GEN_FLOW,
@@ -1723,32 +1690,47 @@ class Worker:
             return
         if self.requests.request_ids():
             return
-        configured: tuple[tuple[int, int, int], ...]
-        if not self._execution.cuda_graph:
-            configured = ((1, *self._warmup_image_geometry()),)
-        else:
+        configured = tuple(
+            sorted(
+                self._flow_graph_buckets,
+                key=lambda value: (
+                    value.rows * value.height * value.width * value.cfg_branches,
+                    value.rows,
+                    value.height,
+                    value.width,
+                    value.cfg_branches,
+                ),
+                reverse=True,
+            )
+        )
+        if not configured:
+            if self._execution.cuda_graph:
+                return
+            height, width = self._warmup_image_geometry()
             configured = tuple(
-                sorted(
-                    (
-                        (int(batch_size), int(height), int(width))
-                        for batch_size, height, width in self._flow_graph_buckets
-                    ),
-                    key=lambda value: value[0] * value[1] * value[2],
-                    reverse=True,
-                )
+                _FlowGraphBucket(1, height, width, cfg_branches)
+                for cfg_branches in self._flow_cfg_branches
             )
         next_session_id = 1
         next_generation = 1
-        for batch_size, height, width in configured:
+        for bucket in configured:
+            batch_size = bucket.rows
+            height = bucket.height
+            width = bucket.width
+            cfg_branches = bucket.cfg_branches
             if batch_size > int(self._capabilities.max_request_pool_size):
                 continue
             mixed_text_sizes = tuple(
-                text_batch_size
-                for text_batch_size, mixed_height, mixed_width in self._mixed_flow_graph_buckets
-                if batch_size == 1
-                and mixed_height == height
-                and mixed_width == width
-                and text_batch_size + batch_size <= int(self._capabilities.max_request_pool_size)
+                mixed.decode_rows
+                for mixed in self._mixed_flow_graph_buckets
+                if mixed.flow_rows == batch_size
+                and mixed.height == height
+                and mixed.width == width
+                and mixed.cfg_branches == cfg_branches
+                and mixed.decode_rows + batch_size <= int(self._capabilities.max_request_pool_size)
+            )
+            mixed_rounds = (
+                3 if self._execution.cuda_graph and self._execution.prefill_cuda_graph else 1
             )
             session_ids = tuple(range(next_session_id, next_session_id + batch_size))
             next_session_id += batch_size
@@ -1758,11 +1740,11 @@ class Worker:
                     key,
                     request_pool_idx=index,
                     gen_admission=GenAdmission(
-                        image=ImageParams(
-                            steps=2 + 2 * len(mixed_text_sizes),
+                        image=_startup_image_parameters(
+                            cfg_branches,
+                            steps=2 + mixed_rounds * len(mixed_text_sizes),
                             height=height,
                             width=width,
-                            seed=0,
                         )
                     ),
                 )
@@ -1879,6 +1861,7 @@ class Worker:
                             image_geometry=(height, width),
                         ),
                         retain_device_outputs=True,
+                        catalog_graphs=False,
                     )
                     text_predecessors.update(zip(text_session_ids, prompt_operations, strict=True))
                 max_latent_elements = max(
@@ -2000,7 +1983,7 @@ class Worker:
                 flow_op_id = 5
                 for text_batch_size in mixed_text_sizes:
                     selected_text = text_session_ids[:text_batch_size]
-                    for _ in range(2):
+                    for _ in range(mixed_rounds):
                         text_operations: list[Operation] = []
                         for session_id in selected_text:
                             predecessor = text_predecessors[session_id]
@@ -2137,8 +2120,6 @@ class Worker:
             )
 
     def copy_kv(self, copies: tuple[CacheCopy, ...]) -> None:
-        if self._system_only:
-            raise unsupported_control(RequestKind.COPY_KV.value)
         for group_id in {copy.group_id for copy in copies}:
             selected = tuple(copy for copy in copies if copy.group_id == group_id)
             self.cache_pool.copy_pages(
@@ -2154,8 +2135,6 @@ class Worker:
 
     def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         if self.snapshot_recovery is None:
-            if self._system_only:
-                raise unsupported_control(RequestKind.SNAPSHOT_SESSION.value)
             raise capability_mismatch("this worker has no configured snapshot recovery")
         self.runner.synchronize()
         return self.snapshot_recovery.snapshot_session(placement)
@@ -2166,8 +2145,6 @@ class Worker:
         placement: RecoveryPlacement,
     ) -> None:
         if self.snapshot_recovery is None:
-            if self._system_only:
-                raise unsupported_control(RequestKind.RESTORE_SESSION.value)
             raise capability_mismatch("this worker has no configured snapshot recovery")
         self.runner.synchronize()
         self.snapshot_recovery.restore(reference, placement)
@@ -2203,6 +2180,15 @@ class Worker:
         self.encoder_cache.close()
         self.device_products.close()
         self.device_events.close()
+
+    def set_completion_wake(
+        self,
+        wake: Callable[[], None],
+        wake_on_stream: Callable[[int], None],
+    ) -> None:
+        self.completion_arena.set_completion_wake(wake_on_stream)
+        self.cpu_tasks.set_completion_wake(wake)
+        self.transfers.set_completion_wake(wake)
 
 
 def _pressure(resource_class: str, used: int, total: int) -> dict[str, object]:

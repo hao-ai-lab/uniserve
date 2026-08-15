@@ -12,7 +12,6 @@ from .requests import (
     QKNormRopeReq,
     RmsNormReq,
     SiluAndMulReq,
-    TpAllReduceReq,
 )
 
 
@@ -283,15 +282,3 @@ def can_run_attention(
         fully_visible=fully_visible,
     )
     return can_run(selection, req)
-
-
-def tp_all_reduce(tensor, op: str = "sum", *, axis, override: str | None = None):
-    from .providers import tp_all_reduce_dispatcher
-
-    dispatcher = tp_all_reduce_dispatcher()
-    handoff = dispatcher.dispatch(
-        TpAllReduceReq(tensor, str(op), axis),
-        override=override,
-        mesh=axis,
-    )
-    return dispatcher.combine(handoff, override=override, mesh=axis)

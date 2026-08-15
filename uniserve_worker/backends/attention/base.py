@@ -25,8 +25,6 @@ class AttentionCapabilities:
     # selection and diagnostics can name it, but dispatch must not route generic
     # dense/paged attention through a backend whose kernel import failed.
     available: bool = True
-    segment_batched_cfg: bool = False
-    mixed_mode: bool = False
     paged_kv: bool = False
     varlen_attention: bool = False
     varlen_paged_kv: bool = False
@@ -34,7 +32,6 @@ class AttentionCapabilities:
     # not be selected for contiguous q/k/v varlen prefill.
     requires_paged_varlen: bool = False
     visible_end: bool = False
-    tree_verify: bool = False
     paged_block_size_multiple: int = 1
     min_head_dim: int = 1
     # The backend's paged-KV kernel only supports single-token decode (one query
@@ -65,19 +62,6 @@ class AttentionCapabilities:
         if not self.trunk_geometries:
             return True
         return (int(q_head_dim), int(k_head_dim), int(v_head_dim)) in self.trunk_geometries
-
-    def supports_trunk_head_dim(self, q_head_dim: int) -> bool:
-        """Whether the backend kernel can run *any* geometry with this q head dim.
-
-        Used on dispatch paths where only the query head dim is known before the
-        cache shapes are resolved. An empty :attr:`trunk_geometries` means the
-        backend is not geometry-restricted and accepts any q head dim.
-        """
-        if not self.trunk_geometries:
-            return True
-        dim = int(q_head_dim)
-        return any(q_dim == dim for q_dim, _k, _v in self.trunk_geometries)
-
 
 class AttentionBackend(Protocol):
     """Universal attention-backend contract.

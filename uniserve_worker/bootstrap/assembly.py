@@ -8,7 +8,7 @@ from dataclasses import replace
 from ..models.identity import architecture_identity
 from ..models.runtime import ExecutionModel
 from .config import WorkerLaunchConfig
-from .plan import WorkerImplementation, resolve_worker_plan
+from .plan import resolve_worker_plan
 
 logger = logging.getLogger(__name__)
 
@@ -17,20 +17,6 @@ def assemble_worker(config: WorkerLaunchConfig):
     """Materialize exactly one worker from a validated launch configuration."""
 
     plan = resolve_worker_plan(config.worker_kind)
-    if plan.implementation is WorkerImplementation.SYSTEM:
-        from ..worker import Worker
-
-        return Worker.system(
-            allowed_work_variants=plan.allowed_work_variants,
-            block_size=config.resources.block_size,
-            max_batch_tokens=config.resources.max_batch_tokens,
-            transfer_backend=config.data_plane.backend,
-            pipeline_depth=config.ipc.pipeline_depth,
-            completion_payload_bytes=config.ipc.max_payload_bytes,
-            device=config.placement.device,
-            snapshot_dir=config.snapshot_dir,
-        )
-
     from ..backends.attention import resolve_attention_selection
     from ..nn.mesh import TensorParallelSpec
     from ..nn.placement import place_towers
@@ -46,9 +32,6 @@ def assemble_worker(config: WorkerLaunchConfig):
         tp_init_method=config.placement.tp_init_method,
     )
     parallel = TensorParallelSpec.from_mesh(mesh)
-    if plan.model_scope is None:
-        raise RuntimeError("model worker plan has no model materialization scope")
-
     if config.use_stub_model:
         from ..server.stub import StubModel, stub_deployment
 
@@ -128,7 +111,6 @@ def assemble_worker(config: WorkerLaunchConfig):
         execution=config.execution,
         tokenizer=tokenizer,
         allowed_work_variants=plan.allowed_work_variants,
-        defer_sampling=config.data_plane.defer_sampling,
         transfer_backend=config.data_plane.backend,
         cross_process=config.worker_kind.value != "full",
         architecture_digest=architecture_digest,

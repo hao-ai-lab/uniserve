@@ -153,14 +153,16 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         parent=second_commit.selected,
         control_seq=second_commit.control_seq,
     )
-    publication_result = finalized_report(worker.execute(
-        execution_batch(
-            step_id=3,
-            admissions=(),
-            operations=(publication,),
-            controls=(second_commit,),
+    publication_result = finalized_report(
+        worker.execute(
+            execution_batch(
+                step_id=3,
+                admissions=(),
+                operations=(publication,),
+                controls=(second_commit,),
+            )
         )
-    ))
+    )
 
     assert publication_result.completions[0].selected_point == 0
     assert publication_result.completions[0].logical_lengths.kv_published_len == 3
@@ -212,14 +214,16 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         parent=suffix_commit.selected,
         control_seq=suffix_commit.control_seq,
     )
-    incremental_result = finalized_report(worker.execute(
-        execution_batch(
-            step_id=5,
-            admissions=(),
-            operations=(incremental,),
-            controls=(suffix_commit,),
+    incremental_result = finalized_report(
+        worker.execute(
+            execution_batch(
+                step_id=5,
+                admissions=(),
+                operations=(incremental,),
+                controls=(suffix_commit,),
+            )
         )
-    ))
+    )
     incremental_payload = incremental_result.products[0]
     kind, descriptor, producer_plan_digest = decode_transfer_descriptor(incremental_payload.payload)
     assert kind == "kv"
@@ -260,13 +264,15 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             parent=commit.selected,
             control_seq=commit.control_seq,
         )
-        published = finalized_report(producer.execute(
-            execution_batch(
-                step_id=2,
-                operations=(publication,),
-                controls=(commit,),
+        published = finalized_report(
+            producer.execute(
+                execution_batch(
+                    step_id=2,
+                    operations=(publication,),
+                    controls=(commit,),
+                )
             )
-        ))
+        )
         assert len(published.products) == 1
         installation, installed = _installation_operation(
             admission,

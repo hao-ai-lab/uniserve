@@ -273,44 +273,6 @@ class RuntimeStates:
                     snapshot.prompt_logits.to(self.device, dtype=self.logits_dtype)
                 )
 
-    def publish_sampling(
-        self,
-        request_pool_indices: torch.Tensor,
-        *,
-        tokens: torch.Tensor,
-        predicates: torch.Tensor,
-        selected_points: torch.Tensor,
-        logical_lengths: torch.Tensor,
-        sampling_positions: torch.Tensor,
-    ) -> None:
-        indices = self._indices(request_pool_indices)
-        count = int(indices.numel())
-        values = (
-            tokens.reshape(-1),
-            predicates.reshape(-1),
-            selected_points.reshape(-1),
-            logical_lengths.reshape(-1),
-            sampling_positions.reshape(-1),
-        )
-        if any(int(value.numel()) != count for value in values):
-            raise ValueError("runtime sampling publication columns are not aligned")
-        self.future_input_tokens[indices, 0] = values[0].to(device=self.device, dtype=torch.int64)
-        self.predicates[indices] = values[1].to(device=self.device, dtype=torch.bool)
-        self.selected_points[indices] = values[2].to(device=self.device, dtype=torch.int32)
-        self.logical_lengths[indices] = values[3].to(device=self.device, dtype=torch.int32)
-        self.sampling_positions[indices] = values[4].to(device=self.device, dtype=torch.int64)
-
-    def update_valid_cache_lengths(
-        self,
-        request_pool_indices: torch.Tensor,
-        values: torch.Tensor,
-    ) -> None:
-        indices = self._indices(request_pool_indices)
-        lengths = values.reshape(-1)
-        if int(lengths.numel()) != int(indices.numel()):
-            raise ValueError("runtime cache-length columns are not aligned")
-        self.valid_cache_lengths[indices] = lengths.to(device=self.device, dtype=torch.int32)
-
     def publish_decode(
         self,
         request_pool_indices: Sequence[int],

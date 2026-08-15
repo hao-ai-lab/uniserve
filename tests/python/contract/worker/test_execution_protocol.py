@@ -14,7 +14,6 @@ _RESPONSE_FIELDS = {
     "call_id",
     "capabilities",
     "completion_report",
-    "metrics",
     "pressure",
     "message",
     "code",

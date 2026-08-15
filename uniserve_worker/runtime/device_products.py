@@ -35,6 +35,9 @@ _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.BF16: torch.bfloat16,
     DType.F32: torch.float32,
 }
+_DEVICE_TORCH_DTYPES: Final[tuple[torch.dtype, ...]] = tuple(
+    dict.fromkeys(_DEVICE_DTYPES.values())
+)
 _PROTOCOL_STORAGE: Final[dict[DType, tuple[str, int]]] = {
     dtype: (
         str(torch_dtype).removeprefix("torch."),
@@ -44,7 +47,7 @@ _PROTOCOL_STORAGE: Final[dict[DType, tuple[str, int]]] = {
 }
 _TORCH_DTYPE_BYTES: Final[dict[torch.dtype, int]] = {
     torch_dtype: int(torch.empty((), dtype=torch_dtype).element_size())
-    for torch_dtype in frozenset(_DEVICE_DTYPES.values())
+    for torch_dtype in _DEVICE_TORCH_DTYPES
 }
 _DEVICE_PRODUCT_KINDS: Final[frozenset[ProductKind]] = frozenset(
     {
@@ -229,10 +232,6 @@ class DeviceProductRead:
         return self._write.reference
 
     @property
-    def physical_slot(self) -> int:
-        return self._write.slot.index
-
-    @property
     def physical_generation(self) -> int:
         return self._write.physical_generation
 
@@ -298,11 +297,6 @@ class DeviceProducts:
         self._binding_token = object()
         self._lock = RLock()
 
-    @property
-    def allocated_bytes(self) -> int:
-        with self._lock:
-            return self._allocated_bytes
-
     def close(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -315,6 +309,32 @@ class DeviceProducts:
             self._free_slot_queues.clear()
             self._compatible_free_slots.clear()
             self._allocated_bytes = 0
+
+    def warmup_scattered_publication(
+        self,
+        devices: Iterable[torch.device | str],
+    ) -> None:
+        """Materialize the CUDA kernels used by scattered scalar publication."""
+
+        resolved = tuple(dict.fromkeys(_resolved_device(device) for device in devices))
+        for device in resolved:
+            if device.type != "cuda":
+                continue
+            retained: list[torch.Tensor] = []
+            with torch.cuda.device(device):
+                for dtype in _DEVICE_TORCH_DTYPES:
+                    source = torch.empty(2, dtype=dtype, device=device)
+                    targets = (
+                        torch.empty(1, dtype=dtype, device=device),
+                        torch.empty(1, dtype=dtype, device=device),
+                    )
+                    torch._foreach_copy_(
+                        targets,
+                        (source[0:1], source[1:2]),
+                        non_blocking=True,
+                    )
+                    retained.extend((source, *targets))
+                torch.cuda.current_stream(device).synchronize()
 
     @staticmethod
     def _tensor_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -337,51 +357,6 @@ class DeviceProducts:
         bindings: tuple[tuple[ProductRef, str, torch.device | str], ...],
     ) -> tuple[DeviceProductWrite, ...]:
         return self.bind_output_batch(bindings).writes
-
-    def restore_published(
-        self,
-        bindings: tuple[
-            tuple[ProductRef, str, torch.Tensor, torch.device | str],
-            ...,
-        ],
-    ) -> tuple[torch.Tensor, ...]:
-        """Install exact checkpoint products as ordinary published generations.
-
-        Restore is an administrative boundary: selected sessions have no
-        runnable work, so their prior bindings are logically released before
-        the checkpoint values are atomically rebound. The resulting entries use
-        the same lookup, generation, event, reader, and reclamation machinery as
-        products created by model execution.
-        """
-
-        if not bindings:
-            return ()
-        session_ids = {
-            int(reference.request_key.session_id)
-            for reference, _digest, _value, _device in bindings
-        }
-        for session_id in session_ids:
-            self.drop_session(session_id)
-        batch = self.bind_output_batch(
-            tuple(
-                (reference, producer_plan_digest, device)
-                for reference, producer_plan_digest, _value, device in bindings
-            )
-        )
-        try:
-            values = tuple(
-                self.publish_write(write, value)
-                for write, (_reference, _digest, value, _device) in zip(
-                    batch.writes,
-                    bindings,
-                    strict=True,
-                )
-            )
-            self.commit_writes(batch.writes)
-            return values
-        except BaseException:
-            self.abandon_writes(batch.writes)
-            raise
 
     def snapshot_entries(self, session_ids: set[int]) -> tuple[DeviceProductSnapshot, ...]:
         selected = {int(value) for value in session_ids}
@@ -719,28 +694,6 @@ class DeviceProducts:
                 self._restore_planned_slots_locked(slots)
                 raise
 
-    def producer_view(self, reference: ProductRef) -> torch.Tensor:
-        """Return a bound unpublished tensor for the registered producer."""
-
-        return self.producer_views((reference,))[0]
-
-    def producer_views(
-        self,
-        references: tuple[ProductRef, ...],
-    ) -> tuple[torch.Tensor, ...]:
-        """Return bound unpublished tensors under one generation check batch."""
-
-        if not references:
-            return ()
-        with self._lock:
-            entries = tuple(self._require_locked(reference) for reference in references)
-            if any(entry.producer_recorded for entry in entries):
-                raise _invariant("device product was published more than once")
-            tensors = tuple(entry.slot.tensor for entry in entries)
-            if any(tensor is None for tensor in tensors):
-                raise _invariant("device product has no physical tensor")
-            return tuple(tensor for tensor in tensors if tensor is not None)
-
     def producer_write_views(
         self,
         writes: tuple[DeviceProductWrite, ...],
@@ -784,17 +737,6 @@ class DeviceProducts:
                 self._require_live_scalar_batch_locked(linked)
                 return linked
             return self._scalar_batch_locked(writes)
-
-    def publish(
-        self,
-        reference: ProductRef,
-        value: torch.Tensor,
-        *,
-        producer_event: torch.cuda.Event | None = None,
-    ) -> torch.Tensor:
-        with self._lock:
-            entry = self._require_locked(reference)
-            return self._publish_locked(entry, value, producer_event=producer_event)
 
     def publish_write(
         self,
@@ -840,25 +782,6 @@ class DeviceProducts:
             entry._scalar_batch._published = True
         return view.reshape(value.shape)
 
-    def publish_batch(
-        self,
-        references: tuple[ProductRef, ...],
-        values: torch.Tensor,
-        *,
-        producer_event: torch.cuda.Event | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        """Publish aligned scalar products with one stream-completion event."""
-
-        if not references:
-            return ()
-        with self._lock:
-            entries = tuple(self._require_locked(reference) for reference in references)
-            return self._publish_batch_locked(
-                entries,
-                values,
-                producer_event=producer_event,
-            )
-
     def publish_writes(
         self,
         writes: tuple[DeviceProductWrite, ...],
@@ -873,25 +796,6 @@ class DeviceProducts:
         with self._lock:
             entries = tuple(self._require_write_locked(write) for write in writes)
             return self._publish_batch_locked(
-                entries,
-                values,
-                producer_event=producer_event,
-            )
-
-    def publish_rows(
-        self,
-        writes: tuple[DeviceProductWrite, ...],
-        values: torch.Tensor,
-        *,
-        producer_event: torch.cuda.Event | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        """Publish equal-shaped tensor rows with one completion event."""
-
-        if not writes:
-            return ()
-        with self._lock:
-            entries = tuple(self._require_write_locked(write) for write in writes)
-            return self._publish_rows_locked(
                 entries,
                 values,
                 producer_event=producer_event,
@@ -1016,7 +920,8 @@ class DeviceProducts:
         source = flat.to(dtype=first.dtype)
         slots = tuple(entry.slot.index for entry in entries)
         arena = self._scalar_arenas.get((str(first.device), first.dtype))
-        if arena is not None and slots == tuple(range(slots[0], slots[0] + len(slots))):
+        contiguous = slots == tuple(range(slots[0], slots[0] + len(slots)))
+        if arena is not None and contiguous:
             destination = arena.narrow(0, slots[0], len(slots))
             aliases_destination = (
                 source.device == destination.device
@@ -1029,6 +934,19 @@ class DeviceProducts:
                     source,
                     non_blocking=source.device.type == "cuda",
                 )
+        elif arena is not None:
+            aliases_arena = (
+                source.device == arena.device
+                and source.dtype == arena.dtype
+                and source.untyped_storage().data_ptr() == arena.untyped_storage().data_ptr()
+            )
+            if aliases_arena:
+                source = source.clone()
+            torch._foreach_copy_(
+                tensors,
+                tuple(source[index : index + 1] for index in range(len(tensors))),
+                non_blocking=source.device.type == "cuda",
+            )
         else:
             for index, tensor in enumerate(tensors):
                 source_view = source[index : index + 1]
@@ -1064,74 +982,6 @@ class DeviceProducts:
         if linked is not None:
             linked._published = True
         return tensors
-
-    def _publish_rows_locked(
-        self,
-        entries: tuple[DeviceProductWrite, ...],
-        values: torch.Tensor,
-        *,
-        producer_event: torch.cuda.Event | None,
-    ) -> tuple[torch.Tensor, ...]:
-        rows = values.detach()
-        if rows.ndim < 2 or int(rows.shape[0]) != len(entries):
-            raise invalid_descriptor(
-                "row device-product publication requires one tensor row per output"
-            )
-        if any(entry.producer_recorded for entry in entries):
-            raise _invariant("device product was published more than once")
-        targets = tuple(entry.slot.tensor for entry in entries)
-        if any(target is None for target in targets):
-            raise _invariant("device product has no physical tensor")
-        tensors = tuple(target for target in targets if target is not None)
-        first = tensors[0]
-        if any(tensor.device != first.device or tensor.dtype != first.dtype for tensor in tensors):
-            raise invalid_descriptor("row device-product publication spans incompatible storage")
-        if rows.device != first.device:
-            raise invalid_descriptor("row device-product publication spans incompatible devices")
-
-        row_shape = tuple(int(size) for size in rows.shape[1:])
-        row_extent = math.prod(row_shape)
-        if any(int(tensor.numel()) < row_extent for tensor in tensors):
-            raise _invariant("device product exceeds its registered shape bound")
-        source = rows.to(dtype=first.dtype)
-        views = tuple(tensor.reshape(-1)[:row_extent].reshape(row_shape) for tensor in tensors)
-        torch._foreach_copy_(
-            views,
-            tuple(source.unbind(0)),
-            non_blocking=source.device.type == "cuda",
-        )
-
-        event: torch.cuda.Event | None = None
-        if first.device.type == "cuda":
-            event, stream_id = self._producer_event_locked(
-                first.device,
-                producer_event,
-            )
-            self._retain_event_locked(event, first.device, len(entries))
-        else:
-            stream_id = None
-        for entry in entries:
-            entry.producer_event = event
-            entry.producer_stream = stream_id
-            entry.actual_extent = row_extent
-            entry.actual_shape = row_shape
-            entry.producer_recorded = True
-        return views
-
-    def publish_scalar(
-        self,
-        reference: ProductRef,
-        value: bool | int,
-        *,
-        producer_event: torch.cuda.Event | None = None,
-    ) -> torch.Tensor:
-        with self._lock:
-            entry = self._require_locked(reference)
-            return self._publish_scalar_locked(
-                entry,
-                value,
-                producer_event=producer_event,
-            )
 
     def publish_scalar_write(
         self,
@@ -1394,14 +1244,6 @@ class DeviceProducts:
                 )
             return tuple(reads)
 
-    def record_reader(
-        self,
-        read: DeviceProductRead,
-        *,
-        device: torch.device | str | None = None,
-    ) -> None:
-        self.record_readers((read,), device=device)
-
     def record_readers(
         self,
         reads: tuple[DeviceProductRead, ...],
@@ -1542,9 +1384,6 @@ class DeviceProducts:
                     for entry in pending:
                         self._append_reader_event_locked(entry, event, target)
 
-    def release_operation(self, request_key: RequestKey, op_id: int) -> None:
-        self.release_operations(((request_key, op_id),))
-
     def release_operations(
         self,
         releases: Iterable[tuple[RequestKey, int]],
@@ -1614,17 +1453,6 @@ class DeviceProducts:
                 entry.released = True
             self._reclaim_ready_locked()
 
-    def abandon_outputs(self, references: tuple[ProductRef, ...]) -> None:
-        with self._lock:
-            for reference in references:
-                key = _reference_key(reference)
-                entry = self._entries.get(key)
-                if entry is None or entry.reference != reference:
-                    continue
-                entry.logical_references = 0
-                entry.released = True
-            self._reclaim_ready_locked()
-
     def abandon_writes(self, writes: tuple[DeviceProductWrite, ...]) -> None:
         with self._lock:
             for write in writes:
@@ -1636,22 +1464,9 @@ class DeviceProducts:
                 entry.released = True
             self._reclaim_ready_locked()
 
-    def reclaim_ready(self) -> int:
-        with self._lock:
-            return self._reclaim_ready_locked()
-
     def physical_generation(self, reference: ProductRef) -> int:
         with self._lock:
             return self._require_locked(reference).physical_generation
-
-    def validate_completion(self, references: tuple[ProductRef, ...]) -> None:
-        with self._lock:
-            for reference in references:
-                if reference.storage_class is not StorageClass.DEVICE_TENSOR:
-                    continue
-                entry = self._require_locked(reference)
-                if not entry.producer_recorded:
-                    raise _invariant("completion packing found an unpublished device product")
 
     def validate_writes(self, writes: tuple[DeviceProductWrite, ...]) -> None:
         with self._lock:

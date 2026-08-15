@@ -103,10 +103,3 @@ class AttentionReq:
     seqused_k: torch.Tensor | None = None
     use_prefix_bounds: bool = False
     fully_visible: bool = False
-
-
-@dataclass(frozen=True)
-class TpAllReduceReq:
-    tensor: torch.Tensor
-    op: str
-    axis: Any

@@ -18,6 +18,7 @@ def test_cuda_completions_become_observable_by_event_query() -> None:
     pending = []
     for expected in ((3, 7, 11), (13,)):
         lease = arena.reserve(1, devices=(device,))
+        lease.begin_device(device)
         capture = lease.capture(torch.tensor(expected, dtype=torch.long, device=device))
         lease.seal()
         pending.append((lease, capture, expected))
@@ -30,6 +31,11 @@ def test_cuda_completions_become_observable_by_event_query() -> None:
     for lease, capture, expected in reversed(pending):
         assert capture.values() == expected
         lease.observe(0, lease.generation)
+        queued_us, device_us, copy_us, host_us = lease.timing()
+        assert queued_us >= 0
+        assert device_us > 0
+        assert copy_us >= 0
+        assert host_us >= 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

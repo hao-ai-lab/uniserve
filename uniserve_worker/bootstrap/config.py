@@ -9,9 +9,8 @@ from ..foundation.runtime_config import (
     ExecutionConfig,
     execution_config_from_namespace,
 )
-from ..loader.schema import ModelLoadScope
 from ..server.worker_kind import WorkerKind
-from .plan import WorkerImplementation, resolve_worker_plan
+from .plan import ModelLoadScope, resolve_worker_plan
 
 
 @dataclass(frozen=True)
@@ -49,7 +48,6 @@ class ModelLaunchConfig:
 @dataclass(frozen=True)
 class DataPlaneConfig:
     backend: str
-    defer_sampling: bool
 
 
 @dataclass(frozen=True)
@@ -80,18 +78,13 @@ class WorkerLaunchConfig:
         _validate_scalars(namespace, generation_kv_capacity_tokens)
         if use_stub_model and not bool(namespace.allow_stub):
             raise ValueError("--no-model loads synthetic outputs and requires --allow-stub")
-        if use_stub_model and plan.implementation is not WorkerImplementation.MODEL:
-            raise ValueError(
-                f"--no-model is only valid for model workers, not {worker_kind.value!r}"
-            )
         if use_stub_model and plan.model_scope is not ModelLoadScope.WHOLE:
             raise ValueError("--no-model cannot emulate partial model materialization")
-        if plan.requires_model and not use_stub_model and not model_path:
+        if not use_stub_model and not model_path:
             raise ValueError(f"--model is required for worker kind {worker_kind.value!r}")
         _validate_data_plane(
             worker_kind,
             backend=backend,
-            defer_sampling=bool(namespace.defer_sampling),
         )
 
         return cls(
@@ -130,7 +123,6 @@ class WorkerLaunchConfig:
             ),
             data_plane=DataPlaneConfig(
                 backend=backend,
-                defer_sampling=bool(namespace.defer_sampling),
             ),
             execution=execution_config_from_namespace(namespace),
             use_stub_model=use_stub_model,
@@ -165,14 +157,11 @@ def _validate_data_plane(
     worker_kind: WorkerKind,
     *,
     backend: str,
-    defer_sampling: bool,
 ) -> None:
     if backend not in {"local", "shm", "cuda_ipc"}:
         raise ValueError(f"unknown --transfer-backend {backend!r}")
     if worker_kind in {WorkerKind.UND, WorkerKind.GEN} and backend != "cuda_ipc":
         raise ValueError(f"{worker_kind.value!r} requires same-node CUDA IPC transport")
-    if (worker_kind is WorkerKind.SAMPLER or defer_sampling) and backend == "local":
-        raise ValueError(f"{worker_kind.value!r} requires a cross-process logits transport")
 
 
 def _parse_mesh(

@@ -3,32 +3,14 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Generic, Protocol, TypeVar, runtime_checkable
 
 from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
 
 Req = TypeVar("Req")
 Res = TypeVar("Res")
-DispatchReq = TypeVar("DispatchReq")
-CombineRes = TypeVar("CombineRes")
-Adapted = TypeVar("Adapted")
 ProviderReq = TypeVar("ProviderReq", contravariant=True)
 ProviderRes = TypeVar("ProviderRes", covariant=True)
-CommReq = TypeVar("CommReq", contravariant=True)
-CommRes = TypeVar("CommRes", covariant=True)
-
-
-@dataclass(frozen=True)
-class Capabilities:
-    """Static provider capabilities used for coarse selection and introspection."""
-
-    tags: frozenset[str] = frozenset()
-    priority: int = 0
-    attrs: dict[str, Any] = field(default_factory=dict)
-
-    def get(self, name: str, default: Any = None) -> Any:
-        return self.attrs.get(name, default)
 
 
 @runtime_checkable
@@ -36,47 +18,9 @@ class Provider(Protocol[ProviderReq, ProviderRes]):
     name: str
     operator: str
 
-    def capabilities(self) -> Capabilities: ...
-
     def can_run(self, req: ProviderReq) -> bool: ...
 
     def run(self, req: ProviderReq) -> ProviderRes: ...
-
-
-@dataclass(frozen=True)
-class Handoff:
-    """Format-tagged state passed between phases of a communication op.
-
-    Composite ops such as MoE choose a comm provider and a compute provider on
-    separate axes. The comm dispatch phase returns one of these handoffs; adapter
-    pools can then translate ``handoff.format`` into the compute provider's
-    preferred input layout before the same comm provider combines the result.
-    """
-
-    format: str
-    payload: Any = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-    operator: str | None = None
-    provider: str | None = None
-
-
-@runtime_checkable
-class CommProvider(Protocol[CommReq, CommRes]):
-    name: str
-    operator: str
-
-    def capabilities(self) -> Capabilities: ...
-
-    def can_dispatch(self, req: CommReq, *, mesh: Any | None = None) -> bool: ...
-
-    def dispatch(self, req: CommReq, *, mesh: Any | None = None) -> Handoff: ...
-
-    def can_combine(self, handoff: Handoff, *, mesh: Any | None = None) -> bool: ...
-
-    def combine(self, handoff: Handoff, *, mesh: Any | None = None) -> CommRes: ...
-
-
-
 
 class Dispatcher(Generic[Req, Res]):
     """Run the first eligible provider for one operator.
@@ -104,10 +48,6 @@ class Dispatcher(Generic[Req, Res]):
         self._fallback_names = fallback_names
         if not any(p.name in self._fallback_names for p in self._providers):
             raise ValueError(f"operator {operator!r} has no terminal fallback provider")
-
-    @property
-    def providers(self) -> tuple[Provider[Req, Res], ...]:
-        return tuple(self._providers)
 
     def provider_names(self) -> tuple[str, ...]:
         return tuple(p.name for p in self._providers)
@@ -193,158 +133,3 @@ class Dispatcher(Generic[Req, Res]):
                     self._memo[key] = provider.name
                 return self._observe(provider, req)
         raise RuntimeError(f"operator {self.operator!r} has no eligible provider; eager provider is broken")
-
-
-class CommDispatcher(Generic[DispatchReq, CombineRes]):
-    """Two-phase dispatcher for stateful collective/communication providers."""
-
-    def __init__(
-        self,
-        operator: str,
-        providers: list[CommProvider[DispatchReq, CombineRes]],
-        *,
-        env_override: str | None = None,
-        fallback_names: tuple[str, ...] = ("standard", "eager"),
-    ) -> None:
-        if not providers:
-            raise ValueError(f"comm operator {operator!r} needs at least one provider")
-        self.operator = operator
-        self._providers = list(providers)
-        self._env_override = env_override
-        self._fallback_names = fallback_names
-        if not any(p.name in self._fallback_names for p in self._providers):
-            raise ValueError(f"comm operator {operator!r} has no terminal fallback provider")
-
-    @property
-    def providers(self) -> tuple[CommProvider[DispatchReq, CombineRes], ...]:
-        return tuple(self._providers)
-
-    def provider_names(self) -> tuple[str, ...]:
-        return tuple(p.name for p in self._providers)
-
-    def _resolve_override(self, override: str | None) -> str | None:
-        selected = override
-        if selected is None and self._env_override:
-            selected = os.environ.get(self._env_override)
-        if selected is None:
-            return None
-        selected = str(selected).strip()
-        if not selected or selected.lower() == "auto":
-            return None
-        if selected.lower() in {"0", "false", "off", "standard", "eager"}:
-            return self._fallback_names[0]
-        if selected.lower() in {"1", "true", "on"}:
-            return None
-        return selected
-
-    def _raise_unknown_override(self, selected: str) -> None:
-        available = ", ".join(self.provider_names())
-        raise ValueError(
-            f"unknown comm provider override {selected!r} for operator {self.operator!r}; "
-            f"available providers: {available}"
-        )
-
-    def _ordered(self, override: str | None) -> list[CommProvider[DispatchReq, CombineRes]]:
-        selected = self._resolve_override(override)
-        if selected is None:
-            return list(self._providers)
-        matches = [p for p in self._providers if p.name == selected]
-        rest = [p for p in self._providers if p.name != selected]
-        if not matches:
-            self._raise_unknown_override(selected)
-        return matches + rest
-
-    def dispatch(
-        self,
-        req: DispatchReq,
-        *,
-        override: str | None = None,
-        mesh: Any | None = None,
-    ) -> Handoff:
-        for provider in self._ordered(override):
-            if provider.can_dispatch(req, mesh=mesh):
-                handoff = provider.dispatch(req, mesh=mesh)
-                return replace(
-                    handoff,
-                    operator=handoff.operator or self.operator,
-                    provider=handoff.provider or provider.name,
-                )
-        raise RuntimeError(
-            f"comm operator {self.operator!r} has no eligible dispatch provider; "
-            "terminal fallback provider is broken"
-        )
-
-    def combine(
-        self,
-        handoff: Handoff,
-        *,
-        override: str | None = None,
-        mesh: Any | None = None,
-    ) -> CombineRes:
-        selected = override or handoff.provider
-        for provider in self._ordered(selected):
-            if provider.can_combine(handoff, mesh=mesh):
-                return provider.combine(handoff, mesh=mesh)
-        raise RuntimeError(
-            f"comm operator {self.operator!r} has no eligible combine provider "
-            f"for handoff format {handoff.format!r}"
-        )
-
-
-class AdapterPool:
-    """Format adapters for composite ops with independent comm/compute axes."""
-
-    def __init__(self) -> None:
-        self._pre: dict[tuple[str, str], Callable[[Handoff], Any]] = {}
-        self._post: dict[tuple[str, str], Callable[[Any], Handoff]] = {}
-
-    def register_pre(
-        self,
-        handoff_format: str,
-        compute_provider: str,
-        fn: Callable[[Handoff], Any],
-    ) -> None:
-        self._pre[(str(handoff_format), str(compute_provider))] = fn
-
-    def register_post(
-        self,
-        compute_provider: str,
-        combine_format: str,
-        fn: Callable[[Any], Handoff],
-    ) -> None:
-        self._post[(str(compute_provider), str(combine_format))] = fn
-
-    def adapt_pre(self, handoff: Handoff, compute_provider: str) -> Any:
-        key = (handoff.format, str(compute_provider))
-        try:
-            return self._pre[key](handoff)
-        except KeyError as exc:
-            raise KeyError(
-                f"no pre-adapter for handoff format {handoff.format!r} "
-                f"and compute provider {compute_provider!r}"
-            ) from exc
-
-    def adapt_post(self, value: Any, compute_provider: str, combine_format: str) -> Handoff:
-        key = (str(compute_provider), str(combine_format))
-        try:
-            return self._post[key](value)
-        except KeyError as exc:
-            raise KeyError(
-                f"no post-adapter for compute provider {compute_provider!r} "
-                f"and combine format {combine_format!r}"
-            ) from exc
-
-
-class FusedOpPool:
-    """Registry for co-designed composite fast paths."""
-
-    def __init__(self) -> None:
-        self._ops: dict[tuple[str, ...], Callable[..., Any]] = {}
-
-    def register(self, axes: tuple[str, ...], fn: Callable[..., Any]) -> None:
-        if not axes:
-            raise ValueError("fused op axes must not be empty")
-        self._ops[tuple(str(axis) for axis in axes)] = fn
-
-    def get(self, axes: tuple[str, ...]) -> Callable[..., Any] | None:
-        return self._ops.get(tuple(str(axis) for axis in axes))

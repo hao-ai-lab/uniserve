@@ -496,10 +496,6 @@ class EncoderCache:
             self.abandon_writes(writes)
             raise
 
-    def reclaim_ready(self) -> int:
-        with self._lock:
-            return self._reclaim_ready_locked()
-
     def close(self) -> None:
         with self._lock:
             self._entries.clear()

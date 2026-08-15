@@ -10,7 +10,6 @@ import torch
 
 from ..backends.paged_kv_math import paged_kv_write
 from ..foundation.device import (
-    TensorStagingSlot,
     copy_cpu_to_device,
     cpu_int_staging_buffer,
     fill_cpu_ints,
@@ -819,8 +818,6 @@ class CacheBatchView:
     def block_table(
         self,
         device: torch.device,
-        *,
-        slot: TensorStagingSlot | None = None,
     ) -> torch.Tensor:
         target = torch.device(device)
         cached = self._block_tables.get(target)
@@ -830,8 +827,6 @@ class CacheBatchView:
             len(self._rows) * self._block_table_width,
             dtype=torch.int32,
             pin=target.type == "cuda",
-            slot=slot,
-            name="kv_block_table",
         )
         offset = 0
         for pages in self._block_ids:
@@ -843,8 +838,6 @@ class CacheBatchView:
             cpu,
             device=target,
             non_blocking=target.type == "cuda" and is_pinned(cpu),
-            slot=slot,
-            name="kv_block_table",
         ).view(len(self._rows), self._block_table_width)
         self._block_tables[target] = result
         return result
@@ -852,8 +845,6 @@ class CacheBatchView:
     def cache_seqlens(
         self,
         device: torch.device,
-        *,
-        slot: TensorStagingSlot | None = None,
     ) -> torch.Tensor:
         target = torch.device(device)
         cached = self._cache_lengths.get(target)
@@ -863,16 +854,12 @@ class CacheBatchView:
             len(self._base_lens),
             dtype=torch.int32,
             pin=target.type == "cuda",
-            slot=slot,
-            name="kv_cache_lengths",
         )
         fill_cpu_ints(cpu, self._base_lens)
         result = copy_cpu_to_device(
             cpu,
             device=target,
             non_blocking=target.type == "cuda" and is_pinned(cpu),
-            slot=slot,
-            name="kv_cache_lengths",
         )
         self._cache_lengths[target] = result
         return result

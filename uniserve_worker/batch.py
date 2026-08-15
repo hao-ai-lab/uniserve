@@ -419,7 +419,6 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "kv_dtype",
         "model_dtype",
         "attention_backend",
-        "quantization",
         "rank",
         "pipeline_depth",
         "encoder_cache_budget",
@@ -427,13 +426,14 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "max_batch_operations",
         "max_unresolved_window",
         "incremental_kv_publication",
-        "tensorized_mixed",
+        "mixed_buckets",
         "sampling_ownership",
         "resource_classes",
         "model_identity",
         "weight_digest",
         "protocol_layout_digest",
     ),
+    ("decode_rows", "flow_rows", "height", "width", "cfg_branches"),
 )
 
 
@@ -1040,6 +1040,10 @@ class Work:
     def advances_state(self) -> bool:
         return self.variant_index in _STATE_ADVANCING_WORK
 
+    @property
+    def requires_fixed_parent(self) -> bool:
+        return self.variant is WorkVariant.TRANSFER_KV_PUBLISH
+
     @classmethod
     def token(cls, mode: TokenMode) -> Work:
         return cls("token", mode.value)
@@ -1224,6 +1228,8 @@ class Operation:
             )
         if self.parent.request_key != self.request_key:
             raise invalid_descriptor("operation parent belongs to another request lineage")
+        if self.work.requires_fixed_parent and not isinstance(self.parent.point, FixedPoint):
+            raise invalid_descriptor("operation requires a fixed semantic parent")
         if self.bounds.max_kv_pages > self.kv_capacity_pages:
             raise invalid_descriptor("operation KV growth bound exceeds its logical capacity")
         output_indices: set[int] = set()
@@ -2600,7 +2606,12 @@ class Batch:
                     "a submission batch reuses a control identity with different content"
                 )
             identities[identity] = control
-        declared_inputs = {product for operation in self.operations for product in operation.inputs}
+        declared_inputs = {
+            product
+            for operation in self.operations
+            for product in (*operation.inputs, operation.predicate)
+            if product is not None
+        }
         for operation in self.operations:
             for product in operation.inputs:
                 if product.storage_class is StorageClass.HOST_STAGING and (
@@ -2787,6 +2798,7 @@ class SamplingState:
     allowed_token_ids: tuple[int, ...] | None = None
     suppressed_token_ids: tuple[int, ...] = ()
     finish_token_ids: tuple[int, ...] = ()
+    transition_token_ids: tuple[int, ...] = ()
     force_finish: bool = False
 
 
@@ -2798,6 +2810,7 @@ def encode_sampling_state_bytes(state: SamplingState) -> bytes:
     )
     suppressed = tuple(sorted(set(int(token) for token in state.suppressed_token_ids)))
     finish = tuple(sorted(set(int(token) for token in state.finish_token_ids)))
+    transition = tuple(sorted(set(int(token) for token in state.transition_token_ids)))
     out = bytearray()
     if allowed is None:
         out += b"\x00"
@@ -2810,6 +2823,9 @@ def encode_sampling_state_bytes(state: SamplingState) -> bytes:
         out += struct.pack("<I", token)
     out += struct.pack("<I", len(finish))
     for token in finish:
+        out += struct.pack("<I", token)
+    out += struct.pack("<I", len(transition))
+    for token in transition:
         out += struct.pack("<I", token)
     out += bytes((int(state.force_finish),))
     return bytes(out)
@@ -2844,6 +2860,7 @@ def decode_sampling_state_bytes(data: bytes) -> SamplingState:
         raise invalid_descriptor(f"sampling-state allowed presence {presence} is invalid")
     suppressed = take_ids(take_u32())
     finish = take_ids(take_u32())
+    transition = take_ids(take_u32())
     if offset >= len(data):
         raise invalid_descriptor("sampling-state bytes omit force-finish")
     force_finish = data[offset]
@@ -2852,7 +2869,7 @@ def decode_sampling_state_bytes(data: bytes) -> SamplingState:
         raise invalid_descriptor(f"sampling-state force-finish {force_finish} is invalid")
     if offset != len(data):
         raise invalid_descriptor("sampling-state bytes contain trailing data")
-    return SamplingState(allowed, suppressed, finish, bool(force_finish))
+    return SamplingState(allowed, suppressed, finish, transition, bool(force_finish))
 
 
 @dataclass(frozen=True, slots=True)
@@ -3215,12 +3232,9 @@ def _digest_und_admission(digest: _Digest, value: UndAdmission) -> None:
 # ---------------------------------------------------------------------------
 # Decode helpers
 #
-# Every helper (and every `_fast_*` record decoder below) has one contract: on
-# well-formed wire values it produces exactly the value the original readable
-# decode would, without allocating error-location strings on the happy path;
-# on anything anomalous it falls back to the original checks so the raised
-# error is identical. `type(x) is T` guards route exotic-but-valid values
-# (int/str subclasses) onto the fallback, which accepts them as before.
+# Each `_fast_*` helper recognizes the exact built-in wire shape without
+# allocating error-location strings. A non-matching value returns ``None`` so
+# the caller applies the canonical validated constructor and its precise error.
 # ---------------------------------------------------------------------------
 
 _E = TypeVar("_E", bound=StrEnum)

@@ -73,14 +73,6 @@ class ExecutionPartitionRuntime:
     def domains(self) -> tuple[Domain, ...]:
         return tuple(Domain) if self.lane is None else self.lane.domains
 
-    @property
-    def context_handle(self) -> int | None:
-        return None if self._green is None else int(self._green.context)
-
-    @property
-    def green_context_handle(self) -> int | None:
-        return None if self._green is None else int(self._green.green)
-
     def verify_stream(self) -> None:
         if self._green is None:
             return

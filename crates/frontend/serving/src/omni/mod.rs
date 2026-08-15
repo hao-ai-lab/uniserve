@@ -46,7 +46,6 @@ mod context_image_defaults {
 struct RuntimeBinding<'a> {
     tokenizer: DynTokenizer,
     capabilities: &'a GenerationRuntimeCapabilities,
-    policy: &'a GenerationPolicyDescriptor,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
     identity: ModelEventIdentity,
@@ -89,7 +88,6 @@ pub(crate) fn tokenize_sensenova(
     let binding = RuntimeBinding {
         tokenizer,
         capabilities,
-        policy: &profile.generation_policy,
         default_max_output_tokens,
         max_model_tokens,
         identity,
@@ -97,8 +95,12 @@ pub(crate) fn tokenize_sensenova(
     let result = (|| {
         let lowered = lower_sensenova(profile, &binding.tokenizer, renderer, &request)?;
         let context = build_sensenova_context(profile, &lowered)?;
+        let policy = profile
+            .generation_policy_for_dimensions(lowered.image.width, lowered.image.height)
+            .map_err(|error| error.to_string())?;
         finish_tokenized(
             &binding,
+            &policy,
             request,
             lowered,
             context,
@@ -125,7 +127,6 @@ pub(crate) fn tokenize_bagel(
     let binding = RuntimeBinding {
         tokenizer,
         capabilities,
-        policy: &profile.generation_policy,
         default_max_output_tokens,
         max_model_tokens,
         identity,
@@ -133,8 +134,12 @@ pub(crate) fn tokenize_bagel(
     let result = (|| {
         let lowered = lower_bagel(profile, &binding.tokenizer, renderer, &request)?;
         let context = build_bagel_context(profile, &lowered)?;
+        let policy = profile
+            .generation_policy_for_dimensions(lowered.image.width, lowered.image.height)
+            .map_err(|error| error.to_string())?;
         finish_tokenized(
             &binding,
+            &policy,
             request,
             lowered,
             context,
@@ -153,7 +158,7 @@ fn lower_sensenova(
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
 ) -> std::result::Result<LoweredInput, String> {
-    let constraint = derive_constraint(request);
+    let constraint = generation_constraint(request);
     let (prompt_ids, images) = sensenova_prompt(profile, tokenizer, renderer, request, constraint)?;
     validate_prompt(&prompt_ids)?;
     let negative_prompt_ids = profile
@@ -181,7 +186,7 @@ fn lower_bagel(
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
 ) -> std::result::Result<LoweredInput, String> {
-    let constraint = derive_constraint(request);
+    let constraint = generation_constraint(request);
     let (prompt_ids, images, context_image_mode) =
         bagel_prompt(profile, tokenizer, renderer, request, constraint)?;
     validate_prompt(&prompt_ids)?;
@@ -448,6 +453,7 @@ fn tokenize_bagel_with_slots(
 
 fn finish_tokenized(
     binding: &RuntimeBinding<'_>,
+    policy: &GenerationPolicyDescriptor,
     request: GenerateReqInput,
     mut lowered: LoweredInput,
     mut context: Vec<CoreContextSegment>,
@@ -455,7 +461,7 @@ fn finish_tokenized(
 ) -> std::result::Result<TokenizedGenerateReqInput, String> {
     let prompt_tokens = u32::try_from(lowered.prompt_ids.len())
         .map_err(|_| "generation prompt exceeds the supported token count".to_string())?;
-    let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, binding.policy);
+    let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, policy);
     let mut max_tokens = if behavior.und_decode {
         crate::text::resolve_max_tokens(
             request.sampling.max_tokens,
@@ -495,7 +501,7 @@ fn finish_tokenized(
         &context,
         &negative_context,
         &behavior,
-        binding.policy,
+        policy,
         &lowered.image,
         max_tokens,
         &cache,
@@ -518,7 +524,7 @@ fn finish_tokenized(
             &context,
             &negative_context,
             &behavior,
-            binding.policy,
+            policy,
             &lowered.image,
             max_tokens,
             &cache,
@@ -559,7 +565,7 @@ fn finish_tokenized(
         stop_token_ids: lowered.stop_token_ids,
         priority: request.scheduling.priority,
         cache,
-        policy: binding.policy.clone(),
+        policy: policy.clone(),
         resources,
     };
     generation.validate().map_err(|error| error.to_string())?;
@@ -863,13 +869,14 @@ fn assemble_context(
     Ok(segments)
 }
 
-fn derive_constraint(request: &GenerateReqInput) -> GenerationConstraint {
-    if request.modalities.output_image && !request.modalities.output_text {
-        GenerationConstraint::GenOnly
-    } else if request.has_input_image() && !request.modalities.output_image {
-        GenerationConstraint::UndOnly
-    } else {
-        GenerationConstraint::Default
+pub(crate) fn generation_constraint(request: &GenerateReqInput) -> GenerationConstraint {
+    match (
+        request.modalities.output_text,
+        request.modalities.output_image,
+    ) {
+        (true, false) => GenerationConstraint::UndOnly,
+        (false, true) => GenerationConstraint::GenOnly,
+        (true, true) | (false, false) => GenerationConstraint::Default,
     }
 }
 

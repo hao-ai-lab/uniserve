@@ -164,6 +164,11 @@ impl WorkVariant {
         )
     }
 
+    /// Whether this work leaf can execute only over a host-resolved semantic root.
+    pub const fn requires_fixed_parent(self) -> bool {
+        matches!(self, Self::TransferKvPublish)
+    }
+
     /// The device execution domain that owns this work leaf.
     pub const fn domain(self) -> Domain {
         match self {
@@ -661,6 +666,10 @@ impl Operation {
         anyhow::ensure!(
             self.parent.request_key == self.request_key,
             "operation parent belongs to another request lineage"
+        );
+        anyhow::ensure!(
+            !self.work.variant().requires_fixed_parent() || self.parent.is_fixed(),
+            "operation requires a fixed semantic parent"
         );
         self.bounds_are_finite()?;
         anyhow::ensure!(
@@ -1704,7 +1713,7 @@ impl Batch {
         }
         let declared_inputs = self
             .operations()
-            .flat_map(|operation| operation.inputs.iter())
+            .flat_map(|operation| operation.inputs.iter().chain(operation.predicate.iter()))
             .collect::<HashSet<_>>();
         for operation in self.operations() {
             for input in operation
@@ -1925,6 +1934,7 @@ pub struct SamplingState {
     pub allowed_token_ids: Option<Vec<u32>>,
     pub suppressed_token_ids: Vec<u32>,
     pub finish_token_ids: Vec<u32>,
+    pub transition_token_ids: Vec<u32>,
     pub force_finish: bool,
 }
 
@@ -1938,14 +1948,16 @@ impl SamplingState {
         self.suppressed_token_ids.dedup();
         self.finish_token_ids.sort_unstable();
         self.finish_token_ids.dedup();
+        self.transition_token_ids.sort_unstable();
+        self.transition_token_ids.dedup();
     }
 }
 
 /// Encode canonical branch-local sampling state.
 ///
 /// Layout: one allowed-presence byte; an allowed count and ids when present;
-/// then a suppressed count and ids; then a finish count and ids; then one
-/// force-finish byte.
+/// then a suppressed count and ids; a finish count and ids; a transition count
+/// and ids; then one force-finish byte.
 pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
     let mut canonical = state.clone();
     canonical.canonicalize();
@@ -1956,6 +1968,8 @@ pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
             + canonical.suppressed_token_ids.len() * 4
             + 4
             + canonical.finish_token_ids.len() * 4
+            + 4
+            + canonical.transition_token_ids.len() * 4
             + 1,
     );
     match canonical.allowed_token_ids {
@@ -1974,6 +1988,10 @@ pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
     }
     bytes.extend_from_slice(&(canonical.finish_token_ids.len() as u32).to_le_bytes());
     for token in canonical.finish_token_ids {
+        bytes.extend_from_slice(&token.to_le_bytes());
+    }
+    bytes.extend_from_slice(&(canonical.transition_token_ids.len() as u32).to_le_bytes());
+    for token in canonical.transition_token_ids {
         bytes.extend_from_slice(&token.to_le_bytes());
     }
     bytes.push(u8::from(canonical.force_finish));
@@ -2024,6 +2042,8 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> anyhow::Result<SamplingState
     let suppressed_token_ids = take_ids(bytes, &mut offset, suppressed_len)?;
     let finish_len = take_u32(bytes, &mut offset)?;
     let finish_token_ids = take_ids(bytes, &mut offset, finish_len)?;
+    let transition_len = take_u32(bytes, &mut offset)?;
+    let transition_token_ids = take_ids(bytes, &mut offset, transition_len)?;
     anyhow::ensure!(
         offset < bytes.len(),
         "sampling-state bytes omit force-finish"
@@ -2042,6 +2062,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> anyhow::Result<SamplingState
         allowed_token_ids,
         suppressed_token_ids,
         finish_token_ids,
+        transition_token_ids,
         force_finish,
     })
 }
@@ -2125,6 +2146,16 @@ pub struct GraphBucketCapability {
     pub layout: String,
 }
 
+/// One exact decode-and-flow row combination qualified for a single physical call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MixedExecutionCapability {
+    pub decode_rows: u32,
+    pub flow_rows: u32,
+    pub height: u32,
+    pub width: u32,
+    pub cfg_branches: u32,
+}
+
 /// Immutable scheduler-visible resources and execution coverage for one lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneCapabilities {
@@ -2169,7 +2200,6 @@ pub struct WorkerCapabilities {
     pub kv_dtype: String,
     pub model_dtype: String,
     pub attention_backend: String,
-    pub quantization: Option<String>,
     pub rank: RankInfo,
     pub pipeline_depth: u32,
     pub encoder_cache_budget: u32,
@@ -2179,7 +2209,7 @@ pub struct WorkerCapabilities {
     pub max_request_pool_size: u32,
     pub max_unresolved_window: u32,
     pub incremental_kv_publication: bool,
-    pub tensorized_mixed: bool,
+    pub mixed_buckets: Vec<MixedExecutionCapability>,
     pub sampling_ownership: SamplingOwnership,
     pub resource_classes: Vec<ResourceClass>,
     pub model_identity: Digest,
@@ -2270,6 +2300,22 @@ impl WorkerCapabilities {
                 && self.max_unresolved_window > 0,
             "worker capabilities declare a zero scheduling bound"
         );
+        anyhow::ensure!(
+            self.mixed_buckets.iter().collect::<HashSet<_>>().len() == self.mixed_buckets.len(),
+            "worker capabilities repeat a mixed-execution bucket"
+        );
+        for bucket in &self.mixed_buckets {
+            anyhow::ensure!(
+                bucket.decode_rows > 0
+                    && bucket.flow_rows > 0
+                    && bucket.height > 0
+                    && bucket.width > 0
+                    && bucket.cfg_branches > 0
+                    && bucket.decode_rows.saturating_add(bucket.flow_rows)
+                        <= self.max_batch_operations,
+                "worker capabilities declare an invalid mixed-execution bucket"
+            );
+        }
         anyhow::ensure!(
             self.block_size > 0
                 && self.num_blocks > 1
@@ -2391,7 +2437,6 @@ impl Default for WorkerCapabilities {
             kv_dtype: "bfloat16".into(),
             model_dtype: "bfloat16".into(),
             attention_backend: "flashinfer".into(),
-            quantization: None,
             rank: RankInfo::default(),
             pipeline_depth: 1,
             encoder_cache_budget: 0,
@@ -2401,7 +2446,7 @@ impl Default for WorkerCapabilities {
             max_request_pool_size: 128,
             max_unresolved_window: 1,
             incremental_kv_publication: true,
-            tensorized_mixed: false,
+            mixed_buckets: Vec::new(),
             sampling_ownership: SamplingOwnership::DesignatedRank,
             resource_classes: Vec::new(),
             model_identity: String::new(),
@@ -2444,7 +2489,7 @@ pub fn protocol_layout_digest() -> Digest {
         digest.string(control);
     }
     // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 16] = [
+    let record_layouts: [&[&str]; 17] = [
         &[
             "request_key",
             "op_id",
@@ -2576,7 +2621,6 @@ pub fn protocol_layout_digest() -> Digest {
             "kv_dtype",
             "model_dtype",
             "attention_backend",
-            "quantization",
             "rank",
             "pipeline_depth",
             "encoder_cache_budget",
@@ -2584,12 +2628,19 @@ pub fn protocol_layout_digest() -> Digest {
             "max_batch_operations",
             "max_unresolved_window",
             "incremental_kv_publication",
-            "tensorized_mixed",
+            "mixed_buckets",
             "sampling_ownership",
             "resource_classes",
             "model_identity",
             "weight_digest",
             "protocol_layout_digest",
+        ],
+        &[
+            "decode_rows",
+            "flow_rows",
+            "height",
+            "width",
+            "cfg_branches",
         ],
     ];
     for record in record_layouts {
@@ -2628,14 +2679,13 @@ pub enum RequestKind {
     Shutdown,
     CopyKv,
     ReleaseProducts,
-    GetMetrics,
     GetPressure,
     SnapshotSession,
     RestoreSession,
 }
 
 impl RequestKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 10] = [
         Self::GetCapabilities,
         Self::Execute,
         Self::PollCompletions,
@@ -2643,7 +2693,6 @@ impl RequestKind {
         Self::Shutdown,
         Self::CopyKv,
         Self::ReleaseProducts,
-        Self::GetMetrics,
         Self::GetPressure,
         Self::SnapshotSession,
         Self::RestoreSession,
@@ -2658,7 +2707,6 @@ impl RequestKind {
             Self::Shutdown => "shutdown",
             Self::CopyKv => "copy_kv",
             Self::ReleaseProducts => "release_products",
-            Self::GetMetrics => "get_metrics",
             Self::GetPressure => "get_pressure",
             Self::SnapshotSession => "snapshot_session",
             Self::RestoreSession => "restore_session",
@@ -2752,9 +2800,6 @@ impl WorkerRequest {
             ..Self::bare(RequestKind::ReleaseProducts)
         }
     }
-    pub fn get_metrics() -> Self {
-        Self::bare(RequestKind::GetMetrics)
-    }
     pub fn get_pressure() -> Self {
         Self::bare(RequestKind::GetPressure)
     }
@@ -2773,28 +2818,6 @@ impl WorkerRequest {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct WorkerMetrics {
-    pub executes: u64,
-    pub operations_total: u64,
-    pub exec_us_total: u64,
-    pub last_exec_us: u64,
-    pub operation_counts: BTreeMap<String, u64>,
-    pub operation_us: BTreeMap<String, u64>,
-    pub control_ok: BTreeMap<String, u64>,
-    pub control_err: BTreeMap<String, u64>,
-    pub error_counts: BTreeMap<String, u64>,
-    pub replay_counts: BTreeMap<String, u64>,
-    pub cuda_graph_captures: u64,
-    pub cuda_graph_replays: u64,
-    pub cuda_graph_misses: u64,
-    pub cuda_graph_fallbacks: u64,
-    pub cuda_graph_unpadded_tokens: u64,
-    pub cuda_graph_padded_tokens: u64,
-    pub cuda_graph_runtime_mode_counts: BTreeMap<String, u64>,
-    pub forward: Option<WorkerForwardStats>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseKind {
@@ -2802,7 +2825,6 @@ pub enum ResponseKind {
     Result,
     Ok,
     Error,
-    Metrics,
     Pressure,
     Snapshot,
 }
@@ -2819,7 +2841,6 @@ pub struct WorkerResponse {
     pub call_id: Option<u64>,
     pub capabilities: Option<WorkerCapabilities>,
     pub completion_report: Option<CompletionReport>,
-    pub metrics: Option<WorkerMetrics>,
     pub pressure: Option<Vec<ResourcePressure>>,
     pub message: Option<String>,
     pub code: Option<String>,
@@ -2838,7 +2859,6 @@ impl WorkerResponse {
             call_id: None,
             capabilities: None,
             completion_report: None,
-            metrics: None,
             pressure: None,
             message: None,
             code: None,

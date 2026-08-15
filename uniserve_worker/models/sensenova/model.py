@@ -5,21 +5,35 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoTokenizer
 
 from ...batch import WorkVariant
 from ...execution.forward_batch import (
+    ExpertRoute,
     ForwardBatch,
     ForwardOutput,
     PackedAttentionPlan,
     PagedDecodePlan,
+    RouteSpan,
     TokenSelection,
 )
-from ...loader.schema import Stack, TowerSplit, WeightSpec
+from ...loader.weight_utils import (
+    WeightNameMap,
+    dtype_from_name,
+    infer_input_device,
+    iter_weights,
+    load_parameter,
+    materialize_parameter,
+    missing_required_parameters,
+    preview_names,
+    resolve_weight_files,
+    stacked_weight_name,
+)
 from ...nn.attention import RadixAttention
 from ...nn.decoder.qwen import Qwen3MLP
 from ...nn.diffusion import (
@@ -30,6 +44,7 @@ from ...nn.diffusion import (
     TimestepEmbedder,
 )
 from ...nn.diffusion.cfg import CfgRecipe
+from ...nn.expert_routing import RoutedTensor
 from ...nn.layer import LayerSpec
 from ...nn.linear import (
     LinearBase,
@@ -40,6 +55,8 @@ from ...nn.linear import (
 )
 from ...nn.norm import RMSNorm
 from ...nn.placement import WeightMode, set_tower_coord
+from ...nn.quant import QuantizationConfig
+from ...nn.quant.base import process_quantized_modules
 from ...nn.rope import HFRotaryEmbedding, RotaryEmbedding, get_rope, qk_norm_rope
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
 from ...nn.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
@@ -83,21 +100,38 @@ _FLOW_SYSTEM_MESSAGE = (
     "General Rules:\n- For any visible text in the image, follow the language specified for the rendered text in the user's description, not the language of the prompt. If no language is specified, use the user's input language."
 )
 
-_STACKED_WEIGHTS = (
-    Stack("qkv_proj", "q_proj", "q"),
-    Stack("qkv_proj", "k_proj", "k"),
-    Stack("qkv_proj", "v_proj", "v"),
-    Stack("qkv_proj_mot_gen", "q_proj_mot_gen", "q"),
-    Stack("qkv_proj_mot_gen", "k_proj_mot_gen", "k"),
-    Stack("qkv_proj_mot_gen", "v_proj_mot_gen", "v"),
-    Stack("gate_up_proj", "gate_proj", 0),
-    Stack("gate_up_proj", "up_proj", 1),
+_STACKED_WEIGHTS: WeightNameMap = (
+    ("qkv_proj_mot_gen", "q_proj_mot_gen", "q"),
+    ("qkv_proj_mot_gen", "k_proj_mot_gen", "k"),
+    ("qkv_proj_mot_gen", "v_proj_mot_gen", "v"),
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
 )
 
-_TOWER_SPLIT = TowerSplit(
-    generation_prefixes=("fm_modules.",),
-    generation_infixes=("_mot_gen.",),
-)
+
+def _scope_includes(name: str, scope: str) -> bool:
+    if scope == "whole":
+        return True
+    generation = name.startswith("fm_modules.") or "_mot_gen." in name
+    if scope == "generation":
+        return generation
+    if scope == "understanding":
+        return not generation
+    raise ValueError(f"unknown SenseNova model scope {scope!r}")
+
+
+def _check_checkpoint_code_version(config: Any) -> None:
+    from packaging.version import Version
+
+    raw = config.to_dict() if hasattr(config, "to_dict") else config
+    if not isinstance(raw, dict):
+        return
+    required = raw.get("uniserve_sensenova_min_version")
+    if required and Version(_MODEL_CODE_VERSION) < Version(str(required)):
+        raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
 
 
 def _module_tensor(
@@ -116,63 +150,35 @@ def _module_tensor(
     return context.mesh.combine(result, "tower", coordinate, target)
 
 
-def _route_tensor(
-    value: torch.Tensor,
+def _route_modules(
+    value: RoutedTensor,
     *,
-    plan: PackedAttentionPlan | None,
     text_module: nn.Module,
     flow_module: nn.Module,
     context: ForwardBatch,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
-) -> torch.Tensor:
-    target = value.device
-    if plan is None:
+) -> RoutedTensor:
+    def apply_text(item: torch.Tensor) -> torch.Tensor:
         return _module_tensor(
             text_module,
-            value,
+            item,
             context=context,
             coordinate=_TEXT_COORDINATE,
-            target=target,
+            target=item.device,
             call=call,
         )
-    if plan.has_text and plan.has_flow:
-        result = _module_tensor(
-            flow_module,
-            value,
-            context=context,
-            coordinate=_FLOW_COORDINATE,
-            target=target,
-            call=call,
-        )
-        text = _module_tensor(
-            text_module,
-            value.index_select(0, plan.text_indices),
-            context=context,
-            coordinate=_TEXT_COORDINATE,
-            target=target,
-            call=call,
-        )
-        result.index_copy_(0, plan.text_indices, text)
-        return result
-    if plan.has_flow:
+
+    def apply_flow(item: torch.Tensor) -> torch.Tensor:
         return _module_tensor(
             flow_module,
-            value,
+            item,
             context=context,
             coordinate=_FLOW_COORDINATE,
-            target=target,
+            target=item.device,
             call=call,
         )
-    if plan.has_text:
-        return _module_tensor(
-            text_module,
-            value,
-            context=context,
-            coordinate=_TEXT_COORDINATE,
-            target=target,
-            call=call,
-        )
-    raise ValueError("SenseNova packed route contains no neural tokens")
+
+    return value.map(apply_text, apply_flow)
 
 
 def _plain_call(
@@ -197,19 +203,49 @@ class _PackedRope:
     cos: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     sin: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
-    def select(self, indices: torch.Tensor) -> _PackedRope:
-        return _PackedRope(
+
+@dataclass(frozen=True, slots=True)
+class _RoutedRope:
+    text: _PackedRope | None
+    flow: _PackedRope | None
+
+
+def _route_rope(rope: _PackedRope, spans: tuple[RouteSpan, ...]) -> _RoutedRope:
+    cosine = tuple(RoutedTensor.from_packed(value, spans) for value in rope.cos)
+    sine = tuple(RoutedTensor.from_packed(value, spans) for value in rope.sin)
+    text = (
+        None
+        if cosine[0].text is None
+        else _PackedRope(
             (
-                self.cos[0].index_select(0, indices),
-                self.cos[1].index_select(0, indices),
-                self.cos[2].index_select(0, indices),
+                cosine[0].text,
+                cast(torch.Tensor, cosine[1].text),
+                cast(torch.Tensor, cosine[2].text),
             ),
             (
-                self.sin[0].index_select(0, indices),
-                self.sin[1].index_select(0, indices),
-                self.sin[2].index_select(0, indices),
+                cast(torch.Tensor, sine[0].text),
+                cast(torch.Tensor, sine[1].text),
+                cast(torch.Tensor, sine[2].text),
             ),
         )
+    )
+    flow = (
+        None
+        if cosine[0].flow is None
+        else _PackedRope(
+            (
+                cosine[0].flow,
+                cast(torch.Tensor, cosine[1].flow),
+                cast(torch.Tensor, cosine[2].flow),
+            ),
+            (
+                cast(torch.Tensor, sine[0].flow),
+                cast(torch.Tensor, sine[1].flow),
+                cast(torch.Tensor, sine[2].flow),
+            ),
+        )
+    )
+    return _RoutedRope(text, flow)
 
 
 class _VisionModel(nn.Module):
@@ -396,47 +432,45 @@ class _SenseAttention(nn.Module):
 
     def forward(
         self,
-        hidden: torch.Tensor,
+        hidden: RoutedTensor,
         *,
         context: ForwardBatch,
-        plan: PackedAttentionPlan | None,
-        rope: _PackedRope,
-    ) -> torch.Tensor:
-        if plan is not None and plan.has_text and plan.has_flow:
-            query, key, value = self._project(
-                hidden,
-                rope,
-                generation=True,
-                context=context,
-            )
-            text_rope = rope.select(plan.text_indices)
-            text_query, text_key, text_value = self._project(
-                hidden.index_select(0, plan.text_indices),
-                text_rope,
-                generation=False,
-                context=context,
-            )
-            query.index_copy_(0, plan.text_indices, text_query)
-            key.index_copy_(0, plan.text_indices, text_key)
-            value.index_copy_(0, plan.text_indices, text_value)
-        else:
-            query, key, value = self._project(
-                hidden,
-                rope,
-                generation=plan is not None and plan.has_flow,
-                context=context,
-            )
+        spans: tuple[RouteSpan, ...],
+        rope: _RoutedRope,
+        causal: bool,
+    ) -> RoutedTensor:
+        text_projection = (
+            None
+            if hidden.text is None or rope.text is None
+            else self._project(hidden.text, rope.text, generation=False, context=context)
+        )
+        flow_projection = (
+            None
+            if hidden.flow is None or rope.flow is None
+            else self._project(hidden.flow, rope.flow, generation=True, context=context)
+        )
+        query = RoutedTensor(
+            None if text_projection is None else text_projection[0],
+            None if flow_projection is None else flow_projection[0],
+        ).packed(spans)
+        key = RoutedTensor(
+            None if text_projection is None else text_projection[1],
+            None if flow_projection is None else flow_projection[1],
+        ).packed(spans)
+        value = RoutedTensor(
+            None if text_projection is None else text_projection[2],
+            None if flow_projection is None else flow_projection[2],
+        ).packed(spans)
         attended = self.attention(
             query,
             key,
             value,
             context,
-            causal=plan is None,
+            causal=causal,
             scale=self.scaling,
-        ).reshape(hidden.shape[0], -1)
-        return _route_tensor(
-            attended,
-            plan=plan,
+        ).reshape(query.shape[0], -1)
+        return _route_modules(
+            RoutedTensor.from_packed(attended, spans),
             text_module=self.o_proj,
             flow_module=self.o_proj_mot_gen,
             context=context,
@@ -473,43 +507,44 @@ class _SenseLayer(nn.Module):
 
     def forward(
         self,
-        hidden: torch.Tensor,
+        hidden: RoutedTensor,
         *,
         context: ForwardBatch,
-        plan: PackedAttentionPlan | None,
-        rope: _PackedRope,
-    ) -> torch.Tensor:
-        normalized = _route_tensor(
+        spans: tuple[RouteSpan, ...],
+        rope: _RoutedRope,
+        causal: bool,
+    ) -> RoutedTensor:
+        normalized = _route_modules(
             hidden,
-            plan=plan,
             text_module=self.input_layernorm,
             flow_module=self.input_layernorm_mot_gen,
             context=context,
             call=_plain_call,
         )
-        hidden = hidden + self.self_attn(
-            normalized,
-            context=context,
-            plan=plan,
-            rope=rope,
+        hidden = hidden.add(
+            self.self_attn(
+                normalized,
+                context=context,
+                spans=spans,
+                rope=rope,
+                causal=causal,
+            )
         )
-        normalized = _route_tensor(
+        normalized = _route_modules(
             hidden,
-            plan=plan,
             text_module=self.post_attention_layernorm,
             flow_module=self.post_attention_layernorm_mot_gen,
             context=context,
             call=_plain_call,
         )
-        feed_forward = _route_tensor(
+        feed_forward = _route_modules(
             normalized,
-            plan=plan,
             text_module=self.mlp,
             flow_module=self.mlp_mot_gen,
             context=context,
             call=_parallel_call,
         )
-        return hidden + feed_forward
+        return hidden.add(feed_forward)
 
 
 class _SenseDecoder(nn.Module):
@@ -544,25 +579,19 @@ class _SenseDecoder(nn.Module):
             raise ValueError("SenseNova decoder inputs must have shape [tokens, hidden]")
         token_count = int(inputs.shape[0])
         attention = context.attention
-        plan: PackedAttentionPlan | None
+        spans: tuple[RouteSpan, ...]
         indexes: torch.Tensor
+        causal: bool
         if isinstance(attention, PackedAttentionPlan):
-            plan = attention
-            if tuple(plan.route_indicators.shape) != (token_count,):
-                raise ValueError("SenseNova route indicators must align with decoder inputs")
-            if tuple(plan.indexes.shape) != (3, token_count):
+            if tuple(attention.indexes.shape) != (3, token_count):
                 raise ValueError("SenseNova positions must have shape [3, tokens]")
-            if plan.text_indices.ndim != 1:
-                raise ValueError("SenseNova text indices must be one-dimensional")
-            if plan.has_text != (int(plan.text_indices.numel()) > 0):
-                raise ValueError("SenseNova text presence does not match its static indices")
-            if not plan.has_text and not plan.has_flow:
-                raise ValueError("SenseNova decoder plan contains no tokens")
-            indexes = plan.indexes
+            spans = attention.route_spans
+            indexes = attention.indexes
+            causal = False
         elif isinstance(attention, PagedDecodePlan):
-            plan = None
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("SenseNova paged decode positions must align with text tokens")
+            spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)
             indexes = torch.stack(
                 (
                     positions,
@@ -570,25 +599,31 @@ class _SenseDecoder(nn.Module):
                     torch.zeros_like(positions),
                 )
             )
+            causal = True
         else:
             raise ValueError("SenseNova decoder requires packed attention or paged decode")
         if not self.layers:
             raise ValueError("SenseNova decoder requires at least one layer")
 
         first = cast(_SenseLayer, self.layers[0])
-        rope = first.self_attn.rope(indexes)
-        hidden = inputs
+        rope = _route_rope(first.self_attn.rope(indexes), spans)
+        hidden = RoutedTensor.from_packed(inputs, spans)
         for layer_module in self.layers:
             layer = cast(_SenseLayer, layer_module)
-            hidden = layer(hidden, context=context, plan=plan, rope=rope)
-        return _route_tensor(
+            hidden = layer(
+                hidden,
+                context=context,
+                spans=spans,
+                rope=rope,
+                causal=causal,
+            )
+        return _route_modules(
             hidden,
-            plan=plan,
             text_module=self.norm,
             flow_module=self.norm_mot_gen,
             context=context,
             call=_plain_call,
-        )
+        ).packed(spans)
 
 
 class _LanguageModel(nn.Module):
@@ -606,10 +641,104 @@ class _LanguageModel(nn.Module):
 class NEOChatModel(ExecutionModel):
     """Concrete stateless SenseNova model for mixed text, flow, and vision rows."""
 
-    weight_spec = WeightSpec(
-        transforms=_STACKED_WEIGHTS,
-        tower=_TOWER_SPLIT,
-    )
+    @classmethod
+    def from_checkpoint(
+        cls,
+        raw_config: dict[str, Any],
+        *,
+        model_path: str,
+        device: str,
+        attention_backend: str | None,
+        model_scope: str,
+        execution: Any,
+        parallel: Any,
+    ) -> tuple["NEOChatModel", Any, str]:
+        try:
+            from accelerate import init_empty_weights
+            from accelerate.utils import set_module_tensor_to_device
+        except ImportError as exc:
+            raise RuntimeError(
+                "SenseNova checkpoint loading requires accelerate in the worker environment"
+            ) from exc
+
+        del attention_backend
+        config = NeoChatConfig.from_dict(raw_config)
+        _check_checkpoint_code_version(config)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                use_fast=False,
+                trust_remote_code=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to load the configured SenseNova tokenizer from {model_path!r}: {exc}"
+            ) from exc
+        dtype = dtype_from_name(execution.model_dtype)
+        with init_empty_weights():
+            model = cls(
+                config,
+                layer_spec=LayerSpec(
+                    parallel=parallel,
+                    quantization=QuantizationConfig.from_model_config(config),
+                ),
+            )
+        model.load_weights(
+            iter_weights(resolve_weight_files(model_path)),
+            device=device,
+            dtype=dtype,
+            model_scope=model_scope,
+            set_module_tensor_to_device=set_module_tensor_to_device,
+        )
+        process_quantized_modules(model.modules())
+        if model_scope == "whole":
+            model.to(device=device)
+        model.eval()
+        return model, tokenizer, str(infer_input_device(model, fallback=device))
+
+    def load_weights(
+        self,
+        weights: Any,
+        *,
+        device: str,
+        dtype: torch.dtype,
+        model_scope: str,
+        set_module_tensor_to_device: Callable[..., Any],
+    ) -> set[str]:
+        """Stream checkpoint tensors into the selected SenseNova tower scope."""
+
+        parameters = dict(self.named_parameters())
+        included = {name for name in parameters if _scope_includes(name, model_scope)}
+        loaded: set[str] = set()
+        unexpected: list[str] = []
+        for source_name, tensor in weights:
+            target_name, shard_id = stacked_weight_name(source_name, _STACKED_WEIGHTS)
+            if target_name not in parameters:
+                if source_name in parameters:
+                    target_name, shard_id = source_name, None
+                else:
+                    unexpected.append(source_name)
+                    continue
+            if target_name not in included:
+                continue
+            materialize_parameter(
+                self,
+                target_name,
+                tensor,
+                device=device,
+                dtype=dtype,
+                set_module_tensor_to_device=set_module_tensor_to_device,
+            )
+            load_parameter(self, target_name, tensor, shard_id=shard_id, dtype=dtype)
+            loaded.add(target_name)
+        missing = missing_required_parameters(self, loaded, included=included)
+        if missing or unexpected:
+            raise RuntimeError(
+                "SenseNova checkpoint load mismatch: "
+                f"missing={len(missing)} {preview_names(missing)} "
+                f"unexpected={len(unexpected)} {preview_names(unexpected)}"
+            )
+        return loaded
 
     def __init__(self, config: NeoChatConfig, *, layer_spec: LayerSpec) -> None:
         super().__init__()
@@ -716,7 +845,6 @@ class NEOChatModel(ExecutionModel):
                 downsample_ratio=float(vision.downsample_ratio),
                 min_pixels=512 * 512,
                 max_pixels=2048 * 2048,
-                multi_image_pixel_budget=4096 * 4096,
             ),
             staging_dtype="bfloat16",
             feature_injection=FeatureInjection(

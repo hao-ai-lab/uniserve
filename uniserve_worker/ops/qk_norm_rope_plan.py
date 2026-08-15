@@ -110,24 +110,6 @@ class QKNormRopePlan:
             group_end += 1
         return group_end if group_dim == int(q_weight.shape[-1]) else start + 1
 
-    @staticmethod
-    def align_rope_table(table: torch.Tensor, tokens: int) -> torch.Tensor:
-        rows = int(table.shape[0])
-        if rows == tokens:
-            return table.contiguous()
-        if rows < tokens and tokens % rows == 0:
-            return table.repeat(tokens // rows, 1).contiguous()
-        if rows > tokens and rows % tokens == 0:
-            return table[:tokens].contiguous()
-        raise RuntimeError(f"cannot align RoPE table length {rows} to token count {tokens}")
-
-    @staticmethod
-    def can_repeat_rope(table: torch.Tensor, tokens: int) -> bool:
-        return table.ndim == 2 and int(table.shape[0]) > 0 and (
-            tokens % int(table.shape[0]) == 0 or int(table.shape[0]) % tokens == 0
-        )
-
-
 class _QKNormAxes(Protocol):
     @property
     def axis_dims(self) -> tuple[int, ...] | None: ...

@@ -3,8 +3,8 @@
 A kernel declares the layout it consumes via :class:`QKVLayout`. ``normalize_to``
 reshapes an incoming q/k/v tensor into that layout and returns a
 :class:`LayoutRestore` whose ``apply`` undoes the reshape on the kernel output.
-The reshape/transpose/squeeze operations match each backend's previous inline
-normalizer byte for byte on the valid-input paths.
+The reshape, transpose, and squeeze operations define the canonical tensor
+forms consumed by every paged attention backend.
 """
 from __future__ import annotations
 

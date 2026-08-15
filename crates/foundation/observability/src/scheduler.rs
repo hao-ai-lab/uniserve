@@ -49,6 +49,21 @@ pub struct EngineComponentLabels {
     pub component: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EngineDomainLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub domain: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EngineDomainKindLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub domain: String,
+    pub kind: String,
+}
+
 /// label set for per-attention-backend counters (backend = the kernel
 /// family that served the launch, e.g. `flashinfer`/`triton`).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -107,6 +122,51 @@ pub struct SchedulerMetrics {
         help = "Maximum queue wait in microseconds observed by the scheduler."
     )]
     pub scheduler_queue_wait_max_us: Family<EngineLabels, U64Gauge>,
+    #[metric(
+        name = "uniserve:scheduler_domain_active_credits",
+        help = "Current scheduler operation credits in use by execution domain."
+    )]
+    pub scheduler_domain_active_credits: Family<EngineDomainLabels, U64Gauge>,
+    #[metric(
+        name = "uniserve:scheduler_domain_peak_credits",
+        help = "Maximum scheduler operation credits observed in use by execution domain."
+    )]
+    pub scheduler_domain_peak_credits: Family<EngineDomainLabels, U64Gauge>,
+    #[metric(
+        name = "uniserve:scheduler_domain_operations",
+        help = "Scheduler operation events by execution domain and kind: launched, completed, predicated, or error."
+    )]
+    pub scheduler_domain_operations: Family<EngineDomainKindLabels, U64Counter>,
+    #[metric(
+        name = "uniserve:scheduler_domain_backpressure",
+        help = "Nonblocking scheduler resource-pressure events by execution domain."
+    )]
+    pub scheduler_domain_backpressure: Family<EngineDomainLabels, U64Counter>,
+    #[metric(
+        name = "uniserve:scheduler_domain_reclaimed_credits",
+        help = "Scheduler operation credits reclaimed by execution domain."
+    )]
+    pub scheduler_domain_reclaimed_credits: Family<EngineDomainLabels, U64Counter>,
+    #[metric(
+        name = "uniserve:scheduler_domain_completed_partitions",
+        help = "Completed physical partitions by execution domain."
+    )]
+    pub scheduler_domain_completed_partitions: Family<EngineDomainLabels, U64Counter>,
+    #[metric(
+        name = "uniserve:scheduler_domain_commits",
+        help = "Semantic and public commit events by execution domain and kind."
+    )]
+    pub scheduler_domain_commits: Family<EngineDomainKindLabels, U64Counter>,
+    #[metric(
+        name = "uniserve:scheduler_domain_time_us",
+        help = "Cumulative execution-domain time in microseconds by phase: queue, launch, device, completion, semantic_commit, public_commit, or co_resident."
+    )]
+    pub scheduler_domain_time_us: Family<EngineDomainKindLabels, U64Counter>,
+    #[metric(
+        name = "uniserve:scheduler_domain_co_resident_partitions",
+        help = "Physical partitions served in a qualified tensorized mixed call by execution domain."
+    )]
+    pub scheduler_domain_co_resident_partitions: Family<EngineDomainLabels, U64Counter>,
 
     // Prefix-cache counters, including the connector-backed external cache path.
     #[metric(

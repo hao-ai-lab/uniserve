@@ -19,11 +19,11 @@ from ..foundation.sizing import (
 )
 from ..loader import Loader
 from ..loader.paths import read_config, resolve_model_path
-from ..loader.schema import ModelLoadScope
 from ..models.identity import ModelIdentity, architecture_identity
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import TensorParallelSpec
 from .catalog import CatalogEntry, resolve_catalog_entry
+from .plan import ModelLoadScope
 
 logger = logging.getLogger(__name__)
 

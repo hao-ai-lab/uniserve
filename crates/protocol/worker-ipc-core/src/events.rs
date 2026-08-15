@@ -1,5 +1,4 @@
-//! iceoryx2 event-service companions that make the request-response boundary
-//! event-driven instead of polled.
+//! iceoryx2 event-service companions for the request-response boundary.
 //!
 //! The request-response ports (`Client`/`Server`) carry no file descriptor, so
 //! they cannot be parked on directly — only an event `Listener` implements
@@ -13,11 +12,8 @@
 //! a shared service would enqueue every result on the worker's own listener
 //! while it is busy on the GPU and eventually overflow that listener.
 //!
-//! Every wait carries a bounded safety-net timeout ([`EVENT_WAIT_SAFETY_NET`]),
-//! so a missed notification degrades to the old poll latency instead of
-//! hanging: correctness is identical to polling, only the common-case latency
-//! drops toward the raw shm transfer time. This is what makes the event path
-//! safe to enable by default and trivially reversible.
+//! Wait deadlines are supplied by the caller's operation or liveness contract.
+//! They are not transport polling intervals: progress is signalled by an event.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,29 +34,8 @@ pub const EVT_COMMAND: usize = 3;
 pub const EVT_DEATH: usize = 4;
 /// `evt_worker_wake`: the host signals that an IPC request was queued.
 pub const EVT_REQUEST: usize = 5;
-
-/// Env switch for the event-driven boundary. Default on; set to `0`/`false`/
-/// `off` to fall back to the fixed-interval poll on both ends. The host
-/// process and the worker it spawns inherit the same value, so the two ends
-/// always agree; even if they did not, a mismatch only costs poll latency
-/// (the safety-net timeout), never correctness.
-pub const EVENT_DRIVEN_ENV: &str = "UNISERVE_IPC_EVENT_DRIVEN";
-
-/// Upper bound on how long any event wait blocks before re-checking the
-/// transport directly. Matches the 1ms poll interval, so the worst case
-/// when a notification is missed is exactly the poll-based behavior.
-pub const EVENT_WAIT_SAFETY_NET: Duration = Duration::from_millis(1);
-
-/// Whether the event-driven boundary is enabled (see [`EVENT_DRIVEN_ENV`]).
-pub fn event_driven_enabled() -> bool {
-    match std::env::var(EVENT_DRIVEN_ENV) {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off" | ""
-        ),
-        Err(_) => true,
-    }
-}
+/// `evt_worker_wake`: asynchronous worker progress became observable.
+pub const EVT_COMPLETION: usize = 6;
 
 fn host_wake_event_name(svc: &str) -> String {
     format!("{svc}/evt_host_wake")
@@ -110,17 +85,20 @@ pub struct WakeSender {
 }
 
 impl WakeSender {
-    /// Fire the wake. Errors are swallowed: a wake is a best-effort latency
-    /// optimization over the parked listener's safety-net timeout, never a
-    /// correctness requirement, so a transient notify failure must not surface
-    /// as a command/teardown error.
+    /// Fire one coalesced wake. A notifier failure clears the pending bit so a
+    /// later producer can retry; endpoint teardown remains intentionally
+    /// non-panicking for callback and watcher threads.
     pub fn wake(&self) {
         if self.pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = self
+        if self
             .notifier
-            .notify_with_custom_event_id(EventId::new(self.event_id));
+            .notify_with_custom_event_id(EventId::new(self.event_id))
+            .is_err()
+        {
+            self.pending.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -188,9 +166,29 @@ impl ClientEvents {
         Ok(ev)
     }
 
+    pub(crate) fn drain(&self) -> anyhow::Result<WakeEvents> {
+        let mut ev = WakeEvents::default();
+        self.command_pending.store(false, Ordering::Release);
+        self.death_pending.store(false, Ordering::Release);
+        self.wake_listener
+            .try_wait_all(|id| match id.as_value() {
+                EVT_RESULT => ev.result = true,
+                EVT_COMMAND => ev.command = true,
+                EVT_DEATH => ev.death = true,
+                _ => ev.other = true,
+            })
+            .map_err(|e| anyhow::anyhow!("draining iceoryx2 host wake listener: {e:?}"))?;
+        Ok(ev)
+    }
+
+    pub(crate) fn file_descriptor(&self) -> i32 {
+        // SAFETY: the listener owns this descriptor for at least as long as the
+        // endpoint exposing it. Callers borrow it only while the endpoint lives.
+        unsafe { self.wake_listener.file_descriptor().native_handle() }
+    }
+
     /// A cloneable wake source the command ingress fires after enqueuing a
-    /// command, so the parked host wakes immediately instead of after the
-    /// safety-net timeout.
+    /// command.
     pub(crate) fn command_wake(&self) -> WakeSender {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
@@ -200,7 +198,7 @@ impl ClientEvents {
     }
 
     /// A cloneable wake source the worker-death watcher fires on child exit, so
-    /// an idle host detects death immediately (no liveness-poll floor).
+    /// an idle host detects death immediately.
     pub(crate) fn death_wake(&self) -> WakeSender {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
@@ -222,6 +220,8 @@ impl ClientEvents {
 pub(crate) struct ServerEvents {
     wake_notifier: Notifier<IxService>,
     wake_listener: Listener<IxService>,
+    completion_notifier: Arc<Notifier<IxService>>,
+    completion_pending: Arc<AtomicBool>,
 }
 
 impl ServerEvents {
@@ -229,10 +229,13 @@ impl ServerEvents {
         let wake = open_event_service(node, &host_wake_event_name(service))?;
         let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
         let wake_notifier = make_notifier(&wake, EVT_RESULT)?;
+        let completion_notifier = Arc::new(make_notifier(&request_wake, EVT_COMPLETION)?);
         let wake_listener = make_listener(&request_wake)?;
         Ok(Self {
             wake_notifier,
             wake_listener,
+            completion_notifier,
+            completion_pending: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -245,22 +248,42 @@ impl ServerEvents {
 
     /// Park until an inbound request wake fires or `timeout` elapses, draining
     /// every pending event id. The IPC client fires `EVT_REQUEST` after send, so
-    /// an idle server wakes immediately instead of polling; the timeout is the
-    /// safety-net re-check floor for a missed notification.
+    /// an idle server wakes immediately. The timeout belongs to the caller's
+    /// liveness or shutdown deadline.
     pub(crate) fn wait_request(&self, timeout: Duration) -> anyhow::Result<()> {
         self.wake_listener
-            .timed_wait_all(|_id| {}, timeout)
+            .timed_wait_all(
+                |id| {
+                    if id.as_value() == EVT_COMPLETION {
+                        self.completion_pending.store(false, Ordering::Release);
+                    }
+                },
+                timeout,
+            )
             .map_err(|e| anyhow::anyhow!("waiting on iceoryx2 server wake listener: {e:?}"))?;
         Ok(())
     }
 
-    /// Drain request notifications after consuming from the ring. This keeps a
-    /// busy worker's event queue aligned with the ring it is already servicing.
-    pub(crate) fn drain_requests(&self) -> anyhow::Result<()> {
+    /// Drain wake hints after consuming directly from the request ring. A busy
+    /// worker may never need to park, so keeping the listener aligned with ring
+    /// consumption prevents bounded event capacity from becoming backpressure.
+    pub(crate) fn drain_worker_wakes(&self) -> anyhow::Result<()> {
         self.wake_listener
-            .try_wait_all(|_id| {})
+            .try_wait_all(|id| {
+                if id.as_value() == EVT_COMPLETION {
+                    self.completion_pending.store(false, Ordering::Release);
+                }
+            })
             .map_err(|e| anyhow::anyhow!("draining iceoryx2 worker wake listener: {e:?}"))?;
         Ok(())
+    }
+
+    pub(crate) fn completion_wake(&self) -> WakeSender {
+        WakeSender {
+            notifier: Arc::clone(&self.completion_notifier),
+            event_id: EVT_COMPLETION,
+            pending: Arc::clone(&self.completion_pending),
+        }
     }
 }
 
@@ -297,6 +320,10 @@ mod tests {
         server
             .wait_request(Duration::from_secs(1))
             .expect("drain worker request wake");
+        server.completion_wake().wake();
+        server
+            .wait_request(Duration::from_secs(1))
+            .expect("receive worker completion wake");
 
         server.notify_response();
         assert!(

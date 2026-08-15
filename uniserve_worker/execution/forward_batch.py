@@ -345,16 +345,35 @@ class PagedVarlenPlan:
     binding: int
 
 
+class ExpertRoute(StrEnum):
+    TEXT = "text"
+    FLOW = "flow"
+
+
+@dataclass(frozen=True, slots=True)
+class RouteSpan:
+    """One contiguous expert span in packed attention token order."""
+
+    route: ExpertRoute
+    token_start: int
+    token_count: int
+
+    def __post_init__(self) -> None:
+        if self.token_start < 0 or self.token_count < 1:
+            raise ValueError("packed expert span geometry is invalid")
+
+    @property
+    def token_end(self) -> int:
+        return self.token_start + self.token_count
+
+
 @dataclass(frozen=True, slots=True)
 class PackedAttentionPlan:
     """Visible-segment attention for a mixed token/flow route."""
 
     backends: AttentionSelection
     indexes: torch.Tensor
-    route_indicators: torch.Tensor
-    text_indices: torch.Tensor
-    has_text: bool
-    has_flow: bool
+    route_spans: tuple[RouteSpan, ...]
     visible_end: torch.Tensor
     cu_seqlens_q: torch.Tensor
     page_table: torch.Tensor
@@ -369,6 +388,24 @@ class PackedAttentionPlan:
     binding: int
     query_lens_cpu: tuple[int, ...]
     key_lens_cpu: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.indexes.ndim != 2:
+            raise ValueError("packed attention indexes must be a matrix")
+        expected_start = 0
+        previous: ExpertRoute | None = None
+        for span in self.route_spans:
+            if span.token_start != expected_start:
+                raise ValueError("packed expert spans must cover tokens contiguously")
+            if span.route is previous:
+                raise ValueError("adjacent packed expert spans must be coalesced")
+            expected_start = span.token_end
+            previous = span.route
+        if expected_start != int(self.indexes.shape[1]):
+            raise ValueError("packed expert spans must cover every attention token")
+
+    def token_count(self, route: ExpertRoute) -> int:
+        return sum(span.token_count for span in self.route_spans if span.route is route)
 
 
 AttnPlan: TypeAlias = NoAttention | PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
@@ -526,6 +563,7 @@ __all__ = [
     "EmptyMeshView",
     "EmptyOutputView",
     "EncodeKind",
+    "ExpertRoute",
     "FlowPatches",
     "ForwardBatch",
     "ForwardOutput",
@@ -538,6 +576,7 @@ __all__ = [
     "PagedDecodePlan",
     "PagedVarlenPlan",
     "RouteMeshView",
+    "RouteSpan",
     "ModelPhase",
     "TokenSelection",
     "WrittenRange",

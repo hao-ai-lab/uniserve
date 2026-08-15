@@ -89,8 +89,9 @@ pub struct EngineCoreConfig {
     /// behind a `StageRouter`.
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
-    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Passed through to the
-    /// `TensorMover`; unconfigured edges use the in-process backend.
+    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Participating worker
+    /// pools receive the selected transport; unconfigured edges use local
+    /// worker-resident products.
     pub transfer: Option<String>,
     /// Explicit Python worker launch/runtime configuration.
     pub worker_launch: WorkerLaunchConfig,
@@ -261,13 +262,9 @@ impl EngineCore {
                 .find(|((src, dst), _)| *src == kind || *dst == kind)
                 .map(|(_, backend)| backend.clone())
         };
-        // When the topology peels a Sampler, the model pools (Full/Prefill/Decode)
-        // publish logits + defer sampling.
-        let has_sampler = workers.pools.iter().any(|p| p.kind == WorkerKind::Sampler);
         // The Und/Gen stage split places each pool on its own GPU so the two
         // towers run in parallel and the conditioning KV crosses GPU↔GPU over
-        // CUDA IPC. Other staged topologies keep the shared device (the model-
-        // free sampler/postprocess pools don't need a dedicated GPU).
+        // CUDA IPC. Other staged topologies keep the shared device.
         let is_tower = workers
             .pools
             .iter()
@@ -276,21 +273,13 @@ impl EngineCore {
         let mut pools: Vec<(WorkerKind, Box<dyn Executor>)> =
             Vec::with_capacity(workers.total_pools());
         for pool in &workers.pools {
-            // The decode↔sampler edge is inter-process, so it needs a real
-            // cross-process transport; default to same-node shm when the topology
-            // peels a sampler and no explicit --transfer backend was given.
             let backend = backend_for(pool.kind).or_else(|| {
                 if is_tower && matches!(pool.kind, WorkerKind::Und | WorkerKind::Gen) {
                     Some("cuda_ipc".to_string())
                 } else {
-                    has_sampler.then(|| "shm".to_string())
+                    None
                 }
             });
-            let defer_sampling = has_sampler
-                && matches!(
-                    pool.kind,
-                    WorkerKind::Full | WorkerKind::Prefill | WorkerKind::Decode
-                );
             for instance in 0..pool.count {
                 let pool_device = if is_tower {
                     assign_pool_device(&config.device, next_gpu)
@@ -323,7 +312,6 @@ impl EngineCore {
                     &config.attention_backend,
                     pool.kind.as_str(),
                     backend.as_deref(),
-                    defer_sampling,
                     &pool_worker_launch,
                 )
                 .with_context(|| {

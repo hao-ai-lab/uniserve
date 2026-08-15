@@ -102,6 +102,48 @@ pub struct TimingStats {
     pub queue_wait_us_max: AtomicU64,
 }
 
+/// Cumulative accounting for one physical execution domain.
+#[derive(Default)]
+pub struct DomainStats {
+    pub active_credits: AtomicUsize,
+    pub peak_credits: AtomicUsize,
+    pub launched_operations: AtomicU64,
+    pub completed_operations: AtomicU64,
+    pub predicated_operations: AtomicU64,
+    pub error_operations: AtomicU64,
+    pub backpressure_events: AtomicU64,
+    pub reclaimed_credits: AtomicU64,
+    pub completed_partitions: AtomicU64,
+    pub semantic_commits: AtomicU64,
+    pub public_commits: AtomicU64,
+    pub co_resident_partitions: AtomicU64,
+    pub queue_us: AtomicU64,
+    pub launch_us: AtomicU64,
+    pub device_us: AtomicU64,
+    pub completion_us: AtomicU64,
+    pub semantic_commit_us: AtomicU64,
+    pub public_commit_us: AtomicU64,
+    pub co_resident_us: AtomicU64,
+}
+
+/// Domain-indexed scheduler accounting shared with the stats reporter.
+#[derive(Default)]
+pub struct ExecutionDomainStats {
+    pub prefill: DomainStats,
+    pub decode: DomainStats,
+    pub flow: DomainStats,
+}
+
+impl ExecutionDomainStats {
+    pub fn get(&self, domain: uniserve_worker_wire::Domain) -> &DomainStats {
+        match domain {
+            uniserve_worker_wire::Domain::Prefill => &self.prefill,
+            uniserve_worker_wire::Domain::Decode => &self.decode,
+            uniserve_worker_wire::Domain::Flow => &self.flow,
+        }
+    }
+}
+
 /// Worker-local forward/kernel counters, aggregated as completed batches
 /// resolve so OpenMetrics can explain scheduler vs worker/kernel latency.
 #[derive(Default)]
@@ -148,6 +190,7 @@ pub struct SchedStats {
     pub prefix: PrefixStats,
     pub encoder: EncoderStats,
     pub timing: TimingStats,
+    pub domains: ExecutionDomainStats,
     pub worker: WorkerStats,
 }
 
@@ -165,8 +208,8 @@ use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
     CompletionReport, Control, Disposition, ExecutionCapability, GenAdmission, KvAdmission,
     KvBranchPlacement, KvPlacement, LatentPlacement, OpId, OpStatus, Operation, Point, ProductKind,
-    ProductPayload, ProductRef, RequestKey, ResourceClass, SamplingState, UndAdmission, VersionRef,
-    WorkVariant, WorkerCapabilities, WorkerForwardStats,
+    ProductPayload, ProductRef, RequestKey, ResourceClass, SamplingState, TimingCounters,
+    UndAdmission, VersionRef, WorkVariant, WorkerCapabilities, WorkerForwardStats,
 };
 
 use crate::image_artifact::validate_png_artifact;
@@ -186,7 +229,6 @@ type RouteDomainOperations = Vec<(
     Vec<(uniserve_worker_wire::Domain, Vec<Operation>)>,
 )>;
 
-const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
 /// maximum time the fully-idle scheduler blocks on the command channel
 /// before waking to probe worker liveness. Bounds how long a worker that dies
 /// while the engine is idle stays undetected (the next request would otherwise
@@ -777,8 +819,10 @@ pub struct Scheduler {
     planner: GenerationPlanner,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
-    /// Partition ids still expected for each submitted batch.
-    batch_partitions: HashMap<u64, HashSet<u32>>,
+    /// Domain and physical-call identity for partitions still expected from each batch.
+    batch_partitions: HashMap<u64, HashMap<u32, SubmittedPartitionAccounting>>,
+    /// Worker duration per physical submission group across returned partitions.
+    batch_group_worker_exec_us: HashMap<u64, HashMap<u32, u64>>,
     /// Ordered semantic controls waiting to cross the worker boundary.
     pending_controls: VecDeque<Control>,
     /// Controls attached to an in-flight batch, retained until its ack report.
@@ -826,6 +870,31 @@ pub struct PhaseSpanDelay {
     pub max_us: u64,
 }
 
+/// Cumulative operation-window and lifecycle accounting for one domain.
+#[derive(Debug, Clone)]
+pub struct DomainWindowMetrics {
+    pub domain: uniserve_worker_wire::Domain,
+    pub active_credits: usize,
+    pub peak_credits: usize,
+    pub launched_operations: u64,
+    pub completed_operations: u64,
+    pub predicated_operations: u64,
+    pub error_operations: u64,
+    pub backpressure_events: u64,
+    pub reclaimed_credits: u64,
+    pub completed_partitions: u64,
+    pub semantic_commits: u64,
+    pub public_commits: u64,
+    pub co_resident_partitions: u64,
+    pub queue_us: u64,
+    pub launch_us: u64,
+    pub device_us: u64,
+    pub completion_us: u64,
+    pub semantic_commit_us: u64,
+    pub public_commit_us: u64,
+    pub co_resident_us: u64,
+}
+
 /// The bounded operation-window and lifecycle observability surface.
 #[derive(Debug, Clone)]
 pub struct ResourceWindowMetrics {
@@ -834,6 +903,7 @@ pub struct ResourceWindowMetrics {
     pub max_unresolved_window: u32,
     pub peak_ops_in_batch: usize,
     pub phase_delays: Vec<PhaseSpanDelay>,
+    pub domains: Vec<DomainWindowMetrics>,
 }
 
 fn now() -> f64 {
@@ -1041,6 +1111,50 @@ fn policy_str(policy: SchedulingPolicy) -> &'static str {
     }
 }
 
+fn domain_str(domain: uniserve_worker_wire::Domain) -> &'static str {
+    match domain {
+        uniserve_worker_wire::Domain::Prefill => "prefill",
+        uniserve_worker_wire::Domain::Decode => "decode",
+        uniserve_worker_wire::Domain::Flow => "flow",
+    }
+}
+
+fn execution_capability_str(execution: ExecutionCapability) -> &'static str {
+    match execution {
+        ExecutionCapability::DomainHomogeneous => "domain_homogeneous",
+        ExecutionCapability::TensorizedMixed => "tensorized_mixed",
+    }
+}
+
+fn domain_window_metrics(
+    domains: &ExecutionDomainStats,
+    domain: uniserve_worker_wire::Domain,
+) -> DomainWindowMetrics {
+    let stats = domains.get(domain);
+    DomainWindowMetrics {
+        domain,
+        active_credits: stats.active_credits.load(Ordering::Relaxed),
+        peak_credits: stats.peak_credits.load(Ordering::Relaxed),
+        launched_operations: stats.launched_operations.load(Ordering::Relaxed),
+        completed_operations: stats.completed_operations.load(Ordering::Relaxed),
+        predicated_operations: stats.predicated_operations.load(Ordering::Relaxed),
+        error_operations: stats.error_operations.load(Ordering::Relaxed),
+        backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
+        reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
+        completed_partitions: stats.completed_partitions.load(Ordering::Relaxed),
+        semantic_commits: stats.semantic_commits.load(Ordering::Relaxed),
+        public_commits: stats.public_commits.load(Ordering::Relaxed),
+        co_resident_partitions: stats.co_resident_partitions.load(Ordering::Relaxed),
+        queue_us: stats.queue_us.load(Ordering::Relaxed),
+        launch_us: stats.launch_us.load(Ordering::Relaxed),
+        device_us: stats.device_us.load(Ordering::Relaxed),
+        completion_us: stats.completion_us.load(Ordering::Relaxed),
+        semantic_commit_us: stats.semantic_commit_us.load(Ordering::Relaxed),
+        public_commit_us: stats.public_commit_us.load(Ordering::Relaxed),
+        co_resident_us: stats.co_resident_us.load(Ordering::Relaxed),
+    }
+}
+
 /// One submitted-but-unresolved operation tracked in a request's ordered queue.
 /// Its apply record is paired by `(operation.request_key, operation.op_id)`.
 struct InflightOp {
@@ -1048,6 +1162,28 @@ struct InflightOp {
     apply: SchedulerApply,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct SubmittedPartitionAccounting {
+    domain: uniserve_worker_wire::Domain,
+    execution: ExecutionCapability,
+    submission_group: u32,
+    operation_count: usize,
+}
+
+#[derive(Clone)]
+struct ProjectedBranch {
+    phase: Phase,
+    image_id: u32,
+    conditioning_position: u32,
+    steps_done: u16,
+    conditioning: Option<ProductRef>,
+    latent: Option<ProductRef>,
+    feedback_source: Option<ProductRef>,
+    feedback_feature: Option<ProductRef>,
+    feedback_step: usize,
+    chainable: bool,
 }
 
 struct PendingCompletion {
@@ -1237,6 +1373,7 @@ impl Scheduler {
             planner: GenerationPlanner::new(latent_dtype),
             batch_started: HashMap::new(),
             batch_partitions: HashMap::new(),
+            batch_group_worker_exec_us: HashMap::new(),
             pending_controls: VecDeque::new(),
             control_batches: HashMap::new(),
             authority_id: 1,
@@ -1410,6 +1547,14 @@ impl Scheduler {
             max_unresolved_window: self.caps.max_unresolved_window,
             peak_ops_in_batch: self.peak_ops_in_batch,
             phase_delays,
+            domains: [
+                uniserve_worker_wire::Domain::Prefill,
+                uniserve_worker_wire::Domain::Decode,
+                uniserve_worker_wire::Domain::Flow,
+            ]
+            .into_iter()
+            .map(|domain| domain_window_metrics(&self.stats.domains, domain))
+            .collect(),
         }
     }
 
@@ -1446,10 +1591,6 @@ impl Scheduler {
     /// spin the schedule-ahead loop. Returns `true` if the engine died
     /// (executor/worker failure) rather than shutting down gracefully.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
-        // Event-driven executors park on {result, command, worker-death}; the
-        // command ingress wakes that wait. Polling executors use the crossbeam
-        // selection path below.
-        let event_driven = self.executor.event_driven();
         loop {
             // drain pending commands (non-blocking)
             let mut shutdown = false;
@@ -1480,75 +1621,15 @@ impl Scheduler {
                 return true;
             }
 
-            if event_driven {
-                // One park point. On wake, loop back to drain commands + step.
-                // The park itself never observes shutdown — commands are drained
-                // at the loop head — so it only needs to surface fatal death.
-                if !progressed {
-                    self.park_event_driven();
-                    if self.fatal {
-                        tracing::error!(
-                            "engine fatal: executor/worker died during park; stopping the control loop"
-                        );
-                        self.abort_all_requests();
-                        self.executor.shutdown();
-                        return true;
-                    }
-                }
-                continue;
-            }
-
-            if !progressed && self.executor.in_flight() > 0 {
-                if self.wait_for_inflight_or_command(&rx) {
-                    break;
-                }
+            if !progressed {
+                self.park_for_progress();
                 if self.fatal {
                     tracing::error!(
-                        "engine fatal: executor/worker died during wait; stopping the control loop"
+                        "engine fatal: executor/worker died during park; stopping the control loop"
                     );
                     self.abort_all_requests();
                     self.executor.shutdown();
                     return true;
-                }
-                continue;
-            }
-
-            if !progressed && self.executor.in_flight() == 0 {
-                // Nothing in flight and nothing schedulable this pass — park on
-                // the command channel instead of spinning. This covers both the
-                // fully idle case and the backpressured case (requests resident
-                // or queued but no op currently buildable): any state change
-                // arrives as a command or as freed capacity from a command
-                // (cancel/finish), and the timeout doubles as the worker
-                // liveness probe so a worker that dies with nothing in flight
-                // is detected promptly. CPU continuations require a shorter
-                // slice so ready results are incorporated promptly.
-                let wait = if !self.cpu_tasks_pending() {
-                    IDLE_LIVENESS_POLL
-                } else {
-                    std::time::Duration::from_millis(1)
-                };
-                match rx.recv_timeout(wait) {
-                    Ok(cmd) => {
-                        if self.handle_command(cmd) {
-                            break;
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // No command arrived; verify the worker is still alive.
-                        if let Err(e) = self.executor.check_liveness() {
-                            self.on_executor_error(e);
-                            if self.fatal {
-                                tracing::error!(
-                                    "engine fatal: worker died while idle; stopping the control loop"
-                                );
-                                self.abort_all_requests();
-                                self.executor.shutdown();
-                                return true;
-                            }
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
             }
         }
@@ -1560,18 +1641,11 @@ impl Scheduler {
         false
     }
 
-    /// Event-driven park over result, command, worker-death, CPU-continuation,
-    /// and output-capacity wakes. The timeout is a liveness backstop.
-    fn park_event_driven(&mut self) {
+    /// One park over result, command, worker-death, CPU-continuation, and
+    /// output-capacity wakes. The timeout is solely a liveness deadline.
+    fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        let timeout = if self.cpu_tasks_pending() {
-            Duration::from_millis(1)
-        } else if self.executor.in_flight() > 0 {
-            SCHEDULER_WAIT_SLICE
-        } else {
-            IDLE_LIVENESS_POLL
-        };
-        if let Err(e) = self.executor.park_for_event(timeout) {
+        if let Err(e) = self.executor.park_for_event(IDLE_LIVENESS_POLL) {
             self.on_executor_error(e);
             return;
         }
@@ -1586,32 +1660,6 @@ impl Scheduler {
             .in_flight
             .store(self.executor.in_flight(), Ordering::Relaxed);
         self.publish_cache_stats();
-    }
-
-    fn wait_for_inflight_or_command(&mut self, rx: &Receiver<Command>) -> bool {
-        crossbeam_channel::select! {
-            recv(rx) -> msg => match msg {
-                Ok(cmd) => {
-                    if self.handle_command(cmd) {
-                        return true;
-                    }
-                }
-                Err(_) => return true,
-            },
-            default(SCHEDULER_WAIT_SLICE) => {
-                match self.executor.wait_result_timeout(Duration::ZERO) {
-                    Ok(Some(r)) => self.apply_result(r),
-                    Ok(None) => {}
-                    Err(e) => self.on_executor_error(e),
-                }
-            }
-        }
-        self.stats
-            .general
-            .in_flight
-            .store(self.executor.in_flight(), Ordering::Relaxed);
-        self.publish_cache_stats();
-        false
     }
 
     /// Abort every queued/gated/running request with a terminal event.
@@ -1987,6 +2035,7 @@ impl Scheduler {
         request_id: RequestId,
         request_key: RequestKey,
         op_id: OpId,
+        conditioning_tokens: u32,
     ) -> Result<Vec<KvBranchPlacement>, &'static str> {
         let Some(state) = self.running.get(&request_id) else {
             return Err("generation request lost its runtime state");
@@ -1996,7 +2045,7 @@ impl Scheduler {
         let branch_tokens = self
             .num_vae(&state.req.image)
             .saturating_add(u64::from(self.caps.commit_marker_tokens));
-        let conditioning_tokens = u64::from(state.und.physical_kv_len);
+        let conditioning_tokens = u64::from(conditioning_tokens);
         let negative_tokens = state.context.negative_prompt_ids.len() as u64;
         let branch_pages = |prefix_tokens: u64| {
             usize::try_from(
@@ -2181,10 +2230,6 @@ impl Scheduler {
         pos.saturating_add(1).saturating_add(spec_len)
     }
 
-    fn cpu_tasks_pending(&self) -> bool {
-        !self.cpu_deadlines.is_empty()
-    }
-
     /// One loop iteration of the schedule-ahead loop. Returns true if any work
     /// was submitted or any result resolved.
     pub fn step(&mut self) -> bool {
@@ -2195,7 +2240,12 @@ impl Scheduler {
         match self.executor.next_result() {
             Ok(result) => {
                 self.apply_result(result);
-                self.step_nonblocking();
+                self.refill_executor();
+                self.stats
+                    .general
+                    .in_flight
+                    .store(self.executor.in_flight(), Ordering::Relaxed);
+                self.publish_cache_stats();
             }
             Err(error) => {
                 self.on_executor_error(error);
@@ -2224,6 +2274,19 @@ impl Scheduler {
         // made, so subsequent ready completions are handled on successive turns.
         progressed |= self.poll_one_result();
 
+        progressed |= self.refill_executor();
+
+        self.stats
+            .general
+            .in_flight
+            .store(self.executor.in_flight(), Ordering::Relaxed);
+        self.publish_cache_stats();
+        progressed
+    }
+
+    fn refill_executor(&mut self) -> bool {
+        let mut progressed = false;
+
         // 2. reap cancellations before assembling.
         self.reap_cancellations();
 
@@ -2243,20 +2306,19 @@ impl Scheduler {
                 break;
             }
             let controls = self.pending_controls.drain(..).collect();
-            self.submit_batch(new_reqs, ops, controls);
+            if !self.submit_batch(new_reqs, ops, controls) {
+                break;
+            }
             progressed = true;
         }
         while self.executor.can_submit() && !self.pending_controls.is_empty() {
             let controls = self.pending_controls.drain(..).collect();
-            self.submit_batch(Vec::new(), Vec::new(), controls);
+            if !self.submit_batch(Vec::new(), Vec::new(), controls) {
+                break;
+            }
             progressed = true;
         }
 
-        self.stats
-            .general
-            .in_flight
-            .store(self.executor.in_flight(), Ordering::Relaxed);
-        self.publish_cache_stats();
         progressed
     }
 
@@ -2360,16 +2422,148 @@ impl Scheduler {
             .into_iter()
             .flatten()
             .map(|op| &op.apply);
-        Some(st.cursor.project(applies))
+        st.cursor.project(applies)
     }
 
-    fn projected_version(&self, id: RequestId) -> Option<u64> {
+    fn projected_branch(&self, id: RequestId) -> Option<ProjectedBranch> {
         let state = self.running.get(&id)?;
-        Some(if self.inflight_len(id) > 0 {
-            1
-        } else {
-            state.version
-        })
+        let cursor = self.projected_cursor(id)?;
+        let mut projected = ProjectedBranch {
+            phase: state.lifecycle.phase,
+            image_id: state.image_gen.image_id,
+            conditioning_position: state.image_gen.cond_pos,
+            steps_done: state.image_gen.steps_done,
+            conditioning: state.image_gen.conditioning.clone(),
+            latent: state.image_gen.latent.clone(),
+            feedback_source: state.feedback.source_product.clone(),
+            feedback_feature: state.feedback.encoded_product.clone(),
+            feedback_step: state.feedback.ingest_step,
+            chainable: true,
+        };
+        if projected.phase == Phase::DenoiseGen && projected.steps_done >= state.req.image.steps {
+            projected.phase = Phase::CommitGen;
+        }
+        for inflight in self.inflight_ops.get(&id).into_iter().flatten() {
+            match &inflight.apply.delta {
+                TransitionDelta::CloseKv {
+                    image_id,
+                    logical_position,
+                    ..
+                } => {
+                    projected.phase = Phase::PublishKv;
+                    projected.image_id = *image_id;
+                    projected.conditioning_position = *logical_position;
+                }
+                TransitionDelta::PublishKv { image_id, .. } => {
+                    projected.phase = Phase::TransitionGen;
+                    projected.image_id = *image_id;
+                    projected.conditioning = inflight
+                        .operation
+                        .outputs
+                        .iter()
+                        .find(|output| output.kind == ProductKind::Kv)
+                        .cloned();
+                }
+                TransitionDelta::TransitionGen { image_id, .. } => {
+                    projected.phase = Phase::DenoiseGen;
+                    projected.image_id = *image_id;
+                    projected.steps_done = 0;
+                    projected.latent = inflight
+                        .operation
+                        .outputs
+                        .iter()
+                        .find(|output| output.kind == ProductKind::Latent)
+                        .cloned();
+                }
+                TransitionDelta::DenoiseGen {
+                    image_id,
+                    start_step,
+                    step_count,
+                    ..
+                } => {
+                    projected.image_id = *image_id;
+                    projected.steps_done = projected
+                        .steps_done
+                        .max(start_step.saturating_add(*step_count));
+                    projected.latent = inflight
+                        .operation
+                        .outputs
+                        .iter()
+                        .find(|output| output.kind == ProductKind::Latent)
+                        .cloned();
+                    projected.phase = if projected.steps_done >= state.req.image.steps {
+                        Phase::CommitGen
+                    } else {
+                        Phase::DenoiseGen
+                    };
+                }
+                TransitionDelta::CommitGen { image_id, .. } => {
+                    projected.image_id = *image_id;
+                    projected.feedback_source = inflight
+                        .operation
+                        .outputs
+                        .iter()
+                        .find(|output| {
+                            output.kind == ProductKind::Artifact
+                                && output.storage_class
+                                    == uniserve_worker_wire::StorageClass::LatentArena
+                        })
+                        .cloned();
+                    projected.feedback_step = 0;
+                    projected.phase = Phase::FeedbackEncode;
+                    projected.chainable = state.req.behavior.generated_image_feedback
+                        && state.req.policy.feedback.as_ref().is_some_and(|feedback| {
+                            feedback.source == uniserve_core::FeedbackSource::DeviceProduct
+                        });
+                }
+                TransitionDelta::EncodeFeedbackStep {
+                    image_id,
+                    step_index,
+                } => {
+                    projected.image_id = *image_id;
+                    projected.feedback_step = *step_index;
+                    projected.feedback_feature = inflight
+                        .operation
+                        .outputs
+                        .iter()
+                        .find(|output| {
+                            matches!(
+                                output.kind,
+                                ProductKind::VisionFeature | ProductKind::LatentFeature
+                            )
+                        })
+                        .cloned();
+                    projected.phase = Phase::FeedbackState;
+                }
+                TransitionDelta::FeedbackState {
+                    step_index,
+                    is_final_step,
+                    ..
+                } => {
+                    projected.feedback_step = step_index.saturating_add(1);
+                    projected.feedback_feature = None;
+                    if *is_final_step {
+                        projected.phase = Phase::DecodeUnd;
+                        projected.chainable = state
+                            .req
+                            .policy
+                            .feedback
+                            .as_ref()
+                            .is_some_and(|feedback| feedback.sample_continuation);
+                    } else {
+                        projected.phase = Phase::FeedbackEncode;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if projected.phase == Phase::Prefill
+            && cursor.prompt_cursor >= state.context.prompt_ids.len() as u32
+            && state.ingest.mm_cursor >= state.context.images.len()
+        {
+            projected.phase = Phase::DecodeUnd;
+        }
+        Some(projected)
     }
 
     fn fixed_version(&self, id: RequestId) -> Option<VersionRef> {
@@ -2381,6 +2575,40 @@ impl Scheduler {
             point: Point::Fixed {
                 point_index: state.version as u32,
                 semantic_digest: state.resolved_semantic.clone(),
+            },
+        })
+    }
+
+    fn projected_parent(&self, id: RequestId) -> Option<VersionRef> {
+        let operation = self
+            .inflight_ops
+            .get(&id)?
+            .iter()
+            .rev()
+            .find(|inflight| inflight.operation.advances_state)
+            .map(|inflight| &inflight.operation);
+        let Some(operation) = operation else {
+            return self.fixed_version(id);
+        };
+        let selected_point = (operation.bounds.max_points > 1)
+            .then(|| {
+                operation
+                    .outputs
+                    .iter()
+                    .find(|output| output.kind == ProductKind::SelectedPoint)
+                    .cloned()
+            })
+            .flatten();
+        if operation.bounds.max_points > 1 && selected_point.is_none() {
+            return None;
+        }
+        Some(VersionRef {
+            request_key: operation.request_key,
+            producer_op_id: operation.op_id,
+            point: Point::Device {
+                point_index: u32::from(selected_point.is_none()),
+                selected_point,
+                producer_plan_digest: operation.plan_digest.clone(),
             },
         })
     }
@@ -2418,11 +2646,29 @@ impl Scheduler {
         };
         state.committed_producer_op_id = selected.producer_op_id.0;
         state.public_event_limit = public_event_limit;
-        state.trace.stamp_existing(
+        let committed_us = uniserve_core::now_monotonic_us();
+        let newly_committed = state.trace.stamp_existing(
             selected.producer_op_id,
             crate::trace::LifecyclePhase::SemanticallyCommitted,
-            uniserve_core::now_monotonic_us(),
+            committed_us,
         );
+        let domain_commit = newly_committed.then(|| {
+            (
+                state.trace.domain(selected.producer_op_id),
+                state.trace.span_us(
+                    selected.producer_op_id,
+                    crate::trace::LifecyclePhase::CompletionObserved,
+                    crate::trace::LifecyclePhase::SemanticallyCommitted,
+                ),
+            )
+        });
+        if let Some((Some(domain), delay)) = domain_commit {
+            let stats = self.stats.domains.get(domain);
+            stats.semantic_commits.fetch_add(1, Ordering::Relaxed);
+            if let Some(delay) = delay {
+                stats.semantic_commit_us.fetch_add(delay, Ordering::Relaxed);
+            }
+        }
         self.pending_controls.push_back(Control::Commit {
             request_key: selected.request_key,
             control_seq: state.control_seq,
@@ -2484,16 +2730,11 @@ impl Scheduler {
         }
     }
 
-    /// Whether a request may keep an additional operation in flight rooted on a
-    /// predecessor's not-yet-observed selected point.
-    ///
-    /// Such a successor roots on a device version reference (`Point::Device`).
-    /// The predecessor's tagged token product is the successor predicate.
-    /// Terminal tokens and direct image triggers clear its continuation bit, so
-    /// the worker resolves an already registered successor as a semantic no-op.
-    /// The host can then apply the sampled token's terminal or branch transition
-    /// without admitting an extra text token into that lineage.
-    fn can_queue_decode_successor(&self, id: RequestId) -> bool {
+    /// Whether a request may keep an additional operation in flight at the
+    /// predecessor's not-yet-observed selected point. Eligibility requires an
+    /// exact projected cursor and a reachable predicate product for the target
+    /// work leaf.
+    fn can_queue_successor(&self, id: RequestId, target: WorkVariant) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
         };
@@ -2505,8 +2746,6 @@ impl Scheduler {
             || state.cancelled
             || self.pending_finishes.contains_key(&id)
             || self.custom_logits_processors > 0
-            || !matches!(state.lifecycle.phase, Phase::Prefill | Phase::DecodeUnd)
-            || (state.lifecycle.phase == Phase::Prefill && state.starts_gen_after_context())
             || !Self::device_token_relay_eligible(state)
         {
             return false;
@@ -2514,10 +2753,13 @@ impl Scheduler {
         let Some(predecessor) = queue.back() else {
             return false;
         };
-        if !self.executor.device_products_reachable(
-            predecessor.operation.work.variant(),
-            WorkVariant::TokenDecode,
-        ) {
+        if target.requires_fixed_parent() {
+            return false;
+        }
+        if !self
+            .executor
+            .device_products_reachable(predecessor.operation.work.variant(), target)
+        {
             return false;
         }
         if matches!(
@@ -2526,22 +2768,89 @@ impl Scheduler {
         ) {
             return false;
         }
-        // Only plain decode/extend predecessors may carry a device-relay
-        // successor; any other variant is not a single-token advance.
-        if queue.iter().any(|op| {
-            !matches!(
-                op.operation.work.variant(),
-                WorkVariant::TokenExtend | WorkVariant::TokenDecode
-            )
-        }) {
-            return false;
+        if target == WorkVariant::TokenDecode {
+            let feedback_continuation = matches!(
+                predecessor.apply.delta,
+                TransitionDelta::FeedbackState {
+                    is_final_step: true,
+                    ..
+                }
+            ) && state
+                .req
+                .policy
+                .feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.sample_continuation)
+                && predecessor
+                    .operation
+                    .outputs
+                    .iter()
+                    .any(|output| output.kind == ProductKind::Token);
+            if feedback_continuation {
+                return self
+                    .projected_inflight_variant(id)
+                    .is_some_and(|variant| variant == WorkVariant::TokenDecode)
+                    && state.und.tokens_emitted.saturating_add(1) < state.req.max_und_tokens;
+            }
+            if !matches!(state.lifecycle.phase, Phase::Prefill | Phase::DecodeUnd)
+                || (state.lifecycle.phase == Phase::Prefill && state.starts_gen_after_context())
+                || queue.iter().any(|op| {
+                    !matches!(
+                        op.operation.work.variant(),
+                        WorkVariant::TokenExtend | WorkVariant::TokenDecode
+                    )
+                })
+            {
+                return false;
+            }
+            let Some(projected) = self.projected_cursor(id) else {
+                return false;
+            };
+            return projected.prompt_cursor as usize >= state.effective_prompt().len()
+                && state.ingest.mm_cursor >= state.context.images.len()
+                && state.und.tokens_emitted.saturating_add(queue.len()) < state.req.max_und_tokens;
         }
-        let Some(projected) = self.projected_cursor(id) else {
-            return false;
-        };
-        projected.prompt_cursor as usize >= state.effective_prompt().len()
-            && state.ingest.mm_cursor >= state.context.images.len()
-            && state.und.tokens_emitted.saturating_add(queue.len()) < state.req.max_und_tokens
+        predecessor
+            .operation
+            .outputs
+            .iter()
+            .any(|output| output.kind == ProductKind::Completion)
+            && self
+                .projected_inflight_variant(id)
+                .is_some_and(|variant| variant == target)
+    }
+
+    fn projected_inflight_variant(&self, id: RequestId) -> Option<WorkVariant> {
+        if !self.has_inflight(id) {
+            return None;
+        }
+        let state = self.running.get(&id)?;
+        let cursor = self.projected_cursor(id)?;
+        if cursor.prompt_cursor < state.context.prompt_ids.len() as u32
+            || state.ingest.mm_cursor < state.context.images.len()
+        {
+            return None;
+        }
+        let branch = self.projected_branch(id)?;
+        if !branch.chainable {
+            return None;
+        }
+        Some(match branch.phase {
+            Phase::Prefill | Phase::DecodeUnd => WorkVariant::TokenDecode,
+            Phase::CloseKv | Phase::FeedbackState => WorkVariant::TokenExtend,
+            Phase::PublishKv => WorkVariant::TransferKvPublish,
+            Phase::TransitionGen => WorkVariant::GenTransition,
+            Phase::DenoiseGen => WorkVariant::GenFlow,
+            Phase::CommitGen => WorkVariant::Materialize,
+            Phase::FeedbackEncode => {
+                let feedback = state.req.policy.feedback.as_ref()?;
+                match feedback.ingest.steps.get(branch.feedback_step)? {
+                    ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
+                    ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
+                }
+            }
+            Phase::Encode | Phase::IngestState => return None,
+        })
     }
 
     fn device_token_relay_eligible(state: &ReqState) -> bool {
@@ -2596,7 +2905,10 @@ impl Scheduler {
                 .running
                 .get(&id)
                 .is_some_and(|state| self.pending_commit_horizon_open(state))
-            && (!self.has_inflight(id) || self.can_queue_decode_successor(id))
+            && (!self.has_inflight(id)
+                || self
+                    .projected_inflight_variant(id)
+                    .is_some_and(|target| self.can_queue_successor(id, target)))
     }
 
     /// Whether the request may register another operation without exceeding its
@@ -2779,8 +3091,19 @@ impl Scheduler {
         }
     }
 
-    fn register_inflight(&mut self, operation: Operation, apply: SchedulerApply, started: Instant) {
+    fn register_inflight(
+        &mut self,
+        operation: Operation,
+        apply: SchedulerApply,
+        started: Instant,
+        queue_us: u64,
+    ) {
         let request_id = operation.request_key.session_id;
+        let domain = self.stats.domains.get(operation.domain);
+        let active = domain.active_credits.fetch_add(1, Ordering::Relaxed) + 1;
+        domain.peak_credits.fetch_max(active, Ordering::Relaxed);
+        domain.launched_operations.fetch_add(1, Ordering::Relaxed);
+        domain.queue_us.fetch_add(queue_us, Ordering::Relaxed);
         self.inflight_ops
             .entry(request_id)
             .or_default()
@@ -2789,6 +3112,73 @@ impl Scheduler {
                 apply,
                 started,
             });
+    }
+
+    fn record_domain_backpressure(&self, domain: uniserve_worker_wire::Domain) {
+        self.stats
+            .domains
+            .get(domain)
+            .backpressure_events
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_domain_partition(
+        &self,
+        accounting: SubmittedPartitionAccounting,
+        timing: TimingCounters,
+    ) {
+        let stats = self.stats.domains.get(accounting.domain);
+        stats.completed_partitions.fetch_add(1, Ordering::Relaxed);
+        stats
+            .launch_us
+            .fetch_add(timing.queued_us, Ordering::Relaxed);
+        stats
+            .device_us
+            .fetch_add(timing.device_us, Ordering::Relaxed);
+        stats.completion_us.fetch_add(
+            timing.copy_us.saturating_add(timing.host_us),
+            Ordering::Relaxed,
+        );
+        if accounting.execution == ExecutionCapability::TensorizedMixed {
+            stats.co_resident_partitions.fetch_add(1, Ordering::Relaxed);
+            stats
+                .co_resident_us
+                .fetch_add(timing.device_us, Ordering::Relaxed);
+        }
+    }
+
+    fn record_domain_completion(&self, domain: uniserve_worker_wire::Domain, status: OpStatus) {
+        let stats = self.stats.domains.get(domain);
+        stats.completed_operations.fetch_add(1, Ordering::Relaxed);
+        match status {
+            OpStatus::Ok => {}
+            OpStatus::Predicated => {
+                stats.predicated_operations.fetch_add(1, Ordering::Relaxed);
+            }
+            OpStatus::Error => {
+                stats.error_operations.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn reclaim_domain_credit(&self, domain: uniserve_worker_wire::Domain, failed: bool) {
+        let stats = self.stats.domains.get(domain);
+        let active = stats.active_credits.load(Ordering::Relaxed);
+        if active == 0 {
+            tracing::error!(?domain, "domain operation credit accounting underflowed");
+            return;
+        }
+        stats.active_credits.fetch_sub(1, Ordering::Relaxed);
+        stats.reclaimed_credits.fetch_add(1, Ordering::Relaxed);
+        if failed {
+            stats.error_operations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn fail_inflight_domain_credits(&self) {
+        for inflight in self.inflight_ops.values().flatten() {
+            self.reclaim_domain_credit(inflight.operation.domain, true);
+        }
     }
 
     fn stage_completion(&mut self, record: CompletionRecord, products: Arc<[ProductPayload]>) {
@@ -2887,6 +3277,7 @@ impl Scheduler {
         if empty {
             self.inflight_ops.remove(&id);
         }
+        self.reclaim_domain_credit(inflight.operation.domain, false);
         if parent_op_id > 0 {
             self.mark_operation_reclaimed(id, parent_op_id);
         }
@@ -2977,20 +3368,29 @@ impl Scheduler {
 
     fn apply_result(&mut self, report: CompletionReport) {
         let result_step_id = report.step_id;
-        let returned_partitions = report
-            .partitions
-            .iter()
-            .map(|partition| partition.partition_id)
-            .collect::<Vec<_>>();
+        let mut returned_accounting = HashMap::with_capacity(report.partitions.len());
+        let mut invalid_partition = false;
         let batch_complete = if let Some(pending) = self.batch_partitions.get_mut(&result_step_id) {
-            for partition_id in &returned_partitions {
-                if !pending.remove(partition_id) {
+            for partition in &report.partitions {
+                if let Some(accounting) = pending.remove(&partition.partition_id) {
+                    if accounting.operation_count != partition.completions.len() {
+                        tracing::error!(
+                            step_id = result_step_id,
+                            partition_id = partition.partition_id,
+                            expected_operations = accounting.operation_count,
+                            actual_completions = partition.completions.len(),
+                            "executor returned an incomplete partition"
+                        );
+                        invalid_partition = true;
+                    }
+                    returned_accounting.insert(partition.partition_id, accounting);
+                } else {
                     tracing::error!(
                         step_id = result_step_id,
-                        partition_id,
+                        partition_id = partition.partition_id,
                         "executor returned a duplicate or unknown partition"
                     );
-                    self.fatal = true;
+                    invalid_partition = true;
                 }
             }
             pending.is_empty()
@@ -2999,14 +3399,14 @@ impl Scheduler {
                 step_id = result_step_id,
                 "executor returned a result for an unknown batch"
             );
-            self.fatal = true;
+            invalid_partition = true;
             false
         };
-        let worker_exec_us = report
-            .partitions
-            .iter()
-            .filter_map(|partition| partition.worker_exec_us)
-            .reduce(u64::saturating_add);
+        if invalid_partition {
+            self.fatal = true;
+            self.fail_all_running("executor returned an invalid completion partition");
+            return;
+        }
         let forward_stats = report
             .partitions
             .iter()
@@ -3017,6 +3417,52 @@ impl Scheduler {
             .iter()
             .map(|partition| partition.completions.len())
             .sum();
+        let trace_enabled = self.trace_enabled();
+        let mut domain_partition_trace = trace_enabled.then(Vec::new);
+        for partition in &report.partitions {
+            let accounting = returned_accounting[&partition.partition_id];
+            let timing = partition.completions.iter().fold(
+                TimingCounters::default(),
+                |mut aggregate, record| {
+                    aggregate.queued_us = aggregate.queued_us.max(record.timing_counters.queued_us);
+                    aggregate.device_us = aggregate.device_us.max(record.timing_counters.device_us);
+                    aggregate.copy_us = aggregate.copy_us.max(record.timing_counters.copy_us);
+                    aggregate.host_us = aggregate.host_us.max(record.timing_counters.host_us);
+                    aggregate
+                },
+            );
+            self.record_domain_partition(accounting, timing);
+            for record in &partition.completions {
+                self.record_domain_completion(accounting.domain, record.status);
+            }
+            if let Some(worker_exec_us) = partition.worker_exec_us {
+                let groups = self
+                    .batch_group_worker_exec_us
+                    .get_mut(&result_step_id)
+                    .expect("known batch has worker timing state");
+                groups
+                    .entry(accounting.submission_group)
+                    .and_modify(|current| *current = (*current).max(worker_exec_us))
+                    .or_insert(worker_exec_us);
+            }
+            if let Some(trace) = domain_partition_trace.as_mut() {
+                trace.push(json!({
+                    "partition_id": partition.partition_id,
+                    "submission_group": accounting.submission_group,
+                    "domain": domain_str(accounting.domain),
+                    "operations": accounting.operation_count,
+                    "execution": execution_capability_str(accounting.execution),
+                    "queue_us": timing.queued_us,
+                    "device_us": timing.device_us,
+                    "completion_us": timing.copy_us.saturating_add(timing.host_us),
+                    "co_resident_us": if accounting.execution == ExecutionCapability::TensorizedMixed {
+                        timing.device_us
+                    } else {
+                        0
+                    },
+                }));
+            }
+        }
         if batch_complete {
             self.batch_partitions.remove(&result_step_id);
             if let Some(controls) = self.control_batches.remove(&result_step_id) {
@@ -3031,29 +3477,35 @@ impl Scheduler {
         if batch_complete {
             self.batch_started.remove(&result_step_id);
         }
-        let worker_us = worker_exec_us.unwrap_or(0);
-        if let Some(w) = worker_exec_us {
+        let worker_us = if batch_complete {
+            self.batch_group_worker_exec_us
+                .remove(&result_step_id)
+                .into_iter()
+                .flat_map(|groups| groups.into_values())
+                .fold(0, u64::saturating_add)
+        } else {
+            0
+        };
+        if batch_complete {
             self.stats
                 .timing
                 .last_worker_exec_us
-                .store(w, Ordering::Relaxed);
+                .store(worker_us, Ordering::Relaxed);
         }
-        // fold the per-batch worker compute time and host round-trip
-        // latency into cumulative counters so they surface in the structured
-        // wire stats / Prometheus, mirroring what the JSON trace already records.
-        self.stats
-            .timing
-            .worker_exec_us_total
-            .fetch_add(worker_us, Ordering::Relaxed);
-        self.stats
-            .timing
-            .batch_roundtrip_us_total
-            .fetch_add(batch_roundtrip_us, Ordering::Relaxed);
-        self.stats
-            .timing
-            .batch_timing_count
-            .fetch_add(1, Ordering::Relaxed);
-        let trace_enabled = self.trace_enabled();
+        if batch_complete {
+            self.stats
+                .timing
+                .worker_exec_us_total
+                .fetch_add(worker_us, Ordering::Relaxed);
+            self.stats
+                .timing
+                .batch_roundtrip_us_total
+                .fetch_add(batch_roundtrip_us, Ordering::Relaxed);
+            self.stats
+                .timing
+                .batch_timing_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let forward_stats_trace = trace_enabled.then(|| {
             forward_stats
                 .iter()
@@ -3119,9 +3571,12 @@ impl Scheduler {
                         "request_id": id.0,
                         "op_id": op_id,
                         "operation_type": operation_variant.as_wire_str(),
+                        "domain": domain_str(operation.domain),
                         "transition_delta": apply.delta.as_str(),
                         "transition_replayability": apply.replayability_after_apply.as_str(),
                         "roundtrip_us": roundtrip_us,
+                        "worker_queue_us": record.timing_counters.queued_us,
+                        "device_us": record.timing_counters.device_us,
                         "completion_copy_us": record.timing_counters.copy_us,
                         "completion_ready_to_observed_us": record.timing_counters.host_us,
                         "sampled_token": sampled_token_ids_last.is_some(),
@@ -3216,11 +3671,18 @@ impl Scheduler {
                 let expected_parent = self.fixed_version(id);
                 let prefix_versions =
                     token_prefix_versions(Some(&operation), &record, expected_parent.as_ref());
-                let cursor_result = self.running.get_mut(&id).map(|state| {
-                    state
-                        .cursor
-                        .apply_transition(&operation, &apply, &record, products.as_ref())
-                });
+                let cursor_result = if record.status == OpStatus::Ok {
+                    self.running.get_mut(&id).map(|state| {
+                        state.cursor.apply_transition(
+                            &operation,
+                            &apply,
+                            &record,
+                            products.as_ref(),
+                        )
+                    })
+                } else {
+                    None
+                };
                 if let Some(Err(error)) = cursor_result {
                     self.trace_record(json!({
                         "event": "cursor_transition_failed",
@@ -3328,6 +3790,10 @@ impl Scheduler {
                     .get(&id)
                     .map_or(0, |state| state.public_token_seq);
                 if record.status == OpStatus::Predicated {
+                    if let Some(state) = self.running.get_mut(&id) {
+                        state.resources.blocks_sent =
+                            state.resources.blocks_sent.saturating_sub(apply.new_blocks);
+                    }
                     let unused_products = operation.outputs.to_vec();
                     self.release_products(unused_products);
                     self.finish_pending_if_idle(id);
@@ -3455,6 +3921,8 @@ impl Scheduler {
                 "step_id": result_step_id,
                 "worker_exec_us": worker_us,
                 "host_roundtrip_us": batch_roundtrip_us,
+                "batch_complete": batch_complete,
+                "domains": domain_partition_trace,
                 "forward_stats": forward_stats_trace,
                 "batch_size": resolved_ops.len(),
                 "ops": resolved_ops,
@@ -3590,6 +4058,7 @@ impl Scheduler {
 
     fn fail_all_inflight(&mut self, msg: &str) {
         let ids: Vec<RequestId> = self.inflight_ops.keys().copied().collect();
+        self.fail_inflight_domain_credits();
         self.inflight_ops.clear();
         self.inflight_transfers = 0;
         self.pending_completions.clear();
@@ -3598,6 +4067,7 @@ impl Scheduler {
         // `batch_started` accumulates orphaned entries for every failed batch.
         self.batch_started.clear();
         self.batch_partitions.clear();
+        self.batch_group_worker_exec_us.clear();
         for id in ids {
             if self.running.contains_key(&id) {
                 self.emit(
@@ -3612,11 +4082,13 @@ impl Scheduler {
     }
 
     fn fail_all_running(&mut self, message: &str) {
+        self.fail_inflight_domain_credits();
         self.inflight_ops.clear();
         self.inflight_transfers = 0;
         self.pending_completions.clear();
         self.batch_started.clear();
         self.batch_partitions.clear();
+        self.batch_group_worker_exec_us.clear();
         let ids = self.running.keys().copied().collect::<Vec<_>>();
         for id in ids {
             self.emit(
@@ -4009,6 +4481,7 @@ impl Scheduler {
                 }
                 budget = budget.saturating_sub(planned_op_token_cost(&op));
                 if !self.reserve_transition_resources(&mut op) {
+                    self.record_domain_backpressure(op.domain);
                     self.return_unsent_blocks(id, &op);
                     tracing::debug!(
                         request_id = id.0,
@@ -4156,6 +4629,9 @@ impl Scheduler {
         if st.image_gen.branch_pending {
             return None;
         }
+        if let Some(variant) = self.projected_inflight_variant(id) {
+            return Some(variant);
+        }
         if st.has_context_images()
             && st.lifecycle.phase == Phase::Prefill
             && self.projected_cursor(id).is_some_and(|cursor| {
@@ -4176,20 +4652,14 @@ impl Scheduler {
                 ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
             },
             Phase::IngestState => WorkVariant::TokenExtend,
-            Phase::Prefill
-                if self.has_inflight(id)
-                    && self.can_queue_decode_successor(id)
-                    && self.projected_cursor(id).is_some_and(|cursor| {
-                        cursor.prompt_cursor as usize >= st.effective_prompt().len()
-                    }) =>
-            {
-                WorkVariant::TokenDecode
-            }
             Phase::Prefill => WorkVariant::TokenExtend,
             Phase::DecodeUnd => WorkVariant::TokenDecode,
             Phase::CloseKv => WorkVariant::TokenExtend,
             Phase::PublishKv => WorkVariant::TransferKvPublish,
             Phase::TransitionGen => WorkVariant::GenTransition,
+            Phase::DenoiseGen if st.image_gen.steps_done >= st.req.image.steps => {
+                WorkVariant::Materialize
+            }
             Phase::DenoiseGen => WorkVariant::GenFlow,
             Phase::CommitGen => WorkVariant::Materialize,
             Phase::FeedbackEncode => {
@@ -4208,7 +4678,7 @@ impl Scheduler {
         admissions: Vec<Admission>,
         transitions: Vec<PlannedTransition>,
         mut controls: Vec<Control>,
-    ) {
+    ) -> bool {
         let _span =
             tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
         self.step_id += 1;
@@ -4230,16 +4700,12 @@ impl Scheduler {
             let oid = self.next_op_id;
             self.next_op_id += 1;
             let request_id = transition.request_id;
-            let Some((epoch, resolved_semantic, resolved_producer_op_id, latest_device_version)) =
+            let Some((epoch, latest_device_version)) =
                 self.running.get(&request_id).and_then(|state| {
-                    state.admission_digest.as_ref().map(|_| {
-                        (
-                            state.epoch,
-                            state.resolved_semantic.clone(),
-                            state.resolved_producer_op_id,
-                            state.latest_device_version.clone(),
-                        )
-                    })
+                    state
+                        .admission_digest
+                        .as_ref()
+                        .map(|_| (state.epoch, state.latest_device_version.clone()))
                 })
             else {
                 tracing::error!(
@@ -4247,20 +4713,18 @@ impl Scheduler {
                     "planned operation lost its session"
                 );
                 self.fatal = true;
-                return;
+                return false;
             };
-            if self.has_inflight(request_id) && !self.can_queue_decode_successor(request_id) {
+            if self.has_inflight(request_id)
+                && !self.can_queue_successor(request_id, transition.operation_variant)
+            {
                 tracing::error!(
                     request_id = request_id.0,
                     "scheduler attempted to issue an unsafe projected successor"
                 );
                 self.fatal = true;
-                return;
+                return false;
             }
-            let Some(version) = self.projected_version(request_id) else {
-                self.fatal = true;
-                return;
-            };
             let request_key = RequestKey::new(self.authority_id, request_id, epoch);
             // A device successor roots on the exact selected-point product of
             // either its in-flight predecessor or the latest resolved operation.
@@ -4274,6 +4738,14 @@ impl Scheduler {
                     None
                 };
             let (parent, predicate) = if projected_successor {
+                let Some(parent) = self.projected_parent(request_id) else {
+                    tracing::error!(
+                        request_id = request_id.0,
+                        "projected successor has no semantic parent"
+                    );
+                    self.fatal = true;
+                    return false;
+                };
                 let Some(predecessor) = self
                     .inflight_ops
                     .get(&request_id)
@@ -4285,58 +4757,36 @@ impl Scheduler {
                         "projected successor lost its predecessor operation"
                     );
                     self.fatal = true;
-                    return;
+                    return false;
+                };
+                let predicate_kind = if transition.operation_variant == WorkVariant::TokenDecode {
+                    ProductKind::Token
+                } else {
+                    ProductKind::Completion
                 };
                 (
-                    VersionRef {
-                        request_key,
-                        producer_op_id: predecessor.op_id,
-                        point: Point::Device {
-                            point_index: u32::from(predecessor.bounds.max_points == 1),
-                            selected_point: (predecessor.bounds.max_points > 1).then(|| {
-                                predecessor
-                                    .outputs
-                                    .iter()
-                                    .find(|output| output.kind == ProductKind::SelectedPoint)
-                                    .cloned()
-                                    .expect("multi-point predecessor has a selected-point product")
-                            }),
-                            producer_plan_digest: predecessor.plan_digest.clone(),
-                        },
-                    },
+                    parent,
                     predecessor
                         .outputs
                         .iter()
-                        .find(|output| output.kind == ProductKind::Token)
+                        .find(|output| output.kind == predicate_kind)
                         .cloned(),
                 )
             } else if let Some(parent) = reusable_device_version {
                 (parent.version, Some(parent.token))
             } else {
-                (
-                    VersionRef {
-                        request_key,
-                        producer_op_id: OpId(resolved_producer_op_id),
-                        point: Point::Fixed {
-                            point_index: version as u32,
-                            semantic_digest: resolved_semantic,
-                        },
-                    },
-                    None,
-                )
+                let Some(parent) = self.fixed_version(request_id) else {
+                    self.fatal = true;
+                    return false;
+                };
+                (parent, None)
             };
-            // A device parent carries no embedded host point index. The
-            // scheduler-owned resolved/projected cursor supplies it for result
-            // validation without reading the device product.
-            let device_parent = matches!(parent.point, Point::Device { .. });
-            transition.device_parent_point = device_parent.then_some(version as u32);
             transition.predicate = predicate;
             transition.control_seq = self
                 .running
                 .get(&request_id)
                 .map_or(0, |state| state.control_seq);
-            let kv_lengths =
-                transition_kv_lengths(&transition.delta, self.running.get(&request_id));
+            let kv_lengths = transition_kv_lengths(&transition.delta);
             let new_page_count = transition.new_blocks.len();
             transition.kv_capacity_pages = kv_lengths.map_or(0, |_| {
                 self.bm
@@ -4363,7 +4813,7 @@ impl Scheduler {
                             "KV groups disagree on request capacity"
                         );
                         self.fatal = true;
-                        return;
+                        return false;
                     }
                     let pages_to_zero = if admitted_request_keys.contains(&request_key) {
                         let retained_pages = if group_id == 0 {
@@ -4415,7 +4865,7 @@ impl Scheduler {
                     );
                     self.fatal = true;
                     self.fail_all_running("scheduler authority exhausted product identity space");
-                    return;
+                    return false;
                 }
             };
             if !operation_kv_placements.is_empty() {
@@ -4425,10 +4875,17 @@ impl Scheduler {
                 );
             }
             if operation.work.variant() == WorkVariant::GenFlow {
+                let conditioning_tokens = match &apply.delta {
+                    TransitionDelta::DenoiseGen {
+                        physical_kv_len, ..
+                    } => *physical_kv_len,
+                    _ => unreachable!("generation flow has a non-flow scheduler delta"),
+                };
                 let placements = match self.kv_branch_placements_for(
                     request_id,
                     operation.request_key,
                     operation.op_id,
+                    conditioning_tokens,
                 ) {
                     Ok(placements) => placements,
                     Err(error) => {
@@ -4438,7 +4895,7 @@ impl Scheduler {
                             "invalid generation KV branch placement"
                         );
                         self.fatal = true;
-                        return;
+                        return false;
                     }
                 };
                 kv_branch_placements.insert((operation.request_key, operation.op_id), placements);
@@ -4453,7 +4910,7 @@ impl Scheduler {
             {
                 let Some(state) = self.running.get(&request_id) else {
                     self.fatal = true;
-                    return;
+                    return false;
                 };
                 let page_table = self.latent_pages.pages_for(request_id).to_vec();
                 let latent_units = self.worker_image_latent_units_for(state).max(1);
@@ -4464,7 +4921,16 @@ impl Scheduler {
                         ..
                     } => (u32::from(*start_step), u32::from(*step_count)),
                     TransitionDelta::TransitionGen { .. } => (0, 0),
-                    _ => (u32::from(state.image_gen.steps_done), 0),
+                    TransitionDelta::CommitGen { step, .. } => (u32::from(*step), 0),
+                    _ => {
+                        tracing::error!(
+                            request_id = request_id.0,
+                            operation = operation.work.variant().as_wire_str(),
+                            "latent operation has no declared schedule placement"
+                        );
+                        self.fatal = true;
+                        return false;
+                    }
                 };
                 latent_placements.insert(
                     (operation.request_key, operation.op_id),
@@ -4505,11 +4971,16 @@ impl Scheduler {
             }
             input_products.extend(payloads);
             let op_key = crate::trace::OperationKey::from(&operation);
-            self.register_inflight(operation.clone(), apply, submit_at);
+            let submitted_us = uniserve_core::now_monotonic_us();
+            self.register_inflight(
+                operation.clone(),
+                apply,
+                submit_at,
+                submitted_us.saturating_sub(planned_us),
+            );
             wire_ops.push(operation);
             if let Some(st) = self.running.get_mut(&request_id) {
                 st.latest_device_version = None;
-                let now_us = uniserve_core::now_monotonic_us();
                 // Backfill the two pre-registration phases from the builder now
                 // that the operation carries its canonical identity.
                 st.trace.stamp(
@@ -4530,13 +5001,13 @@ impl Scheduler {
                     op_key,
                     Some(operation_variant),
                     crate::trace::LifecyclePhase::WorkerRegistrationComplete,
-                    now_us,
+                    submitted_us,
                 );
                 st.trace.stamp(
                     op_key,
                     Some(operation_variant),
                     crate::trace::LifecyclePhase::Submitted,
-                    now_us,
+                    submitted_us,
                 );
             }
         }
@@ -4632,17 +5103,29 @@ impl Scheduler {
             &kv_branch_placements,
             &latent_placements,
         );
-        let partition_ids = partitions
+        let partition_accounting = partitions
             .iter()
-            .map(|partition| partition.partition_id)
-            .collect::<HashSet<_>>();
-        self.batch_partitions.insert(step, partition_ids);
+            .map(|partition| {
+                (
+                    partition.partition_id,
+                    SubmittedPartitionAccounting {
+                        domain: partition.domain,
+                        execution: partition.execution,
+                        submission_group: partition.submission_group,
+                        operation_count: partition.operations.len(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        self.batch_partitions.insert(step, partition_accounting);
+        self.batch_group_worker_exec_us.insert(step, HashMap::new());
         let batch = Batch::new(step, admissions, partitions)
             .with_controls(controls.clone())
             .with_input_products(input_products);
         if let Err(e) = self.executor.submit(batch) {
             self.batch_started.remove(&step);
             self.batch_partitions.remove(&step);
+            self.batch_group_worker_exec_us.remove(&step);
             self.trace_record(json!({
                 "event": "batch_submit_failed",
                 "at_s": now(),
@@ -4652,10 +5135,12 @@ impl Scheduler {
             tracing::error!("executor submit failed: {e}");
             self.fatal = true;
             self.fail_all_inflight(&format!("{e}"));
+            false
         } else {
             if !controls.is_empty() {
                 self.control_batches.insert(step, controls);
             }
+            true
         }
     }
 
@@ -4691,7 +5176,7 @@ impl Scheduler {
         let mut next_partition_id = 1u32;
         let mut next_submission_group = 1u32;
         for (route, groups) in routes {
-            let mixed_capable = self.caps.tensorized_mixed;
+            let mixed_capable = !self.caps.mixed_buckets.is_empty();
             let mut mixed_candidates = Vec::new();
             let mut homogeneous = Vec::new();
             for (domain, operations) in groups {
@@ -4709,39 +5194,24 @@ impl Scheduler {
                     homogeneous.push((domain, independent));
                 }
             }
-            let candidate_variants = mixed_candidates
-                .iter()
-                .flat_map(|(_, operations)| {
-                    operations.iter().map(|operation| operation.work.variant())
-                })
-                .collect::<HashSet<_>>();
-            let tensorized_mixed = mixed_candidates.len() > 1
-                && candidate_variants.contains(&WorkVariant::GenFlow)
-                && candidate_variants.iter().any(|variant| {
-                    matches!(
-                        variant,
-                        WorkVariant::TokenExtend
-                            | WorkVariant::TokenDecode
-                            | WorkVariant::TokenVerify
-                            | WorkVariant::Draft
-                    )
-                });
-            if !tensorized_mixed {
-                homogeneous.append(&mut mixed_candidates);
-            }
-            if tensorized_mixed {
+            while let Some(mixed_group) = extract_mixed_group(
+                &mut mixed_candidates,
+                &self.caps.mixed_buckets,
+                kv_branch_placements,
+                latent_placements,
+            ) {
                 let collective_seq = {
                     let value = self.next_collective_seq.max(1);
                     self.next_collective_seq = value.saturating_add(1);
                     value
                 };
                 let attention = partition_attention(
-                    &mixed_candidates
+                    &mixed_group
                         .iter()
                         .flat_map(|(_, operations)| operations.iter().cloned())
                         .collect::<Vec<_>>(),
                 );
-                for (domain, operations) in mixed_candidates {
+                for (domain, operations) in mixed_group {
                     let request_pool_indices = self.request_pool_indices(&operations);
                     let kv_placements = self.kv_placements(&operations, kv_placements);
                     let kv_branch_placements =
@@ -4766,6 +5236,11 @@ impl Scheduler {
                 }
                 next_submission_group = next_submission_group.saturating_add(1);
             }
+            homogeneous.extend(
+                mixed_candidates
+                    .into_iter()
+                    .filter(|(_, operations)| !operations.is_empty()),
+            );
             for (domain, operations) in homogeneous {
                 let collective_seq = {
                     let value = self.next_collective_seq.max(1);
@@ -4925,14 +5400,10 @@ impl Scheduler {
         }
     }
 
-    /// Build the next op for a running request, given the remaining per-step token
-    /// `budget`. Returns `None` when the block budget cannot be satisfied.
-    /// Data-plane causality gate: whether the request's next op may be dispatched
-    /// given that its input tensors must be reachable on the worker that will run
-    /// that will run it. Delegates to the executor, which is the `StageRouter`
-    /// under a local staged topology and
-    /// reports readiness from its `TensorMover`. Direct executors
-    /// return `true`, so this is a no-op gate in the single-pool default.
+    /// Data-plane causality gate for the request's next operation. A staged
+    /// executor retains a cross-pool consumer until every exact input product
+    /// has a published transfer descriptor. Direct executors are immediately
+    /// ready because producer and consumer share worker-resident ownership.
     fn stage_ready(&self, id: RequestId) -> bool {
         self.executor.stage_ready(id)
     }
@@ -4974,16 +5445,8 @@ impl Scheduler {
         {
             return None;
         }
-        let committed_phase = self.running.get(&id)?.lifecycle.phase;
-        let phase = if committed_phase == Phase::Prefill
-            && self.has_inflight(id)
-            && self.can_queue_decode_successor(id)
-            && projection.prompt_cursor as usize >= self.running.get(&id)?.effective_prompt().len()
-        {
-            Phase::DecodeUnd
-        } else {
-            committed_phase
-        };
+        let projected_branch = self.projected_branch(id)?;
+        let phase = projected_branch.phase;
         match phase {
             Phase::Encode => None,
             Phase::Prefill => {
@@ -5061,13 +5524,13 @@ impl Scheduler {
             Phase::CloseKv => {
                 let st = self.running.get(&id)?;
                 let capacity_target =
-                    self.decode_capacity_target(st.und.physical_kv_len as usize, 0);
+                    self.decode_capacity_target(projection.physical_kv_len as usize, 0);
                 if !self.bm.ensure_capacity(id, capacity_target) {
                     return None;
                 }
-                let image_id = st.image_gen.image_id;
-                let position = st.und.logical_pos;
-                let physical_position = st.und.physical_kv_len;
+                let image_id = projected_branch.image_id;
+                let position = projection.logical_pos;
+                let physical_position = projection.physical_kv_len;
                 let token = st.und.next_token;
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
@@ -5078,24 +5541,22 @@ impl Scheduler {
                         position,
                         physical_position,
                         token,
+                        relay_input: false,
                         new_blocks,
                     },
                 )
             }
-            Phase::PublishKv => {
-                let st = self.running.get(&id)?;
-                self.plan_intent(
-                    id,
-                    projection,
-                    TransitionIntent::PublishKv {
-                        image_id: st.image_gen.image_id,
-                    },
-                )
-            }
+            Phase::PublishKv => self.plan_intent(
+                id,
+                projection,
+                TransitionIntent::PublishKv {
+                    image_id: projected_branch.image_id,
+                },
+            ),
             Phase::TransitionGen => {
                 let st = self.running.get(&id)?;
-                let conditioning = st.image_gen.conditioning.clone()?;
-                let image_id = st.image_gen.image_id;
+                let conditioning = projected_branch.conditioning.clone()?;
+                let image_id = projected_branch.image_id;
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
                 self.plan_intent(
                     id,
@@ -5113,18 +5574,8 @@ impl Scheduler {
                 // transition rather than a spurious zero-length step. Termination
                 // is host-driven off the committed step count, not a worker
                 // completion flag.
-                if self
-                    .running
-                    .get(&id)
-                    .is_some_and(|st| st.image_gen.steps_done >= st.req.image.steps)
-                {
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.lifecycle.phase = Phase::CommitGen;
-                    }
-                    return self.next_transition(id, budget);
-                }
                 let st = self.running.get(&id)?;
-                let cond_pos = st.image_gen.cond_pos;
+                let cond_pos = projected_branch.conditioning_position;
                 let nvae = self.num_vae(&st.req.image) as usize;
                 if st.req.image.retain_images
                     && !self.bm.ensure_capacity(
@@ -5134,15 +5585,18 @@ impl Scheduler {
                 {
                     return None;
                 }
-                let timestep = st.image_gen.steps_done;
+                let timestep = projected_branch.steps_done;
                 let remaining = st.req.image.steps.saturating_sub(timestep);
+                if remaining == 0 {
+                    return None;
+                }
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
                 let host_scratch_tokens = self.denoise_host_scratch_tokens(st);
-                let image_id = st.image_gen.image_id;
-                let conditioning = st.image_gen.conditioning.clone()?;
-                let latent = st.image_gen.latent.clone()?;
+                let image_id = projected_branch.image_id;
+                let conditioning = projected_branch.conditioning.clone()?;
+                let latent = projected_branch.latent.clone()?;
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
@@ -5160,9 +5614,8 @@ impl Scheduler {
                 )
             }
             Phase::CommitGen => {
-                let st = self.running.get(&id)?;
-                let image_id = st.image_gen.image_id;
-                let latent = st.image_gen.latent.clone()?;
+                let image_id = projected_branch.image_id;
+                let latent = projected_branch.latent.clone()?;
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
@@ -5173,13 +5626,17 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let st = self.running.get(&id)?;
                 let feedback = st.req.policy.feedback.as_ref()?;
-                let step_index = st.feedback.ingest_step;
+                let step_index = projected_branch.feedback_step;
                 let step = feedback.ingest.steps.get(step_index).copied()?;
-                let image_id = st.image_gen.image_id;
+                let image_id = projected_branch.image_id;
                 let source = (feedback.source == uniserve_core::FeedbackSource::DeviceProduct)
-                    .then(|| st.feedback.source_product.clone())
+                    .then(|| projected_branch.feedback_source.clone())
                     .flatten();
-                let image_b64 = st.feedback.image_b64.clone().unwrap_or_default();
+                let image_b64 = if source.is_none() {
+                    st.feedback.image_b64.clone().unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
@@ -5196,12 +5653,12 @@ impl Scheduler {
             Phase::FeedbackState => {
                 let st = self.running.get(&id)?;
                 let feedback = st.req.policy.feedback.as_ref()?;
-                let step_index = st.feedback.ingest_step;
+                let step_index = projected_branch.feedback_step;
                 let is_final_step = step_index + 1 == feedback.ingest.steps.len();
-                let image_id = st.image_gen.image_id;
+                let image_id = projected_branch.image_id;
                 let logical_positions = feedback.ingest.logical_positions;
                 let physical_kv_tokens = feedback.ingest.kv_effect(step_index)?;
-                let feature = st.feedback.encoded_product.clone();
+                let feature = projected_branch.feedback_feature.clone();
                 let sample_continuation = is_final_step && feedback.sample_continuation;
                 let Some(feature) = feature else {
                     self.finish(id, FinishReason::Error);
@@ -5412,11 +5869,14 @@ impl Scheduler {
     /// follows: for a successor registered before its predecessors are observed
     /// it is the committed count plus the unresolved window depth, so the
     /// minimum-token floor is evaluated at the successor's own exact point
-    /// without reading any device token.
+    /// without reading any device token. `projected_images_done` includes final
+    /// feedback states already registered ahead of the operation, so the image
+    /// cap masks its branch token at the same point on every pipeline depth.
     fn token_masks(
         &mut self,
         id: RequestId,
         n_generated: usize,
+        projected_images_done: usize,
     ) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
         let st = match self.running.get(&id) {
             Some(s) => s,
@@ -5443,7 +5903,7 @@ impl Scheduler {
         // own context forever. Suppression beats logit bias (bias skips
         // -inf'd logits on the worker).
         if st.req.behavior.gen_output
-            && st.image_gen.images_done >= st.req.image.max_images as usize
+            && projected_images_done >= st.req.image.max_images as usize
             && let Some(trigger) = st.req.policy.trigger.direct_token()
         {
             suppress.get_or_insert_with(Vec::new).push(trigger);
@@ -5465,15 +5925,41 @@ impl Scheduler {
         let n_generated = self.running.get(&id).map_or(0, |state| {
             state.und.tokens_emitted.saturating_add(projected)
         });
-        let (allowed_token_ids, suppressed_token_ids) = self.token_masks(id, n_generated);
+        let projected_images_done = self.running.get(&id).map_or(0, |state| {
+            state.image_gen.images_done.saturating_add(
+                self.inflight_ops
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|inflight| {
+                        matches!(
+                            inflight.apply.delta,
+                            TransitionDelta::FeedbackState {
+                                is_final_step: true,
+                                ..
+                            }
+                        )
+                    })
+                    .count(),
+            )
+        });
+        let (allowed_token_ids, suppressed_token_ids) =
+            self.token_masks(id, n_generated, projected_images_done);
         let Some(state) = self.running.get(&id) else {
             return SamplingState::default();
         };
         let finish_token_ids = canonical_continuation_stop_token_ids(&state.req, &self.ctrl.eos);
+        let transition_token_ids = (state.req.behavior.gen_output
+            && projected_images_done < state.req.image.max_images as usize)
+            .then(|| state.req.policy.trigger.direct_token())
+            .flatten()
+            .into_iter()
+            .collect();
         SamplingState {
             allowed_token_ids,
             suppressed_token_ids: suppressed_token_ids.unwrap_or_default(),
             finish_token_ids,
+            transition_token_ids,
             force_finish: n_generated.saturating_add(1) >= state.req.max_und_tokens,
         }
     }
@@ -6145,7 +6631,7 @@ impl Scheduler {
         mut event: GenEvent,
         root: Option<&VersionRef>,
         modality: PublicModality,
-    ) {
+    ) -> bool {
         let root = root.cloned().or_else(|| self.fixed_version(id));
         let Some(VersionRef {
             producer_op_id,
@@ -6158,7 +6644,7 @@ impl Scheduler {
         }) = root
         else {
             self.finish_after_inflight(id, FinishReason::Error, None);
-            return;
+            return false;
         };
         let event_seq = self
             .running
@@ -6179,10 +6665,46 @@ impl Scheduler {
             | GenEvent::ImageDone { public_commit, .. } => *public_commit = Some(commit),
             _ => {
                 self.finish_after_inflight(id, FinishReason::Error, None);
-                return;
+                return false;
             }
         }
+        let before = self
+            .running
+            .get(&id)
+            .map_or(0, |state| state.public_event_seq);
         self.emit(id, event);
+        let published = self
+            .running
+            .get(&id)
+            .is_some_and(|state| state.public_event_seq > before);
+        if published {
+            let published_us = uniserve_core::now_monotonic_us();
+            let accounting = self.running.get_mut(&id).and_then(|state| {
+                let newly_published = state.trace.stamp_existing(
+                    producer_op_id,
+                    crate::trace::LifecyclePhase::PubliclyCommitted,
+                    published_us,
+                );
+                newly_published.then(|| {
+                    (
+                        state.trace.domain(producer_op_id),
+                        state.trace.span_us(
+                            producer_op_id,
+                            crate::trace::LifecyclePhase::SemanticallyCommitted,
+                            crate::trace::LifecyclePhase::PubliclyCommitted,
+                        ),
+                    )
+                })
+            });
+            if let Some((Some(domain), delay)) = accounting {
+                let stats = self.stats.domains.get(domain);
+                stats.public_commits.fetch_add(1, Ordering::Relaxed);
+                if let Some(delay) = delay {
+                    stats.public_commit_us.fetch_add(delay, Ordering::Relaxed);
+                }
+            }
+        }
+        published
     }
 
     /// Emit a text token and retain its semantic history.
@@ -6202,11 +6724,7 @@ impl Scheduler {
         };
         match action {
             uniserve_core::UndTokenAction::Emit => {
-                let before = self
-                    .running
-                    .get(&id)
-                    .map_or(0, |state| state.public_event_seq);
-                self.emit_visible(
+                let published = self.emit_visible(
                     id,
                     GenEvent::TextToken {
                         id: tok,
@@ -6216,17 +6734,8 @@ impl Scheduler {
                     root,
                     PublicModality::Text,
                 );
-                if let Some(state) = self.running.get_mut(&id)
-                    && state.public_event_seq > before
-                {
+                if published && let Some(state) = self.running.get_mut(&id) {
                     state.public_token_seq = state.public_token_seq.saturating_add(1);
-                    if let Some(root) = root {
-                        state.trace.stamp_existing(
-                            root.producer_op_id,
-                            crate::trace::LifecyclePhase::PubliclyCommitted,
-                            uniserve_core::now_monotonic_us(),
-                        );
-                    }
                 }
                 true
             }
@@ -6518,7 +7027,7 @@ struct KvLengths {
     resulting: u32,
 }
 
-fn transition_kv_lengths(delta: &TransitionDelta, state: Option<&ReqState>) -> Option<KvLengths> {
+fn transition_kv_lengths(delta: &TransitionDelta) -> Option<KvLengths> {
     let (prefix, input) = match delta {
         TransitionDelta::IngestText {
             start,
@@ -6549,10 +7058,15 @@ fn transition_kv_lengths(delta: &TransitionDelta, state: Option<&ReqState>) -> O
         | TransitionDelta::CloseKv {
             physical_position, ..
         } => (*physical_position, 1),
-        TransitionDelta::PublishKv { .. } => (state?.und.physical_kv_len, 0),
-        TransitionDelta::TransitionGen { .. } | TransitionDelta::DenoiseGen { .. } => {
-            (state?.und.physical_kv_len, 0)
+        TransitionDelta::PublishKv {
+            physical_kv_len, ..
         }
+        | TransitionDelta::TransitionGen {
+            physical_kv_len, ..
+        }
+        | TransitionDelta::DenoiseGen {
+            physical_kv_len, ..
+        } => (*physical_kv_len, 0),
         TransitionDelta::EncodeImageStep { .. }
         | TransitionDelta::CommitGen { .. }
         | TransitionDelta::EncodeFeedbackStep { .. } => return None,
@@ -6624,14 +7138,97 @@ fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
 }
 
 fn tensorized_mixed_runner_work(variant: WorkVariant) -> bool {
-    matches!(
-        variant,
-        WorkVariant::TokenExtend
-            | WorkVariant::TokenDecode
-            | WorkVariant::TokenVerify
-            | WorkVariant::Draft
-            | WorkVariant::GenFlow
-    )
+    matches!(variant, WorkVariant::TokenDecode | WorkVariant::GenFlow)
+}
+
+fn flow_matches_mixed_bucket(
+    operation: &Operation,
+    kv_branch_placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
+    latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
+    bucket: &uniserve_worker_wire::MixedExecutionCapability,
+) -> bool {
+    if operation.work.variant() != WorkVariant::GenFlow {
+        return false;
+    }
+    let identity = (operation.request_key, operation.op_id);
+    latent_placements.get(&identity).is_some_and(|placement| {
+        placement.height == bucket.height
+            && placement.width == bucket.width
+            && kv_branch_placements
+                .get(&identity)
+                .is_some_and(|placements| placements.len() == bucket.cfg_branches as usize)
+    })
+}
+
+fn extract_mixed_group(
+    candidates: &mut [(uniserve_worker_wire::Domain, Vec<Operation>)],
+    buckets: &[uniserve_worker_wire::MixedExecutionCapability],
+    kv_branch_placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
+    latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
+) -> Option<Vec<(uniserve_worker_wire::Domain, Vec<Operation>)>> {
+    let decode_index = candidates
+        .iter()
+        .position(|(domain, _)| *domain == uniserve_worker_wire::Domain::Decode)?;
+    let flow_index = candidates
+        .iter()
+        .position(|(domain, _)| *domain == uniserve_worker_wire::Domain::Flow)?;
+    let decode_available = candidates[decode_index].1.len();
+    let flow_operations = &candidates[flow_index].1;
+    let bucket = buckets
+        .iter()
+        .filter(|bucket| bucket.decode_rows as usize <= decode_available)
+        .filter(|bucket| {
+            flow_operations
+                .iter()
+                .filter(|operation| {
+                    flow_matches_mixed_bucket(
+                        operation,
+                        kv_branch_placements,
+                        latent_placements,
+                        bucket,
+                    )
+                })
+                .count()
+                >= bucket.flow_rows as usize
+        })
+        .max_by_key(|bucket| {
+            (
+                u64::from(bucket.decode_rows) + u64::from(bucket.flow_rows),
+                bucket.decode_rows,
+                bucket.flow_rows,
+            )
+        })?
+        .clone();
+
+    let decode = candidates[decode_index]
+        .1
+        .drain(..bucket.decode_rows as usize)
+        .collect::<Vec<_>>();
+    let mut flow = Vec::with_capacity(bucket.flow_rows as usize);
+    let mut remaining_flow = Vec::with_capacity(candidates[flow_index].1.len());
+    for operation in std::mem::take(&mut candidates[flow_index].1) {
+        if flow.len() < bucket.flow_rows as usize
+            && flow_matches_mixed_bucket(
+                &operation,
+                kv_branch_placements,
+                latent_placements,
+                &bucket,
+            )
+        {
+            flow.push(operation);
+        } else {
+            remaining_flow.push(operation);
+        }
+    }
+    candidates[flow_index].1 = remaining_flow;
+    let mut selected = vec![
+        (uniserve_worker_wire::Domain::Decode, decode),
+        (uniserve_worker_wire::Domain::Flow, flow),
+    ];
+    if flow_index < decode_index {
+        selected.swap(0, 1);
+    }
+    Some(selected)
 }
 
 fn partition_attention(operations: &[Operation]) -> AttentionRegime {

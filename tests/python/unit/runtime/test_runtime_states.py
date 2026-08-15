@@ -43,15 +43,6 @@ def test_request_mutations_never_change_the_padding_sentinel_row():
     states = _states()
 
     states.reset((1, 3), valid_cache_lengths=(4, 6), logical_lengths=(5, 7))
-    states.publish_sampling(
-        torch.tensor([1, 3]),
-        tokens=torch.tensor([2, 4]),
-        predicates=torch.tensor([True, False]),
-        selected_points=torch.tensor([1, 2]),
-        logical_lengths=torch.tensor([6, 9]),
-        sampling_positions=torch.tensor([8, 10]),
-    )
-
     assert states.valid_cache_lengths[0].item() == 0
     assert states.logical_lengths[0].item() == 0
     assert states.sampling_positions[0].item() == 0

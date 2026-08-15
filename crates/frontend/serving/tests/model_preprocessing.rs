@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_core::{
-    ContextSegment, GenerationRuntimeCapabilities, ImageIngestStep, SegmentPlacement,
+    ContextSegment, GenerationRuntimeCapabilities, ImageIngestStep, ImageKvEffect, SegmentPlacement,
 };
 use uniserve_model_profile::assets::ResolvedModelFiles;
 use uniserve_model_profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -237,6 +237,16 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
         }
     );
     assert_eq!(steps, &[ImageIngestStep::VitEncode]);
+    assert_eq!(
+        tokenized
+            .request
+            .policy
+            .feedback
+            .unwrap()
+            .ingest
+            .step_kv_tokens,
+        vec![ImageKvEffect::Exact { tokens: 2305 }]
+    );
 }
 
 #[test]

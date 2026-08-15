@@ -162,6 +162,7 @@ def active_sensenova_control_ids(model: Path) -> dict[str, int]:
         model,
         local_files_only=True,
         use_fast=False,
+        trust_remote_code=False,
     )
     worker_ids = {
         token: int(worker_tokenizer.convert_tokens_to_ids(token)) for token in CONTROL_TOKENS
@@ -250,8 +251,6 @@ def configured_sim_server(
         str(Path.cwd() / ".venv" / "bin" / "python"),
         "--device",
         "cpu",
-        "--max-model-len",
-        "8192",
         "--max-running-requests",
         "8",
         "--max-num-batched-tokens",

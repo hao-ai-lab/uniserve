@@ -3,10 +3,7 @@
 use uniserve_core::{BlockId, KvGroupKind, RequestId};
 
 use super::*;
-use crate::flat::{
-    decode_request, decode_request_unpack, decode_response, decode_response_unpack, encode_request,
-    encode_response,
-};
+use crate::flat::{decode_request, decode_response, encode_request, encode_response};
 
 fn digest_string(seed: u8) -> String {
     format!("{seed:02x}").repeat(32)
@@ -579,6 +576,23 @@ fn validation_rejects_a_work_domain_mismatch() {
 }
 
 #[test]
+fn kv_publication_requires_a_fixed_semantic_parent() {
+    let mut operation = operation_for(Work::Transfer(TransferMode::KvPublish), OpId(12), false);
+    operation.parent = VersionRef {
+        request_key: request_key(),
+        producer_op_id: OpId(9),
+        point: Point::Device {
+            point_index: 1,
+            selected_point: None,
+            producer_plan_digest: digest_string(0xcc),
+        },
+    };
+    operation.plan_digest = operation.compute_plan_digest();
+
+    assert!(operation.validate().is_err());
+}
+
+#[test]
 fn validation_rejects_an_output_owned_by_another_operation() {
     let mut operation = token_decode_operation();
     operation.outputs[0].producer_op_id = OpId(999);
@@ -645,6 +659,7 @@ fn sampling_state_bytes_preserve_empty_allowed_and_canonical_sets() {
         allowed_token_ids: Some(Vec::new()),
         suppressed_token_ids: vec![7, 2, 7],
         finish_token_ids: vec![11, 5, 11],
+        transition_token_ids: vec![29, 13, 29],
         force_finish: true,
     };
     let decoded =
@@ -655,6 +670,7 @@ fn sampling_state_bytes_preserve_empty_allowed_and_canonical_sets() {
             allowed_token_ids: Some(Vec::new()),
             suppressed_token_ids: vec![2, 7],
             finish_token_ids: vec![5, 11],
+            transition_token_ids: vec![13, 29],
             force_finish: true,
         }
     );
@@ -834,13 +850,9 @@ fn image_generation_requires_incremental_kv_publication() {
 }
 
 // ---------------------------------------------------------------------------
-// Accessor-decode equivalence. The fixtures below cover every request and
-// response kind, every `Work` and `Control` variant, fixed and device parents,
-// admissions with full sampling and image parameters, and non-empty product
-// payload bytes. Every scalar field carries a distinct value so a transposed
-// field mapping cannot cancel out. Each fixture is asserted to (1) round-trip
-// exactly through encode/decode and (2) decode byte-identically through the
-// object-API path and the accessor path.
+// Canonical wire fixtures cover every request and response kind, every `Work`
+// and `Control` variant, fixed and device parents, full admissions, and non-empty
+// product payloads. Distinct scalar values expose transposed field mappings.
 // ---------------------------------------------------------------------------
 
 fn session_key(session: u64) -> RequestKey {
@@ -952,8 +964,7 @@ fn comprehensive_batch() -> Batch {
     for (index, work) in variants.into_iter().enumerate() {
         let key = session_key(100 + index as u64);
         let op_id = OpId(11 + index as u64);
-        // Alternate fixed and device parents across the set.
-        let parent = if index % 2 == 0 {
+        let parent = if work.variant().requires_fixed_parent() || index % 2 == 0 {
             VersionRef::admission_root(key, OpId(1), digest_string(0xaa))
         } else {
             VersionRef {
@@ -1121,7 +1132,6 @@ fn request_fixtures() -> Vec<WorkerRequest> {
             },
         ]),
         WorkerRequest::release_products(vec![1, 2, 3]),
-        WorkerRequest::get_metrics(),
         WorkerRequest::get_pressure(),
         WorkerRequest::snapshot_session(recovery_placement_fixture()),
         WorkerRequest::restore_session(snapshot_fixture(), recovery_placement_fixture()),
@@ -1131,7 +1141,6 @@ fn request_fixtures() -> Vec<WorkerRequest> {
 fn full_caps() -> WorkerCapabilities {
     WorkerCapabilities {
         supported_work: WorkVariant::ALL.to_vec(),
-        quantization: Some("fp8".into()),
         groups: vec![
             KvCacheGroupSpec {
                 group_id: 0,
@@ -1152,10 +1161,6 @@ fn full_caps() -> WorkerCapabilities {
         rank: RankInfo {
             tp_rank: 1,
             tp_size: 2,
-            pp_rank: 3,
-            pp_size: 4,
-            dp_rank: 5,
-            dp_size: 6,
         },
         pipeline_depth: 2,
         encoder_cache_budget: 77,
@@ -1164,7 +1169,13 @@ fn full_caps() -> WorkerCapabilities {
         max_batch_tokens: 4096,
         max_request_pool_size: 96,
         max_unresolved_window: 3,
-        tensorized_mixed: true,
+        mixed_buckets: vec![MixedExecutionCapability {
+            decode_rows: 1,
+            flow_rows: 1,
+            height: 1152,
+            width: 2048,
+            cfg_branches: 3,
+        }],
         sampling_ownership: SamplingOwnership::DesignatedRank,
         resource_classes: vec![ResourceClass::KvBlock, ResourceClass::ImageLatent],
         latent_page_units: 64,
@@ -1317,35 +1328,6 @@ fn full_completion_report() -> CompletionReport {
     )
 }
 
-fn full_metrics() -> WorkerMetrics {
-    let map = |prefix: &str, base: u64| {
-        BTreeMap::from([
-            (format!("{prefix}.a"), base),
-            (format!("{prefix}.b"), base + 1),
-        ])
-    };
-    WorkerMetrics {
-        executes: 51,
-        operations_total: 52,
-        exec_us_total: 53,
-        last_exec_us: 54,
-        operation_counts: map("operation_counts", 55),
-        operation_us: map("operation_us", 57),
-        control_ok: map("control_ok", 59),
-        control_err: map("control_err", 61),
-        error_counts: map("error_counts", 63),
-        replay_counts: map("replay_counts", 75),
-        cuda_graph_captures: 65,
-        cuda_graph_replays: 66,
-        cuda_graph_misses: 67,
-        cuda_graph_fallbacks: 68,
-        cuda_graph_unpadded_tokens: 69,
-        cuda_graph_padded_tokens: 70,
-        cuda_graph_runtime_mode_counts: map("runtime_mode", 71),
-        forward: Some(full_forward_stats()),
-    }
-}
-
 /// One fixture per `ResponseKind`, plus a second capabilities frame that fills
 /// every optional field the default leaves empty.
 fn response_fixtures() -> Vec<WorkerResponse> {
@@ -1354,7 +1336,6 @@ fn response_fixtures() -> Vec<WorkerResponse> {
         call_id: Some(17),
         capabilities: None,
         completion_report: None,
-        metrics: None,
         pressure: None,
         message: None,
         code: None,
@@ -1390,10 +1371,6 @@ fn response_fixtures() -> Vec<WorkerResponse> {
             ..bare(ResponseKind::Error)
         },
         WorkerResponse {
-            metrics: Some(full_metrics()),
-            ..bare(ResponseKind::Metrics)
-        },
-        WorkerResponse {
             pressure: Some(vec![
                 ResourcePressure {
                     class: ResourceClass::KvBlock,
@@ -1417,7 +1394,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
 }
 
 #[test]
-fn accessor_decode_round_trips_and_matches_unpack_for_every_request_kind() {
+fn every_request_kind_round_trips_through_the_wire() {
     let fixtures = request_fixtures();
     for kind in RequestKind::ALL {
         assert!(
@@ -1427,26 +1404,23 @@ fn accessor_decode_round_trips_and_matches_unpack_for_every_request_kind() {
     }
     for request in fixtures {
         let bytes = encode_request(&request).unwrap();
-        let accessor = decode_request(&bytes).unwrap();
-        let unpack = decode_request_unpack(&bytes).unwrap();
-        assert_eq!(accessor, request, "round trip for {:?}", request.kind);
         assert_eq!(
-            accessor, unpack,
-            "accessor vs unpack for {:?}",
+            decode_request(&bytes).unwrap(),
+            request,
+            "round trip for {:?}",
             request.kind
         );
     }
 }
 
 #[test]
-fn accessor_decode_round_trips_and_matches_unpack_for_every_response_kind() {
+fn every_response_kind_round_trips_through_the_wire() {
     let fixtures = response_fixtures();
     for kind in [
         ResponseKind::Capabilities,
         ResponseKind::Result,
         ResponseKind::Ok,
         ResponseKind::Error,
-        ResponseKind::Metrics,
         ResponseKind::Pressure,
         ResponseKind::Snapshot,
     ] {
@@ -1457,154 +1431,28 @@ fn accessor_decode_round_trips_and_matches_unpack_for_every_response_kind() {
     }
     for response in fixtures {
         let bytes = encode_response(&response).unwrap();
-        let accessor = decode_response(&bytes).unwrap();
-        let unpack = decode_response_unpack(&bytes).unwrap();
-        assert_eq!(accessor, response, "round trip for {:?}", response.kind);
         assert_eq!(
-            accessor, unpack,
-            "accessor vs unpack for {:?}",
+            decode_response(&bytes).unwrap(),
+            response,
+            "round trip for {:?}",
             response.kind
         );
     }
 }
 
 #[test]
-fn accessor_decode_rejects_malformed_frames_like_unpack_decode() {
-    // Both paths must agree on rejection too, not just success.
+fn wire_decode_rejects_malformed_frames_and_payload_shapes() {
     let garbage: &[u8] = &[0x01, 0x02, 0x03];
     assert!(decode_request(garbage).is_err());
-    assert!(decode_request_unpack(garbage).is_err());
-    // A structurally valid frame whose payload shape is invalid for its kind:
-    // an execute request with no batch.
+    assert!(decode_response(garbage).is_err());
+
     let mut request = WorkerRequest::get_capabilities();
     request.kind = RequestKind::Execute;
     let bytes = encode_request(&request).unwrap();
-    let accessor_err = decode_request(&bytes).unwrap_err().to_string();
-    let unpack_err = decode_request_unpack(&bytes).unwrap_err().to_string();
-    assert_eq!(accessor_err, unpack_err);
-    assert_eq!(accessor_err, "execute request has no batch");
-}
+    assert!(decode_request(&bytes).is_err());
 
-/// A realistic decode-step submission: `operations` token-decode operations on
-/// distinct sessions, mirroring the measured 35-operation production batch.
-fn decode_step_batch(operations: usize) -> Batch {
-    let ops = (0..operations)
-        .map(|index| {
-            let key = session_key(1000 + index as u64);
-            let op_id = OpId(11);
-            Operation::registered(
-                key,
-                op_id,
-                VersionRef::admission_root(key, OpId(1), digest_string(0xaa)),
-                Work::Token(TokenMode::Decode),
-                RouteId(1),
-                Domain::Decode,
-                Bounds {
-                    max_points: 1,
-                    max_tokens: 1,
-                    max_kv_pages: 1,
-                    ..Bounds::default()
-                },
-                Vec::new(),
-                vec![
-                    product_for(key, op_id, 0, ProductKind::Token),
-                    product_for(key, op_id, 1, ProductKind::Kv),
-                ],
-                1,
-                None,
-                Some(Rng {
-                    seed: 99 + index as u64,
-                    semantic_index_base: 4,
-                    draw_layout: DrawLayout::TargetSampling,
-                }),
-                0,
-            )
-        })
-        .collect();
-    batch_with_operations(1, Vec::new(), ops)
-}
-
-#[test]
-#[ignore = "micro-benchmark: cargo test -p uniserve-worker-wire --release -- --ignored --nocapture"]
-fn bench_decode_unpack_vs_accessor() {
-    let request = WorkerRequest::execute(decode_step_batch(35));
-    let request_bytes = encode_request(&request).unwrap();
-    let mut payload_batch = decode_step_batch(35);
-    let payload_operation = payload_batch
-        .partitions
-        .first_mut()
-        .expect("decode benchmark has a partition")
-        .operations
-        .first_mut()
-        .expect("decode benchmark has operations");
-    let mut input_product = product_for(
-        payload_operation.request_key,
-        payload_operation.op_id,
-        2,
-        ProductKind::Artifact,
-    );
-    input_product.storage_class = StorageClass::HostStaging;
-    input_product.dtype = DType::U8;
-    input_product.shape_bound = ShapeBound {
-        dims: vec![DimBound::Static(1 << 20)],
-    };
-    payload_operation.inputs.push(input_product.clone());
-    payload_operation.plan_digest = payload_operation.compute_plan_digest();
-    let payload_request =
-        WorkerRequest::execute(payload_batch.with_input_products(vec![ProductPayload {
-            product: input_product,
-            bytes: vec![0x5a; 1 << 20],
-        }]));
-    let payload_request_bytes = encode_request(&payload_request).unwrap();
-    let mut report = full_completion_report();
-    report.partitions[0].products[1].bytes = vec![0xa5; 4 << 20];
-    let response_bytes = encode_response(&WorkerResponse::completion_report(report)).unwrap();
-
-    let time = |mut run: Box<dyn FnMut()>| {
-        for _ in 0..50 {
-            run();
-        }
-        let iters = 500u32;
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            run();
-        }
-        start.elapsed().as_nanos() / u128::from(iters)
-    };
-    let unpack_request_ns = time(Box::new(|| {
-        std::hint::black_box(decode_request_unpack(&request_bytes).unwrap());
-    }));
-    let accessor_request_ns = time(Box::new(|| {
-        std::hint::black_box(decode_request(&request_bytes).unwrap());
-    }));
-    let unpack_payload_ns = time(Box::new(|| {
-        std::hint::black_box(decode_request_unpack(&payload_request_bytes).unwrap());
-    }));
-    let accessor_payload_ns = time(Box::new(|| {
-        std::hint::black_box(decode_request(&payload_request_bytes).unwrap());
-    }));
-    let unpack_response_ns = time(Box::new(|| {
-        std::hint::black_box(decode_response_unpack(&response_bytes).unwrap());
-    }));
-    let accessor_response_ns = time(Box::new(|| {
-        std::hint::black_box(decode_response(&response_bytes).unwrap());
-    }));
-    println!(
-        "decode_request (35-op decode batch, {} bytes): unpack {unpack_request_ns} ns/iter, \
-         accessor {accessor_request_ns} ns/iter ({:.2}x)",
-        request_bytes.len(),
-        unpack_request_ns as f64 / accessor_request_ns as f64
-    );
-    println!(
-        "decode_request (35-op batch + 1 MiB input product, {} bytes): unpack \
-         {unpack_payload_ns} ns/iter, accessor {accessor_payload_ns} ns/iter ({:.2}x)",
-        payload_request_bytes.len(),
-        unpack_payload_ns as f64 / accessor_payload_ns as f64
-    );
-    println!(
-        "decode_response (completion report with 4 MiB product, {} bytes): unpack \
-         {unpack_response_ns} ns/iter, accessor {accessor_response_ns} ns/iter ({:.2}x)",
-        response_bytes.len(),
-        unpack_response_ns as f64 / accessor_response_ns as f64
-    );
+    let mut response = WorkerResponse::ok();
+    response.kind = ResponseKind::Capabilities;
+    let bytes = encode_response(&response).unwrap();
+    assert!(decode_response(&bytes).is_err());
 }

@@ -97,8 +97,6 @@ class Fa4CuteAttentionBackend:
         available = _fa4_flash_attn_fwd is not None
         return AttentionCapabilities(
             available=available,
-            segment_batched_cfg=True,
-            mixed_mode=True,
             paged_kv=available,
             visible_end=available,
             visible_end_cuda_graph=available,

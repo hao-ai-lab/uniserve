@@ -23,19 +23,18 @@ pub use generation::{
 pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs, try_apply_sampling_counts};
 
 /// A cloneable, thread-safe wake the command ingress fires after enqueuing a
-/// command, so a parked event-driven executor wakes immediately instead of
-/// after its safety-net timeout.
+/// command, so a parked executor wakes immediately.
 ///
 /// Defined in the foundation crate so the executor seam (which mints the real
 /// waker over an iceoryx2 notifier) and the engine API (which holds it on the
 /// command front door and fires it on every send) can share the type without a
-/// cross-crate dependency. Polling executors hand out [`CommandWaker::noop`]:
-/// they observe commands through their own timed wait, so firing it is a no-op.
+/// cross-crate dependency. The no-op value is reserved for executor fixtures
+/// that do not run the threaded scheduler loop.
 #[derive(Clone, Default)]
 pub struct CommandWaker(Option<Arc<dyn Fn() + Send + Sync>>);
 
 impl CommandWaker {
-    /// A waker that does nothing (the polling path).
+    /// A waker that does nothing.
     pub fn noop() -> Self {
         Self(None)
     }
@@ -52,7 +51,7 @@ impl CommandWaker {
         }
     }
 
-    /// Whether this is the no-op (polling) waker.
+    /// Whether this is the no-op waker.
     pub fn is_noop(&self) -> bool {
         self.0.is_none()
     }
@@ -600,20 +599,12 @@ pub struct KvCacheGroupSpec {
 pub struct RankInfo {
     pub tp_rank: u32,
     pub tp_size: u32,
-    pub pp_rank: u32,
-    pub pp_size: u32,
-    pub dp_rank: u32,
-    pub dp_size: u32,
 }
 impl Default for RankInfo {
     fn default() -> Self {
         Self {
             tp_rank: 0,
             tp_size: 1,
-            pp_rank: 0,
-            pp_size: 1,
-            dp_rank: 0,
-            dp_size: 1,
         }
     }
 }

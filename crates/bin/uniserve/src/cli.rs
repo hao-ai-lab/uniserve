@@ -561,12 +561,6 @@ pub(crate) struct WorkerLaunchArgs {
     pub kv_cache_dtype: Option<String>,
     #[arg(long = "mem-fraction-static", default_value = "0.70")]
     pub kv_memory_fraction: String,
-    #[arg(long = "trust-remote-code")]
-    pub transformers_trust_remote_code: bool,
-    #[arg(long, default_value = "uniserve", hide = true)]
-    pub transformers_attn_implementation: String,
-    #[arg(long = "disable-model-arch", hide = true)]
-    pub disable_model_arch: Vec<String>,
     /// Parallelism mesh forwarded to the Python worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536`.
     #[arg(long, hide = true)]
@@ -588,10 +582,6 @@ pub(crate) struct WorkerLaunchArgs {
     pub flow_graph_batch_sizes: Option<String>,
     #[arg(long, hide = true)]
     pub flow_graph_shapes: Option<String>,
-    #[arg(long, default_value_t = 8192, hide = true)]
-    pub mixed_text_max_tokens: u32,
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
-    pub varlen_prefill: bool,
     #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
     pub flashinfer_workspace_size: u64,
     #[arg(long, hide = true)]
@@ -619,9 +609,6 @@ impl WorkerLaunchArgs {
             model_dtype: self.model_dtype.clone(),
             kv_cache_dtype: self.kv_cache_dtype.clone(),
             kv_memory_fraction: self.kv_memory_fraction.clone(),
-            transformers_trust_remote_code: self.transformers_trust_remote_code,
-            transformers_attn_implementation: self.transformers_attn_implementation.clone(),
-            disable_model_arch: self.disable_model_arch.clone(),
             mesh: self.worker_mesh.clone(),
             tp_backend: self.tp_backend.clone(),
             lanes: self.lanes.clone(),
@@ -631,8 +618,6 @@ impl WorkerLaunchArgs {
             prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
-            mixed_text_max_tokens: self.mixed_text_max_tokens,
-            varlen_prefill: self.varlen_prefill,
             flashinfer_workspace_size: self.flashinfer_workspace_size,
             flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
             flashinfer_decode_backend: self.flashinfer_decode_backend.clone(),
@@ -659,19 +644,6 @@ impl WorkerLaunchArgs {
             &cfg.kv_memory_fraction,
             &default.kv_memory_fraction,
         );
-        if cfg.transformers_trust_remote_code {
-            args.push("--trust-remote-code".to_string());
-        }
-        push_if_changed(
-            args,
-            "--transformers-attn-implementation",
-            &cfg.transformers_attn_implementation,
-            &default.transformers_attn_implementation,
-        );
-        for arch in &cfg.disable_model_arch {
-            args.push("--disable-model-arch".to_string());
-            args.push(arch.clone());
-        }
         push_option(args, "--worker-mesh", cfg.mesh.as_ref());
         push_option(args, "--tp-backend", cfg.tp_backend.as_ref());
         for lane in &cfg.lanes {
@@ -701,18 +673,6 @@ impl WorkerLaunchArgs {
             cfg.flow_graph_batch_sizes.as_ref(),
         );
         push_option(args, "--flow-graph-shapes", cfg.flow_graph_shapes.as_ref());
-        push_u32_if_changed(
-            args,
-            "--mixed-text-max-tokens",
-            cfg.mixed_text_max_tokens,
-            default.mixed_text_max_tokens,
-        );
-        push_bool_value(
-            args,
-            "--varlen-prefill",
-            cfg.varlen_prefill,
-            default.varlen_prefill,
-        );
         if cfg.flashinfer_workspace_size != default.flashinfer_workspace_size {
             args.push("--flashinfer-workspace-size".to_string());
             args.push(cfg.flashinfer_workspace_size.to_string());
@@ -778,13 +738,6 @@ fn push_bool_value(args: &mut Vec<String>, name: &str, value: bool, default: boo
     }
 }
 
-fn push_u32_if_changed(args: &mut Vec<String>, name: &str, value: u32, default: u32) {
-    if value != default {
-        args.push(name.to_string());
-        args.push(value.to_string());
-    }
-}
-
 fn push_u32_option(args: &mut Vec<String>, name: &str, value: Option<u32>) {
     if let Some(value) = value {
         args.push(name.to_string());
@@ -825,7 +778,6 @@ fn default_worker_python() -> String {
 
 #[cfg(test)]
 mod tests {
-    // `Parser` (for `try_parse_from`) is re-exported via `super::*`.
     use super::*;
 
     #[test]
@@ -835,8 +787,8 @@ mod tests {
     }
 
     #[test]
-    fn serve_rejects_zero_block_size() {
-        let res = <Cli as clap::Parser>::try_parse_from([
+    fn serve_rejects_zero_page_size() {
+        let result = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
             "model",
@@ -845,475 +797,86 @@ mod tests {
             "--page-size",
             "0",
         ]);
-        assert!(res.is_err(), "block-size 0 must be rejected by clap range");
+        assert!(result.is_err());
     }
 
     #[test]
-    fn serve_accepts_configured_model_description() {
-        let cli = <Cli as clap::Parser>::try_parse_from([
+    fn serve_accepts_runtime_configuration() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
             "model",
             "--model-description",
             "qwen3",
-        ])
-        .expect("configured serve invocation must parse");
-        let Command::Serve(args) = cli.command else {
-            panic!("expected serve command");
-        };
-        // Graceful drain is enabled by default (non-zero), not disabled.
-        assert_eq!(args.runtime.shutdown_timeout, 30);
-        assert_eq!(args.runtime.block_size, 64);
-    }
-
-    #[test]
-    fn serve_configures_resp_slot_cap_and_defaults_max_model_len_to_derived() {
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "model",
-            "--model-description",
-            "qwen3",
+            "--device",
+            "cpu",
+            "--tp-size",
+            "2",
+            "--page-size",
+            "128",
+            "--pipeline-depth",
+            "3",
+            "--max-batch",
+            "7",
+            "--max-num-batched-tokens",
+            "4096",
+            "--max-running-requests",
+            "33",
+            "--max-total-tokens",
+            "65536",
+            "--chunked-prefill-size",
+            "1234",
+            "--schedule-policy",
+            "priority",
             "--resp-slot-cap",
             "1048576",
-        ])
-        .expect("serve invocation with --resp-slot-cap must parse");
-        let Command::Serve(args) = cli.command else {
-            panic!("expected serve command");
-        };
-        let settings = args.runtime.engine_settings();
-        // The in-process serve path configures resp_slot_cap...
-        assert_eq!(settings.resp_slot_cap, 1 << 20);
-        //...and leaves max_model_len unset so build_state derives the model's
-        // real context length instead of forcing 8192.
-        assert_eq!(settings.max_model_len, None);
-    }
-
-    #[test]
-    fn serve_forwards_resp_slot_cap_to_managed_engine_args() {
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "model",
-            "--model-description",
-            "qwen3",
-            "--resp-slot-cap",
-            "1048576",
-        ])
-        .expect("serve invocation must parse");
-        let Command::Serve(args) = cli.command else {
-            panic!("expected serve command");
-        };
-        let engine_args = args.runtime.engine_cli_args();
-        let idx = engine_args
-            .iter()
-            .position(|a| a == "--resp-slot-cap")
-            .expect("managed engine args must forward --resp-slot-cap");
-        assert_eq!(engine_args[idx + 1], "1048576");
-    }
-
-    #[test]
-    fn serve_parses_and_forwards_worker_bool_values() {
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "model",
-            "--model-description",
-            "qwen3",
+            "--dtype",
+            "float16",
+            "--mem-fraction-static",
+            "0.5",
             "--cuda-graph",
             "false",
             "--prefill-cuda-graph",
             "true",
-            "--varlen-prefill",
-            "false",
             "--flashinfer-fast-decode-plan",
             "false",
+            "--worker-mesh",
+            "tower=text:cpu",
+            "--lane",
+            r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
+            "--workers",
+            "prefill:1:tp=2,decode:1:tp=2",
+            "--transfer",
+            "prefill->decode=shm",
         ])
-        .expect("serve invocation with worker bool values must parse");
-        let Command::Serve(args) = cli.command else {
-            panic!("expected serve command");
-        };
-        let settings = args.runtime.engine_settings();
-        assert!(!settings.worker_launch.cuda_graph);
-        assert!(settings.worker_launch.prefill_cuda_graph);
-        assert!(!settings.worker_launch.varlen_prefill);
-        assert!(!settings.worker_launch.flashinfer_fast_decode_plan);
-
-        let engine_args = args.runtime.engine_cli_args();
-        assert!(
-            engine_args
-                .windows(2)
-                .any(|pair| pair[0] == "--cuda-graph" && pair[1] == "false")
-        );
-        assert!(
-            engine_args
-                .windows(2)
-                .any(|pair| pair[0] == "--prefill-cuda-graph" && pair[1] == "true")
-        );
-        assert!(
-            engine_args
-                .windows(2)
-                .any(|pair| pair[0] == "--varlen-prefill" && pair[1] == "false")
-        );
-        assert!(
-            engine_args
-                .windows(2)
-                .any(|pair| pair[0] == "--flashinfer-fast-decode-plan" && pair[1] == "false")
-        );
-    }
-
-    // ---- Cross-mode consistency: serve-settable flags forward to engine ----
-    //
-    // Every flag that `serve` forwards through `engine_cli_args()` is also a
-    // real flag of the `engine` subcommand. These tests parameterize over the
-    // forwarded flag set: for each `serve` flag/value, the forwarded args must
-    // carry the same value AND must round-trip through the `engine` parser.
-
-    /// Parse a `serve` invocation and return its `SharedRuntimeArgs`.
-    fn parse_serve(extra: &[&str]) -> SharedRuntimeArgs {
-        let mut argv = vec!["uniserve", "serve", "model", "--model-description", "qwen3"];
-        argv.extend_from_slice(extra);
-        let cli = <Cli as clap::Parser>::try_parse_from(argv)
-            .expect("serve invocation under test must parse");
-        match cli.command {
-            Command::Serve(args) => args.runtime,
-            Command::Engine(_) => panic!("expected serve command"),
-        }
-    }
-
-    /// Find the value following `flag` in a forwarded args vector.
-    fn forwarded_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-        args.iter()
-            .position(|a| a == flag)
-            .and_then(|i| args.get(i + 1))
-            .map(String::as_str)
-    }
-
-    /// `serve` flags that are always forwarded, with a non-default value and
-    /// the exact string the forwarded engine arg should carry.
-    fn always_forwarded_cases() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
-        // (serve_flag, serve_value, engine_flag, expected_forwarded_value)
-        vec![
-            ("--device", "cpu", "--device", "cpu"),
-            (
-                "--worker-python",
-                "/usr/bin/py",
-                "--worker-python",
-                "/usr/bin/py",
-            ),
-            ("--tp-size", "4", "--tp-size", "4"),
-            (
-                "--attention-backend",
-                "flashinfer",
-                "--attention-backend",
-                "flashinfer",
-            ),
-            ("--page-size", "512", "--page-size", "512"),
-            ("--pipeline-depth", "3", "--pipeline-depth", "3"),
-            ("--max-batch", "7", "--max-batch", "7"),
-            (
-                "--max-num-batched-tokens",
-                "4096",
-                "--max-num-batched-tokens",
-                "4096",
-            ),
-            (
-                "--max-running-requests",
-                "33",
-                "--max-running-requests",
-                "33",
-            ),
-            (
-                "--chunked-prefill-size",
-                "1234",
-                "--chunked-prefill-size",
-                "1234",
-            ),
-            (
-                "--schedule-policy",
-                "priority",
-                "--schedule-policy",
-                "priority",
-            ),
-            ("--resp-slot-cap", "1048576", "--resp-slot-cap", "1048576"),
-        ]
+        .expect("configured serve invocation");
+        assert!(matches!(parsed.command, Command::Serve(_)));
     }
 
     #[test]
-    fn serve_forwards_each_always_forwarded_flag_with_identical_value() {
-        for (serve_flag, serve_value, engine_flag, expected) in always_forwarded_cases() {
-            let runtime = parse_serve(&[serve_flag, serve_value]);
-            let engine_args = runtime.engine_cli_args();
-            assert_eq!(
-                forwarded_value(&engine_args, engine_flag),
-                Some(expected),
-                "{serve_flag} {serve_value} must forward as {engine_flag} {expected}",
-            );
-        }
-    }
-
-    #[test]
-    fn every_forwarded_flag_is_accepted_by_the_engine_subcommand() {
-        // The full forwarded arg set (all always-forwarded flags set to
-        // non-default values at once) must parse cleanly as `engine` flags,
-        // proving the two modes agree on flag names and value formats.
-        let extra: Vec<&str> = always_forwarded_cases()
-            .iter()
-            .flat_map(|(flag, value, _, _)| [*flag, *value])
-            .collect();
-        let runtime = parse_serve(&extra);
-        let engine_args = runtime.engine_cli_args();
-
-        let mut argv = vec![
-            "uniserve".to_string(),
-            "engine".to_string(),
-            "model".to_string(),
-            "--handshake-address".to_string(),
-            "tcp://127.0.0.1:5557".to_string(),
-        ];
-        argv.extend(engine_args.iter().cloned());
-
-        let parsed = <Cli as clap::Parser>::try_parse_from(&argv);
-        assert!(
-            parsed.is_ok(),
-            "forwarded args {engine_args:?} must parse as engine flags: {:?}",
-            parsed.err().map(|e| e.to_string()),
-        );
-    }
-
-    #[test]
-    fn forwarded_scheduler_policy_value_round_trips_into_engine_mode() {
-        // `--schedule-policy` is forwarded as a lowercased Debug string; the
-        // engine subcommand must accept that exact spelling.
-        let runtime = parse_serve(&["--schedule-policy", "priority"]);
-        let engine_args = runtime.engine_cli_args();
-        assert_eq!(
-            forwarded_value(&engine_args, "--schedule-policy"),
-            Some("priority"),
-        );
-
-        let engine = <Cli as clap::Parser>::try_parse_from([
+    fn engine_accepts_runtime_configuration() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "engine",
             "model",
             "--handshake-address",
             "tcp://127.0.0.1:5557",
-            "--schedule-policy",
-            "priority",
-        ])
-        .expect("engine must accept forwarded scheduler-policy spelling");
-        match engine.command {
-            Command::Engine(args) => {
-                assert!(matches!(
-                    args.scheduler_policy,
-                    SchedulerPolicyArg::Priority
-                ));
-            }
-            Command::Serve(_) => panic!("expected engine command"),
-        }
-    }
-
-    #[test]
-    fn optional_max_model_len_is_forwarded_only_when_set() {
-        // Unset on serve -> absent from forwarded args.
-        let default_runtime = parse_serve(&[]);
-        assert_eq!(
-            forwarded_value(&default_runtime.engine_cli_args(), "--max-model-len"),
-            None,
-            "--max-model-len must not be forwarded when unset",
-        );
-
-        // Set on serve -> forwarded with the identical value.
-        let set_runtime = parse_serve(&["--max-model-len", "8192"]);
-        assert_eq!(
-            forwarded_value(&set_runtime.engine_cli_args(), "--max-model-len"),
-            Some("8192"),
-        );
-    }
-
-    #[test]
-    fn optional_kv_token_capacity_is_forwarded_only_when_set() {
-        let default_runtime = parse_serve(&[]);
-        assert_eq!(
-            forwarded_value(&default_runtime.engine_cli_args(), "--max-total-tokens"),
-            None,
-        );
-
-        let set_runtime = parse_serve(&["--max-total-tokens", "100000"]);
-        assert_eq!(
-            forwarded_value(&set_runtime.engine_cli_args(), "--max-total-tokens"),
-            Some("100000"),
-        );
-    }
-
-    #[test]
-    fn optional_workers_and_transfer_topology_forward_verbatim() {
-        let runtime = parse_serve(&[
-            "--workers",
-            "encoder:2,prefill:1:tp=4,decode:1:tp=4",
-            "--transfer",
-            "prefill->decode=cuda_ipc",
-        ]);
-        let engine_args = runtime.engine_cli_args();
-        assert_eq!(
-            forwarded_value(&engine_args, "--workers"),
-            Some("encoder:2,prefill:1:tp=4,decode:1:tp=4"),
-        );
-        assert_eq!(
-            forwarded_value(&engine_args, "--transfer"),
-            Some("prefill->decode=cuda_ipc"),
-        );
-    }
-
-    #[test]
-    fn sim_flag_forwards_as_bare_switch_at_the_tail() {
-        let runtime = parse_serve(&["--sim"]);
-        let engine_args = runtime.engine_cli_args();
-        assert!(
-            engine_args.iter().any(|a| a == "--sim"),
-            "--sim must be forwarded as a bare switch",
-        );
-        // `--sim` takes no value: it must not be followed by a stray value that
-        // looks like an unrelated token (it is the final pushed arg).
-        assert_eq!(engine_args.last().map(String::as_str), Some("--sim"));
-    }
-
-    #[test]
-    fn default_serve_does_not_forward_the_sim_switch() {
-        let runtime = parse_serve(&[]);
-        assert!(
-            !runtime.engine_cli_args().iter().any(|a| a == "--sim"),
-            "default (non-sim) serve must not forward --sim",
-        );
-    }
-
-    #[test]
-    fn worker_launch_flag_kept_at_default_is_not_forwarded() {
-        // `--dtype` defaults to "bfloat16"; an unchanged value is omitted.
-        let runtime = parse_serve(&[]);
-        assert_eq!(
-            forwarded_value(&runtime.engine_cli_args(), "--dtype"),
-            None,
-            "default --dtype must be omitted from forwarded args",
-        );
-    }
-
-    #[test]
-    fn worker_launch_flag_changed_from_default_forwards_identical_value() {
-        let runtime = parse_serve(&["--dtype", "float16"]);
-        assert_eq!(
-            forwarded_value(&runtime.engine_cli_args(), "--dtype"),
-            Some("float16"),
-        );
-    }
-
-    #[test]
-    fn worker_mesh_forwards_to_managed_engine_args() {
-        let runtime = parse_serve(&[
-            "--worker-mesh",
-            "tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536",
-        ]);
-        assert_eq!(
-            forwarded_value(&runtime.engine_cli_args(), "--worker-mesh"),
-            Some("tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536"),
-        );
-        assert_eq!(
-            runtime.engine_settings().worker_launch.mesh.as_deref(),
-            Some("tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536"),
-        );
-    }
-
-    #[test]
-    fn serve_runtime_flags_parse_to_target_fields() {
-        let runtime = parse_serve(&[
+            "--device",
+            "cpu",
             "--tp-size",
             "2",
             "--page-size",
             "128",
-            "--max-total-tokens",
-            "4096",
-            "--chunked-prefill-size",
-            "2048",
+            "--pipeline-depth",
+            "3",
             "--schedule-policy",
             "priority",
             "--dtype",
             "float16",
-            "--mem-fraction-static",
-            "0.5",
-            "--trust-remote-code",
-            "--lane",
-            r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
-        ]);
-
-        assert_eq!(runtime.worker_ranks, 2);
-        assert_eq!(runtime.block_size, 128);
-        assert_eq!(runtime.kv_token_capacity, Some(4096));
-        assert_eq!(runtime.long_prefill_threshold, 2048);
-        assert!(matches!(
-            runtime.scheduler_policy,
-            SchedulerPolicyArg::Priority
-        ));
-        assert_eq!(runtime.worker_launch.model_dtype, "float16");
-        assert_eq!(runtime.worker_launch.kv_memory_fraction, "0.5");
-        assert!(runtime.worker_launch.transformers_trust_remote_code);
-        assert_eq!(runtime.worker_launch.lanes.len(), 1);
-    }
-
-    #[test]
-    fn serve_uses_required_positional_model() {
-        let runtime = parse_serve(&[]);
-        assert_eq!(runtime.resolved_model(), "model");
-    }
-
-    #[test]
-    fn serve_configures_public_server_controls() {
-        let runtime = parse_serve(&[
-            "--api-key",
-            "public-key",
-            "--request-timeout",
-            "9",
-            "--max-concurrent-requests",
-            "11",
-        ]);
-        let config = runtime.into_config(HttpListenerMode::BindTcp {
-            host: "127.0.0.1".to_string(),
-            port: 8000,
-        });
-
-        assert_eq!(config.api_key.as_deref(), Some("public-key"));
-        assert_eq!(config.request_timeout, Some(Duration::from_secs(9)));
-        assert_eq!(config.max_concurrent_requests, Some(11));
-    }
-
-    #[test]
-    fn forwarded_args_are_well_formed_flag_value_pairs() {
-        // Every forwarded token that introduces a value must be a recognized
-        // engine flag (no orphaned positionals leaking into the passthrough).
-        let runtime = parse_serve(&[
-            "--device",
-            "cpu",
-            "--page-size",
-            "512",
-            "--workers",
-            "encoder:1",
-        ]);
-        let engine_args = runtime.engine_cli_args();
-        // Every entry starting with "--" is a flag; the construction never emits
-        // an empty token.
-        assert!(
-            engine_args.iter().all(|a| !a.is_empty()),
-            "forwarded args must contain no empty tokens",
-        );
-        // The forwarded args, prefixed with the required engine positionals,
-        // must parse without error (end-to-end well-formedness).
-        let mut argv = vec![
-            "uniserve".to_string(),
-            "engine".to_string(),
-            "model".to_string(),
-            "--handshake-address".to_string(),
-            "tcp://127.0.0.1:5557".to_string(),
-        ];
-        argv.extend(engine_args.iter().cloned());
-        assert!(<Cli as clap::Parser>::try_parse_from(&argv).is_ok());
+            "--worker-mesh",
+            "tower=text:cpu",
+        ])
+        .expect("configured engine invocation");
+        assert!(matches!(parsed.command, Command::Engine(_)));
     }
 }

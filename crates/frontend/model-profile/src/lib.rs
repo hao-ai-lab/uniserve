@@ -449,6 +449,14 @@ mod tests {
             ingest.step_kv_tokens,
             vec![ImageKvEffect::Exact { tokens: 2304 }]
         );
+        let policy = profile
+            .preprocessing
+            .generation_policy_for_dimensions(2048, 1152)
+            .unwrap();
+        assert_eq!(
+            policy.feedback.unwrap().ingest.step_kv_tokens,
+            vec![ImageKvEffect::Exact { tokens: 2305 }]
+        );
 
         let (_directory, files) = configured_files("bagel");
         let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
@@ -486,6 +494,14 @@ mod tests {
                 ImageKvEffect::Exact { tokens: 2050 },
                 ImageKvEffect::Exact { tokens: 2452 },
             ]
+        );
+        let policy = profile
+            .preprocessing
+            .generation_policy_for_dimensions(512, 512)
+            .unwrap();
+        assert_eq!(
+            policy.feedback.unwrap().ingest.step_kv_tokens,
+            vec![ImageKvEffect::Exact { tokens: 1026 }]
         );
     }
 }

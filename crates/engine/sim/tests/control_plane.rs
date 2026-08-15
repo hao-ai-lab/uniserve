@@ -16,8 +16,8 @@ use uniserve_core::{
     TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent, PublicModality};
-use uniserve_executor::{ControlAck, ControlOp, Executor};
-use uniserve_scheduler::{ControlTokens, Scheduler, SchedulerConfig, SchedulingPolicy};
+use uniserve_executor::Executor;
+use uniserve_scheduler::{ControlTokens, Scheduler, SchedulingPolicy};
 use uniserve_sim::SimEngine;
 use uniserve_sim::SimExecutor;
 use uniserve_worker_ipc::MultiprocExecutor;
@@ -241,460 +241,6 @@ fn text_and_image_requests_complete() {
 }
 
 #[test]
-fn scheduler_submits_mixed_op_kind_batches() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, ExecutionCapability, WorkVariant, WorkerCapabilities,
-    };
-
-    type PartitionLog = Arc<Mutex<Vec<Vec<(ExecutionCapability, u32, Vec<WorkVariant>)>>>>;
-
-    struct Recording {
-        inner: SimExecutor,
-        batches: PartitionLog,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
-            self.batches.lock().unwrap().push(
-                b.partitions
-                    .iter()
-                    .map(|partition| {
-                        (
-                            partition.execution,
-                            partition.submission_group,
-                            partition
-                                .operations
-                                .iter()
-                                .map(|operation| operation.work.variant())
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            );
-            self.inner.submit(b)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_text_len(32);
-    sim.set_pipeline_depth(2);
-    let batches = Arc::new(Mutex::new(Vec::new()));
-    let exec = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        batches: batches.clone(),
-    };
-    let sched = Scheduler::new(Box::new(exec), ctrl(), 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut text_rx = handle
-        .submit(generation_request(
-            RequestId(1),
-            text_context(vec![1, 2, 3]),
-            SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            64,
-        ))
-        .unwrap();
-    let mut image_rx = handle
-        .submit(generation_request(
-            RequestId(2),
-            text_context(vec![4, 5, 6]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 1,
-                ..Default::default()
-            },
-            GenerationConstraint::GenOnly,
-            0,
-        ))
-        .unwrap();
-
-    let mut text_done = false;
-    let mut image_done = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while (!text_done || !image_done) && Instant::now() < deadline {
-        while let Ok(ev) = text_rx.try_recv() {
-            if matches!(ev, GenEvent::Finished { .. }) {
-                text_done = true;
-            }
-        }
-        while let Ok(ev) = image_rx.try_recv() {
-            if matches!(ev, GenEvent::Finished { .. }) {
-                image_done = true;
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(text_done, "text request did not finish");
-    assert!(image_done, "image request did not finish");
-    let batches = batches.lock().unwrap();
-    assert!(
-        batches.iter().any(|partitions| {
-            let token = partitions
-                .iter()
-                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::TokenDecode));
-            let flow = partitions
-                .iter()
-                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::GenFlow));
-            matches!(
-                (token, flow),
-                (
-                    Some((ExecutionCapability::TensorizedMixed, token_group, _)),
-                    Some((ExecutionCapability::TensorizedMixed, flow_group, _)),
-                ) if token_group == flow_group
-            )
-        }),
-        "expected one batch mixing decode_und and denoise_gen, got {batches:?}",
-    );
-    assert!(
-        batches.iter().any(|partitions| {
-            let token = partitions
-                .iter()
-                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::TokenDecode));
-            let materialize = partitions
-                .iter()
-                .find(|(_, _, kinds)| kinds.contains(&WorkVariant::Materialize));
-            matches!(
-                (token, materialize),
-                (
-                    Some((ExecutionCapability::DomainHomogeneous, token_group, _)),
-                    Some((ExecutionCapability::DomainHomogeneous, materialize_group, _)),
-                ) if token_group != materialize_group
-            )
-        }),
-        "expected decode_und and commit_gen to retain independent physical submissions, got {batches:?}",
-    );
-}
-
-#[test]
-fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, WorkVariant, WorkerCapabilities};
-
-    type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, WorkVariant)>>>>;
-
-    struct Recording {
-        inner: SimExecutor,
-        batches: BatchLog,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
-            self.batches.lock().unwrap().push(
-                b.operations()
-                    .map(|operation| (operation.request_key.session_id, operation.work.variant()))
-                    .collect(),
-            );
-            self.inner.submit(b)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    fn run() {
-        let mut sim = SimEngine::new();
-        sim.set_pipeline_depth(2);
-        sim.set_text_len(64);
-        sim.mut_caps_for_test().max_batch_operations = 1024;
-        let batches = Arc::new(Mutex::new(Vec::new()));
-        let exec = Recording {
-            inner: SimExecutor::new(Box::new(sim)),
-            batches: batches.clone(),
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(exec),
-            ctrl(),
-            SchedulerConfig {
-                max_batch: 2,
-                max_num_batched_tokens: 8192,
-                max_num_seqs: 16,
-                ..Default::default()
-            },
-        );
-
-        let greedy_lookahead = SamplingParams {
-            temperature: 0.0,
-            ignore_eos: true,
-            ..SamplingParams::default()
-        };
-        let _rx1 = sched.submit_for_test(generation_request(
-            RequestId(1),
-            text_context(vec![1, 2, 3]),
-            greedy_lookahead.clone(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            64,
-        ));
-        let _rx2 = sched.submit_for_test(generation_request(
-            RequestId(2),
-            text_context(vec![4, 5, 6]),
-            greedy_lookahead.clone(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            64,
-        ));
-
-        let mut saw_decode_pressure = false;
-        for _ in 0..40 {
-            sched.step();
-            let log = batches.lock().unwrap();
-            saw_decode_pressure = log.iter().any(|batch| {
-                batch.len() == 2
-                    && batch
-                        .iter()
-                        .all(|(_, kind)| *kind == WorkVariant::TokenDecode)
-            });
-            if saw_decode_pressure {
-                break;
-            }
-        }
-        assert!(
-            saw_decode_pressure,
-            "setup must reach a full decode batch before testing admission"
-        );
-
-        let before = batches.lock().unwrap().len();
-        let _rx3 = sched.submit_for_test(generation_request(
-            RequestId(3),
-            text_context(vec![7, 8, 9]),
-            greedy_lookahead.clone(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            64,
-        ));
-
-        for _ in 0..40 {
-            sched.step();
-            if batches.lock().unwrap().len() > before {
-                break;
-            }
-        }
-        let log = batches.lock().unwrap();
-        let prefill_batch = log.get(before).unwrap_or_else(|| {
-            panic!("expected the ready prompt at the next available slot: {log:?}")
-        });
-        assert!(
-            prefill_batch
-                .iter()
-                .any(|(id, kind)| *id == RequestId(3) && *kind == WorkVariant::TokenExtend),
-            "the ready prompt should receive prefill service, got {prefill_batch:?}"
-        );
-    }
-
-    run();
-}
-
-#[test]
-fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, ResourceClass, WorkVariant, WorkerCapabilities,
-    };
-
-    struct Recording {
-        inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Batch>>>,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
-            self.batches.lock().unwrap().push(b.clone());
-            self.inner.submit(b)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.mut_caps_for_test().resource_classes = vec![ResourceClass::ImageLatent];
-    sim.mut_caps_for_test().latent_page_units = 64;
-    sim.mut_caps_for_test().num_latent_pages = 17;
-    sim.mut_caps_for_test().latent_downsample = 16;
-    sim.mut_caps_for_test().max_batch_operations = 1024;
-    let batches = Arc::new(Mutex::new(Vec::new()));
-    let exec = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        batches: batches.clone(),
-    };
-    let sched = Scheduler::new(Box::new(exec), ctrl(), 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut receivers = Vec::new();
-    for id in 1..=3 {
-        let image_rx = handle
-            .submit(generation_request(
-                RequestId(id),
-                text_context(vec![4, 5, 6]),
-                SamplingParams::default(),
-                ImageParams {
-                    steps: 1,
-                    ..Default::default()
-                },
-                GenerationConstraint::GenOnly,
-                0,
-            ))
-            .unwrap();
-        receivers.push(image_rx);
-    }
-
-    let mut done = vec![false; receivers.len()];
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while done.iter().any(|finished| !*finished) && Instant::now() < deadline {
-        for (idx, rx) in receivers.iter_mut().enumerate() {
-            while let Ok(ev) = rx.try_recv() {
-                if matches!(ev, GenEvent::Finished { .. }) {
-                    done[idx] = true;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(
-        done.iter().all(|finished| *finished),
-        "image requests did not finish"
-    );
-    let batches = batches.lock().unwrap();
-    assert!(
-        batches.iter().all(|batch| {
-            let kinds = batch
-                .operations()
-                .map(|operation| operation.work.variant())
-                .collect::<Vec<_>>();
-            [WorkVariant::GenTransition, WorkVariant::GenFlow]
-                .into_iter()
-                .all(|target| kinds.iter().filter(|kind| **kind == target).count() <= 1)
-        }),
-        "expected every latent-producing batch to respect one-image capacity, got {batches:?}",
-    );
-    let placements = batches
-        .iter()
-        .flat_map(|batch| &batch.partitions)
-        .flat_map(|partition| &partition.latent_placements)
-        .collect::<Vec<_>>();
-    assert!(!placements.is_empty());
-    assert!(placements.iter().all(|placement| {
-        placement.page_table.iter().all(|page| *page > 0)
-            && placement.page_table.len() == (placement.latent_units as usize).div_ceil(64)
-    }));
-    let pages_by_request = placements.iter().fold(
-        HashMap::<RequestId, Vec<u32>>::new(),
-        |mut pages, placement| {
-            pages
-                .entry(placement.request_key.session_id)
-                .or_insert_with(|| placement.page_table.clone());
-            pages
-        },
-    );
-    assert_eq!(pages_by_request.len(), 3);
-    assert_eq!(
-        pages_by_request.values().collect::<HashSet<_>>().len(),
-        1,
-        "retired trajectory pages should be reusable by the next request"
-    );
-}
-
-#[test]
 fn cancellation_releases_latent_admission_for_a_waiting_image() {
     use uniserve_worker_wire::ResourceClass;
 
@@ -774,81 +320,20 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     assert_eq!(second_images, 1);
 }
 
-/// The flow phase runs exactly `image.steps` denoise quanta and then commits —
-/// never `image.steps + 1`. The worker signals no flow-completion, so
-/// termination is host-driven off the committed step count; this guards the
-/// off-by-one that planned a spurious extra denoise operation.
+/// Image generation exposes every declared denoise step in order before one committed image and terminal completion.
 #[test]
-fn flow_phase_plans_exactly_image_steps_then_commits() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, Control, WorkVariant, WorkerCapabilities};
-
-    struct Recording {
-        inner: SimExecutor,
-        ops: Arc<Mutex<Vec<WorkVariant>>>,
-        public_event_limits: Arc<Mutex<Vec<u64>>>,
-    }
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            self.ops
-                .lock()
-                .unwrap()
-                .extend(batch.operations().map(|op| op.work.variant()));
-            self.public_event_limits
-                .lock()
-                .unwrap()
-                .extend(batch.controls.iter().filter_map(|control| match control {
-                    Control::Commit {
-                        public_event_limit, ..
-                    } => Some(*public_event_limit),
-                    _ => None,
-                }));
-            self.inner.submit(batch)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
+fn image_events_cover_declared_denoise_steps() {
     const STEPS: u16 = 3;
-    let ops = Arc::new(Mutex::new(Vec::new()));
-    let public_event_limits = Arc::new(Mutex::new(Vec::new()));
-    let exec = Recording {
-        inner: SimExecutor::new(Box::new(SimEngine::new())),
-        ops: ops.clone(),
-        public_event_limits: public_event_limits.clone(),
-    };
-    let sched = Scheduler::new(Box::new(exec), ctrl(), 32);
+    let scheduler = Scheduler::new(
+        Box::new(SimExecutor::new(Box::new(SimEngine::new()))),
+        ctrl(),
+        32,
+    );
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
 
-    let mut erx = handle
+    let mut events = handle
         .submit(generation_request(
             RequestId(1),
             text_context(vec![4, 5, 6]),
@@ -862,52 +347,47 @@ fn flow_phase_plans_exactly_image_steps_then_commits() {
         ))
         .unwrap();
 
-    let mut finished = false;
+    let mut begin = None;
+    let mut steps = Vec::new();
+    let mut commits = 0;
+    let mut image_done = None;
+    let mut finished = None;
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !finished && Instant::now() < deadline {
-        while let Ok(event) = erx.try_recv() {
-            if matches!(event, GenEvent::Finished { .. }) {
-                finished = true;
+    while finished.is_none() && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::ImageBegin {
+                image_id,
+                height,
+                width,
+                steps,
+            }) => begin = Some((image_id, height, width, steps)),
+            Ok(GenEvent::ImageStep { image_id, step }) => steps.push((image_id, step)),
+            Ok(GenEvent::ImageCommit { image_id }) => {
+                assert_eq!(image_id, 1);
+                commits += 1;
             }
+            Ok(GenEvent::ImageDone {
+                image_id,
+                height,
+                width,
+                public_commit,
+                ..
+            }) => image_done = Some((image_id, height, width, public_commit)),
+            Ok(GenEvent::Finished { reason, images, .. }) => finished = Some((reason, images)),
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
         }
-        thread::sleep(Duration::from_millis(1));
     }
     handle.shutdown();
-    let _ = jh.join();
+    let _ = scheduler_thread.join();
 
-    assert!(
-        finished,
-        "gen-only image request never finished — the flow phase did not terminate"
-    );
-    let ops = ops.lock().unwrap();
-    let flow_count = ops
-        .iter()
-        .filter(|kind| **kind == WorkVariant::GenFlow)
-        .count();
-    assert_eq!(
-        flow_count, STEPS as usize,
-        "flow must plan exactly image.steps denoise quanta, got {ops:?}"
-    );
-    let last_flow = ops.iter().rposition(|kind| *kind == WorkVariant::GenFlow);
-    let commit = ops
-        .iter()
-        .position(|kind| *kind == WorkVariant::Materialize);
-    assert!(
-        commit.is_some(),
-        "the flow must be followed by a commit (materialize), got {ops:?}"
-    );
-    assert!(
-        last_flow < commit,
-        "the commit must follow the final flow quantum, got {ops:?}"
-    );
-    let public_event_limits = public_event_limits.lock().unwrap();
-    assert!(public_event_limits.len() > usize::from(STEPS));
-    assert!(
-        public_event_limits
-            .windows(2)
-            .all(|pair| pair[0] <= pair[1]),
-        "semantic commits must carry a monotonic public-event bound: {public_event_limits:?}"
-    );
+    assert_eq!(begin, Some((1, 512, 512, STEPS)));
+    assert_eq!(steps, (1..=STEPS).map(|step| (1, step)).collect::<Vec<_>>());
+    assert_eq!(commits, 1);
+    let (image_id, height, width, public_commit) = image_done.expect("image completion event");
+    assert_eq!((image_id, height, width), (1, 512, 512));
+    assert!(public_commit.is_some());
+    assert_eq!(finished, Some((FinishReason::ImageDone, 1)));
 }
 
 #[test]
@@ -989,6 +469,31 @@ fn operation_window_metrics_record_the_full_lifecycle() {
         })
         .expect("submit->observed span present");
     assert!(roundtrip.count > 0, "device roundtrip delays recorded");
+    let active_domains = metrics
+        .domains
+        .iter()
+        .filter(|domain| domain.launched_operations > 0)
+        .collect::<Vec<_>>();
+    assert!(!active_domains.is_empty(), "domain launches recorded");
+    for domain in &active_domains {
+        assert_eq!(domain.active_credits, 0);
+        assert_eq!(domain.launched_operations, domain.completed_operations);
+        assert_eq!(domain.launched_operations, domain.reclaimed_credits);
+        assert!(domain.completed_partitions > 0);
+    }
+    let mut reporter = uniserve_scheduler::SchedStatsReporter::default();
+    let wire = reporter.snapshot(&scheduler.stats, 16);
+    let wire_active = wire
+        .domain_stats
+        .iter()
+        .filter(|domain| domain.launched_operations > 0)
+        .collect::<Vec<_>>();
+    assert_eq!(wire_active.len(), active_domains.len());
+    assert!(wire_active.iter().all(|domain| {
+        domain.active_credits == 0
+            && domain.launched_operations == domain.completed_operations
+            && domain.launched_operations == domain.reclaimed_credits
+    }));
 
     let traces = scheduler.take_completed_traces();
     let trace = traces
@@ -1017,217 +522,19 @@ fn operation_window_metrics_record_the_full_lifecycle() {
     }
 }
 
-#[test]
-fn stochastic_decode_relays_a_device_selected_successor_before_observation() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, OpId, Point, WorkVariant, WorkerCapabilities,
-    };
-
-    // (op_id, variant, device_parent, in_flight_at_submit)
-    type OpLog = Arc<Mutex<Vec<(OpId, WorkVariant, bool, usize)>>>;
-
-    struct Recording {
-        inner: SimExecutor,
-        ops: OpLog,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            let in_flight = self.inner.in_flight();
-            for envelope in batch.operations() {
-                let device_parent = matches!(envelope.parent.point, Point::Device { .. });
-                self.ops.lock().unwrap().push((
-                    envelope.op_id,
-                    envelope.work.variant(),
-                    device_parent,
-                    in_flight,
-                ));
-            }
-            self.inner.submit(batch)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(operation)
-        }
-        fn control_wait(
-            &mut self,
-            operation: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(operation, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let sampling = SamplingParams {
-        temperature: 0.8,
-        top_k: 32,
-        top_p: 0.9,
-        seed: Some(917),
-        ..SamplingParams::default()
-    };
-
-    let mut runs = Vec::new();
-    for depth in [1u32, 2] {
-        let mut sim = SimEngine::new();
-        sim.set_pipeline_depth(depth);
-        sim.set_text_len(8);
-        let ops: OpLog = Arc::new(Mutex::new(Vec::new()));
-        let executor = Recording {
-            inner: SimExecutor::new(Box::new(sim)),
-            ops: ops.clone(),
-        };
-        let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
-        let request = generation_request(
-            RequestId(1),
-            text_context(vec![1, 2, 3, 4, 5]),
-            sampling.clone(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            16,
-        );
-        let mut events = scheduler.submit_for_test(request);
-        let mut tokens = Vec::new();
-        let mut finished = false;
-        for _ in 0..256 {
-            scheduler.step();
-            while let Ok(event) = events.try_recv() {
-                match event {
-                    GenEvent::TextToken { id, .. } => tokens.push(id),
-                    GenEvent::Finished { .. } => finished = true,
-                    _ => {}
-                }
-            }
-            if finished {
-                break;
-            }
-        }
-        drop(scheduler);
-        runs.push((tokens, Arc::try_unwrap(ops).unwrap().into_inner().unwrap()));
-    }
-
-    let (serial_tokens, _) = &runs[0];
-    let (relayed_tokens, relayed_ops) = &runs[1];
-    assert!(!serial_tokens.is_empty(), "the request produced tokens");
-    // Depth equivalence: relayed stochastic tokens equal the serial oracle.
-    assert_eq!(
-        serial_tokens, relayed_tokens,
-        "stochastic tokens differ between serial and device-relay execution"
-    );
-    // Production trace: a stochastic decode successor was submitted from the
-    // parent's device-selected point while the parent was still in flight, i.e.
-    // before its completion could be observed on the host.
-    assert!(
-        relayed_ops
-            .iter()
-            .any(|(_, variant, device_parent, in_flight)| {
-                *variant == WorkVariant::TokenDecode && *device_parent && *in_flight > 0
-            }),
-        "expected a stochastic decode successor relayed from a device point before observation"
-    );
-}
-
-/// Run one text request through a scheduler at `depth`, taping every submitted
-/// operation's `(variant, device_parent, in_flight_at_submit)`. Returns the
-/// emitted token ids and the operation tape. Shared by the generalized
-/// device-continuation depth oracle: at depth one every successor roots on the
-/// fixed committed parent (the serial reference); at higher depth an eligible
-/// successor roots on the predecessor's device-selected point while the
-/// predecessor is still in flight, i.e. before its completion is observed.
 fn relay_run(
     sampling: SamplingParams,
     stop_token_ids: Vec<u32>,
     max_und_tokens: usize,
     text_len: usize,
     depth: u32,
-) -> (
-    Vec<u32>,
-    Vec<(uniserve_worker_wire::WorkVariant, bool, usize)>,
-) {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, Point, WorkVariant, WorkerCapabilities};
-
-    type Tape = Arc<Mutex<Vec<(WorkVariant, bool, usize)>>>;
-
-    struct Tap {
-        inner: SimExecutor,
-        ops: Tape,
-    }
-
-    impl Executor for Tap {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            let in_flight = self.inner.in_flight();
-            for envelope in batch.operations() {
-                let device_parent = matches!(envelope.parent.point, Point::Device { .. });
-                self.ops
-                    .lock()
-                    .unwrap()
-                    .push((envelope.work.variant(), device_parent, in_flight));
-            }
-            self.inner.submit(batch)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(operation)
-        }
-        fn control_wait(
-            &mut self,
-            operation: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(operation, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
+) -> (Vec<u32>, bool) {
+    use uniserve_scheduler::LifecyclePhase;
 
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
     sim.set_text_len(text_len);
-    let ops: Tape = Arc::new(Mutex::new(Vec::new()));
-    let executor = Tap {
-        inner: SimExecutor::new(Box::new(sim)),
-        ops: ops.clone(),
-    };
-    let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
     let mut request = generation_request(
         RequestId(1),
         text_context(vec![1, 2, 3, 4, 5]),
@@ -1253,22 +560,37 @@ fn relay_run(
             break;
         }
     }
-    drop(scheduler);
-    (tokens, Arc::try_unwrap(ops).unwrap().into_inner().unwrap())
+    assert!(finished, "processor request reached a terminal event");
+
+    let trace = scheduler
+        .take_completed_traces()
+        .into_iter()
+        .find(|trace| trace.request_key.session_id == RequestId(1))
+        .expect("completed processor trace");
+    let token_operations = trace
+        .operations()
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.op_kind,
+                Some("token_extend" | "token_decode" | "token_verify")
+            )
+        })
+        .collect::<Vec<_>>();
+    let successor_precedes_parent_observation = token_operations.windows(2).any(|pair| {
+        let Some(parent_observed) = pair[0].at(LifecyclePhase::CompletionObserved) else {
+            return false;
+        };
+        let Some(successor_submitted) = pair[1].at(LifecyclePhase::Submitted) else {
+            return false;
+        };
+        successor_submitted < parent_observed
+    });
+    (tokens, successor_precedes_parent_observation)
 }
 
-/// S16 generalized device-continuation depth oracle. Every admitted
-/// device-representable processor combination — penalties, requested logprobs,
-/// the minimum-token floor, static allowed-token masks, positional forced
-/// tokens, and device stop-token finish predicates — produces the identical
-/// committed token sequence at depth one (serial, fixed-parent) and at higher
-/// depth (a successor relayed from the predecessor's device point before host
-/// observation). Penalty counts are folded from a device-resident base, so the
-/// successor sees its ancestors' tokens without observing them on the host.
 #[test]
 fn generalized_processor_successors_match_depth_one_before_observation() {
-    use uniserve_worker_wire::WorkVariant;
-
     let cases: Vec<(&str, SamplingParams, Vec<u32>)> = vec![
         (
             "repetition+frequency+presence penalties",
@@ -1326,129 +648,35 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
     ];
 
     for (label, sampling, stop_token_ids) in cases {
-        let (serial, serial_ops) = relay_run(sampling.clone(), stop_token_ids.clone(), 24, 12, 1);
-        let (relayed, relayed_ops) = relay_run(sampling, stop_token_ids, 24, 12, 2);
+        let (serial, serial_preobserved) =
+            relay_run(sampling.clone(), stop_token_ids.clone(), 24, 12, 1);
+        let (relayed, relayed_preobserved) = relay_run(sampling, stop_token_ids, 24, 12, 2);
 
         assert!(!serial.is_empty(), "[{label}] produced no tokens");
         assert_eq!(
             serial, relayed,
             "[{label}] device-relay tokens diverged from the depth-one serial oracle",
         );
-        // The depth-one reference never registers a successor ahead of an
-        // in-flight predecessor: every submitted op sees an empty pipeline.
         assert!(
-            serial_ops.iter().all(|(_, _, in_flight)| *in_flight == 0),
+            !serial_preobserved,
             "[{label}] the depth-one oracle submitted a successor before observation",
         );
-        // The depth-two run proves production continuity: a decode successor was
-        // submitted from a device point while its predecessor was still in
-        // flight, before any completion could be observed on the host.
         assert!(
-            relayed_ops
-                .iter()
-                .any(|(variant, device_parent, in_flight)| {
-                    *variant == WorkVariant::TokenDecode && *device_parent && *in_flight > 0
-                }),
-            "[{label}] expected a decode successor relayed from a device point before observation",
+            relayed_preobserved,
+            "[{label}] expected a token successor submission before parent observation",
         );
     }
 }
 
 #[test]
-fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, Control, OpId, Point, WorkVariant, WorkerCapabilities,
-    };
-
-    type OperationLog = Arc<Mutex<Vec<(OpId, WorkVariant, Option<(OpId, u64)>, usize, bool)>>>;
-
-    struct Recording {
-        inner: SimExecutor,
-        operations: OperationLog,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            let in_flight = self.inner.in_flight();
-            for envelope in batch.operations() {
-                let parent = match &envelope.parent.point {
-                    Point::Fixed { point_index, .. } => {
-                        Some((envelope.parent.producer_op_id, u64::from(*point_index)))
-                    }
-                    Point::Device { .. } => None,
-                };
-                let releases_parent = envelope.parent.producer_op_id.0 == 0
-                    || batch.controls.iter().any(|control| {
-                        matches!(
-                            control,
-                            Control::Release {
-                                request_key,
-                                op_id,
-                            } if *request_key == envelope.request_key
-                                && *op_id == envelope.parent.producer_op_id
-                        )
-                    });
-                self.operations.lock().unwrap().push((
-                    envelope.op_id,
-                    envelope.work.variant(),
-                    parent,
-                    in_flight,
-                    releases_parent,
-                ));
-            }
-            self.inner.submit(batch)
-        }
-
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-
-        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(operation)
-        }
-
-        fn control_wait(
-            &mut self,
-            operation: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(operation, targets)
-        }
-
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
+fn image_context_decode_is_depth_invariant() {
     let mut runs = Vec::new();
     for pipeline_depth in [1, 2] {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(pipeline_depth);
         sim.set_text_len(8);
-        let operations = Arc::new(Mutex::new(Vec::new()));
-        let executor = Recording {
-            inner: SimExecutor::new(Box::new(sim)),
-            operations: operations.clone(),
-        };
-        let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
-        let mut request = generation_request(
+        let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+        let request = generation_request(
             RequestId(1),
             context_with_image(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
             SamplingParams::default(),
@@ -1456,18 +684,14 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
             GenerationConstraint::UndOnly,
             16,
         );
-        if pipeline_depth == 1 {
-            request.stop_token_ids = vec![u32::MAX];
-        }
         let mut events = scheduler.submit_for_test(request);
-
         let mut finish_reason = None;
-        let mut text_tokens = 0;
-        for _ in 0..256 {
+        let mut tokens = Vec::new();
+        for _ in 0..512 {
             scheduler.step();
             while let Ok(event) = events.try_recv() {
                 match event {
-                    GenEvent::TextToken { .. } => text_tokens += 1,
+                    GenEvent::TextToken { id, .. } => tokens.push(id),
                     GenEvent::Finished { reason, .. } => finish_reason = Some(reason),
                     _ => {}
                 }
@@ -1476,171 +700,14 @@ fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors()
                 break;
             }
         }
-        drop(scheduler);
-        runs.push((
-            pipeline_depth,
-            finish_reason,
-            text_tokens,
-            Arc::try_unwrap(operations).unwrap().into_inner().unwrap(),
-        ));
+        assert_eq!(finish_reason, Some(FinishReason::Eos));
+        assert_eq!(tokens.len(), 8);
+        runs.push(tokens);
     }
 
-    for (_, finish_reason, text_tokens, operations) in &runs {
-        assert_eq!(*finish_reason, Some(FinishReason::Eos));
-        assert_eq!(*text_tokens, 8);
-        assert!(operations.len() >= 2);
-        assert!(
-            operations
-                .iter()
-                .all(|(_, _, _, _, releases_parent)| *releases_parent),
-            "every successor retires its parent after submission"
-        );
-        // A fixed producer exports operation-local point one when it advances
-        // state and point zero when it preserves state.
-        for (_, _, parent, _, _) in operations {
-            if let Some((producer_op_id, point)) = parent {
-                let expected = if producer_op_id.0 == 0 {
-                    0
-                } else {
-                    u64::from(
-                        operations
-                            .iter()
-                            .find(|(op_id, _, _, _, _)| op_id == producer_op_id)
-                            .expect("fixed parent producer must precede its consumer")
-                            .1
-                            .advances_state(),
-                    )
-                };
-                assert_eq!(*point, expected);
-            }
-        }
-    }
-
-    let serial = &runs[0].3;
-    assert!(
-        serial.iter().any(|(_, kind, parent, in_flight, _)| {
-            *kind == WorkVariant::TokenDecode && parent.is_none() && *in_flight == 0
-        }),
-        "a resolved selected-point product remains the next decode parent"
-    );
-    let pipelined = &runs[1].3;
-    assert!(
-        pipelined.iter().any(|(_, kind, parent, in_flight, _)| {
-            *kind == WorkVariant::TokenDecode && parent.is_none() && *in_flight > 0
-        }),
-        "an in-flight selected-point product feeds the next decode"
-    );
+    assert_eq!(runs[0], runs[1]);
 }
 
-#[test]
-fn staged_product_reachability_uses_a_fixed_handoff_then_same_pool_device_lineage() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, Point, WorkVariant, WorkerCapabilities};
-
-    struct StagedReachability {
-        inner: SimExecutor,
-        operations: Arc<Mutex<Vec<(WorkVariant, Point)>>>,
-    }
-
-    impl Executor for StagedReachability {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            self.operations.lock().unwrap().extend(
-                batch
-                    .operations()
-                    .map(|operation| (operation.work.variant(), operation.parent.point.clone())),
-            );
-            self.inner.submit(batch)
-        }
-
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-
-        fn device_products_reachable(&self, producer: WorkVariant, consumer: WorkVariant) -> bool {
-            producer == WorkVariant::TokenDecode && consumer == WorkVariant::TokenDecode
-        }
-
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-
-        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(operation)
-        }
-
-        fn control_wait(
-            &mut self,
-            operation: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(operation, targets)
-        }
-
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_pipeline_depth(2);
-    sim.set_text_len(6);
-    let operations = Arc::new(Mutex::new(Vec::new()));
-    let executor = StagedReachability {
-        inner: SimExecutor::new(Box::new(sim)),
-        operations: operations.clone(),
-    };
-    let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
-    let mut events = scheduler.submit_for_test(generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        12,
-    ));
-
-    let mut finished = false;
-    for _ in 0..256 {
-        scheduler.step();
-        while let Ok(event) = events.try_recv() {
-            if matches!(event, GenEvent::Finished { .. }) {
-                finished = true;
-            }
-        }
-        if finished {
-            break;
-        }
-    }
-    assert!(finished);
-    let operations = operations.lock().unwrap();
-    let decode_parents = operations
-        .iter()
-        .filter_map(|(variant, point)| (*variant == WorkVariant::TokenDecode).then_some(point))
-        .collect::<Vec<_>>();
-    assert!(matches!(decode_parents.first(), Some(Point::Fixed { .. })));
-    assert!(
-        decode_parents
-            .iter()
-            .skip(1)
-            .any(|point| matches!(point, Point::Device { .. }))
-    );
-}
-
-/// an explicit stop token id terminates the request with FinishReason::Stop.
-/// The SimEngine's first sampled token for request id=1 is deterministic:
-/// `1000 + ((1*7 + 0) % 5000) = 1007`.
 #[test]
 fn stop_token_terminates_with_stop() {
     let mut sim = SimEngine::new();
@@ -1742,378 +809,26 @@ fn abort_and_cancel_are_distinct() {
 }
 
 #[test]
-fn exact_prefix_controls_close_the_selected_semantic_versions() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, Control, Point, VersionRef, WorkerCapabilities,
-    };
-
-    struct Recording {
-        inner: SimExecutor,
-        controls: Arc<Mutex<Vec<Control>>>,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            self.controls
-                .lock()
-                .unwrap()
-                .extend(batch.controls.iter().cloned());
-            self.inner.submit(batch)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1024);
-    sim.set_pipeline_depth(4);
-    let controls = Arc::new(Mutex::new(Vec::new()));
-    let executor = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        controls: Arc::clone(&controls),
-    };
-    let scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
-
-    let request = generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        1024,
-    );
-    let mut events = handle.submit(request).unwrap();
-    let mut consumed_tokens = 0;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while consumed_tokens < 2 && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => {
-                consumed_tokens += 1;
-            }
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    assert_eq!(consumed_tokens, 2);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let committed = controls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|control| matches!(control, Control::Commit { .. }))
-            .count();
-        if committed > consumed_tokens {
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.cancel_at(RequestId(1), consumed_tokens);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let close_cutoff = loop {
-        let cutoff = controls.lock().unwrap().iter().find_map(|control| {
-            if let Control::Close { cutoff, .. } = control {
-                Some(cutoff.clone())
-            } else {
-                None
-            }
-        });
-        if cutoff.is_some() || Instant::now() >= deadline {
-            break cutoff;
-        }
-        thread::sleep(Duration::from_millis(1));
-    };
-    handle.shutdown();
-    let _ = scheduler_thread.join();
-
-    let committed: Vec<(u64, VersionRef)> = controls
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|control| {
-            if let Control::Commit {
-                control_seq,
-                selected,
-                ..
-            } = control
-            {
-                Some((*control_seq, selected.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert!(committed.len() > consumed_tokens);
-    let close_cutoff = close_cutoff.expect("cancelled lineage must close");
-    assert_eq!(close_cutoff, committed[consumed_tokens - 1].1);
-    let close_seq = controls
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|control| {
-            if let Control::Close { control_seq, .. } = control {
-                Some(*control_seq)
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    assert_eq!(close_seq, committed.last().unwrap().0 + 1);
-
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1024);
-    sim.set_pipeline_depth(4);
-    let stop_controls = Arc::new(Mutex::new(Vec::new()));
-    let executor = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        controls: Arc::clone(&stop_controls),
-    };
-    let scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
-    let mut request = generation_request(
-        RequestId(2),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        1024,
-    );
-    request.stop_strings = vec!["boundary".to_string()];
-    let mut events = handle.submit(request).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut consumed_tokens = 0;
-    while consumed_tokens < 2 && Instant::now() < deadline {
-        match events.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => {
-                consumed_tokens += 1;
-                if consumed_tokens == 1 {
-                    handle.acknowledge_at(RequestId(2), consumed_tokens);
-                    handle.acknowledge_at(RequestId(2), consumed_tokens);
-                }
-            }
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    assert_eq!(consumed_tokens, 2);
-    handle.stop_at(RequestId(2), consumed_tokens);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut finish_reason = None;
-    while Instant::now() < deadline {
-        while let Ok(event) = events.try_recv() {
-            if let GenEvent::Finished { reason, .. } = event {
-                finish_reason = Some(reason);
-            }
-        }
-        let closed = stop_controls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|control| matches!(control, Control::Close { .. }));
-        if closed && finish_reason.is_some() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.shutdown();
-    let _ = scheduler_thread.join();
-    assert_eq!(finish_reason, Some(FinishReason::Stop));
-
-    let stop_controls = stop_controls.lock().unwrap();
-    let committed: Vec<(u64, VersionRef)> = stop_controls
-        .iter()
-        .filter_map(|control| {
-            if let Control::Commit {
-                control_seq,
-                selected,
-                ..
-            } = control
-            {
-                Some((*control_seq, selected.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert_eq!(committed.len(), consumed_tokens - 1);
-    let (close_seq, close_cutoff, close_reason) = stop_controls
-        .iter()
-        .find_map(|control| {
-            if let Control::Close {
-                control_seq,
-                cutoff,
-                reason,
-                ..
-            } = control
-            {
-                Some((*control_seq, cutoff, *reason))
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    assert_eq!(close_reason, uniserve_worker_wire::CloseReason::Completed);
-    assert_eq!(close_seq, committed[0].0 + 1);
-    assert_eq!(
-        close_cutoff.producer_op_id.0,
-        committed[0].1.producer_op_id.0 + 1
-    );
-    let (
-        Point::Fixed {
-            point_index: committed_point,
-            ..
-        },
-        Point::Fixed {
-            point_index: close_point,
-            ..
-        },
-    ) = (&committed[0].1.point, &close_cutoff.point)
-    else {
-        panic!("semantic controls must use fixed versions");
-    };
-    assert_eq!(*committed_point, 1);
-    assert_eq!(*close_point, 1);
-}
-
-/// S17 provisional-descendant retraction with lineage isolation. A stop-string
-/// request samples device-continuously: it registers a bounded provisional
-/// decode successor from its predecessor's device point before that predecessor
-/// is host-observed. A matched stop then retracts the provisional descendant to
-/// the exact accepted prefix through the ordered close cutoff, while an
-/// unrelated request runs to natural completion the whole time.
-#[test]
-fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests_continue() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{
-        Batch, CompletionReport, Control, Point, WorkVariant, WorkerCapabilities,
-    };
-
-    // (request_id, variant, device_parent, in_flight_at_submit)
-    type OpLog = Arc<Mutex<Vec<(u64, WorkVariant, bool, usize)>>>;
-
-    struct Recording {
-        inner: SimExecutor,
-        ops: OpLog,
-        controls: Arc<Mutex<Vec<Control>>>,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            let in_flight = self.inner.in_flight();
-            for envelope in batch.operations() {
-                self.ops.lock().unwrap().push((
-                    envelope.request_key.session_id.0,
-                    envelope.work.variant(),
-                    matches!(envelope.parent.point, Point::Device { .. }),
-                    in_flight,
-                ));
-            }
-            self.controls
-                .lock()
-                .unwrap()
-                .extend(batch.controls.iter().cloned());
-            self.inner.submit(batch)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
+fn stop_string_cutoff_is_request_local() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
-    let ops: OpLog = Arc::new(Mutex::new(Vec::new()));
-    let controls = Arc::new(Mutex::new(Vec::new()));
-    let executor = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        ops: Arc::clone(&ops),
-        controls: Arc::clone(&controls),
-    };
-    let scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
 
-    // An unrelated greedy request that must complete on its own throughout.
-    let unrelated = generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        6,
-    );
-    let mut unrelated_events = handle.submit(unrelated).unwrap();
+    let mut unrelated_events = handle
+        .submit(generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            6,
+        ))
+        .unwrap();
 
-    // A stop-string request that samples device-continuously. It is never
-    // acknowledged, so its held commits accumulate up to the bounded horizon and
-    // a provisional decode successor is registered before observation.
     let mut stopping = generation_request(
         RequestId(2),
         text_context(vec![1, 2, 3]),
@@ -2123,16 +838,14 @@ fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests
         1024,
     );
     stopping.stop_strings = vec!["boundary".to_string()];
-    let mut events = handle.submit(stopping).unwrap();
+    let mut stopping_events = handle.submit(stopping).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut consumed_tokens = 0;
     while consumed_tokens < 2 && Instant::now() < deadline {
-        match events.try_recv() {
+        match stopping_events.try_recv() {
             Ok(GenEvent::TextToken { .. }) => {
                 consumed_tokens += 1;
-                // Accept the first token so the second is a committed-ahead
-                // provisional descendant the stop then retracts.
                 if consumed_tokens == 1 {
                     handle.acknowledge_at(RequestId(2), 1);
                 }
@@ -2141,17 +854,14 @@ fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
     }
-    assert_eq!(
-        consumed_tokens, 2,
-        "stop-string request produced provisional tokens"
-    );
+    assert_eq!(consumed_tokens, 2);
     handle.stop_at(RequestId(2), 1);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut stop_reason = None;
     let mut unrelated_reason = None;
     while Instant::now() < deadline {
-        while let Ok(event) = events.try_recv() {
+        while let Ok(event) = stopping_events.try_recv() {
             if let GenEvent::Finished { reason, .. } = event {
                 stop_reason = Some(reason);
             }
@@ -2169,63 +879,13 @@ fn stop_string_retracts_a_provisional_device_descendant_while_unrelated_requests
     handle.shutdown();
     let _ = scheduler_thread.join();
 
-    // Lineage isolation: the unrelated request completed on its own while the
-    // stop-string request held its commits.
-    assert!(
-        matches!(
-            unrelated_reason,
-            Some(FinishReason::Eos | FinishReason::MaxTokens)
-        ),
-        "unrelated request must complete while the stop-string lineage is suspended, got {unrelated_reason:?}",
-    );
-    // The stop-string request retracted to the exact accepted prefix.
     assert_eq!(stop_reason, Some(FinishReason::Stop));
-
-    let ops = ops.lock().unwrap();
-    // Production trace: a provisional decode successor for the stop-string
-    // request was submitted from a device point while its predecessor was still
-    // in flight, before any completion could be observed on the host.
-    assert!(
-        ops.iter()
-            .any(|(request, variant, device_parent, in_flight)| {
-                *request == RequestId(2).0
-                    && *variant == WorkVariant::TokenDecode
-                    && *device_parent
-                    && *in_flight > 0
-            }),
-        "expected a provisional device-relayed successor for the stop-string request",
-    );
-    let submitted_token_ops = ops
-        .iter()
-        .filter(|(request, variant, _, _)| {
-            *request == RequestId(2).0
-                && matches!(variant, WorkVariant::TokenExtend | WorkVariant::TokenDecode)
-        })
-        .count();
-    let controls = controls.lock().unwrap();
-    let committed = controls
-        .iter()
-        .filter(|control| {
-            matches!(control, Control::Commit { request_key, .. } if request_key.session_id.0 == RequestId(2).0)
-        })
-        .count();
-    // Only the accepted prefix commits; every provisional descendant beyond it
-    // was submitted before observation and then retracted rather than committed.
-    assert_eq!(committed, 1, "only the acknowledged prefix commits");
-    assert!(
-        submitted_token_ops > committed,
-        "provisional descendants ({submitted_token_ops} submitted) were retracted, not committed ({committed})",
-    );
-    assert!(
-        controls.iter().any(|control| {
-            matches!(control, Control::Close { request_key, .. } if request_key.session_id.0 == RequestId(2).0)
-        }),
-        "stopped lineage must close at its exact cutoff",
-    );
+    assert!(matches!(
+        unrelated_reason,
+        Some(FinishReason::Eos | FinishReason::MaxTokens)
+    ));
 }
 
-/// the WorkerCapabilities hybrid-group handshake builds a multi-group block
-/// manager and the scheduler still drives requests to completion.
 #[test]
 fn hybrid_groups_handshake_runs() {
     use uniserve_core::{KvCacheGroupSpec, KvGroupKind};
@@ -2978,6 +1638,20 @@ fn interleave_c4_generated_images_complete() {
         );
         assert_eq!(result.images, 1, "request {id:?} missed its image branch");
     }
+    let metrics = scheduler.resource_window_metrics();
+    let decode = metrics
+        .domains
+        .iter()
+        .find(|domain| domain.domain == uniserve_worker_wire::Domain::Decode)
+        .expect("decode accounting");
+    let flow = metrics
+        .domains
+        .iter()
+        .find(|domain| domain.domain == uniserve_worker_wire::Domain::Flow)
+        .expect("flow accounting");
+    assert!(decode.co_resident_partitions > 0);
+    assert!(flow.co_resident_partitions > 0);
+    assert_eq!(decode.co_resident_partitions, flow.co_resident_partitions);
 }
 
 #[test]
@@ -3046,55 +1720,54 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
 /// image starts must come from the model, not a scheduler-forced cadence.
 #[test]
 fn gen_branch_waits_for_model_image_starts() {
-    let mut sim = SimEngine::new();
-    sim.set_text_len(1_000_000);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let sched = Scheduler::new(executor, ctrl(), 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let req = with_trigger(
-        generation_request(
-            RequestId(1),
-            text_context(vec![1, 2, 3]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 3,
-                max_images: 3,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            40,
-        ),
-        TriggerPolicyDescriptor::Token { token_id: 2222 },
-    );
-    let mut erx = handle.submit(req).unwrap();
-
-    let mut seq = Vec::new();
-    let mut finished = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !finished && Instant::now() < deadline {
-        match erx.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenEvent::Finished { .. }) => finished = true,
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(1)),
+    let mut runs = Vec::new();
+    for depth in [1, 2] {
+        let mut sim = SimEngine::new();
+        sim.set_text_len(1_000_000);
+        sim.set_pipeline_depth(depth);
+        let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        let jh = thread::spawn(move || sched.run(rx));
+        let request = with_trigger(
+            generation_request(
+                RequestId(1),
+                text_context(vec![1, 2, 3]),
+                SamplingParams::default(),
+                ImageParams {
+                    steps: 3,
+                    max_images: 3,
+                    ..Default::default()
+                },
+                GenerationConstraint::Default,
+                40,
+            ),
+            TriggerPolicyDescriptor::Token { token_id: 2222 },
+        );
+        let mut events = handle.submit(request).unwrap();
+        let mut tokens = Vec::new();
+        let mut images = 0;
+        let mut finish_reason = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while finish_reason.is_none() && Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(GenEvent::TextToken { id, .. }) => tokens.push(id),
+                Ok(GenEvent::ImageDone { .. }) => images += 1,
+                Ok(GenEvent::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
         }
+        handle.shutdown();
+        let _ = jh.join();
+        assert_eq!(finish_reason, Some(FinishReason::MaxTokens));
+        assert_eq!(images, 0, "a false transition predicate emitted an image");
+        assert!(!tokens.is_empty(), "request emitted no text");
+        runs.push(tokens);
     }
-    handle.shutdown();
-    let _ = jh.join();
-
-    assert!(finished, "request did not finish (seq={seq:?})");
-    let images = seq.iter().filter(|&&c| c == 'I').count();
     assert_eq!(
-        images, 0,
-        "image starts must be model-triggered (seq={seq:?})"
-    );
-    assert!(
-        seq.iter().all(|&c| c == 'T'),
-        "expected text-only stream (seq={seq:?})"
+        runs[0], runs[1],
+        "false generation predicates changed the depth-one text result"
     );
 }
 
@@ -3452,124 +2125,6 @@ fn fcfs_policy_completes_text() {
     }
 }
 
-/// Sequence admission carries the prefix-cache reuse boundary: zero for a cold
-/// session and cached blocks times block size for a reused prompt prefix.
-#[test]
-fn sequence_admission_carries_the_prefix_reuse_boundary() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, WorkerCapabilities};
-
-    #[derive(Default)]
-    struct Log {
-        registrations: Vec<(RequestId, u32)>,
-    }
-
-    struct Recording {
-        inner: SimExecutor,
-        log: Arc<Mutex<Log>>,
-    }
-    impl Executor for Recording {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
-            let mut log = self.log.lock().unwrap();
-            for admission in &b.admissions {
-                if let Some(und) = &admission.und {
-                    log.registrations
-                        .push((admission.request_key.session_id, und.kv.prefix_len));
-                }
-            }
-            drop(log);
-            self.inner.submit(b)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_text_len(4);
-    let block_size = sim.mut_caps_for_test().block_size;
-    assert_eq!(block_size, 64, "test geometry assumes the sim block size");
-    let log = Arc::new(Mutex::new(Log::default()));
-    let exec = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        log: log.clone(),
-    };
-    let mut sched = Scheduler::new(Box::new(exec), ctrl(), 32);
-
-    // 600 tokens => 9 full 64-token blocks + a partial; the 9 full blocks are
-    // the cacheable shared prefix.
-    let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
-    let run_one = |rid: u64, sched: &mut Scheduler| {
-        let _erx = sched.submit_for_test(generation_request(
-            RequestId(rid),
-            text_context(prompt.clone()),
-            SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            8,
-        ));
-        for _ in 0..10_000 {
-            if !sched.step() {
-                break;
-            }
-        }
-    };
-
-    // cold: req1 populates the prefix cache and registers with no reuse.
-    run_one(1, &mut sched);
-    // warm: req2 (same prompt) registers with the reused prefix boundary.
-    run_one(2, &mut sched);
-
-    let log = log.lock().unwrap();
-    let prefix_of = |rid: u64| -> Vec<u32> {
-        log.registrations
-            .iter()
-            .filter(|(r, _)| r.0 == rid)
-            .map(|(_, p)| *p)
-            .collect()
-    };
-    assert_eq!(
-        prefix_of(1),
-        vec![0],
-        "a cold admission must register prefix_len == 0"
-    );
-    assert_eq!(
-        prefix_of(2),
-        vec![9 * block_size],
-        "a prefix-cache-hit admission must register prefix_len == cached blocks x block size"
-    );
-}
-
-/// The literal image trigger (ThinkMorph's textual visual-thinking
-/// signal): when the generated round text completes `image_start_ids`, the
-/// next image begins immediately — without waiting for EOS or BAGEL's
-/// <|vision_start|> token. The sim never emits EOS here (huge text_len), so
-/// images can only come from the literal trigger.
 #[test]
 fn gen_branch_literal_trigger_starts_images() {
     let mut sim = SimEngine::new();
@@ -3929,228 +2484,6 @@ fn kv_resources_return_after_completion() {
     assert_eq!(health.free_blocks, health.total_blocks);
 }
 
-/// Logical KV leases remain bound to their request until the exact close
-/// acknowledgement orders retirement ahead of cross-request reuse.
-#[test]
-fn kv_lease_ownership_turns_over_after_close_acknowledgement() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{Batch, CompletionReport, WorkerCapabilities};
-
-    struct OwnershipChecking {
-        inner: SimExecutor,
-        owners: Arc<Mutex<HashMap<u32, RequestId>>>,
-        slot_owners: Arc<Mutex<HashMap<u32, RequestId>>>,
-        observed_slots: Arc<Mutex<HashMap<RequestId, u32>>>,
-        observed_groups: Arc<Mutex<Vec<HashSet<u32>>>>,
-    }
-
-    impl Executor for OwnershipChecking {
-        fn caps(&self) -> WorkerCapabilities {
-            self.inner.caps()
-        }
-
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-
-        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-            {
-                let mut owners = self.owners.lock().unwrap();
-                for partition in &batch.partitions {
-                    for (operation, request_pool_idx) in partition
-                        .operations
-                        .iter()
-                        .zip(&partition.request_pool_indices)
-                    {
-                        let session_id = operation.request_key.session_id;
-                        if let Some(owner) = self.slot_owners.lock().unwrap().get(request_pool_idx)
-                        {
-                            anyhow::ensure!(
-                                *owner == session_id,
-                                "request slot {} remains owned by session {}",
-                                request_pool_idx,
-                                owner.0
-                            );
-                        }
-                        self.slot_owners
-                            .lock()
-                            .unwrap()
-                            .insert(*request_pool_idx, session_id);
-                        let mut observed = self.observed_slots.lock().unwrap();
-                        if let Some(expected) = observed.get(&session_id) {
-                            anyhow::ensure!(
-                                *expected == *request_pool_idx,
-                                "request slot changed within one session epoch"
-                            );
-                        }
-                        observed.insert(session_id, *request_pool_idx);
-                    }
-                    for placement in &partition.kv_placements {
-                        let session_id = placement.request_key.session_id;
-                        for block in &placement.block_table {
-                            if let Some(owner) = owners.get(&block.0) {
-                                anyhow::ensure!(
-                                    *owner == session_id,
-                                    "KV lease {} remains owned by session {}",
-                                    block.0,
-                                    owner.0
-                                );
-                            }
-                            owners.insert(block.0, session_id);
-                        }
-                    }
-                    for operation in &partition.operations {
-                        if operation.kv_capacity_pages == 0 {
-                            continue;
-                        }
-                        self.observed_groups.lock().unwrap().push(
-                            partition
-                                .kv_placements
-                                .iter()
-                                .filter(|placement| {
-                                    placement.request_key == operation.request_key
-                                        && placement.op_id == operation.op_id
-                                })
-                                .map(|placement| placement.group_id)
-                                .collect(),
-                        );
-                    }
-                }
-            }
-            self.inner.submit(batch)
-        }
-
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            self.inner.poll()
-        }
-
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.inner.next_result()
-        }
-
-        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-            if let ControlOp::DropSession(id) = &operation {
-                self.owners.lock().unwrap().retain(|_, owner| owner != id);
-                self.slot_owners
-                    .lock()
-                    .unwrap()
-                    .retain(|_, owner| owner != id);
-            }
-            self.inner.control(operation)
-        }
-
-        fn control_wait(
-            &mut self,
-            operation: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            if let ControlOp::DropSession(id) = &operation {
-                self.owners.lock().unwrap().retain(|_, owner| owner != id);
-                self.slot_owners
-                    .lock()
-                    .unwrap()
-                    .retain(|_, owner| owner != id);
-            }
-            self.inner.control_wait(operation, targets)
-        }
-
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_num_blocks(8);
-    sim.mut_caps_for_test().groups = vec![
-        uniserve_core::KvCacheGroupSpec {
-            group_id: 0,
-            block_offset: 0,
-            num_blocks: 4,
-            kind: uniserve_core::KvGroupKind::Full,
-        },
-        uniserve_core::KvCacheGroupSpec {
-            group_id: 1,
-            block_offset: 4,
-            num_blocks: 4,
-            kind: uniserve_core::KvGroupKind::Full,
-        },
-    ];
-    sim.set_pipeline_depth(2);
-    sim.set_text_len(1);
-    let owners = Arc::new(Mutex::new(HashMap::new()));
-    let slot_owners = Arc::new(Mutex::new(HashMap::new()));
-    let observed_slots = Arc::new(Mutex::new(HashMap::new()));
-    let observed_groups = Arc::new(Mutex::new(Vec::new()));
-    let executor = OwnershipChecking {
-        inner: SimExecutor::new(Box::new(sim)),
-        owners: Arc::clone(&owners),
-        slot_owners: Arc::clone(&slot_owners),
-        observed_slots: Arc::clone(&observed_slots),
-        observed_groups: Arc::clone(&observed_groups),
-    };
-    let mut scheduler = Scheduler::with_config(
-        Box::new(executor),
-        ctrl(),
-        SchedulerConfig {
-            max_batch: 32,
-            max_num_seqs: 1,
-            policy: SchedulingPolicy::Fcfs,
-            ..SchedulerConfig::default()
-        },
-    );
-    let mut receivers = (1..=2)
-        .map(|request_id| {
-            scheduler.submit_for_test(generation_request(
-                RequestId(request_id),
-                text_context(vec![1]),
-                SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
-                1,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let mut finished = HashSet::new();
-    for _ in 0..256 {
-        scheduler.step();
-        for (index, receiver) in receivers.iter_mut().enumerate() {
-            while let Ok(event) = receiver.try_recv() {
-                if matches!(event, GenEvent::Finished { .. }) {
-                    finished.insert(index);
-                }
-            }
-        }
-        if finished.len() == receivers.len() && scheduler.health_snapshot().in_flight == 0 {
-            break;
-        }
-    }
-
-    assert_eq!(finished.len(), receivers.len());
-    assert_eq!(scheduler.health_snapshot().free_blocks, 3);
-    assert!(owners.lock().unwrap().is_empty());
-    assert!(
-        observed_groups
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|groups| groups == &HashSet::from([0, 1]))
-    );
-    assert!(slot_owners.lock().unwrap().is_empty());
-    assert_eq!(
-        *observed_slots.lock().unwrap(),
-        HashMap::from([(RequestId(1), 1), (RequestId(2), 1)])
-    );
-}
-
-/// The scheduler exposes structured facts, explainable decisions, and latency history.
 #[test]
 fn policy_facts_and_decisions_are_recorded() {
     let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 
 import torch
@@ -15,12 +19,16 @@ from ..execution.forward_batch import (
     PagedDecodePlan,
     TokenSelection,
 )
-from ..loader.schema import (
-    Rename,
-    Sidecar,
-    Stack,
-    UnmatchedWeightPolicy,
-    WeightSpec,
+from ..foundation.errors import capability_mismatch
+from ..loader.weight_utils import (
+    WeightNameMap,
+    dtype_from_name,
+    iter_weights,
+    load_parameter,
+    missing_required_parameters,
+    root_weight_file,
+    stacked_weight_name,
+    tensor_shape,
 )
 from ..nn import (
     LayerSpec,
@@ -37,6 +45,8 @@ from ..nn.diffusion import (
     TimestepEmbedder,
 )
 from ..nn.diffusion.cfg import CfgRecipe
+from ..nn.quant import QuantizationConfig
+from ..nn.quant.base import process_quantized_modules
 from ..nn.vae import AutoEncoder, default_ae_params
 from ..nn.vision import (
     PositionEmbedding,
@@ -96,8 +106,6 @@ class LLMConfig:
     rms_norm_eps: float = _BAGEL_RMS_NORM_EPS
     rope_theta: float = _BAGEL_ROPE_THETA
     qk_norm: bool = True
-    bos_token_id: int = 151644
-    eos_token_id: int = 151645
     max_position_embeddings: int = 32768
 
     @property
@@ -110,8 +118,6 @@ class BagelConfig:
     """Top-level BAGEL model configuration (LLM, ViT, VAE, and latent settings)."""
 
     llm: LLMConfig = field(default_factory=LLMConfig)
-    visual_gen: bool = True
-    visual_und: bool = True
     start_of_image_id: int = 151652
     end_of_image_id: int = 151653
     vae_z_channels: int = 16
@@ -164,15 +170,11 @@ class BagelConfig:
             rms_norm_eps=llm_raw.get("rms_norm_eps", _BAGEL_RMS_NORM_EPS),
             rope_theta=llm_raw.get("rope_theta", 1e6),
             qk_norm=llm_raw.get("qk_norm", True),
-            bos_token_id=llm_raw.get("bos_token_id", 151644),
-            eos_token_id=llm_raw.get("eos_token_id", 151645),
         )
         vae = raw.get("vae_config", {})
         vit = raw.get("vit_config", {})
         return cls(
             llm=llm,
-            visual_gen=raw.get("visual_gen", True),
-            visual_und=raw.get("visual_und", True),
             start_of_image_id=raw.get("start_of_image_id", 151652),
             end_of_image_id=raw.get("end_of_image_id", 151653),
             vae_z_channels=vae.get("z_channels", 16),
@@ -388,60 +390,161 @@ class _BagelGraph(nn.Module):
         return (self.vae.decode(latent_images) * 0.5 + 0.5).clamp(0, 1)
 
 
-# Checkpoint tensor names map onto the ``_BagelGraph`` parameter tree through
-# these ordered rules; a name outside them is not a graph target (the VAE loads
-# from its sidecar file).
-_BAGEL_RENAMES = (
-    Rename("language_model.model.embed_tokens.weight", "lm.embed_tokens.weight", exact=True),
-    Rename("language_model.model.norm.weight", "lm.norm.weight", exact=True),
-    Rename("language_model.model.norm_moe_gen.weight", "lm.norm_moe_gen.weight", exact=True),
-    Rename("language_model.lm_head.weight", "lm_head.weight", exact=True),
-    Rename(
-        "language_model.model.layers.",
-        "lm.layers.",
-        substitutions=((".self_attn.", "."),),
-    ),
-    Rename("vit_model.vision_model.embeddings.", "vit_model."),
-    Rename(
-        "vit_model.vision_model.encoder.",
-        "vit_model.encoder.",
-        substitutions=((".mlp.fc1.", ".mlp.0."), (".mlp.fc2.", ".mlp.2.")),
-    ),
-    Rename(
-        "vit_model.vision_model.post_layernorm.",
-        "vit_model.encoder.post_layernorm.",
-    ),
-    Rename("connector.", "connector."),
-    Rename("vit_pos_embed.", "vit_pos_embed."),
-    Rename("vae2llm.", "vae2llm."),
-    Rename("llm2vae.", "llm2vae."),
-    Rename("time_embedder.", "time_embedder."),
-    Rename("latent_pos_embed.", "latent_pos_embed."),
+_BAGEL_STACKED_WEIGHTS: WeightNameMap = (
+    ("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
+    ("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
+    ("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
 )
 
-# Stack declarations bind exact parameter-path segments and preserve the target
-# module's packed projection order.
-_BAGEL_STACKED = (
-    Stack("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
-    Stack("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
-    Stack("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
-    Stack("qkv_proj", "q_proj", "q"),
-    Stack("qkv_proj", "k_proj", "k"),
-    Stack("qkv_proj", "v_proj", "v"),
-    Stack("gate_up_proj", "gate_proj", 0),
-    Stack("gate_up_proj", "up_proj", 1),
-)
+
+def _bagel_checkpoint_name(name: str) -> str | None:
+    exact = {
+        "language_model.model.embed_tokens.weight": "lm.embed_tokens.weight",
+        "language_model.model.norm.weight": "lm.norm.weight",
+        "language_model.model.norm_moe_gen.weight": "lm.norm_moe_gen.weight",
+        "language_model.lm_head.weight": "lm_head.weight",
+    }
+    if name in exact:
+        return exact[name]
+    if name.startswith("language_model.model.layers."):
+        return ("lm.layers." + name.removeprefix("language_model.model.layers.")).replace(
+            ".self_attn.", "."
+        )
+    if name.startswith("vit_model.vision_model.embeddings."):
+        return "vit_model." + name.removeprefix("vit_model.vision_model.embeddings.")
+    if name.startswith("vit_model.vision_model.encoder."):
+        return (
+            "vit_model.encoder." + name.removeprefix("vit_model.vision_model.encoder.")
+        ).replace(".mlp.fc1.", ".mlp.0.").replace(".mlp.fc2.", ".mlp.2.")
+    if name.startswith("vit_model.vision_model.post_layernorm."):
+        return "vit_model.encoder.post_layernorm." + name.removeprefix(
+            "vit_model.vision_model.post_layernorm."
+        )
+    if name.startswith(
+        (
+            "connector.",
+            "vit_pos_embed.",
+            "vae2llm.",
+            "llm2vae.",
+            "time_embedder.",
+            "latent_pos_embed.",
+        )
+    ):
+        return name
+    return None
 
 
 class BagelForConditionalGeneration(ExecutionModel):
     """Stateless BAGEL neural graph for the declared MoT, ViT, and VAE routes."""
 
-    weight_spec = WeightSpec(
-        files=("ema.safetensors", "model.safetensors"),
-        transforms=(*_BAGEL_RENAMES, *_BAGEL_STACKED),
-        unmatched=UnmatchedWeightPolicy.SKIP,
-        sidecars=(Sidecar(file="ae.safetensors", module="vae", optional_substrings=("reg",)),),
-    )
+    @classmethod
+    def from_checkpoint(
+        cls,
+        config: Mapping[str, Any],
+        *,
+        model_path: str,
+        device: str,
+        attention_backend: str | None,
+        model_scope: str,
+        execution: Any,
+        parallel: Any,
+    ) -> tuple["BagelForConditionalGeneration", None, str]:
+        del attention_backend, execution
+        if model_scope != "whole":
+            raise ValueError("BAGEL checkpoints require whole-model materialization")
+        raw = dict(config)
+        root = Path(model_path)
+        for field_name, file_name in (
+            ("llm_config", "llm_config.json"),
+            ("vit_config", "vit_config.json"),
+            ("vae_config", "vae_config.json"),
+        ):
+            if field_name in raw:
+                continue
+            path = root / file_name
+            if not path.is_file():
+                raise capability_mismatch(
+                    f"BAGEL checkpoint is missing {file_name!r} for {field_name!r}"
+                )
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise capability_mismatch(f"BAGEL checkpoint file {file_name!r} must contain an object")
+            raw[field_name] = value
+        weights = root_weight_file(model_path, ("ema.safetensors", "model.safetensors"))
+        latent_positions = tensor_shape(weights, "latent_pos_embed.pos_embed")[0]
+        max_latent_size = math.isqrt(latent_positions)
+        if max_latent_size * max_latent_size != latent_positions:
+            raise capability_mismatch(
+                f"BAGEL latent position count {latent_positions} is not square"
+            )
+        raw["max_latent_size"] = max_latent_size
+        resolved = BagelConfig.from_mapping(raw)
+        layer_spec = LayerSpec(
+            parallel=parallel,
+            quantization=QuantizationConfig.from_model_config(resolved),
+        )
+        model = cls(resolved, layer_spec=layer_spec)
+        loaded, ignored = model.load_weights(iter_weights((weights,)))
+        expected = {
+            name
+            for name, _ in model.model.named_parameters()
+            if not name.startswith("vae.")
+        }
+        missing = missing_required_parameters(model.model, loaded, included=expected)
+        if missing:
+            raise capability_mismatch(
+                f"BAGEL checkpoint load mismatch: missing={len(missing)} {missing[:20]!r}"
+            )
+        sidecar = root / "ae.safetensors"
+        if not sidecar.is_file():
+            raise FileNotFoundError(f"BAGEL checkpoint is missing {sidecar.name!r}")
+        state = dict(iter_weights((sidecar,)))
+        sidecar_missing, sidecar_unexpected = model.model.vae.load_state_dict(state, strict=False)
+        sidecar_missing = [name for name in sidecar_missing if "reg" not in name]
+        if sidecar_missing or sidecar_unexpected:
+            raise capability_mismatch(
+                "BAGEL autoencoder checkpoint load mismatch: "
+                f"missing={sidecar_missing[:20]!r} unexpected={sidecar_unexpected[:20]!r}"
+            )
+        serving_dtype = dtype_from_name(model.serving_dtype)
+        model.to(device=device, dtype=serving_dtype)
+        process_quantized_modules(model.modules())
+        model.eval()
+        if ignored:
+            logging.getLogger(__name__).warning(
+                "ignored %d checkpoint tensors during BAGEL load", len(ignored)
+            )
+        return model, None, device
+
+    def load_weights(self, weights: Any) -> tuple[set[str], list[str]]:
+        """Load BAGEL's root checkpoint into its language, vision, and connector graph."""
+
+        parameters = dict(self.model.named_parameters())
+        loaded: set[str] = set()
+        ignored: list[str] = []
+        for source_name, tensor in weights:
+            renamed = _bagel_checkpoint_name(source_name)
+            if renamed is None:
+                ignored.append(source_name)
+                continue
+            target_name, shard_id = stacked_weight_name(renamed, _BAGEL_STACKED_WEIGHTS)
+            if target_name not in parameters:
+                ignored.append(source_name)
+                continue
+            load_parameter(
+                self.model,
+                target_name,
+                tensor,
+                shard_id=shard_id,
+                dtype=dtype_from_name(self.serving_dtype),
+            )
+            loaded.add(target_name)
+        return loaded, ignored
 
     def __init__(
         self,

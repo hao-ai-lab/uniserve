@@ -9,8 +9,15 @@ from typing import Protocol, cast
 import torch
 import torch.nn as nn
 
-from ...execution.forward_batch import ForwardBatch, PackedAttentionPlan, PagedDecodePlan
+from ...execution.forward_batch import (
+    ExpertRoute,
+    ForwardBatch,
+    PackedAttentionPlan,
+    PagedDecodePlan,
+    RouteSpan,
+)
 from ..attention import RadixAttention
+from ..expert_routing import RoutedTensor
 from ..layer import LayerSpec
 from ..linear import (
     QKVParallelLinear,
@@ -94,56 +101,35 @@ def _apply(
     return context.mesh.combine(result, "tower", coordinate, target)
 
 
-def _route(
-    value: torch.Tensor,
+def _route_modules(
+    value: RoutedTensor,
     *,
-    text_indices: torch.Tensor,
-    has_text: bool,
-    has_flow: bool,
     text_module: nn.Module,
     flow_module: nn.Module,
     context: ForwardBatch,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
-) -> torch.Tensor:
-    target = value.device
-    if has_text and has_flow:
-        result = _apply(
-            flow_module,
-            value,
-            context=context,
-            coordinate=_FLOW_COORDINATE,
-            target=target,
-            call=call,
-        )
-        text = _apply(
-            text_module,
-            value.index_select(0, text_indices),
-            context=context,
-            coordinate=_TEXT_COORDINATE,
-            target=target,
-            call=call,
-        )
-        result.index_copy_(0, text_indices, text)
-        return result
-    if has_flow:
-        return _apply(
-            flow_module,
-            value,
-            context=context,
-            coordinate=_FLOW_COORDINATE,
-            target=target,
-            call=call,
-        )
-    if has_text:
+) -> RoutedTensor:
+    def apply_text(item: torch.Tensor) -> torch.Tensor:
         return _apply(
             text_module,
-            value,
+            item,
             context=context,
             coordinate=_TEXT_COORDINATE,
-            target=target,
+            target=item.device,
             call=call,
         )
-    raise ValueError("MoT routing requires at least one modality")
+
+    def apply_flow(item: torch.Tensor) -> torch.Tensor:
+        return _apply(
+            flow_module,
+            item,
+            context=context,
+            coordinate=_FLOW_COORDINATE,
+            target=item.device,
+            call=call,
+        )
+
+    return value.map(apply_text, apply_flow)
 
 
 def _plain_call(
@@ -300,48 +286,45 @@ class MoTDecoderLayer(nn.Module):
     def forward(
         self,
         layer: int,
-        hidden: torch.Tensor,
+        hidden: RoutedTensor,
         *,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        cos: RoutedTensor,
+        sin: RoutedTensor,
         context: ForwardBatch,
-        plan: PackedAttentionPlan | None,
-    ) -> torch.Tensor:
+        spans: tuple[RouteSpan, ...],
+        causal: bool,
+    ) -> RoutedTensor:
         """Apply the selected experts and one shared attention operation."""
 
-        if plan is None:
-            text_indices = hidden.new_empty((0,), dtype=torch.long)
-            has_text = True
-            has_flow = False
-        else:
-            text_indices = plan.text_indices
-            has_text = plan.has_text
-            has_flow = plan.has_flow
-        normalized = _route(
+        normalized = _route_modules(
             hidden,
-            text_indices=text_indices,
-            has_text=has_text,
-            has_flow=has_flow,
             text_module=self._text.input_norm,
             flow_module=self._flow.input_norm,
             context=context,
             call=_plain_call,
         )
-        if has_text and has_flow:
-            query, key, value = self._project(self._flow, normalized, cos, sin, context)
-            text_query, text_key, text_value = self._project(
-                self._text,
-                normalized.index_select(0, text_indices),
-                cos.index_select(0, text_indices),
-                sin.index_select(0, text_indices),
-                context,
-            )
-            query.index_copy_(0, text_indices, text_query)
-            key.index_copy_(0, text_indices, text_key)
-            value.index_copy_(0, text_indices, text_value)
-        else:
-            expert = self._flow if has_flow else self._text
-            query, key, value = self._project(expert, normalized, cos, sin, context)
+        text_projection = (
+            None
+            if normalized.text is None or cos.text is None or sin.text is None
+            else self._project(self._text, normalized.text, cos.text, sin.text, context)
+        )
+        flow_projection = (
+            None
+            if normalized.flow is None or cos.flow is None or sin.flow is None
+            else self._project(self._flow, normalized.flow, cos.flow, sin.flow, context)
+        )
+        query = RoutedTensor(
+            None if text_projection is None else text_projection[0],
+            None if flow_projection is None else flow_projection[0],
+        ).packed(spans)
+        key = RoutedTensor(
+            None if text_projection is None else text_projection[1],
+            None if flow_projection is None else flow_projection[1],
+        ).packed(spans)
+        value = RoutedTensor(
+            None if text_projection is None else text_projection[2],
+            None if flow_projection is None else flow_projection[2],
+        ).packed(spans)
 
         self.attention.layer_id = int(layer)
         attended = self.attention(
@@ -349,41 +332,35 @@ class MoTDecoderLayer(nn.Module):
             key,
             value,
             context,
-            causal=plan is None,
+            causal=causal,
             scale=self.scale,
-        ).reshape(hidden.shape[0], self.query_size)
-        projected = _route(
-            attended,
-            text_indices=text_indices,
-            has_text=has_text,
-            has_flow=has_flow,
+        ).reshape(query.shape[0], self.query_size)
+        projected = _route_modules(
+            RoutedTensor.from_packed(attended, spans),
             text_module=self._text.output,
             flow_module=self._flow.output,
             context=context,
             call=_parallel_call,
         )
-        residual = hidden + projected
-        normalized = _route(
+        residual = hidden.add(projected)
+        normalized = _route_modules(
             residual,
-            text_indices=text_indices,
-            has_text=has_text,
-            has_flow=has_flow,
             text_module=self._text.post_norm,
             flow_module=self._flow.post_norm,
             context=context,
             call=_plain_call,
-        ).to(torch.bfloat16)
-        feed_forward = _route(
+        ).map(
+            lambda item: item.to(torch.bfloat16),
+            lambda item: item.to(torch.bfloat16),
+        )
+        feed_forward = _route_modules(
             normalized,
-            text_indices=text_indices,
-            has_text=has_text,
-            has_flow=has_flow,
             text_module=self._text.mlp,
             flow_module=self._flow.mlp,
             context=context,
             call=_parallel_call,
         )
-        return residual + feed_forward
+        return residual.add(feed_forward)
 
 
 class MoTModel(nn.Module):
@@ -417,51 +394,43 @@ class MoTModel(nn.Module):
             raise ValueError("MoT inputs must have shape [tokens, hidden]")
         token_count = int(inputs_embeds.shape[0])
         attention = context.attention
-        plan: PackedAttentionPlan | None
+        spans: tuple[RouteSpan, ...]
         temporal_positions: torch.Tensor
+        causal: bool
         if isinstance(attention, PackedAttentionPlan):
-            plan = attention
-            if tuple(plan.route_indicators.shape) != (token_count,):
-                raise ValueError("MoT route indicators must align with input tokens")
-            if plan.indexes.ndim != 2 or int(plan.indexes.shape[1]) != token_count:
+            if attention.indexes.ndim != 2 or int(attention.indexes.shape[1]) != token_count:
                 raise ValueError("MoT positions must align with input tokens")
-            if plan.text_indices.ndim != 1:
-                raise ValueError("MoT text indices must be one-dimensional")
-            if not plan.has_text and int(plan.text_indices.numel()) != 0:
-                raise ValueError("MoT plan without text cannot contain text indices")
-            if not plan.has_text and not plan.has_flow:
-                raise ValueError("MoT plan must contain text or flow tokens")
-            temporal_positions = plan.indexes[0].reshape(-1)
+            spans = attention.route_spans
+            temporal_positions = attention.indexes[0].reshape(-1)
+            causal = False
         elif isinstance(attention, PagedDecodePlan):
-            plan = None
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("MoT paged decode positions must align with text tokens")
+            spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)
             temporal_positions = positions
+            causal = True
         else:
             raise ValueError("MoT forward requires packed attention or paged decode")
 
         cos, sin = self.rotary.cos_sin_1d(temporal_positions)
-        hidden = inputs_embeds
+        routed_cos = RoutedTensor.from_packed(cos, spans)
+        routed_sin = RoutedTensor.from_packed(sin, spans)
+        hidden = RoutedTensor.from_packed(inputs_embeds, spans)
         for layer_index, layer_module in enumerate(self.layers):
             layer = cast(MoTDecoderLayer, layer_module)
             hidden = layer(
                 layer_index,
                 hidden,
-                cos=cos,
-                sin=sin,
+                cos=routed_cos,
+                sin=routed_sin,
                 context=context,
-                plan=plan,
+                spans=spans,
+                causal=causal,
             )
-        text_indices = (
-            hidden.new_empty((0,), dtype=torch.long) if plan is None else plan.text_indices
-        )
-        return _route(
+        return _route_modules(
             hidden,
-            text_indices=text_indices,
-            has_text=True if plan is None else plan.has_text,
-            has_flow=False if plan is None else plan.has_flow,
             text_module=self.norm,
             flow_module=self.norm_moe_gen,
             context=context,
             call=_plain_call,
-        )
+        ).packed(spans)

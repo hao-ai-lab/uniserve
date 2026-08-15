@@ -181,4 +181,26 @@ impl BagelProfile {
         ];
         Ok(ingest)
     }
+
+    pub fn generation_policy_for_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> assets::Result<GenerationPolicyDescriptor> {
+        let tokens = stride_resize_tokens(width, height, &[(1024, 512, 16, 1_806_336)], 16, 2)?;
+        let mut policy = self.generation_policy.clone();
+        let feedback = policy
+            .feedback
+            .as_mut()
+            .ok_or_else(|| assets::Error::message("Bagel generation policy has no feedback"))?;
+        if feedback.ingest.steps.as_slice() != [ImageIngestStep::VaeEncode]
+            || feedback.ingest.step_kv_tokens.len() != 1
+        {
+            return Err(assets::Error::message(
+                "Bagel feedback recipe does not match its image processor",
+            ));
+        }
+        feedback.ingest.step_kv_tokens[0] = ImageKvEffect::Exact { tokens };
+        Ok(policy)
+    }
 }

@@ -53,7 +53,16 @@ def test_worker_capability_wire_reports_schedulable_work_and_bounds() -> None:
     )
     assert wire["incremental_kv_publication"] is True
     assert wire["sampling_ownership"] == SamplingOwnership.DESIGNATED_RANK.value
-    assert isinstance(wire["tensorized_mixed"], bool)
+    assert wire["mixed_buckets"] == [
+        {
+            "decode_rows": 1,
+            "flow_rows": 1,
+            "height": 16,
+            "width": 16,
+            "cfg_branches": cfg_branches,
+        }
+        for cfg_branches in (1, 2, 3)
+    ]
     assert _is_digest(wire["protocol_layout_digest"])
     assert wire["protocol_layout_digest"] == batch.protocol_layout_digest()
 

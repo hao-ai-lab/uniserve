@@ -19,7 +19,6 @@ serde.workspace = true
 serde-json-fmt.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
-sha2.workspace = true
 subenum.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true

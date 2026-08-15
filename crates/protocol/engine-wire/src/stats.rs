@@ -211,6 +211,55 @@ impl WorkerForwardStats {
     }
 }
 
+/// Per-domain scheduler accounting for one stats update.
+///
+/// Operation, partition, pressure, reclaim, and time fields are interval
+/// deltas. Credit fields are gauges. Device and co-residency time describe the
+/// full interval visible to the named domain; values from co-resident domains
+/// therefore must not be summed to estimate aggregate GPU busy time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainSchedulerStats {
+    pub domain: String,
+    #[serde(default)]
+    pub active_credits: u64,
+    #[serde(default)]
+    pub peak_credits: u64,
+    #[serde(default)]
+    pub launched_operations: u64,
+    #[serde(default)]
+    pub completed_operations: u64,
+    #[serde(default)]
+    pub predicated_operations: u64,
+    #[serde(default)]
+    pub error_operations: u64,
+    #[serde(default)]
+    pub backpressure_events: u64,
+    #[serde(default)]
+    pub reclaimed_credits: u64,
+    #[serde(default)]
+    pub completed_partitions: u64,
+    #[serde(default)]
+    pub semantic_commits: u64,
+    #[serde(default)]
+    pub public_commits: u64,
+    #[serde(default)]
+    pub co_resident_partitions: u64,
+    #[serde(default)]
+    pub queue_us: u64,
+    #[serde(default)]
+    pub launch_us: u64,
+    #[serde(default)]
+    pub device_us: u64,
+    #[serde(default)]
+    pub completion_us: u64,
+    #[serde(default)]
+    pub semantic_commit_us: u64,
+    #[serde(default)]
+    pub public_commit_us: u64,
+    #[serde(default)]
+    pub co_resident_us: u64,
+}
+
 /// Stats associated with the scheduler.
 ///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -260,4 +309,7 @@ pub struct SchedulerStats {
     pub batch_roundtrip_us: u64,
     #[serde(default)]
     pub batch_count: u64,
+    /// Exact prefill, decode, and flow accounting for this update.
+    #[serde(default)]
+    pub domain_stats: Vec<DomainSchedulerStats>,
 }

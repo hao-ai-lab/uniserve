@@ -12,9 +12,7 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use uniserve_core::CommandWaker;
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError};
-use uniserve_worker_ipc_core::{
-    ClientEndpoint, Frame, Pending, event_driven_enabled, service_name,
-};
+use uniserve_worker_ipc_core::{ClientEndpoint, Frame, Pending, service_name};
 use uniserve_worker_wire::{
     Batch, CompletionReport, Domain, ResponseKind, WorkerCapabilities, WorkerRequest,
     WorkerResponse,
@@ -39,7 +37,6 @@ const WORKER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// hung (alive but unresponsive) worker must not be able to block shutdown forever.
 const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
-const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Explicit Python worker launch configuration.
@@ -95,9 +92,6 @@ pub struct WorkerLaunchConfig {
     pub model_dtype: String,
     pub kv_cache_dtype: Option<String>,
     pub kv_memory_fraction: String,
-    pub transformers_trust_remote_code: bool,
-    pub transformers_attn_implementation: String,
-    pub disable_model_arch: Vec<String>,
     pub mesh: Option<String>,
     pub tp_backend: Option<String>,
     pub lanes: Vec<LaneConfig>,
@@ -107,8 +101,6 @@ pub struct WorkerLaunchConfig {
     pub prefill_graph_token_sizes: Option<String>,
     pub flow_graph_batch_sizes: Option<String>,
     pub flow_graph_shapes: Option<String>,
-    pub mixed_text_max_tokens: u32,
-    pub varlen_prefill: bool,
     pub flashinfer_workspace_size: u64,
     pub flashinfer_use_tensor_core: Option<String>,
     pub flashinfer_decode_backend: String,
@@ -127,9 +119,6 @@ impl Default for WorkerLaunchConfig {
             model_dtype: "bfloat16".to_string(),
             kv_cache_dtype: None,
             kv_memory_fraction: "0.70".to_string(),
-            transformers_trust_remote_code: false,
-            transformers_attn_implementation: "uniserve".to_string(),
-            disable_model_arch: Vec::new(),
             mesh: None,
             tp_backend: None,
             lanes: Vec::new(),
@@ -139,8 +128,6 @@ impl Default for WorkerLaunchConfig {
             prefill_graph_token_sizes: None,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
-            mixed_text_max_tokens: 8192,
-            varlen_prefill: true,
             flashinfer_workspace_size: 512 * 1024 * 1024,
             flashinfer_use_tensor_core: None,
             flashinfer_decode_backend: "fa2".to_string(),
@@ -165,14 +152,6 @@ impl WorkerLaunchConfig {
         }
         cmd.arg("--kv-memory-fraction")
             .arg(&self.kv_memory_fraction);
-        if self.transformers_trust_remote_code {
-            cmd.arg("--transformers-trust-remote-code");
-        }
-        cmd.arg("--transformers-attn-implementation")
-            .arg(&self.transformers_attn_implementation);
-        for arch in &self.disable_model_arch {
-            cmd.arg("--disable-model-arch").arg(arch);
-        }
         if let Some(value) = &self.mesh {
             cmd.arg("--mesh").arg(value);
         }
@@ -199,11 +178,6 @@ impl WorkerLaunchConfig {
         }
         if let Some(value) = &self.flow_graph_shapes {
             cmd.arg("--flow-graph-shapes").arg(value);
-        }
-        cmd.arg("--mixed-text-max-tokens")
-            .arg(self.mixed_text_max_tokens.to_string());
-        if !self.varlen_prefill {
-            cmd.arg("--no-varlen-prefill");
         }
         cmd.arg("--flashinfer-workspace-size")
             .arg(self.flashinfer_workspace_size.to_string());
@@ -401,7 +375,6 @@ impl UniprocExecutor {
             tp_init_method,
             None,
             None,
-            false,
             worker_config,
         )?;
         me.finish_startup()?;
@@ -425,17 +398,11 @@ impl UniprocExecutor {
         tp_init_method: Option<&str>,
         worker_kind: Option<&str>,
         transfer_backend: Option<&str>,
-        defer_sampling: bool,
         worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
         let depth = pipeline_depth.max(1);
         let max_payload = req_slot_cap.max(resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
-        // The host is authoritative for the boundary mode: resolve it once and
-        // force the worker to match (env var on the child) so the two ends never
-        // disagree on whether to run event-driven or polled.
-        let event_driven = event_driven_enabled();
-
         let mut cmd = Command::new(python);
         cmd.arg("-m")
             .arg("uniserve_worker.main")
@@ -473,19 +440,10 @@ impl UniprocExecutor {
         if let Some(backend) = transfer_backend.filter(|b| *b != "inproc") {
             cmd.arg("--transfer-backend").arg(backend);
         }
-        // Sampler-stage split: a model pool peeled from its sampler publishes
-        // logits + defers sampling.
-        if defer_sampling {
-            cmd.arg("--defer-sampling");
-        }
         cmd.env("RANK", tp_rank.to_string())
             .env("WORLD_SIZE", tp_size.to_string())
             .env("LOCAL_RANK", tp_rank.to_string())
-            .env("LOCAL_WORLD_SIZE", tp_size.to_string())
-            .env(
-                uniserve_worker_ipc_core::EVENT_DRIVEN_ENV,
-                if event_driven { "1" } else { "0" },
-            );
+            .env("LOCAL_WORLD_SIZE", tp_size.to_string());
         // Serving batches change shape continuously, and fixed-size cached
         // segments strand device memory that later shapes cannot use.
         // Expandable segments let the allocator resize its mapping instead, so
@@ -509,15 +467,9 @@ impl UniprocExecutor {
         }
         let child = cmd.spawn().context("spawning python worker")?;
 
-        let client = ClientEndpoint::connect_with(&service, max_payload, depth, event_driven)
+        let client = ClientEndpoint::connect(&service, max_payload, depth)
             .context("connecting to worker IPC service")?;
-        // Wire the edge-triggered death watcher onto the park's death wake. Only
-        // meaningful on the event-driven path (the wake feeds the park
-        // listener); on the polling path the scheduler probes liveness on its
-        // own timer.
-        let death_watcher = client
-            .death_wake()
-            .and_then(|wake| DeathWatcher::spawn(child.id(), wake));
+        let death_watcher = DeathWatcher::spawn(child.id(), client.death_wake());
         Ok(Self {
             client,
             caps: WorkerCapabilities::default(),
@@ -627,10 +579,6 @@ impl UniprocExecutor {
         let mut last_log = started;
         let mut last_worker_check = started;
         loop {
-            // The worker may spend minutes materializing its startup catalog
-            // after this request is queued. Poll the request-response ring on
-            // the bounded cadence here instead of parking on a companion event
-            // whose notification can predate the worker's serving loop.
             if let Some(frame) = self.client.try_recv_response(pending)? {
                 return Ok(frame);
             }
@@ -645,11 +593,14 @@ impl UniprocExecutor {
                 );
                 last_log = Instant::now();
             }
-            std::thread::sleep(RESPONSE_POLL_INTERVAL);
+            let until_check = WORKER_CHECK_INTERVAL.saturating_sub(last_worker_check.elapsed());
+            let until_log = STARTUP_LOG_INTERVAL.saturating_sub(last_log.elapsed());
+            self.client.wait_wake(until_check.min(until_log))?;
         }
     }
 
     fn drain_ready(&mut self) -> anyhow::Result<usize> {
+        self.client.drain_wakes()?;
         let ids = self.pending.keys().copied().collect::<Vec<_>>();
         let mut drained = 0usize;
         for call_id in ids {
@@ -767,6 +718,7 @@ impl UniprocExecutor {
                     .retryable
                     .ok_or_else(|| anyhow::anyhow!("error response missing retryability"))?;
                 Err(WorkerExecError {
+                    step_id: Some(step_id),
                     fatal,
                     retryable,
                     code: wr.code.clone(),
@@ -813,13 +765,7 @@ impl UniprocExecutor {
                 return Ok(());
             }
             self.check_worker("worker response wait")?;
-            // Park on the worker's result wake instead of polling on a fixed
-            // 1ms interval: the worker fires EVT_RESULT the instant it responds,
-            // so the submitter wakes in ~event latency rather than waiting out
-            // the poll. `wait_wake` degrades to a bounded sleep on a
-            // non-event-driven endpoint, so the safety-net slice still bounds
-            // latency if a notification is missed.
-            self.client.wait_wake(RESPONSE_POLL_INTERVAL)?;
+            self.client.wait_wake(WORKER_CHECK_INTERVAL)?;
         }
     }
 
@@ -881,22 +827,18 @@ impl Executor for UniprocExecutor {
         self.pending.len() < self.depth
     }
 
-    fn event_driven(&self) -> bool {
-        self.client.is_event_driven()
+    fn command_waker(&self) -> CommandWaker {
+        let sender = self.client.command_wake();
+        CommandWaker::new(move || sender.wake())
     }
 
-    fn command_waker(&self) -> CommandWaker {
-        match self.client.command_wake() {
-            Some(sender) => CommandWaker::new(move || sender.wake()),
-            None => CommandWaker::noop(),
-        }
+    fn wake_file_descriptors(&self) -> Vec<i32> {
+        vec![self.client.wake_file_descriptor()]
     }
 
     fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
         // Park over {result, command, death} without consuming anything: the
-        // scheduler drains results, drains commands, and probes liveness after
-        // we return, so a spurious wake is harmless. The wait carries its own
-        // safety-net slice, so a missed notification degrades to poll latency.
+        // scheduler drains results, commands, and liveness after return.
         self.client.wait_wake(timeout)?;
         Ok(())
     }
@@ -961,10 +903,8 @@ impl Executor for UniprocExecutor {
             if now >= deadline {
                 return Ok(None);
             }
-            // Event-driven wake on EVT_RESULT; bounded by the remaining deadline
-            // so the timeout contract is preserved.
             self.client
-                .wait_wake((deadline - now).min(RESPONSE_POLL_INTERVAL))?;
+                .wait_wake((deadline - now).min(WORKER_CHECK_INTERVAL))?;
         }
     }
 
@@ -1043,7 +983,8 @@ impl Executor for UniprocExecutor {
                         if self.check_worker("shutdown drain").is_err() {
                             break;
                         }
-                        std::thread::sleep(RESPONSE_POLL_INTERVAL);
+                        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                        let _ = self.client.wait_wake(remaining.min(WORKER_CHECK_INTERVAL));
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -1100,95 +1041,4 @@ pub(crate) fn nano_id() -> u64 {
         .unwrap_or(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     (nanos << 16) | (seq & 0xffff)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{OutstandingKind, PendingRecord, enqueue_ready, nano_id, release_consumed_request};
-    use std::collections::{HashSet, VecDeque};
-    use std::time::Duration;
-    use uniserve_worker_ipc_core::{ClientEndpoint, Header, ServerEndpoint};
-    use uniserve_worker_wire::CompletionReport;
-
-    fn report(step_id: u64) -> CompletionReport {
-        CompletionReport {
-            step_id,
-            partitions: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn nano_id_is_unique_within_a_tight_loop() {
-        // subsec_nanos alone would collide here because the loop runs faster than a
-        // second; the monotonic counter must make every id distinct.
-        let n = 10_000;
-        let ids: HashSet<u64> = (0..n).map(|_| nano_id()).collect();
-        assert_eq!(
-            ids.len(),
-            n,
-            "nano_id produced a collision within a tight loop"
-        );
-    }
-
-    #[test]
-    fn ready_reports_preserve_worker_readiness_order() {
-        let mut ready = VecDeque::new();
-        enqueue_ready(&mut ready, report(9));
-        enqueue_ready(&mut ready, report(4));
-
-        assert_eq!(ready.pop_front().map(|value| value.step_id), Some(9));
-        assert_eq!(ready.pop_front().map(|value| value.step_id), Some(4));
-    }
-
-    #[test]
-    fn consumed_response_releases_its_physical_request_slot() {
-        let service = format!(
-            "uniserve/worker/request_slot_{}_{}",
-            std::process::id(),
-            nano_id()
-        );
-        let mut server = ServerEndpoint::bind_with(&service, 64, 2, false).unwrap();
-        let client = ClientEndpoint::connect_with(&service, 64, 2, false).unwrap();
-        let header = |call_id| Header {
-            call_id,
-            ..Header::default()
-        };
-
-        let first = client.send_raw(header(1), &[]).unwrap();
-        let second = client.send_raw(header(2), &[]).unwrap();
-        assert_eq!(server.recv().unwrap().header.call_id, 1);
-        assert_eq!(server.recv().unwrap().header.call_id, 2);
-        server.respond_raw(header(1), &[]).unwrap();
-        assert_eq!(
-            client
-                .recv_response_timeout(&first, Duration::from_secs(1))
-                .unwrap()
-                .unwrap()
-                .header
-                .call_id,
-            1
-        );
-
-        let kind = release_consumed_request(PendingRecord {
-            kind: OutstandingKind::Control,
-            pending: first,
-        });
-        assert!(matches!(kind, OutstandingKind::Control));
-        let third = client.send_raw(header(3), &[]).unwrap();
-        assert_eq!(server.recv().unwrap().header.call_id, 3);
-
-        server.respond_raw(header(2), &[]).unwrap();
-        server.respond_raw(header(3), &[]).unwrap();
-        for (pending, call_id) in [(second, 2), (third, 3)] {
-            assert_eq!(
-                client
-                    .recv_response_timeout(&pending, Duration::from_secs(1))
-                    .unwrap()
-                    .unwrap()
-                    .header
-                    .call_id,
-                call_id
-            );
-        }
-    }
 }

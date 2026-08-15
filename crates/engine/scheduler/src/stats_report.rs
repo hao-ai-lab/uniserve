@@ -9,8 +9,31 @@ use std::sync::atomic::Ordering;
 
 use crate::SchedStats;
 use uniserve_engine_wire::stats::{
-    BaseCacheStats, PrefixCacheStats, SchedulerStats, WorkerForwardStats,
+    BaseCacheStats, DomainSchedulerStats, PrefixCacheStats, SchedulerStats, WorkerForwardStats,
 };
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DomainCumulative {
+    active_credits: u64,
+    peak_credits: u64,
+    launched_operations: u64,
+    completed_operations: u64,
+    predicated_operations: u64,
+    error_operations: u64,
+    backpressure_events: u64,
+    reclaimed_credits: u64,
+    completed_partitions: u64,
+    semantic_commits: u64,
+    public_commits: u64,
+    co_resident_partitions: u64,
+    queue_us: u64,
+    launch_us: u64,
+    device_us: u64,
+    completion_us: u64,
+    semantic_commit_us: u64,
+    public_commit_us: u64,
+    co_resident_us: u64,
+}
 
 /// Converts the scheduler's cumulative counters into per-update deltas for the
 /// wire shape (whose prefix-cache counters are increments, not totals).
@@ -25,6 +48,7 @@ pub struct SchedStatsReporter {
     last_worker_exec_us_total: u64,
     last_batch_roundtrip_us_total: u64,
     last_batch_timing_count: u64,
+    last_domains: [DomainCumulative; 3],
 }
 
 impl SchedStatsReporter {
@@ -98,8 +122,74 @@ impl SchedStatsReporter {
             worker_exec_us: delta_worker_exec_us,
             batch_roundtrip_us: delta_batch_roundtrip_us,
             batch_count: delta_batch_count,
+            domain_stats: self.domain_stats(stats),
             ..Default::default()
         }
+    }
+
+    fn domain_stats(&mut self, stats: &SchedStats) -> Vec<DomainSchedulerStats> {
+        let domains = [
+            ("prefill", &stats.domains.prefill),
+            ("decode", &stats.domains.decode),
+            ("flow", &stats.domains.flow),
+        ];
+        domains
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, stats))| {
+                let current = domain_cumulative(stats);
+                let previous = self.last_domains[index];
+                self.last_domains[index] = current;
+                DomainSchedulerStats {
+                    domain: name.to_string(),
+                    active_credits: current.active_credits,
+                    peak_credits: current.peak_credits,
+                    launched_operations: current
+                        .launched_operations
+                        .saturating_sub(previous.launched_operations),
+                    completed_operations: current
+                        .completed_operations
+                        .saturating_sub(previous.completed_operations),
+                    predicated_operations: current
+                        .predicated_operations
+                        .saturating_sub(previous.predicated_operations),
+                    error_operations: current
+                        .error_operations
+                        .saturating_sub(previous.error_operations),
+                    backpressure_events: current
+                        .backpressure_events
+                        .saturating_sub(previous.backpressure_events),
+                    reclaimed_credits: current
+                        .reclaimed_credits
+                        .saturating_sub(previous.reclaimed_credits),
+                    completed_partitions: current
+                        .completed_partitions
+                        .saturating_sub(previous.completed_partitions),
+                    semantic_commits: current
+                        .semantic_commits
+                        .saturating_sub(previous.semantic_commits),
+                    public_commits: current
+                        .public_commits
+                        .saturating_sub(previous.public_commits),
+                    co_resident_partitions: current
+                        .co_resident_partitions
+                        .saturating_sub(previous.co_resident_partitions),
+                    queue_us: current.queue_us.saturating_sub(previous.queue_us),
+                    launch_us: current.launch_us.saturating_sub(previous.launch_us),
+                    device_us: current.device_us.saturating_sub(previous.device_us),
+                    completion_us: current.completion_us.saturating_sub(previous.completion_us),
+                    semantic_commit_us: current
+                        .semantic_commit_us
+                        .saturating_sub(previous.semantic_commit_us),
+                    public_commit_us: current
+                        .public_commit_us
+                        .saturating_sub(previous.public_commit_us),
+                    co_resident_us: current
+                        .co_resident_us
+                        .saturating_sub(previous.co_resident_us),
+                }
+            })
+            .collect()
     }
 
     fn worker_forward_stats(&mut self, stats: &SchedStats) -> Option<WorkerForwardStats> {
@@ -107,6 +197,30 @@ impl SchedStatsReporter {
         let delta = delta_worker_forward_stats(&current, &self.last_worker_forward_stats);
         self.last_worker_forward_stats = current;
         (!delta.is_empty()).then_some(delta)
+    }
+}
+
+fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative {
+    DomainCumulative {
+        active_credits: stats.active_credits.load(Ordering::Relaxed) as u64,
+        peak_credits: stats.peak_credits.load(Ordering::Relaxed) as u64,
+        launched_operations: stats.launched_operations.load(Ordering::Relaxed),
+        completed_operations: stats.completed_operations.load(Ordering::Relaxed),
+        predicated_operations: stats.predicated_operations.load(Ordering::Relaxed),
+        error_operations: stats.error_operations.load(Ordering::Relaxed),
+        backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
+        reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
+        completed_partitions: stats.completed_partitions.load(Ordering::Relaxed),
+        semantic_commits: stats.semantic_commits.load(Ordering::Relaxed),
+        public_commits: stats.public_commits.load(Ordering::Relaxed),
+        co_resident_partitions: stats.co_resident_partitions.load(Ordering::Relaxed),
+        queue_us: stats.queue_us.load(Ordering::Relaxed),
+        launch_us: stats.launch_us.load(Ordering::Relaxed),
+        device_us: stats.device_us.load(Ordering::Relaxed),
+        completion_us: stats.completion_us.load(Ordering::Relaxed),
+        semantic_commit_us: stats.semantic_commit_us.load(Ordering::Relaxed),
+        public_commit_us: stats.public_commit_us.load(Ordering::Relaxed),
+        co_resident_us: stats.co_resident_us.load(Ordering::Relaxed),
     }
 }
 

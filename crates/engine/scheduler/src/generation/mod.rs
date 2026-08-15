@@ -193,6 +193,7 @@ fn logprob_blob_bound(
 fn token_outputs(
     logprob_bound: Option<u64>,
     produces_finish_candidate: bool,
+    produces_transition_candidate: bool,
     max_points: u32,
 ) -> Result<Vec<ProductRef>, PlanningError> {
     let mut token = output_product(
@@ -254,6 +255,14 @@ fn token_outputs(
             dynamic_element_bound(bytes, DType::U8)?,
         ));
     }
+    if produces_transition_candidate {
+        outputs.push(output_product(
+            6,
+            ProductKind::Completion,
+            StorageClass::DeviceTensor,
+            DType::U8,
+        ));
+    }
     Ok(outputs)
 }
 
@@ -264,6 +273,7 @@ fn feedback_state_outputs(
     logprob_bound: Option<u64>,
     sample_continuation: bool,
     produces_finish_candidate: bool,
+    produces_transition_candidate: bool,
 ) -> Result<Vec<ProductRef>, PlanningError> {
     let mut outputs = vec![output_product(
         0,
@@ -293,6 +303,14 @@ fn feedback_state_outputs(
                 StorageClass::HostStaging,
                 DType::U8,
                 dynamic_element_bound(bytes, DType::U8)?,
+            ));
+        }
+        if produces_transition_candidate {
+            outputs.push(output_product(
+                4,
+                ProductKind::Completion,
+                StorageClass::DeviceTensor,
+                DType::U8,
             ));
         }
     }
@@ -688,7 +706,7 @@ impl GenerationCursor {
     pub(crate) fn project<'a>(
         &self,
         applies: impl IntoIterator<Item = &'a SchedulerApply>,
-    ) -> CursorProjection {
+    ) -> Option<CursorProjection> {
         let mut projection = CursorProjection {
             phase: self.lifecycle.phase,
             prompt_cursor: self.ingest.prompt_cursor,
@@ -697,9 +715,9 @@ impl GenerationCursor {
             replayability: self.replay.replayability,
         };
         for apply in applies {
-            projection.apply(apply);
+            projection.apply(apply)?;
         }
-        projection
+        Some(projection)
     }
 }
 
@@ -806,7 +824,7 @@ pub(crate) struct CursorProjection {
 }
 
 impl CursorProjection {
-    fn apply(&mut self, apply: &SchedulerApply) {
+    fn apply(&mut self, apply: &SchedulerApply) -> Option<()> {
         match apply.delta {
             TransitionDelta::IngestText {
                 start,
@@ -832,8 +850,7 @@ impl CursorProjection {
             } => {
                 let physical = match physical_kv_tokens {
                     ImageKvEffect::Exact { tokens } => tokens,
-                    ImageKvEffect::Bounded { max_tokens } => max_tokens,
-                    ImageKvEffect::WorkerDefined => 0,
+                    ImageKvEffect::Bounded { .. } | ImageKvEffect::WorkerDefined => return None,
                 };
                 self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
                 if is_final_step {
@@ -876,8 +893,7 @@ impl CursorProjection {
             } => {
                 let physical = match physical_kv_tokens {
                     ImageKvEffect::Exact { tokens } => tokens,
-                    ImageKvEffect::Bounded { max_tokens } => max_tokens,
-                    ImageKvEffect::WorkerDefined => 0,
+                    ImageKvEffect::Bounded { .. } | ImageKvEffect::WorkerDefined => return None,
                 };
                 self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
                 if is_final_step {
@@ -890,6 +906,7 @@ impl CursorProjection {
         if apply.replayability_after_apply == Replayability::NotReplayable {
             self.replayability = Replayability::NotReplayable;
         }
+        Some(())
     }
 }
 
@@ -950,6 +967,7 @@ pub(crate) enum TransitionIntent {
         position: u32,
         physical_position: u32,
         token: u32,
+        relay_input: bool,
         new_blocks: Vec<BlockId>,
     },
     DenoiseGen {
@@ -1139,6 +1157,7 @@ impl GenerationPlanner {
                                     .map_or(0, |tokens| tokens.len().min(u32::MAX as usize) as u32),
                             )?,
                             finish_candidate,
+                            !sampling_state.transition_token_ids.is_empty(),
                             1,
                         )?,
                         new_blocks,
@@ -1304,6 +1323,7 @@ impl GenerationPlanner {
                         outputs: token_outputs(
                             logprob_blob_bound(&request.sampling, 0)?,
                             finish_candidate,
+                            !sampling_state.transition_token_ids.is_empty(),
                             token_cost.min(u32::MAX as usize) as u32,
                         )?,
                         new_blocks,
@@ -1338,7 +1358,15 @@ impl GenerationPlanner {
                     Wire {
                         work: Work::Transfer(TransferMode::KvPublish),
                         inputs: Vec::new(),
-                        outputs: vec![output],
+                        outputs: vec![
+                            output,
+                            output_product(
+                                1,
+                                ProductKind::Completion,
+                                StorageClass::DeviceTensor,
+                                DType::U8,
+                            ),
+                        ],
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: 0,
@@ -1349,7 +1377,10 @@ impl GenerationPlanner {
                         input_image_bytes: None,
                         sampling_state: None,
                     },
-                    TransitionDelta::PublishKv { image_id },
+                    TransitionDelta::PublishKv {
+                        image_id,
+                        physical_kv_len: cursor.physical_kv_len,
+                    },
                     Vec::new(),
                     cursor.replayability,
                     0,
@@ -1374,7 +1405,7 @@ impl GenerationPlanner {
                                 1,
                                 ProductKind::Completion,
                                 StorageClass::DeviceTensor,
-                                DType::U32,
+                                DType::U8,
                             ),
                         ],
                         new_blocks: Vec::new(),
@@ -1387,7 +1418,10 @@ impl GenerationPlanner {
                         input_image_bytes: None,
                         sampling_state: None,
                     },
-                    TransitionDelta::TransitionGen { image_id },
+                    TransitionDelta::TransitionGen {
+                        image_id,
+                        physical_kv_len: cursor.physical_kv_len,
+                    },
                     Vec::new(),
                     cursor.replayability,
                     latent_units,
@@ -1399,19 +1433,25 @@ impl GenerationPlanner {
                 position,
                 physical_position,
                 token,
+                relay_input,
                 new_blocks,
             } => (
                 Wire {
                     work: Work::Token(TokenMode::Extend),
                     inputs: Vec::new(),
-                    outputs: Vec::new(),
+                    outputs: vec![output_product(
+                        0,
+                        ProductKind::Completion,
+                        StorageClass::DeviceTensor,
+                        DType::U8,
+                    )],
                     new_blocks,
                     draft_token_ids: Vec::new(),
                     token_cost: 1,
                     cfg_branches: 1,
                     allowed_text_tokens: None,
                     expected_prompt_token_ids: None,
-                    input_tokens: vec![token],
+                    input_tokens: if relay_input { Vec::new() } else { vec![token] },
                     input_image_bytes: None,
                     sampling_state: None,
                 },
@@ -1443,7 +1483,15 @@ impl GenerationPlanner {
                     Wire {
                         work: Work::Gen(GenMode::Flow),
                         inputs: vec![conditioning, latent],
-                        outputs: vec![self.latent_output(0, &request.resources)?],
+                        outputs: vec![
+                            self.latent_output(0, &request.resources)?,
+                            output_product(
+                                1,
+                                ProductKind::Completion,
+                                StorageClass::DeviceTensor,
+                                DType::U8,
+                            ),
+                        ],
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: usize::from(step_count),
@@ -1458,6 +1506,7 @@ impl GenerationPlanner {
                         image_id,
                         start_step,
                         step_count,
+                        physical_kv_len: cursor.physical_kv_len,
                     },
                     Vec::new(),
                     Replayability::NotReplayable,
@@ -1474,11 +1523,18 @@ impl GenerationPlanner {
                     .generated_image_feedback
                     .then_some(request.policy.feedback.as_ref())
                     .flatten();
+                let mut outputs = materialize_outputs(request, feedback)?;
+                outputs.push(output_product(
+                    2,
+                    ProductKind::Completion,
+                    StorageClass::DeviceTensor,
+                    DType::U8,
+                ));
                 (
                     Wire {
                         work: Work::Materialize,
                         inputs: vec![latent],
-                        outputs: materialize_outputs(request, feedback)?,
+                        outputs,
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: 1,
@@ -1489,7 +1545,10 @@ impl GenerationPlanner {
                         input_image_bytes: None,
                         sampling_state: None,
                     },
-                    TransitionDelta::CommitGen { image_id },
+                    TransitionDelta::CommitGen {
+                        image_id,
+                        step: request.image.steps,
+                    },
                     Vec::new(),
                     Replayability::NotReplayable,
                     0,
@@ -1510,11 +1569,18 @@ impl GenerationPlanner {
                     ImageIngestStep::VaeEncode => Work::Encode(EncodeMode::Latent),
                     ImageIngestStep::VitEncode => Work::Encode(EncodeMode::Vision),
                 };
+                let mut outputs = encode_outputs(step, 0, &request.resources)?;
+                outputs.push(output_product(
+                    1,
+                    ProductKind::Completion,
+                    StorageClass::DeviceTensor,
+                    DType::U8,
+                ));
                 (
                     Wire {
                         work,
                         inputs: source.clone().into_iter().collect(),
-                        outputs: encode_outputs(step, 0, &request.resources)?,
+                        outputs,
                         new_blocks: Vec::new(),
                         draft_token_ids: Vec::new(),
                         token_cost: 1,
@@ -1577,6 +1643,7 @@ impl GenerationPlanner {
                         .flatten(),
                     sample_continuation,
                     finish_candidate,
+                    sample_continuation && !sampling_state.transition_token_ids.is_empty(),
                 )?;
                 (
                     Wire {
@@ -1754,7 +1821,7 @@ impl GenerationPlanner {
             max_transfer_bytes,
         };
         let rng = match &delta {
-            TransitionDelta::TransitionGen { image_id } => Some(Rng {
+            TransitionDelta::TransitionGen { image_id, .. } => Some(Rng {
                 seed: request.image.seed.unwrap_or(0),
                 semantic_index_base: u64::from(*image_id),
                 draw_layout: DrawLayout::FlowNoise,
@@ -1788,7 +1855,6 @@ impl GenerationPlanner {
             input_tokens: wire.input_tokens,
             input_image_bytes: wire.input_image_bytes,
             sampling_state: wire.sampling_state,
-            device_parent_point: None,
             delta,
             resources,
             validation,
@@ -1973,10 +2039,6 @@ pub(crate) struct PlannedTransition {
     pub(crate) input_image_bytes: Option<Vec<u8>>,
     /// Branch-local processor state consumed by this operation's sampler.
     pub(crate) sampling_state: Option<SamplingState>,
-    /// For a `Point::Device`-rooted successor, the scheduler-owned point index
-    /// selected by its parent. `None` for a fixed-parent op, whose parent point
-    /// is carried directly on the parent `Point::Fixed`.
-    pub(crate) device_parent_point: Option<u32>,
     pub(crate) delta: TransitionDelta,
     pub(crate) resources: TransitionResources,
     pub(crate) validation: TransitionValidation,
@@ -1991,9 +2053,9 @@ pub(crate) struct SchedulerApply {
     pub(crate) validation: TransitionValidation,
     pub(crate) visibility: OutputVisibilityPlan,
     pub(crate) replayability_after_apply: Replayability,
+    pub(crate) new_blocks: usize,
     pub(crate) release_on_apply: Vec<ResourceClass>,
     pub(crate) output_event_bound: usize,
-    pub(crate) device_parent_point: Option<u32>,
 }
 
 impl PlannedTransition {
@@ -2122,9 +2184,9 @@ impl PlannedTransition {
             validation: self.validation,
             visibility: self.visibility,
             replayability_after_apply: self.resources.replayability_after_apply,
+            new_blocks: self.resources.new_blocks,
             release_on_apply: self.resources.release_on_apply,
             output_event_bound,
-            device_parent_point: self.device_parent_point,
         };
         Ok((operation, apply, input_products))
     }
@@ -2150,25 +2212,10 @@ impl SchedulerApply {
                 actual: record.op_id.0,
             });
         }
-        let declared_parent_point = match operation.parent.point {
-            Point::Fixed {
-                point_index: parent_point,
-                ..
-            } => parent_point,
-            // A device parent carries no host-known point index. The scheduler
-            // records its selected point in the validation expectations.
-            Point::Device { .. } => {
-                let Some(device_parent_point) = self.device_parent_point else {
-                    return Err(TransitionValidationError::VersionMismatch {
-                        expected_base: 0,
-                        actual_base: 0,
-                        actual_result: u64::from(record.selected_point),
-                    });
-                };
-                device_parent_point
-            }
-        };
         if record.status == OpStatus::Predicated {
+            let declared_parent_point = match operation.parent.point {
+                Point::Fixed { point_index, .. } | Point::Device { point_index, .. } => point_index,
+            };
             let expected_point = predicated_parent_point.unwrap_or(declared_parent_point);
             if operation.predicate.is_none()
                 || record.selected_point != expected_point
@@ -2240,17 +2287,21 @@ pub(crate) enum TransitionDelta {
     },
     PublishKv {
         image_id: u32,
+        physical_kv_len: u32,
     },
     TransitionGen {
         image_id: u32,
+        physical_kv_len: u32,
     },
     DenoiseGen {
         image_id: u32,
         start_step: u16,
         step_count: u16,
+        physical_kv_len: u32,
     },
     CommitGen {
         image_id: u32,
+        step: u16,
     },
     EncodeFeedbackStep {
         image_id: u32,
@@ -3065,13 +3116,14 @@ mod tests {
                     position: 3,
                     physical_position: 2,
                     token: 42,
+                    relay_input: false,
                     new_blocks: vec![BlockId(9)],
                 },
             )
             .expect("plan KV closure");
         assert_eq!(closure.work, Work::Token(TokenMode::Extend));
         assert_eq!(closure.input_tokens, vec![42]);
-        assert!(closure.outputs.is_empty());
+        assert_eq!(closure.outputs[0].kind, ProductKind::Completion);
         assert_eq!(closure.resources.kv_target_tokens, Some(3));
 
         let publication = GenerationPlanner::new(Some(DType::BF16))
@@ -3128,7 +3180,7 @@ mod tests {
                 },
             )
             .expect("plan image materialization");
-        assert_eq!(transition.outputs.len(), 2);
+        assert_eq!(transition.outputs.len(), 3);
         assert_eq!(
             (
                 transition.outputs[0].kind,
@@ -3138,6 +3190,18 @@ mod tests {
             (
                 ProductKind::Artifact,
                 StorageClass::CompletionArena,
+                DType::U8,
+            )
+        );
+        assert_eq!(
+            (
+                transition.outputs[2].kind,
+                transition.outputs[2].storage_class,
+                transition.outputs[2].dtype,
+            ),
+            (
+                ProductKind::Completion,
+                StorageClass::DeviceTensor,
                 DType::U8,
             )
         );

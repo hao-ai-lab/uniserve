@@ -1,8 +1,7 @@
 """Typed worker error taxonomy.
 
 Every failure is classified into a stable error class with ``code``, ``message``,
-``retryable``, ``cleanup`` (whether the host must drop request state), and
-``fatal`` (whether the worker process must be torn down).
+``retryable``, and ``fatal`` (whether the worker process must be torn down).
 
 ``to_wire()`` produces ``{"kind": "error", "message", "code", "retryable",
 "fatal", ...}``. Wire fields are scalars and short strings only — never tensors.
@@ -102,7 +101,6 @@ class WorkerError(Exception):
     message: str
     retryable: bool = False
     fatal: bool = False
-    cleanup: bool = True
     req_id: int | None = None
     op_id: int | None = None
     op_kind: str | None = None
@@ -116,7 +114,7 @@ class WorkerError(Exception):
 
     def to_wire(self) -> dict[str, Any]:
         # Only the fields modeled on the Rust WorkerResponse cross the wire.
-        # Richer context (cleanup, req_id, op_id, op_kind, details) stays local
+        # Richer context (req_id, op_id, op_kind, details) stays local
         # for logging and metrics.
         return {
             "kind": "error",
@@ -214,7 +212,6 @@ def unsupported_control(name: str) -> WorkerError:
     return _make(
         ErrorCode.UNSUPPORTED_CONTROL,
         f"control {name!r} is not supported by this worker",
-        cleanup=False,
     )
 
 

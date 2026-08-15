@@ -8,7 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 iceoryx2.workspace = true
 iceoryx2-bb-elementary-traits.workspace = true
-tracing.workspace = true
 uniserve-worker-wire.workspace = true
 
 [lints]

@@ -104,8 +104,6 @@ fn main() -> anyhow::Result<()> {
         "auto",
         &worker_config,
     )?;
-    let event_driven = engine.event_driven();
-    println!("event_driven = {event_driven}");
     let waker = engine.command_waker();
     let sched = Scheduler::new(Box::new(engine), ControlTokens::default(), 32);
 

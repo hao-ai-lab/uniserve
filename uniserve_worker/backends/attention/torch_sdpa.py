@@ -20,14 +20,11 @@ class TorchSDPAAttentionBackend:
 
     def capabilities(self) -> AttentionCapabilities:
         return AttentionCapabilities(
-            segment_batched_cfg=True,
-            mixed_mode=True,
             paged_kv=True,
             varlen_attention=True,
             varlen_paged_kv=True,
             visible_end=True,
             visible_end_cuda_graph=True,
-            tree_verify=True,
         )
 
     def forward(

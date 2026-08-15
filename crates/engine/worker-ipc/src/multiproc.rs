@@ -16,8 +16,6 @@ use crate::WorkerLaunchConfig;
 /// healthy-but-slow forward is never falsely failed; short enough that a hung
 /// rank does not wedge the scheduler loop forever.
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
-/// Per-iteration bounded wait used while draining a lagging rank.
-const NEXT_RESULT_POLL: Duration = Duration::from_millis(1);
 
 #[derive(Clone)]
 struct MultiprocSpawnSpec {
@@ -34,7 +32,6 @@ struct MultiprocSpawnSpec {
     attention_backend: String,
     worker_kind: Option<String>,
     transfer_backend: Option<String>,
-    defer_sampling: bool,
     worker_config: WorkerLaunchConfig,
 }
 
@@ -74,7 +71,6 @@ impl MultiprocSpawnSpec {
                 tp_init_method.as_deref(),
                 self.worker_kind.as_deref(),
                 self.transfer_backend.as_deref(),
-                self.defer_sampling,
                 &rank_config,
             )?);
         }
@@ -97,7 +93,9 @@ pub struct MultiprocExecutor {
     next_call_id: u64,
     pending_batches: BTreeMap<u64, Batch>,
     pending_partitions: BTreeMap<u64, BTreeSet<u32>>,
-    last_collective_seq: u64,
+    rank_errors: Vec<BTreeMap<u64, WorkerExecError>>,
+    rank_returned_partitions: Vec<BTreeMap<u64, BTreeSet<u32>>>,
+    rank_successes: Vec<BTreeSet<u64>>,
     spawn_spec: Option<MultiprocSpawnSpec>,
     known_sessions: BTreeSet<RequestId>,
     dirty_sessions: BTreeSet<RequestId>,
@@ -153,7 +151,9 @@ impl MultiprocExecutor {
             next_call_id: 1,
             pending_batches: BTreeMap::new(),
             pending_partitions: BTreeMap::new(),
-            last_collective_seq: 0,
+            rank_errors: (0..n).map(|_| BTreeMap::new()).collect(),
+            rank_returned_partitions: (0..n).map(|_| BTreeMap::new()).collect(),
+            rank_successes: (0..n).map(|_| BTreeSet::new()).collect(),
             spawn_spec,
             known_sessions: BTreeSet::new(),
             dirty_sessions: BTreeSet::new(),
@@ -219,7 +219,6 @@ impl MultiprocExecutor {
             attention_backend,
             None,
             None,
-            false,
             worker_config,
         )
     }
@@ -243,7 +242,6 @@ impl MultiprocExecutor {
         attention_backend: &str,
         worker_kind: &str,
         transfer_backend: Option<&str>,
-        defer_sampling: bool,
     ) -> anyhow::Result<Self> {
         Self::spawn_staged_with_config(
             python,
@@ -259,7 +257,6 @@ impl MultiprocExecutor {
             attention_backend,
             worker_kind,
             transfer_backend,
-            defer_sampling,
             &WorkerLaunchConfig::default(),
         )
     }
@@ -279,7 +276,6 @@ impl MultiprocExecutor {
         attention_backend: &str,
         worker_kind: &str,
         transfer_backend: Option<&str>,
-        defer_sampling: bool,
         worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
         Self::spawn_inner(
@@ -296,7 +292,6 @@ impl MultiprocExecutor {
             attention_backend,
             Some(worker_kind),
             transfer_backend,
-            defer_sampling,
             worker_config,
         )
     }
@@ -316,7 +311,6 @@ impl MultiprocExecutor {
         attention_backend: &str,
         worker_kind: Option<&str>,
         transfer_backend: Option<&str>,
-        defer_sampling: bool,
         worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
         let spec = MultiprocSpawnSpec {
@@ -333,7 +327,6 @@ impl MultiprocExecutor {
             attention_backend: attention_backend.to_string(),
             worker_kind: worker_kind.map(str::to_string),
             transfer_backend: transfer_backend.map(str::to_string),
-            defer_sampling,
             worker_config: worker_config.clone(),
         };
         let workers = spec.launch()?;
@@ -341,10 +334,63 @@ impl MultiprocExecutor {
     }
 
     fn pump_once(&mut self) -> anyhow::Result<()> {
-        for (i, worker) in self.workers.iter_mut().enumerate() {
-            while let Some(result) = worker.poll()? {
-                self.buffers[i].push_back(result);
+        for rank in 0..self.workers.len() {
+            loop {
+                match self.workers[rank].poll() {
+                    Ok(Some(result)) => {
+                        let step_id = result.step_id;
+                        let expected = self
+                            .pending_batches
+                            .get(&step_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("rank {rank} returned unknown step {step_id}")
+                            })?
+                            .partitions
+                            .iter()
+                            .map(|partition| partition.partition_id)
+                            .collect::<BTreeSet<_>>();
+                        let returned = self.rank_returned_partitions[rank]
+                            .entry(step_id)
+                            .or_default();
+                        for partition_id in report_partition_ids(&result) {
+                            anyhow::ensure!(
+                                returned.insert(partition_id),
+                                "rank {rank} returned partition {partition_id} more than once for step {step_id}"
+                            );
+                        }
+                        anyhow::ensure!(
+                            returned.is_subset(&expected),
+                            "rank {rank} returned an unplanned partition for step {step_id}"
+                        );
+                        if *returned == expected {
+                            self.rank_successes[rank].insert(step_id);
+                        }
+                        self.buffers[rank].push_back(result);
+                    }
+                    Ok(None) => break,
+                    Err(error) => self.record_rank_error(rank, &error)?,
+                }
             }
+        }
+        Ok(())
+    }
+
+    fn record_rank_error(&mut self, rank: usize, error: &anyhow::Error) -> anyhow::Result<()> {
+        let execution = error
+            .downcast_ref::<WorkerExecError>()
+            .ok_or_else(|| anyhow::anyhow!("rank {rank} failed: {error:#}"))?;
+        let step_id = execution.step_id.ok_or_else(|| {
+            anyhow::anyhow!("rank {rank} returned an execution error without a step identity")
+        })?;
+        anyhow::ensure!(
+            self.pending_batches.contains_key(&step_id),
+            "rank {rank} returned an execution error for unknown step {step_id}"
+        );
+        if let Some(existing) = self.rank_errors[rank].insert(step_id, execution.clone()) {
+            anyhow::ensure!(
+                existing == *execution,
+                "rank {rank} returned conflicting errors for step {step_id}"
+            );
         }
         Ok(())
     }
@@ -363,8 +409,9 @@ impl MultiprocExecutor {
         self.spawn_spec = Some(spec);
         self.discard_sessions_after_loss();
         Err(WorkerLossError {
-            message: "worker process was replaced and affected sessions were terminated"
-                .to_string(),
+            message: format!(
+                "worker process was replaced and affected sessions were terminated: {cause:#}"
+            ),
         }
         .into())
     }
@@ -383,6 +430,9 @@ impl MultiprocExecutor {
         }
         self.workers = workers;
         self.buffers = (0..spec.world_size).map(|_| VecDeque::new()).collect();
+        self.rank_errors = (0..spec.world_size).map(|_| BTreeMap::new()).collect();
+        self.rank_returned_partitions = (0..spec.world_size).map(|_| BTreeMap::new()).collect();
+        self.rank_successes = (0..spec.world_size).map(|_| BTreeSet::new()).collect();
         Ok(())
     }
 
@@ -390,6 +440,11 @@ impl MultiprocExecutor {
         self.pending_batches.clear();
         self.pending_partitions.clear();
         self.buffers.iter_mut().for_each(VecDeque::clear);
+        self.rank_errors.iter_mut().for_each(BTreeMap::clear);
+        self.rank_returned_partitions
+            .iter_mut()
+            .for_each(BTreeMap::clear);
+        self.rank_successes.iter_mut().for_each(BTreeSet::clear);
         self.inflight = 0;
         self.known_sessions.clear();
         self.dirty_sessions.clear();
@@ -397,7 +452,13 @@ impl MultiprocExecutor {
 
     fn discard_inflight(&mut self) {
         self.pending_batches.clear();
+        self.pending_partitions.clear();
         self.buffers.iter_mut().for_each(VecDeque::clear);
+        self.rank_errors.iter_mut().for_each(BTreeMap::clear);
+        self.rank_returned_partitions
+            .iter_mut()
+            .for_each(BTreeMap::clear);
+        self.rank_successes.iter_mut().for_each(BTreeSet::clear);
         self.inflight = 0;
     }
 
@@ -439,6 +500,7 @@ impl MultiprocExecutor {
     }
 
     fn try_join(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+        self.join_rank_errors()?;
         if self.buffers.iter().any(|buffer| buffer.is_empty()) {
             return Ok(None);
         }
@@ -483,11 +545,68 @@ impl MultiprocExecutor {
             );
         }
         if remaining.is_empty() {
-            self.inflight = self.inflight.saturating_sub(1);
-            self.pending_batches.remove(&step_id);
-            self.pending_partitions.remove(&step_id);
+            self.finish_step(step_id);
         }
         Ok(Some(out))
+    }
+
+    fn join_rank_errors(&mut self) -> anyhow::Result<()> {
+        let steps = self
+            .rank_errors
+            .iter()
+            .flat_map(|errors| errors.keys().copied())
+            .collect::<BTreeSet<_>>();
+        for step_id in steps {
+            let terminal = (0..self.workers.len())
+                .map(|rank| {
+                    self.rank_errors[rank].contains_key(&step_id)
+                        || self.rank_successes[rank].contains(&step_id)
+                })
+                .collect::<Vec<_>>();
+            if terminal.iter().any(|value| !value) {
+                continue;
+            }
+            let errors = self
+                .rank_errors
+                .iter()
+                .enumerate()
+                .filter_map(|(rank, entries)| entries.get(&step_id).map(|error| (rank, error)))
+                .collect::<Vec<_>>();
+            if errors.len() != self.workers.len() {
+                self.finish_step(step_id);
+                anyhow::bail!(
+                    "tensor-parallel ranks disagreed between success and failure for step {step_id}"
+                );
+            }
+            let canonical = errors[0].1.clone();
+            for (rank, error) in errors.iter().copied().skip(1) {
+                anyhow::ensure!(
+                    *error == canonical,
+                    "rank {rank} returned a different execution error for step {step_id}"
+                );
+            }
+            self.finish_step(step_id);
+            return Err(canonical.into());
+        }
+        Ok(())
+    }
+
+    fn finish_step(&mut self, step_id: u64) {
+        self.pending_batches.remove(&step_id);
+        self.pending_partitions.remove(&step_id);
+        for buffer in &mut self.buffers {
+            buffer.retain(|report| report.step_id != step_id);
+        }
+        for errors in &mut self.rank_errors {
+            errors.remove(&step_id);
+        }
+        for returned in &mut self.rank_returned_partitions {
+            returned.remove(&step_id);
+        }
+        for successes in &mut self.rank_successes {
+            successes.remove(&step_id);
+        }
+        self.inflight = self.inflight.saturating_sub(1);
     }
 
     fn joinable_report_key(&self) -> Option<(u64, Vec<u32>)> {
@@ -756,23 +875,6 @@ impl Executor for MultiprocExecutor {
             batch.step_id
         );
         let step_id = batch.step_id;
-        let mut collective_sequences = batch
-            .partitions
-            .iter()
-            .map(|partition| partition.collective_seq)
-            .collect::<Vec<_>>();
-        collective_sequences.sort_unstable();
-        collective_sequences.dedup();
-        anyhow::ensure!(
-            collective_sequences
-                .windows(2)
-                .all(|window| window[0] < window[1])
-                && collective_sequences
-                    .first()
-                    .is_none_or(|sequence| *sequence > self.last_collective_seq),
-            "step {step_id} collective order does not advance beyond {}",
-            self.last_collective_seq
-        );
         let sessions = batch
             .operations()
             .map(|operation| operation.request_key.session_id)
@@ -798,8 +900,8 @@ impl Executor for MultiprocExecutor {
                         .map(|control| control.request_key().session_id),
                 ),
         );
-        if let Some(sequence) = collective_sequences.last() {
-            self.last_collective_seq = *sequence;
+        for rank in 0..self.workers.len() {
+            self.rank_returned_partitions[rank].insert(step_id, BTreeSet::new());
         }
         self.inflight += 1;
         for (rank, worker) in self.workers.iter_mut().enumerate() {
@@ -830,36 +932,28 @@ impl Executor for MultiprocExecutor {
         Ok(())
     }
 
-    fn event_driven(&self) -> bool {
-        // The pool is event-driven only when every rank is, so the scheduler's
-        // single park covers them all (a mixed pool falls back to polling).
-        !self.workers.is_empty() && self.workers.iter().all(|w| w.event_driven())
+    fn command_waker(&self) -> CommandWaker {
+        let wakes = self
+            .workers
+            .iter()
+            .map(|worker| worker.command_waker())
+            .collect::<Vec<_>>();
+        CommandWaker::new(move || {
+            for wake in &wakes {
+                wake.wake();
+            }
+        })
     }
 
-    fn command_waker(&self) -> CommandWaker {
-        // TP ranks run in lockstep, so rank 0's waker is enough to break the
-        // park on a freshly enqueued command (the scheduler then drains all).
+    fn wake_file_descriptors(&self) -> Vec<i32> {
         self.workers
-            .first()
-            .map(|w| w.command_waker())
-            .unwrap_or_else(CommandWaker::noop)
+            .iter()
+            .flat_map(|worker| worker.wake_file_descriptors())
+            .collect()
     }
 
     fn park_for_event(&mut self, timeout: std::time::Duration) -> anyhow::Result<()> {
-        // Every rank receives the same batch and finishes within a hair of the
-        // others, so parking on rank 0's wake surfaces a ready result without a
-        // cross-endpoint WaitSet; a spurious wake is harmless because the
-        // scheduler re-drains every rank after the park returns.
-        match self.workers.first_mut() {
-            Some(worker) => match worker.park_for_event(timeout) {
-                Ok(()) => Ok(()),
-                Err(error) => self.recover_workers(&error),
-            },
-            None => {
-                std::thread::sleep(timeout.min(Duration::from_millis(1)));
-                Ok(())
-            }
-        }
+        crate::park_descriptors(&self.wake_file_descriptors(), timeout)
     }
 
     fn wait_result_timeout(
@@ -882,7 +976,24 @@ impl Executor for MultiprocExecutor {
             if now >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+            let idx = self
+                .workers
+                .iter()
+                .position(|worker| worker.in_flight() > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tensor-parallel ranks completed without a joinable outcome while {} batch(es) remained in flight",
+                        self.inflight
+                    )
+                })?;
+            match self.workers[idx].wait_result_timeout(deadline - now) {
+                Ok(Some(result)) => self.buffers[idx].push_back(result),
+                Ok(None) => return Ok(None),
+                Err(error) if error.downcast_ref::<WorkerExecError>().is_some() => {
+                    self.record_rank_error(idx, &error)?;
+                }
+                Err(error) => self.recover_workers(&error)?,
+            }
         }
     }
 
@@ -904,11 +1015,18 @@ impl Executor for MultiprocExecutor {
             // the per-worker bounded wait (rather than the unbounded
             // next_result) keeps a hung rank from blocking indefinitely.
             let idx = self
-                .buffers
+                .workers
                 .iter()
-                .position(|buffer| buffer.is_empty())
-                .unwrap_or(0);
-            match self.workers[idx].wait_result_timeout(NEXT_RESULT_POLL) {
+                .position(|worker| worker.in_flight() > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tensor-parallel ranks completed without a joinable outcome while {} batch(es) remained in flight",
+                        self.inflight
+                    )
+                })?;
+            match self.workers[idx]
+                .wait_result_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
                 Ok(Some(result)) => {
                     self.buffers[idx].push_back(result);
                     deadline = Instant::now() + NEXT_RESULT_DEADLINE;
@@ -924,8 +1042,7 @@ impl Executor for MultiprocExecutor {
                 }
                 Ok(None) => {}
                 Err(error) if error.downcast_ref::<WorkerExecError>().is_some() => {
-                    self.discard_inflight();
-                    return Err(error);
+                    self.record_rank_error(idx, &error)?;
                 }
                 Err(error) => {
                     self.recover_workers(&error)?;
@@ -1031,476 +1148,6 @@ impl Executor for MultiprocExecutor {
     fn shutdown(&mut self) {
         for worker in self.workers.iter_mut() {
             worker.shutdown();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::{BTreeSet, VecDeque};
-    use std::time::Duration;
-
-    use super::{MultiprocExecutor, device_for_rank, report_partition_ids};
-    use uniserve_core::RequestId;
-    use uniserve_executor::{ControlAck, ControlOp, Executor};
-    use uniserve_worker_wire::{
-        AttentionRegime, Batch, BatchPartition, Bounds, CompletionRecord, CompletionReport, DType,
-        Domain, ExecutionCapability, FinishFlags, LogicalLengths, OpId, OpStatus, Operation,
-        PartitionCompletion, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-        RequestKey, RouteId, SamplingOwnership, ShapeBound, StorageClass, TimingCounters,
-        TokenMode, TokenSpan, VersionRef, Work, WorkerCapabilities,
-    };
-
-    #[test]
-    fn cuda_device_is_ranked_for_multiproc() {
-        assert_eq!(device_for_rank("cuda", 1, 4), "cuda:1");
-        assert_eq!(device_for_rank("gpu", 2, 4), "cuda:2");
-        assert_eq!(device_for_rank("cuda:0", 1, 4), "cuda:0");
-        assert_eq!(device_for_rank("cpu", 1, 4), "cpu");
-        assert_eq!(device_for_rank("cuda", 0, 1), "cuda");
-    }
-
-    #[test]
-    fn multiproc_construction_requires_exact_rank_capability_agreement() {
-        let exec = MultiprocExecutor::new(vec![fake_worker(0, 2), fake_worker(1, 2)]).unwrap();
-        assert_eq!(exec.caps.rank.tp_rank, 0);
-        assert_eq!(exec.caps.rank.tp_size, 2);
-        assert_eq!(exec.pipeline_depth(), 2);
-
-        let topology_error = MultiprocExecutor::new(vec![fake_worker(0, 2), fake_worker(0, 2)])
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            topology_error.contains("reported topology"),
-            "got: {topology_error}"
-        );
-
-        let mut disagreeing_caps = fake_caps(1, 2);
-        disagreeing_caps.num_blocks += 1;
-        let capability_error = MultiprocExecutor::new(vec![
-            fake_worker(0, 2),
-            Box::new(FakeExec {
-                caps: disagreeing_caps,
-                queued: VecDeque::new(),
-            }),
-        ])
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(
-            capability_error.contains("capabilities disagree"),
-            "got: {capability_error}"
-        );
-
-        let mut invalid_protocol = fake_caps(1, 2);
-        invalid_protocol.protocol_layout_digest = "0".repeat(64);
-        let protocol_error = MultiprocExecutor::new(vec![
-            fake_worker(0, 2),
-            Box::new(FakeExec {
-                caps: invalid_protocol,
-                queued: VecDeque::new(),
-            }),
-        ])
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(
-            protocol_error.contains("invalid capabilities"),
-            "got: {protocol_error}"
-        );
-    }
-
-    #[test]
-    fn multiproc_next_result_bails_with_no_inflight() {
-        let mut exec = fake_multiproc(2);
-        exec.inflight = 0;
-        let err = exec.next_result().unwrap_err().to_string();
-        assert!(err.contains("no in-flight batches"), "got: {err}");
-    }
-
-    #[test]
-    fn multiproc_join_matches_by_step_id_without_consuming_unmatched_front() {
-        let mut exec = fake_multiproc(2);
-        exec.inflight = 2;
-        queue_pending(&mut exec, &[1, 2]);
-        exec.buffers[0].push_back(result(2, 20));
-        exec.buffers[0].push_back(result(1, 10));
-        exec.buffers[1].push_back(result(1, 10));
-
-        let joined = exec.try_join().unwrap().unwrap();
-
-        assert_eq!(joined.step_id, 1);
-        assert_eq!(exec.inflight, 1);
-        assert_eq!(exec.buffers[0].front().unwrap().step_id, 2);
-        assert!(exec.buffers[1].is_empty());
-    }
-
-    #[test]
-    fn multiproc_join_rejects_rank_token_divergence() {
-        let mut exec = fake_multiproc(2);
-        exec.inflight = 1;
-        queue_pending(&mut exec, &[1]);
-        exec.buffers[0].push_back(result(1, 10));
-        exec.buffers[1].push_back(result(1, 11));
-
-        let err = exec.try_join().unwrap_err().to_string();
-
-        assert!(err.contains("completion 0 differs"), "got: {err}");
-        assert_eq!(exec.inflight, 1);
-    }
-
-    #[test]
-    fn multiproc_join_requires_identical_selected_point_and_semantic_digest() {
-        let mut selected = fake_multiproc(2);
-        selected.inflight = 1;
-        queue_pending(&mut selected, &[1]);
-        selected.buffers[0].push_back(result(1, 10));
-        let mut selected_divergence = result(1, 10);
-        selected_divergence.partitions[0].completions[0].selected_point = 1;
-        selected.buffers[1].push_back(selected_divergence);
-        let selected_error = selected.try_join().unwrap_err().to_string();
-        assert!(
-            selected_error.contains("completion 0 differs"),
-            "got: {selected_error}"
-        );
-
-        let mut digest = fake_multiproc(2);
-        digest.inflight = 1;
-        queue_pending(&mut digest, &[1]);
-        digest.buffers[0].push_back(result(1, 10));
-        let mut digest_divergence = result(1, 10);
-        digest_divergence.partitions[0].completions[0].semantic_digest = "1".repeat(64);
-        digest.buffers[1].push_back(digest_divergence);
-        let digest_error = digest.try_join().unwrap_err().to_string();
-        assert!(
-            digest_error.contains("completion 0 differs"),
-            "got: {digest_error}"
-        );
-    }
-
-    #[test]
-    fn multiproc_join_concatenates_rank_ordered_products() {
-        // The tensor-parallel join concatenates each completion's
-        // `product_generations` and the report-level `products` in rank order,
-        // while the semantic completion is required to be identical per rank.
-        let mut exec = fake_multiproc(2);
-        exec.caps.sampling_ownership = SamplingOwnership::DeterministicSharded;
-        exec.inflight = 1;
-        queue_pending(&mut exec, &[1]);
-        exec.buffers[0].push_back(result_with_products(1, vec![10, 11], 100));
-        exec.buffers[1].push_back(result_with_products(1, vec![20, 21], 200));
-
-        let joined = exec.try_join().unwrap().unwrap();
-
-        assert_eq!(
-            joined.partitions[0].completions[0].product_generations,
-            vec![10, 11, 20, 21]
-        );
-        assert_eq!(joined.partitions[0].products.len(), 2);
-        assert_eq!(joined.partitions[0].products[0].product.generation, 100);
-        assert_eq!(joined.partitions[0].products[1].product.generation, 200);
-
-        // Identity / committed-token divergence across ranks is still rejected.
-        let mut exec = fake_multiproc(2);
-        exec.caps.sampling_ownership = SamplingOwnership::DeterministicSharded;
-        exec.inflight = 1;
-        queue_pending(&mut exec, &[1]);
-        exec.buffers[0].push_back(result_with_products(1, vec![10], 100));
-        let mut diverged = result_with_products(1, vec![20], 200);
-        diverged.partitions[0].completions[0].committed_tokens = vec![99];
-        exec.buffers[1].push_back(diverged);
-
-        let error = exec.try_join().unwrap_err().to_string();
-        assert!(error.contains("completion 0 differs"), "got: {error}");
-    }
-
-    #[test]
-    fn multiproc_join_releases_each_partition_when_every_rank_reports_it() {
-        let mut exec = fake_multiproc(2);
-        let batch = two_partition_batch(1);
-        exec.pending_partitions.insert(1, BTreeSet::from([1, 2]));
-        exec.pending_batches.insert(1, batch);
-        exec.inflight = 1;
-        exec.buffers[0].push_back(partition_result(1, 1, 7, 1, 10));
-        exec.buffers[1].push_back(partition_result(1, 1, 7, 1, 10));
-
-        let first = exec.try_join().unwrap().unwrap();
-
-        assert_eq!(report_partition_ids(&first), vec![1]);
-        assert_eq!(exec.inflight, 1);
-        assert_eq!(exec.pending_partitions.get(&1), Some(&BTreeSet::from([2])));
-
-        exec.buffers[0].push_back(partition_result(1, 2, 8, 2, 20));
-        exec.buffers[1].push_back(partition_result(1, 2, 8, 2, 20));
-
-        let second = exec.try_join().unwrap().unwrap();
-
-        assert_eq!(report_partition_ids(&second), vec![2]);
-        assert_eq!(exec.inflight, 0);
-        assert!(!exec.pending_batches.contains_key(&1));
-        assert!(!exec.pending_partitions.contains_key(&1));
-    }
-
-    fn fake_multiproc(n: usize) -> MultiprocExecutor {
-        let workers = (0..n).map(|rank| fake_worker(rank, n)).collect();
-        MultiprocExecutor::new(workers).unwrap()
-    }
-
-    fn fake_caps(rank: usize, world_size: usize) -> WorkerCapabilities {
-        let mut caps = WorkerCapabilities::default();
-        caps.rank.tp_rank = rank as u32;
-        caps.rank.tp_size = world_size as u32;
-        caps.pipeline_depth = 2;
-        caps
-    }
-
-    fn fake_worker(rank: usize, world_size: usize) -> Box<dyn Executor> {
-        Box::new(FakeExec {
-            caps: fake_caps(rank, world_size),
-            queued: VecDeque::new(),
-        })
-    }
-
-    fn queue_pending(exec: &mut MultiprocExecutor, step_ids: &[u64]) {
-        for step_id in step_ids {
-            let batch = test_batch(*step_id);
-            exec.pending_partitions.insert(
-                *step_id,
-                batch
-                    .partitions
-                    .iter()
-                    .map(|partition| partition.partition_id)
-                    .collect(),
-            );
-            exec.pending_batches.insert(*step_id, batch);
-        }
-    }
-
-    fn test_batch(step_id: u64) -> Batch {
-        let key = RequestKey::new(1, RequestId(7), 1);
-        let operation = Operation::registered(
-            key,
-            OpId(step_id.max(1)),
-            VersionRef::admission_root(key, OpId(1), "0".repeat(64)),
-            Work::Token(TokenMode::Decode),
-            RouteId(0),
-            Domain::Decode,
-            Bounds {
-                max_points: 1,
-                max_tokens: 1,
-                ..Bounds::default()
-            },
-            Vec::new(),
-            Vec::new(),
-            0,
-            None,
-            None,
-            0,
-        );
-        Batch::new(
-            step_id,
-            Vec::new(),
-            vec![BatchPartition {
-                partition_id: 1,
-                submission_group: 1,
-                collective_seq: step_id.max(1),
-                domain: Domain::Decode,
-                route: RouteId(0),
-                execution: ExecutionCapability::DomainHomogeneous,
-                attention: AttentionRegime::Causal,
-                shape_class: 0,
-                operations: vec![operation],
-                request_pool_indices: vec![1],
-                kv_placements: Vec::new(),
-                kv_branch_placements: Vec::new(),
-                latent_placements: Vec::new(),
-            }],
-        )
-    }
-
-    fn two_partition_batch(step_id: u64) -> Batch {
-        let mut batch = test_batch(step_id);
-        let key = RequestKey::new(1, RequestId(8), 1);
-        let operation = Operation::registered(
-            key,
-            OpId(2),
-            VersionRef::admission_root(key, OpId(1), "0".repeat(64)),
-            Work::Token(TokenMode::Decode),
-            RouteId(0),
-            Domain::Decode,
-            Bounds {
-                max_points: 1,
-                max_tokens: 1,
-                ..Bounds::default()
-            },
-            Vec::new(),
-            Vec::new(),
-            0,
-            None,
-            None,
-            0,
-        );
-        batch.partitions.push(BatchPartition {
-            partition_id: 2,
-            submission_group: 2,
-            collective_seq: step_id.max(1) + 1,
-            domain: Domain::Decode,
-            route: RouteId(0),
-            execution: ExecutionCapability::DomainHomogeneous,
-            attention: AttentionRegime::Causal,
-            shape_class: 0,
-            operations: vec![operation],
-            request_pool_indices: vec![2],
-            kv_placements: Vec::new(),
-            kv_branch_placements: Vec::new(),
-            latent_placements: Vec::new(),
-        });
-        batch
-    }
-
-    fn completion(
-        op: u64,
-        committed_tokens: Vec<u32>,
-        product_generations: Vec<u32>,
-    ) -> CompletionRecord {
-        CompletionRecord {
-            request_key: RequestKey::new(1, RequestId(7), 1),
-            op_id: OpId(op.max(1)),
-            completion_slot_generation: 1,
-            status: OpStatus::Ok,
-            selected_point: 0,
-            logical_lengths: LogicalLengths::default(),
-            token_span: TokenSpan::default(),
-            committed_tokens,
-            finish_flags: FinishFlags::default(),
-            product_generations,
-            semantic_digest: "0".repeat(64),
-            error_code: None,
-            timing_counters: TimingCounters::default(),
-        }
-    }
-
-    fn result(step_id: u64, sampled_token_id: u32) -> CompletionReport {
-        CompletionReport {
-            step_id,
-            partitions: vec![PartitionCompletion {
-                partition_id: 1,
-                completions: vec![completion(step_id, vec![sampled_token_id], Vec::new())],
-                products: Vec::new(),
-                registration: RegistrationAck::default(),
-                worker_exec_us: Some(step_id),
-                forward_stats: None,
-            }],
-        }
-    }
-
-    fn partition_result(
-        step_id: u64,
-        partition_id: u32,
-        session_id: u64,
-        op_id: u64,
-        sampled_token_id: u32,
-    ) -> CompletionReport {
-        let mut record = completion(op_id, vec![sampled_token_id], Vec::new());
-        record.request_key = RequestKey::new(1, RequestId(session_id), 1);
-        CompletionReport {
-            step_id,
-            partitions: vec![PartitionCompletion {
-                partition_id,
-                completions: vec![record],
-                products: Vec::new(),
-                registration: RegistrationAck::default(),
-                worker_exec_us: Some(step_id),
-                forward_stats: None,
-            }],
-        }
-    }
-
-    fn result_with_products(
-        step_id: u64,
-        product_generations: Vec<u32>,
-        payload_generation: u32,
-    ) -> CompletionReport {
-        CompletionReport {
-            step_id,
-            partitions: vec![PartitionCompletion {
-                partition_id: 1,
-                completions: vec![completion(step_id, vec![10], product_generations)],
-                products: vec![product_payload(payload_generation)],
-                registration: RegistrationAck::default(),
-                worker_exec_us: Some(step_id),
-                forward_stats: None,
-            }],
-        }
-    }
-
-    fn product_payload(generation: u32) -> ProductPayload {
-        ProductPayload {
-            product: ProductRef {
-                request_key: RequestKey::new(1, RequestId(7), 1),
-                producer_op_id: OpId(1),
-                output_index: 0,
-                generation,
-                kind: ProductKind::Kv,
-                storage_class: StorageClass::PagedKv,
-                dtype: DType::BF16,
-                shape_bound: ShapeBound::default(),
-                point_range: PointRange::default(),
-            },
-            bytes: vec![generation as u8],
-        }
-    }
-
-    struct FakeExec {
-        caps: WorkerCapabilities,
-        queued: VecDeque<CompletionReport>,
-    }
-
-    impl Executor for FakeExec {
-        fn caps(&self) -> WorkerCapabilities {
-            self.caps.clone()
-        }
-
-        fn pipeline_depth(&self) -> usize {
-            2
-        }
-
-        fn in_flight(&self) -> usize {
-            self.queued.len()
-        }
-
-        fn submit(&mut self, _batch: Batch) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-            Ok(self.queued.pop_front())
-        }
-
-        fn wait_result_timeout(
-            &mut self,
-            _timeout: Duration,
-        ) -> anyhow::Result<Option<CompletionReport>> {
-            self.poll()
-        }
-
-        fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-            self.queued
-                .pop_front()
-                .ok_or_else(|| anyhow::anyhow!("no fake result"))
-        }
-
-        fn control(&mut self, _op: ControlOp) -> anyhow::Result<u64> {
-            Ok(0)
-        }
-
-        fn control_wait(
-            &mut self,
-            _op: ControlOp,
-            _targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            Ok(Vec::new())
         }
     }
 }

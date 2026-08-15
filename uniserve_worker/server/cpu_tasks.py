@@ -31,6 +31,10 @@ class BoundedCpuTaskPool:
             max_workers=worker_count,
             thread_name_prefix="worker-cpu",
         )
+        self._completion_wake: Callable[[], None] | None = None
+
+    def set_completion_wake(self, wake: Callable[[], None]) -> None:
+        self._completion_wake = wake
 
     @property
     def reserved(self) -> int:
@@ -62,7 +66,13 @@ class BoundedCpuTaskPool:
         except BaseException:
             reservation.release()
             raise
-        future.add_done_callback(lambda _future: reservation.release())
+        def completed(_future: object) -> None:
+            reservation.release()
+            wake = self._completion_wake
+            if wake is not None:
+                wake()
+
+        future.add_done_callback(completed)
         return future
 
     def _release(self, reservation: CpuTaskReservation) -> None:
@@ -87,10 +97,6 @@ class CpuTaskReservation:
         self._pool = pool
         self._submitted = False
         self._released = False
-
-    @property
-    def submitted(self) -> bool:
-        return self._submitted
 
     @property
     def active(self) -> bool:

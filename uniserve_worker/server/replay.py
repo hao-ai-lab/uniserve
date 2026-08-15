@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import RLock
-from typing import Final
 
 from ..batch import (
     Admission,
@@ -153,6 +152,10 @@ class _CompletedSubmission:
     def complete(self) -> bool:
         return True
 
+    @property
+    def execution_complete(self) -> bool:
+        return True
+
     def advance(self) -> None:
         return None
 
@@ -207,6 +210,11 @@ class _InFlightSubmission:
         return self._completed is not None
 
     @property
+    def execution_complete(self) -> bool:
+        with self._lock:
+            return self._raw_report is not None or self._completed is not None
+
+    @property
     def source(self) -> object | None:
         return self._source
 
@@ -230,37 +238,59 @@ class _InFlightSubmission:
             if self._failure is None:
                 self._failure = error
 
+    def _resolve_execution_locked(self) -> CompletionReport | None:
+        if self._failure is not None:
+            raise self._failure
+        if self._completed is not None:
+            return None
+        report = self._raw_report
+        if report is not None:
+            return report
+        source = self._source
+        if source is None:
+            return None
+        if isinstance(source, CompletionReport):
+            report = source
+        else:
+            ready = getattr(source, "ready")
+            if not bool(ready()):
+                return None
+            result = getattr(source, "resolve")()
+            if not isinstance(result, CompletionReport):
+                raise RuntimeError(
+                    "in-flight execution resolved to an invalid completion report"
+                )
+            report = result
+        _validate_report_shape(
+            report,
+            step_id=self.identity.step_id,
+            partition_order=self.partition_order,
+            partition_operation_keys=self.partition_operation_keys,
+        )
+        self._raw_report = report
+        return report
+
+    def _record_advance_failure_locked(self, error: BaseException) -> None:
+        self._failure = error
+        self._coordinator._abort_submission(self)
+
+    def advance_execution(self) -> bool:
+        """Resolve the execution source without polling deferred host values."""
+
+        with self._lock:
+            try:
+                self._resolve_execution_locked()
+                return self._raw_report is not None or self._completed is not None
+            except BaseException as error:
+                self._record_advance_failure_locked(error)
+                raise
+
     def advance(self) -> None:
         with self._lock:
-            if self._failure is not None:
-                raise self._failure
-            if self._completed is not None:
-                return
-            source = self._source
-            if source is None:
-                return
             try:
-                report = self._raw_report
+                report = self._resolve_execution_locked()
                 if report is None:
-                    if isinstance(source, CompletionReport):
-                        report = source
-                    else:
-                        ready = getattr(source, "ready")
-                        if not bool(ready()):
-                            return
-                        result = getattr(source, "resolve")()
-                        if not isinstance(result, CompletionReport):
-                            raise RuntimeError(
-                                "in-flight execution resolved to an invalid completion report"
-                            )
-                        report = result
-                    _validate_report_shape(
-                        report,
-                        step_id=self.identity.step_id,
-                        partition_order=self.partition_order,
-                        partition_operation_keys=self.partition_operation_keys,
-                    )
-                    self._raw_report = report
+                    return
 
                 for partition in report.partitions:
                     partition_id = int(partition.partition_id)
@@ -291,8 +321,7 @@ class _InFlightSubmission:
                 self._raw_report = None
                 self._source = None
             except BaseException as error:
-                self._failure = error
-                self._coordinator._abort_submission(self)
+                self._record_advance_failure_locked(error)
                 raise
 
     def materialized_partitions(self) -> tuple[PartitionCompletion, ...]:
@@ -353,6 +382,18 @@ class CompletionDelivery:
             for partition in current.materialized_partitions()
         )
 
+    def execution_complete(self) -> bool:
+        """Advance device execution and report whether request state is published."""
+
+        submission = self._submission
+        if isinstance(submission, _InFlightSubmission):
+            complete = submission.advance_execution()
+            current = submission.current()
+            if current is not submission:
+                self._submission = current
+            return complete
+        return True
+
     def take_ready(self) -> CompletionReport:
         current = self._current()
         partitions = tuple(
@@ -379,16 +420,11 @@ class CompletionDelivery:
 class ReplayRegistration:
     delivery: CompletionDelivery
     execute: bool
-    outcome: str
     _submission: _InFlightSubmission | None
 
 
 class ReplayCoordinator:
     """Own operation registration, shared completion progress, and host replay."""
-
-    _EXECUTE: Final[str] = "execute"
-    _INFLIGHT: Final[str] = "inflight_join"
-    _COMPLETED: Final[str] = "completed_replay"
 
     def __init__(self, *, in_flight_capacity: int, completed_capacity: int) -> None:
         if int(in_flight_capacity) < 1:
@@ -405,16 +441,6 @@ class ReplayCoordinator:
         self._ended_epochs: set[tuple[int, int]] = set()
         self._next_token = 1
         self._lock = RLock()
-
-    @property
-    def in_flight_operations(self) -> int:
-        with self._lock:
-            return len(self._in_flight)
-
-    @property
-    def completed_operations(self) -> int:
-        with self._lock:
-            return self._completed_operations
 
     def register(self, batch: Batch) -> ReplayRegistration:
         operations = batch.operations
@@ -477,7 +503,6 @@ class ReplayCoordinator:
                 return ReplayRegistration(
                     delivery=CompletionDelivery(submission),
                     execute=True,
-                    outcome=self._EXECUTE,
                     _submission=submission,
                 )
 
@@ -502,7 +527,6 @@ class ReplayCoordinator:
                 return ReplayRegistration(
                     delivery=CompletionDelivery(submission),
                     execute=False,
-                    outcome=self._INFLIGHT,
                     _submission=None,
                 )
             if completed:
@@ -522,7 +546,6 @@ class ReplayCoordinator:
                 return ReplayRegistration(
                     delivery=CompletionDelivery(completed_submission),
                     execute=False,
-                    outcome=self._COMPLETED,
                     _submission=None,
                 )
             raise RuntimeError("replay registration reached an incomplete state")

@@ -421,13 +421,7 @@ fn omni_capability_needs(
     request: &GenerateReqInput,
 ) -> GenerationCapabilityNeeds {
     let has_input_image = request.has_input_image();
-    let constraint = if request.modalities.output_image && !request.modalities.output_text {
-        GenerationConstraint::GenOnly
-    } else if has_input_image && !request.modalities.output_image {
-        GenerationConstraint::UndOnly
-    } else {
-        GenerationConstraint::Default
-    };
+    let constraint = crate::omni::generation_constraint(request);
     let behavior = GenerationBehaviorDescriptor::resolve(constraint, policy);
     let context_steps = if has_input_image {
         image_ingest.steps.clone()

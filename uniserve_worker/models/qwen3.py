@@ -13,30 +13,28 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
+import torch.nn as nn
 
+from ..batch import WorkVariant
 from ..execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
     PagedVarlenPlan,
     TokenSelection,
 )
-
-__all__ = [
-    "Qwen3Attention",
-    "Qwen3MLP",
-    "Qwen3MoE",
-    "Qwen3DecoderLayer",
-    "Qwen3Model",
-    "Qwen3ForCausalLM",
-]
-
-import torch.nn as nn
-
-from ..batch import WorkVariant
-from ..loader.schema import Stack, WeightSpec
+from ..loader.weight_utils import (
+    WeightNameMap,
+    dtype_from_name,
+    iter_weights,
+    load_parameter,
+    missing_required_parameters,
+    prepare_serving_dtype,
+    resolve_weight_files,
+    stacked_weight_name,
+)
 from ..nn import (
     FusedMoE,
     LayerSpec,
@@ -54,10 +52,30 @@ from ..nn import (
 )
 from ..nn.decoder import Qwen3MLP
 from ..nn.logits import LogitsProcessor
+from ..nn.quant import QuantizationConfig
+from ..nn.quant.base import process_quantized_modules
 from .runtime import (
     CacheGeometry,
     ExecutionModel,
     ResourceGeometry,
+)
+
+__all__ = [
+    "Qwen3Attention",
+    "Qwen3MLP",
+    "Qwen3MoE",
+    "Qwen3DecoderLayer",
+    "Qwen3Model",
+    "Qwen3ForCausalLM",
+]
+
+
+_QWEN_STACKED_WEIGHTS: WeightNameMap = (
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
 )
 
 
@@ -199,7 +217,6 @@ class Qwen3Attention(nn.Module):
         self.total_num_kv_heads = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.total_q_size = self.total_num_heads * self.head_dim
-        self.total_kv_size = self.total_num_kv_heads * self.head_dim
         self.scale = self.head_dim**-0.5
         self.qkv_proj = QKVParallelLinear(
             cfg.hidden_size,
@@ -430,7 +447,6 @@ class Qwen3Model(nn.Module):
         self.rotary = get_rope(
             cfg.head_dim,
             theta=cfg.rope_theta,
-            max_position_embeddings=cfg.max_position_embeddings,
         )
 
     def forward(
@@ -465,15 +481,68 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(ExecutionModel):
     """Qwen3 serving model with a thin tensor-level text core."""
 
-    weight_spec = WeightSpec(
-        transforms=(
-            Stack("qkv_proj", "q_proj", "q"),
-            Stack("qkv_proj", "k_proj", "k"),
-            Stack("qkv_proj", "v_proj", "v"),
-            Stack("gate_up_proj", "gate_proj", 0),
-            Stack("gate_up_proj", "up_proj", 1),
-        ),
-    )
+    @classmethod
+    def from_checkpoint(
+        cls,
+        config: Mapping[str, object],
+        *,
+        model_path: str,
+        device: str,
+        attention_backend: str | None,
+        model_scope: str,
+        execution: Any,
+        parallel: Any,
+    ) -> tuple["Qwen3ForCausalLM", None, str]:
+        del attention_backend
+        if model_scope != "whole":
+            raise ValueError("Qwen3 checkpoints require whole-model materialization")
+        model = cls(
+            config,
+            layer_spec=LayerSpec(
+                parallel=parallel,
+                quantization=QuantizationConfig.from_model_config(config),
+            ),
+        )
+        loaded, ignored = model.load_weights(iter_weights(resolve_weight_files(model_path)))
+        missing = missing_required_parameters(model, loaded)
+        if missing:
+            raise ValueError(
+                f"Qwen3 checkpoint load mismatch: missing={len(missing)} {missing[:20]!r}"
+            )
+        process_quantized_modules(model.modules())
+        serving_dtype = dtype_from_name(model.serving_dtype)
+        prepare_serving_dtype(model, serving_dtype)
+        model.to(device)
+        model.eval()
+        if ignored:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "ignored %d checkpoint tensors during Qwen3 load", len(ignored)
+            )
+        del execution
+        return model, None, str(next(model.parameters()).device)
+
+    def load_weights(
+        self,
+        weights: Any,
+    ) -> tuple[set[str], list[str]]:
+        """Load Hugging Face Qwen tensors into the model's packed projections."""
+
+        parameters = dict(self.named_parameters())
+        loaded: set[str] = set()
+        ignored: list[str] = []
+        for source_name, tensor in weights:
+            target_name, shard_id = stacked_weight_name(source_name, _QWEN_STACKED_WEIGHTS)
+            if target_name not in parameters:
+                if source_name in parameters:
+                    target_name, shard_id = source_name, None
+                else:
+                    ignored.append(source_name)
+                    continue
+            load_parameter(self, target_name, tensor, shard_id=shard_id)
+            loaded.add(target_name)
+        return loaded, ignored
 
     def __init__(self, config: Mapping[str, object], *, layer_spec: LayerSpec) -> None:
         super().__init__()

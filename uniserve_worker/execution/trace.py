@@ -16,13 +16,10 @@ logger = logging.getLogger("uniserve.execution")
 class ExecutionPhase(StrEnum):
     PROTOCOL_VALIDATION = "protocol_validation"
     CANDIDATE_STAGE = "candidate_stage"
-    PLAN_CREATION = "plan_creation"
     ROUTE_EXECUTION = "route_execution"
     FORWARD_COMPLETION = "forward_completion"
-    POSTPROCESS = "postprocess"
     COMMIT = "commit"
     CANDIDATE_DISCARD = "candidate_discard"
-    REPLAY = "replay"
     CLEANUP = "cleanup"
 
 

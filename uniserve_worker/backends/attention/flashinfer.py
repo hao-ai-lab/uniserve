@@ -110,8 +110,6 @@ class FlashInferAttentionBackend(_WrapperPool):
         has_paged_prefill = _BatchPrefillWithPagedKVCacheWrapper is not None
         return AttentionCapabilities(
             available=_flashinfer is not None,
-            segment_batched_cfg=True,
-            mixed_mode=False,
             paged_kv=has_paged_decode,
             varlen_attention=has_paged_prefill,
             varlen_paged_kv=has_paged_prefill,
@@ -751,21 +749,6 @@ class FlashInferAttentionBackend(_WrapperPool):
         )
         self._binding_prefill_graph_wrappers[id(binding)] = (key, _weakref_or_none(binding))
         self.bind_graph((id(binding), "prefill"), key)
-
-    def paged_prefill_graph_wrapper_planned(self, binding: Any) -> bool:
-        """Whether the wrapper bound to ``binding`` has been planned.
-
-        The denoise-step graph runner asserts this after capture: if the
-        dispatcher routed the captured attention to a different backend, the
-        exclusive wrapper never planned and the capture must be discarded
-        rather than replayed against undefined plan state.
-        """
-
-        bound = self._prefill_graph_wrapper_for_binding(binding)
-        if bound is None:
-            return False
-        _key, wrapper = bound
-        return getattr(wrapper, "_plan_info", None) is not None
 
     def release_paged_prefill_graph_wrapper(self, binding: Any) -> None:
         """Drop the exclusive prefill wrapper (and its caches) bound to ``binding``."""

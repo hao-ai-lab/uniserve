@@ -261,7 +261,7 @@ async def _send_sse(
             stamp_time=True,
             on_parse_error="record",
         )
-    last_event_time = _last_event_time(events, record.start_time)
+    last_event_time = _last_event_time(events)
     record.final_event_time = last_event_time
     record.latency = last_event_time - record.start_time
     _parse_openai(events, record, output_len_fallback=output_len_fallback, prompt_len=prompt_len)
@@ -402,6 +402,6 @@ def _is_token_count(value: Any) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _last_event_time(events: list[dict[str, Any]], default_start: float) -> float:
+def _last_event_time(events: list[dict[str, Any]]) -> float:
     times = [float(event["_client_t"]) for event in events if event.get("_client_t") is not None]
     return max(times) if times else time.perf_counter()

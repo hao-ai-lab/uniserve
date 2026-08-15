@@ -144,20 +144,17 @@ class GenerationPipeline:
         self.noise_scale_maximum = float(noise_scale_maximum)
         self.timestep_shift = None if timestep_shift is None else float(timestep_shift)
         self.prompt = prompt
-        if (
-            min(
-                self.latent_downsample,
-                self.max_latent_tokens,
-                self.max_vae_grid_tokens,
-                self.commit_marker_tokens,
-                self.rope_advance,
-                self.max_cfg_branches,
-                self.latent_channels,
-                self.latent_patch_size,
-            )
-            < 1
-        ):
-            raise invalid_descriptor("generation geometry must be positive")
+        if min(
+            self.latent_downsample,
+            self.max_latent_tokens,
+            self.max_vae_grid_tokens,
+            self.commit_marker_tokens,
+            self.rope_advance,
+            self.max_cfg_branches,
+            self.latent_channels,
+            self.latent_patch_size,
+        ) < 1 or self.max_cfg_branches > len(Branch):
+            raise invalid_descriptor("generation geometry exceeds the concrete model bounds")
 
     def schedule_pair(
         self,

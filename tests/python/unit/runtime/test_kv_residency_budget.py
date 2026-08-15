@@ -5,7 +5,6 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
-from uniserve_worker.bootstrap import capabilities as capabilities_module
 from uniserve_worker.bootstrap.capabilities import resolve_capabilities
 from uniserve_worker.foundation.runtime_config import (
     graph_memory_budget_bytes,
@@ -24,7 +23,12 @@ STATIC_FRACTION = 0.70
 
 @pytest.fixture(autouse=True)
 def fixed_device_total(monkeypatch):
-    monkeypatch.setattr(capabilities_module, "device_total_bytes", lambda _device: TOTAL_BYTES)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True, raising=False)
+    monkeypatch.setattr(
+        "torch.cuda.mem_get_info",
+        lambda device: (TOTAL_BYTES, TOTAL_BYTES),
+        raising=False,
+    )
 
 
 def _model(scratch: ScratchGeometry | None) -> StubModel:
@@ -75,7 +79,6 @@ def test_automatic_capacity_respects_the_static_memory_fraction(monkeypatch, wei
         lambda device: (TOTAL_BYTES - weight_bytes, TOTAL_BYTES),
         raising=False,
     )
-    monkeypatch.setattr("torch.cuda.is_available", lambda: True, raising=False)
 
     capabilities = resolve_capabilities(model, deployment)
 

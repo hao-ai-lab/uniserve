@@ -17,4 +17,3 @@ png.workspace = true
 uniserve-engine-api.workspace = true
 uniserve-scheduler.workspace = true
 uniserve-worker-ipc.workspace = true
-tokio.workspace = true
