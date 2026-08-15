@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..foundation.device import fill_cpu_ints
+from .device import fill_cpu_ints
 from ..foundation.errors import invalid_descriptor
 
 

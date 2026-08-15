@@ -1,4 +1,4 @@
-"""Host-to-device staging primitives for integer sidecar tensors."""
+"""Device identity and host integer staging for physical resource owners."""
 
 from __future__ import annotations
 
@@ -7,24 +7,19 @@ from typing import Any
 
 import torch
 
-from ..foundation.torch_compat import torch_is_compiling
-
-_np: Any | None
-try:  # Optional fast host packing path; minimal environments may not carry numpy.
-    import numpy as _numpy_module
-except Exception:  # pragma: no cover - availability depends on worker image.
-    _np = None
-else:  # pragma: no cover
-    _np = _numpy_module
-
 __all__ = [
     "canonical_device",
-    "copy_cpu_to_device",
     "cpu_int_staging_buffer",
     "fill_cpu_ints",
-    "is_pinned",
-    "torch_is_compiling",
 ]
+
+_np: Any | None
+try:
+    import numpy as _numpy_module
+except Exception:
+    _np = None
+else:
+    _np = _numpy_module
 
 _NUMPY_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
 
@@ -37,10 +32,6 @@ def canonical_device(device: torch.device | str) -> torch.device:
     return dev
 
 
-def is_pinned(tensor: torch.Tensor) -> bool:
-    return bool(getattr(tensor, "is_pinned", lambda: False)())
-
-
 def cpu_int_staging_buffer(
     numel: int,
     *,
@@ -48,7 +39,7 @@ def cpu_int_staging_buffer(
     pin: bool,
 ) -> torch.Tensor:
     """Allocate a CPU integer staging tensor with pinned storage when available."""
-    if pin and not torch_is_compiling():
+    if pin:
         try:
             return torch.empty(int(numel), dtype=dtype, pin_memory=True)
         except RuntimeError:
@@ -57,13 +48,7 @@ def cpu_int_staging_buffer(
 
 
 def fill_cpu_ints(cpu: torch.Tensor, values: Sequence[int]) -> None:
-    """Bulk-fill a CPU integer tensor from a Python int sequence.
-
-    One bulk host->host conversion for every size: a Python list of a few
-    hundred ints converts in a single C call, which is cheaper than the N
-    individual tensor ``__setitem__`` ATen ops a scalar loop issues on the
-    per-forward staging path.
-    """
+    """Bulk-fill a CPU integer tensor from a Python int sequence."""
     if len(values) == 0:
         return
     if _np is not None and cpu.dtype in _NUMPY_DTYPES:
@@ -72,14 +57,3 @@ def fill_cpu_ints(cpu: torch.Tensor, values: Sequence[int]) -> None:
         )
         return
     cpu[: len(values)].copy_(torch.as_tensor(values, dtype=cpu.dtype))
-
-
-def copy_cpu_to_device(
-    cpu: torch.Tensor,
-    *,
-    device: torch.device,
-    non_blocking: bool,
-) -> torch.Tensor:
-    """Copy a staged CPU tensor to ``device``."""
-    device = canonical_device(device)
-    return cpu.to(device=device, non_blocking=non_blocking)

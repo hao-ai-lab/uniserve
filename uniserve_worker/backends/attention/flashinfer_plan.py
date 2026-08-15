@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
-from ...foundation.sizing import ceil_div
+from ...foundation.math import ceil_div
 
 if TYPE_CHECKING:
     from .flashinfer_pool import WrapperKey

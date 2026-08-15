@@ -6,7 +6,6 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
@@ -52,14 +51,10 @@ from ..execution.forward_batch import AttentionSelection
 from ..execution.model_invocation import _ModelInvocation
 from ..execution.model_runner import ModelRunner, PreparedExecution
 from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
+from ..bootstrap.capacity import device_total_bytes
+from ..bootstrap.execution_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
-from ..foundation.sizing import ceil_div, device_total_bytes
-from ..foundation.sync_detector import (
-    sync_detection_active,
-    sync_detection_enforced,
-    sync_detector,
-)
+from ..foundation.math import ceil_div
 from ..loader.weight_set import WeightSet
 from ..models.generation import GenerationPipeline
 from ..models.identity import ModelIdentity, architecture_identity
@@ -1035,28 +1030,15 @@ class Worker:
         return min(blocks, max(0, int(self.cache_pool.request_pages) - 1))
 
     def execute(self, batch: Batch) -> CompletionReport:
-        with self._sync_guard("execute"):
-            return self.runner.execute(batch)
+        return self.runner.execute(batch)
 
     def prepare_execute(self, batch: Batch) -> object | None:
-        with self._sync_guard("prepare"):
-            return self.runner.prepare(batch)
+        return self.runner.prepare(batch)
 
     def execute_prepared(self, prepared: object) -> CompletionReport:
         if not isinstance(prepared, PreparedExecution):
             raise invalid_descriptor("prepared execution has an invalid type")
-        with self._sync_guard("execute_prepared"):
-            return self.runner.execute_prepared(prepared)
-
-    def _sync_guard(self, label: str):
-        """Run a steady-state execute region under the forbidden-sync detector.
-
-        Inert unless zero-blocking detection is activated, so the production hot
-        path is unchanged until a qualification run enables it.
-        """
-        if not sync_detection_active():
-            return nullcontext()
-        return sync_detector().guard(label, enforce=sync_detection_enforced())
+        return self.runner.execute_prepared(prepared)
 
     def _execute_warmup(
         self,

@@ -1,1 +1,1 @@
-"""Shared environment, error, sizing, profiling, and runtime support."""
+"""Worker error taxonomy, environment parsers, and integer math."""

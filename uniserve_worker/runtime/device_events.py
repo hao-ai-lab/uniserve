@@ -8,7 +8,7 @@ from threading import RLock
 
 import torch
 
-from ..foundation.device import canonical_device
+from .device import canonical_device
 from ..foundation.errors import ErrorCode, WorkerError
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.foundation.product_transfer import (
+from uniserve_worker.batch import (
     MAX_TRANSFER_DESCRIPTOR_BYTES,
     TRANSFER_DESCRIPTOR_PREFIX,
 )

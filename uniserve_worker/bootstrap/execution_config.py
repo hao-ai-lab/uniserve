@@ -10,9 +10,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, cast
 
+from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
 from uniserve_worker.batch import Domain
-
-from .env import DEFAULT_ATTENTION_BACKEND
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
@@ -20,7 +19,6 @@ __all__ = [
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
     "graph_padding_block_count",
     "graph_memory_budget_bytes",
-    "FlashInferTuningConfig",
     "LaneConfig",
     "ExecutionConfig",
     "execution_config_from_namespace",
@@ -207,18 +205,6 @@ class LaneConfig:
             value = getattr(self, name)
             if value is not None and int(value) < 1:
                 raise ValueError(f"lane {name} must be positive when configured")
-
-
-@dataclass(frozen=True)
-class FlashInferTuningConfig:
-    workspace_size: int = 512 * 1024 * 1024
-    use_tensor_core: bool | None = None
-    decode_backend: str = "fa2"
-    prefill_backend: str = DEFAULT_ATTENTION_BACKEND
-    decode_split_tile_size: int | None = None
-    prefill_split_tile_size: int | None = None
-    disable_split_kv: bool = False
-    fast_decode_plan: bool = True
 
 
 @dataclass(frozen=True)

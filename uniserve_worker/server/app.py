@@ -23,10 +23,9 @@ from ..foundation.errors import (
     should_capture_trace,
     unsupported_control,
 )
-from ..foundation.profiling import profile_range
 from ..worker import Worker
 from .process import WorkerIpcTransport
-from .profiler import WorkerProfiler
+from .profiler import WorkerProfiler, profile_range
 from .replay import CompletionDelivery, ReplayCoordinator
 
 __all__ = ["WorkerServer", "dispatch"]

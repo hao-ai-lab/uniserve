@@ -1,4 +1,5 @@
-"""Triton runtime compatibility helpers."""
+"""Triton toolchain setup for fused worker kernels."""
+
 from __future__ import annotations
 
 import os
@@ -9,25 +10,18 @@ from pathlib import Path
 
 import torch
 
-from .env import env_flag
+from ..foundation.env import env_flag
 
 __all__ = [
-    'triton_fused_layers_enabled',
-    'ensure_blackwell_ptxas',
-    'triton_device_supported',
+    "configure_triton_toolchain",
+    "triton_available",
 ]
 
 
-def triton_fused_layers_enabled() -> bool:
-    return True
-
-
 @lru_cache(maxsize=1)
-def ensure_blackwell_ptxas() -> bool:
-    """Point Triton at a CUDA 13+ ptxas when serving on Blackwell."""
+def configure_triton_toolchain() -> bool:
+    """Install a CUDA 13+ ptxas for Blackwell devices when one is present."""
 
-    # TRITON_PTXAS_PATH is Triton's own env var; we intentionally read and write
-    # it directly rather than through core/env.py to drive the external toolchain.
     existing = os.environ.get("TRITON_PTXAS_PATH")
     if existing and _ptxas_supports_blackwell(Path(existing)):
         return True
@@ -39,17 +33,18 @@ def ensure_blackwell_ptxas() -> bool:
         if _ptxas_supports_blackwell(path):
             os.environ["TRITON_PTXAS_PATH"] = str(path)
             return True
-    return False
+    return env_flag("UNISERVE_ENABLE_UNSUPPORTED_TRITON_SM100")
 
 
-def triton_device_supported(device: torch.device | str) -> bool:
-    dev = torch.device(device)
+def triton_available(device: torch.device | str) -> bool:
+    """Whether fused Triton kernels may run on ``device``."""
+
     try:
-        major, _minor = torch.cuda.get_device_capability(dev)
+        major, _minor = torch.cuda.get_device_capability(torch.device(device))
     except Exception:
         return False
     if major >= 10:
-        return ensure_blackwell_ptxas() or env_flag("UNISERVE_ENABLE_UNSUPPORTED_TRITON_SM100")
+        return configure_triton_toolchain()
     return True
 
 

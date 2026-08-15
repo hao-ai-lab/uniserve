@@ -89,7 +89,7 @@ from uniserve_worker.execution.trace import (
     ExecutionTrace,
     OperationTrace,
 )
-from uniserve_worker.foundation.device import canonical_device
+from uniserve_worker.backends.triton import triton_available
 from uniserve_worker.foundation.errors import (
     ErrorCode as WorkerErrorCode,
 )
@@ -101,9 +101,9 @@ from uniserve_worker.foundation.errors import (
     should_capture_trace,
     unsupported_operation,
 )
-from uniserve_worker.foundation.profiling import profile_range
-from uniserve_worker.foundation.sizing import bucketed_length
-from uniserve_worker.foundation.triton_compat import triton_device_supported
+from uniserve_worker.foundation.math import bucketed_length
+from uniserve_worker.runtime.device import canonical_device
+from uniserve_worker.server.profiler import profile_range
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import (
     BranchSource,
@@ -7110,7 +7110,7 @@ def _run_fused_top_k_sampling(
     parameters: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not triton_device_supported(logits.device):
+    if not triton_available(logits.device):
         raise capability_mismatch("fused sampling requires a supported Triton toolchain")
     provider = import_module("uniserve_kernel.sampling")
     result = provider.sample_top_k(

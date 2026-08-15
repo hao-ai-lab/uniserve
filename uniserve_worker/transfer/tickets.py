@@ -34,11 +34,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from ..batch import MAX_TRANSFER_DESCRIPTOR_BYTES, TRANSFER_DESCRIPTOR_PREFIX
 from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_error
-from ..foundation.product_transfer import (
-    MAX_TRANSFER_DESCRIPTOR_BYTES,
-    TRANSFER_DESCRIPTOR_PREFIX,
-)
 
 if TYPE_CHECKING:
     import torch

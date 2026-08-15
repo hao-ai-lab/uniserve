@@ -18,9 +18,12 @@ def assemble_worker(config: WorkerLaunchConfig):
 
     plan = resolve_worker_plan(config.worker_kind)
     from ..backends.attention import resolve_attention_selection
+    from ..backends.triton import configure_triton_toolchain
     from ..nn.mesh import TensorParallelSpec
     from ..nn.placement import place_towers
     from ..server.distributed import build_device_mesh
+
+    configure_triton_toolchain()
 
     mesh = build_device_mesh(
         tp_rank=config.placement.tp_rank,

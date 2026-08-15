@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from uniserve_worker.batch import Domain
-from uniserve_worker.foundation.runtime_config import LaneConfig
+from uniserve_worker.bootstrap.execution_config import LaneConfig
 
 
 class ExecutionPartitionError(RuntimeError):

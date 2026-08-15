@@ -11,7 +11,7 @@ from typing import Final
 import torch
 
 from ..batch import DType, ProductKind, ProductRef, RequestKey, StaticDim, StorageClass
-from ..foundation.device import canonical_device
+from .device import canonical_device
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
 from .device_events import DeviceEventPool
 

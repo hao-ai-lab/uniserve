@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from uniserve_worker.foundation.env import env_flag, flag_from_value
-from uniserve_worker.foundation.sizing import ceil_div
+from uniserve_worker.foundation.math import ceil_div
 
 pytestmark = pytest.mark.unit
 

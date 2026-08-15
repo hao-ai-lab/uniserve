@@ -9,14 +9,9 @@ from typing import cast
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
-from ..foundation.device import (
-    copy_cpu_to_device,
-    cpu_int_staging_buffer,
-    fill_cpu_ints,
-    is_pinned,
-)
 from ..foundation.errors import capability_mismatch, compute_error, invalid_descriptor
-from ..foundation.sizing import bucketed_page_count
+from ..foundation.math import bucketed_length
+from .device import cpu_int_staging_buffer, fill_cpu_ints
 from ..nn.quant.kv_cache import (
     dequantize_fp8_block,
     fp8_quantize,
@@ -568,7 +563,7 @@ class CacheBatchView:
             required = row.length + query if write else row.length
             if required > row.capacity:
                 raise invalid_descriptor("KV row exceeds scheduler capacity")
-        self._block_table_width = bucketed_page_count(max(map(len, self._block_ids)))
+        self._block_table_width = bucketed_length(max(map(len, self._block_ids)))
         self._block_tables: dict[torch.device, torch.Tensor] = {}
         self._cache_lengths: dict[torch.device, torch.Tensor] = {}
 
@@ -610,7 +605,7 @@ class CacheBatchView:
             required = row.length + query if write else row.length
             if required > row.capacity:
                 raise invalid_descriptor("KV row exceeds scheduler capacity")
-        view._block_table_width = bucketed_page_count(max(map(len, view._block_ids)))
+        view._block_table_width = bucketed_length(max(map(len, view._block_ids)))
         view._block_tables = {}
         view._cache_lengths = {}
         return view
@@ -834,10 +829,9 @@ class CacheBatchView:
             fill_cpu_ints(cpu[offset : offset + count], pages)
             cpu[offset + count : offset + self._block_table_width].zero_()
             offset += self._block_table_width
-        result = copy_cpu_to_device(
-            cpu,
+        result = cpu.to(
             device=target,
-            non_blocking=target.type == "cuda" and is_pinned(cpu),
+            non_blocking=target.type == "cuda" and bool(cpu.is_pinned()),
         ).view(len(self._rows), self._block_table_width)
         self._block_tables[target] = result
         return result
@@ -856,10 +850,9 @@ class CacheBatchView:
             pin=target.type == "cuda",
         )
         fill_cpu_ints(cpu, self._base_lens)
-        result = copy_cpu_to_device(
-            cpu,
+        result = cpu.to(
             device=target,
-            non_blocking=target.type == "cuda" and is_pinned(cpu),
+            non_blocking=target.type == "cuda" and bool(cpu.is_pinned()),
         )
         self._cache_lengths[target] = result
         return result

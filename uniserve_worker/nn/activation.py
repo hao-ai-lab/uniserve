@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
+from ..backends.triton import triton_available
 
 __all__ = [
     'SiluAndMul',
@@ -79,8 +79,7 @@ class _TritonSiluAndMul:
             return False
         if not (
             triton is not None
-            and triton_fused_layers_enabled()
-            and triton_device_supported(x.device)
+            and triton_available(x.device)
         ):
             return False
         return int(x.shape[-1] // 2) > 0

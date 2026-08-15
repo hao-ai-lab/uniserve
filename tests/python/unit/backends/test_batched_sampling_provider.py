@@ -6,7 +6,7 @@ import pytest
 import torch
 from uniserve_kernel.sampling import sample_top_k
 
-from uniserve_worker.foundation.triton_compat import ensure_blackwell_ptxas
+from uniserve_worker.backends.triton import configure_triton_toolchain
 
 pytestmark = pytest.mark.unit
 
@@ -97,7 +97,7 @@ def test_top_k_provider_matches_the_full_expression() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
-    assert ensure_blackwell_ptxas()
+    assert configure_triton_toolchain()
     inputs = _inputs(torch.device("cuda"))
     expected = _reference(*inputs, 4)
     sample_top_k(*inputs, 4)
@@ -116,7 +116,7 @@ def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_top_k_provider_accepts_every_serving_wave_row_count() -> None:
-    assert ensure_blackwell_ptxas()
+    assert configure_triton_toolchain()
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(42)
 

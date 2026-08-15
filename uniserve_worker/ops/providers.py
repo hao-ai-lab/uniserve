@@ -7,6 +7,7 @@ from importlib import import_module
 
 import torch
 
+from ..backends.triton import triton_available
 from ..execution.forward_batch import PagedDecodePlan
 from .core import Dispatcher
 from .requests import (
@@ -665,9 +666,8 @@ class _TritonQKNormRopeProvider:
         k_heads = int(req.k.shape[1]) if req.k.ndim in (3, 4) else 0
         return not (
             norm_mod.triton is None
-            or not norm_mod.triton_fused_layers_enabled()
             or torch.is_grad_enabled()
-            or not norm_mod.triton_device_supported(req.q.device)
+            or not triton_available(req.q.device)
             or req.q.device != req.k.device
             or req.q.dtype != req.k.dtype
             or q_heads <= 0
@@ -732,9 +732,8 @@ class _TritonQKNormRopeProvider:
         heads = int(req.q.shape[1]) if req.q.ndim in (3, 4) else 0
         return not (
             rope_mod.triton is None
-            or not rope_mod.triton_fused_layers_enabled()
             or torch.is_grad_enabled()
-            or not rope_mod.triton_device_supported(req.q.device)
+            or not triton_available(req.q.device)
             or axis_dim <= 0
             or axis_dim % 2 != 0
             or heads <= 0

@@ -9,7 +9,7 @@ import torch
 
 from ..batch import FixedPoint, ProductKind, ProductRef, RequestKey, VersionRef
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.sizing import ceil_div
+from ..foundation.math import ceil_div
 from ..runtime.cache_pool import CachePool, CacheRow
 from .tickets import Locator, Transport, fetch_locator, make_transport
 

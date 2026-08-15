@@ -6,13 +6,14 @@ from collections.abc import Callable
 
 from ...execution.forward_batch import AttentionBackend, AttentionSelection
 from ...foundation.errors import capability_mismatch
-from ...foundation.runtime_config import FlashInferTuningConfig
+from .tuning import FlashInferTuningConfig
 from .base import AttentionCapabilities
 
 __all__ = [
     "AttentionBackend",
     "AttentionCapabilities",
     "ATTENTION_BACKENDS",
+    "FlashInferTuningConfig",
     "resolve_attention_selection",
 ]
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from ..foundation.sizing import DEFAULT_BLOCK_SIZE
+from .capacity import DEFAULT_BLOCK_SIZE
 from ..server.worker_kind import WorkerKind
 from .config import WorkerLaunchConfig
 

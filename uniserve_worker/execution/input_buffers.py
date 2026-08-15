@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import torch
 
-from uniserve_worker.foundation.device import fill_cpu_ints
+from uniserve_worker.runtime.device import fill_cpu_ints
 
 from .forward_batch import (
     AttnPlan,

@@ -12,11 +12,8 @@ from typing import Any, Mapping
 from torch import nn
 
 from ..foundation.errors import capability_mismatch
-from ..foundation.runtime_config import ExecutionConfig
-from ..foundation.sizing import (
-    DEFAULT_MAX_BATCH_OPS,
-    DEFAULT_MAX_REQUEST_POOL_SIZE,
-)
+from .capacity import DEFAULT_MAX_BATCH_OPS, DEFAULT_MAX_REQUEST_POOL_SIZE
+from .execution_config import ExecutionConfig
 from ..loader import Loader
 from ..loader.paths import read_config, resolve_model_path
 from ..models.identity import ModelIdentity, architecture_identity

@@ -1,23 +1,16 @@
-"""Worker-side per-step profiling capture controller.
-
-The profiler is intentionally controlled by environment variables so production
-hot paths stay unchanged unless a profiling run asks for traces. The hot-path
-span primitive (``profile_range``) lives in ``foundation/profiling.py``; this
-module owns the stateful per-execute-step capture/export orchestration.
-"""
+"""Worker-side profiling spans and per-step capture."""
 from __future__ import annotations
 
 import inspect
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from ..foundation.env import flag_from_value, int_from_value
-from ..foundation.profiling import _parse_activities, profile_range
 
 torch: Any | None
 try:  # torch is an optional import for CPU-only control-plane tests.
@@ -27,7 +20,11 @@ except Exception:  # pragma: no cover - exercised only in torch-free envs.
 else:  # pragma: no cover
     torch = _torch_module
 
-__all__ = ["WorkerProfiler", "WorkerProfileConfig"]
+__all__ = ["WorkerProfiler", "WorkerProfileConfig", "profile_range"]
+
+_PROFILE_NVTX_ENV = "UNISERVE_PROFILE_NVTX"
+_NVTX_ENV = "UNISERVE_NVTX"
+_NULL_CONTEXT = nullcontext()
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +181,56 @@ class WorkerProfiler:
             self._torch_profiler = None
             self._active = False
             self._finished = True
+
+
+def profile_range(debug_name: str):
+    """Emit a torch-profiler span and/or NVTX range when profiling is active."""
+    record = _torch_profiler_enabled()
+    nvtx = _nvtx_ranges_enabled()
+    if not record and not nvtx:
+        return _NULL_CONTEXT
+    return _profile_range_impl(debug_name, record=record, nvtx=nvtx)
+
+
+@contextmanager
+def _profile_range_impl(debug_name: str, *, record: bool, nvtx: bool) -> Iterator[None]:
+    with ExitStack() as stack:
+        if record and torch is not None:
+            stack.enter_context(torch.profiler.record_function(debug_name))
+        if nvtx and torch is not None:
+            torch.cuda.nvtx.range_push(debug_name)
+            stack.callback(torch.cuda.nvtx.range_pop)
+        yield
+
+
+def _torch_profiler_enabled() -> bool:
+    if torch is None:
+        return False
+    enabled = getattr(torch.autograd, "_profiler_enabled", None)
+    return bool(enabled()) if callable(enabled) else False
+
+
+def _nvtx_ranges_enabled() -> bool:
+    if torch is None:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    env = os.environ
+    if flag_from_value(env.get(_PROFILE_NVTX_ENV)) or flag_from_value(env.get(_NVTX_ENV)):
+        return True
+    activities = _parse_activities(env.get(_PROFILE_ACTIVITIES_ENV, ""))
+    return "CUDA_PROFILER" in activities or flag_from_value(env.get(_CUDA_PROFILER_ENV))
+
+
+def _parse_activities(raw: str | None) -> tuple[str, ...]:
+    values = []
+    for piece in (raw or "").replace(",", " ").split():
+        value = piece.strip().upper()
+        if value == "CUDA":
+            value = "GPU"
+        if value in {"CPU", "GPU", "CUDA_PROFILER"} and value not in values:
+            values.append(value)
+    return tuple(values)
 
 
 def _trace_base(config: WorkerProfileConfig, start_step: int, end_step: int) -> str:

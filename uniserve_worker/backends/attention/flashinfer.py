@@ -12,7 +12,7 @@ __all__ = [
 ]
 
 from ...execution.forward_batch import ForwardBatch
-from ...foundation.runtime_config import FlashInferTuningConfig
+from .tuning import FlashInferTuningConfig
 from .base import AttentionCapabilities
 from .flashinfer_kernels import (
     _decode_effective_seqlens,

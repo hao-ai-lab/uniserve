@@ -6,7 +6,7 @@ from typing import Any
 import torch
 
 from ...foundation.env import env_optional_flag
-from ...foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
+from ..triton import triton_available
 from ..paged_kv_math import decode_write_locations, paged_kv_write
 from .flashinfer_plan import _DecodePlanWorkspace, _PrefillPlanWorkspace
 
@@ -199,7 +199,7 @@ def _triton_decode_indices_enabled(device: torch.device | str) -> bool:
         return False
     if env_optional_flag(_TRITON_DECODE_INDICES_ENV) is False:
         return False
-    return triton_fused_layers_enabled() and triton_device_supported(device)
+    return triton_available(device)
 
 
 def _write_decode_token(

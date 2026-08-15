@@ -13,7 +13,7 @@ from ..execution.forward_batch import (
     PagedVarlenPlan,
     TokenSelection,
 )
-from ..foundation.sizing import (
+from ..bootstrap.capacity import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
     DEFAULT_MAX_REQUEST_POOL_SIZE,

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from uniserve_worker.foundation.triton_compat import triton_device_supported
+from uniserve_worker.backends.triton import triton_available
 
 try:  # pragma: no cover - availability depends on the serving environment.
     import triton
@@ -158,7 +158,7 @@ class RuntimeStates:
             dtype=torch.int64,
             device=self.device,
         )
-        if triton is not None and self.device.type == "cuda" and triton_device_supported(self.device):
+        if triton is not None and self.device.type == "cuda" and triton_available(self.device):
             self._reset_device_row(0, 0, 0, 0)
             for block_size in (1, 2, 4, 8, 16, 32, 64, 128):
                 if block_size > self.request_pool_size:
@@ -304,7 +304,7 @@ class RuntimeStates:
         selected = ones_i32 if selected_points is None else selected_points.reshape(-1)
         if int(selected.numel()) != count:
             raise ValueError("decode selected points are not row-aligned")
-        if triton is not None and self.device.type == "cuda" and triton_device_supported(self.device):
+        if triton is not None and self.device.type == "cuda" and triton_available(self.device):
             block_size = triton.next_power_of_2(count)
             selected_input = ones_i32 if selected_points is None else selected
             _publish_decode_kernel[(1,)](
@@ -404,7 +404,7 @@ class RuntimeStates:
         logical_length: int,
         sampling_position: int,
     ) -> None:
-        if triton is not None and triton_device_supported(self.device):
+        if triton is not None and triton_available(self.device):
             block_size = 256
             span = max(self.continuation_width, self.vocab_size)
             _reset_row_kernel[(triton.cdiv(span, block_size),)](

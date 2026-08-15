@@ -25,11 +25,8 @@ __all__ = [
     "capability_mismatch",
     "unsupported_operation",
     "unsupported_control",
-    "input_error",
     "compute_error",
     "resource_error",
-    "resource_lease_violation",
-    "scheduler_bug",
     "distributed_setup_error",
 ]
 
@@ -232,24 +229,12 @@ def capability_mismatch(message: str, **kw: Any) -> WorkerError:
     return _make(ErrorCode.CAPABILITY_MISMATCH, message, **kw)
 
 
-def input_error(message: str, **kw: Any) -> InputError:
-    return InputError(message, **kw)
-
-
 def compute_error(message: str, **kw: Any) -> ComputeError:
     return ComputeError(message, **kw)
 
 
 def resource_error(message: str, **kw: Any) -> ResourceError:
     return ResourceError(message, **kw)
-
-
-def resource_lease_violation(message: str, **kw: Any) -> WorkerError:
-    return _make(ErrorCode.RESOURCE_LEASE_VIOLATION, message, **kw)
-
-
-def scheduler_bug(message: str, **kw: Any) -> WorkerError:
-    return _make(ErrorCode.SCHEDULER_BUG, message, **kw)
 
 
 def distributed_setup_error(message: str, **kw: Any) -> WorkerError:

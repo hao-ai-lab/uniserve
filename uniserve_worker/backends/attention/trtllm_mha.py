@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 import torch
 
 from ...execution.forward_batch import ForwardBatch
-from ...foundation.runtime_config import FlashInferTuningConfig
+from .tuning import FlashInferTuningConfig
 from .base import AttentionCapabilities
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to

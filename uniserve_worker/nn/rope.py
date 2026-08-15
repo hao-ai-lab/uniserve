@@ -14,7 +14,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ..foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
+from ..backends.triton import triton_available
 
 __all__ = [
     'rotate_half',
@@ -763,7 +763,7 @@ def can_run_triton_qk_multi_axis_rms_norm_rope(
     *,
     axis_dims: tuple[int, ...],
 ) -> bool:
-    if triton is None or not triton_fused_layers_enabled() or torch.is_grad_enabled():
+    if triton is None or torch.is_grad_enabled():
         return False
     if len(axis_dims) != 3 or len(cos) != 3 or len(sin) != 3:
         return False
@@ -829,7 +829,7 @@ def can_run_triton_qk_split_rms_norm_rope(
     *,
     rope_dim: int,
 ) -> bool:
-    if triton is None or not triton_fused_layers_enabled() or torch.is_grad_enabled():
+    if triton is None or torch.is_grad_enabled():
         return False
     if not _qk_rms_norm_rope_tensors_on_supported_device(
         q, k, q_head_weight, k_head_weight, cos, sin
@@ -897,7 +897,7 @@ def _qk_rms_norm_rope_is_eligible(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> bool:
-    if triton is None or not triton_fused_layers_enabled() or torch.is_grad_enabled():
+    if triton is None or torch.is_grad_enabled():
         return False
     if not _qk_rms_norm_rope_tensors_on_supported_device(q, k, q_weight, k_weight, cos, sin):
         return False
@@ -919,7 +919,7 @@ def _qk_rms_norm_rope_tensors_on_supported_device(
         and k_weight.is_cuda
         and cos.is_cuda
         and sin.is_cuda
-        and triton_device_supported(q.device)
+        and triton_available(q.device)
         and q.device == k.device
         and q.device == cos.device
         and q.device == sin.device
@@ -972,11 +972,10 @@ class _TritonPackedRope:
     def is_eligible(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> bool:
         if (
             triton is None
-            or not triton_fused_layers_enabled()
             or not x.is_cuda
             or not cos.is_cuda
             or not sin.is_cuda
-            or not triton_device_supported(x.device)
+            or not triton_available(x.device)
             or torch.is_grad_enabled()
             or not x.is_contiguous()
             or not cos.is_contiguous()

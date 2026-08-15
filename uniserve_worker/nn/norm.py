@@ -7,7 +7,7 @@ from typing import overload
 import torch
 import torch.nn as nn
 
-from ..foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
+from ..backends.triton import triton_available
 
 __all__ = [
     "RMSNorm",
@@ -196,7 +196,7 @@ def _norm_inputs_eligible(hidden_states: torch.Tensor, weight: torch.Tensor) -> 
 
 
 def _triton_norm_available(device: torch.device) -> bool:
-    return triton is not None and triton_fused_layers_enabled() and triton_device_supported(device)
+    return triton is not None and triton_available(device)
 
 
 def _sgl_rms_norm_input(hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -425,12 +425,11 @@ def can_run_triton_qk_rms_norm(
     del q_eps, k_eps
     if (
         triton is None
-        or not triton_fused_layers_enabled()
         or not q.is_cuda
         or not k.is_cuda
         or not q_weight.is_cuda
         or not k_weight.is_cuda
-        or not triton_device_supported(q.device)
+        or not triton_available(q.device)
         or torch.is_grad_enabled()
         or q.device != k.device
         or q.dtype != k.dtype

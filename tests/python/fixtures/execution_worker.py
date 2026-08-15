@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 from uniserve_worker.backends.attention import resolve_attention_selection
-from uniserve_worker.foundation.runtime_config import ExecutionConfig, FlashInferTuningConfig
+from uniserve_worker.backends.attention import FlashInferTuningConfig
+from uniserve_worker.bootstrap.execution_config import ExecutionConfig
 from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.server.stub import StubModel, stub_deployment

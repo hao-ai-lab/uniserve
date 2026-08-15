@@ -21,7 +21,7 @@ from uniserve_worker.execution.forward_batch import (
     TokenSelection,
 )
 from uniserve_worker.execution.lane import verify_graph_context
-from uniserve_worker.foundation.sizing import bucketed_length
+from uniserve_worker.foundation.math import bucketed_length
 from uniserve_worker.models.runtime import CacheGeometry
 
 logger = logging.getLogger(__name__)

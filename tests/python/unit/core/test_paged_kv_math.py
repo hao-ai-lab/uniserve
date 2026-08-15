@@ -4,12 +4,12 @@ import pytest
 import torch
 
 from uniserve_worker.backends import paged_kv_math
-from uniserve_worker.foundation.triton_compat import triton_device_supported
+from uniserve_worker.backends.triton import triton_available
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fused_paged_kv_write_replays_dynamic_rows_in_cuda_graph():
-    if paged_kv_math.triton is None or not triton_device_supported(torch.device("cuda")):
+    if paged_kv_math.triton is None or not triton_available(torch.device("cuda")):
         pytest.skip("Triton fused layers are not supported on this CUDA device")
 
     device = torch.device("cuda")

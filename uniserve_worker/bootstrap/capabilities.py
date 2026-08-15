@@ -11,14 +11,16 @@ from ..capabilities import (
     configured_work_variants,
 )
 from ..foundation.errors import invalid_descriptor
-from ..foundation.runtime_config import (
-    graph_memory_budget_bytes,
-    graph_padding_block_count,
-)
-from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
+from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment, active_latent_capacity_tokens
-from .capacity import latent_pool_capacity_bytes, operation_window
+from .capacity import (
+    derive_runtime_kv_capacity,
+    device_total_bytes,
+    latent_pool_capacity_bytes,
+    operation_window,
+)
+from .execution_config import graph_memory_budget_bytes, graph_padding_block_count
 
 __all__ = ["resolve_capabilities"]
 

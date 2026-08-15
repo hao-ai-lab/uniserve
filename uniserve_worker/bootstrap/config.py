@@ -5,10 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
-from ..foundation.runtime_config import (
-    ExecutionConfig,
-    execution_config_from_namespace,
-)
+from .execution_config import ExecutionConfig, execution_config_from_namespace
 from ..server.worker_kind import WorkerKind
 from .plan import ModelLoadScope, resolve_worker_plan
 

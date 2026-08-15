@@ -22,7 +22,7 @@ from ..batch import (
     VersionRef,
 )
 from ..batch import ErrorCode as ProtocolErrorCode
-from ..foundation.device import canonical_device
+from ..runtime.device import canonical_device
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
 from ..runtime.device_events import DeviceEventPool
 from ..transfer.tickets import (

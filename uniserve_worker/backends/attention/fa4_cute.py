@@ -16,7 +16,7 @@ from typing import Any, Protocol
 import torch
 
 from ...execution.forward_batch import ForwardBatch
-from ...foundation.sizing import ceil_div
+from ...foundation.math import ceil_div
 from ..paged_kv_math import paged_kv_write, write_locations
 from .base import AttentionCapabilities
 from .layout import QKVLayout, normalize_kv, normalize_to

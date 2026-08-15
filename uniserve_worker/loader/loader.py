@@ -8,7 +8,7 @@ from typing import Any
 from torch import nn
 
 from ..foundation.errors import capability_mismatch
-from ..foundation.runtime_config import ExecutionConfig
+from ..bootstrap.execution_config import ExecutionConfig
 from ..nn.mesh import TensorParallelSpec
 
 

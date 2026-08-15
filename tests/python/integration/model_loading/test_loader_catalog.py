@@ -8,10 +8,10 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from uniserve_worker.bootstrap.execution_config import ExecutionConfig
 from uniserve_worker.bootstrap.model_loader import WorkerModelLoadRequest, load_worker_model
 from uniserve_worker.bootstrap.plan import ModelLoadScope
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.foundation.runtime_config import ExecutionConfig
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.nn.layer import LayerSpec
 from uniserve_worker.nn.mesh import TensorParallelSpec

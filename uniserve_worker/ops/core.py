@@ -5,8 +5,6 @@ import os
 import time
 from typing import Any, Callable, Generic, Protocol, TypeVar, runtime_checkable
 
-from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
-
 Req = TypeVar("Req")
 Res = TypeVar("Res")
 ProviderReq = TypeVar("ProviderReq", contravariant=True)
@@ -93,7 +91,7 @@ class Dispatcher(Generic[Req, Res]):
 
     def _observe(self, provider: Provider[Req, Res], req: Req) -> Res:
         stats = getattr(req, "stats", None)
-        if stats is None or _torch_is_compiling():
+        if stats is None:
             return provider.run(req)
         start = time.perf_counter_ns()
         try:

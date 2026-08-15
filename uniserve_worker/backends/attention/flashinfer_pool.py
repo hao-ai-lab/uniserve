@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...foundation.runtime_config import FlashInferTuningConfig
+from .tuning import FlashInferTuningConfig
 from .flashinfer_plan import (
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,

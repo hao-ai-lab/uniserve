@@ -11,7 +11,7 @@ from uniserve_worker.batch import WorkVariant
 from uniserve_worker.bootstrap.capabilities import resolve_capabilities
 from uniserve_worker.bootstrap.capacity import latent_trajectory_bytes, model_arena_capacity
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.foundation.sizing import ceil_div
+from uniserve_worker.foundation.math import ceil_div
 from uniserve_worker.models.identity import ModelIdentity, architecture_identity
 
 pytestmark = pytest.mark.unit

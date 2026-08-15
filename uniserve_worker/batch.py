@@ -24,10 +24,20 @@ from functools import lru_cache
 from typing import Any, TypeAlias, TypeVar, cast
 
 from .foundation.errors import invalid_descriptor
-from .foundation.product_transfer import (
-    is_transfer_descriptor,
-    validate_transfer_descriptor_frame,
-)
+
+TRANSFER_DESCRIPTOR_PREFIX = b"uniserve-transfer\0"
+MAX_TRANSFER_DESCRIPTOR_BYTES = 64 * 1024
+
+
+def is_transfer_descriptor(value: bytes) -> bool:
+    return value.startswith(TRANSFER_DESCRIPTOR_PREFIX)
+
+
+def validate_transfer_descriptor_frame(value: bytes) -> None:
+    if not is_transfer_descriptor(value):
+        raise ValueError("cross-stage product input has no transfer descriptor frame")
+    if len(value) > MAX_TRANSFER_DESCRIPTOR_BYTES:
+        raise ValueError("cross-stage product transfer descriptor exceeds its byte bound")
 
 
 class TokenMode(StrEnum):

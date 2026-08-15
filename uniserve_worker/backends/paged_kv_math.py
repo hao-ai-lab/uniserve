@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-from ..foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
+from .triton import triton_available
 
 __all__ = [
     'write_locations',
@@ -102,10 +102,9 @@ def _triton_paged_kv_write_eligible(
     if (
         triton is None
         or torch.is_grad_enabled()
-        or not triton_fused_layers_enabled()
         or not all(tensor.is_cuda for tensor in tensors)
         or len({tensor.device for tensor in tensors}) != 1
-        or not triton_device_supported(k_cache.device)
+        or not triton_available(k_cache.device)
     ):
         return False
     if page_ids.dtype not in (torch.int32, torch.int64) or offsets.dtype not in (
