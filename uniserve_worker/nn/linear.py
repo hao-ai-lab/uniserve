@@ -61,10 +61,24 @@ class LinearBase(nn.Module):
 
 def _attach_shard_plan(module: LinearBase, plan_for: Callable[[nn.Parameter], ShardPlan]) -> None:
     """Attach a per-parameter :class:`ShardPlan` to weight/weight_scale/bias."""
+    from ..loader.weight_loaders import (
+        default_weight_loader,
+        packed_weight_loader,
+        sharded_weight_loader,
+    )
+
     for name in ("weight", "weight_scale", "bias"):
         param = getattr(module, name, None)
         if isinstance(param, nn.Parameter):
-            set_shard_plan(param, plan_for(param))
+            plan = plan_for(param)
+            set_shard_plan(param, plan)
+            current = getattr(param, "weight_loader", None)
+            if current is default_weight_loader:
+                setattr(
+                    param,
+                    "weight_loader",
+                    packed_weight_loader if plan.slots else sharded_weight_loader,
+                )
 
 
 class ColumnParallelLinear(LinearBase):
@@ -125,6 +139,10 @@ class RowParallelLinear(LinearBase):
         # The weight shards on the input axis; the per-channel weight_scale is
         # replicated across ranks (its rows index the unsharded output axis).
         set_shard_plan(self.weight, ShardPlan(spec=shard_spec(1, parallel)))
+        from ..loader.weight_loaders import default_weight_loader, sharded_weight_loader
+
+        if getattr(self.weight, "weight_loader", None) is default_weight_loader:
+            setattr(self.weight, "weight_loader", sharded_weight_loader)
         weight_scale = getattr(self, "weight_scale", None)
         if isinstance(weight_scale, nn.Parameter):
             set_shard_plan(

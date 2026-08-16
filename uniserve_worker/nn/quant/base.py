@@ -62,6 +62,13 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
             "bias",
             nn.Parameter(torch.empty(int(output_size))) if bias else None,
         )
+        from ...loader.weight_loaders import attach_weight_loader, default_weight_loader
+
+        weight = cast(nn.Parameter, module.weight)
+        attach_weight_loader(weight, default_weight_loader)
+        bias_parameter = cast(nn.Parameter | None, module.bias)
+        if bias_parameter is not None:
+            attach_weight_loader(bias_parameter, default_weight_loader)
 
     def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
         from ..linear import LinearBase

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
+from ..loader.weight_set import WeightSet
 from ..models.identity import architecture_identity
 from ..models.runtime import ExecutionModel
 from .config import WorkerLaunchConfig
@@ -66,6 +67,8 @@ def assemble_worker(config: WorkerLaunchConfig):
             {"architecture": stub.architecture},
         )
         weight_digest = None
+        weights = WeightSet.from_module(stub)
+        weight_sidecars: tuple[str, ...] = ("config.json",)
     else:
         from .model_loader import WorkerModelLoadRequest, load_worker_model
 
@@ -88,6 +91,7 @@ def assemble_worker(config: WorkerLaunchConfig):
                     if config.placement.tower_devices is not None
                     else None
                 ),
+                load=config.load,
             )
         )
         model = loaded.model
@@ -95,8 +99,11 @@ def assemble_worker(config: WorkerLaunchConfig):
         tokenizer = loaded.tokenizer
         architecture_digest = loaded.identity.architecture_digest
         weight_digest = loaded.identity.weight_digest
+        weights = loaded.weights
+        weight_sidecars = loaded.entry.sidecars
 
     place_towers(model, mesh)
+    weights = WeightSet.from_module(model, digest=weight_digest or weights.digest)
 
     from ..worker import Worker
 
@@ -118,6 +125,8 @@ def assemble_worker(config: WorkerLaunchConfig):
         cross_process=config.worker_kind.value != "full",
         architecture_digest=architecture_digest,
         weight_digest=weight_digest,
+        weights=weights,
+        weight_sidecars=weight_sidecars,
         pipeline_depth=config.ipc.pipeline_depth,
         completion_payload_bytes=config.ipc.max_payload_bytes,
         snapshot_dir=config.snapshot_dir,

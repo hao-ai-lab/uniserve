@@ -22,6 +22,7 @@ class CatalogEntry:
     architecture: str
     model_class: type[nn.Module]
     scopes: tuple[ModelLoadScope, ...] = (ModelLoadScope.WHOLE,)
+    sidecars: tuple[str, ...] = ("config.json",)
 
     def __post_init__(self) -> None:
         if not self.architecture:
@@ -30,6 +31,8 @@ class CatalogEntry:
             raise invalid_descriptor("catalog model classes must inherit torch.nn.Module")
         if not self.scopes:
             raise invalid_descriptor("catalog entries require at least one materialization scope")
+        if not self.sidecars or any(not value for value in self.sidecars):
+            raise invalid_descriptor("catalog entries require a non-empty sidecar manifest")
 
 
 QWEN3_ENTRY = CatalogEntry(
@@ -39,6 +42,7 @@ QWEN3_ENTRY = CatalogEntry(
 BAGEL_ENTRY = CatalogEntry(
     architecture="BagelForConditionalGeneration",
     model_class=BagelForConditionalGeneration,
+    sidecars=("config.json", "llm_config.json", "vit_config.json", "vae_config.json"),
 )
 SENSENOVA_ENTRY = CatalogEntry(
     architecture="NEOChatModel",
@@ -47,6 +51,20 @@ SENSENOVA_ENTRY = CatalogEntry(
         ModelLoadScope.WHOLE,
         ModelLoadScope.UNDERSTANDING,
         ModelLoadScope.GENERATION,
+    ),
+    sidecars=(
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.model",
+        "spiece.model",
+        "sentencepiece.bpe.model",
+        "chat_template.json",
+        "chat_template.jinja",
     ),
 )
 

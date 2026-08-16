@@ -79,6 +79,7 @@ class RotaryEmbedding(nn.Module):
         self.dim = dim
         self.theta = theta
         self.attention_scaling = attention_scaling
+        self.keep_freq_range = bool(keep_freq_range)
         inv_dim = dim * 2 if keep_freq_range else dim
         inv_freq = 1.0 / (
             theta ** (torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device) / inv_dim)
@@ -86,6 +87,19 @@ class RotaryEmbedding(nn.Module):
         if keep_freq_range:
             inv_freq = inv_freq[::2]
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def materialize_load_buffers(self, device: torch.device | str) -> None:
+        if not self.inv_freq.is_meta:
+            return
+        inv_dim = self.dim * 2 if self.keep_freq_range else self.dim
+        inv_freq = 1.0 / (
+            self.theta
+            ** (
+                torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device)
+                / inv_dim
+            )
+        )
+        self.inv_freq = inv_freq[::2] if self.keep_freq_range else inv_freq
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -165,6 +179,13 @@ class HFRotaryEmbedding(nn.Module):
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
+
+    def materialize_load_buffers(self, device: torch.device | str) -> None:
+        if not self.inv_freq.is_meta:
+            return
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.inv_freq = inv_freq
+        self.original_inv_freq = inv_freq
 
     def _keep_freq_range(self, base_rope_init_fn):
         def _rope_init_fn_keep_freq_range(cfg: Any, dev=None):

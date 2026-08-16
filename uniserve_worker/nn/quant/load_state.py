@@ -20,8 +20,6 @@ __all__ = [
     'fp8_scale_loaded',
     'fp8_load_phase',
     'copy_tensor_policy',
-    'capture_tensor_policy',
-    'restore_tensor_policy',
 ]
 
 # Parameters are reached through ``nn.Module`` attribute access, which is typed
@@ -115,26 +113,3 @@ def copy_tensor_policy(src: ParamLike, dst: ParamLike) -> None:
     plan = get_shard_plan(src)
     if plan is not None:
         set_shard_plan(dst, plan)
-
-
-def capture_tensor_policy(tensor: ParamLike) -> dict[str, object]:
-    """Snapshot checkpoint-policy flags before a tensor is materialized."""
-    captured = {name: getattr(tensor, name) for name in _TENSOR_POLICY_ATTRS if hasattr(tensor, name)}
-    from ..placement import get_shard_plan
-
-    plan = get_shard_plan(tensor)
-    if plan is not None:
-        captured["_uniserve_shard"] = plan
-    return captured
-
-
-def restore_tensor_policy(tensor: ParamLike, captured: dict[str, object]) -> None:
-    for name, value in captured.items():
-        if name == "_uniserve_shard":
-            from ..placement import ShardPlan, set_shard_plan
-
-            if not isinstance(value, ShardPlan):
-                raise TypeError("captured shard policy must be a ShardPlan")
-            set_shard_plan(tensor, value)
-        else:
-            setattr(tensor, name, value)

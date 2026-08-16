@@ -121,10 +121,14 @@ def server_launch(server: ServerProfile, executable: Path | None = None) -> Serv
     selected_executable = selected_executable.absolute()
     command[0] = str(selected_executable)
 
-    working_directory = ROOT
-    runtime_root = selected_executable.parent.parent
-    if (runtime_root / "uniserve_worker").is_dir():
-        working_directory = runtime_root
+    working_directory = next(
+        (
+            parent
+            for parent in selected_executable.parents
+            if (parent / "uniserve_worker").is_dir()
+        ),
+        ROOT,
+    )
 
     _resolve_command_path(command, "--worker-python", ROOT)
     return ServerLaunch(tuple(command), working_directory, dict(server.environment))

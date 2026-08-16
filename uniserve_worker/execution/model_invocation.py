@@ -264,6 +264,10 @@ class _ModelInvocation:
                 raise GraphExecutionError("tensor-parallel execution partitions disagree")
             logger.info("verified tensor-parallel execution partition agreement")
 
+    def invalidate_graphs(self, weight_digest: str) -> None:
+        for partition in self._owned_partitions:
+            partition.graphs.invalidate(weight_digest)
+
     def close(self) -> None:
         self._last_request_pool_indices = None
         self._last_output_event = None
@@ -456,15 +460,7 @@ class _ModelInvocation:
             calls += 1
             ids = buffers.input_ids[:0] if value.input_ids is None else value.input_ids
             positions = buffers.positions[0, :0] if value.positions is None else value.positions
-            if weights.version == 0:
-                result = self._phase(ids, positions, value)
-            else:
-                result = torch.func.functional_call(
-                    self._phase,
-                    {f"model.{name}": tensor for name, tensor in weights.tensors.items()},
-                    (ids, positions, value),
-                    strict=True,
-                )
+            result = self._phase(ids, positions, value)
             return result
 
         try:

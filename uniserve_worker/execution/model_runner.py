@@ -15,6 +15,7 @@ from typing import Any, TypeAlias, cast
 
 import torch
 
+from uniserve_worker.backends.triton import triton_available
 from uniserve_worker.batch import (
     Batch,
     BatchPartition,
@@ -89,7 +90,6 @@ from uniserve_worker.execution.trace import (
     ExecutionTrace,
     OperationTrace,
 )
-from uniserve_worker.backends.triton import triton_available
 from uniserve_worker.foundation.errors import (
     ErrorCode as WorkerErrorCode,
 )
@@ -102,8 +102,6 @@ from uniserve_worker.foundation.errors import (
     unsupported_operation,
 )
 from uniserve_worker.foundation.math import bucketed_length
-from uniserve_worker.runtime.device import canonical_device
-from uniserve_worker.server.profiler import profile_range
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import (
     BranchSource,
@@ -125,6 +123,7 @@ from uniserve_worker.nn.diffusion.schedule import (
 from uniserve_worker.nn.mesh import BroadcastTransport, DeviceMesh
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.runtime.cache_pool import CacheBatchView, CachePool, CacheRow
+from uniserve_worker.runtime.device import canonical_device
 from uniserve_worker.runtime.device_products import (
     DeviceProductMetadata,
     DeviceProductRead,
@@ -172,6 +171,7 @@ from uniserve_worker.server.cpu_tasks import BoundedCpuTaskPool, CpuTaskReservat
 from uniserve_worker.server.image_codec import (
     quantize_image_hwc,
 )
+from uniserve_worker.server.profiler import profile_range
 from uniserve_worker.server.request_state import (
     RequestRow,
     RequestRuntime,
@@ -707,6 +707,13 @@ class ModelRunner:
 
     def synchronize(self) -> None:
         self._model_invocation.synchronize()
+
+    def install_weights(self, weights: WeightSet) -> None:
+        if weights.version <= self.weights.version:
+            raise ValueError("installed weight version must increase")
+        self._model_invocation.invalidate_graphs(weights.digest)
+        self.weights = weights
+        self.weight_digest = weights.digest
 
     def prepare(self, batch: Batch) -> PreparedExecution | None:
         """Submit bounded transfer and predicate observations without waiting."""

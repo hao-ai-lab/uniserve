@@ -56,6 +56,7 @@ from uniserve_worker.batch import (
     UndAdmission,
     VersionRef,
     Work,
+    WorkVariant,
     control_from_wire,
     control_to_wire,
     decode_sampling_state_bytes,

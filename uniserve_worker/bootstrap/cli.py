@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from .capacity import DEFAULT_BLOCK_SIZE
 from ..server.worker_kind import WorkerKind
+from .capacity import DEFAULT_BLOCK_SIZE
 from .config import WorkerLaunchConfig
 
 
@@ -39,6 +39,14 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         help="data-plane backend: local, shm, or cuda_ipc",
     )
     parser.add_argument("--attention-backend", default="auto")
+    parser.add_argument(
+        "--load-format",
+        default="auto",
+        choices=("auto", "safetensors", "pt", "dummy", "sharded_state", "layered"),
+    )
+    parser.add_argument("--download-dir", default=None)
+    parser.add_argument("--load-threads", type=int, default=None)
+    parser.add_argument("--checksum-manifest", default=None)
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     parser.add_argument("--max-batch-tokens", type=int, required=True)
     parser.add_argument("--kv-token-capacity", type=int, default=None)

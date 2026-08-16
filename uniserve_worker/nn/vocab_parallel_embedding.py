@@ -87,6 +87,14 @@ class VocabParallelEmbedding(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(self.num_embeddings_per_partition, self.embedding_dim)
         )
+        from ..loader.weight_loaders import set_vocab_layout
+
+        set_vocab_layout(
+            self.weight,
+            real_size=self.num_embeddings,
+            start=self.vocab_start_index,
+            end=self.vocab_end_index,
+        )
         self.reset_parameters(init_weights=init_weights)
 
     def reset_parameters(self, *, init_weights: bool = True) -> None:
@@ -151,6 +159,21 @@ class ParallelLMHead(ColumnParallelLinear):
         )
         self.vocab_start_index = int(parallel.rank) * self.output_size
         self.vocab_end_index = self.vocab_start_index + self.output_size
+        from ..loader.weight_loaders import set_vocab_layout
+
+        set_vocab_layout(
+            self.weight,
+            real_size=self.vocab_size,
+            start=self.vocab_start_index,
+            end=self.vocab_end_index,
+        )
+        if self.bias is not None:
+            set_vocab_layout(
+                self.bias,
+                real_size=self.vocab_size,
+                start=self.vocab_start_index,
+                end=self.vocab_end_index,
+            )
         self._zero_padding_rows()
 
     def _zero_padding_rows(self) -> None:

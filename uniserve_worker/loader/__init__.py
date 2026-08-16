@@ -1,10 +1,15 @@
-"""Model loading and immutable weight snapshots."""
+"""Model loading and live weight identity."""
 
-from .loader import LoadedModel, Loader
+from .config import LoadConfig, LoadFormat, LoadRequest
+from .loader import BaseModelLoader, LoadedModel, get_model_loader
 from .weight_set import WeightSet
 
 __all__ = [
+    "BaseModelLoader",
+    "LoadConfig",
+    "LoadFormat",
+    "LoadRequest",
     "LoadedModel",
-    "Loader",
     "WeightSet",
+    "get_model_loader",
 ]

@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from threading import Condition, RLock
 
 import torch
 from torch import nn
@@ -37,8 +39,10 @@ from ..batch import (
 )
 from ..bootstrap.capabilities import resolve_capabilities
 from ..bootstrap.capacity import (
+    device_total_bytes,
     model_arena_capacity,
 )
+from ..bootstrap.execution_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
 from ..capabilities import (
     GraphBucketCapability,
     LaneCapabilities,
@@ -51,10 +55,9 @@ from ..execution.forward_batch import AttentionSelection
 from ..execution.model_invocation import _ModelInvocation
 from ..execution.model_runner import ModelRunner, PreparedExecution
 from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..bootstrap.capacity import device_total_bytes
-from ..bootstrap.execution_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.math import ceil_div
+from ..loader.update import WeightUpdater
 from ..loader.weight_set import WeightSet
 from ..models.generation import GenerationPipeline
 from ..models.identity import ModelIdentity, architecture_identity
@@ -94,6 +97,14 @@ class _FlowPrefixGraphBucket:
     rows: int
     cfg_branches: int
     prefix_lengths: tuple[int, ...]
+
+
+@dataclass(slots=True)
+class _PreparedWeightCall:
+    prepared: PreparedExecution
+
+    def ready(self) -> bool:
+        return self.prepared.ready()
 
 
 def _flow_graph_executable(bucket: _FlowGraphBucket) -> tuple[object, ...]:
@@ -305,6 +316,8 @@ class Worker:
         cross_process: bool = False,
         architecture_digest: str | None = None,
         weight_digest: str | None = None,
+        weights: WeightSet | None = None,
+        weight_sidecars: tuple[str, ...] = ("config.json",),
         pipeline_depth: int,
         completion_payload_bytes: int,
         snapshot_dir: str | None = None,
@@ -317,9 +330,18 @@ class Worker:
             raise capability_mismatch("model worker requires a worker deployment")
         self.model = model
         self.deployment = deployment
-        weights = WeightSet.from_module(model, digest=weight_digest)
-        self.weights = weights
-        self.weight_digest = weights.digest
+        self._weight_condition = Condition(RLock())
+        self._active_model_calls = 0
+        self._weight_update_active = False
+        installed_weights = (
+            WeightSet.from_module(model, digest=weight_digest)
+            if weights is None
+            else weights
+        )
+        if weight_digest is not None and installed_weights.digest != weight_digest:
+            raise capability_mismatch("worker weight identity does not match the installed WeightSet")
+        self.weights = installed_weights
+        self.weight_digest = installed_weights.digest
         self.identity = ModelIdentity(
             architecture=model.architecture,
             architecture_digest=architecture_digest
@@ -1015,6 +1037,16 @@ class Worker:
                 runtime_states=self.runtime_states,
                 transport=self.transfers.transport,
             )
+        self.weight_updater = WeightUpdater(
+            self.model,
+            architecture=self.identity.architecture,
+            scope=self.deployment.model_scope,
+            sidecars=weight_sidecars,
+            weights=self.weights,
+            publish=self._publish_weight_set,
+            exclusive=self._exclusive_weight_update,
+            gather_rank_digests=self._gather_rank_weight_digests,
+        )
 
     @property
     def capabilities(self) -> WorkerCapabilities:
@@ -1030,15 +1062,89 @@ class Worker:
         return min(blocks, max(0, int(self.cache_pool.request_pages) - 1))
 
     def execute(self, batch: Batch) -> CompletionReport:
-        return self.runner.execute(batch)
+        with self._model_call():
+            return self.runner.execute(batch)
 
     def prepare_execute(self, batch: Batch) -> object | None:
-        return self.runner.prepare(batch)
+        self._begin_model_call()
+        try:
+            prepared = self.runner.prepare(batch)
+        except BaseException:
+            self._end_model_call()
+            raise
+        if prepared is None:
+            self._end_model_call()
+            return None
+        return _PreparedWeightCall(prepared)
 
     def execute_prepared(self, prepared: object) -> CompletionReport:
-        if not isinstance(prepared, PreparedExecution):
+        if not isinstance(prepared, _PreparedWeightCall):
             raise invalid_descriptor("prepared execution has an invalid type")
-        return self.runner.execute_prepared(prepared)
+        try:
+            return self.runner.execute_prepared(prepared.prepared)
+        finally:
+            self._end_model_call()
+
+    @contextmanager
+    def _model_call(self) -> Generator[None, None, None]:
+        self._begin_model_call()
+        try:
+            yield
+        finally:
+            self._end_model_call()
+
+    def _begin_model_call(self) -> None:
+        with self._weight_condition:
+            updater = getattr(self, "weight_updater", None)
+            if updater is not None and updater.unhealthy:
+                raise RuntimeError("worker weight graph is unhealthy")
+            if self._weight_update_active:
+                raise RuntimeError("worker weight update is draining model execution")
+            self._active_model_calls += 1
+
+    def _end_model_call(self) -> None:
+        with self._weight_condition:
+            if self._active_model_calls < 1:
+                raise RuntimeError("worker model-call accounting underflow")
+            self._active_model_calls -= 1
+            self._weight_condition.notify_all()
+
+    @contextmanager
+    def _exclusive_weight_update(self) -> Generator[None, None, None]:
+        with self._weight_condition:
+            if self._weight_update_active:
+                raise RuntimeError("worker already has an active weight update")
+            self._weight_update_active = True
+            while self._active_model_calls:
+                self._weight_condition.wait()
+        try:
+            yield
+        finally:
+            with self._weight_condition:
+                self._weight_update_active = False
+                self._weight_condition.notify_all()
+
+    def _publish_weight_set(self, weights: WeightSet) -> None:
+        self.runner.install_weights(weights)
+        self.weights = weights
+        self.weight_digest = weights.digest
+        self.identity = ModelIdentity(
+            architecture=self.identity.architecture,
+            architecture_digest=self.identity.architecture_digest,
+            weight_digest=weights.digest,
+        )
+        self._capabilities = replace(self._capabilities, weight_digest=weights.digest)
+        if self.snapshot_recovery is not None:
+            self.snapshot_recovery.rebind_weight_digest(weights.digest)
+
+    def _gather_rank_weight_digests(self, rank_digest: str) -> Sequence[str]:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return (rank_digest,)
+        gathered: list[object] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, rank_digest)
+        if any(not isinstance(value, str) for value in gathered):
+            raise RuntimeError("tensor-parallel ranks did not publish weight digests")
+        return tuple(str(value) for value in gathered)
 
     def _execute_warmup(
         self,

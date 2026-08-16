@@ -89,6 +89,10 @@ impl LaneConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkerLaunchConfig {
     pub stub: bool,
+    pub load_format: String,
+    pub download_dir: Option<String>,
+    pub load_threads: Option<u32>,
+    pub checksum_manifest: Option<String>,
     pub model_dtype: String,
     pub kv_cache_dtype: Option<String>,
     pub kv_memory_fraction: String,
@@ -116,6 +120,10 @@ impl Default for WorkerLaunchConfig {
     fn default() -> Self {
         Self {
             stub: false,
+            load_format: "auto".to_string(),
+            download_dir: None,
+            load_threads: None,
+            checksum_manifest: None,
             model_dtype: "bfloat16".to_string(),
             kv_cache_dtype: None,
             kv_memory_fraction: "0.70".to_string(),
@@ -145,6 +153,18 @@ impl WorkerLaunchConfig {
     fn append_worker_args(&self, cmd: &mut Command) {
         if self.stub {
             cmd.arg("--no-model").arg("--allow-stub");
+        }
+        if self.load_format != "auto" {
+            cmd.arg("--load-format").arg(&self.load_format);
+        }
+        if let Some(value) = &self.download_dir {
+            cmd.arg("--download-dir").arg(value);
+        }
+        if let Some(value) = self.load_threads {
+            cmd.arg("--load-threads").arg(value.to_string());
+        }
+        if let Some(value) = &self.checksum_manifest {
+            cmd.arg("--checksum-manifest").arg(value);
         }
         cmd.arg("--model-dtype").arg(&self.model_dtype);
         if let Some(value) = &self.kv_cache_dtype {

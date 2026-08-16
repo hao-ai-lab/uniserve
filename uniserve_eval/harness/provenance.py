@@ -22,8 +22,8 @@ def collect_provenance(
     working_directory: Path,
     environment: dict[str, str],
 ) -> dict[str, Any]:
-    head = _command(["git", "rev-parse", "HEAD"])
-    status = _command(["git", "status", "--short"])
+    head = _command(["git", "rev-parse", "HEAD"], cwd=working_directory)
+    status = _command(["git", "status", "--short"], cwd=working_directory)
     return {
         "server_command": list(command),
         "server_working_directory": str(working_directory),
@@ -51,11 +51,11 @@ def _gpu(selector: str | None) -> dict[str, str] | None:
     return {"name": name.strip(), "driver_version": driver.strip()} if separator else None
 
 
-def _command(command: list[str]) -> str:
+def _command(command: list[str], *, cwd: Path = ROOT) -> str:
     try:
         result = subprocess.run(
             command,
-            cwd=ROOT,
+            cwd=cwd,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

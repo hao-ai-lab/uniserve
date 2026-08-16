@@ -121,6 +121,13 @@ class SnapshotRecovery:
         references, _replacements = self._create_snapshot(placements)
         return references
 
+    def rebind_weight_digest(self, weight_digest: str) -> None:
+        if not weight_digest:
+            raise ValueError("snapshot recovery requires a weight digest")
+        with self._lock:
+            self.weight_digest = str(weight_digest)
+            self._current_refs.clear()
+
     def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         return self.snapshot_sessions((placement,))[0]
 

@@ -1,6 +1,7 @@
 """FP8 linear quantization method with a dequantized correctness floor."""
 from __future__ import annotations
 
+from functools import partial
 from typing import cast
 
 import torch
@@ -12,7 +13,6 @@ from .base import QuantizeMethodBase
 from .kv_cache import fp8_quantize, fp8_scale_from
 from .load_state import (
     Fp8LoadPhase,
-    copy_tensor_policy,
     fp8_load_phase,
     init_fp8_phase,
     set_fp8_scale_loaded,
@@ -66,6 +66,17 @@ class W8A8Fp8LinearMethod(QuantizeMethodBase):
         set_optional_checkpoint(linear.weight_scale, True)
         set_skip_serving_cast(linear.weight_scale, True)
         init_fp8_phase(module)
+        from ...loader.weight_loaders import (
+            attach_weight_loader,
+            default_weight_loader,
+            fp8_scale_loader,
+            fp8_weight_loader,
+        )
+
+        attach_weight_loader(linear.weight, partial(fp8_weight_loader, module=module))
+        if linear.bias is not None:
+            attach_weight_loader(linear.bias, default_weight_loader)
+        attach_weight_loader(linear.weight_scale, partial(fp8_scale_loader, module=module))
 
     def process_weights_after_loading(self, module: nn.Module) -> None:
         from ..linear import LinearBase
@@ -92,9 +103,22 @@ class W8A8Fp8LinearMethod(QuantizeMethodBase):
         scale = fp8_scale_from(dense, dim=1)
         quantized = fp8_quantize(dense, scale)
         fp8_weight = nn.Parameter(quantized.contiguous(), requires_grad=False)
-        copy_tensor_policy(weight, fp8_weight)
+        from ...loader.weight_loaders import copy_parameter_loader_state
+
+        copy_parameter_loader_state(weight, fp8_weight)
         set_skip_serving_cast(fp8_weight, True)
         linear.weight = fp8_weight
+        if linear.weight_scale.is_meta:
+            materialized_scale = nn.Parameter(
+                torch.empty(
+                    tuple(linear.weight_scale.shape),
+                    device=fp8_weight.device,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            copy_parameter_loader_state(linear.weight_scale, materialized_scale)
+            linear.weight_scale = materialized_scale
         linear.weight_scale.data = scale.to(device=fp8_weight.device, dtype=torch.float32)
         set_fp8_scale_loaded(module, True)
 

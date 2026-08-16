@@ -555,6 +555,18 @@ impl SharedRuntimeArgs {
 pub(crate) struct WorkerLaunchArgs {
     #[arg(long, hide = true)]
     pub worker_stub: bool,
+    /// Checkpoint loader format used by every model worker.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "sharded_state", "layered"])]
+    pub load_format: String,
+    /// Hugging Face cache root for repository model paths.
+    #[arg(long)]
+    pub download_dir: Option<String>,
+    /// Concurrent checkpoint file readers.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub load_threads: Option<u32>,
+    /// JSON map of checkpoint-relative paths to SHA-256 digests.
+    #[arg(long)]
+    pub checksum_manifest: Option<String>,
     #[arg(long = "dtype", default_value = "bfloat16")]
     pub model_dtype: String,
     #[arg(long)]
@@ -606,6 +618,10 @@ impl WorkerLaunchArgs {
     fn to_config(&self) -> WorkerLaunchConfig {
         WorkerLaunchConfig {
             stub: self.worker_stub,
+            load_format: self.load_format.clone(),
+            download_dir: self.download_dir.clone(),
+            load_threads: self.load_threads,
+            checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype.clone(),
             kv_cache_dtype: self.kv_cache_dtype.clone(),
             kv_memory_fraction: self.kv_memory_fraction.clone(),
@@ -636,6 +652,15 @@ impl WorkerLaunchArgs {
         if cfg.stub {
             args.push("--worker-stub".to_string());
         }
+        push_if_changed(
+            args,
+            "--load-format",
+            &cfg.load_format,
+            &default.load_format,
+        );
+        push_option(args, "--download-dir", cfg.download_dir.as_ref());
+        push_u32_option(args, "--load-threads", cfg.load_threads);
+        push_option(args, "--checksum-manifest", cfg.checksum_manifest.as_ref());
         push_if_changed(args, "--dtype", &cfg.model_dtype, &default.model_dtype);
         push_option(args, "--kv-cache-dtype", cfg.kv_cache_dtype.as_ref());
         push_if_changed(
@@ -801,6 +826,20 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_zero_checkpoint_readers() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--model-description",
+            "qwen3",
+            "--load-threads",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn serve_accepts_runtime_configuration() {
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
@@ -834,6 +873,14 @@ mod tests {
             "float16",
             "--mem-fraction-static",
             "0.5",
+            "--load-format",
+            "safetensors",
+            "--download-dir",
+            "/models/cache",
+            "--load-threads",
+            "4",
+            "--checksum-manifest",
+            "/models/checksums.json",
             "--cuda-graph",
             "false",
             "--prefill-cuda-graph",

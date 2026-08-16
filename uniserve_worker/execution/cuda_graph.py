@@ -315,6 +315,15 @@ class CudaGraphRunner:
         for state in states:
             _release_state(state)
 
+    def invalidate(self, weight_digest: str) -> None:
+        """Retire every executable captured against the previous weight identity."""
+
+        if not weight_digest:
+            raise ValueError("CUDA graph invalidation requires a weight digest")
+        self.close()
+        self.weight_digest = str(weight_digest)
+        self._sealed = False
+
     def _capture(
         self,
         batch: ForwardBatch,

@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
-from .execution_config import ExecutionConfig, execution_config_from_namespace
+from ..loader.config import LoadConfig
 from ..server.worker_kind import WorkerKind
+from .execution_config import ExecutionConfig, execution_config_from_namespace
 from .plan import ModelLoadScope, resolve_worker_plan
 
 
@@ -56,6 +57,7 @@ class WorkerLaunchConfig:
     model: ModelLaunchConfig | None
     data_plane: DataPlaneConfig
     execution: ExecutionConfig
+    load: LoadConfig
     use_stub_model: bool
     snapshot_dir: str | None
 
@@ -122,6 +124,7 @@ class WorkerLaunchConfig:
                 backend=backend,
             ),
             execution=execution_config_from_namespace(namespace),
+            load=_load_config(namespace),
             use_stub_model=use_stub_model,
             snapshot_dir=_optional_text(namespace.snapshot_dir),
         )
@@ -148,6 +151,25 @@ def _validate_scalars(
         raise ValueError("--mesh tower-kv-capacity must be positive when provided")
     if int(namespace.tp_rank) < 0 or int(namespace.tp_rank) >= int(namespace.tp_size):
         raise ValueError("--tp-rank must satisfy 0 <= rank < tp-size")
+
+
+def _load_config(namespace: argparse.Namespace) -> LoadConfig:
+    threads = getattr(namespace, "load_threads", None)
+    load_format = str(getattr(namespace, "load_format", "auto"))
+    download_dir = _optional_text(getattr(namespace, "download_dir", None))
+    checksum_manifest = _optional_text(getattr(namespace, "checksum_manifest", None))
+    if threads is None:
+        return LoadConfig(
+            load_format=load_format,
+            download_dir=download_dir,
+            checksum_manifest=checksum_manifest,
+        )
+    return LoadConfig(
+        load_format=load_format,
+        download_dir=download_dir,
+        num_threads=int(threads),
+        checksum_manifest=checksum_manifest,
+    )
 
 
 def _validate_data_plane(

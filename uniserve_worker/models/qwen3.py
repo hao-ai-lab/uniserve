@@ -11,9 +11,9 @@ advances KV length. The model runner and stores own those behaviors.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -25,16 +25,9 @@ from ..execution.forward_batch import (
     PagedVarlenPlan,
     TokenSelection,
 )
-from ..loader.weight_utils import (
-    WeightNameMap,
-    dtype_from_name,
-    iter_weights,
-    load_parameter,
-    missing_required_parameters,
-    prepare_serving_dtype,
-    resolve_weight_files,
-    stacked_weight_name,
-)
+from ..loader.handles import WeightHandle
+from ..loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
+from ..loader.weight_loaders import load_parameter_weight
 from ..nn import (
     FusedMoE,
     LayerSpec,
@@ -52,8 +45,6 @@ from ..nn import (
 )
 from ..nn.decoder import Qwen3MLP
 from ..nn.logits import LogitsProcessor
-from ..nn.quant import QuantizationConfig
-from ..nn.quant.base import process_quantized_modules
 from .runtime import (
     CacheGeometry,
     ExecutionModel,
@@ -77,6 +68,20 @@ _QWEN_STACKED_WEIGHTS: WeightNameMap = (
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
 )
+
+
+def _qwen_declared_skip(source_name: str, target_name: str) -> bool:
+    return (
+        source_name.endswith(
+            (
+                "rotary_emb.inv_freq",
+                "rotary_emb.cos_cached",
+                "rotary_emb.sin_cached",
+            )
+        )
+        or "projector" in source_name.split(".")
+        or (source_name.endswith(".bias") and target_name.endswith(".bias"))
+    )
 
 
 def _required_int(config: Mapping[str, object], name: str) -> int:
@@ -439,7 +444,12 @@ class Qwen3Model(nn.Module):
 
     def __init__(self, cfg: _QwenConfig, *, spec: LayerSpec) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size, spec=spec)
+        self.embed_tokens = VocabParallelEmbedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            spec=spec,
+            init_weights=False,
+        )
         self.layers = nn.ModuleList(
             Qwen3DecoderLayer(cfg, idx, spec=spec) for idx in range(cfg.num_hidden_layers)
         )
@@ -481,68 +491,38 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(ExecutionModel):
     """Qwen3 serving model with a thin tensor-level text core."""
 
-    @classmethod
-    def from_checkpoint(
-        cls,
-        config: Mapping[str, object],
-        *,
-        model_path: str,
-        device: str,
-        attention_backend: str | None,
-        model_scope: str,
-        execution: Any,
-        parallel: Any,
-    ) -> tuple["Qwen3ForCausalLM", None, str]:
-        del attention_backend
-        if model_scope != "whole":
-            raise ValueError("Qwen3 checkpoints require whole-model materialization")
-        model = cls(
-            config,
-            layer_spec=LayerSpec(
-                parallel=parallel,
-                quantization=QuantizationConfig.from_model_config(config),
-            ),
-        )
-        loaded, ignored = model.load_weights(iter_weights(resolve_weight_files(model_path)))
-        missing = missing_required_parameters(model, loaded)
-        if missing:
-            raise ValueError(
-                f"Qwen3 checkpoint load mismatch: missing={len(missing)} {missing[:20]!r}"
-            )
-        process_quantized_modules(model.modules())
-        serving_dtype = dtype_from_name(model.serving_dtype)
-        prepare_serving_dtype(model, serving_dtype)
-        model.to(device)
-        model.eval()
-        if ignored:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "ignored %d checkpoint tensors during Qwen3 load", len(ignored)
-            )
-        del execution
-        return model, None, str(next(model.parameters()).device)
-
     def load_weights(
         self,
-        weights: Any,
-    ) -> tuple[set[str], list[str]]:
+        weights: Iterable[WeightHandle],
+    ) -> LoadReport:
         """Load Hugging Face Qwen tensors into the model's packed projections."""
 
-        parameters = dict(self.named_parameters())
-        loaded: set[str] = set()
-        ignored: list[str] = []
-        for source_name, tensor in weights:
-            target_name, shard_id = stacked_weight_name(source_name, _QWEN_STACKED_WEIGHTS)
-            if target_name not in parameters:
-                if source_name in parameters:
-                    target_name, shard_id = source_name, None
-                else:
-                    ignored.append(source_name)
+        parameter_names = set(dict(self.named_parameters()))
+        report = LoadReport()
+        for handle in weights:
+            source_name = handle.name
+            repaired = (
+                f"model.{source_name}"
+                if source_name.startswith("layers.")
+                else source_name
+            )
+            target_name, shard_id = stacked_weight_name(repaired, _QWEN_STACKED_WEIGHTS)
+            if target_name not in parameter_names:
+                if repaired in parameter_names:
+                    target_name, shard_id = repaired, None
+                elif repaired == "lm_head.weight" and self._tied_embeddings:
+                    report.skipped.append(source_name)
                     continue
-            load_parameter(self, target_name, tensor, shard_id=shard_id)
-            loaded.add(target_name)
-        return loaded, ignored
+                elif _qwen_declared_skip(source_name, target_name):
+                    report.skipped.append(source_name)
+                    continue
+                else:
+                    report.unexpected.append(source_name)
+                    continue
+            parameter = dict(self.named_parameters())[target_name]
+            load_parameter_weight(parameter, handle, shard_id)
+            report.loaded.add(target_name)
+        return report
 
     def __init__(self, config: Mapping[str, object], *, layer_spec: LayerSpec) -> None:
         super().__init__()
@@ -557,6 +537,7 @@ class Qwen3ForCausalLM(ExecutionModel):
             spec=layer_spec,
             bias=False,
         )
+        self._tied_embeddings = cfg.tie_word_embeddings
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits = LogitsProcessor()

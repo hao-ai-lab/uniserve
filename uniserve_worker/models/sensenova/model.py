@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
 
 from ...batch import WorkVariant
 from ...execution.forward_batch import (
@@ -22,18 +21,9 @@ from ...execution.forward_batch import (
     RouteSpan,
     TokenSelection,
 )
-from ...loader.weight_utils import (
-    WeightNameMap,
-    dtype_from_name,
-    infer_input_device,
-    iter_weights,
-    load_parameter,
-    materialize_parameter,
-    missing_required_parameters,
-    preview_names,
-    resolve_weight_files,
-    stacked_weight_name,
-)
+from ...loader.handles import WeightHandle
+from ...loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
+from ...loader.weight_loaders import load_parameter_weight
 from ...nn.attention import RadixAttention
 from ...nn.decoder.qwen import Qwen3MLP
 from ...nn.diffusion import (
@@ -55,8 +45,6 @@ from ...nn.linear import (
 )
 from ...nn.norm import RMSNorm
 from ...nn.placement import WeightMode, set_tower_coord
-from ...nn.quant import QuantizationConfig
-from ...nn.quant.base import process_quantized_modules
 from ...nn.rope import HFRotaryEmbedding, RotaryEmbedding, get_rope, qk_norm_rope
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
 from ...nn.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
@@ -558,6 +546,7 @@ class _SenseDecoder(nn.Module):
             hidden,
             int(getattr(config, "pad_token_id")),
             spec=spec,
+            init_weights=False,
         )
         self.layers = nn.ModuleList(
             _SenseLayer(config, index, spec=spec)
@@ -641,107 +630,51 @@ class _LanguageModel(nn.Module):
 class NEOChatModel(ExecutionModel):
     """Concrete stateless SenseNova model for mixed text, flow, and vision rows."""
 
-    @classmethod
-    def from_checkpoint(
-        cls,
-        raw_config: dict[str, Any],
-        *,
-        model_path: str,
-        device: str,
-        attention_backend: str | None,
-        model_scope: str,
-        execution: Any,
-        parallel: Any,
-    ) -> tuple["NEOChatModel", Any, str]:
-        try:
-            from accelerate import init_empty_weights
-            from accelerate.utils import set_module_tensor_to_device
-        except ImportError as exc:
-            raise RuntimeError(
-                "SenseNova checkpoint loading requires accelerate in the worker environment"
-            ) from exc
-
-        del attention_backend
-        config = NeoChatConfig.from_dict(raw_config)
-        _check_checkpoint_code_version(config)
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                use_fast=False,
-                trust_remote_code=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"failed to load the configured SenseNova tokenizer from {model_path!r}: {exc}"
-            ) from exc
-        dtype = dtype_from_name(execution.model_dtype)
-        with init_empty_weights():
-            model = cls(
-                config,
-                layer_spec=LayerSpec(
-                    parallel=parallel,
-                    quantization=QuantizationConfig.from_model_config(config),
-                ),
-            )
-        model.load_weights(
-            iter_weights(resolve_weight_files(model_path)),
-            device=device,
-            dtype=dtype,
-            model_scope=model_scope,
-            set_module_tensor_to_device=set_module_tensor_to_device,
-        )
-        process_quantized_modules(model.modules())
-        if model_scope == "whole":
-            model.to(device=device)
-        model.eval()
-        return model, tokenizer, str(infer_input_device(model, fallback=device))
-
     def load_weights(
         self,
-        weights: Any,
-        *,
-        device: str,
-        dtype: torch.dtype,
-        model_scope: str,
-        set_module_tensor_to_device: Callable[..., Any],
-    ) -> set[str]:
+        weights: Iterable[WeightHandle],
+    ) -> LoadReport:
         """Stream checkpoint tensors into the selected SenseNova tower scope."""
 
-        parameters = dict(self.named_parameters())
-        included = {name for name in parameters if _scope_includes(name, model_scope)}
-        loaded: set[str] = set()
-        unexpected: list[str] = []
-        for source_name, tensor in weights:
+        parameter_names = set(dict(self.named_parameters()))
+        included = {
+            name for name in parameter_names if _scope_includes(name, self._load_scope)
+        }
+        report = LoadReport()
+        for handle in weights:
+            source_name = handle.name
             target_name, shard_id = stacked_weight_name(source_name, _STACKED_WEIGHTS)
-            if target_name not in parameters:
-                if source_name in parameters:
+            if target_name not in parameter_names:
+                if source_name in parameter_names:
                     target_name, shard_id = source_name, None
                 else:
-                    unexpected.append(source_name)
+                    report.unexpected.append(source_name)
                     continue
             if target_name not in included:
                 continue
-            materialize_parameter(
-                self,
-                target_name,
-                tensor,
-                device=device,
-                dtype=dtype,
-                set_module_tensor_to_device=set_module_tensor_to_device,
-            )
-            load_parameter(self, target_name, tensor, shard_id=shard_id, dtype=dtype)
-            loaded.add(target_name)
-        missing = missing_required_parameters(self, loaded, included=included)
-        if missing or unexpected:
-            raise RuntimeError(
-                "SenseNova checkpoint load mismatch: "
-                f"missing={len(missing)} {preview_names(missing)} "
-                f"unexpected={len(unexpected)} {preview_names(unexpected)}"
-            )
-        return loaded
+            parameter = dict(self.named_parameters())[target_name]
+            load_parameter_weight(parameter, handle, shard_id)
+            report.loaded.add(target_name)
+        return report
 
-    def __init__(self, config: NeoChatConfig, *, layer_spec: LayerSpec) -> None:
+    def checkpoint_parameter_names(self) -> set[str]:
+        return {
+            name
+            for name, _ in self.named_parameters()
+            if _scope_includes(name, self._load_scope)
+        }
+
+    def __init__(
+        self,
+        config: NeoChatConfig,
+        *,
+        layer_spec: LayerSpec,
+        scope: str = "whole",
+    ) -> None:
         super().__init__()
+        if scope not in {"whole", "understanding", "generation"}:
+            raise ValueError(f"unknown SenseNova model scope {scope!r}")
+        self._load_scope = scope
         vision = config.vision_config
         hidden = int(config.llm_config.hidden_size)
         self.vision_model = _VisionModel(vision)

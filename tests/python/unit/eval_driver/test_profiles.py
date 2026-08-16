@@ -29,6 +29,23 @@ def test_decode_runtime_suite_resolves_to_four_explicit_points() -> None:
     assert config.suites["decode-runtime"].max_regression is None
 
 
+def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> None:
+    config = load_config()
+    points = config.selected_points("serving-runtime")
+    assert tuple(point.name for point in points) == (
+        "qwen-uniserve-sharegpt-r16",
+        "sensenova-uniserve-i2t-stream",
+        "sensenova-uniserve-t2i-image",
+        "sensenova-uniserve-interleave-c4",
+    )
+    assert points[1].wire == "openai_chat"
+    assert points[2].wire == "openai_chat_json"
+    assert tuple(metric.name for metric in points[2].metrics) == (
+        "images_per_second",
+        "image_latency_ms.mean",
+    )
+
+
 def test_toml_rejects_an_unknown_benchmark_field(tmp_path: Path) -> None:
     config = tmp_path / "profiles.toml"
     config.write_text(

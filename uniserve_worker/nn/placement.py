@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-import torch
 import torch.nn as nn
 
 from .mesh import DeviceMesh, TensorParallelSpec
@@ -17,7 +16,6 @@ __all__ = [
     'shard_spec',
     'get_shard_plan',
     'set_shard_plan',
-    'place_partitioned_tensor',
     # tower-axis module placement
     'set_tower_coord',
     'get_tower_coord',
@@ -53,17 +51,6 @@ class ShardSpec:
     rank: int
     size: int
     replicated: bool = False
-
-    def narrow(self, loaded: torch.Tensor, target_dim: int) -> torch.Tensor:
-        if self.replicated or self.size <= 1:
-            return loaded
-        dim = int(loaded.shape[self.axis])
-        if dim == target_dim:
-            return loaded
-        if dim % self.size != 0:
-            raise ValueError(f"loaded tensor dim {dim} is not divisible by size {self.size}")
-        per_rank = dim // self.size
-        return loaded.narrow(self.axis, self.rank * per_rank, per_rank)
 
 
 @dataclass(frozen=True)
@@ -116,39 +103,6 @@ def get_shard_plan(param: nn.Parameter) -> ShardPlan | None:
 
 def set_shard_plan(param: nn.Parameter, plan: ShardPlan) -> None:
     setattr(param, _SHARD_PLAN_ATTR, plan)
-
-
-def place_partitioned_tensor(
-    param: nn.Parameter,
-    target: torch.Tensor,
-    loaded: torch.Tensor,
-    *,
-    shard_id: int | str | None = None,
-) -> None:
-    """Narrow ``loaded`` for this rank and copy it into ``target``.
-
-    The single placement helper shared by the dense and FP8 weight loaders, so
-    sharding semantics live in one place. ``target`` is the destination storage
-    (usually ``param.data``); when ``shard_id`` selects a named shard the
-    destination is the corresponding slice of ``target``.
-    """
-    plan = get_shard_plan(param)
-    spec: ShardSpec | None = None
-    if plan is not None and shard_id is not None and plan.shard_axis is not None:
-        slot = plan.slot_for(shard_id)
-        if slot is None:
-            raise ValueError(f"unknown shard id {shard_id!r}")
-        slices = [slice(None)] * target.ndim
-        slices[plan.shard_axis] = slice(slot.offset, slot.offset + slot.size)
-        target = target[tuple(slices)]
-        spec = slot.spec
-    elif plan is not None:
-        spec = plan.spec
-    if spec is not None:
-        loaded = spec.narrow(loaded, int(target.shape[spec.axis]))
-    if tuple(target.shape) != tuple(loaded.shape):
-        raise ValueError(f"loaded tensor shape {tuple(loaded.shape)} != target {tuple(target.shape)}")
-    target.copy_(loaded)
 
 
 _TOWER_COORD_ATTR = "_uniserve_tower_coord"
