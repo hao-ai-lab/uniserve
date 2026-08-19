@@ -18,8 +18,14 @@ from tests.python.e2e.http_helpers import (
     server_process,
     tiny_input_png_b64,
 )
-from uniserve_eval.harness.runner import BenchmarkRunner
-from uniserve_eval.harness.spec import BenchmarkSpec, MetricDefinition, TaskName
+from uniserve_eval.pipeline.run import run_point
+from uniserve_eval.types import (
+    BenchmarkPoint,
+    LoadConfig,
+    MetricDefinition,
+    SamplingConfig,
+    TaskName,
+)
 
 pytestmark = [pytest.mark.e2e]
 
@@ -451,7 +457,7 @@ def test_bagel_public_funnels(tmp_path: Path):
             assert len(image["sha256"]) == 64
 
 
-def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
+def test_sim_http_configured_routes_and_evaluator_contract(tmp_path: Path):
     # CPU simulation emits deterministic text and image fixtures through the
     # configured HTTP, scheduler, generation-event, and geometry contracts.
     image_start_id = active_sensenova_control_ids(active_sensenova_model())["<img>"]
@@ -653,23 +659,23 @@ def test_sim_http_configured_routes_and_harness_contract(tmp_path: Path):
             + "\n",
             encoding="utf-8",
         )
-        spec = BenchmarkSpec(
+        point = BenchmarkPoint(
             name="sensenova_interleave_contract",
+            server="test",
             task=TaskName.INTERLEAVE,
             model="SenseNova-U1",
-            server="test",
-            metrics=(MetricDefinition(("mean_ttft_ms",), "lower"),),
-            dataset="trace",
+            dataset="jsonl",
             dataset_path=str(trace_path),
-            num_prompts=1,
-            warmup_requests=0,
-            max_tokens=8,
-            minimum_average_images=1.0,
-            extra_request_body={"logit_bias": {str(image_start_id): 100.0}},
+            metrics=(MetricDefinition(("mean_ttft_ms",), "lower"),),
+            load=LoadConfig(num_prompts=1, warmup_requests=0),
+            sampling=SamplingConfig(
+                max_tokens=8,
+                ignore_eos=False,
+                extra_body={"logit_bias": {str(image_start_id): 100.0}},
+            ),
         )
-        result = asyncio.run(BenchmarkRunner(base_url, spec, tmp_path / "bench").run())
+        result = asyncio.run(run_point(base_url, point, tmp_path / "bench"))
         assert result.summary["status"] == "completed"
         assert result.summary["failed_count"] == 0
         assert result.summary["ok_count"] == 1
-        assert result.summary["validation"]["valid"] is True
         assert (tmp_path / "bench" / "summary.json").exists()

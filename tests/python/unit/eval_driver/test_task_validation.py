@@ -5,11 +5,19 @@ import io
 import pytest
 from PIL import Image
 
-from uniserve_eval.harness.image_outputs import inspect_image_bytes
-from uniserve_eval.harness.metrics.common import RequestRecord
-from uniserve_eval.harness.spec import BenchmarkSpec, MetricDefinition, TaskName
-from uniserve_eval.harness.tasks.interleave import InterleaveTask
-from uniserve_eval.harness.tasks.t2i import T2ITask
+from uniserve_eval.tasks.interleave import InterleaveTask
+from uniserve_eval.tasks.t2i import T2ITask
+from uniserve_eval.transport.images import inspect_image_bytes
+from uniserve_eval.types import (
+    BenchmarkPoint,
+    Example,
+    ImageConfig,
+    LoadConfig,
+    MetricDefinition,
+    RequestRecord,
+    SamplingConfig,
+    TaskName,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -25,20 +33,20 @@ def _metric(path: str = "images_per_second", direction: str = "higher") -> Metri
 
 
 def test_t2i_requests_and_validation_use_exact_image_count() -> None:
-    spec = BenchmarkSpec(
+    point = BenchmarkPoint(
         name="t2i",
+        server="server",
         task=TaskName.T2I,
         model="model",
-        server="server",
+        dataset="mjhq",
         metrics=(_metric(),),
-        num_prompts=2,
-        image_count=1,
-        width=2,
-        height=3,
-        wire="openai_chat_json",
+        load=LoadConfig(num_prompts=2),
+        sampling=SamplingConfig(stream=False),
+        image=ImageConfig(image_count=1, width=2, height=3),
     )
-    task = T2ITask(spec)
-    request = task.build_request({"prompt": "draw"})
+    task = T2ITask(point)
+    request = task.build_request(Example(id="row", prompt="draw"))
+    assert request.stream is False
     assert request.payload["image_config"]["num_images"] == 1
 
     image = _image()
@@ -59,19 +67,20 @@ def test_t2i_requests_and_validation_use_exact_image_count() -> None:
 
 
 def test_interleave_sends_no_count_and_checks_point_average() -> None:
-    spec = BenchmarkSpec(
+    point = BenchmarkPoint(
         name="interleave",
+        server="server",
         task=TaskName.INTERLEAVE,
         model="model",
-        server="server",
+        dataset="ueval",
         metrics=(_metric("mean_ttft_ms", "lower"),),
-        num_prompts=2,
-        minimum_average_images=1.0,
-        width=2,
-        height=3,
+        load=LoadConfig(num_prompts=2),
+        sampling=SamplingConfig(stream=True),
+        image=ImageConfig(width=2, height=3),
     )
-    task = InterleaveTask(spec)
-    request = task.build_request({"prompt": "travel"})
+    task = InterleaveTask(point)
+    request = task.build_request(Example(id="row", prompt="travel"))
+    assert request.stream is True
     assert "num_images" not in request.payload["image_config"]
 
     image = _image()
@@ -90,14 +99,14 @@ def test_interleave_sends_no_count_and_checks_point_average() -> None:
         generated_text="answer",
         output_len_source="server_usage",
         prompt_len_source="server_usage",
-        images=2,
-        decoded_images=[image, image],
+        images=3,
+        decoded_images=[image, image, image],
     )
     validation = task.validate([text_only, multimodal])
     assert validation.valid is True
-    assert validation.statistics["images_per_request"] == 1.0
+    assert validation.statistics["images_per_request"] == 1.5
     assert validation.statistics["zero_image_requests"] == 1
 
-    multimodal.images = 1
-    multimodal.decoded_images = [image]
+    multimodal.images = 2
+    multimodal.decoded_images = [image, image]
     assert task.validate([text_only, multimodal]).checks["minimum_average_images"] is False

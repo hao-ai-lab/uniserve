@@ -6,10 +6,7 @@ import io
 import pytest
 from PIL import Image
 
-from uniserve_eval.harness.image_outputs import (
-    ImageOutputError,
-    decode_openai_image_part,
-)
+from uniserve_eval.transport.images import ImageOutputError, decode_openai_image_part
 
 pytestmark = pytest.mark.unit
 

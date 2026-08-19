@@ -49,13 +49,6 @@ test-python-gpu: build-debug
 # Run all checks
 test-all: fmt clippy test-rust bench-build test-python-fast test-python-integration test-python-e2e
 
-# Quick benchmark smoke test
-bench-smoke: build-debug
-    {{python}} -m uniserve_eval.harness.cli \
-        --base-url http://127.0.0.1:18080 \
-        --model sim-model \
-        --task interleave \
-        --dataset trace \
-        --dataset-path uniserve_eval/data/smoke_trace.jsonl \
-        --output-dir results/benchmarks/smoke \
-        --smoke
+# Resolve the decode-runtime suite without starting a server
+eval-plan:
+    {{python}} -m uniserve_eval plan decode-runtime

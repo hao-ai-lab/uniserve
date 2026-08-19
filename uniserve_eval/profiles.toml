@@ -23,10 +23,14 @@ model = "Qwen3-32B"
 dataset = "sharegpt"
 dataset_revision = "192ab2185289094fc556ec8ce5ce1e8e587154ca"
 tokenizer = "${UNISERVE_QWEN3_MODEL}"
+
+[benchmarks.qwen-uniserve-sharegpt-r16.load]
 num_prompts = 200
 request_rate = 16.0
 warmup_requests = 1
 seed = 42
+
+[benchmarks.qwen-uniserve-sharegpt-r16.sampling]
 temperature = 0.0
 top_p = 1.0
 top_k = 20
@@ -36,6 +40,7 @@ frequency_penalty = 0.0
 presence_penalty = 0.0
 sampling_seed = 42
 ignore_eos = true
+stream = true
 
 [benchmarks.qwen-uniserve-sharegpt-r16.metrics]
 output_throughput = "higher"
@@ -48,11 +53,15 @@ task = "i2t"
 model = "SenseNova-U1"
 dataset = "beans"
 dataset_revision = "27aa014ce09b193e1a6f58112d4a66e0eddb69c5"
+
+[benchmarks.sensenova-uniserve-i2t-c32.load]
 num_prompts = 32
 request_rate = inf
 max_concurrency = 32
 warmup_requests = 1
 seed = 42
+
+[benchmarks.sensenova-uniserve-i2t-c32.sampling]
 temperature = 0.0
 top_p = 1.0
 top_k = 1
@@ -63,7 +72,7 @@ presence_penalty = 0.0
 sampling_seed = 42
 ignore_eos = false
 max_tokens = 8192
-wire = "openai_chat_json"
+stream = false
 
 [benchmarks.sensenova-uniserve-i2t-c32.metrics]
 output_throughput = "higher"
@@ -74,13 +83,20 @@ task = "t2i"
 model = "SenseNova-U1"
 dataset = "mjhq"
 dataset_revision = "15b0a659e066e763d0e9a6cd8f00e25f8af5e084"
+
+[benchmarks.sensenova-uniserve-t2i-c32.load]
 num_prompts = 32
 request_rate = inf
 max_concurrency = 32
 warmup_requests = 1
 seed = 42
+
+[benchmarks.sensenova-uniserve-t2i-c32.sampling]
 temperature = 0.0
 top_p = 1.0
+stream = false
+
+[benchmarks.sensenova-uniserve-t2i-c32.image]
 width = 2048
 height = 1152
 steps = 50
@@ -90,7 +106,6 @@ image_guidance_scale = 1.0
 cfg_norm = "none"
 cfg_interval = [0.0, 1.0]
 timestep_shift = 3.0
-wire = "openai_chat_json"
 
 [benchmarks.sensenova-uniserve-t2i-c32.metrics]
 images_per_second = "higher"
@@ -101,11 +116,15 @@ task = "interleave"
 model = "SenseNova-U1"
 dataset = "ueval"
 dataset_revision = "fdeac6654b113d20e7e89d496167a4a5bb55bc66"
+
+[benchmarks.sensenova-uniserve-interleave-c4.load]
 num_prompts = 32
 request_rate = inf
 max_concurrency = 4
 warmup_requests = 1
 seed = 42
+
+[benchmarks.sensenova-uniserve-interleave-c4.sampling]
 temperature = 0.0
 top_p = 1.0
 top_k = 1
@@ -116,21 +135,22 @@ presence_penalty = 0.0
 sampling_seed = 42
 ignore_eos = false
 max_tokens = 8192
+stream = true
+
+[benchmarks.sensenova-uniserve-interleave-c4.image]
 width = 2048
 height = 1152
 steps = 50
-minimum_average_images = 1.0
 guidance_scale = 4.0
 image_guidance_scale = 1.0
 cfg_norm = "none"
 cfg_interval = [0.0, 1.0]
 timestep_shift = 3.0
-wire = "openai_chat"
 
 [benchmarks.sensenova-uniserve-interleave-c4.metrics]
 mean_ttft_ms = "lower"
 mean_tpot_ms = "lower"
-"images.image_latency_ms.mean" = "lower"
+"image_latency_ms.mean" = "lower"
 
 [benchmarks.sensenova-uniserve-i2t-stream]
 server = "sensenova"
@@ -138,11 +158,15 @@ task = "i2t"
 model = "SenseNova-U1"
 dataset = "beans"
 dataset_revision = "27aa014ce09b193e1a6f58112d4a66e0eddb69c5"
+
+[benchmarks.sensenova-uniserve-i2t-stream.load]
 num_prompts = 32
 request_rate = inf
 max_concurrency = 32
 warmup_requests = 1
 seed = 42
+
+[benchmarks.sensenova-uniserve-i2t-stream.sampling]
 temperature = 0.0
 top_p = 1.0
 top_k = 1
@@ -153,7 +177,7 @@ presence_penalty = 0.0
 sampling_seed = 42
 ignore_eos = false
 max_tokens = 8192
-wire = "openai_chat"
+stream = true
 
 [benchmarks.sensenova-uniserve-i2t-stream.metrics]
 output_throughput = "higher"
@@ -166,13 +190,20 @@ task = "t2i"
 model = "SenseNova-U1"
 dataset = "mjhq"
 dataset_revision = "15b0a659e066e763d0e9a6cd8f00e25f8af5e084"
+
+[benchmarks.sensenova-uniserve-t2i-image.load]
 num_prompts = 32
 request_rate = inf
 max_concurrency = 32
 warmup_requests = 1
 seed = 42
+
+[benchmarks.sensenova-uniserve-t2i-image.sampling]
 temperature = 0.0
 top_p = 1.0
+stream = false
+
+[benchmarks.sensenova-uniserve-t2i-image.image]
 width = 2048
 height = 1152
 steps = 50
@@ -182,7 +213,6 @@ image_guidance_scale = 1.0
 cfg_norm = "none"
 cfg_interval = [0.0, 1.0]
 timestep_shift = 3.0
-wire = "openai_chat_json"
 
 [benchmarks.sensenova-uniserve-t2i-image.metrics]
 images_per_second = "higher"
@@ -193,4 +223,3 @@ points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-c32", "sensenova
 
 [suites.serving-runtime]
 points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-stream", "sensenova-uniserve-t2i-image", "sensenova-uniserve-interleave-c4"]
-max_regression = 0.10

@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 from PIL import Image
 
-from uniserve_eval.harness.sse import iter_sse_events
+from uniserve_eval.transport.sse import iter_sse_events
 
 
 def find_free_port() -> int:

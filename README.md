@@ -173,7 +173,7 @@ crates/frontend/         Model profiles, serving request funnel, and OpenAI adap
 crates/server/           Configured HTTP application
 crates/bin/uniserve/     `uniserve` CLI
 uniserve_worker/         Forward-only Python model workers
-uniserve_eval/           Evaluation driver and benchmark harness
+uniserve_eval/           Public-protocol serving evaluator
 specs/                   Builder-facing runtime and serving contracts
 docs/                    User-facing protocols and evaluation documentation
 ```

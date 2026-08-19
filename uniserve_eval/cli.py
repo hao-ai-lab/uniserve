@@ -1,31 +1,16 @@
-"""Run and compare explicit public-protocol serving benchmarks."""
+"""Run explicit public-protocol serving benchmarks."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
-import os
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
-from .backends import ManagedServer
-from .harness.comparison import (
-    compare_suite,
-)
-from .harness.comparison import (
-    render_markdown as render_comparison,
-)
-from .harness.provenance import collect_provenance
-from .harness.runner import BenchmarkRunner
-from .profiles import (
-    DEFAULT_CONFIG,
-    load_config,
-    require_resolved,
-    server_launch,
-)
+from .config import DEFAULT_CONFIG, load_config, server_launch
+from .pipeline.run import run_point
+from .pipeline.setup import applied_environment, describe_launch, host_lock, prepare_launch
+from .server import ManagedServer
 
 
 def list_items(args: argparse.Namespace) -> None:
@@ -59,9 +44,11 @@ def plan(args: argparse.Namespace) -> None:
                 "server_working_directory": str(launch.working_directory),
                 "base_url": server.base_url,
                 "dataset": point.dataset,
-                "num_prompts": point.num_prompts,
-                "request_rate": "inf" if point.request_rate == float("inf") else point.request_rate,
-                "max_concurrency": point.max_concurrency,
+                "num_prompts": point.load.num_prompts,
+                "request_rate": (
+                    "inf" if point.load.request_rate == float("inf") else point.load.request_rate
+                ),
+                "max_concurrency": point.load.max_concurrency,
                 "metrics": [metric.as_dict() for metric in point.metrics],
             }
         )
@@ -73,29 +60,22 @@ def run(args: argparse.Namespace) -> None:
     output_root = args.output_root or config.artifact_root
     points = config.selected_points(args.selection)
     failures = 0
-    with _host_lock():
+    with host_lock():
         for point in points:
             server = config.servers[point.server]
-            launch = server_launch(server, args.executable)
-            require_resolved(launch.command, context=f"server {server.name}")
-            require_resolved(point.workload_dict(), context=f"benchmark {point.name}")
+            launch = prepare_launch(config, point, args.executable)
             point_dir = output_root / point.name
             log_path = output_root / "server-logs" / f"{point.name}.log"
-            provenance = collect_provenance(
-                launch.command,
-                launch.working_directory,
-                launch.environment,
-            )
-            with _environment(launch.environment):
+            with applied_environment(launch.environment):
                 with ManagedServer(server, launch, log_path, timeout_s=args.launch_timeout_s):
                     result = asyncio.run(
-                        BenchmarkRunner(
+                        run_point(
                             server.base_url,
                             point,
                             point_dir,
-                            provenance=provenance,
+                            launch=describe_launch(launch),
                             timeout_s=args.request_timeout_s,
-                        ).run()
+                        )
                     )
             print(
                 f"{point.name}: {'pass' if result.summary['validation']['valid'] else 'fail'} "
@@ -105,32 +85,6 @@ def run(args: argparse.Namespace) -> None:
                 failures += 1
                 break
     if failures:
-        raise SystemExit(2)
-
-
-def compare(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
-    points = config.selected_points(args.selection)
-    suite = config.suites.get(args.selection)
-    max_regression = args.max_regression
-    if max_regression is None:
-        max_regression = suite.max_regression if suite is not None else None
-    report = compare_suite(
-        args.reference_root,
-        args.candidate_root,
-        [point.name for point in points],
-        max_regression=max_regression,
-    )
-    markdown = render_comparison(report)
-    print(markdown, end="")
-    if args.output_dir is not None:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        (args.output_dir / "comparison.json").write_text(
-            json.dumps(report, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        (args.output_dir / "comparison.md").write_text(markdown, encoding="utf-8")
-    if report["valid"] is not True or (max_regression is not None and report["passed"] is not True):
         raise SystemExit(2)
 
 
@@ -160,45 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--launch-timeout-s", type=float, default=1800)
     command.add_argument("--request-timeout-s", type=float, default=6 * 60 * 60)
     command.set_defaults(function=run)
-
-    command = subparsers.add_parser("compare")
-    command.add_argument("selection")
-    command.add_argument("--reference-root", type=Path, required=True)
-    command.add_argument("--candidate-root", type=Path, required=True)
-    command.add_argument("--max-regression", type=float)
-    command.add_argument("--output-dir", type=Path)
-    command.set_defaults(function=compare)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     args.function(args)
-
-
-@contextmanager
-def _host_lock() -> Iterator[None]:
-    path = Path("/tmp/uniserve-eval.lock")
-    with path.open("a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError("another uniserve-eval process holds the host lock") from error
-        yield
-
-
-@contextmanager
-def _environment(values: dict[str, str]) -> Iterator[None]:
-    previous: dict[str, str | None] = {name: os.environ.get(name) for name in values}
-    os.environ.update(values)
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
 
 
 if __name__ == "__main__":

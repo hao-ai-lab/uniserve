@@ -26,9 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench);
-# the loaders raise a clear ImportError pointing here when missing, and
-# --dataset-path local files work without this extra.
+# Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench, Beans).
 eval-datasets = [
     "datasets>=3",
     "pyarrow<20",
@@ -52,10 +50,7 @@ dev = [
 bench = [
     "datasets>=2.0",
     "httpx>=0.27",
-    "jsonschema>=4.22",
-    "lpips>=0.1.4",
     "pillow>=10.4",
-    "scikit-image>=0.24",
 ]
 # Optional accelerator kernels. Worker imports are guarded and fall back to a
 # pure-PyTorch attention path when absent. Install only wheels that exist for
@@ -75,7 +70,7 @@ uniserve-eval = "uniserve_eval.cli:main"
 include = ["uniserve_worker*", "uniserve_eval*"]
 
 [tool.setuptools.package-data]
-uniserve_eval = ["profiles.toml", "data/*.jsonl"]
+uniserve_eval = ["profiles.toml"]
 
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]

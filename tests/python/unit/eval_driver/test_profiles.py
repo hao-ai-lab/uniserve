@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from uniserve_eval.profiles import ROOT, load_config
+from uniserve_eval.config import ROOT, load_config
 
 pytestmark = pytest.mark.unit
 
@@ -24,9 +24,8 @@ def test_decode_runtime_suite_resolves_to_four_explicit_points() -> None:
     assert tuple((metric.name, metric.direction) for metric in points[-1].metrics) == (
         ("mean_ttft_ms", "lower"),
         ("mean_tpot_ms", "lower"),
-        ("images.image_latency_ms.mean", "lower"),
+        ("image_latency_ms.mean", "lower"),
     )
-    assert config.suites["decode-runtime"].max_regression is None
 
 
 def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> None:
@@ -38,8 +37,8 @@ def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> Non
         "sensenova-uniserve-t2i-image",
         "sensenova-uniserve-interleave-c4",
     )
-    assert points[1].wire == "openai_chat"
-    assert points[2].wire == "openai_chat_json"
+    assert points[1].sampling.stream is True
+    assert points[2].sampling.stream is False
     assert tuple(metric.name for metric in points[2].metrics) == (
         "images_per_second",
         "image_latency_ms.mean",
@@ -58,7 +57,12 @@ command = ["server"]
 server = "local"
 task = "text"
 model = "model"
+dataset = "sharegpt"
+tokenizer = "model"
 unexpected = true
+
+[benchmarks.point.load]
+num_prompts = 1
 
 [benchmarks.point.metrics]
 output_throughput = "higher"
@@ -82,6 +86,11 @@ command = ["target/release/uniserve", "serve", "model", "--worker-python", ".ven
 server = "local"
 task = "text"
 model = "model"
+dataset = "sharegpt"
+tokenizer = "model"
+
+[benchmarks.point.load]
+num_prompts = 1
 
 [benchmarks.point.metrics]
 output_throughput = "higher"
