@@ -10,7 +10,7 @@ from uniserve_worker.bootstrap.cli import parse_worker_launch
 pytestmark = pytest.mark.unit
 
 
-def test_engine_batch_token_budget_reaches_worker_resources() -> None:
+def test_engine_batch_capacity_reaches_worker_resources() -> None:
     config = parse_worker_launch(
         [
             "--service-name",
@@ -21,11 +21,14 @@ def test_engine_batch_token_budget_reaches_worker_resources() -> None:
             "model",
             "--device",
             "cpu",
+            "--max-batch-operations",
+            "128",
             "--max-batch-tokens",
             "16384",
         ]
     )
 
+    assert config.resources.max_batch_operations == 128
     assert config.resources.max_batch_tokens == 16384
 
 

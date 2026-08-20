@@ -44,6 +44,7 @@ def assemble_worker(config: WorkerLaunchConfig):
         deployment = replace(
             stub_deployment(
                 config.resources.block_size,
+                max_batch_operations=config.resources.max_batch_operations,
                 max_batch_tokens=config.resources.max_batch_tokens,
             ),
             device=config.placement.device,
@@ -79,6 +80,7 @@ def assemble_worker(config: WorkerLaunchConfig):
                 model_path=config.model.path,
                 device=config.placement.device,
                 block_size=config.resources.block_size,
+                max_batch_operations=config.resources.max_batch_operations,
                 max_batch_tokens=config.resources.max_batch_tokens,
                 kv_token_capacity=config.resources.kv_token_capacity,
                 attention_backend=config.model.attention_backend,

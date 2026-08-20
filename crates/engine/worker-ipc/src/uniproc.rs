@@ -278,6 +278,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_operations: u32,
         max_batch_tokens: u32,
         attention_backend: &str,
     ) -> anyhow::Result<Self> {
@@ -290,6 +291,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_operations,
             max_batch_tokens,
             attention_backend,
             &WorkerLaunchConfig::default(),
@@ -306,6 +308,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_operations: u32,
         max_batch_tokens: u32,
         attention_backend: &str,
         worker_config: &WorkerLaunchConfig,
@@ -319,6 +322,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_operations,
             max_batch_tokens,
             attention_backend,
             0,
@@ -338,6 +342,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_operations: u32,
         max_batch_tokens: u32,
         attention_backend: &str,
         tp_rank: u32,
@@ -353,6 +358,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_operations,
             max_batch_tokens,
             attention_backend,
             tp_rank,
@@ -372,6 +378,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_operations: u32,
         max_batch_tokens: u32,
         attention_backend: &str,
         tp_rank: u32,
@@ -388,6 +395,7 @@ impl UniprocExecutor {
             resp_slot_cap,
             kv_token_capacity,
             block_size,
+            max_batch_operations,
             max_batch_tokens,
             attention_backend,
             tp_rank,
@@ -411,6 +419,7 @@ impl UniprocExecutor {
         resp_slot_cap: usize,
         kv_token_capacity: Option<u64>,
         block_size: u32,
+        max_batch_operations: u32,
         max_batch_tokens: u32,
         attention_backend: &str,
         tp_rank: u32,
@@ -442,6 +451,8 @@ impl UniprocExecutor {
             .arg(attention_backend)
             .arg("--block-size")
             .arg(block_size.to_string())
+            .arg("--max-batch-operations")
+            .arg(max_batch_operations.to_string())
             .arg("--max-batch-tokens")
             .arg(max_batch_tokens.to_string())
             .arg("--tp-rank")

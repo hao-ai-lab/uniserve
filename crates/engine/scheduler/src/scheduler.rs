@@ -801,10 +801,6 @@ pub struct Scheduler {
     /// request state. The scheduler retains all leases until those successors
     /// drain, then publishes the terminal event exactly once.
     pending_finishes: HashMap<RequestId, PendingFinish>,
-    /// Finite set of resident prompts coalesced behind active decode work.
-    /// Membership is frozen until every member's prompt work drains, so later
-    /// arrivals cannot indefinitely delay the cohort's first decode service.
-    prompt_cohort: Option<HashSet<RequestId>>,
     /// Sequential denoise timesteps to execute per denoise op. The worker runs
     /// the exact same Euler steps and reports the cumulative step cursor.
     denoise_step_burst: u16,
@@ -1364,7 +1360,6 @@ impl Scheduler {
             inflight_ops: HashMap::new(),
             pending_completions: HashMap::new(),
             pending_finishes: HashMap::new(),
-            prompt_cohort: None,
             denoise_step_burst,
             flow_exclusive_batch,
             fatal: false,
@@ -4311,15 +4306,6 @@ impl Scheduler {
     /// pair first-dispatch requests with their typed admission record.
     fn assemble(&mut self) -> (Vec<Admission>, Vec<PlannedTransition>) {
         let ids = self.assembly_order();
-        self.refresh_prompt_cohort(&ids);
-        if let Some(cohort) = self.prompt_cohort.as_ref() {
-            let cohort_ids = ids
-                .iter()
-                .copied()
-                .filter(|id| cohort.contains(id))
-                .collect::<Vec<_>>();
-            return self.assemble_pass(&cohort_ids, Some(AssemblyLane::Prefill));
-        }
         let lane = self.select_assembly_lane(&ids);
         let (new_reqs, ops) = self.assemble_pass(&ids, lane);
         if ops.is_empty() && lane == Some(AssemblyLane::Prefill) {
@@ -4331,65 +4317,6 @@ impl Scheduler {
             return self.assemble_pass(&ids, Some(AssemblyLane::Decode));
         }
         (new_reqs, ops)
-    }
-
-    fn request_has_prompt_work(&self, id: RequestId) -> bool {
-        if self.running.get(&id).is_none_or(|state| state.cancelled) {
-            return false;
-        }
-        self.inflight_ops
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .any(|op| assembly_lane(op.operation.work.variant()) == AssemblyLane::Prefill)
-            || self
-                .peek_next_operation_variant(id)
-                .is_some_and(|operation_variant| {
-                    assembly_lane(operation_variant) == AssemblyLane::Prefill
-                })
-    }
-
-    fn request_has_ready_decode(&self, id: RequestId) -> bool {
-        self.running.get(&id).is_some_and(|state| !state.cancelled)
-            && self
-                .peek_next_operation_variant(id)
-                .is_some_and(|operation_variant| {
-                    assembly_lane(operation_variant) == AssemblyLane::Decode
-                })
-            && self.can_schedule_next(id)
-    }
-
-    fn refresh_prompt_cohort(&mut self, ids: &[RequestId]) {
-        let active = self.prompt_cohort.as_ref().is_some_and(|cohort| {
-            cohort
-                .iter()
-                .copied()
-                .any(|id| self.request_has_prompt_work(id))
-        });
-        if active {
-            return;
-        }
-        if self.prompt_cohort.take().is_some() {
-            // The first scheduling turn after a cohort drains belongs to ready
-            // decode work before another finite prompt cohort may open.
-            return;
-        }
-
-        let prompt_ids = ids
-            .iter()
-            .copied()
-            .filter(|id| self.request_has_prompt_work(*id))
-            .collect::<HashSet<_>>();
-        if prompt_ids.len() < 2 {
-            return;
-        }
-        let overlaps_decode = ids.iter().copied().any(|decode_id| {
-            self.request_has_ready_decode(decode_id)
-                && prompt_ids.iter().any(|prompt_id| *prompt_id != decode_id)
-        });
-        if overlaps_decode {
-            self.prompt_cohort = Some(prompt_ids);
-        }
     }
 
     fn assemble_pass(
@@ -4796,47 +4723,55 @@ impl Scheduler {
             });
             let mut operation_kv_placements = Vec::new();
             if let Some(lengths) = kv_lengths {
+                let block_table_update =
+                    admitted_request_keys.contains(&request_key) || new_page_count > 0;
                 for group_id in 0..self.bm.num_groups() {
-                    let block_table = self
-                        .bm
-                        .blocks_for_group(request_id, group_id)
-                        .iter()
-                        .take(transition.kv_capacity_pages as usize)
-                        .copied()
-                        .collect::<Vec<_>>();
-                    if block_table.len() != transition.kv_capacity_pages as usize {
-                        tracing::error!(
-                            request_id = request_id.0,
-                            group_id,
-                            expected_pages = transition.kv_capacity_pages,
-                            actual_pages = block_table.len(),
-                            "KV groups disagree on request capacity"
-                        );
-                        self.fatal = true;
-                        return false;
-                    }
-                    let pages_to_zero = if admitted_request_keys.contains(&request_key) {
-                        let retained_pages = if group_id == 0 {
-                            self.running
-                                .get(&request_id)
-                                .map(|state| {
-                                    (state.ingest.prompt_cursor as usize)
-                                        .div_ceil(self.caps.block_size as usize)
-                                })
-                                .unwrap_or_default()
-                                .min(block_table.len())
+                    let (block_table, pages_to_zero) = if block_table_update {
+                        let block_table = self
+                            .bm
+                            .blocks_for_group(request_id, group_id)
+                            .iter()
+                            .take(transition.kv_capacity_pages as usize)
+                            .copied()
+                            .collect::<Vec<_>>();
+                        if block_table.len() != transition.kv_capacity_pages as usize {
+                            tracing::error!(
+                                request_id = request_id.0,
+                                group_id,
+                                expected_pages = transition.kv_capacity_pages,
+                                actual_pages = block_table.len(),
+                                "KV groups disagree on request capacity"
+                            );
+                            self.fatal = true;
+                            return false;
+                        }
+                        let pages_to_zero = if admitted_request_keys.contains(&request_key) {
+                            let retained_pages = if group_id == 0 {
+                                self.running
+                                    .get(&request_id)
+                                    .map(|state| {
+                                        (state.ingest.prompt_cursor as usize)
+                                            .div_ceil(self.caps.block_size as usize)
+                                    })
+                                    .unwrap_or_default()
+                                    .min(block_table.len())
+                            } else {
+                                0
+                            };
+                            block_table[retained_pages..].to_vec()
                         } else {
-                            0
+                            block_table[block_table.len().saturating_sub(new_page_count)..].to_vec()
                         };
-                        block_table[retained_pages..].to_vec()
+                        (block_table, pages_to_zero)
                     } else {
-                        block_table[block_table.len().saturating_sub(new_page_count)..].to_vec()
+                        (Vec::new(), Vec::new())
                     };
                     operation_kv_placements.push(KvPlacement {
                         request_key,
                         op_id: OpId(oid),
                         group_id: group_id as u32,
                         block_table,
+                        block_table_update,
                         pages_to_zero,
                         prefix_length: lengths.prefix,
                         input_length: lengths.input,

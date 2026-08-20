@@ -5,6 +5,11 @@ from __future__ import annotations
 import torch
 
 from ..batch import WorkVariant
+from ..bootstrap.capacity import (
+    DEFAULT_BLOCK_SIZE,
+    DEFAULT_MAX_BATCH_OPS,
+    DEFAULT_MAX_REQUEST_POOL_SIZE,
+)
 from ..execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
@@ -12,11 +17,6 @@ from ..execution.forward_batch import (
     PagedDecodePlan,
     PagedVarlenPlan,
     TokenSelection,
-)
-from ..bootstrap.capacity import (
-    DEFAULT_BLOCK_SIZE,
-    DEFAULT_MAX_BATCH_OPS,
-    DEFAULT_MAX_REQUEST_POOL_SIZE,
 )
 from ..models.generation import BranchSource, GenerationPipeline, LatentLayout, Materialization
 from ..models.inputs import (
@@ -59,6 +59,7 @@ __all__ = [
 def stub_deployment(
     block_size: int = DEFAULT_BLOCK_SIZE,
     *,
+    max_batch_operations: int = DEFAULT_MAX_BATCH_OPS,
     max_batch_tokens: int,
 ) -> WorkerDeployment:
     return WorkerDeployment(
@@ -73,7 +74,7 @@ def stub_deployment(
         model_dtype="bfloat16",
         kv_cache_dtype=None,
         kv_memory_fraction=1.0,
-        max_batch_operations=DEFAULT_MAX_BATCH_OPS,
+        max_batch_operations=int(max_batch_operations),
         max_batch_tokens=int(max_batch_tokens),
         max_request_pool_size=DEFAULT_MAX_REQUEST_POOL_SIZE,
         generation_device=None,

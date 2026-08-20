@@ -53,6 +53,8 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
         capabilities.sampling_ownership,
         SamplingOwnership::DesignatedRank
     );
+    assert_eq!(capabilities.max_batch_operations, 256);
+    assert_eq!(capabilities.max_batch_tokens, 256);
     assert_eq!(executor.pipeline_depth(), PIPELINE_DEPTH);
 
     let admission = text_admission(11, 1, 1)?;
@@ -313,6 +315,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         8 << 20,
         Some(4096),
         16,
+        256,
         256,
         "torch_sdpa",
         "full",
@@ -751,6 +754,7 @@ fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
         Some(4096),
         16,
         256,
+        256,
         "torch_sdpa",
         &config,
     )
@@ -911,6 +915,7 @@ fn token_batch(
             op_id,
             group_id: 0,
             block_table: vec![page],
+            block_table_update: true,
             pages_to_zero: if prefix_length == 0 {
                 vec![page]
             } else {

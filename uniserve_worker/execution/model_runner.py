@@ -73,6 +73,7 @@ from uniserve_worker.execution.forward_batch import (
     PackedAttentionPlan,
     PagedDecodePlan,
     PagedVarlenPlan,
+    RequestIndexedDecodePlan,
     RouteMeshView,
     RouteSpan,
     TokenSelection,
@@ -192,7 +193,7 @@ from ._inputs import (
     prepare_image,
     prepare_tensor_image,
 )
-from .cuda_graph import GraphExecutionError
+from .cuda_graph import GraphExecutionError, GraphGreedyOutput
 from .model_invocation import RunObservation, RunPath, _ModelInvocation
 
 logger = logging.getLogger(__name__)
@@ -231,6 +232,9 @@ class _ForwardTask:
     attention_indexes: torch.Tensor | None = None
     text_local_indices: tuple[int, ...] = ()
     request_pool_index: torch.Tensor | None = None
+    decode_predicate: torch.Tensor | None = None
+    decode_predicate_tagged: bool = False
+    decode_force_finish: bool = False
 
     @property
     def query_tokens(self) -> int:
@@ -291,6 +295,17 @@ class _SampleTask:
 
 
 @dataclass(frozen=True, slots=True)
+class _SampleBatchVectors:
+    request_pool_indices: torch.Tensor
+    tokens: torch.Tensor
+    valid: torch.Tensor
+    active: torch.Tensor
+    continuation: torch.Tensor
+    selected_points: torch.Tensor | None
+    penalty_bases: tuple[torch.Tensor | None, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _SampleResult:
     token_id: int | _CompletionToken
     device_token: torch.Tensor | None
@@ -308,6 +323,8 @@ class _SampleResult:
     device_finish: torch.Tensor | None = None
     device_continuation: torch.Tensor | None = None
     device_product_published: bool = False
+    device_batch: _SampleBatchVectors | None = None
+    device_batch_index: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -698,10 +715,12 @@ class ModelRunner:
         self._collective_history: OrderedDict[int, str] = OrderedDict()
         self._transport_publications: dict[_OperationIdentity, tuple[Locator, ...]] = {}
         self._branch_cache_rows: dict[tuple[RequestKey, int, int], CacheRow] = {}
+        self._request_cache_pages: dict[tuple[RequestKey, int], tuple[int, ...]] = {}
 
     def close(self) -> None:
         self._collective_history.clear()
         self._transport_publications.clear()
+        self._request_cache_pages.clear()
         self._qualified_mixed_buckets.clear()
         self._model_invocation.close()
 
@@ -2413,6 +2432,13 @@ class ModelRunner:
         )
         for branch_identity in branch_rows:
             del self._branch_cache_rows[branch_identity]
+        request_rows = tuple(
+            identity
+            for identity in self._request_cache_pages
+            if int(identity[0].session_id) == int(session_id)
+        )
+        for request_identity in request_rows:
+            del self._request_cache_pages[request_identity]
         if self.transport is None:
             return
         selected = tuple(
@@ -2529,6 +2555,10 @@ class ModelRunner:
             for operation in partition.operations
         }
         cache_rows: list[tuple[tuple[RequestKey, int, int], CacheRow, tuple[int, ...]]] = []
+        placement_updates: dict[tuple[RequestKey, int], tuple[int, int, tuple[int, ...]]] = {}
+        placement_contexts: list[
+            tuple[RequestRow, RequestRuntime, RequestRuntime, tuple[int, ...]]
+        ] = []
         for placement in partition.kv_placements:
             operation = operations.get((placement.request_key, placement.op_id))
             if operation is None:
@@ -2538,11 +2568,46 @@ class ModelRunner:
             committed_runtime = session.runtime_for(session.committed_version())
             if committed_runtime is None:
                 raise invalid_descriptor("KV placement session has no committed runtime")
-            pages = self.cache_pool.validate_pages(
-                placement.block_table,
-                scratch=False,
-                group=placement.group_id,
-            )
+            placement_identity = (placement.request_key, int(placement.group_id))
+            if placement.block_table_update:
+                pages = self.cache_pool.validate_pages(
+                    placement.block_table,
+                    scratch=False,
+                    group=placement.group_id,
+                )
+                update = (
+                    int(session.request_pool_idx),
+                    int(placement.group_id),
+                    pages,
+                )
+                existing_update = placement_updates.get(placement_identity)
+                if existing_update is not None and existing_update != update:
+                    raise invalid_descriptor(
+                        "one batch changes a request page table more than once"
+                    )
+                placement_updates[placement_identity] = update
+            else:
+                pending = placement_updates.get(placement_identity)
+                stored_pages = (
+                    pending[2]
+                    if pending is not None
+                    else self._request_cache_pages.get(placement_identity)
+                )
+                if stored_pages is None:
+                    raise invalid_descriptor(
+                        "KV placement reference has no published request page table"
+                    )
+                pages = stored_pages
+            if len(pages) != int(operation.kv_capacity_pages):
+                raise invalid_descriptor(
+                    "KV placement request page table does not match operation capacity"
+                )
+            placement_contexts.append((session, parent_runtime, committed_runtime, pages))
+        for placement, (session, parent_runtime, committed_runtime, pages) in zip(
+            partition.kv_placements,
+            placement_contexts,
+            strict=True,
+        ):
             pages_to_zero = self.cache_pool.validate_pages(
                 placement.pages_to_zero,
                 scratch=False,
@@ -2643,6 +2708,9 @@ class ModelRunner:
                     pages_to_zero,
                 )
             )
+        for identity, (_slot, _group, pages) in placement_updates.items():
+            self._request_cache_pages[identity] = pages
+        self.cache_pool.publish_request_placements(tuple(placement_updates.values()))
         for cache_identity, row, pages_to_zero in cache_rows:
             if pages_to_zero:
                 self.cache_pool.zero_pages(row.group_id, pages_to_zero)
@@ -3016,8 +3084,6 @@ class ModelRunner:
     ) -> tuple[_Outcome, ...]:
         build_started = time.perf_counter_ns()
         starts: list[int] = []
-        tasks: list[_ForwardTask] = []
-        current_tokens = self._resolve_decode_tokens(operations, scope)
         layout = scope.layout
         if layout is None:
             raise RuntimeError("partition lost its aligned request-row view")
@@ -3041,42 +3107,40 @@ class ModelRunner:
             cache_rows = tuple(value[1] for value in selected)
             weights = tuple(value[2] for value in selected)
         starts.extend(int(request.logical_position) for request in requests)
-        position_values = torch.tensor(starts, dtype=torch.long)
-        for row_index, (operation, session, entry, weight, current) in enumerate(
-            zip(
-                operations,
-                requests,
-                cache_rows,
-                weights,
-                current_tokens,
-                strict=True,
-            )
-        ):
-            if session.sampling is None:
-                raise invalid_descriptor("sequence operation has no admitted sampling state")
-            tasks.append(
-                self._token_task(
-                    operation,
-                    session,
-                    (current,),
-                    position_values[row_index : row_index + 1],
-                    TokenSelection.LAST_LOGITS,
-                    scope,
-                    entry=entry,
-                    weights=weight,
-                )
-            )
+        tasks = self._decode_forward_tasks(
+            operations,
+            requests,
+            cache_rows,
+            weights,
+            starts,
+            scope,
+        )
 
         _record_component(scope, "text_build_batch", build_started)
         forward_started = time.perf_counter_ns()
-        outputs = self._run_wave(tuple(tasks), scope)
+        outputs, output_event = self._run_observed_forward_group(tasks, scope)
+        graph_greedy = self._model_invocation.last_greedy_output
+        if output_event is not None:
+            device, event = output_event
+            torch.cuda.current_stream(device).wait_event(event)
         _record_component(scope, "text_model_forward", forward_started)
-        logits: list[torch.Tensor] = []
-        for task, output in zip(tasks, outputs, strict=True):
-            logits.append(_token_logits(output)[-1])
+        for task in tasks:
             self._commit_task_kv(task, 1, scope, publish_runtime=False)
 
         sample_started = time.perf_counter_ns()
+        graph_outcomes = self._project_graph_decode(
+            operations,
+            requests,
+            cache_rows,
+            tasks,
+            starts,
+            graph_greedy,
+            scope,
+        )
+        if graph_outcomes is not None:
+            _record_component(scope, "text_sample", sample_started)
+            return graph_outcomes
+        logits = tuple(_token_logits(output)[-1] for output in outputs)
         sample_tasks = tuple(
             self._sample_task(
                 operation,
@@ -3095,12 +3159,25 @@ class ModelRunner:
                 strict=True,
             )
         )
-        samples = _sample_task_batch(
-            sample_tasks,
-            scope.completion,
-            device_products=self.device_products,
-            device_reads=tuple(scope.device_reads),
-            selection_broadcast=self._broadcast_tp_selection,
+        sampling_reads = tuple(scope.device_reads)
+        samples = (
+            _sample_device_greedy_group(
+                sample_tasks,
+                scope.completion,
+                apply_suppression=False,
+                device_products=self.device_products,
+                device_reads=sampling_reads,
+                selection_broadcast=self._broadcast_tp_selection,
+                preselected=graph_greedy,
+            )
+            if _graph_greedy_compatible(sample_tasks, tasks, graph_greedy)
+            else _sample_task_batch(
+                sample_tasks,
+                scope.completion,
+                device_products=self.device_products,
+                device_reads=sampling_reads,
+                selection_broadcast=self._broadcast_tp_selection,
+            )
         )
         _record_component(scope, "text_sample", sample_started)
         finalize_started = time.perf_counter_ns()
@@ -3143,6 +3220,252 @@ class ModelRunner:
             decode_increment=True,
         )
         _record_component(scope, "text_finalize", finalize_started)
+        return tuple(outcomes)
+
+    def _decode_forward_tasks(
+        self,
+        operations: tuple[Operation, ...],
+        requests: tuple[RequestRow, ...],
+        cache_rows: tuple[CacheRow | None, ...],
+        weights: tuple[WeightSet, ...],
+        starts: list[int],
+        scope: _ExecutionScope,
+    ) -> tuple[_ForwardTask, ...]:
+        states = self.runtime_states
+        predicates = tuple(
+            scope.predicate_values.get(_operation_identity(operation)) for operation in operations
+        )
+        entries = tuple(row for row in cache_rows if row is not None)
+        request_indexed = (
+            states is not None
+            and states.device.type == "cuda"
+            and self.cache_pool.request_page_tables.device == states.device
+            and len(entries) == len(operations)
+            and len({row.group_id for row in entries}) == 1
+            and all(value is not None and value[1] for value in predicates)
+        )
+        if request_indexed:
+            placeholder = states.future_input_tokens[0, :1]
+            tasks: list[_ForwardTask] = []
+            for operation, request, entry, weight, predicate in zip(
+                operations,
+                requests,
+                cache_rows,
+                weights,
+                predicates,
+                strict=True,
+            ):
+                if request.sampling is None or entry is None or predicate is None:
+                    raise RuntimeError("request-indexed decode lost its aligned row state")
+                sampling_state = scope.sampling_states.get(
+                    _operation_identity(operation), SamplingState()
+                )
+                tasks.append(
+                    _ForwardTask(
+                        operation=operation,
+                        request=request,
+                        weights=weight,
+                        phase=ModelPhase.TEXT,
+                        token_ids=placeholder,
+                        positions=placeholder,
+                        selection=TokenSelection.LAST_LOGITS,
+                        entry=entry,
+                        write_kv=True,
+                        causal=True,
+                        decode_predicate=predicate[0],
+                        decode_predicate_tagged=True,
+                        decode_force_finish=bool(sampling_state.force_finish),
+                    )
+                )
+            return tuple(tasks)
+
+        current_tokens = self._resolve_decode_tokens(operations, scope)
+        position_values = torch.tensor(starts, dtype=torch.long)
+        return tuple(
+            self._token_task(
+                operation,
+                request,
+                (current,),
+                position_values[index : index + 1],
+                TokenSelection.LAST_LOGITS,
+                scope,
+                entry=entry,
+                weights=weight,
+            )
+            for index, (operation, request, entry, weight, current) in enumerate(
+                zip(
+                    operations,
+                    requests,
+                    cache_rows,
+                    weights,
+                    current_tokens,
+                    strict=True,
+                )
+            )
+        )
+
+    def _project_graph_decode(
+        self,
+        operations: tuple[Operation, ...],
+        requests: tuple[RequestRow, ...],
+        cache_rows: tuple[CacheRow | None, ...],
+        tasks: tuple[_ForwardTask, ...],
+        starts: list[int],
+        output: GraphGreedyOutput | None,
+        scope: _ExecutionScope,
+    ) -> tuple[_Outcome, ...] | None:
+        """Project a captured greedy decision directly into protocol state."""
+
+        if output is None:
+            return None
+        count = len(operations)
+        columns = (requests, cache_rows, tasks, starts)
+        vectors = (
+            output.request_pool_indices,
+            output.tokens,
+            output.valid,
+            output.active,
+            output.finish,
+            output.continuation,
+            output.tagged_tokens,
+        )
+        if (
+            count == 0
+            or any(len(values) != count for values in columns)
+            or any(int(value.numel()) != count for value in vectors)
+            or int(output.completion.numel()) != SAMPLING_COMPLETION_FIELDS * count
+        ):
+            return None
+
+        token_writes: list[DeviceProductWrite] = []
+        for operation, request, task in zip(operations, requests, tasks, strict=True):
+            sampling = request.sampling
+            state = scope.sampling_states.get(_operation_identity(operation), SamplingState())
+            finish_token_ids = (
+                request.finish_token_ids
+                if not state.finish_token_ids
+                else state.finish_token_ids
+                if not request.finish_token_ids
+                else tuple(sorted({*request.finish_token_ids, *state.finish_token_ids}))
+            )
+            write = scope.token_writes.get(_operation_identity(operation))
+            if (
+                sampling is None
+                or not _device_greedy_parameters(sampling)
+                or sampling.allowed_token_ids is not None
+                or bool(sampling.forced_token_ids)
+                or state.allowed_token_ids is not None
+                or bool(state.suppressed_token_ids)
+                or bool(finish_token_ids)
+                or bool(state.transition_token_ids)
+                or _operation_identity(operation) in scope.transition_writes
+                or task.decode_predicate is None
+                or not task.decode_predicate_tagged
+                or bool(state.force_finish) != bool(task.decode_force_finish)
+                or write is None
+            ):
+                return None
+            token_writes.append(write)
+
+        token_batch = self.device_products.producer_scalar_batch(tuple(token_writes))
+        finish_indexes = tuple(
+            index
+            for index, operation in enumerate(operations)
+            if _operation_identity(operation) in scope.finish_writes
+        )
+        finish_batch: DeviceProductScalarBatch | None = None
+        if finish_indexes:
+            finish_writes = tuple(
+                scope.finish_writes[_operation_identity(operations[index])]
+                for index in finish_indexes
+            )
+            finish_batch = self.device_products.producer_scalar_batch(finish_writes)
+
+        self._broadcast_tp_selection(output.tokens)
+        span = _capture_preselected_span(output, scope.completion)
+        if token_batch is not None and (not finish_indexes or finish_batch is not None):
+            token_batch.tensor.copy_(output.tagged_tokens)
+            batches: tuple[DeviceProductScalarBatch, ...] = (token_batch,)
+            if finish_batch is not None:
+                finish_batch.tensor.copy_(_select_device_values(output.finish, finish_indexes))
+                batches = (finish_batch, token_batch)
+            self.device_products.publish_scalar_group(
+                batches,
+                after_reads=tuple(scope.device_reads),
+            )
+        else:
+            _publish_device_writes(
+                tuple(token_writes),
+                output.tagged_tokens,
+                self.device_products,
+                tuple(scope.device_reads),
+            )
+        if finish_indexes and not (token_batch is not None and finish_batch is not None):
+            finish_writes = tuple(
+                scope.finish_writes[_operation_identity(operations[index])]
+                for index in finish_indexes
+            )
+            _publish_device_writes(
+                finish_writes,
+                _select_device_values(output.finish, finish_indexes),
+                self.device_products,
+                tuple(scope.device_reads),
+            )
+
+        states = self.runtime_states
+        if states is None:
+            raise RuntimeError("graph decode has no request runtime-state owner")
+        slots = tuple(int(request.request_pool_idx) for request in requests)
+        if any(
+            operation.request_key != request.request_key
+            for operation, request in zip(
+                operations,
+                requests,
+                strict=True,
+            )
+        ):
+            raise RuntimeError("graph decode crossed request rows")
+        scope.runtime_publications.append(
+            _DecodeRuntimePublication(
+                slots=slots,
+                device_slots=output.request_pool_indices,
+                tokens=output.tokens,
+                predicates=output.continuation,
+                selected_points=None,
+                penalty_bases=(None,) * count,
+                valid=output.valid,
+                active=output.active,
+            )
+        )
+
+        outcomes: list[_Outcome] = []
+        for index, (operation, request, cache_row, start) in enumerate(
+            zip(operations, requests, cache_rows, starts, strict=True)
+        ):
+            if cache_row is None:
+                raise RuntimeError("graph decode lost its scheduler cache row")
+            request.rng_counter += 1
+            request.logical_position = int(start) + 1
+            extents = cache_row.extents()
+            outcomes.append(
+                _Outcome(
+                    status=OpStatus.OK,
+                    selected_point=1,
+                    logical_lengths=LogicalLengths(
+                        token_len=request.logical_position,
+                        kv_visible_len=extents.visible,
+                        latent_len=request.flow_step,
+                        kv_reserved_len=extents.reserved,
+                        kv_initialized_len=extents.initialized,
+                        kv_committed_len=extents.committed,
+                        kv_published_len=extents.published,
+                    ),
+                    token_span=TokenSpan(base=int(start), len=1),
+                    finish_flags=FinishFlags(),
+                    product_generations=_output_generations(operation),
+                    committed_tokens=(_CompletionSampleToken(span, index),),
+                )
+            )
         return tuple(outcomes)
 
     def _drive(self, drivers: tuple[_Driver, ...], scope: _ExecutionScope) -> tuple[_Outcome, ...]:
@@ -3607,23 +3930,30 @@ class ModelRunner:
         output_events: list[tuple[torch.device, torch.cuda.Event]] = []
         for group in groups:
             indexes, group_tasks = zip(*group, strict=True)
-            output = self._run_forward_group(tuple(group_tasks), scope)
-            observation = self._model_invocation.last_observation
-            if observation is None:
-                raise RuntimeError("model runner returned without an execution observation")
-            scope.observations.append(observation)
-            if self._model_invocation.last_output_event is not None:
-                output_events.append(
-                    (
-                        self._phase_device(group_tasks[0].phase),
-                        self._model_invocation.last_output_event,
-                    )
-                )
+            output, output_event = self._run_observed_forward_group(tuple(group_tasks), scope)
+            if output_event is not None:
+                output_events.append(output_event)
             for index, value in zip(indexes, output, strict=True):
                 result[index] = value
         for device, event in output_events:
             torch.cuda.current_stream(device).wait_event(event)
         return tuple(cast(torch.Tensor, value) for value in result)
+
+    def _run_observed_forward_group(
+        self,
+        tasks: tuple[_ForwardTask, ...],
+        scope: _ExecutionScope,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.device, torch.cuda.Event] | None]:
+        output = self._run_forward_group(tasks, scope)
+        observation = self._model_invocation.last_observation
+        if observation is None:
+            raise RuntimeError("model runner returned without an execution observation")
+        scope.observations.append(observation)
+        event = self._model_invocation.last_output_event
+        return (
+            output,
+            None if event is None else (self._phase_device(tasks[0].phase), event),
+        )
 
     def _broadcast_tp_selection(self, value: torch.Tensor) -> torch.Tensor:
         if self.mesh.tp_size <= 1:
@@ -3699,7 +4029,10 @@ class ModelRunner:
         self,
         tasks: tuple[_ForwardTask, ...],
         scope: _ExecutionScope,
-    ) -> tuple[KvView, PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan]:
+    ) -> tuple[
+        KvView,
+        PagedDecodePlan | RequestIndexedDecodePlan | PagedVarlenPlan | PackedAttentionPlan,
+    ]:
         pure_token_decode = all(
             task.operation.work.variant is WorkVariant.TOKEN_DECODE
             and task.token_ids is not None
@@ -3716,18 +4049,42 @@ class ModelRunner:
             tuple(cast(CacheRow, task.entry) for task in tasks),
             query_lengths=query_lens,
         )
-        host = torch.device("cpu")
-        block_table = view.block_table(host)
-        cache_seqlens = view.cache_seqlens(host)
         kv_lens = tuple(
             base + query for base, query in zip(view.base_lens, query_lens, strict=True)
         )
-        context_capacity = int(block_table.shape[1]) * int(view.block_size)
         causal_values = {bool(task.causal) for task in tasks}
         if len(causal_values) != 1:
             raise invalid_descriptor("paged attention rows must share causal semantics")
         causal = causal_values.pop()
         binding = _binding_identity(tasks)
+        if all(query == 1 for query in query_lens):
+            states = self.runtime_states
+            groups = {cast(CacheRow, task.entry).group_id for task in tasks}
+            if (
+                states is not None
+                and states.device.type == "cuda"
+                and self.cache_pool.request_page_tables.device == states.device
+                and len(groups) == 1
+            ):
+                request_decode = RequestIndexedDecodePlan(
+                    backends=self._attention_selection(),
+                    request_page_tables=self.cache_pool.request_page_tables,
+                    request_cache_lengths=states.valid_cache_lengths,
+                    request_tokens=states.future_input_tokens[:, 0],
+                    request_positions=states.logical_lengths,
+                    group_id=groups.pop(),
+                    page_size=int(view.block_size),
+                    cache_seqlens_cpu=tuple(view.base_lens),
+                    kv_seqlens_cpu=kv_lens,
+                    query_lens_cpu=query_lens,
+                    causal=causal,
+                    binding=binding,
+                )
+                return view, request_decode
+        host = torch.device("cpu")
+        block_table = view.block_table(host)
+        cache_seqlens = view.cache_seqlens(host)
+        context_capacity = int(block_table.shape[1]) * int(view.block_size)
         if all(query == 1 for query in query_lens):
             page_ids = _stage_ints(
                 tuple(
@@ -4419,6 +4776,8 @@ class ModelRunner:
                 tuple(int(value) for value in token_ids),
                 dtype=torch.long,
             )
+        predicate_value = scope.predicate_values.get(_operation_identity(operation))
+        sampling_state = scope.sampling_states.get(_operation_identity(operation), SamplingState())
         return _ForwardTask(
             operation=operation,
             request=session,
@@ -4434,6 +4793,9 @@ class ModelRunner:
             entry=self._cache_row(operation, scope) if entry is None else entry,
             write_kv=True,
             causal=True,
+            decode_predicate=None if predicate_value is None else predicate_value[0],
+            decode_predicate_tagged=False if predicate_value is None else predicate_value[1],
+            decode_force_finish=bool(sampling_state.force_finish),
         )
 
     def _commit_task_kv(
@@ -4606,6 +4968,33 @@ class ModelRunner:
                 for operation, session in zip(operations, sessions, strict=True)
             ):
                 raise RuntimeError("runtime sampling publication crossed request rows")
+            batch_vectors = samples[0].device_batch if samples else None
+            if batch_vectors is not None and all(
+                sample.device_batch is batch_vectors and sample.device_batch_index == index
+                for index, sample in enumerate(samples)
+            ):
+                if (
+                    int(batch_vectors.tokens.numel()) != len(samples)
+                    or int(batch_vectors.valid.numel()) != len(samples)
+                    or int(batch_vectors.active.numel()) != len(samples)
+                    or int(batch_vectors.continuation.numel()) != len(samples)
+                    or int(batch_vectors.request_pool_indices.numel()) != len(samples)
+                    or len(batch_vectors.penalty_bases) != len(samples)
+                ):
+                    raise RuntimeError("batched runtime sampling publication is not row-aligned")
+                scope.runtime_publications.append(
+                    _DecodeRuntimePublication(
+                        slots=tuple(int(session.request_pool_idx) for session in sessions),
+                        device_slots=batch_vectors.request_pool_indices,
+                        tokens=batch_vectors.tokens,
+                        predicates=batch_vectors.continuation,
+                        selected_points=batch_vectors.selected_points,
+                        penalty_bases=batch_vectors.penalty_bases,
+                        valid=batch_vectors.valid,
+                        active=batch_vectors.active,
+                    )
+                )
+                return
             selected_values = tuple(sample.device_selected_point for sample in samples)
             accepted_values = tuple(sample.device_accepted_tokens for sample in samples)
             selected_points = (
@@ -6662,18 +7051,62 @@ def _sampling_task_tensors(
     )
 
 
-def _device_greedy_row(row: _SamplingRow) -> bool:
-    parameters = row.parameters
+def _device_greedy_parameters(parameters: SamplingParams) -> bool:
     return (
         float(parameters.temperature) <= 0.0
         and not parameters.return_logprobs
-        and int(row.n_logprobs) == 0
+        and int(parameters.n_logprobs) == 0
         and not parameters.logprob_token_ids
-        and row.allowed is None
         and not parameters.logit_bias
         and parameters.repetition_penalty == 1.0
         and parameters.frequency_penalty == 0.0
         and parameters.presence_penalty == 0.0
+    )
+
+
+def _device_greedy_row(row: _SamplingRow) -> bool:
+    return (
+        _device_greedy_parameters(row.parameters)
+        and int(row.n_logprobs) == 0
+        and row.allowed is None
+    )
+
+
+def _graph_greedy_compatible(
+    tasks: tuple[_SampleTask, ...],
+    forward_tasks: Sequence[_ForwardTask],
+    output: GraphGreedyOutput | None,
+) -> bool:
+    if output is None or len(tasks) != len(forward_tasks):
+        return False
+    count = len(tasks)
+    vectors = (
+        output.request_pool_indices,
+        output.tokens,
+        output.valid,
+        output.active,
+        output.finish,
+        output.continuation,
+        output.tagged_tokens,
+    )
+    return (
+        count > 0
+        and all(int(value.numel()) == count for value in vectors)
+        and int(output.completion.numel()) == SAMPLING_COMPLETION_FIELDS * count
+        and all(
+            not task.draft_token_ids
+            and len(task.rows) == 1
+            and _device_greedy_row(task.rows[0])
+            and not task.rows[0].suppress
+            and not task.rows[0].finish_token_ids
+            and not task.rows[0].transition_token_ids
+            and task.transition_product is None
+            and task.request_pool_index is not None
+            and forward_task.decode_predicate is not None
+            and forward_task.decode_predicate_tagged
+            and bool(task.rows[0].force_finish) == bool(forward_task.decode_force_finish)
+            for task, forward_task in zip(tasks, forward_tasks, strict=True)
+        )
     )
 
 
@@ -6804,20 +7237,23 @@ def _sample_device_greedy_group(
     device_products: DeviceProducts | None,
     device_reads: tuple[DeviceProductRead, ...],
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
+    preselected: GraphGreedyOutput | None = None,
 ) -> tuple[_SampleResult, ...]:
-    logits = packed_tensor_views(tuple(task.logits for task in tasks))
-    if logits is None:
-        logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
-    else:
-        logits = logits.reshape(len(tasks), -1)
-    selection_logits = logits
-    if apply_suppression:
-        selection_logits = logits.to(dtype=torch.float32, copy=True)
-        vocab = int(selection_logits.shape[1])
-        for row_index, task in enumerate(tasks):
-            for token_id in dict.fromkeys(int(value) for value in task.rows[0].suppress):
-                if 0 <= token_id < vocab:
-                    selection_logits[row_index, token_id].fill_(float("-inf"))
+    selection_logits: torch.Tensor | None = None
+    if preselected is None:
+        logits = packed_tensor_views(tuple(task.logits for task in tasks))
+        if logits is None:
+            logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
+        else:
+            logits = logits.reshape(len(tasks), -1)
+        selection_logits = logits
+        if apply_suppression:
+            selection_logits = logits.to(dtype=torch.float32, copy=True)
+            vocab = int(selection_logits.shape[1])
+            for row_index, task in enumerate(tasks):
+                for token_id in dict.fromkeys(int(value) for value in task.rows[0].suppress):
+                    if 0 <= token_id < vocab:
+                        selection_logits[row_index, token_id].fill_(float("-inf"))
     products = tuple(task.token_product for task in tasks)
     bound_products = device_products is not None and all(
         product is not None for product in products
@@ -6855,10 +7291,15 @@ def _sample_device_greedy_group(
         and (not finish_writes or finish_batch is not None)
         and (not transition_writes or transition_batch is not None)
     )
-    if packed_output is None or int(packed_output.numel()) != len(tasks):
+    if preselected is not None:
+        device_tokens = preselected.tokens
+        max_values = None
+    elif packed_output is None or int(packed_output.numel()) != len(tasks):
+        assert selection_logits is not None
         device_tokens = torch.argmax(selection_logits, dim=-1)
         max_values = None
     elif grouped_publication:
+        assert selection_logits is not None
         device_tokens = packed_output
         max_values = torch.empty(
             len(tasks),
@@ -6867,26 +7308,36 @@ def _sample_device_greedy_group(
         )
         torch.max(selection_logits, dim=-1, out=(max_values, device_tokens))
     else:
+        assert selection_logits is not None
         device_tokens = packed_output
         max_values = None
         torch.argmax(selection_logits, dim=-1, out=device_tokens)
     valid = (
-        torch.isfinite(max_values)
+        preselected.valid
+        if preselected is not None
+        else torch.isfinite(max_values)
         if max_values is not None
         else (
-            ~torch.isnan(selection_logits).any(dim=-1)
-            & ~torch.isposinf(selection_logits).any(dim=-1)
-            & torch.isfinite(selection_logits).any(dim=-1)
+            ~torch.isnan(cast(torch.Tensor, selection_logits)).any(dim=-1)
+            & ~torch.isposinf(cast(torch.Tensor, selection_logits)).any(dim=-1)
+            & torch.isfinite(cast(torch.Tensor, selection_logits)).any(dim=-1)
         )
     )
     if selection_broadcast is not None:
         selection_broadcast(device_tokens)
-    active = _sample_predicates(tasks, device_tokens.device)
-    device_finish: torch.Tensor | None
     empty_finish = grouped_publication and all(
         not task.rows[0].force_finish and not task.rows[0].finish_token_ids for task in tasks
     )
-    if grouped_publication:
+    active = (
+        preselected.active
+        if preselected is not None
+        else _sample_predicates(tasks, device_tokens.device)
+    )
+    device_finish: torch.Tensor | None
+    if preselected is not None:
+        device_finish = preselected.finish
+        continuation_values = preselected.continuation
+    elif grouped_publication:
         if empty_finish:
             device_finish = torch.zeros_like(valid, dtype=torch.bool)
             continuation_values = active & valid
@@ -6949,18 +7400,38 @@ def _sample_device_greedy_group(
             cast(DeviceProducts, device_products),
             device_reads,
         )
-    span = _capture_sample_span(
-        valid,
-        active,
-        device_tokens,
-        cast(torch.Tensor, device_finish) if empty_finish else torch.zeros_like(device_tokens),
-        completion,
+    if preselected is not None and finish_writes and not grouped_publication:
+        if device_products is None:
+            raise RuntimeError("sampling finish outputs have no device-product owner")
+        _publish_device_writes(
+            finish_writes,
+            _select_device_values(preselected.finish, finish_indexes),
+            device_products,
+            device_reads,
+        )
+        device_finish = None
+    span = (
+        _capture_preselected_span(preselected, completion)
+        if preselected is not None
+        else _capture_sample_span(
+            valid,
+            active,
+            device_tokens,
+            cast(torch.Tensor, device_finish) if empty_finish else torch.zeros_like(device_tokens),
+            completion,
+        )
     )
-    tagged_tokens = _tagged_token_values(
-        device_tokens,
-        continuation_values,
-        in_place=packed_output is not None and int(packed_output.numel()) == len(tasks),
+    tagged_tokens = (
+        preselected.tagged_tokens
+        if preselected is not None
+        else _tagged_token_values(
+            device_tokens,
+            continuation_values,
+            in_place=packed_output is not None and int(packed_output.numel()) == len(tasks),
+        )
     )
+    if preselected is not None and packed_output is not None:
+        packed_output.copy_(tagged_tokens)
     published = product_table is not None
     if product_table is not None:
         if grouped_publication:
@@ -6989,6 +7460,23 @@ def _sample_device_greedy_group(
                 product_batch,
                 after_reads=device_reads,
             )
+    batch_vectors = (
+        _SampleBatchVectors(
+            request_pool_indices=(
+                preselected.request_pool_indices
+                if preselected is not None
+                else _sample_request_pool_indices(tasks)
+            ),
+            tokens=device_tokens,
+            valid=valid,
+            active=active,
+            continuation=continuation_values,
+            selected_points=None,
+            penalty_bases=tuple(task.penalty_base for task in tasks),
+        )
+        if all(task.request_pool_index is not None for task in tasks)
+        else None
+    )
     return tuple(
         _SampleResult(
             token_id=_CompletionSampleToken(span, index),
@@ -7000,6 +7488,8 @@ def _sample_device_greedy_group(
             device_finish=(None if device_finish is None else device_finish[index : index + 1]),
             device_continuation=continuation_values[index : index + 1],
             device_product_published=published,
+            device_batch=batch_vectors,
+            device_batch_index=index if batch_vectors is not None else -1,
         )
         for index, task in enumerate(tasks)
     )
@@ -7318,6 +7808,21 @@ def _capture_sample_span(
         raise RuntimeError("CUDA sampling requires a server completion lease")
     span = _CompletionSampleSpan(completion.capture(metadata), count)
     return span
+
+
+def _capture_preselected_span(
+    output: GraphGreedyOutput,
+    completion: CompletionLease | None,
+) -> _CompletionSampleSpan:
+    count = int(output.tokens.numel())
+    if int(output.completion.numel()) != SAMPLING_COMPLETION_FIELDS * count:
+        raise RuntimeError("graph sampling completion vectors do not align")
+    if output.completion.device.type != "cuda":
+        values = tuple(int(value) for value in output.completion.tolist())
+        return _CompletionSampleSpan(None, count, values)
+    if completion is None:
+        raise RuntimeError("CUDA graph sampling requires a server completion lease")
+    return _CompletionSampleSpan(completion.capture(output.completion), count)
 
 
 def _device_finish_values(

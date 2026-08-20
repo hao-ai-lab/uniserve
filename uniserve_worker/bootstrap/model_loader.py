@@ -14,7 +14,7 @@ from ..loader.source import read_model_config, resolve_model_root
 from ..models.identity import ModelIdentity, architecture_identity
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import TensorParallelSpec
-from .capacity import DEFAULT_MAX_BATCH_OPS, DEFAULT_MAX_REQUEST_POOL_SIZE
+from .capacity import DEFAULT_MAX_REQUEST_POOL_SIZE
 from .catalog import CatalogEntry, resolve_catalog_entry
 from .execution_config import ExecutionConfig
 from .plan import ModelLoadScope
@@ -27,6 +27,7 @@ class WorkerModelLoadRequest:
     model_path: str
     device: str
     block_size: int
+    max_batch_operations: int
     max_batch_tokens: int
     kv_token_capacity: int | None
     attention_backend: str | None
@@ -145,7 +146,7 @@ def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
         model_dtype=execution.model_dtype,
         kv_cache_dtype=execution.kv_cache_dtype,
         kv_memory_fraction=execution.kv_memory_fraction,
-        max_batch_operations=DEFAULT_MAX_BATCH_OPS,
+        max_batch_operations=request.max_batch_operations,
         max_batch_tokens=request.max_batch_tokens,
         max_request_pool_size=DEFAULT_MAX_REQUEST_POOL_SIZE,
         generation_device=request.generation_device,

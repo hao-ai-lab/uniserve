@@ -316,6 +316,7 @@ def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() 
         op_id=operation.op_id,
         group_id=0,
         block_table=(),
+        block_table_update=True,
         pages_to_zero=(),
         prefix_length=2,
         input_length=1,
@@ -335,6 +336,76 @@ def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() 
 
     assert report.completions[0].status is OpStatus.ERROR
     assert report.completions[0].error_code is ErrorCode.INVALID_OPERATION
+
+
+def test_decode_reuses_the_published_request_page_table() -> None:
+    worker = execution_worker(pipeline_depth=2)
+    admission = und_admission(10, block_ids=(0,))
+    parent, parent_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    worker.execute(
+        execution_batch(
+            step_id=1,
+            admissions=(admission,),
+            operations=(parent,),
+            input_products=(parent_input,),
+        )
+    )
+    device_parent = VersionRef(
+        admission.request_key,
+        parent.op_id,
+        DevicePoint(1, None, parent.plan_digest),
+    )
+    template, _ = token_operation(
+        admission.request_key,
+        op_id=2,
+        parent=device_parent,
+        mode=TokenMode.DECODE,
+        tokens=(0,),
+        predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+    )
+    operation = Operation.registered(
+        request_key=template.request_key,
+        op_id=template.op_id,
+        parent=template.parent,
+        work=template.work,
+        route=template.route,
+        domain=template.domain,
+        bounds=template.bounds,
+        outputs=template.outputs,
+        kv_capacity_pages=1,
+        predicate=template.predicate,
+    )
+    placement = KvPlacement(
+        request_key=operation.request_key,
+        op_id=operation.op_id,
+        group_id=0,
+        block_table=(),
+        block_table_update=False,
+        pages_to_zero=(),
+        prefix_length=2,
+        input_length=1,
+        visible_length=2,
+        resulting_length=3,
+    )
+
+    report = finalize_completion_report(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                operations=(operation,),
+                kv_placements=(placement,),
+            )
+        )
+    )
+
+    assert report.completions[0].status is OpStatus.OK
+    assert report.completions[0].logical_lengths.kv_visible_len == 3
 
 
 def test_mixed_token_and_flow_match_homogeneous_results():

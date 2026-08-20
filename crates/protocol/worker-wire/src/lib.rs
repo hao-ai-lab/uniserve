@@ -1317,6 +1317,7 @@ pub struct KvPlacement {
     pub op_id: OpId,
     pub group_id: u32,
     pub block_table: Vec<BlockId>,
+    pub block_table_update: bool,
     pub pages_to_zero: Vec<BlockId>,
     pub prefix_length: u32,
     pub input_length: u32,
@@ -1330,24 +1331,31 @@ impl KvPlacement {
             self.op_id.0 > 0,
             "KV placement operation id must be positive"
         );
-        anyhow::ensure!(
-            self.block_table.iter().collect::<HashSet<_>>().len() == self.block_table.len(),
-            "KV placement repeats a page in its block table"
-        );
-        anyhow::ensure!(
-            self.pages_to_zero.iter().collect::<HashSet<_>>().len() == self.pages_to_zero.len(),
-            "KV placement repeats a page-to-zero"
-        );
-        let pages = self.block_table.iter().collect::<HashSet<_>>();
-        anyhow::ensure!(
-            self.pages_to_zero.iter().all(|page| pages.contains(page)),
-            "KV placement zeroes a page outside its block table"
-        );
-        anyhow::ensure!(
-            self.block_table.iter().all(|page| page.0 > 0)
-                && self.pages_to_zero.iter().all(|page| page.0 > 0),
-            "KV placement carries the reserved page zero"
-        );
+        if self.block_table_update {
+            anyhow::ensure!(
+                self.block_table.iter().collect::<HashSet<_>>().len() == self.block_table.len(),
+                "KV placement repeats a page in its block table"
+            );
+            anyhow::ensure!(
+                self.pages_to_zero.iter().collect::<HashSet<_>>().len() == self.pages_to_zero.len(),
+                "KV placement repeats a page-to-zero"
+            );
+            let pages = self.block_table.iter().collect::<HashSet<_>>();
+            anyhow::ensure!(
+                self.pages_to_zero.iter().all(|page| pages.contains(page)),
+                "KV placement zeroes a page outside its block table"
+            );
+            anyhow::ensure!(
+                self.block_table.iter().all(|page| page.0 > 0)
+                    && self.pages_to_zero.iter().all(|page| page.0 > 0),
+                "KV placement carries the reserved page zero"
+            );
+        } else {
+            anyhow::ensure!(
+                self.block_table.is_empty() && self.pages_to_zero.is_empty(),
+                "KV placement reference carries a block-table update"
+            );
+        }
         anyhow::ensure!(
             self.visible_length >= self.prefix_length
                 && self.resulting_length >= self.visible_length
@@ -1467,10 +1475,12 @@ impl BatchPartition {
             let operation = operations.get(&operation_identity).ok_or_else(|| {
                 anyhow::anyhow!("KV placement does not name a partition operation")
             })?;
-            anyhow::ensure!(
-                placement.block_table.len() == operation.kv_capacity_pages as usize,
-                "KV placement does not establish the operation capacity"
-            );
+            if placement.block_table_update {
+                anyhow::ensure!(
+                    placement.block_table.len() == operation.kv_capacity_pages as usize,
+                    "KV placement update does not establish the operation capacity"
+                );
+            }
         }
         for operation in &self.operations {
             anyhow::ensure!(
@@ -2549,6 +2559,7 @@ pub fn protocol_layout_digest() -> Digest {
             "op_id",
             "group_id",
             "block_table",
+            "block_table_update",
             "pages_to_zero",
             "prefix_length",
             "input_length",

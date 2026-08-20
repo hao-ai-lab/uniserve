@@ -148,6 +148,7 @@ def _qwen_request(
         model_path=path,
         device="cpu",
         block_size=16,
+        max_batch_operations=4,
         max_batch_tokens=4096,
         kv_token_capacity=64,
         attention_backend="torch_sdpa",

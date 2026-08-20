@@ -14,7 +14,11 @@ import torch
 from torch import nn
 
 from uniserve_worker.batch import Domain
-from uniserve_worker.execution.cuda_graph import CudaGraphRunner, GraphExecutionError
+from uniserve_worker.execution.cuda_graph import (
+    CudaGraphRunner,
+    GraphExecutionError,
+    GraphGreedyOutput,
+)
 from uniserve_worker.execution.forward_batch import (
     EmptyKvView,
     EmptyMeshView,
@@ -139,6 +143,7 @@ class _ModelInvocation:
                 max_blocks_per_row=max_blocks_per_row,
                 hidden_size=hidden_size,
                 device=device,
+                max_inflight=max_inflight,
             )
 
         if lanes:
@@ -204,6 +209,7 @@ class _ModelInvocation:
         self._last_observation: RunObservation | None = None
         self._last_request_pool_indices: torch.Tensor | None = None
         self._last_output_event: torch.cuda.Event | None = None
+        self._last_greedy_output: GraphGreedyOutput | None = None
 
     @property
     def last_observation(self) -> RunObservation | None:
@@ -216,6 +222,10 @@ class _ModelInvocation:
     @property
     def last_output_event(self) -> torch.cuda.Event | None:
         return self._last_output_event
+
+    @property
+    def last_greedy_output(self) -> GraphGreedyOutput | None:
+        return self._last_greedy_output
 
     @property
     def buffers(self) -> tuple[InputBuffers, ...]:
@@ -271,6 +281,7 @@ class _ModelInvocation:
     def close(self) -> None:
         self._last_request_pool_indices = None
         self._last_output_event = None
+        self._last_greedy_output = None
         for partition in reversed(self._owned_partitions):
             partition.close()
         self._partitions.clear()
@@ -297,6 +308,7 @@ class _ModelInvocation:
             raise ValueError("model runner received an empty call")
         self._last_request_pool_indices = None
         self._last_output_event = None
+        self._last_greedy_output = None
         started = time.perf_counter_ns()
         target = torch.device(device)
         phases = frozenset(task.phase for task in tasks)
@@ -351,6 +363,14 @@ class _ModelInvocation:
                     phase=phase,
                     row_count=len(tasks),
                     request_pool_indices=tuple(task.request.request_pool_idx for task in tasks),
+                    decode_force_finish=(
+                        tuple(bool(task.decode_force_finish) for task in tasks)
+                        if all(
+                            task.decode_predicate is not None and task.decode_predicate_tagged
+                            for task in tasks
+                        )
+                        else ()
+                    ),
                     token_row_indices=tuple(
                         index for index, task in enumerate(tasks) if task.token_ids is not None
                     ),
@@ -484,6 +504,7 @@ class _ModelInvocation:
                     ),
                 )
             output = graph_run.output
+            self._last_greedy_output = graph_run.greedy
             path = RunPath(graph_run.path)
             output.validate_for(batch)
             _validate_outputs(output.values, tasks, target)

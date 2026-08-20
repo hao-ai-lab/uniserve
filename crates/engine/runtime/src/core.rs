@@ -194,6 +194,9 @@ impl EngineCore {
     /// is passed because the worker starts in Full mode by default.
     fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
         let kv_token_capacity = config.effective_kv_token_capacity();
+        let max_batch_operations =
+            u32::try_from(config.max_batch.max(1).min(config.max_num_seqs.max(1)))
+                .context("max_batch exceeds the worker capability representation")?;
         let max_batch_tokens = u32::try_from(config.max_num_batched_tokens)
             .context("max_num_batched_tokens exceeds the worker capability representation")?;
         if tp > 1 {
@@ -207,6 +210,7 @@ impl EngineCore {
                 config.resp_slot_cap,
                 kv_token_capacity,
                 config.block_size,
+                max_batch_operations,
                 max_batch_tokens,
                 &config.attention_backend,
                 &config.worker_launch,
@@ -224,6 +228,7 @@ impl EngineCore {
                 config.resp_slot_cap,
                 kv_token_capacity,
                 config.block_size,
+                max_batch_operations,
                 max_batch_tokens,
                 &config.attention_backend,
                 &config.worker_launch,
@@ -243,6 +248,9 @@ impl EngineCore {
         workers: &WorkersSpec,
     ) -> anyhow::Result<Box<dyn Executor>> {
         let kv_token_capacity = config.effective_kv_token_capacity();
+        let max_batch_operations =
+            u32::try_from(config.max_batch.max(1).min(config.max_num_seqs.max(1)))
+                .context("max_batch exceeds the worker capability representation")?;
         let max_batch_tokens = u32::try_from(config.max_num_batched_tokens)
             .context("max_num_batched_tokens exceeds the worker capability representation")?;
         // Per-edge transfer backends (validated up front so a typo fails at
@@ -308,6 +316,7 @@ impl EngineCore {
                     config.resp_slot_cap,
                     kv_token_capacity,
                     config.block_size,
+                    max_batch_operations,
                     max_batch_tokens,
                     &config.attention_backend,
                     pool.kind.as_str(),

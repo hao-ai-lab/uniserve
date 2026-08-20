@@ -18,13 +18,16 @@ from uniserve_worker.execution.forward_batch import (
     PackedAttentionPlan,
     PagedDecodePlan,
     PagedVarlenPlan,
+    RequestIndexedDecodePlan,
     TokenSelection,
+    packed_tensor_views,
 )
 from uniserve_worker.execution.lane import verify_graph_context
 from uniserve_worker.foundation.math import bucketed_length
 from uniserve_worker.models.runtime import CacheGeometry
 
 logger = logging.getLogger(__name__)
+TOKEN_CONTINUATION_BIT = 1 << 31
 
 
 class GraphExecutionError(RuntimeError):
@@ -36,11 +39,24 @@ class _GraphMiss(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class GraphGreedyOutput:
+    request_pool_indices: torch.Tensor
+    tokens: torch.Tensor
+    valid: torch.Tensor
+    active: torch.Tensor
+    finish: torch.Tensor
+    continuation: torch.Tensor
+    tagged_tokens: torch.Tensor
+    completion: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
 class GraphRun:
     output: ForwardOutput
     path: str
     row_count: int
     padded_row_count: int
+    greedy: GraphGreedyOutput | None = None
 
 
 @dataclass(slots=True)
@@ -48,6 +64,7 @@ class _GraphState:
     graph: torch.cuda.CUDAGraph
     batch: ForwardBatch
     output: ForwardOutput
+    greedy: GraphGreedyOutput | None
     published: tuple[ForwardOutput, ...]
     releases: tuple[Callable[[], None], ...]
     startup_resident: bool
@@ -86,10 +103,11 @@ class CudaGraphRunner:
         weight_digest: str,
         memory_budget_bytes: int,
         decode_batch_sizes: tuple[int, ...] = (),
+        decode_predicates: torch.Tensor | None = None,
         decode_context_blocks: int = 0,
         packed_context_blocks: int = 0,
         prefill_token_sizes: tuple[int, ...] = (),
-        prefill_row_bucket: int = 8,
+        prefill_row_sizes: tuple[int, ...] = (8, 16),
         stream: torch.cuda.Stream | None = None,
         expected_context: int | None = None,
         expected_resident_executables: int | None = None,
@@ -97,6 +115,10 @@ class CudaGraphRunner:
     ) -> None:
         if not weight_digest or block_size < 1 or memory_budget_bytes < 0 or output_slot_count < 1:
             raise ValueError("graph-store identity and geometry are invalid")
+        if decode_predicates is not None and (
+            decode_predicates.ndim != 1 or decode_predicates.dtype is not torch.bool
+        ):
+            raise ValueError("decode predicate state must be a boolean row vector")
         self.enabled = bool(enabled)
         self.prefill_enabled = bool(prefill_enabled)
         self.cache = cache
@@ -106,12 +128,15 @@ class CudaGraphRunner:
         self.decode_batch_sizes = tuple(
             sorted({int(value) for value in decode_batch_sizes if int(value) > 0})
         )
+        self.decode_predicates = decode_predicates
         self.decode_context_blocks = max(0, int(decode_context_blocks))
         self.packed_context_blocks = max(0, int(packed_context_blocks))
         self.prefill_token_sizes = tuple(
             sorted({int(value) for value in prefill_token_sizes if int(value) > 0})
         )
-        self.prefill_row_bucket = max(1, int(prefill_row_bucket))
+        self.prefill_row_sizes = tuple(
+            sorted({int(value) for value in prefill_row_sizes if int(value) > 1})
+        )
         self.captures = 0
         self._states: dict[tuple[object, ...], _GraphState] = {}
         self._equivalence_checks: list[tuple[str, torch.Tensor]] = []
@@ -174,6 +199,7 @@ class CudaGraphRunner:
         return (
             self.decode_batch_sizes,
             self.prefill_token_sizes,
+            self.prefill_row_sizes,
             tuple(sorted((repr(key) for key in self._states))),
             self.captures,
             self._sealed,
@@ -216,7 +242,7 @@ class CudaGraphRunner:
                 batch,
                 self.prefill_token_sizes,
                 self.block_size,
-                self.prefill_row_bucket,
+                self.prefill_row_sizes,
                 self.decode_context_blocks,
             )
         )
@@ -257,16 +283,28 @@ class CudaGraphRunner:
                 self._warmed.add(state_key)
                 if not startup_resident:
                     self._warmed_exact.add(state_key)
+                eager_output = self._eager(execution, forward)
                 return GraphRun(
-                    _trim_output(self._eager(execution, forward), rows),
+                    _trim_output(eager_output, rows),
                     "graph_fallback",
                     rows,
                     padded_rows,
+                    _trim_greedy(
+                        _greedy_decode(execution, eager_output, self.decode_predicates),
+                        rows,
+                    ),
                 )
             if self.memory_budget_bytes == 0:
                 raise GraphExecutionError("configured CUDA graph residency has no memory budget")
             try:
-                eager = self._snapshot_output(_trim_output(self._eager(execution, forward), rows))
+                eager_output = self._eager(execution, forward)
+                eager = self._snapshot_output(_trim_output(eager_output, rows))
+                eager_greedy = _clone_greedy(
+                    _trim_greedy(
+                        _greedy_decode(execution, eager_output, self.decode_predicates),
+                        rows,
+                    )
+                )
                 state = self._capture(
                     execution,
                     forward,
@@ -283,6 +321,11 @@ class CudaGraphRunner:
                     _trim_output(state.output, rows),
                     label=repr(state_key),
                 )
+                self._queue_greedy_equivalence_check(
+                    eager_greedy,
+                    _trim_greedy(state.greedy, rows),
+                    label=repr(state_key),
+                )
             except Exception as error:
                 removed = self._states.pop(state_key, None)
                 if removed is not None:
@@ -293,7 +336,13 @@ class CudaGraphRunner:
                 if borrow_output
                 else self._publish_output(state, rows)
             )
-            return GraphRun(output, "graph_capture", rows, padded_rows)
+            return GraphRun(
+                output,
+                "graph_capture",
+                rows,
+                padded_rows,
+                _trim_greedy(state.greedy, rows),
+            )
         if state.signature != signature:
             raise GraphExecutionError("configured CUDA graph physical shape changed")
         try:
@@ -303,7 +352,13 @@ class CudaGraphRunner:
         output = (
             _trim_output(state.output, rows) if borrow_output else self._publish_output(state, rows)
         )
-        return GraphRun(output, "graph_replay", rows, padded_rows)
+        return GraphRun(
+            output,
+            "graph_replay",
+            rows,
+            padded_rows,
+            _trim_greedy(state.greedy, rows),
+        )
 
     def close(self) -> None:
         states = tuple(self._states.values())
@@ -346,6 +401,7 @@ class CudaGraphRunner:
                 self._pool_handle = torch.cuda.graph_pool_handle()
             with torch.cuda.graph(graph, pool=self._pool_handle, stream=self._stream):
                 output = forward(static)
+                greedy = _greedy_decode(static, output, self.decode_predicates)
             if not isinstance(output, ForwardOutput):
                 raise TypeError("captured model call did not return ForwardOutput")
             graph.instantiate()
@@ -360,6 +416,7 @@ class CudaGraphRunner:
                 graph,
                 static,
                 output,
+                greedy,
                 published,
                 releases,
                 startup_resident,
@@ -419,6 +476,26 @@ class CudaGraphRunner:
         with context:
             check = _equivalence_check(reference, candidate)
         self._equivalence_checks.append((label, check))
+
+    def _queue_greedy_equivalence_check(
+        self,
+        reference: GraphGreedyOutput | None,
+        candidate: GraphGreedyOutput | None,
+        *,
+        label: str,
+    ) -> None:
+        if reference is None or candidate is None:
+            if reference is not candidate:
+                raise GraphExecutionError("CUDA graph greedy output availability changed")
+            return
+        for field in fields(GraphGreedyOutput):
+            expected = getattr(reference, field.name)
+            actual = getattr(candidate, field.name)
+            if expected.shape != actual.shape or expected.dtype != actual.dtype:
+                raise GraphExecutionError("CUDA graph greedy output geometry changed")
+            self._equivalence_checks.append(
+                (f"{label}:{field.name}", torch.eq(expected, actual).all())
+            )
 
     def _complete_equivalence_checks(self) -> None:
         if not self._equivalence_checks:
@@ -542,16 +619,18 @@ def _prefill_geometry(
     batch: ForwardBatch,
     token_sizes: tuple[int, ...],
     block_size: int,
-    row_bucket: int,
+    row_sizes: tuple[int, ...],
     context_blocks: int,
 ) -> _PrefillGeometry | None:
     attention = batch.attention
     if not isinstance(attention, PagedVarlenPlan) or not token_sizes:
         return None
     rows = batch.row_count
+    row_bucket = next((value for value in row_sizes if value > rows), None)
     query_lens = tuple(int(value) for value in attention.query_lens_cpu)
     if (
-        rows >= row_bucket
+        row_bucket is None
+        or (rows >= row_sizes[0] and all(value == 1 for value in query_lens))
         or batch.input_ids is None
         or batch.positions is None
         or batch.token_row_indices != tuple(range(rows))
@@ -626,6 +705,11 @@ def _pad_decode_batch(batch: ForwardBatch, geometry: _DecodeGeometry) -> Forward
         batch,
         row_count=bucket,
         request_pool_indices=_fixed_view(batch.request_pool_indices, (bucket,)),
+        decode_force_finish=(
+            None
+            if batch.decode_force_finish is None
+            else _fixed_view(batch.decode_force_finish, (bucket,))
+        ),
         token_row_indices=tuple(range(bucket)),
         input_ids=input_ids,
         input_embeddings=input_embeddings,
@@ -671,14 +755,14 @@ def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> Forwa
     query_lens[live_rows:].zero_()
     kv_seqlens[live_rows:].zero_()
     if geometry.padding:
-        query_lens[live_rows] = geometry.padding
-        kv_seqlens[live_rows] = geometry.padding
+        query_lens[live_rows : live_rows + 1].fill_(geometry.padding)
+        kv_seqlens[live_rows : live_rows + 1].fill_(geometry.padding)
     cu_seqlens_q[live_rows + 1 :].fill_(geometry.token_bucket)
     padded_kv_tokens = sum(int(value) for value in attention.kv_seqlens_cpu) + geometry.padding
     cu_seqlens_k[live_rows + 1 :].fill_(padded_kv_tokens)
     output_indices[live_rows:].zero_()
     if geometry.padding:
-        output_indices[live_rows] = geometry.token_bucket - 1
+        output_indices[live_rows : live_rows + 1].fill_(geometry.token_bucket - 1)
     dummy_query_lens = (geometry.padding, *(0 for _ in range(dummy_rows - 1)))
     kv = batch.kv
     reserved = (0,) * max(
@@ -866,6 +950,8 @@ def _graph_batch(
     if not isinstance(graph_batch, ForwardBatch):
         raise TypeError("graph input cloning did not preserve ForwardBatch")
     attention = graph_batch.attention
+    if isinstance(attention, RequestIndexedDecodePlan):
+        raise _GraphMiss("request-indexed decode metadata was not staged")
     selection = _graph_selection(attention)
     graph_attention: NoAttention | PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
     if isinstance(attention, NoAttention):
@@ -1043,6 +1129,89 @@ def _trim_output(output: ForwardOutput, rows: int) -> ForwardOutput:
     return ForwardOutput(tuple(output.values[:rows]))
 
 
+def _greedy_decode(
+    batch: ForwardBatch,
+    output: ForwardOutput,
+    predicate_state: torch.Tensor | None,
+) -> GraphGreedyOutput | None:
+    force_finish = batch.decode_force_finish
+    if (
+        not isinstance(batch.attention, PagedDecodePlan)
+        or predicate_state is None
+        or force_finish is None
+        or len(output.values) != batch.row_count
+    ):
+        return None
+    rows = tuple(value.reshape(-1) for value in output.values)
+    logits = packed_tensor_views(rows)
+    if logits is None:
+        raise _GraphMiss("decode logits are not one contiguous graph output")
+    logits = logits.reshape(batch.row_count, -1)
+    max_values, tokens = torch.max(logits, dim=-1)
+    valid = torch.isfinite(max_values)
+    active = predicate_state.index_select(0, batch.request_pool_indices.reshape(-1))
+    finish = force_finish.reshape(-1) & valid & active
+    continuation = valid & active & ~finish
+    tags = torch.where(continuation, TOKEN_CONTINUATION_BIT, 0)
+    tagged_tokens = tokens.bitwise_or(tags)
+    completion = torch.cat(
+        (
+            valid,
+            active,
+            tokens,
+            torch.zeros_like(tokens),
+        )
+    )
+    force_finish.zero_()
+    return GraphGreedyOutput(
+        request_pool_indices=batch.request_pool_indices,
+        tokens=tokens,
+        valid=valid,
+        active=active,
+        finish=finish,
+        continuation=continuation,
+        tagged_tokens=tagged_tokens,
+        completion=completion,
+    )
+
+
+def _trim_greedy(
+    output: GraphGreedyOutput | None,
+    rows: int,
+) -> GraphGreedyOutput | None:
+    if output is None:
+        return None
+    total = int(output.tokens.numel())
+    if rows < 0 or rows > total or int(output.completion.numel()) != 4 * total:
+        raise GraphExecutionError("CUDA graph greedy output has invalid row geometry")
+    completion = torch.cat(
+        tuple(output.completion[index * total : index * total + rows] for index in range(4))
+    )
+    return GraphGreedyOutput(
+        request_pool_indices=output.request_pool_indices[:rows],
+        tokens=output.tokens[:rows],
+        valid=output.valid[:rows],
+        active=output.active[:rows],
+        finish=output.finish[:rows],
+        continuation=output.continuation[:rows],
+        tagged_tokens=output.tagged_tokens[:rows],
+        completion=completion,
+    )
+
+
+def _clone_greedy(output: GraphGreedyOutput | None) -> GraphGreedyOutput | None:
+    if output is None:
+        return None
+    return GraphGreedyOutput(
+        **{
+            field.name: getattr(output, field.name)
+            .detach()
+            .clone(memory_format=torch.preserve_format)
+            for field in fields(GraphGreedyOutput)
+        }
+    )
+
+
 def _clone_output(output: ForwardOutput) -> ForwardOutput:
     return ForwardOutput(
         tuple(value.detach().clone(memory_format=torch.preserve_format) for value in output.values)
@@ -1093,4 +1262,4 @@ def _release_state(state: _GraphState) -> None:
         reset()
 
 
-__all__ = ["CudaGraphRunner", "GraphExecutionError", "GraphRun"]
+__all__ = ["CudaGraphRunner", "GraphExecutionError", "GraphGreedyOutput", "GraphRun"]

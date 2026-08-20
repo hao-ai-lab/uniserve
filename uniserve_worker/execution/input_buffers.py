@@ -6,7 +6,8 @@ from dataclasses import replace
 
 import torch
 
-from uniserve_worker.runtime.device import fill_cpu_ints
+from uniserve_worker.ops.staging import gather_request_decode_inputs
+from uniserve_worker.runtime.device import HostStagingRing, fill_cpu_bools, fill_cpu_ints
 
 from .forward_batch import (
     AttnPlan,
@@ -23,6 +24,7 @@ from .forward_batch import (
     PackedAttentionPlan,
     PagedDecodePlan,
     PagedVarlenPlan,
+    RequestIndexedDecodePlan,
     TokenSelection,
     packed_tensor_views,
 )
@@ -40,6 +42,7 @@ class InputBuffers:
         max_blocks_per_row: int,
         hidden_size: int,
         device: torch.device | str,
+        max_inflight: int = 1,
     ) -> None:
         if min(max_rows, max_tokens, max_blocks_per_row) < 1:
             raise ValueError("input-buffer row, token, and block bounds must be positive")
@@ -71,11 +74,18 @@ class InputBuffers:
         self.request_pool_indices = torch.zeros(
             self.max_rows, dtype=torch.int64, device=self.device
         )
-        self.request_pool_indices_host = torch.empty(
+        self._request_pool_indices_host = HostStagingRing(
             self.max_rows,
             dtype=torch.int64,
-            device="cpu",
-            pin_memory=self.device.type == "cuda",
+            depth=max_inflight,
+            device=self.device,
+        )
+        self.decode_force_finish = torch.zeros(self.max_rows, dtype=torch.bool, device=self.device)
+        self._decode_force_finish_host = HostStagingRing(
+            self.max_rows,
+            dtype=torch.bool,
+            depth=max_inflight,
+            device=self.device,
         )
         self.block_tables = torch.zeros(
             (self.max_rows, self.max_blocks_per_row),
@@ -119,6 +129,7 @@ class InputBuffers:
         phase: ModelPhase,
         row_count: int,
         request_pool_indices: tuple[int, ...],
+        decode_force_finish: tuple[bool, ...] = (),
         token_row_indices: tuple[int, ...] = (),
         token_ids: tuple[torch.Tensor, ...] = (),
         token_embeddings: tuple[torch.Tensor | None, ...] = (),
@@ -148,6 +159,8 @@ class InputBuffers:
             raise ValueError("forward row count exceeds input-buffer capacity")
         if len(request_pool_indices) != row_count:
             raise ValueError("forward request-slot column is not row-aligned")
+        if decode_force_finish and len(decode_force_finish) != row_count:
+            raise ValueError("forward decode finish column is not row-aligned")
         token_count = len(token_row_indices)
         if any(
             len(values) != token_count
@@ -160,15 +173,64 @@ class InputBuffers:
             )
         ):
             raise ValueError("forward token columns are not aligned")
+        if isinstance(attention, RequestIndexedDecodePlan):
+            if any(
+                (
+                    flow_row_indices,
+                    flow_positions,
+                    flow_timesteps,
+                    flow_latents,
+                    flow_conditioning,
+                    flow_image_tokens,
+                    flow_heights,
+                    flow_widths,
+                    encode_pixels,
+                    encode_grids,
+                    encode_grid_shapes,
+                    decode_latents,
+                    decode_heights,
+                    decode_widths,
+                )
+            ):
+                raise ValueError("request-indexed decode cannot mix non-token rows")
+            return self._stage_request_indexed_decode(
+                phase=phase,
+                row_count=row_count,
+                request_pool_indices=request_pool_indices,
+                decode_force_finish=decode_force_finish,
+                token_row_indices=token_row_indices,
+                token_ids=token_ids,
+                token_embeddings=token_embeddings,
+                token_embedding_masks=token_embedding_masks,
+                token_positions=token_positions,
+                token_selections=token_selections,
+                kv=kv,
+                attention=attention,
+                mesh=mesh,
+                output=output,
+            )
         self._scrub(
             attention,
             embeddings=any(value is not None for value in token_embeddings),
         )
-        fill_cpu_ints(self.request_pool_indices_host, request_pool_indices)
+        request_slot, request_host = self._request_pool_indices_host.acquire()
+        fill_cpu_ints(request_host, request_pool_indices)
         self.request_pool_indices[:row_count].copy_(
-            self.request_pool_indices_host[:row_count],
+            request_host[:row_count],
             non_blocking=self.device.type == "cuda",
         )
+        self._request_pool_indices_host.release(request_slot)
+        staged_decode_force_finish: torch.Tensor | None = None
+        if decode_force_finish:
+            staged_decode_force_finish = self.decode_force_finish[:row_count]
+            if any(decode_force_finish):
+                finish_slot, finish_host = self._decode_force_finish_host.acquire()
+                fill_cpu_bools(finish_host, decode_force_finish)
+                staged_decode_force_finish.copy_(
+                    finish_host[:row_count],
+                    non_blocking=self.device.type == "cuda",
+                )
+                self._decode_force_finish_host.release(finish_slot)
 
         flattened_ids = tuple(value.reshape(-1) for value in token_ids)
         query_lens = [int(value.numel()) for value in flattened_ids]
@@ -267,6 +329,7 @@ class InputBuffers:
             phase=phase,
             row_count=row_count,
             request_pool_indices=self.request_pool_indices[:row_count],
+            decode_force_finish=staged_decode_force_finish,
             token_row_indices=token_row_indices,
             flow_row_indices=flow_row_indices,
             input_ids=self.input_ids[:token_offset] if token_count else None,
@@ -301,7 +364,109 @@ class InputBuffers:
             output=output,
         )
 
+    def _stage_request_indexed_decode(
+        self,
+        *,
+        phase: ModelPhase,
+        row_count: int,
+        request_pool_indices: tuple[int, ...],
+        decode_force_finish: tuple[bool, ...],
+        token_row_indices: tuple[int, ...],
+        token_ids: tuple[torch.Tensor, ...],
+        token_embeddings: tuple[torch.Tensor | None, ...],
+        token_embedding_masks: tuple[torch.Tensor | None, ...],
+        token_positions: tuple[torch.Tensor, ...],
+        token_selections: tuple[TokenSelection, ...],
+        kv: KvView | EmptyKvView,
+        attention: RequestIndexedDecodePlan,
+        mesh: MeshView | EmptyMeshView,
+        output: OutputView | EmptyOutputView,
+    ) -> ForwardBatch:
+        if (
+            token_row_indices != tuple(range(row_count))
+            or len(token_ids) != row_count
+            or len(token_positions) != row_count
+            or len(token_selections) != row_count
+            or any(int(value.numel()) != 1 for value in token_ids)
+            or any(int(value.numel()) != 1 for value in token_positions)
+            or any(value is not None for value in token_embeddings)
+            or any(value is not None for value in token_embedding_masks)
+            or len(attention.cache_seqlens_cpu) != row_count
+            or len(attention.kv_seqlens_cpu) != row_count
+            or attention.query_lens_cpu != (1,) * row_count
+        ):
+            raise ValueError("request-indexed decode requires one plain token per row")
+        request_slot, request_host = self._request_pool_indices_host.acquire()
+        fill_cpu_ints(request_host, request_pool_indices)
+        self.request_pool_indices[:row_count].copy_(
+            request_host[:row_count],
+            non_blocking=self.device.type == "cuda",
+        )
+        self._request_pool_indices_host.release(request_slot)
+        staged_decode_force_finish: torch.Tensor | None = None
+        if decode_force_finish:
+            staged_decode_force_finish = self.decode_force_finish[:row_count]
+            if any(decode_force_finish):
+                finish_slot, finish_host = self._decode_force_finish_host.acquire()
+                fill_cpu_bools(finish_host, decode_force_finish)
+                staged_decode_force_finish.copy_(
+                    finish_host[:row_count],
+                    non_blocking=self.device.type == "cuda",
+                )
+                self._decode_force_finish_host.release(finish_slot)
+        gather_request_decode_inputs(
+            request_pool_indices=self.request_pool_indices,
+            request_page_tables=attention.request_page_tables,
+            request_cache_lengths=attention.request_cache_lengths,
+            request_tokens=attention.request_tokens,
+            request_positions=attention.request_positions,
+            input_ids=self.input_ids,
+            positions=self.positions[0],
+            block_tables=self.block_tables,
+            cache_lengths=self.cache_lengths,
+            kv_lengths=self.kv_lengths,
+            query_lengths=self.query_lengths,
+            decode_page_ids=self.decode_page_ids,
+            decode_page_offsets=self.decode_page_offsets,
+            rows=row_count,
+            group_id=attention.group_id,
+            page_size=attention.page_size,
+        )
+        width = int(attention.request_page_tables.shape[2])
+        staged_attention = PagedDecodePlan(
+            backends=attention.backends,
+            block_table=self.block_tables[:row_count, :width],
+            cache_seqlens=self.cache_lengths[:row_count],
+            kv_seqlens=self.kv_lengths[:row_count],
+            query_lens=self.query_lengths[:row_count],
+            cache_seqlens_cpu=attention.cache_seqlens_cpu,
+            kv_seqlens_cpu=attention.kv_seqlens_cpu,
+            query_lens_cpu=attention.query_lens_cpu,
+            decode_page_ids=self.decode_page_ids[:row_count],
+            decode_page_offsets=self.decode_page_offsets[:row_count],
+            max_context_len=width * int(attention.page_size),
+            causal=attention.causal,
+            binding=attention.binding,
+        )
+        return ForwardBatch(
+            phase=phase,
+            row_count=row_count,
+            request_pool_indices=self.request_pool_indices[:row_count],
+            decode_force_finish=staged_decode_force_finish,
+            token_row_indices=token_row_indices,
+            input_ids=self.input_ids[:row_count],
+            positions=self.positions[0, :row_count],
+            query_lens=(1,) * row_count,
+            token_selections=token_selections,
+            kv=kv,
+            attention=staged_attention,
+            mesh=mesh,
+            output=output,
+        )
+
     def stage_attention(self, attention: AttnPlan) -> AttnPlan:
+        if isinstance(attention, RequestIndexedDecodePlan):
+            raise ValueError("request-indexed decode must use fused input staging")
         if isinstance(attention, NoAttention):
             return attention
         if isinstance(attention, PagedDecodePlan):
@@ -346,6 +511,8 @@ class InputBuffers:
         )
 
     def _scrub(self, attention: AttnPlan, *, embeddings: bool) -> None:
+        if isinstance(attention, RequestIndexedDecodePlan):
+            raise ValueError("request-indexed decode must use fused input staging")
         self.input_ids.fill_(1)
         self.positions.zero_()
         if embeddings and self.input_embeddings is not None:

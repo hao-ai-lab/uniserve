@@ -208,6 +208,10 @@ fn kv_placement_to_py<'py>(
         PyList::new(py, placement.block_table.iter().map(|block| block.0))?,
     )?;
     dict.set_item(
+        intern!(py, "block_table_update"),
+        placement.block_table_update,
+    )?;
+    dict.set_item(
         intern!(py, "pages_to_zero"),
         PyList::new(py, placement.pages_to_zero.iter().map(|block| block.0))?,
     )?;
@@ -1511,6 +1515,7 @@ mod tests {
                 op_id: OpId(1),
                 group_id: 0,
                 block_table: vec![BlockId(1)],
+                block_table_update: true,
                 pages_to_zero: vec![BlockId(1)],
                 prefix_length: 0,
                 input_length: 2,

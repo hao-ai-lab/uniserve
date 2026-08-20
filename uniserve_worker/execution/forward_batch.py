@@ -324,6 +324,24 @@ class PagedDecodePlan:
 
 
 @dataclass(frozen=True, slots=True)
+class RequestIndexedDecodePlan:
+    """Decode metadata sourced from persistent request-indexed device state."""
+
+    backends: AttentionSelection
+    request_page_tables: torch.Tensor
+    request_cache_lengths: torch.Tensor
+    request_tokens: torch.Tensor
+    request_positions: torch.Tensor
+    group_id: int
+    page_size: int
+    cache_seqlens_cpu: tuple[int, ...]
+    kv_seqlens_cpu: tuple[int, ...]
+    query_lens_cpu: tuple[int, ...]
+    causal: bool
+    binding: int
+
+
+@dataclass(frozen=True, slots=True)
 class PagedVarlenPlan:
     """Ragged paged attention over explicit query and key spans."""
 
@@ -408,7 +426,9 @@ class PackedAttentionPlan:
         return sum(span.token_count for span in self.route_spans if span.route is route)
 
 
-AttnPlan: TypeAlias = NoAttention | PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
+AttnPlan: TypeAlias = (
+    NoAttention | PagedDecodePlan | RequestIndexedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
+)
 
 
 class TokenSelection(StrEnum):
@@ -478,6 +498,7 @@ class ForwardBatch:
     row_count: int
     request_pool_indices: torch.Tensor
     attention: AttnPlan
+    decode_force_finish: torch.Tensor | None = None
     token_row_indices: tuple[int, ...] = ()
     flow_row_indices: tuple[int, ...] = ()
     input_ids: torch.Tensor | None = None
@@ -508,6 +529,11 @@ class ForwardBatch:
             raise ValueError("forward batch must contain at least one row")
         if int(self.request_pool_indices.numel()) != self.row_count:
             raise ValueError("forward request indices do not align with rows")
+        if self.decode_force_finish is not None and (
+            int(self.decode_force_finish.numel()) != self.row_count
+            or self.decode_force_finish.dtype is not torch.bool
+        ):
+            raise ValueError("forward decode finish column does not align with rows")
         row_indices = (*self.token_row_indices, *self.flow_row_indices)
         if row_indices and (
             len(set(row_indices)) != len(row_indices)
@@ -574,6 +600,7 @@ __all__ = [
     "OutputView",
     "PackedAttentionPlan",
     "PagedDecodePlan",
+    "RequestIndexedDecodePlan",
     "PagedVarlenPlan",
     "RouteMeshView",
     "RouteSpan",

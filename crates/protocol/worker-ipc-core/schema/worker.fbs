@@ -325,6 +325,7 @@ table KvPlacement {
   op_id:ulong;
   group_id:uint;
   block_table:[uint];
+  block_table_update:bool;
   pages_to_zero:[uint];
   prefix_length:uint;
   input_length:uint;

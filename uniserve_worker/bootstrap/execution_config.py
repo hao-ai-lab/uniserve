@@ -16,6 +16,7 @@ from uniserve_worker.batch import Domain
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
     "DEFAULT_GRAPH_MEMORY_FRACTION",
+    "DEFAULT_PREFILL_GRAPH_ROW_BUCKETS",
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
     "graph_padding_block_count",
     "graph_memory_budget_bytes",
@@ -148,6 +149,8 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     15872,
     16384,
 )
+
+DEFAULT_PREFILL_GRAPH_ROW_BUCKETS = (8, 16, 32)
 
 
 def graph_padding_block_count(block_size: int) -> int:

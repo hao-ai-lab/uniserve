@@ -287,6 +287,7 @@ fn kv_placement_from_table(placement: fbs::KvPlacement<'_>) -> anyhow::Result<Kv
             .block_table()
             .map(|items| items.iter().map(BlockId).collect())
             .unwrap_or_default(),
+        block_table_update: placement.block_table_update(),
         pages_to_zero: placement
             .pages_to_zero()
             .map(|items| items.iter().map(BlockId).collect())
@@ -1406,6 +1407,7 @@ fn kv_placement_to_fb(placement: &KvPlacement) -> fbs::KvPlacementT {
         op_id: placement.op_id.0,
         group_id: placement.group_id,
         block_table: Some(placement.block_table.iter().map(|block| block.0).collect()),
+        block_table_update: placement.block_table_update,
         pages_to_zero: Some(
             placement
                 .pages_to_zero

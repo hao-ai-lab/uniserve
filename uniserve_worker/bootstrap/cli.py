@@ -6,7 +6,7 @@ import argparse
 from collections.abc import Sequence
 
 from ..server.worker_kind import WorkerKind
-from .capacity import DEFAULT_BLOCK_SIZE
+from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from .config import WorkerLaunchConfig
 
 
@@ -48,6 +48,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-threads", type=int, default=None)
     parser.add_argument("--checksum-manifest", default=None)
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
+    parser.add_argument("--max-batch-operations", type=int, default=DEFAULT_MAX_BATCH_OPS)
     parser.add_argument("--max-batch-tokens", type=int, required=True)
     parser.add_argument("--kv-token-capacity", type=int, default=None)
     parser.add_argument("--kv-cache-dtype", default=None)

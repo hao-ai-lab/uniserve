@@ -84,6 +84,7 @@ def _installation_placement(operation: Operation, length: int) -> KvPlacement:
         op_id=operation.op_id,
         group_id=0,
         block_table=(1,),
+        block_table_update=True,
         pages_to_zero=(1,),
         prefix_length=0,
         input_length=int(length),

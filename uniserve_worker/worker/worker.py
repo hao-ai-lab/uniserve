@@ -42,7 +42,12 @@ from ..bootstrap.capacity import (
     device_total_bytes,
     model_arena_capacity,
 )
-from ..bootstrap.execution_config import ExecutionConfig, LaneConfig, graph_memory_budget_bytes
+from ..bootstrap.execution_config import (
+    DEFAULT_PREFILL_GRAPH_ROW_BUCKETS,
+    ExecutionConfig,
+    LaneConfig,
+    graph_memory_budget_bytes,
+)
 from ..capabilities import (
     GraphBucketCapability,
     LaneCapabilities,
@@ -99,6 +104,13 @@ class _FlowPrefixGraphBucket:
     prefix_lengths: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _PagedPrefillGraphBucket:
+    token_bucket: int
+    row_bucket: int
+    live_rows: int
+
+
 @dataclass(slots=True)
 class _PreparedWeightCall:
     prepared: PreparedExecution
@@ -133,6 +145,33 @@ def _mixed_flow_graph_executable(
         bucket.height,
         bucket.width,
     )
+
+
+def _paged_prefill_graph_buckets(
+    token_sizes: Sequence[int],
+    row_sizes: Sequence[int],
+    *,
+    max_rows: int,
+    max_tokens: int,
+) -> tuple[_PagedPrefillGraphBucket, ...]:
+    buckets: list[_PagedPrefillGraphBucket] = []
+    minimum_rows = 1
+    for row_bucket in sorted({int(value) for value in row_sizes if int(value) > 1}):
+        if minimum_rows > int(max_rows):
+            break
+        minimum_tokens = minimum_rows if minimum_rows == 1 else minimum_rows + 1
+        for token_bucket in sorted(
+            {int(value) for value in token_sizes if minimum_tokens <= int(value) <= int(max_tokens)}
+        ):
+            buckets.append(
+                _PagedPrefillGraphBucket(
+                    token_bucket=token_bucket,
+                    row_bucket=row_bucket,
+                    live_rows=minimum_rows,
+                )
+            )
+        minimum_rows = row_bucket
+    return tuple(buckets)
 
 
 def _startup_image_parameters(
@@ -401,6 +440,14 @@ class Worker:
         cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
         if not isinstance(cache_dtype, torch.dtype):
             raise capability_mismatch(f"unsupported cache dtype {cache.dtype!r}")
+        max_blocks_per_row = max(
+            1,
+            ceil_div(int(model.text_max_tokens), int(deployment.block_size)),
+            ceil_div(
+                int(self._capabilities.scratch_capacity_tokens),
+                int(deployment.block_size),
+            ),
+        )
         self.cache_pool = CachePool(
             num_layers=int(cache.num_layers),
             request_pages=int(self._capabilities.num_blocks),
@@ -411,6 +458,8 @@ class Worker:
             page_size=int(self._capabilities.block_size),
             num_kv_heads=int(cache.num_kv_heads),
             head_dim=int(cache.head_dim),
+            request_pool_size=int(self._capabilities.max_request_pool_size),
+            max_blocks_per_request=max_blocks_per_row,
             device=deployment.device,
             dtype=cache_dtype,
             store_dtype=cache.store_dtype,
@@ -422,6 +471,7 @@ class Worker:
                 if self._capabilities.groups
                 else None
             ),
+            staging_depth=int(pipeline_depth),
         )
         self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
         torch_dtype = getattr(
@@ -579,6 +629,7 @@ class Worker:
             for value in execution.prefill_graph_token_sizes
             if 0 < int(value) <= min(prefill_capacity, prefill_max_tokens)
         )
+        prefill_graph_row_sizes = DEFAULT_PREFILL_GRAPH_ROW_BUCKETS
         flow_cfg_branches: tuple[int, ...] = ()
         if flow is not None:
             branch_counts: list[int] = []
@@ -726,6 +777,7 @@ class Worker:
         )
         self._decode_graph_batch_sizes = decode_graph_batch_sizes
         self._prefill_graph_token_sizes = prefill_graph_token_sizes
+        self._prefill_graph_row_sizes = prefill_graph_row_sizes
         self._flow_cfg_branches = flow_cfg_branches
         self._flow_graph_buckets = flow_graph_buckets
         self._mixed_flow_graph_buckets = mixed_flow_graph_buckets
@@ -761,6 +813,15 @@ class Worker:
                 if owns_model_compute and Domain.PREFILL in domains
                 else ()
             )
+            lane_prefill_row_sizes = (
+                prefill_graph_row_sizes if owns_model_compute and Domain.PREFILL in domains else ()
+            )
+            lane_prefill_catalog = _paged_prefill_graph_buckets(
+                lane_prefill_buckets,
+                lane_prefill_row_sizes,
+                max_rows=lane_max_operations,
+                max_tokens=lane_max_tokens,
+            )
             lane_flow_buckets = (
                 tuple(value for value in flow_graph_buckets if value.rows <= lane_max_operations)
                 if owns_model_compute and Domain.FLOW in domains
@@ -793,7 +854,11 @@ class Worker:
                     execution.prefill_cuda_graph
                     and WorkVariant.TOKEN_EXTEND in self._effective_work_variants
                 ):
-                    expected_resident_executables += len(lane_prefill_buckets)
+                    expected_resident_executables += (
+                        len(lane_prefill_buckets)
+                        if model.tensorized_mixed
+                        else len(lane_prefill_catalog)
+                    )
                 if execution.prefill_cuda_graph and {
                     WorkVariant.GEN_TRANSITION,
                     WorkVariant.GEN_FLOW,
@@ -825,9 +890,15 @@ class Worker:
                 weight_digest=self.weight_digest,
                 memory_budget_bytes=graph_budget,
                 decode_batch_sizes=lane_decode_buckets,
+                decode_predicates=(
+                    self.runtime_states.predicates
+                    if owns_model_compute and Domain.DECODE in domains
+                    else None
+                ),
                 decode_context_blocks=self._decode_context_blocks(),
                 packed_context_blocks=max_blocks_per_row,
                 prefill_token_sizes=(() if model.tensorized_mixed else lane_prefill_buckets),
+                prefill_row_sizes=lane_prefill_row_sizes,
                 stream=stream,
                 expected_context=expected_context,
                 expected_resident_executables=expected_resident_executables,
@@ -836,14 +907,6 @@ class Worker:
 
         self._execution = execution
         self.trace = ExecutionTrace(self.identity.architecture_digest)
-        max_blocks_per_row = max(
-            1,
-            ceil_div(int(model.text_max_tokens), int(deployment.block_size)),
-            ceil_div(
-                int(self._capabilities.scratch_capacity_tokens),
-                int(deployment.block_size),
-            ),
-        )
         devices = (
             (deployment.device,)
             if deployment.generation_device is None
@@ -898,19 +961,42 @@ class Worker:
                     and execution.prefill_cuda_graph
                     and Domain.PREFILL in lane.domains
                 ):
+                    paged_catalog = (
+                        ()
+                        if model.tensorized_mixed
+                        else _paged_prefill_graph_buckets(
+                            prefill_graph_token_sizes,
+                            prefill_graph_row_sizes,
+                            max_rows=max_operations,
+                            max_tokens=max_tokens,
+                        )
+                    )
                     buckets.extend(
                         GraphBucketCapability(
                             phase="text_prefill",
-                            batch_size=1 if model.tensorized_mixed else 8,
-                            token_bucket=int(token_size),
-                            attention_form=("packed" if model.tensorized_mixed else "paged_varlen"),
+                            batch_size=item.row_bucket,
+                            token_bucket=item.token_bucket,
+                            attention_form="paged_varlen",
                             height=0,
                             width=0,
                             cfg_branches=1,
                         )
-                        for token_size in prefill_graph_token_sizes
-                        if int(token_size) <= max_tokens
+                        for item in paged_catalog
                     )
+                    if model.tensorized_mixed:
+                        buckets.extend(
+                            GraphBucketCapability(
+                                phase="text_prefill",
+                                batch_size=1,
+                                token_bucket=int(token_size),
+                                attention_form="packed",
+                                height=0,
+                                width=0,
+                                cfg_branches=1,
+                            )
+                            for token_size in prefill_graph_token_sizes
+                            if int(token_size) <= max_tokens
+                        )
                 if (
                     execution.cuda_graph
                     and execution.prefill_cuda_graph
@@ -1260,6 +1346,7 @@ class Worker:
                         op_id=operation.op_id,
                         group_id=group_id,
                         block_table=tuple(block_table),
+                        block_table_update=True,
                         pages_to_zero=allocated,
                         prefix_length=visible,
                         input_length=input_length,
@@ -1680,62 +1767,95 @@ class Worker:
         )
         if not token_buckets:
             return
-        logger.info("warming %d paged-prefill CUDA graph token buckets", len(token_buckets))
+        catalog = (
+            tuple(_PagedPrefillGraphBucket(value, 1, 1) for value in token_buckets)
+            if self.model.tensorized_mixed
+            else _paged_prefill_graph_buckets(
+                token_buckets,
+                self._prefill_graph_row_sizes,
+                max_rows=int(self._capabilities.max_request_pool_size),
+                max_tokens=capacity,
+            )
+        )
+        catalog = tuple(
+            sorted(
+                catalog,
+                key=lambda value: (value.token_bucket * value.row_bucket, value.token_bucket),
+                reverse=True,
+            )
+        )
+        logger.info("warming %d paged-prefill CUDA graph executables", len(catalog))
         session_id = 0
         # First warm every configured physical call in descending footprint,
         # then capture every bucket in the same order.
         for _ in range(2):
-            for token_count in token_buckets:
-                block_count = (token_count + int(pool.block_size) - 1) // int(pool.block_size)
-                tokens = (0,) * token_count
-                session_id += 1
-                rk = RequestKey(0, session_id, 1)
-                admission = Admission.create(
-                    rk,
-                    request_pool_idx=1,
-                    und=UndAdmission(
-                        sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                        kv=KvAdmission(),
-                    ),
+            for bucket in catalog:
+                live_rows = bucket.live_rows
+                token_counts = (
+                    bucket.token_bucket - live_rows + 1,
+                    *(1 for _ in range(live_rows - 1)),
                 )
-                token_ref = ProductRef(
-                    request_key=rk,
-                    producer_op_id=1,
-                    output_index=(1 << 16) - 1,
-                    generation=1,
-                    kind=ProductKind.TOKEN,
-                    storage_class=StorageClass.HOST_STAGING,
-                    dtype=DType.U32,
-                    shape_bound=ShapeBound((StaticDim(token_count),)),
-                    point_range=PointRange(),
-                )
-                operation = Operation.registered(
-                    request_key=rk,
-                    op_id=1,
-                    parent=VersionRef(rk, 0, FixedPoint(0, admission.digest)),
-                    work=Work.token(TokenMode.EXTEND),
-                    route=0,
-                    domain=Domain.PREFILL,
-                    bounds=Bounds(max_points=1, max_tokens=token_count),
-                    inputs=(token_ref,),
-                    outputs=_warmup_token_outputs(rk, 1, 2),
-                    kv_capacity_pages=block_count,
-                )
+                admissions: list[Admission] = []
+                operations: list[Operation] = []
+                input_products: list[ProductPayload] = []
+                active_sessions: list[int] = []
+                for row, token_count in enumerate(token_counts):
+                    block_count = ceil_div(token_count, int(pool.block_size))
+                    tokens = (0,) * token_count
+                    session_id += 1
+                    active_sessions.append(session_id)
+                    rk = RequestKey(0, session_id, 1)
+                    admission = Admission.create(
+                        rk,
+                        request_pool_idx=row + 1,
+                        und=UndAdmission(
+                            sampling=SamplingParams(temperature=0.0, ignore_eos=True),
+                            kv=KvAdmission(),
+                        ),
+                    )
+                    token_ref = ProductRef(
+                        request_key=rk,
+                        producer_op_id=1,
+                        output_index=(1 << 16) - 1,
+                        generation=1,
+                        kind=ProductKind.TOKEN,
+                        storage_class=StorageClass.HOST_STAGING,
+                        dtype=DType.U32,
+                        shape_bound=ShapeBound((StaticDim(token_count),)),
+                        point_range=PointRange(),
+                    )
+                    operations.append(
+                        Operation.registered(
+                            request_key=rk,
+                            op_id=1,
+                            parent=VersionRef(rk, 0, FixedPoint(0, admission.digest)),
+                            work=Work.token(TokenMode.EXTEND),
+                            route=0,
+                            domain=Domain.PREFILL,
+                            bounds=Bounds(max_points=1, max_tokens=token_count),
+                            inputs=(token_ref,),
+                            outputs=_warmup_token_outputs(rk, 1, 2),
+                            kv_capacity_pages=block_count,
+                        )
+                    )
+                    admissions.append(admission)
+                    input_products.append(
+                        ProductPayload(
+                            product=token_ref,
+                            payload=encode_token_product_bytes(tokens),
+                        )
+                    )
                 try:
                     self._execute_warmup(
                         self._build_warmup_batch(
-                            admissions=(admission,),
-                            operations=(operation,),
-                            input_products=(
-                                ProductPayload(
-                                    product=token_ref,
-                                    payload=encode_token_product_bytes(tokens),
-                                ),
-                            ),
+                            admissions=tuple(admissions),
+                            operations=tuple(operations),
+                            input_products=tuple(input_products),
                         )
                     )
                 finally:
-                    self.drop_session(session_id)
+                    for active_session in active_sessions:
+                        self.drop_session(active_session)
 
     def _warmup_flow(self) -> None:
         """Drive one denoise quantum through the real flow forward path."""

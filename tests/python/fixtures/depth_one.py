@@ -232,6 +232,7 @@ def execution_batch(
                 block_table=tuple(
                     _BLOCK_TABLES.get(operation.request_key, ())[: operation.kv_capacity_pages]
                 ),
+                block_table_update=True,
                 pages_to_zero=_PAGES_TO_ZERO.get((operation.request_key, operation.op_id), ()),
                 prefix_length=lengths[0],
                 input_length=lengths[1],

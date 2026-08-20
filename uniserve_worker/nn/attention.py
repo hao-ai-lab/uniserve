@@ -14,6 +14,7 @@ from ..execution.forward_batch import (
     PackedAttentionPlan,
     PagedDecodePlan,
     PagedVarlenPlan,
+    RequestIndexedDecodePlan,
 )
 
 
@@ -79,6 +80,8 @@ class RadixAttention(nn.Module):
             return self._decode(q, k, v, context, plan, causal, effective_scale)
         if isinstance(plan, PagedVarlenPlan):
             return self._varlen(q, k, v, context, plan, causal, effective_scale)
+        if isinstance(plan, RequestIndexedDecodePlan):
+            raise ValueError("request-indexed decode metadata was not staged")
         return self._packed(q, k, v, context, plan, effective_scale)
 
     def _decode(

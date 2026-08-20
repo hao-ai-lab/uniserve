@@ -362,6 +362,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "op_id",
         "group_id",
         "block_table",
+        "block_table_update",
         "pages_to_zero",
         "prefix_length",
         "input_length",
@@ -1981,6 +1982,7 @@ class KvPlacement:
     op_id: int
     group_id: int
     block_table: tuple[int, ...]
+    block_table_update: bool
     pages_to_zero: tuple[int, ...]
     prefix_length: int
     input_length: int
@@ -1990,16 +1992,23 @@ class KvPlacement:
     def __post_init__(self) -> None:
         if self.op_id < 1:
             raise invalid_descriptor("KV placement operation id must be positive")
-        if self.group_id < 0 or any(value < 1 for value in self.block_table):
-            raise invalid_descriptor("KV placement contains an invalid group or reserved page zero")
-        if any(value < 1 for value in self.pages_to_zero):
-            raise invalid_descriptor("KV placement carries the reserved page zero")
-        if len(set(self.block_table)) != len(self.block_table):
-            raise invalid_descriptor("KV placement repeats a page in its block table")
-        if len(set(self.pages_to_zero)) != len(self.pages_to_zero):
-            raise invalid_descriptor("KV placement repeats a page-to-zero")
-        if not set(self.pages_to_zero).issubset(self.block_table):
-            raise invalid_descriptor("KV placement zeroes a page outside its block table")
+        if self.group_id < 0:
+            raise invalid_descriptor("KV placement contains an invalid group")
+        if type(self.block_table_update) is not bool:
+            raise invalid_descriptor("KV placement block-table update flag must be boolean")
+        if self.block_table_update:
+            if any(value < 1 for value in self.block_table):
+                raise invalid_descriptor("KV placement carries the reserved page zero")
+            if any(value < 1 for value in self.pages_to_zero):
+                raise invalid_descriptor("KV placement carries the reserved page zero")
+            if len(set(self.block_table)) != len(self.block_table):
+                raise invalid_descriptor("KV placement repeats a page in its block table")
+            if len(set(self.pages_to_zero)) != len(self.pages_to_zero):
+                raise invalid_descriptor("KV placement repeats a page-to-zero")
+            if not set(self.pages_to_zero).issubset(self.block_table):
+                raise invalid_descriptor("KV placement zeroes a page outside its block table")
+        elif self.block_table or self.pages_to_zero:
+            raise invalid_descriptor("KV placement reference carries a block-table update")
         if (
             self.visible_length < self.prefix_length
             or self.resulting_length < self.visible_length
@@ -2035,6 +2044,7 @@ class KvPlacement:
             uint_field("op_id"),
             uint_field("group_id"),
             block_table,
+            _bool(data.get("block_table_update"), f"{where}.block_table_update"),
             pages_to_zero,
             uint_field("prefix_length"),
             uint_field("input_length"),
@@ -2054,6 +2064,7 @@ class KvPlacement:
             "op_id": self.op_id,
             "group_id": self.group_id,
             "block_table": list(self.block_table),
+            "block_table_update": self.block_table_update,
             "pages_to_zero": list(self.pages_to_zero),
             "prefix_length": self.prefix_length,
             "input_length": self.input_length,
@@ -2364,8 +2375,13 @@ class BatchPartition:
             operation = operations.get(kv_identity[:2])
             if operation is None:
                 raise invalid_descriptor("KV placement does not name a partition operation")
-            if len(kv_placement.block_table) != operation.kv_capacity_pages:
-                raise invalid_descriptor("KV placement does not establish operation capacity")
+            if (
+                kv_placement.block_table_update
+                and len(kv_placement.block_table) != operation.kv_capacity_pages
+            ):
+                raise invalid_descriptor(
+                    "KV placement update does not establish operation capacity"
+                )
         if any(
             operation.kv_capacity_pages > 0
             and not any(

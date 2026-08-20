@@ -222,6 +222,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                     op_id: operation.op_id,
                     group_id: 0,
                     block_table: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
+                    block_table_update: true,
                     pages_to_zero: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
                     prefix_length: 0,
                     input_length: 0,

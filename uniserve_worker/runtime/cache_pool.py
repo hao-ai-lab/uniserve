@@ -11,7 +11,6 @@ import torch
 from ..backends.paged_kv_math import paged_kv_write
 from ..foundation.errors import capability_mismatch, compute_error, invalid_descriptor
 from ..foundation.math import bucketed_length
-from .device import cpu_int_staging_buffer, fill_cpu_ints
 from ..nn.quant.kv_cache import (
     dequantize_fp8_block,
     fp8_quantize,
@@ -19,6 +18,7 @@ from ..nn.quant.kv_cache import (
     resolve_kv_store_dtype,
     scale_for_fp8_block,
 )
+from .device import HostStagingRing, cpu_int_staging_buffer, fill_cpu_ints
 
 __all__ = ["CacheBatchView", "CacheExtents", "CachePool", "CacheRow"]
 
@@ -116,10 +116,13 @@ class CachePool:
         page_size: int,
         num_kv_heads: int,
         head_dim: int,
+        request_pool_size: int,
+        max_blocks_per_request: int,
         device: torch.device | str,
         dtype: torch.dtype,
         store_dtype: torch.dtype | str | None = None,
         group_ranges: Sequence[tuple[int, int]] | None = None,
+        staging_depth: int = 1,
     ) -> None:
         self.num_layers = int(num_layers)
         self.request_pages = int(request_pages)
@@ -130,6 +133,8 @@ class CachePool:
         self.block_size = int(page_size)
         self.n_kv = int(num_kv_heads)
         self.head_dim = int(head_dim)
+        self.request_pool_size = int(request_pool_size)
+        self.max_blocks_per_request = int(max_blocks_per_request)
         self.group_ranges = self._group_ranges(group_ranges)
         self.group_count = len(self.group_ranges)
         self.dtype = dtype
@@ -143,6 +148,8 @@ class CachePool:
             or self.block_size < 1
             or self.n_kv < 1
             or self.head_dim < 1
+            or self.request_pool_size < 1
+            or self.max_blocks_per_request < 1
         ):
             raise invalid_descriptor("CachePool geometry is invalid")
         shape = (
@@ -176,6 +183,93 @@ class CachePool:
         self._validated_page_tuples: dict[
             tuple[tuple[int, ...], bool, bool | None, int | None], tuple[int, ...]
         ] = {}
+        request_rows = self.request_pool_size + 1
+        self.request_page_tables = torch.zeros(
+            (self.group_count, request_rows, self.max_blocks_per_request),
+            dtype=torch.int32,
+            device=self.k.device,
+        )
+        self._request_page_staging = torch.empty(
+            (self.request_pool_size, self.max_blocks_per_request),
+            dtype=torch.int32,
+            device=self.k.device,
+        )
+        self._request_slot_staging = torch.empty(
+            self.request_pool_size,
+            dtype=torch.int64,
+            device=self.k.device,
+        )
+        self._request_group_staging = torch.empty_like(self._request_slot_staging)
+        self._request_page_staging_host = HostStagingRing(
+            (self.request_pool_size, self.max_blocks_per_request),
+            dtype=torch.int32,
+            depth=staging_depth,
+            device=self.k.device,
+        )
+        self._request_slot_staging_host = HostStagingRing(
+            self.request_pool_size,
+            dtype=torch.int64,
+            depth=staging_depth,
+            device=self.k.device,
+        )
+        self._request_group_staging_host = HostStagingRing(
+            self.request_pool_size,
+            dtype=torch.int64,
+            depth=staging_depth,
+            device=self.k.device,
+        )
+
+    def publish_request_placements(
+        self,
+        placements: Sequence[tuple[int, int, Sequence[int]]],
+    ) -> None:
+        """Publish complete scheduler page-table updates to request-indexed device rows."""
+
+        count = len(placements)
+        if count == 0:
+            return
+        if count > self.request_pool_size:
+            raise invalid_descriptor("request cache placement exceeds staging capacity")
+        rows: list[tuple[int, ...]] = []
+        groups: list[int] = []
+        slots: list[int] = []
+        for raw_slot, raw_group, raw_pages in placements:
+            slot = int(raw_slot)
+            group = self.validate_group(int(raw_group))
+            if slot < 1 or slot > self.request_pool_size:
+                raise invalid_descriptor("request cache placement slot is outside capacity")
+            pages = self.validate_pages(raw_pages, scratch=False, group=group)
+            if len(pages) > self.max_blocks_per_request:
+                raise invalid_descriptor("request cache placement exceeds block-table capacity")
+            rows.append(pages)
+            groups.append(group)
+            slots.append(slot)
+        pages_slot, pages_buffer = self._request_page_staging_host.acquire()
+        slot_slot, slot_buffer = self._request_slot_staging_host.acquire()
+        group_slot, group_buffer = self._request_group_staging_host.acquire()
+        pages_host = pages_buffer[:count]
+        pages_host.zero_()
+        fill_cpu_ints(group_buffer[:count], groups)
+        fill_cpu_ints(slot_buffer[:count], slots)
+        for row, pages in enumerate(rows):
+            fill_cpu_ints(pages_host[row, : len(pages)], pages)
+        non_blocking = self.k.device.type == "cuda"
+        self._request_page_staging[:count].copy_(pages_host, non_blocking=non_blocking)
+        self._request_group_staging[:count].copy_(
+            group_buffer[:count],
+            non_blocking=non_blocking,
+        )
+        self._request_slot_staging[:count].copy_(
+            slot_buffer[:count],
+            non_blocking=non_blocking,
+        )
+        self._request_page_staging_host.release(pages_slot)
+        self._request_group_staging_host.release(group_slot)
+        self._request_slot_staging_host.release(slot_slot)
+        self.request_page_tables[
+            self._request_group_staging[:count],
+            self._request_slot_staging[:count],
+        ] = self._request_page_staging[:count]
 
     def _group_ranges(
         self,
