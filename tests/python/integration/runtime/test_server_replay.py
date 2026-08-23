@@ -207,6 +207,29 @@ def test_completed_report_remains_replayable_after_later_execution() -> None:
     assert replayed == first
 
 
+def test_prompt_launches_after_an_earlier_queued_same_session_control() -> None:
+    _admission, _operation, _payload, batch = _token_batch(
+        session_id=19,
+        op_id=43,
+        step_id=14,
+        tokens=(3, 5),
+    )
+    endpoint = _Endpoint(
+        (
+            {"kind": "drop_session", "call_id": 1, "session_id": 19},
+            _request(2, batch),
+            {"kind": "shutdown", "call_id": 3},
+        )
+    )
+    server = WorkerServer(execution_worker(pipeline_depth=2), endpoint)
+
+    WorkerServeLoop(server, endpoint).run()
+
+    responses = _by_call(endpoint)
+    assert responses[1]["kind"] == "ok"
+    assert responses[2]["kind"] == "result"
+
+
 def test_atomic_replay_remains_available_until_every_participant_epoch_ends() -> None:
     first_admission, first_operation, first_payload, _first_batch = _token_batch(
         session_id=6,

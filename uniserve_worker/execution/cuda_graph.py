@@ -189,12 +189,39 @@ class CudaGraphRunner:
             raise GraphExecutionError(
                 "resident CUDA graph count does not match the physical executable catalog: "
                 f"resident={len(self._states)} "
-                f"expected={self._expected_resident_executables}"
+                f"expected={self._expected_resident_executables} "
+                f"families={self._resident_family_counts()!r}"
             )
         self._complete_equivalence_checks()
         if self.resident_bytes > self.memory_budget_bytes:
             raise GraphExecutionError("captured graph residency exceeds its startup budget")
         self._sealed = True
+
+    def _resident_family_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for key in self._states:
+            family = str(key[0]) if key else "unknown"
+            if family == "exact" and len(key) > 1:
+                family = f"exact_{key[1]}"
+                signature = key[-1]
+                if isinstance(signature, tuple) and len(signature) > 3:
+                    token_rows = signature[2]
+                    flow_rows = signature[3]
+                    if token_rows and flow_rows:
+                        family = "exact_decode_flow"
+                    elif flow_rows:
+                        family = "exact_flow"
+                    elif token_rows:
+                        query_lens = signature[4] if len(signature) > 4 else ()
+                        selections = signature[5] if len(signature) > 5 else ()
+                        if query_lens and all(int(value) == 1 for value in query_lens):
+                            family = "exact_decode"
+                        elif selections and all(value == TokenSelection.HIDDEN.value for value in selections):
+                            family = "exact_prefix"
+                        else:
+                            family = "exact_prefill"
+            counts[family] = counts.get(family, 0) + 1
+        return dict(sorted(counts.items()))
 
     @property
     def startup_signature(self) -> tuple[object, ...]:

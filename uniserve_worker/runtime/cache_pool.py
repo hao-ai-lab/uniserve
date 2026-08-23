@@ -726,6 +726,10 @@ class CacheBatchView:
             raise invalid_descriptor("KV view has no packed query lengths")
         return self._query_lens
 
+    @property
+    def block_table_width(self) -> int:
+        return self._block_table_width
+
     def with_synthetic_row(
         self,
         block_ids: Sequence[int],

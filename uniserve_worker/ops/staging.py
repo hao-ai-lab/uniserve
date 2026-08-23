@@ -36,6 +36,7 @@ if triton is not None:
         page_table_column_stride: tl.constexpr,
         request_token_stride: tl.constexpr,
         request_position_stride: tl.constexpr,
+        block_table_row_stride: tl.constexpr,
         max_rows: tl.constexpr,
         table_width: tl.constexpr,
         group_id: tl.constexpr,
@@ -61,7 +62,11 @@ if triton is not None:
             mask=live_table,
             other=0,
         )
-        tl.store(block_tables + offsets, table_values, mask=table_mask)
+        tl.store(
+            block_tables + table_rows * block_table_row_stride + columns,
+            table_values,
+            mask=table_mask,
+        )
 
         scalar_mask = offsets < max_rows
         live_rows = scalar_mask & (offsets < rows)
@@ -147,7 +152,7 @@ def gather_request_decode_inputs(
     width = int(block_tables.shape[1])
     if (
         int(block_tables.shape[0]) != max_rows
-        or int(request_page_tables.shape[2]) != width
+        or int(request_page_tables.shape[2]) < width
         or int(group_id) < 0
         or int(group_id) >= int(request_page_tables.shape[0])
         or int(page_size) < 1
@@ -175,6 +180,7 @@ def gather_request_decode_inputs(
         page_table_column_stride=int(request_page_tables.stride(2)),
         request_token_stride=int(request_tokens.stride(0)),
         request_position_stride=int(request_positions.stride(0)),
+        block_table_row_stride=int(block_tables.stride(0)),
         max_rows=max_rows,
         table_width=width,
         group_id=int(group_id),

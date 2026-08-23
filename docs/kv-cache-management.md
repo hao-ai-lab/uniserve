@@ -1,6 +1,6 @@
 # KV cache management
 
-UniServe uses one scheduler-authored KV address space from allocation through model execution. The Rust scheduler allocates request slots and KV pages, while each Python worker owns the fixed tensors stored at those addresses. A batch carries complete physical placement, so the worker validates and executes an allocation decision without deriving another page map.
+UniServe uses one scheduler-authored KV address space from allocation through model execution. The Rust scheduler allocates request slots and KV pages, while each Python worker owns the fixed tensors stored at those addresses. Every batch carries complete physical placement, so execution validates and applies an allocation decision without deriving another page map.
 
 ## Ownership
 
@@ -11,8 +11,11 @@ UniServe uses one scheduler-authored KV address space from allocation through mo
 | Operation block tables, pages to zero, and KV extents | Rust scheduler | `BatchPartition.kv_placements` |
 | Generation branch tables and pages to zero | Rust scheduler | `BatchPartition.kv_branch_placements` |
 | Physical key/value tensors and quantization metadata | Python worker | `CachePool` |
-| Operation-local extent cursors | `ModelRunner` | `CacheRow` |
-| Model-visible access | `ModelRunner` | `CacheBatchView` through `ForwardBatch.kv` |
+| Placement validation, row binding, and partition publication | `execution.step` | `PartitionState`, `CacheRow`, and partition commit functions |
+| Token-operation extent advancement | `execution.token` with step commit functions | Validated `CacheRow` extent transitions |
+| Attention metadata for a physical forward | `execution.attention` | `KvView` and `AttnPlan` |
+| Model-visible KV access | `ForwardBatch` | `ForwardBatch.kv` |
+| GPU staging and model invocation | `ModelRunner` | `ForwardRow` to `ForwardResult` |
 | Cross-stage KV publication and installation | Worker transfer layer | `TransferConnector`, bounded tickets, and `CachePublication` |
 | Administrative state serialization | Worker recovery layer | `SnapshotRecovery` |
 
@@ -20,13 +23,13 @@ A model receives an immutable attention plan and a bounded cache view for the cu
 
 ## Physical address space
 
-`CachePool` is created once from model cache geometry and the worker deployment capacity. Key and value tensors use this logical shape:
+`CachePool` is created once from model cache geometry and worker deployment capacity. Key and value tensors use this logical shape:
 
 ```text
 [layer, physical_page, page_token, kv_head, head_dimension]
 ```
 
-Page `0` is the permanent zero sentinel for padded graph rows and block-table tails. Positive request pages occupy the range below `scratch_page_offset`; generation scratch pages occupy the remaining range. Cache-group ranges partition the request-page axis, and every command names the group that owns its global page IDs. The same page ID addresses the corresponding rank-local storage on every tensor-parallel rank.
+Page `0` is the permanent zero sentinel for padded graph rows and block-table tails. Positive request pages occupy the range below `scratch_page_offset`; generation scratch pages occupy the remaining range. Cache-group ranges partition the request-page axis, and every command names the group that owns its global page IDs. The same page ID addresses corresponding rank-local storage on every tensor-parallel rank.
 
 The pool validates group ownership, page ranges, request and scratch regions, repeated real pages, layer indices, tensor geometry, and token spans before mutation. Its operations are physical: zero, copy, read, write, page view, and restore. Scheduler decisions determine which pages are assigned and when they may be reused.
 
@@ -34,23 +37,26 @@ Optional FP8 storage uses group-, layer-, and page-indexed scale tables. Zeroing
 
 ## Request and operation placement
 
-`Admission` binds a request key to one stable `request_pool_idx`. Each token operation carries a finite KV capacity, and its aligned `KvPlacement` identifies the complete block table, exact `pages_to_zero`, prefix length, input length, visible length, and resulting length. Placement remains execution metadata and does not contribute to admission, plan, semantic, or control identity.
+`Admission` binds a request key to one stable `request_pool_idx`. Each token operation carries a finite KV capacity, and its aligned `KvPlacement` identifies the complete block table, exact `pages_to_zero`, prefix length, input length, visible length, and resulting length. Placement is execution metadata and does not contribute to admission, plan, semantic, or control identity.
 
 ```mermaid
 flowchart LR
     S["Scheduler allocation and prefix policy"] --> P["Batch placement sidecars"]
-    P --> V["ModelRunner validates identities, pages, and extents"]
+    P --> V["execution.step validates identities, pages, and extents"]
     V --> Z["CachePool applies declared zero and copy commands"]
-    Z --> R["ModelRunner creates candidate request and CacheRow values"]
-    R --> F["ForwardBatch exposes a bounded cache view"]
-    F --> M["Model execution"]
-    M --> C["Validate the complete partition outcome"]
-    C --> U["Publish resource-specific state"]
+    Z --> R["execution.step binds request and CacheRow candidates"]
+    R --> A["execution.attention builds KvView and AttnPlan"]
+    A --> F["ForwardBatch exposes kv"]
+    F --> M["ModelRunner invokes the model"]
+    M --> E["execution.token validates and advances extents"]
+    E --> C["execution.step validates and publishes the partition"]
 ```
 
-Before device mutation, `ModelRunner` validates every placement against the operation, fixed pool geometry, request slot, capacity, and logical parent state. It zeroes exactly the declared pages and constructs `CacheRow` values whose reserved, initialized, visible, committed, and published extents are bounded by the supplied block table.
+Before model execution, `execution.step` validates every placement against the operation, fixed pool geometry, request slot, capacity, and logical parent state. It zeroes exactly the declared pages and binds `CacheRow` candidates whose reserved, initialized, visible, committed, and published extents are bounded by the supplied block table.
 
-`CacheBatchView` derives block tables, cache sequence lengths, packed write coordinates, and layer tensors from those rows. Fixed, ragged, and packed append operations validate row alignment and write only declared spans. Model code writes K/V values; `ModelRunner` advances logical extents after validating model output and postprocessing results.
+`execution.attention` constructs the appropriate paged decode, request-indexed decode, paged variable-length, or packed plan from the ready `ForwardRow` group. `CacheBatchView` derives block tables, cache sequence lengths, packed write coordinates, and layer tensors from the bound rows. The resulting `KvView` and `AttnPlan` enter `ModelRunner.forward` as explicit values and become `ForwardBatch.kv` and `ForwardBatch.attention`.
+
+Model code reads and writes K/V tensors through the bounded view. After a successful token forward, `execution.token` requests the validated extent transition and records the operation outcome. `execution.step` publishes those candidates only after the entire partition has passed completion, product, latent, encoder, runtime-state, and KV validation.
 
 ## Prefix reuse and page hygiene
 
@@ -62,25 +68,27 @@ Every page assigned to unrelated content appears in `pages_to_zero`. The worker 
 
 ## Candidate publication
 
-Each partition builds isolated request-row candidates and resource-specific candidates. Validation covers all operation outcomes, completion bounds, KV extents, products, encoder entries, latent state, runtime-state rows, and branch rows before publication begins.
+Each partition binds isolated request-row candidates and resource-specific candidates. Validation covers all operation outcomes, completion bounds, KV extents, products, encoder entries, latent state, runtime-state rows, and branch rows before publication begins.
 
-KV writes target scheduler-reserved pages beyond the live logical extent. Successful partition publication assigns the complete request-row candidate and exposes the validated extents. On an ordinary failure, candidate rows and product bindings are discarded, latent imports are released, prepared transport locators are retired, and bytes outside the preceding published extent remain unreachable. A failure after publication begins is an invariant violation because ordinary request faults are required to resolve during prevalidation.
+KV writes target scheduler-reserved pages beyond the live logical extent. Successful partition publication assigns the complete request-row candidate and exposes the validated extents. On an ordinary failure, candidate rows and product bindings are discarded, latent imports are released, prepared transport locators are retired, and bytes outside the preceding published extent remain unreachable. A failure after publication begins is an invariant violation because ordinary request faults must resolve during prevalidation.
 
 ## Sequence and generation work
 
-Extend, decode, and verify operations declare their input span, finite growth bound, exact capacity, and physical placement. `ModelRunner` verifies the parent cursor, builds the attention plan, invokes the model, validates row-aligned output, applies sampling or verification, and advances by the selected token effect.
+Extend, decode, and verify operations declare their input span, finite growth bound, exact capacity, and physical placement. `execution.token` packs each ready operation into a `ForwardRow`. The ready-set combines compatible rows, `execution.attention` builds one plan for the physical group, and `ModelRunner.forward` returns aligned tensors. Token consumption validates the neural result, samples or verifies it, commits the row extent, and records the selected token effect.
 
 Generation branches receive `KvBranchPlacement` records in the scratch region. Conditional state reaches a named branch only through explicit physical page copies. Text-unconditional and image-unconditional branches use disjoint scheduler assignments and can participate in one packed forward. Scratch rows are operation-scoped and never become request allocation state.
+
+Tensorized mixed token and flow rows share one packed attention plan when their physical group key matches. Each row retains its own visibility bounds, write coordinates, route spans, and cache extent. Flow-prefix completion and Euler integration are causal readiness transitions around model forwards; neither changes KV ownership.
 
 ## Transfer
 
 KV publication binds an exact product generation, fixed semantic version, source extent, destination, cache group, storage identity, and source-page prefix. Incremental publication sends only the suffix beyond the installed destination base. The descriptor carries the exact generation and a `CachePublication`; every referenced locator carries dtype, shape, byte count, and transport identity.
 
-The consumer prepares bounded asynchronous tickets, validates every locator before execution, and installs bytes into the scheduler-assigned destination pages. Destination metadata becomes visible only with the successful partition. Transfer readiness is observed by query, and ticket or byte exhaustion returns bounded backpressure.
+The consumer prepares bounded asynchronous tickets, validates every locator before execution, and installs bytes into scheduler-assigned destination pages. Destination metadata becomes visible only with successful partition publication. Transfer readiness is observed by query, and ticket or byte exhaustion returns bounded backpressure.
 
 ## Recovery
 
-Snapshot and restore are administrative operations. `SnapshotRecovery` serializes the committed request row and exact bytes selected by a scheduler-supplied `RecoveryPlacement`. Restore validates the model identity, weight identity, snapshot digest, format, dtype, shape, byte count, and pool geometry before writing.
+Snapshot and restore are administrative operations. `SnapshotRecovery` serializes the committed request row and exact bytes selected by a scheduler-supplied `RecoveryPlacement`. Restore validates model identity, weight identity, snapshot digest, format, dtype, shape, byte count, and pool geometry before writing.
 
 Physical request slots and page IDs are placement rather than durable identity. The scheduler allocates destination slots and pages for recovery, and the worker restores bytes directly into those locations. A restored request becomes executable only after its complete request row and concrete owner state are installed.
 

@@ -414,6 +414,9 @@ class InputBuffers:
                     non_blocking=self.device.type == "cuda",
                 )
                 self._decode_force_finish_host.release(finish_slot)
+        width = int(attention.table_width)
+        if width < 1 or width > int(self.block_tables.shape[1]):
+            raise ValueError("request-indexed decode table width exceeds staging capacity")
         gather_request_decode_inputs(
             request_pool_indices=self.request_pool_indices,
             request_page_tables=attention.request_page_tables,
@@ -422,7 +425,7 @@ class InputBuffers:
             request_positions=attention.request_positions,
             input_ids=self.input_ids,
             positions=self.positions[0],
-            block_tables=self.block_tables,
+            block_tables=self.block_tables[:, :width],
             cache_lengths=self.cache_lengths,
             kv_lengths=self.kv_lengths,
             query_lengths=self.query_lengths,
@@ -432,7 +435,6 @@ class InputBuffers:
             group_id=attention.group_id,
             page_size=attention.page_size,
         )
-        width = int(attention.request_page_tables.shape[2])
         staged_attention = PagedDecodePlan(
             backends=attention.backends,
             block_table=self.block_tables[:row_count, :width],

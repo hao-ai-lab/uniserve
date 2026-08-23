@@ -334,6 +334,7 @@ class RequestIndexedDecodePlan:
     request_positions: torch.Tensor
     group_id: int
     page_size: int
+    table_width: int
     cache_seqlens_cpu: tuple[int, ...]
     kv_seqlens_cpu: tuple[int, ...]
     query_lens_cpu: tuple[int, ...]

@@ -57,8 +57,22 @@ from ..capabilities import (
 )
 from ..execution.cuda_graph import CudaGraphRunner
 from ..execution.forward_batch import AttentionSelection
-from ..execution.model_invocation import _ModelInvocation
-from ..execution.model_runner import ModelRunner, PreparedExecution
+from ..execution.model_runner import ModelRunner
+from ..execution.step import (
+    PreparedExecution,
+    close_execution,
+    complete_startup,
+    create_execution_resources,
+    execute_batch,
+    execute_prepared,
+    execute_startup,
+    install_weights,
+    parent_runtime,
+    prepare_batch,
+)
+from ..execution.step import (
+    drop_session as drop_execution_session,
+)
 from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.math import ceil_div
@@ -373,12 +387,12 @@ class Worker:
         self._active_model_calls = 0
         self._weight_update_active = False
         installed_weights = (
-            WeightSet.from_module(model, digest=weight_digest)
-            if weights is None
-            else weights
+            WeightSet.from_module(model, digest=weight_digest) if weights is None else weights
         )
         if weight_digest is not None and installed_weights.digest != weight_digest:
-            raise capability_mismatch("worker weight identity does not match the installed WeightSet")
+            raise capability_mismatch(
+                "worker weight identity does not match the installed WeightSet"
+            )
         self.weights = installed_weights
         self.weight_digest = installed_weights.digest
         self.identity = ModelIdentity(
@@ -775,7 +789,6 @@ class Worker:
             )
             > 1
         )
-        self._decode_graph_batch_sizes = decode_graph_batch_sizes
         self._prefill_graph_token_sizes = prefill_graph_token_sizes
         self._prefill_graph_row_sizes = prefill_graph_row_sizes
         self._flow_cfg_branches = flow_cfg_branches
@@ -912,9 +925,9 @@ class Worker:
             if deployment.generation_device is None
             else (deployment.device, deployment.generation_device)
         )
-        model_invocation = _ModelInvocation(
+        runner = ModelRunner(
             model,
-            None,
+            deployment,
             self.trace,
             max_rows=max_staged_rows,
             max_tokens=max_staged_tokens,
@@ -929,7 +942,7 @@ class Worker:
         if execution.lanes:
             lane_by_id = {lane.lane_id: lane for lane in execution.lanes}
             lane_capabilities: list[LaneCapabilities] = []
-            for partition in model_invocation.partitions:
+            for partition in runner.partitions:
                 if partition.lane_id is None:
                     continue
                 lane = lane_by_id[partition.lane_id]
@@ -1066,10 +1079,11 @@ class Worker:
                     )
                 )
             self._capabilities = replace(self._capabilities, lanes=tuple(lane_capabilities))
-        self.runner = ModelRunner(
+        self.runner = runner
+        self.execution = create_execution_resources(
+            runner=runner,
             model=model,
             deployment=deployment,
-            model_invocation=model_invocation,
             attention=attention,
             requests=self.requests,
             runtime_states=self.runtime_states,
@@ -1116,7 +1130,7 @@ class Worker:
                 device=deployment.device,
                 requests=self.requests,
                 cache_pool=self.cache_pool,
-                cache_publications=self.runner.cache_publications,
+                cache_publications=self.execution.cache_publications,
                 latent_pool=self.latent_pool,
                 device_products=self.device_products,
                 encoder_cache=self.encoder_cache,
@@ -1149,12 +1163,12 @@ class Worker:
 
     def execute(self, batch: Batch) -> CompletionReport:
         with self._model_call():
-            return self.runner.execute(batch)
+            return execute_batch(self.execution, batch)
 
     def prepare_execute(self, batch: Batch) -> object | None:
         self._begin_model_call()
         try:
-            prepared = self.runner.prepare(batch)
+            prepared = prepare_batch(self.execution, batch)
         except BaseException:
             self._end_model_call()
             raise
@@ -1167,7 +1181,7 @@ class Worker:
         if not isinstance(prepared, _PreparedWeightCall):
             raise invalid_descriptor("prepared execution has an invalid type")
         try:
-            return self.runner.execute_prepared(prepared.prepared)
+            return execute_prepared(self.execution, prepared.prepared)
         finally:
             self._end_model_call()
 
@@ -1211,7 +1225,7 @@ class Worker:
                 self._weight_condition.notify_all()
 
     def _publish_weight_set(self, weights: WeightSet) -> None:
-        self.runner.install_weights(weights)
+        install_weights(self.execution, weights)
         self.weights = weights
         self.weight_digest = weights.digest
         self.identity = ModelIdentity(
@@ -1239,7 +1253,7 @@ class Worker:
         retain_device_outputs: bool = False,
         catalog_graphs: bool = True,
     ) -> CompletionReport:
-        report = self.runner.execute_startup(batch, catalog_graphs=catalog_graphs)
+        report = execute_startup(self.execution, batch, catalog_graphs=catalog_graphs)
         while not completion_report_ready(report):
             time.sleep(0.00005)
         finalized = finalize_completion_report(report)
@@ -1311,7 +1325,7 @@ class Worker:
                 raise invalid_descriptor("warmup KV admission requires an empty prefix")
             visible = 0
             if session is not None:
-                runtime = self.runner.parent_runtime(operation, session)
+                runtime = parent_runtime(self.execution, operation, session)
                 visible = int(runtime.kv_visible_len)
             input_length = (
                 int(operation.bounds.max_tokens)
@@ -1436,7 +1450,7 @@ class Worker:
             renorm_min=float(image.cfg_renorm_min),
             use_cfg=True,
         )
-        runtime = self.runner.parent_runtime(operation, session)
+        runtime = parent_runtime(self.execution, operation, session)
         query = generation.physical_tokens(height, width)
         image_prompt = image.image_prompts[0] if image.image_prompts else ""
         prefix_lengths = []
@@ -1446,7 +1460,7 @@ class Worker:
                 image_prompt=image_prompt,
                 negative_prompt=image.negative_prompt,
                 negative_token_ids=session.negative_token_ids,
-                tokenizer=self.runner.tokenizer,
+                tokenizer=self.execution.tokenizer,
             )
             prefix_lengths.append(int(runtime.kv_visible_len) if copy_conditioning else len(prefix))
         widths = tuple(
@@ -1518,7 +1532,7 @@ class Worker:
         elif self._capabilities.mixed_buckets:
             self._warmup_flow()
             logger.info("completed mixed execution warmup")
-        self.runner.complete_startup()
+        complete_startup(self.execution)
         logger.info("completed execution partition startup verification")
 
     def _warmup_image_geometry(self) -> tuple[int, int]:
@@ -1579,7 +1593,16 @@ class Worker:
         if self._execution.cuda_graph and self._execution.prefill_cuda_graph:
             self._warmup_prefill_graphs()
         configured = (
-            self._decode_graph_batch_sizes
+            tuple(
+                sorted(
+                    {
+                        batch_size
+                        for partition in self.runner.partitions
+                        if Domain.DECODE in partition.domains
+                        for batch_size in partition.graphs.decode_batch_sizes
+                    }
+                )
+            )
             if (self._execution.cuda_graph and WorkVariant.TOKEN_DECODE in variants)
             else (1,)
         )
@@ -1591,6 +1614,7 @@ class Worker:
         )
         if not batch_sizes:
             return
+        logger.info("warming %d decode CUDA graph executables", len(batch_sizes))
         session_ids = tuple(range(1, max(batch_sizes) + 1))
         keys = {sid: RequestKey(0, sid, 1) for sid in session_ids}
         admissions = {
@@ -2302,7 +2326,7 @@ class Worker:
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
         session = self.requests.peek(session_id)
-        self.runner.drop_session(session_id)
+        drop_execution_session(self.execution, session_id)
         self.device_products.drop_session(session_id)
         if session is not None and self.latent_pool is not None:
             self.latent_pool.release_slots((int(session.request_pool_idx),))
@@ -2379,6 +2403,7 @@ class Worker:
 
     def close(self) -> None:
         self.runner.synchronize()
+        close_execution(self.execution)
         self.runner.close()
         self.cpu_tasks.close()
         self.completion_arena.close()

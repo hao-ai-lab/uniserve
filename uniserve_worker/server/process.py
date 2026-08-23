@@ -247,7 +247,6 @@ class WorkerServeLoop:
         order = [index for index, item in enumerate(items) if item[2]]
         order += [index for index, item in enumerate(items) if not item[2]]
         launched: set[int] = set()
-        blocked_sessions: set[int] = set()
         for index in order:
             request, sessions, _early = items[index]
             # A request may not overtake earlier unlaunched work that shares a
@@ -259,15 +258,13 @@ class WorkerServeLoop:
                 if position not in launched
             )
             if (
-                blocked_sessions.intersection(sessions)
-                or any(not earlier.isdisjoint(sessions) for earlier in ordered_before)
+                any(not earlier.isdisjoint(sessions) for earlier in ordered_before)
                 or not all(
                     self._inflight_sessions[id(response)].isdisjoint(sessions)
                     or _response_execution_complete(response)
                     for response in self.inflight
                 )
             ):
-                blocked_sessions.update(sessions)
                 continue
             response = self.worker_server.handle(request)
             self._append_inflight(sessions, response)
