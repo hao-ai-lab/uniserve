@@ -118,6 +118,7 @@ fn try_resolved_model(
         renderer,
         capabilities,
         4096,
+        true,
     )?;
     Ok((directory, tokenizer, model))
 }

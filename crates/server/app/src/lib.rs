@@ -268,6 +268,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         renderer,
         snapshot.generation_capabilities,
         route_max_model_len,
+        config.reasoning_parsing,
     )
     .context("failed to bind the configured model description")?;
     let public_model_name = config

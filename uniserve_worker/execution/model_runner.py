@@ -201,6 +201,13 @@ logger = logging.getLogger(__name__)
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
+_GENERATION_WORK_VARIANTS = frozenset(
+    {
+        WorkVariant.GEN_TRANSITION,
+        WorkVariant.GEN_FLOW,
+        WorkVariant.MATERIALIZE,
+    }
+)
 MIXED_SERVICE_SERIAL_NUMERATOR = 5
 MIXED_SERVICE_SERIAL_DENOMINATOR = 4
 
@@ -1346,10 +1353,14 @@ class ModelRunner:
             if (identity := _operation_identity(operation)) in predicate_values
             and not predicate_values[identity]
         )
-        active_operations = tuple(
-            operation
-            for operation in operations
-            if _operation_identity(operation) not in predicated
+        active_operations = (
+            operations
+            if not predicated
+            else tuple(
+                operation
+                for operation in operations
+                if _operation_identity(operation) not in predicated
+            )
         )
         traced = _trace_envelopes(operations)
         started = time.perf_counter_ns()
@@ -1425,7 +1436,7 @@ class ModelRunner:
                     scope.cache_rows.get((operation.request_key, operation.op_id, 0))
                     for operation in operations
                 ),
-                weights=tuple(self._weights() for _ in candidates),
+                weights=(self._weights(),) * len(candidates),
                 identities=tuple(_operation_identity(operation) for operation in operations),
             )
             if active_partition is not None:
@@ -1446,6 +1457,7 @@ class ModelRunner:
             self._consume_predicates(active_operations, scope)
             self._publish_predicated_outputs(operations, scope)
             scope.registration_visible = True
+            _record_component(scope, "open_partition", started)
             return scope
         except BaseException:
             self._discard_partition(scope)
@@ -1458,6 +1470,8 @@ class ModelRunner:
     ) -> BatchPartition | None:
         if not operations:
             return None
+        if operations is partition.operations:
+            return partition
         identities = {_operation_identity(operation) for operation in operations}
         indices = tuple(
             request_pool_idx
@@ -1570,6 +1584,7 @@ class ModelRunner:
         outcomes: tuple[_Outcome, ...],
         started: int,
     ) -> PartitionCompletion:
+        commit_started = time.perf_counter_ns()
         partition = scope.partition
         operations = partition.operations
         self._finish_device_reads(scope)
@@ -1641,7 +1656,8 @@ class ModelRunner:
                     ),
                 ),
             )
-            records.append(replace(placeholder, semantic_digest=cast(str, pending)))
+            object.__setattr__(placeholder, "semantic_digest", pending)
+            records.append(placeholder)
             if operation.advances_state:
                 selected_versions[operation.request_key.session_id] = VersionRef(
                     request_key=operation.request_key,
@@ -1665,6 +1681,7 @@ class ModelRunner:
                 kv_committed_len=outcome.logical_lengths.kv_committed_len,
                 kv_published_len=outcome.logical_lengths.kv_published_len,
             )
+        _record_component(scope, "commit_partition", commit_started)
         partition_report = PartitionCompletion(
             partition_id=partition.partition_id,
             completions=tuple(records),
@@ -2058,8 +2075,14 @@ class ModelRunner:
                 if existing != collective_digest:
                     raise invalid_descriptor("collective sequence was reused with different work")
                 continue
-            if self._collective_history and collective_seq <= next(
-                reversed(self._collective_history)
+            # Collective positions order cross-rank collectives, so multi-rank
+            # execution must consume them monotonically. A single-rank worker
+            # runs no collectives and may launch session-disjoint submissions
+            # in admission-priority order, so only sequence reuse is checked.
+            if (
+                self.mesh.tp_size > 1
+                and self._collective_history
+                and collective_seq <= next(reversed(self._collective_history))
             ):
                 raise invalid_descriptor("collective sequence does not advance")
             self._collective_history[collective_seq] = collective_digest
@@ -2068,21 +2091,18 @@ class ModelRunner:
 
     def _completion_devices(self, operations: tuple[Operation, ...]) -> tuple[str, ...]:
         deployment = self.deployment
+        generation_device = deployment.generation_device
+        device = deployment.device
         selected: list[str] = []
         for operation in operations:
-            device = (
-                deployment.generation_device
-                if operation.work.variant
-                in {
-                    WorkVariant.GEN_TRANSITION,
-                    WorkVariant.GEN_FLOW,
-                    WorkVariant.MATERIALIZE,
-                }
-                and deployment.generation_device is not None
-                else deployment.device
+            target = (
+                generation_device
+                if generation_device is not None
+                and operation.work.variant in _GENERATION_WORK_VARIANTS
+                else device
             )
-            if device not in selected:
-                selected.append(device)
+            if target not in selected:
+                selected.append(target)
         return tuple(selected)
 
     @staticmethod
@@ -2550,6 +2570,8 @@ class ModelRunner:
     ) -> None:
         """Validate scheduler placement and zero exactly its declared fresh pages."""
 
+        bc_started = time.perf_counter_ns()
+        bc_zero_ns = 0
         operations = {
             (operation.request_key, operation.op_id): operation
             for operation in partition.operations
@@ -2603,16 +2625,20 @@ class ModelRunner:
                     "KV placement request page table does not match operation capacity"
                 )
             placement_contexts.append((session, parent_runtime, committed_runtime, pages))
+        _record_component(scope, "bc_placements", bc_started)
+        bc_rows_started = time.perf_counter_ns()
         for placement, (session, parent_runtime, committed_runtime, pages) in zip(
             partition.kv_placements,
             placement_contexts,
             strict=True,
         ):
+            zero_started = time.perf_counter_ns()
             pages_to_zero = self.cache_pool.validate_pages(
                 placement.pages_to_zero,
                 scratch=False,
                 group=placement.group_id,
             )
+            bc_zero_ns += time.perf_counter_ns() - zero_started
             if placement.resulting_length > len(pages) * self.cache_pool.block_size:
                 raise invalid_descriptor("KV placement resulting extent exceeds its block table")
             if placement.prefix_length != placement.visible_length:
@@ -2649,6 +2675,11 @@ class ModelRunner:
                     pages_to_zero,
                 )
             )
+        scope.component_us["bc_zero_validate"] = (
+            scope.component_us.get("bc_zero_validate", 0) + bc_zero_ns // 1000
+        )
+        _record_component(scope, "bc_rows", bc_rows_started)
+        bc_tail_started = time.perf_counter_ns()
         branch_rows: list[
             tuple[
                 tuple[RequestKey, int, int],
@@ -2720,6 +2751,7 @@ class ModelRunner:
                 self.cache_pool.zero_pages(row.group_id, pages_to_zero)
             scope.branch_publications[persistent_identity] = row
             scope.branch_rows[branch_identity] = row
+        _record_component(scope, "bc_tail", bc_tail_started)
 
     @staticmethod
     def _request_row(scope: _ExecutionScope, session_id: int) -> RequestRow:

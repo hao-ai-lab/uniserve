@@ -3,7 +3,7 @@ artifact_root = "artifacts/benchmark"
 [servers.qwen]
 host = "127.0.0.1"
 port = 18081
-command = ["target/release/uniserve", "serve", "${UNISERVE_QWEN3_MODEL}", "--model-description", "qwen3", "--served-model-name", "Qwen3-32B", "--host", "127.0.0.1", "--port", "18081", "--worker-python", ".venv/bin/python", "--max-total-tokens", "131072", "--max-running-requests", "128", "--max-num-batched-tokens", "16384", "--chunked-prefill-size", "16384", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--pipeline-depth", "4"]
+command = ["target/release/uniserve", "serve", "${UNISERVE_QWEN3_MODEL}", "--model-description", "qwen3", "--served-model-name", "Qwen3-32B", "--host", "127.0.0.1", "--port", "18081", "--worker-python", ".venv/bin/python", "--max-total-tokens", "131072", "--max-running-requests", "128", "--max-num-batched-tokens", "16384", "--chunked-prefill-size", "16384", "--page-size", "64", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--prefill-cuda-graph", "true", "--pipeline-depth", "3", "--reasoning-parser", "none"]
 
 [servers.qwen.environment]
 CUDA_VISIBLE_DEVICES = "0"

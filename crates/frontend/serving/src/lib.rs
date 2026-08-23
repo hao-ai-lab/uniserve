@@ -1394,14 +1394,20 @@ fn build_output_sink(
 ) -> Result<OutputSink> {
     match policy {
         OutputProcessorPolicy::None | OutputProcessorPolicy::Bagel => Ok(OutputSink::Raw),
-        OutputProcessorPolicy::Qwen3(request) => {
+        OutputProcessorPolicy::Qwen3 {
+            request,
+            parse_reasoning,
+        } => {
             let mut request = *request;
-            let processor =
-                Qwen3ChatOutputProcessor::new(&mut request, std::sync::Arc::clone(tokenizer))
-                    .map_err(|error| ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: error.to_string(),
-                    })?;
+            let processor = Qwen3ChatOutputProcessor::new(
+                &mut request,
+                std::sync::Arc::clone(tokenizer),
+                parse_reasoning,
+            )
+            .map_err(|error| ServeError::OutputProcessing {
+                request_id: request_id.clone(),
+                message: error.to_string(),
+            })?;
             let bridge =
                 ChatOutputBridge::new(processor).map_err(|error| ServeError::OutputProcessing {
                     request_id: request_id.clone(),

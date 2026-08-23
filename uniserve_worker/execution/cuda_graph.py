@@ -70,6 +70,8 @@ class _GraphState:
     startup_resident: bool
     signature: tuple[object, ...]
     publish_cursor: int = 0
+    batch_leaves: tuple[torch.Tensor, ...] = ()
+    plan_leaves: tuple[torch.Tensor, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +423,8 @@ class CudaGraphRunner:
                 releases,
                 startup_resident,
                 signature,
+                batch_leaves=tuple(_tensor_leaves(static)),
+                plan_leaves=tuple(_tensor_leaves(static.attention)),
             )
         except Exception:
             for release in reversed(releases):
@@ -443,9 +447,9 @@ class CudaGraphRunner:
         context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
         with context:
             if not state.startup_resident:
-                _copy_value_tensors(state.batch, execution)
+                _copy_into_leaves(state.batch_leaves, execution, "forward")
             else:
-                _copy_plan_tensors(state.batch.attention, execution.attention)
+                _copy_into_leaves(state.plan_leaves, execution.attention, "attention")
             self._prepare_attention(state.batch, execution, capture=False)
             state.graph.replay()
 
@@ -976,6 +980,22 @@ def _clone_value(value: Any) -> Any:
     return value
 
 
+_LEAF_FIELD_NAMES: dict[type, tuple[str, ...] | None] = {}
+
+
+def _leaf_field_names(value: Any) -> tuple[str, ...] | None:
+    kind = type(value)
+    names = _LEAF_FIELD_NAMES.get(kind, ())
+    if names == ():
+        names = (
+            tuple(field.name for field in fields(value))
+            if is_dataclass(value) and not isinstance(value, type)
+            else None
+        )
+        _LEAF_FIELD_NAMES[kind] = names
+    return names
+
+
 def _tensor_leaves(value: Any) -> Iterator[torch.Tensor]:
     if isinstance(value, torch.Tensor):
         yield value
@@ -986,39 +1006,33 @@ def _tensor_leaves(value: Any) -> Iterator[torch.Tensor]:
         for item in value:
             yield from _tensor_leaves(item)
         return
-    if is_dataclass(value) and not isinstance(value, type):
-        for field in fields(value):
-            yield from _tensor_leaves(getattr(value, field.name))
+    names = _leaf_field_names(value)
+    if names is not None:
+        for name in names:
+            yield from _tensor_leaves(getattr(value, name))
 
 
-def _copy_value_tensors(target: object, source: object) -> None:
-    target_tensors = tuple(_tensor_leaves(target))
-    source_tensors = tuple(_tensor_leaves(source))
-    if len(target_tensors) != len(source_tensors):
-        raise _GraphMiss("forward tensor structure changed")
-    for destination, value in zip(target_tensors, source_tensors, strict=True):
+def _copy_into_leaves(
+    target_tensors: tuple[torch.Tensor, ...],
+    source: object,
+    structure: str,
+) -> None:
+    index = 0
+    limit = len(target_tensors)
+    for value in _tensor_leaves(source):
+        if index >= limit:
+            raise _GraphMiss(f"{structure} tensor structure changed")
+        destination = target_tensors[index]
+        index += 1
         if (
             destination.shape != value.shape
             or destination.dtype != value.dtype
             or destination.device != value.device
         ):
-            raise _GraphMiss("forward tensor geometry changed")
+            raise _GraphMiss(f"{structure} tensor geometry changed")
         destination.copy_(value, non_blocking=True)
-
-
-def _copy_plan_tensors(target: object, source: object) -> None:
-    target_tensors = tuple(_tensor_leaves(target))
-    source_tensors = tuple(_tensor_leaves(source))
-    if len(target_tensors) != len(source_tensors):
-        raise _GraphMiss("attention tensor structure changed")
-    for destination, value in zip(target_tensors, source_tensors, strict=True):
-        if (
-            destination.shape != value.shape
-            or destination.dtype != value.dtype
-            or destination.device != value.device
-        ):
-            raise _GraphMiss("attention tensor geometry changed")
-        destination.copy_(value, non_blocking=True)
+    if index != limit:
+        raise _GraphMiss(f"{structure} tensor structure changed")
 
 
 def _graph_selection(plan: object) -> AttentionSelection:

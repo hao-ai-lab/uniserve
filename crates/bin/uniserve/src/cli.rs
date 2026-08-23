@@ -390,6 +390,12 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long, default_value_t)]
     pub chat_template_content_format: ChatTemplateContentFormatOption,
 
+    /// Reasoning parser applied to model output. `auto` uses the model
+    /// description's parser to split `reasoning_content` from `content`;
+    /// `none` streams reasoning delimiter tokens verbatim as content.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "none"])]
+    pub reasoning_parser: String,
+
     /// Log a summary line for each completed request.
     #[arg(long = "log-requests")]
     pub enable_log_requests: bool,
@@ -545,6 +551,7 @@ impl SharedRuntimeArgs {
             request_timeout,
             max_concurrent_requests: self.max_concurrent_requests,
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout),
+            reasoning_parsing: self.reasoning_parser != "none",
         }
     }
 }

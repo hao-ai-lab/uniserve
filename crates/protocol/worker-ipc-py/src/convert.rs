@@ -85,86 +85,602 @@ pub(crate) fn execute_request_to_py<'py>(
     Ok(dict)
 }
 
-fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyDict>> {
-    let mut context = RequestConversion::new(py);
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "step_id"), batch.step_id)?;
-    dict.set_item(
-        intern!(py, "admissions"),
-        dict_list(py, &batch.admissions, |admission| {
-            admission_to_py(py, admission, &mut context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "partitions"),
-        dict_list(py, &batch.partitions, |partition| {
-            batch_partition_to_py(py, partition, &mut context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "controls"),
-        dict_list(py, &batch.controls, |control| {
-            control_to_py(py, control, &mut context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "input_products"),
-        dict_list(py, &batch.input_products, |payload| {
-            product_payload_to_py(py, payload, &mut context)
-        })?,
-    )?;
-    Ok(dict)
+// ---------------------------------------------------------------------------
+// Native typed construction (recv hot path)
+// ---------------------------------------------------------------------------
+
+/// Cached handles to the worker's protocol types and enum members.
+///
+/// The serve loop constructs one `Batch` object per submission; every hot
+/// record (operations, KV placements, commit/close/release controls) is built
+/// by calling the protocol dataclass constructors positionally, so the worker
+/// never re-decodes those records from wire maps. Rare members (admissions,
+/// input products, branch and latent placements) still cross as wire maps and
+/// are decoded by `native_batch`/`native_partition` on the Python side.
+struct NativeRequestTypes {
+    operation: Py<PyAny>,
+    request_key: Py<PyAny>,
+    version_ref: Py<PyAny>,
+    fixed_point: Py<PyAny>,
+    device_point: Py<PyAny>,
+    product_ref: Py<PyAny>,
+    shape_bound: Py<PyAny>,
+    static_dim: Py<PyAny>,
+    device_dim: Py<PyAny>,
+    point_range: Py<PyAny>,
+    bounds: Py<PyAny>,
+    rng: Py<PyAny>,
+    kv_placement: Py<PyAny>,
+    commit: Py<PyAny>,
+    close: Py<PyAny>,
+    release: Py<PyAny>,
+    native_partition: Py<PyAny>,
+    native_batch: Py<PyAny>,
+    domains: [Py<PyAny>; 3],
+    product_kinds: [Py<PyAny>; 14],
+    storage_classes: [Py<PyAny>; 5],
+    dtypes: [Py<PyAny>; 8],
+    dispositions: [Py<PyAny>; 3],
+    close_reasons: [Py<PyAny>; 4],
+    draw_layouts: [Py<PyAny>; 3],
+    execution_capabilities: [Py<PyAny>; 2],
+    attention_regimes: [Py<PyAny>; 4],
+    works: [Py<PyAny>; 12],
 }
 
-fn batch_partition_to_py<'py>(
+static NATIVE_REQUEST_TYPES: std::sync::OnceLock<NativeRequestTypes> = std::sync::OnceLock::new();
+
+fn enum_members<const N: usize>(
+    module: &Bound<'_, PyModule>,
+    name: &str,
+    values: [&str; N],
+) -> PyResult<[Py<PyAny>; N]> {
+    let class = module.getattr(name)?;
+    let mut members: Vec<Py<PyAny>> = Vec::with_capacity(N);
+    for value in values {
+        members.push(class.call1((value,))?.unbind());
+    }
+    Ok(members
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("member count matches the declared array")))
+}
+
+impl NativeRequestTypes {
+    fn build(py: Python<'_>) -> PyResult<Self> {
+        let module = py.import("uniserve_worker.batch")?;
+        let class = |name: &str| -> PyResult<Py<PyAny>> { Ok(module.getattr(name)?.unbind()) };
+        let work = module.getattr("Work")?;
+        let work_variant = |kind: &str, mode: Option<&str>| -> PyResult<Py<PyAny>> {
+            Ok(work.call1((kind, mode))?.unbind())
+        };
+        Ok(Self {
+            operation: class("Operation")?,
+            request_key: class("RequestKey")?,
+            version_ref: class("VersionRef")?,
+            fixed_point: class("FixedPoint")?,
+            device_point: class("DevicePoint")?,
+            product_ref: class("ProductRef")?,
+            shape_bound: class("ShapeBound")?,
+            static_dim: class("StaticDim")?,
+            device_dim: class("DeviceDim")?,
+            point_range: class("PointRange")?,
+            bounds: class("Bounds")?,
+            rng: class("Rng")?,
+            kv_placement: class("KvPlacement")?,
+            commit: class("Commit")?,
+            close: class("Close")?,
+            release: class("Release")?,
+            native_partition: class("native_partition")?,
+            native_batch: class("native_batch")?,
+            domains: enum_members(&module, "Domain", ["prefill", "decode", "flow"])?,
+            product_kinds: enum_members(
+                &module,
+                "ProductKind",
+                [
+                    "token",
+                    "logprob",
+                    "draft",
+                    "vision_feature",
+                    "latent_feature",
+                    "kv",
+                    "latent",
+                    "artifact",
+                    "completion",
+                    "sampling_state",
+                    "finish",
+                    "selected_point",
+                    "accepted_span",
+                    "continuation",
+                ],
+            )?,
+            storage_classes: enum_members(
+                &module,
+                "StorageClass",
+                [
+                    "device_tensor",
+                    "paged_kv",
+                    "latent_arena",
+                    "host_staging",
+                    "completion_arena",
+                ],
+            )?,
+            dtypes: enum_members(
+                &module,
+                "DType",
+                ["u8", "u16", "u32", "i32", "i64", "f16", "bf16", "f32"],
+            )?,
+            dispositions: enum_members(&module, "Disposition", ["publish", "retain", "discard"])?,
+            close_reasons: enum_members(
+                &module,
+                "CloseReason",
+                ["completed", "cancelled", "error", "preempted"],
+            )?,
+            draw_layouts: enum_members(
+                &module,
+                "DrawLayout",
+                ["target_sampling", "speculative_proposal", "flow_noise"],
+            )?,
+            execution_capabilities: enum_members(
+                &module,
+                "ExecutionCapability",
+                ["domain_homogeneous", "tensorized_mixed"],
+            )?,
+            attention_regimes: enum_members(
+                &module,
+                "AttentionRegime",
+                ["none", "causal", "bidirectional", "hybrid"],
+            )?,
+            works: [
+                work_variant("token", Some("extend"))?,
+                work_variant("token", Some("decode"))?,
+                work_variant("token", Some("verify"))?,
+                work_variant("draft", None)?,
+                work_variant("encode", Some("vision"))?,
+                work_variant("encode", Some("latent"))?,
+                work_variant("transfer", Some("product"))?,
+                work_variant("transfer", Some("kv_publish"))?,
+                work_variant("transfer", Some("kv_install"))?,
+                work_variant("gen", Some("transition"))?,
+                work_variant("gen", Some("flow"))?,
+                work_variant("materialize", None)?,
+            ],
+        })
+    }
+
+    fn get(py: Python<'_>) -> PyResult<&'static Self> {
+        if let Some(types) = NATIVE_REQUEST_TYPES.get() {
+            return Ok(types);
+        }
+        let built = Self::build(py)?;
+        Ok(NATIVE_REQUEST_TYPES.get_or_init(|| built))
+    }
+
+    fn domain<'py>(&self, py: Python<'py>, domain: Domain) -> Bound<'py, PyAny> {
+        let index = match domain {
+            Domain::Prefill => 0,
+            Domain::Decode => 1,
+            Domain::Flow => 2,
+        };
+        self.domains[index].bind(py).clone()
+    }
+
+    fn work<'py>(&self, py: Python<'py>, work: Work) -> Bound<'py, PyAny> {
+        let index = match work {
+            Work::Token(TokenMode::Extend) => 0,
+            Work::Token(TokenMode::Decode) => 1,
+            Work::Token(TokenMode::Verify) => 2,
+            Work::Draft => 3,
+            Work::Encode(EncodeMode::Vision) => 4,
+            Work::Encode(EncodeMode::Latent) => 5,
+            Work::Transfer(TransferMode::Product) => 6,
+            Work::Transfer(TransferMode::KvPublish) => 7,
+            Work::Transfer(TransferMode::KvInstall) => 8,
+            Work::Gen(GenMode::Transition) => 9,
+            Work::Gen(GenMode::Flow) => 10,
+            Work::Materialize => 11,
+        };
+        self.works[index].bind(py).clone()
+    }
+
+    fn product_kind<'py>(&self, py: Python<'py>, kind: ProductKind) -> Bound<'py, PyAny> {
+        let index = match kind {
+            ProductKind::Token => 0,
+            ProductKind::Logprob => 1,
+            ProductKind::Draft => 2,
+            ProductKind::VisionFeature => 3,
+            ProductKind::LatentFeature => 4,
+            ProductKind::Kv => 5,
+            ProductKind::Latent => 6,
+            ProductKind::Artifact => 7,
+            ProductKind::Completion => 8,
+            ProductKind::SamplingState => 9,
+            ProductKind::Finish => 10,
+            ProductKind::SelectedPoint => 11,
+            ProductKind::AcceptedSpan => 12,
+            ProductKind::Continuation => 13,
+        };
+        self.product_kinds[index].bind(py).clone()
+    }
+
+    fn storage_class<'py>(&self, py: Python<'py>, class: StorageClass) -> Bound<'py, PyAny> {
+        let index = match class {
+            StorageClass::DeviceTensor => 0,
+            StorageClass::PagedKv => 1,
+            StorageClass::LatentArena => 2,
+            StorageClass::HostStaging => 3,
+            StorageClass::CompletionArena => 4,
+        };
+        self.storage_classes[index].bind(py).clone()
+    }
+
+    fn dtype<'py>(&self, py: Python<'py>, dtype: DType) -> Bound<'py, PyAny> {
+        let index = match dtype {
+            DType::U8 => 0,
+            DType::U16 => 1,
+            DType::U32 => 2,
+            DType::I32 => 3,
+            DType::I64 => 4,
+            DType::F16 => 5,
+            DType::BF16 => 6,
+            DType::F32 => 7,
+        };
+        self.dtypes[index].bind(py).clone()
+    }
+}
+
+/// Per-batch construction context: typed leaves shared across the batch's
+/// records are built once and reused by identity.
+struct NativeRequestConversion<'py> {
     py: Python<'py>,
-    partition: &BatchPartition,
-    context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "partition_id"), partition.partition_id)?;
-    dict.set_item(intern!(py, "submission_group"), partition.submission_group)?;
-    dict.set_item(intern!(py, "collective_seq"), partition.collective_seq)?;
-    dict.set_item(intern!(py, "domain"), domain_py(py, partition.domain))?;
-    dict.set_item(intern!(py, "route"), partition.route.0)?;
-    dict.set_item(
-        intern!(py, "execution"),
-        execution_capability_py(py, partition.execution),
-    )?;
-    dict.set_item(
-        intern!(py, "attention"),
-        attention_regime_py(py, partition.attention),
-    )?;
-    dict.set_item(intern!(py, "shape_class"), partition.shape_class)?;
-    dict.set_item(
-        intern!(py, "operations"),
-        dict_list(py, &partition.operations, |operation| {
-            operation_to_py(py, operation, context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "request_pool_indices"),
-        u32_list(py, &partition.request_pool_indices)?,
-    )?;
-    dict.set_item(
-        intern!(py, "kv_placements"),
-        dict_list(py, &partition.kv_placements, |placement| {
-            kv_placement_to_py(py, placement, context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "kv_branch_placements"),
-        dict_list(py, &partition.kv_branch_placements, |placement| {
-            kv_branch_placement_to_py(py, placement, context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "latent_placements"),
-        dict_list(py, &partition.latent_placements, |placement| {
-            latent_placement_to_py(py, placement, context)
-        })?,
-    )?;
-    Ok(dict)
+    types: &'static NativeRequestTypes,
+    request_keys: HashMap<RequestKey, Py<PyAny>>,
+    shape_bounds: HashMap<ShapeBound, Py<PyAny>>,
+    point_ranges: HashMap<PointRange, Py<PyAny>>,
+}
+
+impl<'py> NativeRequestConversion<'py> {
+    fn new(py: Python<'py>) -> PyResult<Self> {
+        Ok(Self {
+            py,
+            types: NativeRequestTypes::get(py)?,
+            request_keys: HashMap::new(),
+            shape_bounds: HashMap::new(),
+            point_ranges: HashMap::new(),
+        })
+    }
+
+    fn request_key(&mut self, key: RequestKey) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(value) = self.request_keys.get(&key) {
+            return Ok(value.bind(self.py).clone());
+        }
+        let value = self.types.request_key.bind(self.py).call1((
+            key.authority_id,
+            key.session_id.0,
+            key.epoch,
+        ))?;
+        self.request_keys.insert(key, value.clone().unbind());
+        Ok(value)
+    }
+
+    fn shape_bound(&mut self, shape: &ShapeBound) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(value) = self.shape_bounds.get(shape) {
+            return Ok(value.bind(self.py).clone());
+        }
+        let dims = shape
+            .dims
+            .iter()
+            .map(|dim| match dim {
+                DimBound::Static(extent) => self.types.static_dim.bind(self.py).call1((*extent,)),
+                DimBound::Device { max } => self.types.device_dim.bind(self.py).call1((*max,)),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let value = self
+            .types
+            .shape_bound
+            .bind(self.py)
+            .call1((pyo3::types::PyTuple::new(self.py, dims)?,))?;
+        self.shape_bounds
+            .insert(shape.clone(), value.clone().unbind());
+        Ok(value)
+    }
+
+    fn point_range(&mut self, range: PointRange) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(value) = self.point_ranges.get(&range) {
+            return Ok(value.bind(self.py).clone());
+        }
+        let value = self
+            .types
+            .point_range
+            .bind(self.py)
+            .call1((range.base_point, range.max_points))?;
+        self.point_ranges.insert(range, value.clone().unbind());
+        Ok(value)
+    }
+
+    fn product_ref(&mut self, product: &ProductRef) -> PyResult<Bound<'py, PyAny>> {
+        let request_key = self.request_key(product.request_key)?;
+        let shape_bound = self.shape_bound(&product.shape_bound)?;
+        let point_range = self.point_range(product.point_range)?;
+        self.types.product_ref.bind(self.py).call1((
+            request_key,
+            product.producer_op_id.0,
+            product.output_index,
+            product.generation,
+            self.types.product_kind(self.py, product.kind),
+            self.types.storage_class(self.py, product.storage_class),
+            self.types.dtype(self.py, product.dtype),
+            shape_bound,
+            point_range,
+        ))
+    }
+
+    fn version_ref(&mut self, version: &VersionRef) -> PyResult<Bound<'py, PyAny>> {
+        let point = match &version.point {
+            Point::Fixed {
+                point_index,
+                semantic_digest,
+            } => self
+                .types
+                .fixed_point
+                .bind(self.py)
+                .call1((*point_index, semantic_digest.as_str()))?,
+            Point::Device {
+                point_index,
+                selected_point,
+                producer_plan_digest,
+            } => {
+                let selected = selected_point
+                    .as_ref()
+                    .map(|selected| self.product_ref(selected))
+                    .transpose()?;
+                self.types.device_point.bind(self.py).call1((
+                    *point_index,
+                    selected,
+                    producer_plan_digest.as_str(),
+                ))?
+            }
+        };
+        let request_key = self.request_key(version.request_key)?;
+        self.types
+            .version_ref
+            .bind(self.py)
+            .call1((request_key, version.producer_op_id.0, point))
+    }
+
+    fn operation(&mut self, operation: &Operation) -> PyResult<Bound<'py, PyAny>> {
+        let request_key = self.request_key(operation.request_key)?;
+        let parent = self.version_ref(&operation.parent)?;
+        let bounds = self.types.bounds.bind(self.py).call1((
+            operation.bounds.max_points,
+            operation.bounds.max_tokens,
+            operation.bounds.max_kv_pages,
+            operation.bounds.max_latent_bytes,
+            operation.bounds.max_completion_bytes,
+            operation.bounds.max_transfer_bytes,
+        ))?;
+        let inputs = operation
+            .inputs
+            .iter()
+            .map(|product| self.product_ref(product))
+            .collect::<PyResult<Vec<_>>>()?;
+        let outputs = operation
+            .outputs
+            .iter()
+            .map(|product| self.product_ref(product))
+            .collect::<PyResult<Vec<_>>>()?;
+        let predicate = operation
+            .predicate
+            .as_ref()
+            .map(|predicate| self.product_ref(predicate))
+            .transpose()?;
+        let rng = operation
+            .rng
+            .as_ref()
+            .map(|rng| {
+                let layout = match rng.draw_layout {
+                    DrawLayout::TargetSampling => 0,
+                    DrawLayout::SpeculativeProposal => 1,
+                    DrawLayout::FlowNoise => 2,
+                };
+                self.types.rng.bind(self.py).call1((
+                    rng.seed,
+                    rng.semantic_index_base,
+                    self.types.draw_layouts[layout].bind(self.py).clone(),
+                ))
+            })
+            .transpose()?;
+        let py = self.py;
+        let arguments = pyo3::types::PyTuple::new(
+            py,
+            [
+                request_key.into_any(),
+                operation.op_id.0.into_pyobject(py)?.into_any(),
+                parent.into_any(),
+                self.types.work(py, operation.work),
+                operation.route.0.into_pyobject(py)?.into_any(),
+                self.types.domain(py, operation.domain),
+                PyBool::new(py, operation.advances_state)
+                    .to_owned()
+                    .into_any(),
+                bounds.into_any(),
+                pyo3::types::PyTuple::new(py, inputs)?.into_any(),
+                pyo3::types::PyTuple::new(py, outputs)?.into_any(),
+                operation.kv_capacity_pages.into_pyobject(py)?.into_any(),
+                predicate
+                    .map(Bound::into_any)
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+                rng.map(Bound::into_any)
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+                operation.control_seq.into_pyobject(py)?.into_any(),
+                operation.plan_digest.as_str().into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        self.types.operation.bind(py).call1(arguments)
+    }
+
+    fn kv_placement(&mut self, placement: &KvPlacement) -> PyResult<Bound<'py, PyAny>> {
+        let request_key = self.request_key(placement.request_key)?;
+        self.types.kv_placement.bind(self.py).call1((
+            request_key,
+            placement.op_id.0,
+            placement.group_id,
+            pyo3::types::PyTuple::new(self.py, placement.block_table.iter().map(|block| block.0))?,
+            placement.block_table_update,
+            pyo3::types::PyTuple::new(
+                self.py,
+                placement.pages_to_zero.iter().map(|block| block.0),
+            )?,
+            placement.prefix_length,
+            placement.input_length,
+            placement.visible_length,
+            placement.resulting_length,
+        ))
+    }
+
+    fn control(&mut self, control: &Control) -> PyResult<Bound<'py, PyAny>> {
+        match control {
+            Control::Commit {
+                request_key,
+                control_seq,
+                expected_parent,
+                selected,
+                public_event_limit,
+                disposition,
+            } => {
+                let request_key = self.request_key(*request_key)?;
+                let expected_parent = self.version_ref(expected_parent)?;
+                let selected = self.version_ref(selected)?;
+                let disposition = match disposition {
+                    Disposition::Publish => 0,
+                    Disposition::Retain => 1,
+                    Disposition::Discard => 2,
+                };
+                self.types.commit.bind(self.py).call1((
+                    request_key,
+                    *control_seq,
+                    expected_parent,
+                    selected,
+                    *public_event_limit,
+                    self.types.dispositions[disposition].bind(self.py).clone(),
+                    control.content_digest().as_str(),
+                ))
+            }
+            Control::Close {
+                request_key,
+                control_seq,
+                cutoff,
+                reason,
+            } => {
+                let request_key = self.request_key(*request_key)?;
+                let cutoff = self.version_ref(cutoff)?;
+                let reason = match reason {
+                    CloseReason::Completed => 0,
+                    CloseReason::Cancelled => 1,
+                    CloseReason::Error => 2,
+                    CloseReason::Preempted => 3,
+                };
+                self.types.close.bind(self.py).call1((
+                    request_key,
+                    *control_seq,
+                    cutoff,
+                    self.types.close_reasons[reason].bind(self.py).clone(),
+                    control.content_digest().as_str(),
+                ))
+            }
+            Control::Release { request_key, op_id } => {
+                let request_key = self.request_key(*request_key)?;
+                self.types.release.bind(self.py).call1((
+                    request_key,
+                    op_id.0,
+                    control.content_digest().as_str(),
+                ))
+            }
+        }
+    }
+
+    fn partition(
+        &mut self,
+        partition: &BatchPartition,
+        context: &mut RequestConversion<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let operations = partition
+            .operations
+            .iter()
+            .map(|operation| self.operation(operation))
+            .collect::<PyResult<Vec<_>>>()?;
+        let kv_placements = partition
+            .kv_placements
+            .iter()
+            .map(|placement| self.kv_placement(placement))
+            .collect::<PyResult<Vec<_>>>()?;
+        let execution = match partition.execution {
+            ExecutionCapability::DomainHomogeneous => 0,
+            ExecutionCapability::TensorizedMixed => 1,
+        };
+        let attention = match partition.attention {
+            AttentionRegime::None => 0,
+            AttentionRegime::Causal => 1,
+            AttentionRegime::Bidirectional => 2,
+            AttentionRegime::Hybrid => 3,
+        };
+        let py = self.py;
+        let arguments = pyo3::types::PyTuple::new(
+            py,
+            [
+                partition.partition_id.into_pyobject(py)?.into_any(),
+                partition.submission_group.into_pyobject(py)?.into_any(),
+                partition.collective_seq.into_pyobject(py)?.into_any(),
+                self.types.domain(py, partition.domain),
+                partition.route.0.into_pyobject(py)?.into_any(),
+                self.types.execution_capabilities[execution]
+                    .bind(py)
+                    .clone(),
+                self.types.attention_regimes[attention].bind(py).clone(),
+                partition.shape_class.into_pyobject(py)?.into_any(),
+                pyo3::types::PyTuple::new(py, operations)?.into_any(),
+                pyo3::types::PyTuple::new(py, partition.request_pool_indices.iter().copied())?
+                    .into_any(),
+                pyo3::types::PyTuple::new(py, kv_placements)?.into_any(),
+                dict_list(py, &partition.kv_branch_placements, |placement| {
+                    kv_branch_placement_to_py(py, placement, context)
+                })?
+                .into_any(),
+                dict_list(py, &partition.latent_placements, |placement| {
+                    latent_placement_to_py(py, placement, context)
+                })?
+                .into_any(),
+            ],
+        )?;
+        self.types.native_partition.bind(py).call1(arguments)
+    }
+}
+
+fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny>> {
+    let mut context = RequestConversion::new(py);
+    let mut native = NativeRequestConversion::new(py)?;
+    let partitions = batch
+        .partitions
+        .iter()
+        .map(|partition| native.partition(partition, &mut context))
+        .collect::<PyResult<Vec<_>>>()?;
+    let controls = batch
+        .controls
+        .iter()
+        .map(|control| native.control(control))
+        .collect::<PyResult<Vec<_>>>()?;
+    let admissions = dict_list(py, &batch.admissions, |admission| {
+        admission_to_py(py, admission, &mut context)
+    })?;
+    let input_products = dict_list(py, &batch.input_products, |payload| {
+        product_payload_to_py(py, payload, &mut context)
+    })?;
+    native.types.native_batch.bind(py).call1((
+        batch.step_id,
+        admissions,
+        pyo3::types::PyTuple::new(py, partitions)?,
+        pyo3::types::PyTuple::new(py, controls)?,
+        input_products,
+    ))
 }
 
 fn kv_branch_placement_to_py<'py>(
@@ -188,37 +704,6 @@ fn kv_branch_placement_to_py<'py>(
         intern!(py, "pages_to_zero"),
         PyList::new(py, placement.pages_to_zero.iter().map(|block| block.0))?,
     )?;
-    Ok(dict)
-}
-
-fn kv_placement_to_py<'py>(
-    py: Python<'py>,
-    placement: &KvPlacement,
-    context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "request_key"),
-        context.request_key(placement.request_key)?,
-    )?;
-    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
-    dict.set_item(intern!(py, "group_id"), placement.group_id)?;
-    dict.set_item(
-        intern!(py, "block_table"),
-        PyList::new(py, placement.block_table.iter().map(|block| block.0))?,
-    )?;
-    dict.set_item(
-        intern!(py, "block_table_update"),
-        placement.block_table_update,
-    )?;
-    dict.set_item(
-        intern!(py, "pages_to_zero"),
-        PyList::new(py, placement.pages_to_zero.iter().map(|block| block.0))?,
-    )?;
-    dict.set_item(intern!(py, "prefix_length"), placement.prefix_length)?;
-    dict.set_item(intern!(py, "input_length"), placement.input_length)?;
-    dict.set_item(intern!(py, "visible_length"), placement.visible_length)?;
-    dict.set_item(intern!(py, "resulting_length"), placement.resulting_length)?;
     Ok(dict)
 }
 
@@ -462,63 +947,6 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     Ok(dict)
 }
 
-fn operation_to_py<'py>(
-    py: Python<'py>,
-    operation: &Operation,
-    context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "request_key"),
-        context.request_key(operation.request_key)?,
-    )?;
-    dict.set_item(intern!(py, "op_id"), operation.op_id.0)?;
-    dict.set_item(
-        intern!(py, "parent"),
-        version_ref_to_py(py, &operation.parent, context)?,
-    )?;
-    dict.set_item(intern!(py, "work"), work_to_py(py, operation.work)?)?;
-    dict.set_item(intern!(py, "route"), operation.route.0)?;
-    dict.set_item(intern!(py, "domain"), domain_py(py, operation.domain))?;
-    dict.set_item(intern!(py, "advances_state"), operation.advances_state)?;
-    dict.set_item(intern!(py, "bounds"), bounds_to_py(py, &operation.bounds)?)?;
-    dict.set_item(
-        intern!(py, "inputs"),
-        dict_list(py, &operation.inputs, |product| {
-            product_ref_to_py(py, product, context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "outputs"),
-        dict_list(py, &operation.outputs, |product| {
-            product_ref_to_py(py, product, context)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "kv_capacity_pages"),
-        operation.kv_capacity_pages,
-    )?;
-    dict.set_item(
-        intern!(py, "predicate"),
-        operation
-            .predicate
-            .as_ref()
-            .map(|predicate| product_ref_to_py(py, predicate, context))
-            .transpose()?,
-    )?;
-    dict.set_item(
-        intern!(py, "rng"),
-        operation
-            .rng
-            .as_ref()
-            .map(|rng| rng_to_py(py, rng))
-            .transpose()?,
-    )?;
-    dict.set_item(intern!(py, "control_seq"), operation.control_seq)?;
-    dict.set_item(intern!(py, "plan_digest"), operation.plan_digest.as_str())?;
-    Ok(dict)
-}
-
 fn version_ref_to_py<'py>(
     py: Python<'py>,
     version: &VersionRef,
@@ -631,151 +1059,6 @@ fn point_range_to_py<'py>(py: Python<'py>, range: PointRange) -> PyResult<Bound<
     Ok(dict)
 }
 
-fn bounds_to_py<'py>(py: Python<'py>, bounds: &Bounds) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "max_points"), bounds.max_points)?;
-    dict.set_item(intern!(py, "max_tokens"), bounds.max_tokens)?;
-    dict.set_item(intern!(py, "max_kv_pages"), bounds.max_kv_pages)?;
-    dict.set_item(intern!(py, "max_latent_bytes"), bounds.max_latent_bytes)?;
-    dict.set_item(
-        intern!(py, "max_completion_bytes"),
-        bounds.max_completion_bytes,
-    )?;
-    dict.set_item(intern!(py, "max_transfer_bytes"), bounds.max_transfer_bytes)?;
-    Ok(dict)
-}
-
-fn rng_to_py<'py>(py: Python<'py>, rng: &Rng) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "seed"), rng.seed)?;
-    dict.set_item(intern!(py, "semantic_index_base"), rng.semantic_index_base)?;
-    dict.set_item(
-        intern!(py, "draw_layout"),
-        draw_layout_py(py, rng.draw_layout),
-    )?;
-    Ok(dict)
-}
-
-fn work_to_py<'py>(py: Python<'py>, work: Work) -> PyResult<Bound<'py, PyDict>> {
-    // Adjacently tagged serde enums emit only the tag for unit variants; the
-    // `value` key is present exactly when the variant carries content.
-    let dict = PyDict::new(py);
-    match work {
-        Work::Token(mode) => {
-            dict.set_item(intern!(py, "kind"), intern!(py, "token"))?;
-            let value = match mode {
-                TokenMode::Extend => intern!(py, "extend"),
-                TokenMode::Decode => intern!(py, "decode"),
-                TokenMode::Verify => intern!(py, "verify"),
-            };
-            dict.set_item(intern!(py, "value"), value)?;
-        }
-        Work::Draft => dict.set_item(intern!(py, "kind"), intern!(py, "draft"))?,
-        Work::Encode(mode) => {
-            dict.set_item(intern!(py, "kind"), intern!(py, "encode"))?;
-            let value = match mode {
-                EncodeMode::Vision => intern!(py, "vision"),
-                EncodeMode::Latent => intern!(py, "latent"),
-            };
-            dict.set_item(intern!(py, "value"), value)?;
-        }
-        Work::Transfer(mode) => {
-            dict.set_item(intern!(py, "kind"), intern!(py, "transfer"))?;
-            let value = match mode {
-                TransferMode::Product => intern!(py, "product"),
-                TransferMode::KvPublish => intern!(py, "kv_publish"),
-                TransferMode::KvInstall => intern!(py, "kv_install"),
-            };
-            dict.set_item(intern!(py, "value"), value)?;
-        }
-        Work::Gen(mode) => {
-            dict.set_item(intern!(py, "kind"), intern!(py, "gen"))?;
-            let value = match mode {
-                GenMode::Transition => intern!(py, "transition"),
-                GenMode::Flow => intern!(py, "flow"),
-            };
-            dict.set_item(intern!(py, "value"), value)?;
-        }
-        Work::Materialize => dict.set_item(intern!(py, "kind"), intern!(py, "materialize"))?,
-    }
-    Ok(dict)
-}
-
-fn control_to_py<'py>(
-    py: Python<'py>,
-    control: &Control,
-    context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    let value = PyDict::new(py);
-    match control {
-        Control::Commit {
-            request_key,
-            control_seq,
-            expected_parent,
-            selected,
-            public_event_limit,
-            disposition,
-        } => {
-            dict.set_item(intern!(py, "kind"), intern!(py, "commit"))?;
-            value.set_item(
-                intern!(py, "request_key"),
-                context.request_key(*request_key)?,
-            )?;
-            value.set_item(intern!(py, "control_seq"), *control_seq)?;
-            value.set_item(
-                intern!(py, "expected_parent"),
-                version_ref_to_py(py, expected_parent, context)?,
-            )?;
-            value.set_item(
-                intern!(py, "selected"),
-                version_ref_to_py(py, selected, context)?,
-            )?;
-            value.set_item(intern!(py, "public_event_limit"), *public_event_limit)?;
-            let disposition = match disposition {
-                Disposition::Publish => intern!(py, "publish"),
-                Disposition::Retain => intern!(py, "retain"),
-                Disposition::Discard => intern!(py, "discard"),
-            };
-            value.set_item(intern!(py, "disposition"), disposition)?;
-        }
-        Control::Close {
-            request_key,
-            control_seq,
-            cutoff,
-            reason,
-        } => {
-            dict.set_item(intern!(py, "kind"), intern!(py, "close"))?;
-            value.set_item(
-                intern!(py, "request_key"),
-                context.request_key(*request_key)?,
-            )?;
-            value.set_item(intern!(py, "control_seq"), *control_seq)?;
-            value.set_item(
-                intern!(py, "cutoff"),
-                version_ref_to_py(py, cutoff, context)?,
-            )?;
-            let reason = match reason {
-                CloseReason::Completed => intern!(py, "completed"),
-                CloseReason::Cancelled => intern!(py, "cancelled"),
-                CloseReason::Error => intern!(py, "error"),
-                CloseReason::Preempted => intern!(py, "preempted"),
-            };
-            value.set_item(intern!(py, "reason"), reason)?;
-        }
-        Control::Release { request_key, op_id } => {
-            dict.set_item(intern!(py, "kind"), intern!(py, "release"))?;
-            value.set_item(
-                intern!(py, "request_key"),
-                context.request_key(*request_key)?,
-            )?;
-            value.set_item(intern!(py, "op_id"), op_id.0)?;
-        }
-    }
-    dict.set_item(intern!(py, "value"), value)?;
-    Ok(dict)
-}
-
 fn product_payload_to_py<'py>(
     py: Python<'py>,
     payload: &ProductPayload,
@@ -871,33 +1154,6 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
     }
 }
 
-fn domain_py<'py>(py: Python<'py>, domain: Domain) -> &'py Bound<'py, PyString> {
-    match domain {
-        Domain::Prefill => intern!(py, "prefill"),
-        Domain::Decode => intern!(py, "decode"),
-        Domain::Flow => intern!(py, "flow"),
-    }
-}
-
-fn execution_capability_py<'py>(
-    py: Python<'py>,
-    capability: ExecutionCapability,
-) -> &'py Bound<'py, PyString> {
-    match capability {
-        ExecutionCapability::DomainHomogeneous => intern!(py, "domain_homogeneous"),
-        ExecutionCapability::TensorizedMixed => intern!(py, "tensorized_mixed"),
-    }
-}
-
-fn attention_regime_py<'py>(py: Python<'py>, regime: AttentionRegime) -> &'py Bound<'py, PyString> {
-    match regime {
-        AttentionRegime::None => intern!(py, "none"),
-        AttentionRegime::Causal => intern!(py, "causal"),
-        AttentionRegime::Bidirectional => intern!(py, "bidirectional"),
-        AttentionRegime::Hybrid => intern!(py, "hybrid"),
-    }
-}
-
 fn product_kind_py<'py>(py: Python<'py>, kind: ProductKind) -> &'py Bound<'py, PyString> {
     match kind {
         ProductKind::Token => intern!(py, "token"),
@@ -940,22 +1196,6 @@ fn dtype_py<'py>(py: Python<'py>, dtype: DType) -> &'py Bound<'py, PyString> {
     }
 }
 
-fn draw_layout_py<'py>(py: Python<'py>, layout: DrawLayout) -> &'py Bound<'py, PyString> {
-    match layout {
-        DrawLayout::TargetSampling => intern!(py, "target_sampling"),
-        DrawLayout::SpeculativeProposal => intern!(py, "speculative_proposal"),
-        DrawLayout::FlowNoise => intern!(py, "flow_noise"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Python -> Response (respond hot path)
-// ---------------------------------------------------------------------------
-
-/// Extract a `result` [`WorkerResponse`] from the dict shape the Python worker
-/// emits (`app.py::_response` + `CompletionReport.to_wire`). Returns `None` for
-/// every other response kind or mapping shape so the caller can invoke its
-/// schema-derived decoder.
 pub(crate) fn try_completion_response_from_py(
     response: &Bound<'_, PyAny>,
 ) -> Option<WorkerResponse> {
@@ -1603,23 +1843,35 @@ mod tests {
                 .unwrap();
             let native_request = server.recv(py).unwrap();
             let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
-            let wire_batch = request_dict.get_item("batch").unwrap().unwrap();
-            let decoded = py
-                .import("uniserve_worker.batch")
-                .unwrap()
-                .getattr("Batch")
-                .unwrap()
-                .call_method1("from_wire", (wire_batch,))
-                .unwrap();
+            let native_batch = request_dict.get_item("batch").unwrap().unwrap();
             assert_eq!(
-                decoded
+                native_batch
                     .getattr("step_id")
                     .unwrap()
                     .extract::<u64>()
                     .unwrap(),
                 11
             );
-            assert_eq!(decoded.getattr("operations").unwrap().len().unwrap(), 1);
+            assert_eq!(
+                native_batch.getattr("operations").unwrap().len().unwrap(),
+                1
+            );
+            // The natively constructed batch must be exactly what the
+            // canonical codec decodes from its own wire form.
+            let round_tripped = py
+                .import("uniserve_worker.batch")
+                .unwrap()
+                .getattr("Batch")
+                .unwrap()
+                .call_method1(
+                    "from_wire",
+                    (native_batch.call_method0("to_wire").unwrap(),),
+                )
+                .unwrap();
+            assert!(
+                round_tripped.eq(&native_batch).unwrap(),
+                "native batch construction diverged from the canonical codec"
+            );
 
             let response = pythonize(py, &expected).unwrap();
             server.respond(py, &response).unwrap();

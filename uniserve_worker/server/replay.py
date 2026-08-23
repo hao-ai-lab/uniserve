@@ -15,7 +15,12 @@ from ..batch import (
     PartitionCompletion,
 )
 from ..foundation.errors import invalid_descriptor, resource_error
-from .completion import finalize_completion_report, partition_completion_ready
+from .completion import (
+    _completion_payload_ready,
+    _record_ready,
+    finalize_completion_report,
+    partition_completion_ready,
+)
 
 _OperationKey = tuple[int, int, int]
 
@@ -128,12 +133,17 @@ def _materialize_partition(step_id: int, partition: PartitionCompletion) -> Part
     )
     if len(finalized.partitions) != 1:
         raise RuntimeError("completion materialization changed partition cardinality")
-    # The protocol decoder is the canonical host-data boundary. Deferred values,
-    # device objects, events, leases, and callbacks cannot cross this conversion.
-    host = CompletionReport.from_wire(finalized.to_wire())
-    if len(host.partitions) != 1:
-        raise RuntimeError("host completion conversion changed partition cardinality")
-    materialized = host.partitions[0]
+    materialized = finalized.partitions[0]
+    # This is the canonical host-data boundary: deferred values, device
+    # objects, events, leases, and callbacks must not cross it.
+    if any(type(record.semantic_digest) is not str for record in materialized.completions):
+        raise RuntimeError("materialized completion carries an unresolved semantic digest")
+    if any(
+        type(value) is not int
+        for record in materialized.completions
+        for value in record.committed_tokens
+    ):
+        raise RuntimeError("materialized completion carries an unresolved committed token")
     if any(type(product.payload) is not bytes for product in materialized.products):
         raise RuntimeError("materialized completion contains a non-byte product payload")
     return materialized
@@ -175,6 +185,7 @@ class _InFlightSubmission:
         "_source",
         "_raw_report",
         "_materialized",
+        "_ready_cursor",
         "_completed",
         "_failure",
         "_lock",
@@ -201,6 +212,7 @@ class _InFlightSubmission:
         self._source: object | None = None
         self._raw_report: CompletionReport | None = None
         self._materialized: dict[int, PartitionCompletion] = {}
+        self._ready_cursor: dict[int, tuple[int, int]] = {}
         self._completed: _CompletedSubmission | None = None
         self._failure: BaseException | None = None
         self._lock = RLock()
@@ -296,7 +308,7 @@ class _InFlightSubmission:
                     partition_id = int(partition.partition_id)
                     if partition_id in self._materialized:
                         continue
-                    if partition_completion_ready(partition):
+                    if self._partition_ready_locked(partition_id, partition):
                         self._materialized[partition_id] = _materialize_partition(
                             self.identity.step_id,
                             partition,
@@ -323,6 +335,30 @@ class _InFlightSubmission:
             except BaseException as error:
                 self._record_advance_failure_locked(error)
                 raise
+
+    def _partition_ready_locked(
+        self,
+        partition_id: int,
+        partition: PartitionCompletion,
+    ) -> bool:
+        """Resume the readiness scan where the previous poll stopped.
+
+        Record and product readiness are monotonic — a resolved digest stays
+        resolved and a fired completion event stays fired — so entries that
+        already reported ready are never re-checked on later polls.
+        """
+
+        record_cursor, product_cursor = self._ready_cursor.get(partition_id, (0, 0))
+        completions = partition.completions
+        while record_cursor < len(completions) and _record_ready(completions[record_cursor]):
+            record_cursor += 1
+        products = partition.products
+        while product_cursor < len(products) and _completion_payload_ready(
+            products[product_cursor].payload
+        ):
+            product_cursor += 1
+        self._ready_cursor[partition_id] = (record_cursor, product_cursor)
+        return record_cursor == len(completions) and product_cursor == len(products)
 
     def materialized_partitions(self) -> tuple[PartitionCompletion, ...]:
         with self._lock:
@@ -645,6 +681,8 @@ class ReplayCoordinator:
             self._retain_referenced_ended_epochs()
 
     def _retain_referenced_ended_epochs(self) -> None:
+        if not self._ended_epochs:
+            return
         referenced = {
             (key[0], key[1])
             for submission in self._completed_submissions.values()

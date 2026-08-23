@@ -306,46 +306,17 @@ impl PyServer {
 }
 
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
-    // Execute batches use the typed converter. The decoded Rust batch has passed
-    // `Batch::validate`, so a process-local token carries that validation result
-    // into the Python decoder without hashing every operation again.
+    // Execute batches use the typed converter, which constructs the worker's
+    // protocol objects directly: the decoded Rust batch has already passed
+    // `Batch::validate`, and control content digests are carried across so the
+    // worker never re-derives them.
     if request.kind == RequestKind::Execute {
         let object = convert::execute_request_to_py(py, request)?;
-        mark_validated_batch(py, &object, request.batch.as_ref())?;
         return Ok(object.into_any().unbind());
     }
     let object = pythonize(py, request)
         .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
     Ok(object.unbind())
-}
-
-fn mark_validated_batch(
-    py: Python<'_>,
-    request: &Bound<'_, PyDict>,
-    validated: Option<&Batch>,
-) -> PyResult<()> {
-    if let Some(batch) = request.get_item("batch")? {
-        let batch = batch.cast::<PyDict>()?;
-        let module = py.import("uniserve_worker.batch")?;
-        batch.set_item(
-            module.getattr("_WIRE_VALIDATION_KEY")?,
-            module.getattr("_WIRE_VALIDATION_TOKEN")?,
-        )?;
-        if let Some(validated) = validated {
-            let controls = batch
-                .get_item("controls")?
-                .ok_or_else(|| py_runtime("validated batch has no controls"))?;
-            let controls = controls.cast::<PyList>()?;
-            if controls.len() != validated.controls.len() {
-                return Err(py_runtime("validated batch controls are not aligned"));
-            }
-            for (wire, control) in controls.iter().zip(&validated.controls) {
-                wire.cast::<PyDict>()?
-                    .set_item("_content_digest", control.content_digest())?;
-            }
-        }
-    }
-    Ok(())
 }
 
 impl PyServer {

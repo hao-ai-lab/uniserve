@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
@@ -97,9 +98,20 @@ class WorkerServeLoop:
         self.worker_server = worker_server
         self.ipc_endpoint = ipc_endpoint
         self.inflight: deque[dict[str, Any]] = deque()
-        self.waiting: deque[tuple[dict[str, Any], frozenset[int]]] = deque()
+        self.waiting: deque[tuple[dict[str, Any], frozenset[int], bool]] = deque()
         self._inflight_sessions: dict[int, frozenset[int]] = {}
         self.shutdown: dict[str, Any] | None = None
+        self._launch_reorder = int(worker_server.worker.capabilities.rank.tp_size) == 1
+        profile_dir = os.environ.get("UNISERVE_SERVE_LOOP_CPROFILE_DIR")
+        self._profile_state: tuple[Any, float | None, str] | None = None
+        self._profile_executes = 0
+        self._profile_start_execute = int(
+            os.environ.get("UNISERVE_SERVE_LOOP_CPROFILE_START_EXECUTE", "1")
+        )
+        if profile_dir:
+            import cProfile
+
+            self._profile_state = (cProfile.Profile(), None, profile_dir)
         wake = getattr(ipc_endpoint, "wake", None)
         wake_on_stream = getattr(ipc_endpoint, "wake_on_stream", None)
         install = getattr(worker_server.worker, "set_completion_wake", None)
@@ -108,15 +120,40 @@ class WorkerServeLoop:
 
     def _append_inflight(
         self,
-        request: dict[str, Any],
+        request_sessions: frozenset[int],
         response: dict[str, Any],
     ) -> None:
         self.inflight.append(response)
-        self._inflight_sessions[id(response)] = _request_session_ids(
-            request
-        ) | _response_session_ids(response)
+        self._inflight_sessions[id(response)] = request_sessions | _response_session_ids(
+            response
+        )
 
     def run(self) -> None:
+        self._run()
+
+    def _profile_tick(self) -> None:
+        import time
+
+        if self._profile_state is None:
+            return
+        profiler, deadline, directory = self._profile_state
+        if deadline is None:
+            from pathlib import Path
+
+            window = float(os.environ.get("UNISERVE_SERVE_LOOP_CPROFILE_SECONDS", "15"))
+            self._profile_state = (profiler, time.monotonic() + window, directory)
+            profiler.enable()
+            return
+        if time.monotonic() >= deadline:
+            from pathlib import Path
+
+            profiler.disable()
+            target = Path(directory)
+            target.mkdir(parents=True, exist_ok=True)
+            profiler.dump_stats(str(target / f"serve-loop-{os.getpid()}.cprofile"))
+            self._profile_state = None
+
+    def _run(self) -> None:
         # The loaded model and model-runner graph live for the worker's full
         # lifetime. Do not collect or freeze that initialized graph: both
         # operations traverse every model, CUDA graph, and attention-wrapper
@@ -166,10 +203,39 @@ class WorkerServeLoop:
             self._accept(request)
 
     def _accept(self, request: dict[str, Any]) -> None:
+        if self._profile_state is not None:
+            if request.get("kind") == RequestKind.EXECUTE.value:
+                self._profile_executes += 1
+            if self._profile_executes >= self._profile_start_execute:
+                self._profile_tick()
         if request.get("kind") == RequestKind.SHUTDOWN.value:
             self.shutdown = self.worker_server.handle(request)
             return
-        self.waiting.append((request, _request_session_ids(request)))
+        self.waiting.append(
+            (request, _request_session_ids(request), self._starts_early(request))
+        )
+
+    def _starts_early(self, request: Mapping[str, Any]) -> bool:
+        """Whether this request may launch ahead of older session-disjoint work.
+
+        Prompt batches are admission-latency critical, and their device work is
+        ordered by launch order, so a single-rank worker launches them before
+        queued decode submissions whenever every session-lineage constraint
+        still holds. Multi-rank workers execute strictly in submission order
+        because collective positions are assigned at submission.
+        """
+
+        if not self._launch_reorder:
+            return False
+        batch = request.get("batch")
+        operations = getattr(batch, "operations", None)
+        if not operations:
+            return False
+        return any(
+            work.kind == "encode" or (work.kind == "token" and work.mode == "extend")
+            for operation in operations
+            for work in (operation.work,)
+        )
 
     def _start_waiting(self) -> bool:
         from .app import _response_execution_complete
@@ -177,22 +243,39 @@ class WorkerServeLoop:
         if not self.waiting:
             return False
         started = False
+        items = list(self.waiting)
+        order = [index for index, item in enumerate(items) if item[2]]
+        order += [index for index, item in enumerate(items) if not item[2]]
+        launched: set[int] = set()
         blocked_sessions: set[int] = set()
-        remaining: deque[tuple[dict[str, Any], frozenset[int]]] = deque()
-        while self.waiting:
-            request, sessions = self.waiting.popleft()
-            if blocked_sessions.intersection(sessions) or not all(
-                self._inflight_sessions[id(response)].isdisjoint(sessions)
-                or _response_execution_complete(response)
-                for response in self.inflight
+        for index in order:
+            request, sessions, _early = items[index]
+            # A request may not overtake earlier unlaunched work that shares a
+            # session, and may only start once every overlapping in-flight
+            # execution has published its request state.
+            ordered_before = (
+                item[1]
+                for position, item in enumerate(items[:index])
+                if position not in launched
+            )
+            if (
+                blocked_sessions.intersection(sessions)
+                or any(not earlier.isdisjoint(sessions) for earlier in ordered_before)
+                or not all(
+                    self._inflight_sessions[id(response)].isdisjoint(sessions)
+                    or _response_execution_complete(response)
+                    for response in self.inflight
+                )
             ):
-                remaining.append((request, sessions))
                 blocked_sessions.update(sessions)
                 continue
             response = self.worker_server.handle(request)
-            self._append_inflight(request, response)
+            self._append_inflight(sessions, response)
+            launched.add(index)
             started = True
-        self.waiting = remaining
+        self.waiting = deque(
+            item for position, item in enumerate(items) if position not in launched
+        )
         return started
 
     def _respond_ready(self) -> bool:

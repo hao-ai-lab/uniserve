@@ -14,12 +14,12 @@ use crate::chat::output::parser::reasoning::{Qwen3ReasoningParser, ReasoningDelt
 use crate::chat::output::processor::DecodedTextEventStream;
 
 struct ReasoningState {
-    parser: Qwen3ReasoningParser,
+    parser: Option<Qwen3ReasoningParser>,
     parser_failed: bool,
 }
 
 impl ReasoningState {
-    fn new(parser: Qwen3ReasoningParser) -> Self {
+    fn new(parser: Option<Qwen3ReasoningParser>) -> Self {
         Self {
             parser,
             parser_failed: false,
@@ -27,15 +27,15 @@ impl ReasoningState {
     }
 
     fn process_delta(&mut self, delta: String) -> Vec<ContentEvent> {
-        if self.parser_failed {
+        let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return vec![ContentEvent::TextDelta {
                 kind: AssistantBlockKind::Text,
                 delta,
             }];
-        }
+        };
 
         let mut events = Vec::new();
-        match self.parser.push(&delta) {
+        match parser.push(&delta) {
             Ok(result) => push_reasoning_delta(&mut events, result),
             Err(error) => {
                 warn!(error = %error.as_report(), "Qwen3 reasoning parsing failed");
@@ -47,20 +47,20 @@ impl ReasoningState {
     }
 
     fn initialize(&mut self, prompt_token_ids: &[u32]) {
-        if self.parser_failed {
+        let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return;
-        }
-        if let Err(error) = self.parser.initialize(prompt_token_ids) {
+        };
+        if let Err(error) = parser.initialize(prompt_token_ids) {
             warn!(error = %error.as_report(), "Qwen3 reasoning parser initialization failed");
             self.parser_failed = true;
         }
     }
 
     fn finish(&mut self) -> Vec<ContentEvent> {
-        if self.parser_failed {
+        let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return Vec::new();
-        }
-        match self.parser.finish() {
+        };
+        match parser.finish() {
             Ok(result) => {
                 let mut events = Vec::new();
                 push_reasoning_delta(&mut events, result);
@@ -92,7 +92,7 @@ fn push_reasoning_delta(events: &mut Vec<ContentEvent>, delta: ReasoningDelta) {
 #[try_stream]
 pub async fn reasoning_event_stream(
     decoded_stream: impl DecodedTextEventStream,
-    parser: Qwen3ReasoningParser,
+    parser: Option<Qwen3ReasoningParser>,
     mut y: TryYielder<ContentEvent, Error>,
 ) -> Result<()> {
     pin_mut!(decoded_stream);

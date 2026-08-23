@@ -145,7 +145,8 @@ def _execute(
     replay: ReplayCoordinator,
 ) -> dict[str, Any]:
     raw_batch = _required(request, "batch", RequestKind.EXECUTE)
-    batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_wire(raw_batch)
+    with profile_range("uniserve.worker.batch_wire"):
+        batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_wire(raw_batch)
     supported = frozenset(worker.capabilities.supported_work)
     unsupported = tuple(
         operation.work.variant
@@ -160,7 +161,8 @@ def _execute(
     if not batch.operations:
         result = worker.execute(batch)
         return _response(ResponseKind.RESULT, completion_report=result)
-    registration = replay.register(batch)
+    with profile_range("uniserve.worker.replay_register"):
+        registration = replay.register(batch)
     if not registration.execute:
         return _response(
             ResponseKind.RESULT,
@@ -175,7 +177,8 @@ def _execute(
                 prepared,
             )
         else:
-            source = worker.execute(batch)
+            with profile_range("uniserve.worker.model_execute"):
+                source = worker.execute(batch)
         replay.attach(registration, source)
     except BaseException as error:
         replay.abort(registration, error)

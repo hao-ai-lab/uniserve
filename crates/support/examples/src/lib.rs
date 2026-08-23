@@ -37,6 +37,7 @@ pub fn sim_http_config(model: impl Into<String>) -> Config {
         request_timeout: None,
         max_concurrent_requests: None,
         shutdown_timeout: Duration::ZERO,
+        reasoning_parsing: true,
     }
 }
 

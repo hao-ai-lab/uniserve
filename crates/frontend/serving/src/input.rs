@@ -243,8 +243,13 @@ impl GenerateReqInput {
 pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
-    /// Qwen3 chat reasoning + tool parsing over decoded text.
-    Qwen3(Box<ChatRequest>),
+    /// Qwen3 chat reasoning + tool parsing over decoded text. The flag
+    /// selects whether `<think>` delimiters are parsed into reasoning blocks
+    /// or streamed verbatim as content.
+    Qwen3 {
+        request: Box<ChatRequest>,
+        parse_reasoning: bool,
+    },
     /// SenseNova reasoning and visible-answer filtering over committed text.
     SenseNova(uniserve_model_profile::omni::OutputFilterPolicy),
     /// Bagel committed-event output policy.

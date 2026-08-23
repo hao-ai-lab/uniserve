@@ -188,6 +188,10 @@ pub struct Config {
     pub max_concurrent_requests: Option<u64>,
     /// Maximum time to wait for active HTTP requests to drain on shutdown.
     pub shutdown_timeout: Duration,
+    /// Whether the model description's reasoning parser separates
+    /// `reasoning_content` from `content`. When `false`, reasoning delimiter
+    /// tokens stream verbatim as content text.
+    pub reasoning_parsing: bool,
 }
 
 impl Default for Config {
@@ -211,6 +215,7 @@ impl Default for Config {
             request_timeout: None,
             max_concurrent_requests: None,
             shutdown_timeout: Duration::from_secs(0),
+            reasoning_parsing: true,
         }
     }
 }

@@ -58,6 +58,7 @@ from uniserve_worker.batch import (
     Work,
     WorkVariant,
     control_from_wire,
+    mark_typed_wire,
     control_to_wire,
     decode_sampling_state_bytes,
     decode_token_product_bytes,
@@ -692,3 +693,12 @@ def test_host_visible_output_fits_the_operation_completion_bound() -> None:
 
     with pytest.raises(WorkerError, match="host-visible output"):
         Operation.from_wire(invalid.to_wire())
+
+
+def test_typed_wire_batch_decodes_to_the_validated_batch() -> None:
+    batch = Batch(step_id=7, partitions=(_partition(_decode_operation()),))
+    wire = batch.to_wire()
+    validated = Batch.from_wire(wire)
+    typed = dict(wire)
+    mark_typed_wire(typed)
+    assert Batch.from_wire(typed) == validated

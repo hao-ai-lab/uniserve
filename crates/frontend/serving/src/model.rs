@@ -123,6 +123,7 @@ pub struct Qwen3Desc {
     hints: SamplingHints,
     capabilities: GenerationRuntimeCapabilities,
     logprobs_supported: bool,
+    parse_reasoning: bool,
 }
 
 /// SenseNova omni description: image input, text output, image output, and
@@ -159,6 +160,7 @@ impl ResolvedModel {
         renderer: HfChatRenderer,
         capabilities: GenerationRuntimeCapabilities,
         max_model_tokens: u32,
+        parse_reasoning: bool,
     ) -> Result<Self> {
         match profile {
             ModelProfile::Qwen3(profile) => {
@@ -178,6 +180,7 @@ impl ResolvedModel {
                     hints,
                     capabilities,
                     logprobs_supported: true,
+                    parse_reasoning,
                 }))
             }
             ModelProfile::SenseNova(profile) => {
@@ -505,6 +508,7 @@ impl Qwen3Desc {
                 let _processor = Qwen3ChatOutputProcessor::new(
                     &mut chat_request,
                     std::sync::Arc::clone(&self.tokenizer),
+                    self.parse_reasoning,
                 )
                 .map_err(|error| error.to_string())?;
                 let rendered_text = self
@@ -518,7 +522,10 @@ impl Qwen3Desc {
                 let skip = chat_request.decode_options.skip_special_tokens;
                 (
                     ids,
-                    OutputProcessorPolicy::Qwen3(Box::new(chat_request)),
+                    OutputProcessorPolicy::Qwen3 {
+                        request: Box::new(chat_request),
+                        parse_reasoning: self.parse_reasoning,
+                    },
                     skip,
                 )
             }

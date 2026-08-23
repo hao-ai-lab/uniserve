@@ -235,6 +235,12 @@ type RouteDomainOperations = Vec<(
 /// be the first to notice). Small enough for prompt death detection, large
 /// enough that the idle engine is effectively asleep.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
+/// Physical submissions in the execution window that may carry prompt work at
+/// once. One credit serializes prompt admission behind the previous prompt
+/// batch's host-visible resolution, keeping decode continuity — and with it
+/// inter-token latency and total throughput — at its strongest; additional
+/// credits trade decode continuity for prompt admission latency.
+const PREFILL_WINDOW_CREDITS: usize = 1;
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 /// Diagnostic: give a denoise step a batch of its own instead of letting text
 /// rows ride along in the same forward.
@@ -815,6 +821,8 @@ pub struct Scheduler {
     planner: GenerationPlanner,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
+    /// Steps in the execution window that carry prompt work.
+    prefill_steps: HashSet<u64>,
     /// Domain and physical-call identity for partitions still expected from each batch.
     batch_partitions: HashMap<u64, HashMap<u32, SubmittedPartitionAccounting>>,
     /// Worker duration per physical submission group across returned partitions.
@@ -1367,6 +1375,7 @@ impl Scheduler {
             latency: crate::policy::LatencyHistory::new(),
             planner: GenerationPlanner::new(latent_dtype),
             batch_started: HashMap::new(),
+            prefill_steps: HashSet::new(),
             batch_partitions: HashMap::new(),
             batch_group_worker_exec_us: HashMap::new(),
             pending_controls: VecDeque::new(),
@@ -2300,7 +2309,25 @@ impl Scheduler {
             if ops.is_empty() {
                 break;
             }
-            let controls = self.pending_controls.drain(..).collect();
+            // A prompt batch carries only the controls addressed to its own
+            // sessions. Foreign controls stay pending for the next submission
+            // that carries those sessions' operations, so a prompt batch's
+            // session set stays disjoint from in-flight decode work and the
+            // worker may launch it ahead of queued decode submissions.
+            let prompt_batch = ops
+                .iter()
+                .all(|op| assembly_lane(op.operation_variant) == AssemblyLane::Prefill);
+            let controls: Vec<Control> = if prompt_batch {
+                let sessions: HashSet<RequestId> = ops.iter().map(|op| op.request_id).collect();
+                let (own, foreign): (VecDeque<Control>, VecDeque<Control>) = self
+                    .pending_controls
+                    .drain(..)
+                    .partition(|control| sessions.contains(&control.request_key().session_id));
+                self.pending_controls = foreign;
+                own.into()
+            } else {
+                self.pending_controls.drain(..).collect()
+            };
             if !self.submit_batch(new_reqs, ops, controls) {
                 break;
             }
@@ -3471,6 +3498,7 @@ impl Scheduler {
             .unwrap_or(0);
         if batch_complete {
             self.batch_started.remove(&result_step_id);
+            self.prefill_steps.remove(&result_step_id);
         }
         let worker_us = if batch_complete {
             self.batch_group_worker_exec_us
@@ -4061,6 +4089,7 @@ impl Scheduler {
         // failed here, so drop their pending submit-timestamps too — otherwise
         // `batch_started` accumulates orphaned entries for every failed batch.
         self.batch_started.clear();
+        self.prefill_steps.clear();
         self.batch_partitions.clear();
         self.batch_group_worker_exec_us.clear();
         for id in ids {
@@ -4082,6 +4111,7 @@ impl Scheduler {
         self.inflight_transfers = 0;
         self.pending_completions.clear();
         self.batch_started.clear();
+        self.prefill_steps.clear();
         self.batch_partitions.clear();
         self.batch_group_worker_exec_us.clear();
         let ids = self.running.keys().copied().collect::<Vec<_>>();
@@ -4512,7 +4542,7 @@ impl Scheduler {
                 AssemblyLane::Other => {}
             }
         }
-        if prefill_ready && !self.any_prefill_inflight() {
+        if prefill_ready && self.prefill_steps.len() < PREFILL_WINDOW_CREDITS {
             Some(AssemblyLane::Prefill)
         } else if committed_decode_ready || projected_decode_ready {
             Some(AssemblyLane::Decode)
@@ -4970,6 +5000,12 @@ impl Scheduler {
                 .any(|operation| operation.work.variant() != first.work.variant())
         });
         self.batch_started.insert(step, submit_at);
+        if wire_ops
+            .iter()
+            .any(|operation| assembly_lane(operation.work.variant()) == AssemblyLane::Prefill)
+        {
+            self.prefill_steps.insert(step);
+        }
         if let Some(trace_ops) = trace_ops {
             let operation_types: Vec<&'static str> = wire_ops
                 .iter()
@@ -5059,6 +5095,7 @@ impl Scheduler {
             .with_input_products(input_products);
         if let Err(e) = self.executor.submit(batch) {
             self.batch_started.remove(&step);
+            self.prefill_steps.remove(&step);
             self.batch_partitions.remove(&step);
             self.batch_group_worker_exec_us.remove(&step);
             self.trace_record(json!({
@@ -6669,8 +6706,20 @@ impl Scheduler {
                     root,
                     PublicModality::Text,
                 );
+                let first_token = published
+                    && self
+                        .running
+                        .get(&id)
+                        .is_some_and(|state| state.public_token_seq == 0);
                 if published && let Some(state) = self.running.get_mut(&id) {
                     state.public_token_seq = state.public_token_seq.saturating_add(1);
+                }
+                if first_token && self.trace_enabled() {
+                    self.trace_record(json!({
+                        "event": "first_public_token",
+                        "at_s": now(),
+                        "request_id": id.0,
+                    }));
                 }
                 true
             }

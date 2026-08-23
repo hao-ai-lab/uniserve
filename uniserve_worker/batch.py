@@ -17,7 +17,7 @@ import hashlib
 import math
 import re
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
@@ -229,6 +229,105 @@ _CLOSE_REASON_INDEX = {member: index for index, member in enumerate(CloseReason)
 # mappings never carry the token and retain the full decoder validation path.
 _WIRE_VALIDATION_TOKEN = object()
 _WIRE_VALIDATION_KEY = "_uniserve_wire_validation"
+
+
+def native_partition(
+    partition_id: int,
+    submission_group: int,
+    collective_seq: int,
+    domain: Domain,
+    route: int,
+    execution: ExecutionCapability,
+    attention: AttentionRegime,
+    shape_class: int,
+    operations: tuple[Operation, ...],
+    request_pool_indices: tuple[int, ...],
+    kv_placements: tuple[KvPlacement, ...],
+    kv_branch_placements: Sequence[object],
+    latent_placements: Sequence[object],
+) -> BatchPartition:
+    """Assemble a partition from transport-constructed members.
+
+    The native transport is produced by the engine's own encoder, so members
+    already carry their registered identities and the validation that guards
+    untrusted wire maps is not repeated here.
+    """
+
+    partition = object.__new__(BatchPartition)
+    set_field = object.__setattr__
+    set_field(partition, "partition_id", partition_id)
+    set_field(partition, "submission_group", submission_group)
+    set_field(partition, "collective_seq", collective_seq)
+    set_field(partition, "domain", domain)
+    set_field(partition, "route", route)
+    set_field(partition, "execution", execution)
+    set_field(partition, "attention", attention)
+    set_field(partition, "shape_class", shape_class)
+    set_field(partition, "operations", operations)
+    set_field(partition, "request_pool_indices", request_pool_indices)
+    set_field(partition, "kv_placements", kv_placements)
+    set_field(
+        partition,
+        "kv_branch_placements",
+        tuple(
+            KvBranchPlacement.from_wire(item, f"partition.kv_branch_placements[{index}]")
+            for index, item in enumerate(kv_branch_placements)
+        ),
+    )
+    set_field(
+        partition,
+        "latent_placements",
+        tuple(
+            LatentPlacement.from_wire(item, f"partition.latent_placements[{index}]")
+            for index, item in enumerate(latent_placements)
+        ),
+    )
+    return partition
+
+
+def native_batch(
+    step_id: int,
+    admissions: Sequence[object],
+    partitions: tuple[BatchPartition, ...],
+    controls: tuple[Control, ...],
+    input_products: Sequence[object],
+) -> Batch:
+    """Assemble a batch from transport-constructed members."""
+
+    batch = object.__new__(Batch)
+    set_field = object.__setattr__
+    set_field(batch, "step_id", step_id)
+    set_field(
+        batch,
+        "admissions",
+        tuple(
+            Admission.from_wire(item, f"batch.admissions[{index}]")
+            for index, item in enumerate(admissions)
+        ),
+    )
+    set_field(batch, "partitions", partitions)
+    set_field(batch, "controls", controls)
+    set_field(
+        batch,
+        "input_products",
+        tuple(
+            ProductPayload.from_wire(item, f"batch.input_products[{index}]")
+            for index, item in enumerate(input_products)
+        ),
+    )
+    return batch
+
+
+def mark_typed_wire(batch: MutableMapping[str, object]) -> None:
+    """Record that a decoded execute batch came from the typed worker wire.
+
+    The typed wire is produced by the engine's own encoder, so each operation
+    map already carries the plan digest the scheduler registered it under.
+    Marking the map lets `Batch.from_wire` build operations, partitions, and
+    controls directly instead of re-deriving that digest per operation.
+    """
+
+    batch[_WIRE_VALIDATION_KEY] = _WIRE_VALIDATION_TOKEN
 
 # Precompiled little-endian packers. Multi-field formats fuse the fixed-width
 # runs of the record digests into single calls; `<` guarantees no padding, so

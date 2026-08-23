@@ -1533,13 +1533,20 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
     else:
         resolved = digest
         timing = record.timing_counters
-    tokens = tuple(int(value) for value in record.committed_tokens)
     lengths = record.logical_lengths
     span = record.token_span
-    return replace(
-        record,
-        selected_point=int(record.selected_point),
-        logical_lengths=LogicalLengths(
+    if type(lengths.token_len) is not int or any(
+        type(value) is not int
+        for value in (
+            lengths.kv_visible_len,
+            lengths.latent_len,
+            lengths.kv_reserved_len,
+            lengths.kv_initialized_len,
+            lengths.kv_committed_len,
+            lengths.kv_published_len,
+        )
+    ):
+        lengths = LogicalLengths(
             token_len=int(lengths.token_len),
             kv_visible_len=int(lengths.kv_visible_len),
             latent_len=int(lengths.latent_len),
@@ -1547,8 +1554,17 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
             kv_initialized_len=int(lengths.kv_initialized_len),
             kv_committed_len=int(lengths.kv_committed_len),
             kv_published_len=int(lengths.kv_published_len),
-        ),
-        token_span=TokenSpan(base=int(span.base), len=int(span.len)),
+        )
+    if type(span.base) is not int or type(span.len) is not int:
+        span = TokenSpan(base=int(span.base), len=int(span.len))
+    tokens = record.committed_tokens
+    if type(tokens) is not tuple or any(type(value) is not int for value in tokens):
+        tokens = tuple(int(value) for value in tokens)
+    return replace(
+        record,
+        selected_point=int(record.selected_point),
+        logical_lengths=lengths,
+        token_span=span,
         committed_tokens=tokens,
         semantic_digest=resolved,
         timing_counters=timing,

@@ -25,12 +25,16 @@ trait_set! {
 
 /// Request-scoped Qwen3 reasoning and tool-call processor.
 pub struct Qwen3ChatOutputProcessor {
-    reasoning_parser: Qwen3ReasoningParser,
+    reasoning_parser: Option<Qwen3ReasoningParser>,
     tool_parser: Option<Qwen3XmlToolParser>,
 }
 
 impl Qwen3ChatOutputProcessor {
-    pub fn new(request: &mut ChatRequest, tokenizer: DynTokenizer) -> ChatResult<Self> {
+    pub fn new(
+        request: &mut ChatRequest,
+        tokenizer: DynTokenizer,
+        parse_reasoning: bool,
+    ) -> ChatResult<Self> {
         let tool_parsing_enabled =
             matches!(request.tool_choice, ChatToolChoice::Auto) && !request.tools.is_empty();
         let tool_parser = if tool_parsing_enabled {
@@ -42,13 +46,18 @@ impl Qwen3ChatOutputProcessor {
         } else {
             None
         };
-        let reasoning_parser =
-            Qwen3ReasoningParser::new(tokenizer).map_err(|error| Error::ParserInitialization {
+        let reasoning_parser = parse_reasoning
+            .then(|| Qwen3ReasoningParser::new(tokenizer))
+            .transpose()
+            .map_err(|error| Error::ParserInitialization {
                 kind: "reasoning",
                 name: "qwen3".to_string(),
                 error: Box::new(error),
             })?;
-        if reasoning_parser.preserve_special_tokens() {
+        if reasoning_parser
+            .as_ref()
+            .is_some_and(Qwen3ReasoningParser::preserve_special_tokens)
+        {
             request.decode_options.skip_special_tokens = false;
         }
         Ok(Self {
