@@ -28,6 +28,12 @@ class WorkerPlacement:
     tp_init_method: str | None
     tower_devices: tuple[str, str] | None
 
+    @property
+    def generation_device(self) -> str | None:
+        if self.tower_devices is None:
+            return None
+        return self.tower_devices[1]
+
 
 @dataclass(frozen=True)
 class WorkerResourceConfig:

@@ -1,4 +1,4 @@
-"""Model discovery and materialization for one assembled worker."""
+"""Model discovery and materialization for one worker."""
 
 from __future__ import annotations
 
@@ -13,11 +13,12 @@ from ..loader import LoadConfig, LoadRequest, WeightSet, get_model_loader
 from ..loader.source import read_model_config, resolve_model_root
 from ..models.identity import ModelIdentity, architecture_identity
 from ..models.runtime import ExecutionModel, WorkerDeployment
-from ..nn.mesh import TensorParallelSpec
+from ..nn.mesh import DeviceMesh, TensorParallelSpec
 from .capacity import DEFAULT_MAX_REQUEST_POOL_SIZE
 from .catalog import CatalogEntry, resolve_catalog_entry
+from .config import WorkerLaunchConfig
 from .execution_config import ExecutionConfig
-from .plan import ModelLoadScope
+from .plan import ModelLoadScope, WorkerPlan
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +44,10 @@ class WorkerModelLoadRequest:
 class LoadedWorkerModel:
     model: ExecutionModel
     tokenizer: Any | None
-    entry: CatalogEntry
-    model_path: str
-    scope: ModelLoadScope
     deployment: WorkerDeployment
     identity: ModelIdentity
     weights: WeightSet
+    weight_sidecars: tuple[str, ...]
 
 
 def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
@@ -94,12 +93,83 @@ def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
     return LoadedWorkerModel(
         model=model,
         tokenizer=loaded.tokenizer,
-        entry=entry,
-        model_path=str(model_root),
-        scope=request.scope,
         deployment=deployment,
         identity=identity,
         weights=loaded.weights,
+        weight_sidecars=entry.sidecars,
+    )
+
+
+def materialize_worker_model(
+    config: WorkerLaunchConfig,
+    plan: WorkerPlan,
+    mesh: DeviceMesh,
+) -> LoadedWorkerModel:
+    if config.use_stub_model:
+        return _stub_worker_model(config, plan)
+    return load_worker_model(_checkpoint_request(config, plan, mesh))
+
+
+def _checkpoint_request(
+    config: WorkerLaunchConfig,
+    plan: WorkerPlan,
+    mesh: DeviceMesh,
+) -> WorkerModelLoadRequest:
+    model = config.model
+    if model is None:
+        raise RuntimeError("validated model worker is missing model configuration")
+    return WorkerModelLoadRequest(
+        model_path=model.path,
+        device=config.placement.device,
+        block_size=config.resources.block_size,
+        max_batch_operations=config.resources.max_batch_operations,
+        max_batch_tokens=config.resources.max_batch_tokens,
+        kv_token_capacity=config.resources.kv_token_capacity,
+        attention_backend=model.attention_backend,
+        execution=config.execution,
+        parallel=TensorParallelSpec.from_mesh(mesh),
+        scope=plan.model_scope,
+        generation_kv_capacity_tokens=config.resources.generation_kv_capacity_tokens,
+        generation_device=config.placement.generation_device,
+        load=config.load,
+    )
+
+
+def _stub_worker_model(config: WorkerLaunchConfig, plan: WorkerPlan) -> LoadedWorkerModel:
+    from ..server.stub import StubModel, stub_deployment
+
+    stub = StubModel()
+    weights = WeightSet.from_module(stub)
+    return LoadedWorkerModel(
+        model=stub,
+        tokenizer=None,
+        deployment=replace(
+            stub_deployment(
+                config.resources.block_size,
+                max_batch_operations=config.resources.max_batch_operations,
+                max_batch_tokens=config.resources.max_batch_tokens,
+            ),
+            device=config.placement.device,
+            model_scope=plan.model_scope.value,
+            tp_rank=config.placement.tp_rank,
+            tp_size=config.placement.tp_size,
+            kv_token_capacity=config.resources.kv_token_capacity,
+            generation_kv_capacity_tokens=config.resources.generation_kv_capacity_tokens,
+            model_dtype=config.execution.model_dtype,
+            kv_cache_dtype=config.execution.kv_cache_dtype,
+            kv_memory_fraction=config.execution.kv_memory_fraction,
+            generation_device=config.placement.generation_device,
+        ),
+        identity=ModelIdentity(
+            architecture=stub.architecture,
+            architecture_digest=architecture_identity(
+                stub.architecture,
+                {"architecture": stub.architecture},
+            ),
+            weight_digest=weights.digest,
+        ),
+        weights=weights,
+        weight_sidecars=("config.json",),
     )
 
 

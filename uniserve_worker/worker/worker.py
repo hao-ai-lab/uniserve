@@ -9,6 +9,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from threading import Condition, RLock
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -99,6 +100,9 @@ from ..server.completion import (
 from ..server.cpu_tasks import BoundedCpuTaskPool
 from ..server.request_state import RequestTable
 from ..transfer.connector import TransferConnector
+
+if TYPE_CHECKING:
+    from ..bootstrap.config import WorkerLaunchConfig
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +358,52 @@ class Worker:
     _warmup_kv_pages: dict[tuple[RequestKey, int], list[int]]
     _warmup_scratch_pages: dict[RequestKey, list[int]]
     _warmup_latent_pages: dict[RequestKey, list[int]]
+
+    @classmethod
+    def from_config(cls, config: WorkerLaunchConfig) -> Worker:
+        from ..backends.attention import resolve_attention_selection
+        from ..backends.triton import configure_triton_toolchain
+        from ..bootstrap.model_loader import materialize_worker_model
+        from ..bootstrap.plan import resolve_worker_plan
+        from ..nn.placement import place_towers
+        from ..server.distributed import build_device_mesh
+        from ..server.worker_kind import WorkerKind
+
+        plan = resolve_worker_plan(config.worker_kind)
+        configure_triton_toolchain()
+        mesh = build_device_mesh(
+            tp_rank=config.placement.tp_rank,
+            tp_size=config.placement.tp_size,
+            device=config.placement.device,
+            tower_devices=config.placement.tower_devices,
+            tower_primary=0,
+            tp_backend=config.placement.tp_backend,
+            tp_init_method=config.placement.tp_init_method,
+        )
+        loaded = materialize_worker_model(config, plan, mesh)
+        place_towers(loaded.model, mesh)
+        return cls(
+            loaded.model,
+            mesh=mesh,
+            deployment=loaded.deployment,
+            attention=resolve_attention_selection(
+                loaded.deployment.attention_backend or "auto",
+                tuning=config.execution.flashinfer,
+                block_size=loaded.deployment.block_size,
+            ),
+            execution=config.execution,
+            tokenizer=loaded.tokenizer,
+            allowed_work_variants=plan.allowed_work_variants,
+            transfer_backend=config.data_plane.backend,
+            cross_process=config.worker_kind is not WorkerKind.FULL,
+            architecture_digest=loaded.identity.architecture_digest,
+            weight_digest=loaded.identity.weight_digest,
+            weights=WeightSet.from_module(loaded.model, digest=loaded.identity.weight_digest),
+            weight_sidecars=loaded.weight_sidecars,
+            pipeline_depth=config.ipc.pipeline_depth,
+            completion_payload_bytes=config.ipc.max_payload_bytes,
+            snapshot_dir=config.snapshot_dir,
+        )
 
     def __init__(
         self,

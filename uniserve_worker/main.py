@@ -7,7 +7,7 @@ import logging
 import signal
 import sys
 
-from .bootstrap.assembly import run_worker
+from .bootstrap.launch import run_worker
 from .bootstrap.cli import parse_worker_launch
 
 logger = logging.getLogger(__name__)
