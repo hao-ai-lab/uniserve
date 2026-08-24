@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from .registry import TaskSpec, get_dataset, get_task
+from .datasets import get_dataset
+from .tasks import get_task
+from .tasks.base import BenchmarkTask
 from .types import (
     BenchmarkPoint,
     ImageConfig,
@@ -214,7 +216,7 @@ def _benchmark_point(
     dataset_name = value.get("dataset")
     if not isinstance(dataset_name, str) or not dataset_name:
         raise ValueError(f"benchmarks.{name}.dataset must be a non-empty string")
-    dataset = get_dataset(dataset_name)
+    dataset_cls = get_dataset(dataset_name)
     model = value.get("model")
     if not isinstance(model, str) or not model:
         raise ValueError(f"benchmarks.{name}.model must be a non-empty string")
@@ -223,31 +225,20 @@ def _benchmark_point(
     load = _load_config(value.get("load"), f"benchmarks.{name}.load")
     sampling = _sampling_config(value.get("sampling"), task, f"benchmarks.{name}.sampling")
     image = _image_config(value.get("image"), task, f"benchmarks.{name}.image")
-    endpoint = value.get("endpoint", task.default_endpoint)
-    if not isinstance(endpoint, str) or endpoint not in task.allowed_endpoints:
-        allowed = ", ".join(task.allowed_endpoints)
-        raise ValueError(f"benchmarks.{name}.endpoint must be one of: {allowed}")
-    question = value.get("question")
-    if question is not None:
-        if not task.accepts_question:
-            raise ValueError(f"benchmarks.{name}.question is not valid for task {task_name}")
-        if not isinstance(question, str) or not question:
-            raise ValueError(f"benchmarks.{name}.question must be a non-empty string")
+    endpoint = task.check_endpoint(value.get("endpoint"), f"benchmarks.{name}")
+    question = task.check_question(value.get("question"), f"benchmarks.{name}")
     tokenizer = value.get("tokenizer")
-    if tokenizer is not None and not isinstance(tokenizer, str):
-        raise ValueError(f"benchmarks.{name}.tokenizer must be a string")
-    if dataset.requires_tokenizer and not tokenizer:
-        raise ValueError(f"benchmarks.{name}.tokenizer is required for dataset {dataset_name}")
     dataset_path = value.get("dataset_path")
-    if dataset_path is not None and not isinstance(dataset_path, str):
-        raise ValueError(f"benchmarks.{name}.dataset_path must be a string")
-    if dataset.requires_path and not dataset_path:
-        raise ValueError(f"benchmarks.{name}.dataset_path is required for dataset {dataset_name}")
+    dataset_cls.check_point(
+        tokenizer=tokenizer,
+        dataset_path=dataset_path,
+        context=f"benchmarks.{name}",
+    )
     revision = value.get("dataset_revision")
     if revision is not None and not isinstance(revision, str):
         raise ValueError(f"benchmarks.{name}.dataset_revision must be a string")
 
-    _validate_image_rules(name, task, image)
+    task.check_image(image, f"benchmarks.{name}")
     return BenchmarkPoint(
         name=name,
         server=server,
@@ -264,13 +255,6 @@ def _benchmark_point(
         endpoint=endpoint,
         question=question,
     )
-
-
-def _validate_image_rules(name: str, task: TaskSpec, image: ImageConfig) -> None:
-    if task.requires_image_count and image.image_count is None:
-        raise ValueError(f"benchmarks.{name} requires image.image_count")
-    if task.forbids_image_count and image.image_count is not None:
-        raise ValueError(f"benchmarks.{name} does not declare a per-request image count")
 
 
 def _metrics(raw: Any, context: str) -> tuple[MetricDefinition, ...]:
@@ -296,7 +280,7 @@ def _load_config(raw: Any, context: str) -> LoadConfig:
     return LoadConfig(**value)
 
 
-def _sampling_config(raw: Any, task: TaskSpec, context: str) -> SamplingConfig:
+def _sampling_config(raw: Any, task: type[BenchmarkTask], context: str) -> SamplingConfig:
     value = dict(_mapping(raw, context)) if raw is not None else {}
     _reject_unknown(value, _SAMPLING_FIELDS, context)
     if "stream" not in value:
@@ -307,7 +291,7 @@ def _sampling_config(raw: Any, task: TaskSpec, context: str) -> SamplingConfig:
     return SamplingConfig(**value)
 
 
-def _image_config(raw: Any, task: TaskSpec, context: str) -> ImageConfig:
+def _image_config(raw: Any, task: type[BenchmarkTask], context: str) -> ImageConfig:
     if raw is None:
         return ImageConfig()
     if not task.accepts_image:

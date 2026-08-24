@@ -23,7 +23,7 @@ The evaluator refuses to overwrite a non-empty point directory. Comparison reads
 
 ## Extending evaluation
 
-Add a server command and one explicit benchmark table to [`uniserve_eval/profiles.toml`](../uniserve_eval/profiles.toml). A benchmark selects a registered task and a registered dataset. The task owns public request construction and observable output validation. Shared transport and metric code do not contain model-specific output rules.
+Add a server command and one explicit benchmark table to [`uniserve_eval/profiles.toml`](../uniserve_eval/profiles.toml). A benchmark selects a task class and a dataset class. The task class owns public request construction, config legality, and observable output validation. Shared transport and metric code do not contain model-specific output rules.
 
 Registered tasks are `text`, `t2i`, `i2i`, `i2t`, and `interleave`. Registered datasets are `sharegpt`, `mjhq`, `beans`, `ueval`, `pie-bench`, and `jsonl`.
 

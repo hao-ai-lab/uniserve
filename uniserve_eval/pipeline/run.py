@@ -12,7 +12,7 @@ import numpy as np
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
 from ..load import GpuMemorySampler, WarmupFailure, run_load
-from ..registry import get_task
+from ..tasks import get_task
 from ..transport import send_request
 from ..types import BenchmarkPoint, Example, RequestRecord, RunResult, selected_rows_identity
 from .report import build_summary, render_markdown
@@ -51,7 +51,7 @@ async def run_point(
     )
 
     try:
-        task = get_task(point.task).factory(point)
+        task = get_task(point.task)(point)
         rows, tokenizer = load_examples(point)
         selection = selected_rows_identity(rows)
         writer.write_json(
@@ -90,17 +90,16 @@ async def run_point(
             sampler = GpuMemorySampler()
             sampler.start()
             try:
-                try:
-                    load_result = await run_load(
-                        rows,
-                        request_rate=point.load.request_rate,
-                        max_concurrency=point.load.max_concurrency,
-                        submit=submit,
-                        warmup_requests=point.load.warmup_requests,
-                    )
-                except WarmupFailure as error:
-                    warmup_records = cast(list[RequestRecord], list(error.outputs))
-                    raise
+                load_result = await run_load(
+                    rows,
+                    request_rate=point.load.request_rate,
+                    max_concurrency=point.load.max_concurrency,
+                    submit=submit,
+                    warmup_requests=point.load.warmup_requests,
+                )
+            except WarmupFailure as error:
+                warmup_records = cast(list[RequestRecord], list(error.outputs))
+                raise
             finally:
                 sampler.stop()
 

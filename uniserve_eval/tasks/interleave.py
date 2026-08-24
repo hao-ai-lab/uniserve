@@ -1,27 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import ClassVar
 
-from ..types import Example, RequestRecord, TaskRequest, ValidationResult
-from .base import (
-    BenchmarkTask,
-    apply_text_sampling,
-    image_integrity_checks,
-    render_image_config,
-    server_usage_check,
-)
-
-MINIMUM_AVERAGE_IMAGES = 1.1
+from ..types import Example, RequestRecord, TaskName, TaskRequest, ValidationResult
+from .base import BenchmarkTask, ImageCountRule
 
 
 class InterleaveTask(BenchmarkTask):
+    name: ClassVar[TaskName] = TaskName.INTERLEAVE
+    default_stream: ClassVar[bool] = True
+    accepts_image: ClassVar[bool] = True
+    image_count: ClassVar[ImageCountRule] = ImageCountRule.FORBIDDEN
+    minimum_average_images: ClassVar[float] = 1.1
+
     def build_request(self, example: Example) -> TaskRequest:
-        image_config = render_image_config(
-            self.point.image,
-            example,
-            include_count=False,
-            fallback_seed=self.point.load.seed,
-        )
         max_tokens = int(
             example.max_tokens
             if example.max_tokens is not None
@@ -34,18 +27,18 @@ class InterleaveTask(BenchmarkTask):
             "modalities": ["text", "image"],
             "messages": [{"role": "user", "content": example.prompt}],
             "max_completion_tokens": max_tokens,
-            "image_config": image_config,
+            "image_config": self.image_fields(example, include_count=False),
         }
-        apply_text_sampling(payload, self.point.sampling)
+        self.apply_text_sampling(payload)
         return TaskRequest(self.point.endpoint, payload, stream=True)
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
-        checks = image_integrity_checks(records, self.point.image)
+        checks = self.image_integrity_checks(records)
         checks["visible_text"] = bool(records) and all(record.generated_text for record in records)
-        checks["server_usage"] = server_usage_check(records)
+        checks["server_usage"] = self.server_usage_ok(records)
         total_images = sum(record.images for record in records)
         mean_images = total_images / len(records) if records else 0.0
-        checks["minimum_average_images"] = mean_images >= MINIMUM_AVERAGE_IMAGES
+        checks["minimum_average_images"] = mean_images >= self.minimum_average_images
         return ValidationResult(
             checks=checks,
             statistics={

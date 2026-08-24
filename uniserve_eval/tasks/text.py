@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import ClassVar
 
-from ..types import Example, RequestRecord, TaskRequest, ValidationResult
-from .base import (
-    BenchmarkTask,
-    apply_text_sampling,
-    fixed_output_length_check,
-    server_usage_check,
-)
+from ..types import Example, RequestRecord, TaskName, TaskRequest, ValidationResult
+from .base import BenchmarkTask, ImageCountRule
 
 
 class TextTask(BenchmarkTask):
+    name: ClassVar[TaskName] = TaskName.TEXT
+    default_stream: ClassVar[bool] = True
+    accepts_image: ClassVar[bool] = False
+    image_count: ClassVar[ImageCountRule] = ImageCountRule.FORBIDDEN
+
     def build_request(self, example: Example) -> TaskRequest:
         output_len = example.output_len if example.output_len is not None else self.point.sampling.max_tokens
         payload: dict[str, object] = {
@@ -21,13 +22,13 @@ class TextTask(BenchmarkTask):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        apply_text_sampling(payload, self.point.sampling)
+        self.apply_text_sampling(payload)
         if output_len is not None:
             payload["max_completion_tokens"] = int(output_len)
         return TaskRequest(self.point.endpoint, payload, stream=True)
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
-        checks = {"server_usage": server_usage_check(records)}
+        checks = {"server_usage": self.server_usage_ok(records)}
         if self.point.sampling.ignore_eos:
-            checks["fixed_output_length"] = fixed_output_length_check(records)
+            checks["fixed_output_length"] = self.fixed_output_length_ok(records)
         return ValidationResult(checks=checks)

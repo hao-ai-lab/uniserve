@@ -8,44 +8,49 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from ..types import BenchmarkPoint, Example
+from ..types import Example
+from .base import Dataset
 
 PIE_BENCH_HF_REPO = "UB-CVML-Group/PIE_Bench_pp"
 _MAPPING_CANDIDATES = ("mapping_file.json", "mapping_file_ti2i_benchmark.json")
 _BRACKETS = re.compile(r"[\[\]]")
 
 
-def load_pie_bench(point: BenchmarkPoint, _tokenizer: Any) -> list[Example]:
-    mapping_path, images_root = _resolve_sources(point.dataset_path)
-    with open(mapping_path, encoding="utf-8") as handle:
-        mapping = json.load(handle)
-    entries = [
-        (key, value)
-        for key, value in mapping.items()
-        if isinstance(value, dict) and value.get("image_path")
-    ]
-    random.Random(point.load.seed).shuffle(entries)
-    rows: list[Example] = []
-    for key, value in entries:
-        if len(rows) >= point.load.num_prompts:
-            break
-        image_file = _resolve_image_file(images_root, str(value["image_path"]))
-        if image_file is None:
-            continue
-        instruction = _edit_instruction(value)
-        if not instruction:
-            continue
-        rows.append(
-            Example(
-                id=f"pie-{key}",
-                prompt=instruction,
-                input_image_b64=_png_b64(image_file),
-                input_image_mime="image/png",
+class PieBenchDataset(Dataset):
+    name: ClassVar[str] = "pie-bench"
+
+    def load(self, tokenizer: Any | None = None) -> list[Example]:
+        point = self.point
+        mapping_path, images_root = _resolve_sources(point.dataset_path)
+        with open(mapping_path, encoding="utf-8") as handle:
+            mapping = json.load(handle)
+        entries = [
+            (key, value)
+            for key, value in mapping.items()
+            if isinstance(value, dict) and value.get("image_path")
+        ]
+        random.Random(point.load.seed).shuffle(entries)
+        rows: list[Example] = []
+        for key, value in entries:
+            if len(rows) >= point.load.num_prompts:
+                break
+            image_file = _resolve_image_file(images_root, str(value["image_path"]))
+            if image_file is None:
+                continue
+            instruction = _edit_instruction(value)
+            if not instruction:
+                continue
+            rows.append(
+                Example(
+                    id=f"pie-{key}",
+                    prompt=instruction,
+                    input_image_b64=_png_b64(image_file),
+                    input_image_mime="image/png",
+                )
             )
-        )
-    return rows
+        return rows
 
 
 def _resolve_sources(dataset_path: str | None) -> tuple[Path, Path]:

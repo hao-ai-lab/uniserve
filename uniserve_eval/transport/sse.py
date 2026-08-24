@@ -12,6 +12,61 @@ ParseErrorPolicy = Literal["raise", "record"]
 _INCOMPLETE = object()
 
 
+class SseParser:
+    def __init__(
+        self,
+        *,
+        stamp_time: bool = False,
+        on_parse_error: ParseErrorPolicy = "raise",
+        stop_on: Callable[[Any], bool] | frozenset[str] | None = None,
+    ) -> None:
+        self.stamp_time = stamp_time
+        self.on_parse_error = on_parse_error
+        self.stop = _make_stop(stop_on)
+        self._probe_complete = stop_on is not None
+        self._data_lines: list[str] = []
+
+    def feed(self, line: str) -> tuple[Any | None, bool]:
+        if line == "":
+            event = self._flush()
+            return event, event is not None and self.stop(event)
+        if line.startswith(":"):
+            return None, False
+        if not line.startswith("data:"):
+            return None, False
+        data = line.removeprefix("data:")
+        if data.startswith(" "):
+            data = data[1:]
+        self._data_lines.append(data)
+        if not self._probe_complete:
+            return None, False
+        event = _try_decode_complete_event(
+            "\n".join(self._data_lines),
+            time.perf_counter(),
+            stamp_time=self.stamp_time,
+        )
+        if event is _INCOMPLETE or not self.stop(event):
+            return None, False
+        self._data_lines = []
+        return event, True
+
+    def finish(self) -> tuple[Any | None, bool]:
+        event = self._flush()
+        return event, event is not None and self.stop(event)
+
+    def _flush(self) -> Any | None:
+        if not self._data_lines:
+            return None
+        data = "\n".join(self._data_lines)
+        self._data_lines = []
+        return _decode_event(
+            data,
+            time.perf_counter(),
+            stamp_time=self.stamp_time,
+            on_parse_error=self.on_parse_error,
+        )
+
+
 def _decode_event(
     data: str,
     received: float,
@@ -60,51 +115,16 @@ def iter_sse_events(
     on_parse_error: ParseErrorPolicy = "raise",
     stop_on: Callable[[Any], bool] | frozenset[str] | None = None,
 ) -> Iterator[Any]:
-    stop = _make_stop(stop_on)
-    data_lines: list[str] = []
-
-    def flush() -> Iterator[Any]:
-        nonlocal data_lines
-        if not data_lines:
-            return
-        data = "\n".join(data_lines)
-        data_lines = []
-        yield _decode_event(
-            data,
-            time.perf_counter(),
-            stamp_time=stamp_time,
-            on_parse_error=on_parse_error,
-        )
-
+    parser = SseParser(stamp_time=stamp_time, on_parse_error=on_parse_error, stop_on=stop_on)
     for line in lines:
-        if line == "":
-            for event in flush():
-                yield event
-                if stop(event):
-                    return
-            continue
-        if line.startswith(":"):
-            continue
-        if not line.startswith("data:"):
-            continue
-        data = line.removeprefix("data:")
-        if data.startswith(" "):
-            data = data[1:]
-        data_lines.append(data)
-        if stop_on is not None:
-            event = _try_decode_complete_event(
-                "\n".join(data_lines),
-                time.perf_counter(),
-                stamp_time=stamp_time,
-            )
-            if event is not _INCOMPLETE and stop(event):
-                data_lines = []
-                yield event
+        event, done = parser.feed(line)
+        if event is not None:
+            yield event
+            if done:
                 return
-    for event in flush():
+    event, _done = parser.finish()
+    if event is not None:
         yield event
-        if stop(event):
-            return
 
 
 async def aiter_sse_events(
@@ -114,49 +134,17 @@ async def aiter_sse_events(
     on_parse_error: ParseErrorPolicy = "raise",
     stop_on: Callable[[Any], bool] | frozenset[str] | None = None,
 ) -> list[Any]:
-    stop = _make_stop(stop_on)
+    parser = SseParser(stamp_time=stamp_time, on_parse_error=on_parse_error, stop_on=stop_on)
     events: list[Any] = []
-    data_lines: list[str] = []
-
-    def flush() -> bool:
-        nonlocal data_lines
-        if not data_lines:
-            return False
-        data = "\n".join(data_lines)
-        data_lines = []
-        event = _decode_event(
-            data,
-            time.perf_counter(),
-            stamp_time=stamp_time,
-            on_parse_error=on_parse_error,
-        )
-        events.append(event)
-        return stop(event)
-
     async for line in lines:
-        if line == "":
-            if flush():
+        event, done = parser.feed(line)
+        if event is not None:
+            events.append(event)
+            if done:
                 return events
-            continue
-        if line.startswith(":"):
-            continue
-        if not line.startswith("data:"):
-            continue
-        data = line.removeprefix("data:")
-        if data.startswith(" "):
-            data = data[1:]
-        data_lines.append(data)
-        if stop_on is not None:
-            event = _try_decode_complete_event(
-                "\n".join(data_lines),
-                time.perf_counter(),
-                stamp_time=stamp_time,
-            )
-            if event is not _INCOMPLETE and stop(event):
-                data_lines = []
-                events.append(event)
-                return events
-    flush()
+    event, _done = parser.finish()
+    if event is not None:
+        events.append(event)
     return events
 
 

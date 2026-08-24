@@ -1,22 +1,38 @@
-"""Shared task request helpers and the validation envelope."""
+"""Task object: request construction, config legality, and output validation."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from enum import StrEnum
+from typing import Any, ClassVar
 
 from ..types import (
+    CHAT_COMPLETIONS,
     BenchmarkPoint,
     Example,
     ImageConfig,
     RequestRecord,
-    SamplingConfig,
+    TaskName,
     TaskRequest,
     ValidationResult,
 )
 
 
+class ImageCountRule(StrEnum):
+    REQUIRED = "required"
+    FORBIDDEN = "forbidden"
+    OPTIONAL = "optional"
+
+
 class BenchmarkTask:
+    name: ClassVar[TaskName]
+    allowed_endpoints: ClassVar[tuple[str, ...]] = (CHAT_COMPLETIONS,)
+    default_endpoint: ClassVar[str] = CHAT_COMPLETIONS
+    default_stream: ClassVar[bool] = True
+    accepts_image: ClassVar[bool] = False
+    accepts_question: ClassVar[bool] = False
+    image_count: ClassVar[ImageCountRule] = ImageCountRule.FORBIDDEN
+
     def __init__(self, point: BenchmarkPoint) -> None:
         self.point = point
 
@@ -40,125 +56,129 @@ class BenchmarkTask:
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
         return ValidationResult(checks={"observable_output": bool(records)})
 
+    @classmethod
+    def check_endpoint(cls, endpoint: str | None, context: str) -> str:
+        chosen = endpoint if endpoint is not None else cls.default_endpoint
+        if not isinstance(chosen, str) or chosen not in cls.allowed_endpoints:
+            allowed = ", ".join(cls.allowed_endpoints)
+            raise ValueError(f"{context}.endpoint must be one of: {allowed}")
+        return chosen
 
-def apply_text_sampling(payload: dict[str, Any], sampling: SamplingConfig) -> None:
-    payload["temperature"] = sampling.temperature
-    payload["top_p"] = sampling.top_p
-    payload["ignore_eos"] = sampling.ignore_eos
-    for key in (
-        "top_k",
-        "min_p",
-        "repetition_penalty",
-        "frequency_penalty",
-        "presence_penalty",
-    ):
-        value = getattr(sampling, key)
-        if value is not None:
-            payload[key] = value
-    if sampling.sampling_seed is not None:
-        payload["seed"] = sampling.sampling_seed
-    payload.update(sampling.extra_body)
+    @classmethod
+    def check_question(cls, question: Any, context: str) -> str | None:
+        if question is None:
+            return None
+        if not cls.accepts_question:
+            raise ValueError(f"{context}.question is not valid for task {cls.name.value}")
+        if not isinstance(question, str) or not question:
+            raise ValueError(f"{context}.question must be a non-empty string")
+        return question
 
+    @classmethod
+    def check_image(cls, image: ImageConfig, context: str) -> None:
+        if cls.image_count is ImageCountRule.REQUIRED and image.image_count is None:
+            raise ValueError(f"{context} requires image.image_count")
+        if cls.image_count is ImageCountRule.FORBIDDEN and image.image_count is not None:
+            raise ValueError(f"{context} does not declare a per-request image count")
 
-def render_image_config(
-    image: ImageConfig,
-    example: Example,
-    *,
-    include_count: bool,
-    fallback_seed: int,
-) -> dict[str, Any]:
-    width = example.width if example.width is not None else image.width
-    height = example.height if example.height is not None else image.height
-    steps = example.steps if example.steps is not None else image.steps
-    seed = example.seed if example.seed is not None else fallback_seed
-    payload: dict[str, Any] = {"seed": int(seed)}
-    if include_count and image.image_count is not None:
-        payload["num_images"] = image.image_count
-    if width is not None and height is not None:
-        payload.update(width=int(width), height=int(height))
-    if steps is not None:
-        payload["steps"] = int(steps)
-    for key in (
-        "guidance_scale",
-        "image_guidance_scale",
-        "cfg_norm",
-        "timestep_shift",
-    ):
-        value = getattr(image, key)
-        if value is not None:
-            payload[key] = value
-    if image.cfg_interval is not None:
-        payload["cfg_interval"] = list(image.cfg_interval)
-    if example.aspect_ratio is not None:
-        payload["resolution"] = str(example.aspect_ratio)
-    return payload
+    def apply_text_sampling(self, payload: dict[str, Any]) -> None:
+        sampling = self.point.sampling
+        payload["temperature"] = sampling.temperature
+        payload["top_p"] = sampling.top_p
+        payload["ignore_eos"] = sampling.ignore_eos
+        for key in (
+            "top_k",
+            "min_p",
+            "repetition_penalty",
+            "frequency_penalty",
+            "presence_penalty",
+        ):
+            value = getattr(sampling, key)
+            if value is not None:
+                payload[key] = value
+        if sampling.sampling_seed is not None:
+            payload["seed"] = sampling.sampling_seed
+        payload.update(sampling.extra_body)
 
+    def image_fields(self, example: Example, *, include_count: bool) -> dict[str, Any]:
+        image = self.point.image
+        width = example.width if example.width is not None else image.width
+        height = example.height if example.height is not None else image.height
+        steps = example.steps if example.steps is not None else image.steps
+        seed = example.seed if example.seed is not None else self.point.load.seed
+        payload: dict[str, Any] = {"seed": int(seed)}
+        if include_count and image.image_count is not None:
+            payload["num_images"] = image.image_count
+        if width is not None and height is not None:
+            payload.update(width=int(width), height=int(height))
+        if steps is not None:
+            payload["steps"] = int(steps)
+        for key in (
+            "guidance_scale",
+            "image_guidance_scale",
+            "cfg_norm",
+            "timestep_shift",
+        ):
+            value = getattr(image, key)
+            if value is not None:
+                payload[key] = value
+        if image.cfg_interval is not None:
+            payload["cfg_interval"] = list(image.cfg_interval)
+        if example.aspect_ratio is not None:
+            payload["resolution"] = str(example.aspect_ratio)
+        return payload
 
-def apply_image_generations_fields(
-    payload: dict[str, Any],
-    image: ImageConfig,
-    example: Example,
-    *,
-    fallback_seed: int,
-) -> None:
-    rendered = render_image_config(
-        image, example, include_count=False, fallback_seed=fallback_seed
-    )
-    width = rendered.get("width")
-    height = rendered.get("height")
-    if width is not None and height is not None:
-        payload["size"] = f"{width}x{height}"
-    for key in (
-        "steps",
-        "seed",
-        "guidance_scale",
-        "image_guidance_scale",
-        "cfg_norm",
-        "timestep_shift",
-        "cfg_interval",
-    ):
-        if key in rendered:
-            payload[key] = rendered[key]
+    def apply_image_generations_fields(self, payload: dict[str, Any], example: Example) -> None:
+        rendered = self.image_fields(example, include_count=False)
+        width = rendered.get("width")
+        height = rendered.get("height")
+        if width is not None and height is not None:
+            payload["size"] = f"{width}x{height}"
+        for key in (
+            "steps",
+            "seed",
+            "guidance_scale",
+            "image_guidance_scale",
+            "cfg_norm",
+            "timestep_shift",
+            "cfg_interval",
+        ):
+            if key in rendered:
+                payload[key] = rendered[key]
 
+    def input_image_data_url(self, example: Example) -> str:
+        image_b64 = example.input_image_b64
+        if not isinstance(image_b64, str) or not image_b64:
+            raise ValueError("input image row has no base64 payload")
+        mime = example.input_image_mime or "image/png"
+        if not mime.startswith("image/"):
+            raise ValueError("input image row has an invalid MIME type")
+        return f"data:{mime};base64,{image_b64}"
 
-def image_integrity_checks(
-    records: Sequence[RequestRecord],
-    image: ImageConfig,
-) -> dict[str, bool]:
-    decoded_counts = all(record.images == len(record.decoded_images) for record in records)
-    dimensions = all(
-        (image.width is None or decoded.width == image.width)
-        and (image.height is None or decoded.height == image.height)
-        for record in records
-        for decoded in record.decoded_images
-    )
-    return {
-        "decoded_image_count": decoded_counts,
-        "image_dimensions": dimensions,
-    }
+    def image_integrity_checks(self, records: Sequence[RequestRecord]) -> dict[str, bool]:
+        image = self.point.image
+        decoded_counts = all(record.images == len(record.decoded_images) for record in records)
+        dimensions = all(
+            (image.width is None or decoded.width == image.width)
+            and (image.height is None or decoded.height == image.height)
+            for record in records
+            for decoded in record.decoded_images
+        )
+        return {
+            "decoded_image_count": decoded_counts,
+            "image_dimensions": dimensions,
+        }
 
+    def server_usage_ok(self, records: Sequence[RequestRecord]) -> bool:
+        return bool(records) and all(
+            record.output_len_source == "server_usage" and record.prompt_len_source == "server_usage"
+            for record in records
+        )
 
-def input_image_data_url(example: Example) -> str:
-    image_b64 = example.input_image_b64
-    if not isinstance(image_b64, str) or not image_b64:
-        raise ValueError("input image row has no base64 payload")
-    mime = example.input_image_mime or "image/png"
-    if not mime.startswith("image/"):
-        raise ValueError("input image row has an invalid MIME type")
-    return f"data:{mime};base64,{image_b64}"
-
-
-def server_usage_check(records: Sequence[RequestRecord]) -> bool:
-    return bool(records) and all(
-        record.output_len_source == "server_usage" and record.prompt_len_source == "server_usage"
-        for record in records
-    )
-
-
-def fixed_output_length_check(records: Sequence[RequestRecord]) -> bool:
-    return bool(records) and all(
-        record.requested_output_len > 0
-        and record.output_len == record.requested_output_len
-        and record.finish_reason == "length"
-        for record in records
-    )
+    def fixed_output_length_ok(self, records: Sequence[RequestRecord]) -> bool:
+        return bool(records) and all(
+            record.requested_output_len > 0
+            and record.output_len == record.requested_output_len
+            and record.finish_reason == "length"
+            for record in records
+        )

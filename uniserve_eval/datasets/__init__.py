@@ -2,19 +2,42 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..registry import get_dataset
 from ..types import BenchmarkPoint, Example
-from . import _registry
+from .base import Dataset
+from .beans import BeansDataset
+from .jsonl import JsonlDataset
+from .mjhq import MJHQDataset
+from .pie_bench import PieBenchDataset
+from .sharegpt import ShareGPTDataset
+from .ueval import UEvalDataset
 
-_ = _registry
+DATASETS: dict[str, type[Dataset]] = {
+    "sharegpt": ShareGPTDataset,
+    "mjhq": MJHQDataset,
+    "beans": BeansDataset,
+    "ueval": UEvalDataset,
+    "pie-bench": PieBenchDataset,
+    "jsonl": JsonlDataset,
+}
+
+
+def get_dataset(name: str) -> type[Dataset]:
+    if name not in DATASETS:
+        known = ", ".join(sorted(DATASETS)) or "(none)"
+        raise KeyError(f"unknown dataset {name!r}; known: {known}")
+    return DATASETS[name]
+
+
+def list_datasets() -> tuple[type[Dataset], ...]:
+    return tuple(DATASETS[name] for name in sorted(DATASETS))
 
 
 def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
-    spec = get_dataset(point.dataset)
-    if spec.requires_path and not point.dataset_path:
+    dataset_cls = get_dataset(point.dataset)
+    if dataset_cls.requires_path and not point.dataset_path:
         raise ValueError(f"dataset {point.dataset!r} requires dataset_path")
     tokenizer: Any | None = None
-    if spec.requires_tokenizer:
+    if dataset_cls.requires_tokenizer:
         if not point.tokenizer and not point.model:
             raise ValueError(f"dataset {point.dataset!r} requires tokenizer")
         from transformers import AutoTokenizer
@@ -23,10 +46,25 @@ def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
             point.tokenizer or point.model,
             trust_remote_code=True,
         )
-    rows = spec.loader(point, tokenizer)
+    rows = dataset_cls(point).load(tokenizer)
     if len(rows) != point.load.num_prompts:
         raise ValueError(
             f"dataset resolved {len(rows)} rows; benchmark contract requires "
             f"exactly {point.load.num_prompts}"
         )
     return rows, tokenizer
+
+
+__all__ = [
+    "DATASETS",
+    "BeansDataset",
+    "Dataset",
+    "JsonlDataset",
+    "MJHQDataset",
+    "PieBenchDataset",
+    "ShareGPTDataset",
+    "UEvalDataset",
+    "get_dataset",
+    "list_datasets",
+    "load_examples",
+]

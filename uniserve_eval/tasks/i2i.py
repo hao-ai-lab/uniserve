@@ -1,25 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import ClassVar
 
-from ..types import Example, RequestRecord, TaskRequest, ValidationResult
-from .base import (
-    BenchmarkTask,
-    apply_text_sampling,
-    image_integrity_checks,
-    input_image_data_url,
-    render_image_config,
-)
+from ..types import Example, RequestRecord, TaskName, TaskRequest, ValidationResult
+from .base import BenchmarkTask, ImageCountRule
 
 
 class I2ITask(BenchmarkTask):
+    name: ClassVar[TaskName] = TaskName.I2I
+    default_stream: ClassVar[bool] = False
+    accepts_image: ClassVar[bool] = True
+    image_count: ClassVar[ImageCountRule] = ImageCountRule.OPTIONAL
+
     def build_request(self, example: Example) -> TaskRequest:
-        image_config = render_image_config(
-            self.point.image,
-            example,
-            include_count=self.point.image.image_count is not None,
-            fallback_seed=self.point.load.seed,
-        )
         payload: dict[str, object] = {
             "model": self.point.model,
             "modalities": ["image"],
@@ -28,17 +22,20 @@ class I2ITask(BenchmarkTask):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": example.prompt},
-                        {"type": "image_url", "image_url": {"url": input_image_data_url(example)}},
+                        {"type": "image_url", "image_url": {"url": self.input_image_data_url(example)}},
                     ],
                 }
             ],
-            "image_config": image_config,
+            "image_config": self.image_fields(
+                example,
+                include_count=self.point.image.image_count is not None,
+            ),
         }
-        apply_text_sampling(payload, self.point.sampling)
+        self.apply_text_sampling(payload)
         return TaskRequest(self.point.endpoint, payload, stream=False)
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
-        checks = image_integrity_checks(records, self.point.image)
+        checks = self.image_integrity_checks(records)
         checks["image_output"] = bool(records) and all(record.images > 0 for record in records)
         if self.point.image.image_count is not None:
             checks["exact_image_count"] = all(

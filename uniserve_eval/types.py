@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 CHAT_COMPLETIONS = "/v1/chat/completions"
 IMAGES_GENERATIONS = "/v1/images/generations"
@@ -178,6 +179,115 @@ class RequestRecord:
     finish_reason: str | None = None
     stop_reason: str | None = None
 
+    def begin(
+        self,
+        *,
+        endpoint: str,
+        scheduled_time: float | None,
+        requested_output_len: int,
+    ) -> None:
+        self.endpoint = endpoint
+        self.scheduled_time = scheduled_time
+        self.requested_output_len = requested_output_len
+        self.start_time = time.perf_counter()
+
+    def note_http(self, status_code: int) -> None:
+        self.http_response_time = time.perf_counter()
+        self.status_code = status_code
+
+    def close_now(self) -> None:
+        now = time.perf_counter()
+        self.latency = now - self.start_time
+        self.final_event_time = now
+
+    def close_at(self, timestamp: float) -> None:
+        self.final_event_time = timestamp
+        self.latency = timestamp - self.start_time
+
+    def mark_failure(self, classifier: str, error: str | None = None) -> None:
+        self.success = False
+        self.classifier = classifier
+        if error is not None:
+            self.error = error
+
+    def mark_success(self) -> None:
+        self.success = True
+        self.classifier = "ok"
+
+    def mark_transport_exception(self, error: BaseException) -> None:
+        self.close_now()
+        self.mark_failure("transport_failure", f"{type(error).__name__}: {error}")
+
+    def apply_choice_metadata(self, choice: dict[str, Any]) -> None:
+        finish_reason = choice.get("finish_reason")
+        if isinstance(finish_reason, str):
+            self.finish_reason = finish_reason
+        stop_reason = choice.get("stop_reason")
+        if isinstance(stop_reason, str):
+            self.stop_reason = stop_reason
+
+    def apply_usage(self, usage: dict[str, Any]) -> None:
+        if isinstance(usage.get("completion_tokens"), int):
+            self.output_len = int(usage["completion_tokens"])
+            self.output_len_source = "server_usage"
+        if isinstance(usage.get("prompt_tokens"), int):
+            self.prompt_len = int(usage["prompt_tokens"])
+            self.prompt_len_source = "server_usage"
+        steps = usage.get("image_steps_per_image")
+        if isinstance(steps, list) and all(_is_token_count(step) for step in steps):
+            self.image_steps = [int(step) for step in steps]
+
+    def apply_cached_prompt_tokens(self, payload: dict[str, Any]) -> None:
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return
+        details = usage.get("prompt_tokens_details")
+        if not isinstance(details, dict):
+            return
+        cached = details.get("cached_tokens")
+        if _is_token_count(cached):
+            self.cached_prompt_tokens = int(cached)
+            self.cached_prompt_tokens_source = "openai_usage_prompt_tokens_details"
+
+    def apply_token_fallbacks(self, *, prompt_len: int, output_len_fallback: int) -> None:
+        if self.output_len_source != "server_usage":
+            self.output_len = output_len_fallback
+        if self.prompt_len_source != "server_usage":
+            self.prompt_len = prompt_len
+
+    def add_text(
+        self,
+        content: str,
+        timestamp: float | None,
+        *,
+        last_text_time: float | None,
+        count_itl: bool,
+    ) -> None:
+        self.token_timing_available = True
+        self.generated_text += content
+        if timestamp is None:
+            return
+        if last_text_time is None:
+            self.ttft = timestamp - self.start_time
+            self.first_text_time = timestamp
+        elif count_itl:
+            self.itl.append(timestamp - last_text_time)
+
+    def add_image_arrival(self, count: int, timestamp: float | None) -> None:
+        if timestamp is None:
+            return
+        latency = timestamp - self.start_time
+        if self.first_image_latency is None:
+            self.first_image_latency = latency
+            self.first_image_done_time = timestamp
+        self.image_latencies.extend([latency] * count)
+
+    def attach_images(self, decoded: list[DecodedImage], *, assign_json_latency: bool = False) -> None:
+        self.decoded_images = decoded
+        self.images = len(decoded)
+        if assign_json_latency and decoded:
+            self.image_latencies = [self.latency] * self.images
+
     def record_dict(self) -> dict[str, Any]:
         generated_text_bytes = self.generated_text.encode("utf-8")
         http_response = (
@@ -319,6 +429,10 @@ class ValidationResult:
 class RunResult:
     summary: dict[str, Any]
     output_dir: Path
+
+
+def _is_token_count(value: Any) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def selected_rows_identity(rows: list[Example]) -> dict[str, Any]:

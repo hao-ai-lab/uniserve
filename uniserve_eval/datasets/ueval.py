@@ -6,23 +6,28 @@ import importlib
 import json
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from ..types import BenchmarkPoint, Example
+from .base import Dataset
 
 UEVAL_HF_REPO = "zlab-princeton/UEval"
 _PROMPT_FIELDS = ("prompt", "question", "instruction", "input", "query", "text")
 
 
-def load_ueval(point: BenchmarkPoint, _tokenizer: Any) -> list[Example]:
-    raw = _load_local(point.dataset_path) if point.dataset_path else _load_hf(point)
-    prompts = [prompt for entry in raw if (prompt := _extract_prompt(entry))]
-    random.Random(point.load.seed).shuffle(prompts)
-    prompts = prompts[: point.load.num_prompts]
-    return [
-        Example(id=f"ueval-{index:06d}", prompt=prompt)
-        for index, prompt in enumerate(prompts)
-    ]
+class UEvalDataset(Dataset):
+    name: ClassVar[str] = "ueval"
+
+    def load(self, tokenizer: Any | None = None) -> list[Example]:
+        point = self.point
+        raw = _load_local(point.dataset_path) if point.dataset_path else _load_hf(point)
+        prompts = [prompt for entry in raw if (prompt := _extract_prompt(entry))]
+        random.Random(point.load.seed).shuffle(prompts)
+        prompts = prompts[: point.load.num_prompts]
+        return [
+            Example(id=f"ueval-{index:06d}", prompt=prompt)
+            for index, prompt in enumerate(prompts)
+        ]
 
 
 def _load_local(dataset_path: str) -> list[dict[str, Any]]:
