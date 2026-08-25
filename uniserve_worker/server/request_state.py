@@ -34,11 +34,8 @@ class RequestRuntime:
     rng_counter: int
     latent_product: ProductRef | None
     flow_step: int
-    kv_reserved_len: int
-    kv_initialized_len: int
     kv_visible_len: int
-    kv_committed_len: int
-    kv_published_len: int
+    kv_computed_len: int
 
     def __post_init__(self) -> None:
         if self.logical_position < 0 or self.rng_counter < 0 or self.flow_step < 0:
@@ -49,23 +46,13 @@ class RequestRuntime:
         ):
             raise invalid_descriptor("resolved request latent identity is invalid")
         if not isinstance(self.kv_visible_len, int):
-            if not callable(getattr(self.kv_visible_len, "ready", None)) or not (
-                0
-                <= self.kv_published_len
-                <= self.kv_committed_len
-                <= self.kv_initialized_len
-                <= self.kv_reserved_len
+            if (
+                not callable(getattr(self.kv_visible_len, "ready", None))
+                or self.kv_computed_len < 0
             ):
                 raise invalid_descriptor("resolved request deferred KV extent is invalid")
             return
-        if not (
-            0
-            <= self.kv_published_len
-            <= self.kv_committed_len
-            <= self.kv_visible_len
-            <= self.kv_initialized_len
-            <= self.kv_reserved_len
-        ):
+        if not (0 <= self.kv_visible_len <= self.kv_computed_len):
             raise invalid_descriptor("resolved request KV extents are not contained")
 
 
@@ -519,7 +506,7 @@ class RequestTable:
 
     def _admission_row(self, admission: Admission) -> RequestRow:
         slot = self._validate_slot(admission.request_pool_idx)
-        prefix_len = 0 if admission.und is None else int(admission.und.kv.prefix_len)
+        prefix_len = 0 if admission.und is None else int(admission.und.initial_position)
         row = RequestRow(
             request_key=admission.request_key,
             request_pool_idx=slot,
@@ -542,11 +529,8 @@ class RequestTable:
             rng_counter=0,
             latent_product=None,
             flow_step=0,
-            kv_reserved_len=prefix_len,
-            kv_initialized_len=prefix_len,
             kv_visible_len=prefix_len,
-            kv_committed_len=prefix_len,
-            kv_published_len=0,
+            kv_computed_len=prefix_len,
         )
         return row
 

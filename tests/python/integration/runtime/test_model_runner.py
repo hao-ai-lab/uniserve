@@ -30,8 +30,8 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
+    BlockTable,
     Bounds,
-    CacheGroupPlacement,
     Commit,
     DeviceDim,
     DevicePoint,
@@ -40,7 +40,6 @@ from uniserve_worker.batch import (
     ErrorCode,
     GenAdmission,
     ImageParams,
-    KvPlacement,
     Operation,
     OpStatus,
     PointRange,
@@ -311,17 +310,11 @@ def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() 
         outputs=template.outputs,
         predicate=template.predicate,
     )
-    invalid_placement = KvPlacement(
-        request_key=operation.request_key,
-        op_id=operation.op_id,
+    invalid_table = BlockTable(
+        request_pool_idx=admission.request_pool_idx,
         group_id=0,
-        block_table=(),
-        block_table_update=True,
-        pages_to_zero=(),
-        prefix_length=2,
-        input_length=1,
-        visible_length=2,
-        resulting_length=3,
+        page_ids=(),
+        allocated_tokens=0,
     )
 
     report = finalize_completion_report(
@@ -329,7 +322,7 @@ def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() 
             execution_batch(
                 step_id=2,
                 operations=(operation,),
-                kv_placements=(invalid_placement,),
+                block_tables=(invalid_table,),
             )
         )
     )
@@ -378,28 +371,13 @@ def test_decode_reuses_the_published_request_page_table() -> None:
         domain=template.domain,
         bounds=template.bounds,
         outputs=template.outputs,
-        kv_capacity_pages=1,
         predicate=template.predicate,
     )
-    placement = KvPlacement(
-        request_key=operation.request_key,
-        op_id=operation.op_id,
-        group_id=0,
-        block_table=(),
-        block_table_update=False,
-        pages_to_zero=(),
-        prefix_length=2,
-        input_length=1,
-        visible_length=2,
-        resulting_length=3,
-    )
-
     report = finalize_completion_report(
         worker.execute(
             execution_batch(
                 step_id=2,
                 operations=(operation,),
-                kv_placements=(placement,),
             )
         )
     )
@@ -712,13 +690,14 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         partitions=tuple(
             replace(
                 partition,
-                kv_branch_placements=tuple(
+                forward_rows=tuple(
                     replace(
-                        placement,
-                        block_table=placement.block_table[:1],
-                        pages_to_zero=placement.pages_to_zero[:1],
+                        row,
+                        seq_len=1,
                     )
-                    for placement in partition.kv_branch_placements
+                    if row.request_pool_index != admission.request_pool_idx
+                    else row
+                    for row in partition.forward_rows
                 ),
             )
             for partition in valid_batch.partitions
@@ -1190,7 +1169,14 @@ def test_snapshot_restore_preserves_an_active_trajectory_and_final_artifact(tmp_
     placement = RecoveryPlacement(
         request_key=admission.request_key,
         request_pool_idx=admission.request_pool_idx,
-        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(), length=0),),
+        block_tables=(
+            BlockTable(
+                request_pool_idx=admission.request_pool_idx,
+                group_id=0,
+                page_ids=(),
+                allocated_tokens=0,
+            ),
+        ),
         latent_page_table=(1,),
     )
     reference = worker.snapshot_session(placement)
@@ -1387,7 +1373,6 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
             bounds=consume.bounds,
             inputs=(*consume.inputs, transferred),
             outputs=consume.outputs,
-            kv_capacity_pages=consume.kv_capacity_pages,
             predicate=transferred,
             rng=consume.rng,
             control_seq=consume.control_seq,
@@ -1797,7 +1782,6 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         bounds=state.bounds,
         inputs=(*state.inputs, sampling_product),
         outputs=(*state.outputs, finish_product, transition_product),
-        kv_capacity_pages=state.kv_capacity_pages,
         predicate=state.predicate,
         rng=state.rng,
         control_seq=state.control_seq,

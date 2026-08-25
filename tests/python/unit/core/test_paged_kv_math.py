@@ -55,8 +55,8 @@ def test_fused_paged_kv_write_replays_dynamic_rows_in_cuda_graph():
     v_current = v_storage[:, 24 : 24 + row_width].view(rows, heads, head_dim)
     assert not k_current.is_contiguous()
     assert not v_current.is_contiguous()
-    page_ids = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
-    offsets = torch.tensor([1, 3, 0], dtype=torch.int32, device=device)
+    page_ids = torch.tensor([-1, 2, 4], dtype=torch.int32, device=device)
+    offsets = torch.tensor([0, 3, 0], dtype=torch.int32, device=device)
 
     with torch.inference_mode():
         assert paged_kv_math._triton_paged_kv_write_eligible(
@@ -102,7 +102,7 @@ def test_fused_paged_kv_write_replays_dynamic_rows_in_cuda_graph():
         device=device,
         generator=generator,
     )
-    replay_page_ids = torch.tensor([3, 1, 4], dtype=torch.int32, device=device)
+    replay_page_ids = torch.tensor([3, -1, 4], dtype=torch.int32, device=device)
     replay_offsets = torch.tensor([2, 0, 3], dtype=torch.int32, device=device)
     k_cache.copy_(initial_k)
     v_cache.copy_(initial_v)
@@ -113,9 +113,17 @@ def test_fused_paged_kv_write_replays_dynamic_rows_in_cuda_graph():
 
     expected_k = initial_k.clone()
     expected_v = initial_v.clone()
-    flat_index = (replay_page_ids * page_size + replay_offsets).to(dtype=torch.int64)
-    expected_k.view(-1, heads, head_dim).index_copy_(0, flat_index, replay_k)
-    expected_v.view(-1, heads, head_dim).index_copy_(0, flat_index, replay_v)
+    persisted_rows = torch.tensor([0, 2], dtype=torch.int64, device=device)
+    flat_index = (
+        replay_page_ids.index_select(0, persisted_rows) * page_size
+        + replay_offsets.index_select(0, persisted_rows)
+    ).to(dtype=torch.int64)
+    expected_k.view(-1, heads, head_dim).index_copy_(
+        0, flat_index, replay_k.index_select(0, persisted_rows)
+    )
+    expected_v.view(-1, heads, head_dim).index_copy_(
+        0, flat_index, replay_v.index_select(0, persisted_rows)
+    )
     graph.replay()
     torch.cuda.synchronize()
 

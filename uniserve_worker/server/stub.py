@@ -13,9 +13,6 @@ from ..bootstrap.capacity import (
 from ..execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
-    PackedAttentionPlan,
-    PagedDecodePlan,
-    PagedVarlenPlan,
     TokenSelection,
 )
 from ..models.generation import BranchSource, GenerationPipeline, LatentLayout, Materialization
@@ -32,17 +29,16 @@ from ..models.runtime import (
     ExecutionModel,
     PositionLayout,
     ResourceGeometry,
-    ScratchGeometry,
     WorkerDeployment,
 )
 from ..nn.diffusion.cfg import CfgRecipe
 from ..nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
+from ..runtime.cache_pool import CachePool
 
 STUB_EOS_TOKEN_ID = 151645
 STUB_IMG_START_TOKEN_ID = 151670
 STUB_NUM_BLOCKS = 4096
 STUB_NUM_LAYERS = 1
-STUB_SCRATCH_TOKENS = 65536
 STUB_MAX_LATENT_SIZE = 1024
 STUB_LATENT_DOWNSAMPLE = 16
 _STUB_VOCAB_SIZE = STUB_IMG_START_TOKEN_ID + 1
@@ -69,7 +65,6 @@ def stub_deployment(
         tp_size=1,
         block_size=int(block_size),
         kv_token_capacity=int(block_size) * STUB_NUM_BLOCKS,
-        generation_kv_capacity_tokens=None,
         attention_backend="torch_sdpa",
         model_dtype="bfloat16",
         kv_cache_dtype=None,
@@ -142,7 +137,6 @@ class StubModel(ExecutionModel):
         self.resource_geometry = ResourceGeometry(
             encoder_cache_entries=1024,
             latent_downsample=STUB_LATENT_DOWNSAMPLE,
-            scratch=ScratchGeometry(fixed_tokens=STUB_SCRATCH_TOKENS),
         )
         self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
         self.supported_work = frozenset(WorkVariant)
@@ -151,6 +145,10 @@ class StubModel(ExecutionModel):
         self.text_max_tokens = STUB_MAX_LATENT_SIZE
         self.text_topology = ("tp",)
         self.tensorized_mixed = True
+        self._cache_pool: CachePool | None = None
+
+    def bind_cache_pool(self, cache_pool: CachePool) -> None:
+        self._cache_pool = cache_pool
 
     @torch.inference_mode()
     def forward(
@@ -159,41 +157,20 @@ class StubModel(ExecutionModel):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        query_tokens = sum(forward_batch.query_lens) + sum(forward_batch.flow_image_tokens)
+        query_tokens = sum(forward_batch.query_lens_cpu)
         device = positions.device
         if query_tokens < 1:
             raise ValueError("stub text/denoise forward requires query tokens")
         kv = torch.zeros((query_tokens, 1, 1), dtype=torch.bfloat16, device=device)
-        attention = forward_batch.attention
-        if isinstance(attention, PagedDecodePlan):
-            forward_batch.kv.append(0, kv.unsqueeze(1), kv.unsqueeze(1))
-        elif isinstance(attention, PagedVarlenPlan):
-            forward_batch.kv.append_varlen(
-                0,
-                kv,
-                kv,
-                attention.query_lens_cpu,
-                block_table=attention.block_table,
-                cache_seqlens=attention.cache_seqlens,
-                query_offsets=attention.cu_seqlens_q,
-            )
-        elif isinstance(attention, PackedAttentionPlan):
-            forward_batch.kv.append_packed(
-                0,
-                kv,
-                kv,
-                page_ids=attention.write_page_ids,
-                page_offsets=attention.write_page_offsets,
-                token_indices=attention.write_token_indices,
-            )
-        else:
-            raise TypeError("stub text/denoise forward requires paged attention")
+        if self._cache_pool is None:
+            raise RuntimeError("stub model has no bound physical cache")
+        self._cache_pool.write_locations(0, forward_batch.out_cache_loc, kv, kv)
 
         chunks: list[torch.Tensor | None] = [None] * forward_batch.row_count
         token_offset = 0
         for row_index, count in zip(
             forward_batch.token_row_indices,
-            forward_batch.query_lens,
+            tuple(forward_batch.query_lens_cpu[index] for index in forward_batch.token_row_indices),
             strict=True,
         ):
             row_positions = positions[..., token_offset : token_offset + count]
@@ -224,7 +201,7 @@ class StubModel(ExecutionModel):
         row_lengths = [0] * forward_batch.row_count
         for row_index, count in zip(
             forward_batch.token_row_indices,
-            forward_batch.query_lens,
+            tuple(forward_batch.query_lens_cpu[index] for index in forward_batch.token_row_indices),
             strict=True,
         ):
             row_lengths[row_index] = count
@@ -245,7 +222,10 @@ class StubModel(ExecutionModel):
         if forward_batch.input_ids is not None:
             for row_index, count in zip(
                 forward_batch.token_row_indices,
-                forward_batch.query_lens,
+                tuple(
+                    forward_batch.query_lens_cpu[index]
+                    for index in forward_batch.token_row_indices
+                ),
                 strict=True,
             ):
                 token_ids[row_index] = forward_batch.input_ids[token_offset : token_offset + count]

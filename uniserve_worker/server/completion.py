@@ -22,8 +22,8 @@ from ..batch import (
     VersionRef,
 )
 from ..batch import ErrorCode as ProtocolErrorCode
-from ..runtime.device import canonical_device
 from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
+from ..runtime.device import canonical_device
 from ..runtime.device_events import DeviceEventPool
 from ..transfer.tickets import (
     TRANSFER_DESCRIPTOR_PREFIX,
@@ -1539,21 +1539,15 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
         type(value) is not int
         for value in (
             lengths.kv_visible_len,
+            lengths.kv_computed_len,
             lengths.latent_len,
-            lengths.kv_reserved_len,
-            lengths.kv_initialized_len,
-            lengths.kv_committed_len,
-            lengths.kv_published_len,
         )
     ):
         lengths = LogicalLengths(
             token_len=int(lengths.token_len),
             kv_visible_len=int(lengths.kv_visible_len),
+            kv_computed_len=int(lengths.kv_computed_len),
             latent_len=int(lengths.latent_len),
-            kv_reserved_len=int(lengths.kv_reserved_len),
-            kv_initialized_len=int(lengths.kv_initialized_len),
-            kv_committed_len=int(lengths.kv_committed_len),
-            kv_published_len=int(lengths.kv_published_len),
         )
     if type(span.base) is not int or type(span.len) is not int:
         span = TokenSpan(base=int(span.base), len=int(span.len))
@@ -1608,11 +1602,8 @@ def _predicated_record(
         logical_lengths=LogicalLengths(
             token_len=runtime.logical_position,
             kv_visible_len=runtime.kv_visible_len,
+            kv_computed_len=runtime.kv_computed_len,
             latent_len=0,
-            kv_reserved_len=runtime.kv_reserved_len,
-            kv_initialized_len=runtime.kv_initialized_len,
-            kv_committed_len=runtime.kv_committed_len,
-            kv_published_len=runtime.kv_published_len,
         ),
         token_span=replace(record.token_span, len=0),
         committed_tokens=(),

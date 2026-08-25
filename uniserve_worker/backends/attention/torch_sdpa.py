@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from ...execution.forward_batch import ForwardBatch
-from .base import AttentionCapabilities
+from .base import AttentionCapabilities, merge_attention_states
 
 __all__ = [
     "TorchSDPAAttentionBackend",
@@ -24,6 +24,7 @@ class TorchSDPAAttentionBackend:
             varlen_attention=True,
             varlen_paged_kv=True,
             visible_end=True,
+            segmented_attention=True,
             visible_end_cuda_graph=True,
             dense_ranks=frozenset({3, 4}),
             accepts_dense_mask=True,
@@ -61,12 +62,11 @@ class TorchSDPAAttentionBackend:
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
-        plan = None if context is None else context.attention
-        base_lens = getattr(plan, "cache_seqlens_cpu", None)
+        plan = context
+        base_lens = getattr(plan, "seq_lens_cpu", None)
         if base_lens is None:
             raise ValueError(
-                "torch_sdpa paged decode requires a plan carrying host-known "
-                "cache_seqlens_cpu instead of a device cache-length tensor"
+                "torch_sdpa paged decode requires host-known sequence lengths"
             )
         del cache_seqlens
         lengths = tuple(int(value) for value in base_lens)
@@ -93,7 +93,7 @@ class TorchSDPAAttentionBackend:
                     raise ValueError("current paged K/V length must match its query length")
                 _write_paged_row(k_cache, block_table[index], cache_len, key)
                 _write_paged_row(v_cache, block_table[index], cache_len, value)
-            live_len = cache_len + query.shape[0]
+            live_len = cache_len + (query.shape[0] if current_k is not None else 0)
             keys = _read_paged_row(k_cache, block_table[index], live_len)
             values = _read_paged_row(v_cache, block_table[index], live_len)
             outputs.append(
@@ -107,6 +107,82 @@ class TorchSDPAAttentionBackend:
                 )
             )
         return restore(outputs)
+
+    def forward_segmented(
+        self,
+        q: torch.Tensor,
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        visible_current_end: torch.Tensor,
+        scale: float,
+        fully_visible_current: bool,
+        context: ForwardBatch | None = None,
+    ) -> torch.Tensor:
+        if q.ndim != 3 or current_k.shape != current_v.shape or current_k.ndim != 3:
+            raise ValueError("segmented attention expects packed current Q/K/V tensors")
+        plan = context
+        query_lens = getattr(plan, "query_lens_cpu", None)
+        if query_lens is None:
+            offsets = _validated_offsets(cu_seqlens_q, int(q.shape[0]), "query")
+            query_lens = tuple(right - left for left, right in zip(offsets, offsets[1:]))
+        else:
+            offsets = _offsets_from_lengths(query_lens)
+        host_prefix_lens = getattr(plan, "seq_lens_cpu", None)
+        if host_prefix_lens is None:
+            host_prefix_lens = _integer_values(prefix_lens, "prefix lengths")
+        if (
+            offsets[-1] != int(q.shape[0])
+            or int(current_k.shape[0]) != int(q.shape[0])
+            or len(host_prefix_lens) != len(query_lens)
+            or int(page_table.shape[0]) != len(query_lens)
+        ):
+            raise ValueError("segmented attention rows are not aligned")
+        outputs: list[torch.Tensor] = []
+        for row, (begin, end, prefix_len) in enumerate(
+            zip(offsets[:-1], offsets[1:], host_prefix_lens, strict=True)
+        ):
+            query = q[begin:end]
+            dense_key = current_k[begin:end]
+            dense_value = current_v[begin:end]
+            if fully_visible_current:
+                current_mask = None
+            else:
+                visible = visible_current_end[row, : end - begin].to(
+                    device=q.device, dtype=torch.int64
+                )
+                positions = torch.arange(end - begin, device=q.device)
+                current_mask = positions.unsqueeze(0) < visible.unsqueeze(1)
+            current_output, current_lse = _attention_state(
+                query,
+                dense_key,
+                dense_value,
+                scale=scale,
+                allowed=current_mask,
+            )
+            prefix_key = _read_paged_row(prefix_k, page_table[row], int(prefix_len))
+            prefix_value = _read_paged_row(prefix_v, page_table[row], int(prefix_len))
+            prefix_output, prefix_lse = _attention_state(
+                query,
+                prefix_key,
+                prefix_value,
+                scale=scale,
+                allowed=None,
+            )
+            outputs.append(
+                merge_attention_states(
+                    current_output,
+                    current_lse,
+                    prefix_output,
+                    prefix_lse,
+                )[0]
+            )
+        return torch.cat(outputs, dim=0)
 
     def forward_varlen(
         self,
@@ -129,15 +205,14 @@ class TorchSDPAAttentionBackend:
                 "portable varlen attention expects packed [tokens, heads, dim] queries"
             )
         if block_table is not None:
-            # Paged varlen carries a PagedVarlenPlan whose host-mirrored per-row
-            # query/key lengths give the packed offsets without reading the
-            # device ``cu_seqlens`` tensors back to the host.
-            plan = None if context is None else context.attention
+            # Host-mirrored query/key lengths give the packed offsets without
+            # reading device cumulative-length tensors back to the host.
+            plan = context
             query_lens = getattr(plan, "query_lens_cpu", None)
-            kv_lens = getattr(plan, "kv_seqlens_cpu", None)
+            kv_lens = getattr(plan, "kv_lens_cpu", None)
             if query_lens is None or kv_lens is None:
                 raise ValueError(
-                    "torch_sdpa paged varlen requires a plan carrying host-known "
+                    "torch_sdpa paged varlen requires host-known "
                     "query_lens_cpu and kv_seqlens_cpu"
                 )
             q_offsets = _offsets_from_lengths(query_lens)
@@ -191,9 +266,9 @@ class TorchSDPAAttentionBackend:
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
         del max_seqlen_q, max_seqlen_k, use_prefix_bounds
-        plan = None if context is None else context.attention
+        plan = context
         query_lens = getattr(plan, "query_lens_cpu", None)
-        key_lens = getattr(plan, "key_lens_cpu", None)
+        key_lens = getattr(plan, "kv_lens_cpu", None)
         if q.ndim == 3:
             if query_lens is None:
                 if cu_seqlens_q is None:
@@ -348,6 +423,28 @@ def _expand_gqa(
         return k, v
     rep = n_heads // n_kv_heads
     return k.repeat_interleave(rep, dim=head_axis), v.repeat_interleave(rep, dim=head_axis)
+
+
+def _attention_state(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    scale: float,
+    allowed: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key, value = _expand_gqa(key, value, int(query.shape[1]), head_axis=1)
+    if int(key.shape[0]) == 0:
+        return query.new_zeros(query.shape), query.new_full(query.shape[:2], float("-inf"))
+    scores = torch.einsum("qhd,khd->qhk", query.float(), key.float()) * float(scale)
+    if allowed is not None:
+        if tuple(allowed.shape) != (int(query.shape[0]), int(key.shape[0])):
+            raise ValueError("segmented attention visibility does not match current K/V")
+        scores.masked_fill_(~allowed.unsqueeze(1), float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    probabilities = torch.softmax(scores, dim=-1).to(value.dtype)
+    output = torch.einsum("qhk,khd->qhd", probabilities, value)
+    return output.to(query.dtype), lse
 
 
 def _normalize_mask(mask: torch.Tensor | None, q: torch.Tensor) -> torch.Tensor | None:

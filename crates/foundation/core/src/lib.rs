@@ -18,7 +18,7 @@ pub use generation::{
     GenerationResourceBounds, GenerationResourceError, GenerationRuntimeCapabilities,
     ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPlacement,
     TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction, UndVisibility,
-    VisibilityPolicyDescriptor, denoise_scratch_tokens, encoder_cache_key,
+    VisibilityPolicyDescriptor, encoder_cache_key,
 };
 pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs, try_apply_sampling_counts};
 
@@ -363,7 +363,7 @@ pub struct ImageParams {
 
 impl ImageParams {
     /// Number of active classifier-free-guidance branches implied by the two
-    /// guidance axes. This is the authoritative scratch branch-slot bound.
+    /// guidance axes.
     pub fn cfg_branch_count(&self) -> u8 {
         let text_off = scale_approx(self.cfg_text_scale, 1.0);
         let image_off = scale_approx(self.cfg_img_scale, 1.0);

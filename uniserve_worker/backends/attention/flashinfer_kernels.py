@@ -6,8 +6,8 @@ from typing import Any
 import torch
 
 from ...foundation.env import env_optional_flag
-from ..triton import triton_available
 from ..paged_kv_math import decode_write_locations, paged_kv_write
+from ..triton import triton_available
 from .flashinfer_plan import _DecodePlanWorkspace, _PrefillPlanWorkspace
 
 try:  # pragma: no cover - optional Triton runtime.
@@ -232,7 +232,7 @@ def _decode_effective_seqlens(
     current_tokens = int(current_tokens)
     if current_tokens == 0:
         return cache_seqlens
-    shared = getattr(plan, "kv_seqlens", None)
+    shared = getattr(plan, "kv_lens", None)
     if (
         current_tokens == 1
         and isinstance(shared, torch.Tensor)
@@ -254,6 +254,14 @@ def _decode_write_locations_from_plan(
     device: torch.device,
     plan: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    locations = getattr(plan, "out_cache_loc", None)
+    if (
+        isinstance(locations, torch.Tensor)
+        and int(locations.shape[0]) >= int(batch_size)
+        and locations.device == device
+    ):
+        locations = locations[:batch_size].to(dtype=torch.int64)
+        return locations.div(page_size, rounding_mode="floor"), locations.remainder(page_size)
     page_ids = getattr(plan, "decode_page_ids", None)
     offsets = getattr(plan, "decode_page_offsets", None)
     if (

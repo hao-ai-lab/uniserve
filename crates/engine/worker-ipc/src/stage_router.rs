@@ -8,7 +8,7 @@
 //! producer publishes the bounded transfer descriptor, then submits the
 //! consumer before exposing the producer completion to the scheduler.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -37,6 +37,7 @@ struct PoolSubmission {
     controls: Vec<Control>,
     input_products: Vec<ProductPayload>,
     dependencies: Vec<ProductRef>,
+    collective_seqs: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -105,6 +106,9 @@ pub struct StageRouter {
     product_routes: HashMap<ProductRef, ProductRoute>,
     transfer_products: HashMap<ProductRef, ProductPayload>,
     pool_submissions: Vec<VecDeque<PoolSubmission>>,
+    pool_collective_seqs: Vec<Option<u64>>,
+    observed_collective_seqs: BTreeSet<u64>,
+    collective_frontier: u64,
     next_call_id: u64,
 }
 
@@ -178,6 +182,9 @@ impl StageRouter {
             product_routes: HashMap::new(),
             transfer_products: HashMap::new(),
             pool_submissions: (0..pool_count).map(|_| VecDeque::new()).collect(),
+            pool_collective_seqs: vec![None; pool_count],
+            observed_collective_seqs: BTreeSet::new(),
+            collective_frontier: 0,
             next_call_id: 1,
         })
     }
@@ -328,8 +335,6 @@ impl StageRouter {
             .map_or_else(String::new, |caps| caps.latent_dtype.clone());
         merged.latent_downsample = flow.as_ref().map_or(0, |caps| caps.latent_downsample);
         merged.max_cfg_branches = flow.as_ref().map_or(0, |caps| caps.max_cfg_branches);
-        merged.scratch_capacity_tokens =
-            flow.as_ref().map_or(0, |caps| caps.scratch_capacity_tokens);
         merged.max_vae_grid_tokens = routed_caps(WorkVariant::EncodeLatent)
             .as_ref()
             .map_or(0, |caps| caps.max_vae_grid_tokens);
@@ -472,10 +477,17 @@ impl StageRouter {
                 let ready = self.pool_submissions[pool_index]
                     .front()
                     .is_some_and(|submission| {
-                        submission
-                            .dependencies
-                            .iter()
-                            .all(|product| self.transfer_products.contains_key(product))
+                        let sequence_ready =
+                            submission.collective_seqs.first().is_none_or(|first| {
+                                *first <= self.collective_frontier
+                                    && self.pool_collective_seqs[pool_index]
+                                        .is_none_or(|previous| *first > previous)
+                            });
+                        sequence_ready
+                            && submission
+                                .dependencies
+                                .iter()
+                                .all(|product| self.transfer_products.contains_key(product))
                     });
                 if !ready {
                     continue;
@@ -506,6 +518,9 @@ impl StageRouter {
                     submission.controls,
                     submission.input_products,
                 )?;
+                if let Some(last) = submission.collective_seqs.last() {
+                    self.pool_collective_seqs[pool_index] = Some(*last);
+                }
                 progressed = true;
             }
             if !progressed {
@@ -907,13 +922,40 @@ impl Executor for StageRouter {
                 continue;
             }
             expected_pools |= Self::pool_bit(pool_index);
-            self.pool_submissions[pool_index].push_back(PoolSubmission {
+            let mut collective_seqs = partitions
+                .iter()
+                .map(|partition| partition.collective_seq)
+                .collect::<Vec<_>>();
+            collective_seqs.sort_unstable();
+            collective_seqs.dedup();
+            let submission = PoolSubmission {
                 step_id: batch.step_id,
                 partitions,
                 controls,
                 input_products,
                 dependencies,
-            });
+                collective_seqs,
+            };
+            let sequence = submission.collective_seqs.first().copied();
+            self.observed_collective_seqs
+                .extend(submission.collective_seqs.iter().copied());
+            while self
+                .observed_collective_seqs
+                .remove(&self.collective_frontier.saturating_add(1))
+            {
+                self.collective_frontier = self.collective_frontier.saturating_add(1);
+            }
+            let position = self.pool_submissions[pool_index]
+                .iter()
+                .position(
+                    |queued| match (sequence, queued.collective_seqs.first().copied()) {
+                        (Some(incoming), Some(existing)) => incoming < existing,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    },
+                )
+                .unwrap_or(self.pool_submissions[pool_index].len());
+            self.pool_submissions[pool_index].insert(position, submission);
         }
         self.pending.insert(
             batch.step_id,

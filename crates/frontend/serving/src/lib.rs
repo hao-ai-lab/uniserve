@@ -1154,8 +1154,6 @@ pub struct CacheAccounting {
 pub struct ResourceAccounting {
     pub expected_kv_tokens: u64,
     pub image_latent_units: u64,
-    pub scratch_units: u64,
-    pub host_scratch_tokens: u64,
     pub encoder_cache_pins: usize,
     pub replayable: bool,
 }

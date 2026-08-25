@@ -63,14 +63,16 @@ def _transition(runtime: object, state: OperationState) -> None:
         raise invalid_descriptor(
             "generation transition requires one exact conditioning input and latent output"
         )
-    cache_row = ops._cache_row(runtime, operation, partition)
+    cache = ops._cache_coordinates(runtime, operation, partition)
+    session = ops._request_row(runtime, partition, session_id)
     runtime.cache_publications.validate_conditioning(
         session_id,
         conditioning[0],
-        cache_row,
-        partition.cache_publication_inputs.get(conditioning[0]),
+        request_pool_idx=session.request_pool_idx,
+        group_id=cache[1],
+        visible_length=cache[2],
+        publication=partition.cache_publication_inputs.get(conditioning[0]),
     )
-    session = ops._request_row(runtime, partition, session_id)
     image = session.image
     if image is None:
         raise invalid_descriptor("generation transition has no admitted image parameters")
@@ -124,7 +126,7 @@ def _transition(runtime: object, state: OperationState) -> None:
     state.outcome = ops.Outcome(
         status=ops.OpStatus.OK,
         selected_point=1,
-        logical_lengths=ops._logical_lengths(runtime, operation, session, cache_row, latent_len=0),
+        logical_lengths=ops._logical_lengths(runtime, operation, session, cache, latent_len=0),
         token_span=TokenSpan(base=session.logical_position, len=0),
         finish_flags=FinishFlags(),
         product_generations=ops._output_generations(operation),
@@ -151,10 +153,13 @@ def _transfer(runtime: object, state: OperationState) -> None:
             raise invalid_descriptor("KV publication requires one KV output product")
         if any(reference.kind is ProductKind.KV for reference in operation.inputs):
             raise invalid_descriptor("KV publication is rooted only by its fixed parent")
-        row = ops._cache_row(runtime, operation, partition)
+        cache = ops._cache_coordinates(runtime, operation, partition)
+        request = ops._request_row(runtime, partition, session_id)
         expected_base = runtime.cache_publications.destination_base(session_id, "gen")
         snapshot = runtime.cache_publications.publish(
-            row,
+            request_pool_idx=request.request_pool_idx,
+            group_id=cache[1],
+            visible_length=cache[2],
             source_version=operation.parent,
             source_digest=point.semantic_digest,
             destination="gen",
@@ -163,7 +168,6 @@ def _transfer(runtime: object, state: OperationState) -> None:
             transport=transport,
         )
         partition.cache_publications.append((outputs[0], snapshot))
-        row.published_length = snapshot.published_extent
         for encoded in snapshot.locators:
             partition.published.append(Locator.from_wire_json(encoded))
         payload = _CompletionTransferPayload(
@@ -186,10 +190,12 @@ def _transfer(runtime: object, state: OperationState) -> None:
         outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
         if len(inputs) != 1 or len(outputs) != 1:
             raise invalid_descriptor("KV installation requires one input and one output")
-        row = ops._cache_row(runtime, operation, partition)
+        cache = ops._cache_coordinates(runtime, operation, partition)
+        request = ops._request_row(runtime, partition, session_id)
         prepared = partition.prepared_transfers.get(inputs[0])
         installed = runtime.cache_publications.install(
-            row,
+            request_pool_idx=request.request_pool_idx,
+            group_id=cache[1],
             session_id=session_id,
             source=inputs[0],
             installed_product=outputs[0],
@@ -198,11 +204,19 @@ def _transfer(runtime: object, state: OperationState) -> None:
             publication=partition.cache_publication_inputs.get(inputs[0]),
         )
         partition.cache_installations.append((inputs[0], outputs[0], installed))
-        state.outcome = encode.non_state_outcome(
+        outcome = encode.non_state_outcome(
             runtime,
             operation,
             partition,
             products=(ProductPayload(product=outputs[0], payload=b""),),
+        )
+        state.outcome = replace(
+            outcome,
+            logical_lengths=replace(
+                outcome.logical_lengths,
+                kv_visible_len=int(installed.published_extent),
+                kv_computed_len=int(installed.published_extent),
+            ),
         )
     else:
         inputs = tuple(reference for reference in operation.inputs if transferable(reference))

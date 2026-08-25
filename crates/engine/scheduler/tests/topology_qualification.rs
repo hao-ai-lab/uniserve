@@ -25,11 +25,12 @@ use uniserve_scheduler::{
 };
 use uniserve_worker_ipc::{MultiprocExecutor, WorkerLaunchConfig};
 use uniserve_worker_wire::{
-    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CloseReason, Control, DType,
-    DimBound, Disposition, Domain, ErrorCode, ExecutionCapability, KvAdmission, KvPlacement, OpId,
-    OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
-    RouteId, SamplingOwnership, ShapeBound, StorageClass, TRANSFER_DESCRIPTOR_PREFIX, TokenMode,
-    UndAdmission, VersionRef, Work, encode_token_product_bytes,
+    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
+    CloseReason, Control, DType, DimBound, Disposition, Domain, ErrorCode, ExecutionCapability,
+    ForwardRow, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
+    ProductRef, RequestKey, RouteId, SamplingOwnership, ShapeBound, StorageClass,
+    TRANSFER_DESCRIPTOR_PREFIX, TokenMode, UndAdmission, VersionRef, Work,
+    encode_token_product_bytes,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -816,7 +817,7 @@ fn text_admission(session_id: u64, epoch: u64, request_pool_idx: u32) -> anyhow:
             },
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
-            kv: KvAdmission::default(),
+            initial_position: 0,
         }),
         None,
     )
@@ -893,7 +894,6 @@ fn token_batch(
         },
         vec![input.clone()],
         vec![token_output, finish_output],
-        1,
         None,
         None,
         control_seq,
@@ -909,24 +909,27 @@ fn token_batch(
         attention: AttentionRegime::Causal,
         shape_class: 0,
         operations: vec![operation],
-        request_pool_indices: vec![request_pool_idx],
-        kv_placements: vec![KvPlacement {
-            request_key,
-            op_id,
+        block_tables: vec![BlockTable {
+            request_pool_idx,
             group_id: 0,
-            block_table: vec![page],
-            block_table_update: true,
-            pages_to_zero: if prefix_length == 0 {
-                vec![page]
-            } else {
-                Vec::new()
-            },
-            prefix_length,
-            input_length,
-            visible_length: prefix_length,
-            resulting_length: prefix_length + input_length,
+            page_ids: vec![page],
+            allocated_tokens: prefix_length + input_length,
         }],
-        kv_branch_placements: Vec::new(),
+        new_cache_pages: if prefix_length == 0 {
+            vec![CachePageAllocation {
+                request_pool_idx,
+                group_id: 0,
+                page_ids: vec![page],
+            }]
+        } else {
+            Vec::new()
+        },
+        forward_rows: vec![ForwardRow {
+            operation_index: 0,
+            request_pool_index: request_pool_idx,
+            seq_len: prefix_length,
+            query_len: input_length.max(1),
+        }],
         latent_placements: Vec::new(),
     };
     Batch::new(step_id, admission.into_iter().collect(), vec![partition]).with_input_products(vec![

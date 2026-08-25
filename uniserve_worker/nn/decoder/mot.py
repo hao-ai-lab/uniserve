@@ -12,8 +12,7 @@ import torch.nn as nn
 from ...execution.forward_batch import (
     ExpertRoute,
     ForwardBatch,
-    PackedAttentionPlan,
-    PagedDecodePlan,
+    ForwardMode,
     RouteSpan,
 )
 from ..attention import RadixAttention
@@ -393,17 +392,17 @@ class MoTModel(nn.Module):
         if inputs_embeds.ndim != 2:
             raise ValueError("MoT inputs must have shape [tokens, hidden]")
         token_count = int(inputs_embeds.shape[0])
-        attention = context.attention
         spans: tuple[RouteSpan, ...]
         temporal_positions: torch.Tensor
         causal: bool
-        if isinstance(attention, PackedAttentionPlan):
-            if attention.indexes.ndim != 2 or int(attention.indexes.shape[1]) != token_count:
+        if context.forward_mode is ForwardMode.PACKED:
+            indexes = context.attention_indexes
+            if indexes is None or indexes.ndim != 2 or int(indexes.shape[1]) != token_count:
                 raise ValueError("MoT positions must align with input tokens")
-            spans = attention.route_spans
-            temporal_positions = attention.indexes[0].reshape(-1)
+            spans = context.route_spans
+            temporal_positions = indexes[0].reshape(-1)
             causal = False
-        elif isinstance(attention, PagedDecodePlan):
+        elif context.forward_mode is ForwardMode.PAGED_DECODE:
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("MoT paged decode positions must align with text tokens")
             spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)

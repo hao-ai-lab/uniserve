@@ -12,7 +12,6 @@ __all__ = [
 ]
 
 from ...execution.forward_batch import ForwardBatch
-from .tuning import FlashInferTuningConfig
 from .base import AttentionCapabilities
 from .flashinfer_kernels import (
     _decode_effective_seqlens,
@@ -38,6 +37,7 @@ from .flashinfer_plan import (
 )
 from .flashinfer_pool import WrapperKey, _WrapperPool
 from .layout import QKVLayout, normalize_kv, normalize_to
+from .tuning import FlashInferTuningConfig
 
 _flashinfer: Any | None
 try:  # pragma: no cover - depends on optional CUDA package availability.
@@ -60,6 +60,12 @@ _BatchPrefillWithPagedKVCacheWrapper = (
 _fast_decode_plan = (
     getattr(_flashinfer, "fast_decode_plan", None) if _flashinfer is not None else None
 )
+_single_prefill_return_lse = (
+    getattr(_flashinfer, "single_prefill_with_kv_cache_return_lse", None)
+    if _flashinfer is not None
+    else None
+)
+_merge_state = getattr(_flashinfer, "merge_state", None) if _flashinfer is not None else None
 
 
 class _PagedDecodeInputs(NamedTuple):
@@ -117,6 +123,11 @@ class FlashInferAttentionBackend(_WrapperPool):
             paged_block_size_multiple=1,
             min_head_dim=64,
             paged_decode_only=True,
+            segmented_attention=(
+                has_paged_prefill
+                and _single_prefill_return_lse is not None
+                and _merge_state is not None
+            ),
             cuda_only=True,
             dense_ranks=frozenset({3}),
         )
@@ -166,7 +177,7 @@ class FlashInferAttentionBackend(_WrapperPool):
             raise RuntimeError("flashinfer paged decode wrapper is not available")
         inputs = self._prepare_paged_decode_inputs(q, k_cache, v_cache, block_table, cache_seqlens)
         q_bhd = inputs.q_bhd
-        plan = None if context is None else context.attention
+        plan = context
         binding = getattr(plan, "binding", None)
         current_tokens = self._maybe_write_decode_token(
             k_cache,
@@ -358,7 +369,7 @@ class FlashInferAttentionBackend(_WrapperPool):
             q, k, v, cu_seqlens_q, cu_seqlens_k, block_table
         )
 
-        plan = None if context is None else context.attention
+        plan = context
         binding = getattr(plan, "binding", None)
         # Binding-identity routing: a forward whose context carries a graph
         # binding runs on that graph's exclusive wrapper (so the
@@ -405,6 +416,98 @@ class FlashInferAttentionBackend(_WrapperPool):
         )
 
         return wrapper.run(inputs.q, (k, v))
+
+    def forward_segmented(
+        self,
+        q: torch.Tensor,
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        visible_current_end: torch.Tensor,
+        scale: float,
+        fully_visible_current: bool,
+        context: ForwardBatch | None = None,
+    ) -> torch.Tensor:
+        if (
+            _BatchPrefillWithPagedKVCacheWrapper is None
+            or _single_prefill_return_lse is None
+            or _merge_state is None
+        ):
+            raise RuntimeError("flashinfer segmented prefill is not available")
+        plan = context
+        query_lens = tuple(int(value) for value in getattr(plan, "query_lens_cpu", ()) or ())
+        causal_rows = tuple(bool(value) for value in getattr(plan, "causal_rows_cpu", ()) or ())
+        prefix_lens_cpu = tuple(
+            int(value) for value in getattr(plan, "seq_lens_cpu", ()) or ()
+        )
+        if (
+            not query_lens
+            or len(query_lens) != len(prefix_lens_cpu)
+            or len(query_lens) != len(causal_rows)
+            or sum(query_lens) != int(q.shape[0])
+        ):
+            raise ValueError("flashinfer segmented rows require host-known lengths")
+        offsets = [0]
+        for length in query_lens:
+            offsets.append(offsets[-1] + length)
+        current_outputs: list[torch.Tensor] = []
+        current_lses: list[torch.Tensor] = []
+        for row, (begin, end) in enumerate(
+            zip(offsets[:-1], offsets[1:], strict=True)
+        ):
+            row_query = q[begin:end].contiguous()
+            row_key = current_k[begin:end].contiguous()
+            row_value = current_v[begin:end].contiguous()
+            causal = causal_rows[row]
+            if fully_visible_current and causal:
+                raise RuntimeError("flashinfer segmented visibility metadata is inconsistent")
+            output, lse = _single_prefill_return_lse(
+                row_query,
+                row_key,
+                row_value,
+                causal=causal,
+                sm_scale=scale,
+            )
+            current_outputs.append(output)
+            current_lses.append(lse)
+        current_output = torch.cat(current_outputs, dim=0)
+        current_lse = torch.cat(current_lses, dim=0)
+
+        cu_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32).contiguous()
+        prefix_lengths = prefix_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        cu_prefix = torch.cat((prefix_lengths.new_zeros(1), prefix_lengths.cumsum(0)))
+        pages = page_table.to(device=q.device, dtype=torch.int32).contiguous()
+        wrapper_key, wrapper = self._prefill_wrapper(q.device)
+        self._build_prefill_plan(
+            wrapper_key,
+            wrapper,
+            q,
+            prefix_k,
+            pages,
+            cu_q,
+            cu_prefix,
+            plan,
+            False,
+            scale,
+        )
+        prefix_output, prefix_lse = wrapper.forward_return_lse(
+            q.contiguous(),
+            (prefix_k, prefix_v),
+            causal=False,
+            sm_scale=scale,
+        )
+        output, _ = _merge_state(
+            current_output,
+            current_lse,
+            prefix_output,
+            prefix_lse,
+        )
+        return output
 
     def _prepare_varlen_prefill_inputs(
         self,
@@ -460,7 +563,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         causal: bool,
         scale: float,
     ) -> int:
-        kv_seqlens = getattr(plan, "kv_seqlens", None)
+        kv_seqlens = getattr(plan, "kv_lens", None)
         if not isinstance(kv_seqlens, torch.Tensor) or tuple(kv_seqlens.shape) != (
             int(cu_seqlens_k.numel()) - 1,
         ):
@@ -595,7 +698,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         batch_size = int(cu_seqlens_q.numel()) - 1
         if batch_size <= 0 or int(block_table.shape[0]) != batch_size:
             raise RuntimeError("paged prefill graph block table row count mismatch")
-        kv_seqlens = getattr(plan, "kv_seqlens", None)
+        kv_seqlens = getattr(plan, "kv_lens", None)
         if not isinstance(kv_seqlens, torch.Tensor) or tuple(kv_seqlens.shape) != (batch_size,):
             kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         kv_seqlens = kv_seqlens.to(device=cu_seqlens_k.device, dtype=torch.int32).contiguous()
@@ -780,7 +883,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         kv_dtype: torch.dtype,
     ) -> _DecodeGraphPlanInputs:
         block_table = plan.block_table.to(dtype=torch.int32).contiguous()
-        cache_seqlens = plan.cache_seqlens.to(dtype=torch.int32).contiguous()
+        cache_seqlens = plan.kv_lens.to(dtype=torch.int32).contiguous()
         wrapper_key, wrapper = self._decode_cuda_graph_wrapper(
             block_table.device,
             batch_size=int(batch_size),
@@ -793,7 +896,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         cpu_last_page_len = _cpu_last_page_len(plan, int(batch_size), int(page_size))
         if cpu_indptr is None or cpu_last_page_len is None:
             raise ValueError("decode graph planning requires complete CPU KV lengths")
-        effective_seqlens = getattr(plan, "kv_seqlens", None)
+        effective_seqlens = getattr(plan, "kv_lens", None)
         if not isinstance(effective_seqlens, torch.Tensor) or tuple(effective_seqlens.shape) != (
             int(batch_size),
         ):

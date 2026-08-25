@@ -95,7 +95,6 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
         domain=successor_template.domain,
         bounds=successor_template.bounds,
         outputs=successor_template.outputs,
-        kv_capacity_pages=successor_template.kv_capacity_pages,
         predicate=successor_template.predicate,
         rng=successor_template.rng,
     )

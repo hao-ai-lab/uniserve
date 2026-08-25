@@ -547,8 +547,6 @@ fn finish_tokenized(
     let resource_accounting = ResourceAccounting {
         expected_kv_tokens: resources.max_kv_tokens as u64,
         image_latent_units: resources.max_image_latent_units,
-        scratch_units: resources.max_scratch_units,
-        host_scratch_tokens: resources.max_host_scratch_tokens,
         encoder_cache_pins: resources.encoder_cache_keys.len(),
         replayable: !resources.generated_feedback_makes_non_replayable,
     };

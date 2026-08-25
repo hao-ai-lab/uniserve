@@ -26,10 +26,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyModule};
+use pyo3::types::{PyAny, PyModule};
 use pythonize::{depythonize, pythonize};
 use uniserve_worker_ipc_core::{ServerEndpoint, WakeSender};
-use uniserve_worker_wire::{Batch, RequestKind, WorkerRequest, WorkerResponse};
+use uniserve_worker_wire::{RequestKind, WorkerRequest, WorkerResponse};
 
 #[pyclass(name = "Server")]
 struct PyServer {

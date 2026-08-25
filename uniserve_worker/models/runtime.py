@@ -44,23 +44,10 @@ class CacheGeometry:
 
 
 @dataclass(frozen=True, slots=True)
-class ScratchGeometry:
-    minimum_blocks: int = 1
-    fixed_tokens: int = 0
-    mirror_kv: bool = False
-    latent_copies: int = 0
-
-    def __post_init__(self) -> None:
-        if self.minimum_blocks < 1 or self.fixed_tokens < 0 or self.latent_copies < 0:
-            raise invalid_descriptor("scratch geometry bounds are invalid")
-
-
-@dataclass(frozen=True, slots=True)
 class ResourceGeometry:
     kv: bool = True
     encoder_cache_entries: int = 0
     latent_downsample: int | None = None
-    scratch: ScratchGeometry | None = None
 
     def __post_init__(self) -> None:
         if self.encoder_cache_entries < 0:
@@ -76,8 +63,6 @@ class ResourceGeometry:
             result.append("encoder_output")
         if self.latent_downsample is not None:
             result.append("image_latent")
-        if self.scratch is not None:
-            result.append("scratch")
         return tuple(result)
 
 
@@ -89,7 +74,6 @@ class WorkerDeployment:
     tp_size: int
     block_size: int
     kv_token_capacity: int | None
-    generation_kv_capacity_tokens: int | None
     attention_backend: str | None
     model_dtype: str
     kv_cache_dtype: str | None
@@ -152,7 +136,6 @@ __all__ = [
     "ExecutionModel",
     "PositionLayout",
     "ResourceGeometry",
-    "ScratchGeometry",
     "WorkerDeployment",
     "active_latent_capacity_tokens",
 ]

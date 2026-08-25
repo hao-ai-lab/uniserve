@@ -172,7 +172,6 @@
         }
       }
     ],
-    "kv_capacity_pages": 3,
     "predicate": null,
     "rng": {
       "seed": 81985529216486895,
@@ -180,7 +179,7 @@
       "draw_layout": "target_sampling"
     },
     "control_seq": 7,
-    "plan_digest": "7f2d2826fcf79762d2817537e1dac6b683b10240170aa652cc17e98b4b016cc7"
+    "plan_digest": "9d2be342a7e1b162a7da13ed76c124255b78d74f0d4a3c303d8ee2bc70f88deb"
   },
   "completion": {
     "request_key": {
@@ -195,11 +194,8 @@
     "logical_lengths": {
       "token_len": 41,
       "kv_visible_len": 41,
-      "latent_len": 0,
-      "kv_reserved_len": 64,
-      "kv_initialized_len": 42,
-      "kv_committed_len": 41,
-      "kv_published_len": 40
+      "kv_computed_len": 42,
+      "latent_len": 0
     },
     "token_span": {
       "base": 40,
@@ -219,7 +215,7 @@
       5,
       6
     ],
-    "semantic_digest": "ea99d8f75e008d6806428c4eeab47bd5a5e103c8ea3c7acdb738fb24c819dcf9",
+    "semantic_digest": "abf4809f7d4f3c7317cee8b194b9b7f6aa54deac34c86aa2ef727fb27aca7d2d",
     "error_code": null,
     "timing_counters": {
       "queued_us": 0,
@@ -228,7 +224,7 @@
       "host_us": 0
     }
   },
-  "plan_digest": "7f2d2826fcf79762d2817537e1dac6b683b10240170aa652cc17e98b4b016cc7",
-  "semantic_digest": "ea99d8f75e008d6806428c4eeab47bd5a5e103c8ea3c7acdb738fb24c819dcf9",
-  "protocol_layout_digest": "d44ce823bd9f7b8acba66960794fe8e133d0d526a32f24e205d12657a691b7a7"
+  "plan_digest": "9d2be342a7e1b162a7da13ed76c124255b78d74f0d4a3c303d8ee2bc70f88deb",
+  "semantic_digest": "abf4809f7d4f3c7317cee8b194b9b7f6aa54deac34c86aa2ef727fb27aca7d2d",
+  "protocol_layout_digest": "81061fb7bfa9d709ea642a972ce352979f3b85fcf19bf1b1b224fc85329228ed"
 }

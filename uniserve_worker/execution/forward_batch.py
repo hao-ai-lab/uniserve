@@ -11,114 +11,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, TypeAlias, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import torch
 
 from ..nn.mesh import CollectiveAxisTransport, DeviceMesh, PeerAxisTransport
-
-
-@runtime_checkable
-class KvView(Protocol):
-    """Batch-bounded access to system-owned paged KV storage."""
-
-    @property
-    def block_size(self) -> int: ...
-
-    @property
-    def supports_paged_attention_storage(self) -> bool: ...
-
-    @property
-    def base_lens(self) -> Sequence[int]: ...
-
-    def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-    def append(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> None: ...
-
-    def append_varlen(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        row_lengths: Sequence[int],
-        *,
-        block_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-        query_offsets: torch.Tensor,
-    ) -> None: ...
-
-    def append_packed(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        page_ids: torch.Tensor,
-        page_offsets: torch.Tensor,
-        token_indices: torch.Tensor,
-    ) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class EmptyKvView:
-    """Typed absence of KV access for a route."""
-
-    @property
-    def block_size(self) -> int:
-        return 0
-
-    @property
-    def supports_paged_attention_storage(self) -> bool:
-        return False
-
-    @property
-    def base_lens(self) -> tuple[int, ...]:
-        return ()
-
-    def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        del layer
-        raise RuntimeError("this forward route has no KV view")
-
-    def append(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> None:
-        del layer, key, value
-        raise RuntimeError("this forward route has no KV view")
-
-    def append_varlen(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        row_lengths: Sequence[int],
-        *,
-        block_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-        query_offsets: torch.Tensor,
-    ) -> None:
-        del layer, key, value, row_lengths, block_table, cache_seqlens, query_offsets
-        raise RuntimeError("this forward route has no KV view")
-
-    def append_packed(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        page_ids: torch.Tensor,
-        page_offsets: torch.Tensor,
-        token_indices: torch.Tensor,
-    ) -> None:
-        del layer, key, value, page_ids, page_offsets, token_indices
-        raise RuntimeError("this forward route has no KV view")
 
 
 @runtime_checkable
@@ -297,71 +194,12 @@ class AttentionSelection:
             raise ValueError("attention selection contains duplicate providers")
 
 
-@dataclass(frozen=True, slots=True)
-class NoAttention:
-    """Typed dense/no-paged-attention plan."""
-
-    backends: AttentionSelection
-
-
-@dataclass(frozen=True, slots=True)
-class PagedDecodePlan:
-    """One query token per row against paged KV."""
-
-    backends: AttentionSelection
-    block_table: torch.Tensor
-    cache_seqlens: torch.Tensor
-    kv_seqlens: torch.Tensor
-    query_lens: torch.Tensor
-    cache_seqlens_cpu: tuple[int, ...]
-    kv_seqlens_cpu: tuple[int, ...]
-    query_lens_cpu: tuple[int, ...]
-    decode_page_ids: torch.Tensor
-    decode_page_offsets: torch.Tensor
-    max_context_len: int
-    causal: bool
-    binding: int
-
-
-@dataclass(frozen=True, slots=True)
-class RequestIndexedDecodePlan:
-    """Decode metadata sourced from persistent request-indexed device state."""
-
-    backends: AttentionSelection
-    request_page_tables: torch.Tensor
-    request_cache_lengths: torch.Tensor
-    request_tokens: torch.Tensor
-    request_positions: torch.Tensor
-    group_id: int
-    page_size: int
-    table_width: int
-    cache_seqlens_cpu: tuple[int, ...]
-    kv_seqlens_cpu: tuple[int, ...]
-    query_lens_cpu: tuple[int, ...]
-    causal: bool
-    binding: int
-
-
-@dataclass(frozen=True, slots=True)
-class PagedVarlenPlan:
-    """Ragged paged attention over explicit query and key spans."""
-
-    backends: AttentionSelection
-    block_table: torch.Tensor
-    cache_seqlens: torch.Tensor
-    query_lens: torch.Tensor
-    kv_seqlens: torch.Tensor
-    cu_seqlens_q: torch.Tensor
-    cu_seqlens_k: torch.Tensor
-    output_indices: torch.Tensor
-    cache_seqlens_cpu: tuple[int, ...]
-    query_lens_cpu: tuple[int, ...]
-    kv_seqlens_cpu: tuple[int, ...]
-    max_seqlen_q: int
-    max_seqlen_k: int
-    max_context_len: int
-    causal: bool
-    binding: int
+class ForwardMode(StrEnum):
+    DENSE = "dense"
+    PAGED_DECODE = "paged_decode"
+    PAGED_VARLEN = "paged_varlen"
+    PACKED = "packed"
+    REQUEST_INDEXED_DECODE = "request_indexed_decode"
 
 
 class ExpertRoute(StrEnum):
@@ -384,52 +222,6 @@ class RouteSpan:
     @property
     def token_end(self) -> int:
         return self.token_start + self.token_count
-
-
-@dataclass(frozen=True, slots=True)
-class PackedAttentionPlan:
-    """Visible-segment attention for a mixed token/flow route."""
-
-    backends: AttentionSelection
-    indexes: torch.Tensor
-    route_spans: tuple[RouteSpan, ...]
-    visible_end: torch.Tensor
-    cu_seqlens_q: torch.Tensor
-    page_table: torch.Tensor
-    seqused_k: torch.Tensor
-    write_page_ids: torch.Tensor
-    write_page_offsets: torch.Tensor
-    write_token_indices: torch.Tensor
-    max_seqlen_q: int
-    max_seqlen_k: int
-    use_prefix_bounds: bool
-    fully_visible: bool
-    binding: int
-    query_lens_cpu: tuple[int, ...]
-    key_lens_cpu: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if self.indexes.ndim != 2:
-            raise ValueError("packed attention indexes must be a matrix")
-        expected_start = 0
-        previous: ExpertRoute | None = None
-        for span in self.route_spans:
-            if span.token_start != expected_start:
-                raise ValueError("packed expert spans must cover tokens contiguously")
-            if span.route is previous:
-                raise ValueError("adjacent packed expert spans must be coalesced")
-            expected_start = span.token_end
-            previous = span.route
-        if expected_start != int(self.indexes.shape[1]):
-            raise ValueError("packed expert spans must cover every attention token")
-
-    def token_count(self, route: ExpertRoute) -> int:
-        return sum(span.token_count for span in self.route_spans if span.route is route)
-
-
-AttnPlan: TypeAlias = (
-    NoAttention | PagedDecodePlan | RequestIndexedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
-)
 
 
 class TokenSelection(StrEnum):
@@ -497,8 +289,31 @@ class ForwardBatch:
 
     phase: ModelPhase
     row_count: int
-    request_pool_indices: torch.Tensor
-    attention: AttnPlan
+    forward_mode: ForwardMode
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    query_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    has_cache_writes: bool = True
+    block_table: torch.Tensor | None = None
+    kv_lens: torch.Tensor | None = None
+    cu_seqlens_q: torch.Tensor | None = None
+    cu_seqlens_k: torch.Tensor | None = None
+    output_indices: torch.Tensor | None = None
+    attention_indexes: torch.Tensor | None = None
+    visible_end: torch.Tensor | None = None
+    route_spans: tuple[RouteSpan, ...] = ()
+    max_seqlen_q: int = 0
+    max_seqlen_k: int = 0
+    causal: bool = True
+    causal_rows_cpu: tuple[bool, ...] = ()
+    seq_lens_cpu: tuple[int, ...] = ()
+    query_lens_cpu: tuple[int, ...] = ()
+    kv_lens_cpu: tuple[int, ...] = ()
+    group_id: int = 0
+    fully_visible: bool = False
+    binding: int = 0
+    cuda_graph_capture: bool = False
     decode_force_finish: torch.Tensor | None = None
     token_row_indices: tuple[int, ...] = ()
     flow_row_indices: tuple[int, ...] = ()
@@ -506,7 +321,6 @@ class ForwardBatch:
     input_embeddings: torch.Tensor | None = None
     embedding_mask: torch.Tensor | None = None
     positions: torch.Tensor | None = None
-    query_lens: tuple[int, ...] = ()
     token_selections: tuple[TokenSelection, ...] = ()
     flow_positions: tuple[torch.Tensor, ...] = ()
     flow_timesteps: tuple[torch.Tensor, ...] = ()
@@ -521,15 +335,16 @@ class ForwardBatch:
     decode_latents: tuple[torch.Tensor, ...] = ()
     decode_heights: tuple[int, ...] = ()
     decode_widths: tuple[int, ...] = ()
-    kv: KvView | EmptyKvView = EmptyKvView()
     mesh: MeshView | EmptyMeshView = EmptyMeshView()
     output: OutputView | EmptyOutputView = EmptyOutputView()
 
     def __post_init__(self) -> None:
         if self.row_count < 1:
             raise ValueError("forward batch must contain at least one row")
-        if int(self.request_pool_indices.numel()) != self.row_count:
+        if int(self.req_pool_indices.numel()) != self.row_count:
             raise ValueError("forward request indices do not align with rows")
+        if int(self.seq_lens.numel()) != self.row_count or int(self.query_lens.numel()) != self.row_count:
+            raise ValueError("forward KV lengths do not align with rows")
         if self.decode_force_finish is not None and (
             int(self.decode_force_finish.numel()) != self.row_count
             or self.decode_force_finish.dtype is not torch.bool
@@ -542,10 +357,10 @@ class ForwardBatch:
             or max(row_indices) >= self.row_count
         ):
             raise ValueError("forward row indexes are invalid")
-        if len(self.token_row_indices) != len(self.query_lens) or len(
-            self.token_row_indices
-        ) != len(self.token_selections):
+        if len(self.token_row_indices) != len(self.token_selections):
             raise ValueError("forward token columns are not aligned")
+        if len(self.seq_lens_cpu) != self.row_count or len(self.query_lens_cpu) != self.row_count:
+            raise ValueError("forward host KV lengths do not align with rows")
         flow_count = len(self.flow_row_indices)
         if any(
             len(values) != flow_count
@@ -569,6 +384,10 @@ class ForwardBatch:
         if any(len(values) != decode_count for values in (self.decode_heights, self.decode_widths)):
             raise ValueError("forward decoder columns are not aligned")
 
+    @property
+    def request_pool_indices(self) -> torch.Tensor:
+        return self.req_pool_indices
+
 
 @dataclass(frozen=True, slots=True)
 class ForwardOutput:
@@ -584,8 +403,6 @@ class ForwardOutput:
 
 
 __all__ = [
-    "AttnPlan",
-    "EmptyKvView",
     "EmptyLatentView",
     "EmptyMeshView",
     "EmptyOutputView",
@@ -593,16 +410,11 @@ __all__ = [
     "ExpertRoute",
     "FlowPatches",
     "ForwardBatch",
+    "ForwardMode",
     "ForwardOutput",
-    "KvView",
     "LatentView",
     "MeshView",
-    "NoAttention",
     "OutputView",
-    "PackedAttentionPlan",
-    "PagedDecodePlan",
-    "RequestIndexedDecodePlan",
-    "PagedVarlenPlan",
     "RouteMeshView",
     "RouteSpan",
     "ModelPhase",

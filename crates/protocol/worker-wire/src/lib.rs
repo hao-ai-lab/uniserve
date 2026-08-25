@@ -578,9 +578,6 @@ pub struct Operation {
     pub bounds: Bounds,
     pub inputs: Vec<ProductRef>,
     pub outputs: Vec<ProductRef>,
-    /// Exact per-group KV capacity established by the scheduler-authored
-    /// placement tables carried alongside this operation.
-    pub kv_capacity_pages: u32,
     pub predicate: Option<ProductRef>,
     pub rng: Option<Rng>,
     pub control_seq: u64,
@@ -600,7 +597,6 @@ impl Operation {
         bounds: Bounds,
         inputs: Vec<ProductRef>,
         outputs: Vec<ProductRef>,
-        kv_capacity_pages: u32,
         predicate: Option<ProductRef>,
         rng: Option<Rng>,
         control_seq: u64,
@@ -616,7 +612,6 @@ impl Operation {
             bounds,
             inputs,
             outputs,
-            kv_capacity_pages,
             predicate,
             rng,
             control_seq,
@@ -645,7 +640,6 @@ impl Operation {
         for output in &self.outputs {
             digest.product_ref(output);
         }
-        digest.u32(self.kv_capacity_pages);
         digest.option(self.predicate.as_ref(), CanonicalDigest::product_ref);
         digest.option(self.rng.as_ref(), CanonicalDigest::rng);
         digest.u64(self.control_seq);
@@ -672,10 +666,6 @@ impl Operation {
             "operation requires a fixed semantic parent"
         );
         self.bounds_are_finite()?;
-        anyhow::ensure!(
-            self.bounds.max_kv_pages <= self.kv_capacity_pages,
-            "operation KV growth bound exceeds its logical capacity"
-        );
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         for output in &self.outputs {
             output.validate()?;
@@ -794,11 +784,8 @@ pub enum ErrorCode {
 pub struct LogicalLengths {
     pub token_len: u32,
     pub kv_visible_len: u32,
+    pub kv_computed_len: u32,
     pub latent_len: u32,
-    pub kv_reserved_len: u32,
-    pub kv_initialized_len: u32,
-    pub kv_committed_len: u32,
-    pub kv_published_len: u32,
 }
 
 /// The span of tokens an operation contributed.
@@ -872,6 +859,10 @@ impl CompletionRecord {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.op_id.0 > 0, "completion op id must be positive");
+        anyhow::ensure!(
+            self.logical_lengths.kv_visible_len <= self.logical_lengths.kv_computed_len,
+            "completion selected KV length exceeds computed length"
+        );
         anyhow::ensure!(
             self.completion_slot_generation > 0,
             "completion slot generation must be positive"
@@ -1059,21 +1050,14 @@ impl Control {
 // Admission framing (session establishment)
 // ---------------------------------------------------------------------------
 
-/// KV lineage metadata established at admission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct KvAdmission {
-    pub prefix_len: u32,
-    pub group_id: u32,
-}
-
 /// Understanding-branch admission: invariant sampling policy, negative tokens,
-/// terminal token ids, and KV lineage metadata.
+/// terminal token ids, and the semantic position visible at admission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UndAdmission {
     pub sampling: SamplingParams,
     pub negative_token_ids: Vec<u32>,
     pub finish_token_ids: Vec<u32>,
-    pub kv: KvAdmission,
+    pub initial_position: u32,
 }
 
 /// Generation-branch admission: image parameters.
@@ -1125,8 +1109,7 @@ impl Admission {
             digest.sampling(&und.sampling);
             digest.u32s(und.negative_token_ids.iter().copied());
             digest.u32s(und.finish_token_ids.iter().copied());
-            digest.u32(und.kv.prefix_len);
-            digest.u32(und.kv.group_id);
+            digest.u32(und.initial_position);
         });
         digest.option(self.gen_admission.as_ref(), |digest, branch| {
             digest.image(&branch.image)
@@ -1187,42 +1170,91 @@ pub struct BatchPartition {
     pub attention: AttentionRegime,
     pub shape_class: u64,
     pub operations: Vec<Operation>,
-    /// Scheduler-assigned stable request-state rows aligned with `operations`.
-    pub request_pool_indices: Vec<u32>,
-    /// Complete scheduler-owned KV mappings for operations that address KV.
-    pub kv_placements: Vec<KvPlacement>,
-    /// Scheduler-owned temporary KV mappings for generation branch rows.
-    pub kv_branch_placements: Vec<KvBranchPlacement>,
+    /// Complete scheduler-owned logical-page mappings installed this step.
+    pub block_tables: Vec<BlockTable>,
+    /// Newly acquired physical pages that require worker-side initialization.
+    pub new_cache_pages: Vec<CachePageAllocation>,
+    /// CPU row-packing metadata. One operation may contribute multiple rows.
+    pub forward_rows: Vec<ForwardRow>,
     /// Complete scheduler-owned latent mappings for operations that address a
     /// generation trajectory.
     pub latent_placements: Vec<LatentPlacement>,
 }
 
-/// One generation branch's scheduler-owned temporary KV placement.
+/// One scheduler-owned request-slot block table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvBranchPlacement {
-    pub request_key: RequestKey,
-    pub op_id: OpId,
-    pub branch_index: u32,
-    pub group_id: u32,
-    pub block_table: Vec<BlockId>,
-    pub pages_to_zero: Vec<BlockId>,
-}
-
-/// One cache group's exact physical pages for snapshot export or restore.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheGroupPlacement {
+pub struct BlockTable {
+    pub request_pool_idx: u32,
     pub group_id: u32,
     pub page_ids: Vec<BlockId>,
-    pub length: u32,
+    pub allocated_tokens: u32,
 }
 
-impl CacheGroupPlacement {
+/// Physical pages newly acquired for one installed block table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePageAllocation {
+    pub request_pool_idx: u32,
+    pub group_id: u32,
+    pub page_ids: Vec<BlockId>,
+}
+
+impl BlockTable {
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.request_pool_idx > 0,
+            "block table request slot must be positive"
+        );
         anyhow::ensure!(
             self.page_ids.iter().all(|page| page.0 > 0)
                 && self.page_ids.iter().collect::<HashSet<_>>().len() == self.page_ids.len(),
-            "cache recovery placement repeats a page or carries page zero"
+            "block table repeats a page or carries page zero"
+        );
+        anyhow::ensure!(
+            !self.page_ids.is_empty() || self.allocated_tokens == 0,
+            "empty block table carries allocated tokens"
+        );
+        Ok(())
+    }
+}
+
+impl CachePageAllocation {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.request_pool_idx > 0,
+            "cache-page allocation request slot must be positive"
+        );
+        anyhow::ensure!(
+            !self.page_ids.is_empty()
+                && self.page_ids.iter().all(|page| page.0 > 0)
+                && self.page_ids.iter().collect::<HashSet<_>>().len() == self.page_ids.len(),
+            "cache-page allocation is empty, repeats a page, or carries page zero"
+        );
+        Ok(())
+    }
+}
+
+/// Row-aligned model-forward metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardRow {
+    pub operation_index: u32,
+    pub request_pool_index: u32,
+    pub seq_len: u32,
+    pub query_len: u32,
+}
+
+impl ForwardRow {
+    pub fn validate(self, operation_count: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (self.operation_index as usize) < operation_count,
+            "forward row operation index is outside its partition"
+        );
+        anyhow::ensure!(
+            self.request_pool_index > 0,
+            "forward row carries the reserved request slot"
+        );
+        anyhow::ensure!(
+            self.query_len > 0,
+            "forward row query length must be positive"
         );
         Ok(())
     }
@@ -1233,7 +1265,7 @@ impl CacheGroupPlacement {
 pub struct RecoveryPlacement {
     pub request_key: RequestKey,
     pub request_pool_idx: u32,
-    pub cache_groups: Vec<CacheGroupPlacement>,
+    pub block_tables: Vec<BlockTable>,
     pub latent_page_table: Vec<u32>,
 }
 
@@ -1261,106 +1293,23 @@ impl RecoveryPlacement {
             self.request_pool_idx > 0,
             "recovery placement request slot must be positive"
         );
-        let mut groups = HashSet::with_capacity(self.cache_groups.len());
-        for group in &self.cache_groups {
+        let mut groups = HashSet::with_capacity(self.block_tables.len());
+        for table in &self.block_tables {
             anyhow::ensure!(
-                groups.insert(group.group_id),
+                table.request_pool_idx == self.request_pool_idx,
+                "recovery block table disagrees with its request slot"
+            );
+            anyhow::ensure!(
+                groups.insert(table.group_id),
                 "recovery placement repeats a cache group"
             );
-            group.validate()?;
+            table.validate()?;
         }
         anyhow::ensure!(
             self.latent_page_table.iter().all(|page| *page > 0)
                 && self.latent_page_table.iter().collect::<HashSet<_>>().len()
                     == self.latent_page_table.len(),
             "recovery latent page table repeats a page or carries page zero"
-        );
-        Ok(())
-    }
-}
-
-impl KvBranchPlacement {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.op_id.0 > 0,
-            "KV branch placement operation id must be positive"
-        );
-        anyhow::ensure!(
-            self.branch_index > 0,
-            "KV branch placement index must be positive"
-        );
-        anyhow::ensure!(!self.block_table.is_empty(), "KV branch placement is empty");
-        anyhow::ensure!(
-            self.block_table.iter().all(|page| page.0 > 0)
-                && self.block_table.iter().collect::<HashSet<_>>().len() == self.block_table.len(),
-            "KV branch placement repeats a page or carries page zero"
-        );
-        anyhow::ensure!(
-            self.pages_to_zero.iter().all(|page| page.0 > 0)
-                && self.pages_to_zero.iter().collect::<HashSet<_>>().len()
-                    == self.pages_to_zero.len(),
-            "KV branch placement repeats a page-to-zero or carries page zero"
-        );
-        let pages = self.block_table.iter().collect::<HashSet<_>>();
-        anyhow::ensure!(
-            self.pages_to_zero.iter().all(|page| pages.contains(page)),
-            "KV branch placement zeroes a page outside its block table"
-        );
-        Ok(())
-    }
-}
-
-/// One operation's complete scheduler-owned KV placement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvPlacement {
-    pub request_key: RequestKey,
-    pub op_id: OpId,
-    pub group_id: u32,
-    pub block_table: Vec<BlockId>,
-    pub block_table_update: bool,
-    pub pages_to_zero: Vec<BlockId>,
-    pub prefix_length: u32,
-    pub input_length: u32,
-    pub visible_length: u32,
-    pub resulting_length: u32,
-}
-
-impl KvPlacement {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.op_id.0 > 0,
-            "KV placement operation id must be positive"
-        );
-        if self.block_table_update {
-            anyhow::ensure!(
-                self.block_table.iter().collect::<HashSet<_>>().len() == self.block_table.len(),
-                "KV placement repeats a page in its block table"
-            );
-            anyhow::ensure!(
-                self.pages_to_zero.iter().collect::<HashSet<_>>().len() == self.pages_to_zero.len(),
-                "KV placement repeats a page-to-zero"
-            );
-            let pages = self.block_table.iter().collect::<HashSet<_>>();
-            anyhow::ensure!(
-                self.pages_to_zero.iter().all(|page| pages.contains(page)),
-                "KV placement zeroes a page outside its block table"
-            );
-            anyhow::ensure!(
-                self.block_table.iter().all(|page| page.0 > 0)
-                    && self.pages_to_zero.iter().all(|page| page.0 > 0),
-                "KV placement carries the reserved page zero"
-            );
-        } else {
-            anyhow::ensure!(
-                self.block_table.is_empty() && self.pages_to_zero.is_empty(),
-                "KV placement reference carries a block-table update"
-            );
-        }
-        anyhow::ensure!(
-            self.visible_length >= self.prefix_length
-                && self.resulting_length >= self.visible_length
-                && self.prefix_length.saturating_add(self.input_length) == self.resulting_length,
-            "KV placement lengths are inconsistent"
         );
         Ok(())
     }
@@ -1421,77 +1370,47 @@ impl BatchPartition {
                 "batch partition operation disagrees with its domain or route"
             );
         }
-        anyhow::ensure!(
-            self.request_pool_indices.len() == self.operations.len(),
-            "batch partition request-pool indices are not aligned with operations"
-        );
-        anyhow::ensure!(
-            self.request_pool_indices.iter().all(|index| *index > 0),
-            "batch partition carries the reserved request-pool index zero"
-        );
+        let mut table_ids = HashSet::with_capacity(self.block_tables.len());
+        for table in &self.block_tables {
+            table.validate()?;
+            anyhow::ensure!(
+                table_ids.insert((table.request_pool_idx, table.group_id)),
+                "batch partition repeats a block table"
+            );
+        }
+        let tables = self
+            .block_tables
+            .iter()
+            .map(|table| ((table.request_pool_idx, table.group_id), table))
+            .collect::<HashMap<_, _>>();
+        let mut allocation_ids = HashSet::with_capacity(self.new_cache_pages.len());
+        for allocation in &self.new_cache_pages {
+            allocation.validate()?;
+            let identity = (allocation.request_pool_idx, allocation.group_id);
+            anyhow::ensure!(
+                allocation_ids.insert(identity),
+                "batch partition repeats a cache-page allocation"
+            );
+            let table = tables.get(&identity).ok_or_else(|| {
+                anyhow::anyhow!("cache-page allocation has no matching block table")
+            })?;
+            let table_pages = table.page_ids.iter().collect::<HashSet<_>>();
+            anyhow::ensure!(
+                allocation
+                    .page_ids
+                    .iter()
+                    .all(|page| table_pages.contains(page)),
+                "cache-page allocation is outside its block table"
+            );
+        }
+        for row in &self.forward_rows {
+            row.validate(self.operations.len())?;
+        }
         let operations = self
             .operations
             .iter()
             .map(|operation| ((operation.request_key, operation.op_id), operation))
             .collect::<HashMap<_, _>>();
-        let mut branch_ids = HashSet::with_capacity(self.kv_branch_placements.len());
-        let mut branch_pages = HashSet::new();
-        for placement in &self.kv_branch_placements {
-            placement.validate()?;
-            let identity = (
-                placement.request_key,
-                placement.op_id,
-                placement.branch_index,
-                placement.group_id,
-            );
-            anyhow::ensure!(
-                branch_ids.insert(identity),
-                "batch partition repeats a KV branch placement identity"
-            );
-            let operation = operations
-                .get(&(placement.request_key, placement.op_id))
-                .ok_or_else(|| anyhow::anyhow!("KV branch placement does not name an operation"))?;
-            anyhow::ensure!(
-                operation.work.variant() == WorkVariant::GenFlow,
-                "KV branch placement names a non-generation-flow operation"
-            );
-            anyhow::ensure!(
-                placement
-                    .block_table
-                    .iter()
-                    .all(|page| branch_pages.insert(*page)),
-                "KV branch placements overlap physical pages"
-            );
-        }
-        let mut placement_ids = HashSet::with_capacity(self.kv_placements.len());
-        for placement in &self.kv_placements {
-            placement.validate()?;
-            let identity = (placement.request_key, placement.op_id, placement.group_id);
-            anyhow::ensure!(
-                placement_ids.insert(identity),
-                "batch partition repeats a KV placement identity"
-            );
-            let operation_identity = (placement.request_key, placement.op_id);
-            let operation = operations.get(&operation_identity).ok_or_else(|| {
-                anyhow::anyhow!("KV placement does not name a partition operation")
-            })?;
-            if placement.block_table_update {
-                anyhow::ensure!(
-                    placement.block_table.len() == operation.kv_capacity_pages as usize,
-                    "KV placement update does not establish the operation capacity"
-                );
-            }
-        }
-        for operation in &self.operations {
-            anyhow::ensure!(
-                operation.kv_capacity_pages == 0
-                    || placement_ids
-                        .iter()
-                        .any(|identity| identity.0 == operation.request_key
-                            && identity.1 == operation.op_id),
-                "operation with logical KV capacity has no placement"
-            );
-        }
         let mut latent_ids = HashSet::with_capacity(self.latent_placements.len());
         let mut latent_pages = HashSet::new();
         for placement in &self.latent_placements {
@@ -1660,23 +1579,12 @@ impl Batch {
         }
         // Depth one: at most one runnable operation per request per batch.
         let mut request_keys = HashSet::with_capacity(self.operation_count());
-        let mut request_slots = HashMap::with_capacity(self.operation_count());
-        let mut assigned_slots = HashSet::with_capacity(self.operation_count());
         for partition in &self.partitions {
-            for (operation, request_pool_idx) in partition
-                .operations
-                .iter()
-                .zip(&partition.request_pool_indices)
-            {
+            for operation in &partition.operations {
                 anyhow::ensure!(
                     request_keys.insert(operation.request_key),
                     "a submission batch carries multiple operations for one request"
                 );
-                anyhow::ensure!(
-                    assigned_slots.insert(*request_pool_idx),
-                    "a submission batch assigns one request-pool index to multiple requests"
-                );
-                request_slots.insert(operation.request_key, *request_pool_idx);
             }
         }
         let mut admitted = HashSet::with_capacity(self.admissions.len());
@@ -1690,10 +1598,6 @@ impl Batch {
                 self.operations()
                     .any(|operation| operation.request_key == admission.request_key),
                 "a submission batch admits a request without an operation"
-            );
-            anyhow::ensure!(
-                request_slots.get(&admission.request_key) == Some(&admission.request_pool_idx),
-                "an admission disagrees with its operation request-pool index"
             );
         }
         // Idempotency identity: (request_key, control_seq, variant, content).
@@ -2191,7 +2095,6 @@ pub struct WorkerCapabilities {
     pub num_layers: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
-    pub scratch_capacity_tokens: u64,
     pub supported_work: Vec<WorkVariant>,
     pub latent_page_units: u32,
     pub num_latent_pages: u32,
@@ -2413,8 +2316,6 @@ impl WorkerCapabilities {
             max_vision_feature_bytes: self.max_vision_feature_bytes,
             commit_marker_tokens: self.commit_marker_tokens,
             max_cfg_branches: self.max_cfg_branches,
-            scratch_capacity_tokens: self.scratch_capacity_tokens,
-            scratch_block_size: self.block_size,
             encoder_cache_entries: self.encoder_cache_budget,
         }
     }
@@ -2428,7 +2329,6 @@ impl Default for WorkerCapabilities {
             num_layers: 28,
             num_kv_heads: 8,
             head_dim: 128,
-            scratch_capacity_tokens: 1 << 20,
             supported_work: vec![WorkVariant::TokenExtend, WorkVariant::TokenDecode],
             latent_page_units: 0,
             num_latent_pages: 0,
@@ -2499,7 +2399,7 @@ pub fn protocol_layout_digest() -> Digest {
         digest.string(control);
     }
     // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 17] = [
+    let record_layouts: [&[&str]; 16] = [
         &[
             "request_key",
             "op_id",
@@ -2511,7 +2411,6 @@ pub fn protocol_layout_digest() -> Digest {
             "bounds",
             "inputs",
             "outputs",
-            "kv_capacity_pages",
             "predicate",
             "rng",
             "control_seq",
@@ -2545,8 +2444,12 @@ pub fn protocol_layout_digest() -> Digest {
             "timing_counters",
         ],
         &["version", "digest", "locator"],
-        &["prefix_len", "group_id"],
-        &["sampling", "negative_token_ids", "finish_token_ids", "kv"],
+        &[
+            "sampling",
+            "negative_token_ids",
+            "finish_token_ids",
+            "initial_position",
+        ],
         &[
             "request_key",
             "request_pool_idx",
@@ -2555,30 +2458,22 @@ pub fn protocol_layout_digest() -> Digest {
             "gen_admission",
         ],
         &[
-            "request_key",
-            "op_id",
+            "request_pool_idx",
             "group_id",
-            "block_table",
-            "block_table_update",
-            "pages_to_zero",
-            "prefix_length",
-            "input_length",
-            "visible_length",
-            "resulting_length",
+            "page_ids",
+            "allocated_tokens",
         ],
+        &["request_pool_idx", "group_id", "page_ids"],
         &[
-            "request_key",
-            "op_id",
-            "branch_index",
-            "group_id",
-            "block_table",
-            "pages_to_zero",
+            "operation_index",
+            "request_pool_index",
+            "seq_len",
+            "query_len",
         ],
-        &["group_id", "page_ids", "length"],
         &[
             "request_key",
             "request_pool_idx",
-            "cache_groups",
+            "block_tables",
             "latent_page_table",
         ],
         &["group_id", "source_page", "destination_page"],
@@ -2602,9 +2497,9 @@ pub fn protocol_layout_digest() -> Digest {
             "attention",
             "shape_class",
             "operations",
-            "request_pool_indices",
-            "kv_placements",
-            "kv_branch_placements",
+            "block_tables",
+            "new_cache_pages",
+            "forward_rows",
             "latent_placements",
         ],
         &[
@@ -2613,7 +2508,6 @@ pub fn protocol_layout_digest() -> Digest {
             "num_layers",
             "num_kv_heads",
             "head_dim",
-            "scratch_capacity_tokens",
             "supported_work",
             "latent_page_units",
             "num_latent_pages",
@@ -2663,11 +2557,8 @@ pub fn protocol_layout_digest() -> Digest {
     let logical_lengths = [
         "token_len",
         "kv_visible_len",
+        "kv_computed_len",
         "latent_len",
-        "kv_reserved_len",
-        "kv_initialized_len",
-        "kv_committed_len",
-        "kv_published_len",
     ];
     digest.u64(logical_lengths.len() as u64);
     for field in logical_lengths {

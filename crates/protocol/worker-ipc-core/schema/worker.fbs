@@ -81,7 +81,7 @@ enum ReqKind : ubyte {
 }
 
 enum RespKind : ubyte { Capabilities, Result, Ok, Error, Pressure, Snapshot }
-enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent, Scratch }
+enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
 
 table U32List { items:[uint]; }
@@ -197,7 +197,6 @@ table WorkerCapabilities {
   num_layers:uint;
   num_kv_heads:uint;
   head_dim:uint;
-  scratch_capacity_tokens:ulong;
   supported_work:[WorkVariant];
   latent_page_units:uint;
   num_latent_pages:uint;
@@ -313,33 +312,30 @@ table Operation {
   bounds:Bounds;
   inputs:[ProductRef];
   outputs:[ProductRef];
-  kv_capacity_pages:uint;
   predicate:ProductRef;
   rng:Rng;
   control_seq:ulong;
   plan_digest:string;
 }
 
-table KvPlacement {
-  request_key:RequestKey;
-  op_id:ulong;
+table BlockTable {
+  request_pool_idx:uint;
   group_id:uint;
-  block_table:[uint];
-  block_table_update:bool;
-  pages_to_zero:[uint];
-  prefix_length:uint;
-  input_length:uint;
-  visible_length:uint;
-  resulting_length:uint;
+  page_ids:[uint];
+  allocated_tokens:uint;
 }
 
-table KvBranchPlacement {
-  request_key:RequestKey;
-  op_id:ulong;
-  branch_index:uint;
+table CachePageAllocation {
+  request_pool_idx:uint;
   group_id:uint;
-  block_table:[uint];
-  pages_to_zero:[uint];
+  page_ids:[uint];
+}
+
+table ForwardRow {
+  operation_index:uint;
+  request_pool_index:uint;
+  seq_len:uint;
+  query_len:uint;
 }
 
 table LatentPlacement {
@@ -356,11 +352,8 @@ table LatentPlacement {
 table LogicalLengths {
   token_len:uint;
   kv_visible_len:uint;
+  kv_computed_len:uint;
   latent_len:uint;
-  kv_reserved_len:uint;
-  kv_initialized_len:uint;
-  kv_committed_len:uint;
-  kv_published_len:uint;
 }
 
 table TokenSpan {
@@ -424,16 +417,11 @@ table ControlEnvelope { control:Control; }
 
 // ---- Admission framing (session establishment) ----------------------------
 
-table KvAdmission {
-  prefix_len:uint;
-  group_id:uint;
-}
-
 table UndAdmission {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
-  kv:KvAdmission;
+  initial_position:uint;
 }
 
 table GenAdmission { image:ImageParams; }
@@ -456,9 +444,9 @@ table BatchPartition {
   attention:AttentionRegime;
   shape_class:ulong;
   operations:[Operation];
-  request_pool_indices:[uint];
-  kv_placements:[KvPlacement];
-  kv_branch_placements:[KvBranchPlacement];
+  block_tables:[BlockTable];
+  new_cache_pages:[CachePageAllocation];
+  forward_rows:[ForwardRow];
   latent_placements:[LatentPlacement];
 }
 
@@ -529,16 +517,10 @@ table WorkerForwardStats {
   component_us:[StringU64Pair];
 }
 
-table CacheGroupPlacement {
-  group_id:uint;
-  page_ids:[uint];
-  length:uint;
-}
-
 table RecoveryPlacement {
   request_key:RequestKey;
   request_pool_idx:uint;
-  cache_groups:[CacheGroupPlacement];
+  block_tables:[BlockTable];
   latent_page_table:[uint];
 }
 

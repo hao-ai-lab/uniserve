@@ -12,7 +12,7 @@ from ..capabilities import (
 )
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
-from ..models.generation import GenerationPipeline
+from ..models.generation import GenerationPipeline, LatentLayout
 from ..models.runtime import ExecutionModel, WorkerDeployment, active_latent_capacity_tokens
 from .capacity import (
     derive_runtime_kv_capacity,
@@ -53,7 +53,6 @@ def resolve_capabilities(
     num_latent_pages = (
         ceil_div(requested_latent_units, latent_page_units) + 1 if flow is not None else 0
     )
-    latent_capacity_units = (num_latent_pages - 1) * latent_page_units if flow is not None else 0
     latent_width = (
         int(flow.latent_channels) * int(flow.latent_patch_size) ** 2 if flow is not None else 0
     )
@@ -86,8 +85,6 @@ def resolve_capabilities(
     )
     resident_copies, co_resident_blocks = _kv_residency_shape(
         deployment,
-        resources,
-        latent_capacity_units=latent_capacity_units,
         bytes_per_token=bytes_per_token,
         co_resident_bytes=(
             latent_pool_bytes if deployment.generation_device in {None, deployment.device} else 0
@@ -101,12 +98,6 @@ def resolve_capabilities(
         memory_fraction=float(deployment.kv_memory_fraction),
         resident_copies=resident_copies,
         co_resident_blocks=co_resident_blocks,
-    )
-    scratch_capacity = _scratch_capacity_tokens(
-        deployment,
-        resources,
-        num_blocks=int(capacity.num_blocks),
-        latent_capacity_units=latent_capacity_units,
     )
     if int(completion_payload_bytes) < 1:
         raise ValueError("completion payload capacity must be positive")
@@ -127,7 +118,6 @@ def resolve_capabilities(
         num_layers=int(cache.num_layers),
         num_kv_heads=int(cache.num_kv_heads),
         head_dim=int(cache.head_dim),
-        scratch_capacity_tokens=scratch_capacity,
         supported_work=supported_work,
         latent_page_units=latent_page_units,
         num_latent_pages=num_latent_pages,
@@ -152,7 +142,11 @@ def resolve_capabilities(
         max_vit_grid_tokens=max_vit_grid_tokens,
         max_latent_feature_bytes=max_latent_feature_bytes,
         max_vision_feature_bytes=max_vision_feature_bytes,
-        commit_marker_tokens=int(flow.commit_marker_tokens) if flow is not None else 2,
+        commit_marker_tokens=(
+            int(flow.commit_marker_tokens)
+            if flow is not None and flow.latent_layout is LatentLayout.PATCH_TOKENS
+            else 0
+        ),
         gen_rope_advance=int(flow.rope_advance) if flow is not None else 2,
         max_cfg_branches=int(flow.max_cfg_branches) if flow is not None else 1,
         rank=RankInfo(tp_rank=int(deployment.tp_rank), tp_size=int(deployment.tp_size)),
@@ -197,19 +191,11 @@ def _kv_bytes_per_token(model: ExecutionModel, deployment: WorkerDeployment) -> 
 
 def _kv_residency_shape(
     deployment: WorkerDeployment,
-    resources: object,
     *,
-    latent_capacity_units: int,
     bytes_per_token: int,
     co_resident_bytes: int,
 ) -> tuple[int, int]:
-    """Describe every KV pool that shares the deployment memory budget.
-
-    The first element counts the copies of the request pool held resident at
-    once; the second counts the additional blocks provisioned alongside them.
-    Together they let capacity sizing reserve room for the scratch residency
-    that :func:`_scratch_capacity_tokens` goes on to declare.
-    """
+    """Describe the single KV pool and co-resident fixed allocations."""
 
     block_size = int(deployment.block_size)
     padding_blocks = graph_padding_block_count(block_size)
@@ -224,35 +210,4 @@ def _kv_residency_shape(
         max(0, int(co_resident_bytes)),
         block_size * max(1, int(bytes_per_token)),
     )
-    scratch = getattr(resources, "scratch", None)
-    if scratch is None:
-        return 1, padding_blocks + graph_blocks + fixed_owner_blocks
-    fixed_blocks = ceil_div(int(scratch.fixed_tokens), block_size)
-    latent_blocks = ceil_div(latent_capacity_units * int(scratch.latent_copies), block_size)
-    return (
-        2 if scratch.mirror_kv else 1,
-        2 * padding_blocks
-        + graph_blocks
-        + fixed_owner_blocks
-        + max(int(scratch.minimum_blocks), fixed_blocks + latent_blocks),
-    )
-
-
-def _scratch_capacity_tokens(
-    deployment: WorkerDeployment,
-    resources: object,
-    *,
-    num_blocks: int,
-    latent_capacity_units: int,
-) -> int:
-    scratch = getattr(resources, "scratch", None)
-    if scratch is None:
-        return 0
-    block_size = int(deployment.block_size)
-    blocks = max(
-        int(scratch.minimum_blocks),
-        ceil_div(int(scratch.fixed_tokens), block_size)
-        + (num_blocks if scratch.mirror_kv else 0)
-        + ceil_div(latent_capacity_units * int(scratch.latent_copies), block_size),
-    )
-    return int(blocks * block_size)
+    return 1, padding_blocks + graph_blocks + fixed_owner_blocks

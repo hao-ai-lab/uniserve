@@ -148,7 +148,15 @@ class VisibleEndAttention:
     max_seqlen_k: int | None = None
     use_prefix_bounds: bool = False
     fully_visible: bool = False
+    prefix_k: torch.Tensor | None = None
+    prefix_v: torch.Tensor | None = None
+    prefix_lens: torch.Tensor | None = None
     ctx: ForwardBatch | None = None
 
 
-AttentionReq = DenseAttention | PagedDecodeAttention | VarlenAttention | VisibleEndAttention
+AttentionReq = (
+    DenseAttention
+    | PagedDecodeAttention
+    | VarlenAttention
+    | VisibleEndAttention
+)

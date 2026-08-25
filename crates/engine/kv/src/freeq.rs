@@ -1,10 +1,4 @@
-//! Per-block metadata including the intrusive free/eviction-queue links.
-//!
-//! The free queue is a doubly-linked list threaded through these `prev`/`next`
-//! indices (block-id space), giving O(1) push-back, pop-front, and middle removal
-//! — the mechanics of the reference `FreeKVCacheBlockQueue` (`block_pool.py`), needed so
-//! a cached block can be pulled out of the LRU queue the moment a prefix lookup
-//! re-references it.
+//! Per-page metadata and intrusive free/eviction-queue links.
 
 use crate::BlockState;
 

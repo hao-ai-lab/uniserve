@@ -18,16 +18,18 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_wire::{
-    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CacheCopy, CacheGroupPlacement,
+    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CacheCopy, CachePageAllocation,
     CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound, Disposition, Domain,
     DrawLayout, EncodeMode, ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags,
-    GenAdmission, GenMode, KvAdmission, KvBranchPlacement, KvPlacement, LatentPlacement,
-    LogicalLengths, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind,
-    ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck, RequestKey, RequestKind,
-    ResponseKind, Rng, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenMode, TokenSpan,
-    TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats, WorkerRequest,
-    WorkerResponse,
+    ForwardRow, GenAdmission, GenMode, LatentPlacement, LogicalLengths, OpId, OpStatus, Operation,
+    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    RecoveryPlacement, RegistrationAck, RequestKey, RequestKind, ResponseKind, ShapeBound,
+    SnapshotRef, StorageClass, TimingCounters, TokenMode, TokenSpan, TransferMode, UndAdmission,
+    VersionRef, Work, WorkerForwardStats, WorkerRequest, WorkerResponse,
 };
+
+#[cfg(test)]
+use uniserve_worker_wire::Bounds;
 
 // ---------------------------------------------------------------------------
 // Request -> Python (recv hot path)
@@ -110,7 +112,9 @@ struct NativeRequestTypes {
     point_range: Py<PyAny>,
     bounds: Py<PyAny>,
     rng: Py<PyAny>,
-    kv_placement: Py<PyAny>,
+    block_table: Py<PyAny>,
+    cache_page_allocation: Py<PyAny>,
+    forward_row: Py<PyAny>,
     commit: Py<PyAny>,
     close: Py<PyAny>,
     release: Py<PyAny>,
@@ -166,7 +170,9 @@ impl NativeRequestTypes {
             point_range: class("PointRange")?,
             bounds: class("Bounds")?,
             rng: class("Rng")?,
-            kv_placement: class("KvPlacement")?,
+            block_table: class("BlockTable")?,
+            cache_page_allocation: class("CachePageAllocation")?,
+            forward_row: class("ForwardRow")?,
             commit: class("Commit")?,
             close: class("Close")?,
             release: class("Release")?,
@@ -505,7 +511,6 @@ impl<'py> NativeRequestConversion<'py> {
                 bounds.into_any(),
                 pyo3::types::PyTuple::new(py, inputs)?.into_any(),
                 pyo3::types::PyTuple::new(py, outputs)?.into_any(),
-                operation.kv_capacity_pages.into_pyobject(py)?.into_any(),
                 predicate
                     .map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
@@ -518,22 +523,32 @@ impl<'py> NativeRequestConversion<'py> {
         self.types.operation.bind(py).call1(arguments)
     }
 
-    fn kv_placement(&mut self, placement: &KvPlacement) -> PyResult<Bound<'py, PyAny>> {
-        let request_key = self.request_key(placement.request_key)?;
-        self.types.kv_placement.bind(self.py).call1((
-            request_key,
-            placement.op_id.0,
-            placement.group_id,
-            pyo3::types::PyTuple::new(self.py, placement.block_table.iter().map(|block| block.0))?,
-            placement.block_table_update,
-            pyo3::types::PyTuple::new(
-                self.py,
-                placement.pages_to_zero.iter().map(|block| block.0),
-            )?,
-            placement.prefix_length,
-            placement.input_length,
-            placement.visible_length,
-            placement.resulting_length,
+    fn block_table(&self, table: &BlockTable) -> PyResult<Bound<'py, PyAny>> {
+        self.types.block_table.bind(self.py).call1((
+            table.request_pool_idx,
+            table.group_id,
+            pyo3::types::PyTuple::new(self.py, table.page_ids.iter().map(|page| page.0))?,
+            table.allocated_tokens,
+        ))
+    }
+
+    fn cache_page_allocation(
+        &self,
+        allocation: &CachePageAllocation,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.types.cache_page_allocation.bind(self.py).call1((
+            allocation.request_pool_idx,
+            allocation.group_id,
+            pyo3::types::PyTuple::new(self.py, allocation.page_ids.iter().map(|page| page.0))?,
+        ))
+    }
+
+    fn forward_row(&self, row: &ForwardRow) -> PyResult<Bound<'py, PyAny>> {
+        self.types.forward_row.bind(self.py).call1((
+            row.operation_index,
+            row.request_pool_index,
+            row.seq_len,
+            row.query_len,
         ))
     }
 
@@ -608,10 +623,20 @@ impl<'py> NativeRequestConversion<'py> {
             .iter()
             .map(|operation| self.operation(operation))
             .collect::<PyResult<Vec<_>>>()?;
-        let kv_placements = partition
-            .kv_placements
+        let block_tables = partition
+            .block_tables
             .iter()
-            .map(|placement| self.kv_placement(placement))
+            .map(|table| self.block_table(table))
+            .collect::<PyResult<Vec<_>>>()?;
+        let new_cache_pages = partition
+            .new_cache_pages
+            .iter()
+            .map(|allocation| self.cache_page_allocation(allocation))
+            .collect::<PyResult<Vec<_>>>()?;
+        let forward_rows = partition
+            .forward_rows
+            .iter()
+            .map(|row| self.forward_row(row))
             .collect::<PyResult<Vec<_>>>()?;
         let execution = match partition.execution {
             ExecutionCapability::DomainHomogeneous => 0,
@@ -638,13 +663,9 @@ impl<'py> NativeRequestConversion<'py> {
                 self.types.attention_regimes[attention].bind(py).clone(),
                 partition.shape_class.into_pyobject(py)?.into_any(),
                 pyo3::types::PyTuple::new(py, operations)?.into_any(),
-                pyo3::types::PyTuple::new(py, partition.request_pool_indices.iter().copied())?
-                    .into_any(),
-                pyo3::types::PyTuple::new(py, kv_placements)?.into_any(),
-                dict_list(py, &partition.kv_branch_placements, |placement| {
-                    kv_branch_placement_to_py(py, placement, context)
-                })?
-                .into_any(),
+                pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
+                pyo3::types::PyTuple::new(py, new_cache_pages)?.into_any(),
+                pyo3::types::PyTuple::new(py, forward_rows)?.into_any(),
                 dict_list(py, &partition.latent_placements, |placement| {
                     latent_placement_to_py(py, placement, context)
                 })?
@@ -681,30 +702,6 @@ fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny
         pyo3::types::PyTuple::new(py, controls)?,
         input_products,
     ))
-}
-
-fn kv_branch_placement_to_py<'py>(
-    py: Python<'py>,
-    placement: &KvBranchPlacement,
-    context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "request_key"),
-        context.request_key(placement.request_key)?,
-    )?;
-    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
-    dict.set_item(intern!(py, "branch_index"), placement.branch_index)?;
-    dict.set_item(intern!(py, "group_id"), placement.group_id)?;
-    dict.set_item(
-        intern!(py, "block_table"),
-        PyList::new(py, placement.block_table.iter().map(|block| block.0))?,
-    )?;
-    dict.set_item(
-        intern!(py, "pages_to_zero"),
-        PyList::new(py, placement.pages_to_zero.iter().map(|block| block.0))?,
-    )?;
-    Ok(dict)
 }
 
 fn latent_placement_to_py<'py>(
@@ -839,7 +836,7 @@ fn und_admission_to_py<'py>(py: Python<'py>, und: &UndAdmission) -> PyResult<Bou
         intern!(py, "finish_token_ids"),
         u32_list(py, &und.finish_token_ids)?,
     )?;
-    dict.set_item(intern!(py, "kv"), kv_admission_to_py(py, &und.kv)?)?;
+    dict.set_item(intern!(py, "initial_position"), und.initial_position)?;
     Ok(dict)
 }
 
@@ -849,13 +846,6 @@ fn gen_admission_to_py<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "image"), image_to_py(py, &branch.image)?)?;
-    Ok(dict)
-}
-
-fn kv_admission_to_py<'py>(py: Python<'py>, kv: &KvAdmission) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "prefix_len"), kv.prefix_len)?;
-    dict.set_item(intern!(py, "group_id"), kv.group_id)?;
     Ok(dict)
 }
 
@@ -1094,24 +1084,18 @@ fn cache_copy_to_py<'py>(py: Python<'py>, copy: &CacheCopy) -> PyResult<Bound<'p
     Ok(dict)
 }
 
-fn cache_group_placement_to_py<'py>(
-    py: Python<'py>,
-    placement: &CacheGroupPlacement,
-) -> PyResult<Bound<'py, PyDict>> {
+fn block_table_to_py<'py>(py: Python<'py>, table: &BlockTable) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "group_id"), placement.group_id)?;
+    dict.set_item(intern!(py, "request_pool_idx"), table.request_pool_idx)?;
+    dict.set_item(intern!(py, "group_id"), table.group_id)?;
     dict.set_item(
         intern!(py, "page_ids"),
         u32_list(
             py,
-            &placement
-                .page_ids
-                .iter()
-                .map(|page| page.0)
-                .collect::<Vec<_>>(),
+            &table.page_ids.iter().map(|page| page.0).collect::<Vec<_>>(),
         )?,
     )?;
-    dict.set_item(intern!(py, "length"), placement.length)?;
+    dict.set_item(intern!(py, "allocated_tokens"), table.allocated_tokens)?;
     Ok(dict)
 }
 
@@ -1127,9 +1111,9 @@ fn recovery_placement_to_py<'py>(
     )?;
     dict.set_item(intern!(py, "request_pool_idx"), placement.request_pool_idx)?;
     dict.set_item(
-        intern!(py, "cache_groups"),
-        dict_list(py, &placement.cache_groups, |group| {
-            cache_group_placement_to_py(py, group)
+        intern!(py, "block_tables"),
+        dict_list(py, &placement.block_tables, |table| {
+            block_table_to_py(py, table)
         })?,
     )?;
     dict.set_item(
@@ -1397,11 +1381,8 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionRecor
     let logical_lengths = LogicalLengths {
         token_len: u32_of(&get(lengths, intern!(py, "token_len"))?)?,
         kv_visible_len: u32_of(&get(lengths, intern!(py, "kv_visible_len"))?)?,
+        kv_computed_len: u32_of(&get(lengths, intern!(py, "kv_computed_len"))?)?,
         latent_len: u32_of(&get(lengths, intern!(py, "latent_len"))?)?,
-        kv_reserved_len: u32_of(&get(lengths, intern!(py, "kv_reserved_len"))?)?,
-        kv_initialized_len: u32_of(&get(lengths, intern!(py, "kv_initialized_len"))?)?,
-        kv_committed_len: u32_of(&get(lengths, intern!(py, "kv_committed_len"))?)?,
-        kv_published_len: u32_of(&get(lengths, intern!(py, "kv_published_len"))?)?,
     };
     let span = get(dict, intern!(py, "token_span"))?;
     let span = span.cast::<PyDict>().ok()?;
@@ -1676,7 +1657,7 @@ mod tests {
                 },
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
-                kv: KvAdmission::default(),
+                initial_position: 0,
             }),
             None,
         )
@@ -1734,7 +1715,6 @@ mod tests {
             },
             vec![input.clone()],
             vec![token, finish],
-            1,
             None,
             None,
             0,
@@ -1749,20 +1729,23 @@ mod tests {
             attention: AttentionRegime::Causal,
             shape_class: 0,
             operations: vec![operation],
-            request_pool_indices: vec![1],
-            kv_placements: vec![KvPlacement {
-                request_key,
-                op_id: OpId(1),
+            block_tables: vec![BlockTable {
+                request_pool_idx: 1,
                 group_id: 0,
-                block_table: vec![BlockId(1)],
-                block_table_update: true,
-                pages_to_zero: vec![BlockId(1)],
-                prefix_length: 0,
-                input_length: 2,
-                visible_length: 0,
-                resulting_length: 2,
+                page_ids: vec![BlockId(1)],
+                allocated_tokens: 2,
             }],
-            kv_branch_placements: Vec::new(),
+            new_cache_pages: vec![CachePageAllocation {
+                request_pool_idx: 1,
+                group_id: 0,
+                page_ids: vec![BlockId(1)],
+            }],
+            forward_rows: vec![ForwardRow {
+                operation_index: 0,
+                request_pool_index: 1,
+                seq_len: 0,
+                query_len: 2,
+            }],
             latent_placements: Vec::new(),
         };
         let mut request = WorkerRequest::execute(
@@ -1793,10 +1776,7 @@ mod tests {
                         token_len: 2,
                         kv_visible_len: 2,
                         latent_len: 0,
-                        kv_reserved_len: 2,
-                        kv_initialized_len: 2,
-                        kv_committed_len: 2,
-                        kv_published_len: 2,
+                        kv_computed_len: 2,
                     },
                     token_span: TokenSpan { base: 0, len: 1 },
                     committed_tokens: vec![42],

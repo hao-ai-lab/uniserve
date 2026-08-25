@@ -35,7 +35,6 @@ class WorkerModelLoadRequest:
     execution: ExecutionConfig
     parallel: TensorParallelSpec
     scope: ModelLoadScope = ModelLoadScope.WHOLE
-    generation_kv_capacity_tokens: int | None = None
     generation_device: str | None = None
     load: LoadConfig = LoadConfig()
 
@@ -129,7 +128,6 @@ def _checkpoint_request(
         execution=config.execution,
         parallel=TensorParallelSpec.from_mesh(mesh),
         scope=plan.model_scope,
-        generation_kv_capacity_tokens=config.resources.generation_kv_capacity_tokens,
         generation_device=config.placement.generation_device,
         load=config.load,
     )
@@ -154,7 +152,6 @@ def _stub_worker_model(config: WorkerLaunchConfig, plan: WorkerPlan) -> LoadedWo
             tp_rank=config.placement.tp_rank,
             tp_size=config.placement.tp_size,
             kv_token_capacity=config.resources.kv_token_capacity,
-            generation_kv_capacity_tokens=config.resources.generation_kv_capacity_tokens,
             model_dtype=config.execution.model_dtype,
             kv_cache_dtype=config.execution.kv_cache_dtype,
             kv_memory_fraction=config.execution.kv_memory_fraction,
@@ -211,7 +208,6 @@ def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
         tp_size=request.parallel.size,
         block_size=request.block_size,
         kv_token_capacity=request.kv_token_capacity,
-        generation_kv_capacity_tokens=request.generation_kv_capacity_tokens,
         attention_backend=request.attention_backend,
         model_dtype=execution.model_dtype,
         kv_cache_dtype=execution.kv_cache_dtype,

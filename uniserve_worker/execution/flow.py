@@ -25,7 +25,6 @@ from uniserve_worker.nn.diffusion.cfg import Branch, build_flow_cfg_plan
 from uniserve_worker.nn.diffusion.integrator import euler_step
 from uniserve_worker.nn.diffusion.schedule import x_pred_to_velocity
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
-from uniserve_worker.runtime.cache_pool import CacheRow
 from uniserve_worker.runtime.latent_pool import LatentPublication
 from uniserve_worker.server.completion import _CompletionTransferPayload
 from uniserve_worker.server.request_state import RequestRow
@@ -63,9 +62,24 @@ def consume_forward(
     if state.phase == "prefix_pending":
         if len(outputs) != len(state.rows):
             raise RuntimeError("flow prefix result is not aligned")
-        for task, output in zip(state.rows, outputs, strict=True):
+        for branch, task, output in zip(
+            state.data.pop("prefix_branches"), state.rows, outputs, strict=True
+        ):
             token.token_logits_or_hidden(output)
-            token.commit_kv(runtime, task, task.query_tokens, state.partition)
+            token.commit_kv(
+                runtime,
+                task,
+                task.query_tokens,
+                state.partition,
+                publish_runtime=False,
+            )
+            entry = state.data["entries"][branch]
+            state.data["entries"][branch] = (
+                entry[0],
+                entry[1],
+                entry[2] + task.query_tokens,
+                entry[3],
+            )
         state.phase = "denoise"
         state.rows = ()
         return
@@ -121,14 +135,16 @@ def _initialize(runtime: object, state: OperationState) -> None:
         raise invalid_descriptor(
             "flow operation requires exact conditioning and one latent input/output generation"
         )
-    cache_row = ops._cache_row(runtime, operation, partition)
+    cache = ops._cache_coordinates(runtime, operation, partition)
+    session = ops._request_row(runtime, partition, session_id)
     runtime.cache_publications.validate_conditioning(
         session_id,
         conditioning[0],
-        cache_row,
-        partition.cache_publication_inputs.get(conditioning[0]),
+        request_pool_idx=session.request_pool_idx,
+        group_id=cache[1],
+        visible_length=cache[2],
+        publication=partition.cache_publication_inputs.get(conditioning[0]),
     )
-    session = ops._request_row(runtime, partition, session_id)
     image = session.image
     if image is None:
         raise invalid_descriptor("flow operation has no admitted image parameters")
@@ -159,7 +175,7 @@ def _initialize(runtime: object, state: OperationState) -> None:
     )
     state.data.update(
         flow=flow,
-        cache_row=cache_row,
+        cache=cache,
         session=session,
         image=image,
         latent_input=latent_input,
@@ -199,44 +215,48 @@ def _prepare_step(runtime: object, state: OperationState) -> None:
     if len(guide.branches) > int(data["flow"].max_cfg_branches):
         raise invalid_descriptor("flow CFG plan exceeds the model branch bound")
     prefix_rows = []
+    prefix_branches = []
     entries = data["entries"]
-    for branch_index, branch in enumerate(guide.branches, start=1):
+    descriptors = partition.forward_rows.get(ops._operation_identity(operation), ())
+    if len(descriptors) < len(guide.branches):
+        raise invalid_descriptor("generation flow has incomplete forward-row metadata")
+    denoise_descriptors = descriptors[-len(guide.branches) :]
+    for branch_index, branch in enumerate(guide.branches):
         if branch in entries:
             continue
         source = branch_source(runtime, branch)
         prefix, copy_conditioning = flow_prefix(
             runtime, source, data["image_prompt"], data["session"]
         )
-        entry = partition.branch_rows.get((operation.request_key, operation.op_id, branch_index, 0))
-        if entry is None:
-            raise invalid_descriptor("flow branch has no scheduler scratch placement")
-        query = physical_tokens(
-            runtime, int(data["row"].placement.height), int(data["row"].placement.width)
-        )
-        prefix_length = data["cache_row"].length if copy_conditioning else len(prefix)
-        if prefix_length + query > entry.capacity:
-            raise invalid_descriptor("flow branch exceeds scheduler scratch placement")
-        if entry.length not in {0, prefix_length}:
+        descriptor = denoise_descriptors[branch_index]
+        if copy_conditioning:
+            entry = data["cache"]
+        else:
+            slot = int(descriptor.request_pool_index)
+            capacity = runtime.req_to_token_pool.allocated_length(slot)
+            runtime.req_to_token_pool.pages(slot, 0)
+            has_prefix_forward = any(
+                int(candidate.request_pool_index) == slot
+                and int(candidate.seq_len) == 0
+                and int(candidate.query_len) == len(prefix)
+                for candidate in descriptors[: -len(guide.branches)]
+            )
+            entry = (slot, 0, 0 if has_prefix_forward else int(descriptor.seq_len), capacity)
+        prefix_length = data["cache"][2] if copy_conditioning else len(prefix)
+        if prefix_length > entry[3]:
+            raise invalid_descriptor("flow prefix exceeds scheduler placement")
+        if entry[2] not in {0, prefix_length}:
             raise invalid_descriptor(
                 "flow branch prefix disagrees with its initialized physical state"
             )
-        initialize_prefix = entry.length == 0 and prefix_length > 0
-        if initialize_prefix and copy_conditioning:
-            prefix_pages = (
-                data["cache_row"].length + runtime.cache_pool.block_size - 1
-            ) // runtime.cache_pool.block_size
-            runtime.cache_pool.copy_pages(
-                entry.group_id,
-                data["cache_row"].block_table[:prefix_pages],
-                entry.block_table[:prefix_pages],
-            )
-            entry.length = data["cache_row"].length
-            entry.initialized_length = data["cache_row"].length
+        initialize_prefix = entry[2] == 0 and prefix_length > 0
         entries[branch] = entry
         if initialize_prefix and prefix:
             prefix_rows.append(prefix_row(runtime, operation, prefix, entry, branch, partition))
+            prefix_branches.append(branch)
     data.update(guide=guide, t=t, t_next=t_next)
     if prefix_rows:
+        data["prefix_branches"] = tuple(prefix_branches)
         state.rows = tuple(prefix_rows)
         state.phase = "prefix"
     else:
@@ -311,7 +331,7 @@ def _finish(runtime: object, state: OperationState) -> None:
             runtime,
             operation,
             data["session"],
-            data["cache_row"],
+            data["cache"],
             latent_len=final_step,
         ),
         token_span=TokenSpan(base=data["session"].logical_position, len=0),
@@ -319,6 +339,19 @@ def _finish(runtime: object, state: OperationState) -> None:
         product_generations=ops._output_generations(operation),
         products=products,
     )
+    main_slot = int(data["session"].request_pool_idx)
+    alternative_slots = {
+        int(entry[0]) for entry in data["entries"].values() if int(entry[0]) != main_slot
+    }
+    if alternative_slots and final_step >= int(data["image"].steps):
+        for slot in alternative_slots:
+            partition.runtime_cache_lengths.pop(slot, None)
+        runtime.req_to_token_pool.release(tuple(alternative_slots))
+        tracked = runtime._flow_prefix_slots.get(operation.request_key)
+        if tracked is not None:
+            tracked.difference_update(alternative_slots)
+            if not tracked:
+                runtime._flow_prefix_slots.pop(operation.request_key, None)
     state.phase = "done"
     state.rows = ()
 
@@ -417,12 +450,12 @@ def prefix_row(
     runtime,
     operation: Operation,
     tokens: tuple[int, ...],
-    entry: CacheRow,
+    entry: tuple[int, int, int, int],
     branch: Branch,
     scope: PartitionState,
 ) -> ForwardRow:
     session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    positions = torch.arange(entry.length, entry.length + len(tokens), dtype=torch.long)
+    positions = torch.arange(entry[2], entry[2] + len(tokens), dtype=torch.long)
     return ForwardRow(
         operation=operation,
         request=session,
@@ -433,8 +466,9 @@ def prefix_row(
         token_ids=torch.tensor(tokens, dtype=torch.long),
         positions=positions,
         selection=TokenSelection.HIDDEN,
-        entry=entry,
-        scratch=True,
+        request_pool_idx=entry[0],
+        seq_len=entry[2],
+        group_id=entry[1],
         write_kv=True,
         causal=True,
         attention_indexes=torch.stack(
@@ -448,7 +482,7 @@ def denoise_row(
     operation: Operation,
     conditioning_position: int,
     branch: Branch,
-    entry: CacheRow,
+    entry: tuple[int, int, int, int],
     latent: torch.Tensor,
     timestep: torch.Tensor,
     height: int,
@@ -505,9 +539,10 @@ def denoise_row(
         image_tokens=query_tokens,
         image_height=height,
         image_width=width,
-        entry=entry,
-        scratch=True,
-        write_kv=True,
+        request_pool_idx=entry[0],
+        seq_len=entry[2],
+        group_id=entry[1],
+        write_kv=False,
         causal=False,
         attention_indexes=attention_indexes,
         text_local_indices=text_local,
@@ -518,11 +553,11 @@ def _temporal_position(
     runtime,
     branch: Branch,
     conditioning_position: int,
-    entry: CacheRow,
+    entry: tuple[int, int, int, int],
 ) -> int:
     if branch is Branch.COND:
         return int(conditioning_position)
-    return int(entry.length)
+    return int(entry[2])
 
 
 def image_token_count(runtime, latent: torch.Tensor, height: int, width: int) -> int:

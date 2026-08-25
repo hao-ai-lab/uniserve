@@ -23,10 +23,12 @@ from uniserve_worker.batch import (
     SamplingState,
     TokenSpan,
 )
+from uniserve_worker.batch import (
+    ForwardRow as WireForwardRow,
+)
 from uniserve_worker.execution.forward_batch import FlowPatches, ModelPhase, TokenSelection
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
-from uniserve_worker.runtime.cache_pool import CacheRow
 from uniserve_worker.runtime.device_products import (
     DeviceProductMetadata,
     DeviceProductRead,
@@ -75,8 +77,9 @@ class ForwardRow:
     encode_pixels: torch.Tensor | None = None
     encode_grid: torch.Tensor | None = None
     encode_grid_shape: tuple[int, int] | None = None
-    entry: CacheRow | None = None
-    scratch: bool = False
+    request_pool_idx: int = 0
+    seq_len: int = 0
+    group_id: int = 0
     write_kv: bool = False
     causal: bool = True
     attention_indexes: torch.Tensor | None = None
@@ -321,7 +324,7 @@ class PreparedExecution:
 class PartitionLayout:
     operations: tuple[Operation, ...]
     requests: tuple[RequestRow, ...]
-    cache_rows: tuple[CacheRow | None, ...]
+    seq_lens: tuple[int, ...]
     weights: tuple[WeightSet, ...]
     identities: tuple[OperationIdentity, ...]
 
@@ -331,7 +334,7 @@ class PartitionLayout:
             len(values) == width
             for values in (
                 self.requests,
-                self.cache_rows,
+                self.seq_lens,
                 self.weights,
                 self.identities,
             )
@@ -357,9 +360,7 @@ class PartitionState:
     completion: CompletionLease
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
-    cache_rows: dict[tuple[RequestKey, int, int], CacheRow] = field(default_factory=dict)
-    branch_rows: dict[tuple[RequestKey, int, int, int], CacheRow] = field(default_factory=dict)
-    branch_publications: dict[tuple[RequestKey, int, int], CacheRow] = field(default_factory=dict)
+    forward_rows: dict[OperationIdentity, tuple[WireForwardRow, ...]] = field(default_factory=dict)
     layout: PartitionLayout | None = None
     prepared_transfers: dict[ProductRef, PreparedTransferInput] = field(default_factory=dict)
     transferred_device_products: dict[ProductRef, DeviceProductWrite] = field(default_factory=dict)

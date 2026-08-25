@@ -6,7 +6,7 @@ import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
 from uniserve_worker.bootstrap.capabilities import resolve_capabilities
-from uniserve_worker.models.runtime import CacheGeometry, ScratchGeometry
+from uniserve_worker.models.runtime import CacheGeometry
 from uniserve_worker.server.stub import StubModel
 
 pytestmark = pytest.mark.unit
@@ -26,7 +26,7 @@ def fixed_device_total(monkeypatch):
     )
 
 
-def _model(scratch: ScratchGeometry | None) -> StubModel:
+def _model() -> StubModel:
     model = StubModel()
     model.cache_geometry = CacheGeometry(
         num_layers=32,
@@ -35,7 +35,6 @@ def _model(scratch: ScratchGeometry | None) -> StubModel:
         head_dim=8,
         dtype="bfloat16",
     )
-    model.resource_geometry = replace(model.resource_geometry, scratch=scratch)
     return model
 
 
@@ -49,17 +48,7 @@ def _deployment(*, token_capacity: int | None):
     )
 
 
-@pytest.mark.parametrize(
-    ("scratch", "expected"),
-    [
-        (None, 0),
-        (ScratchGeometry(fixed_tokens=65536), 65536),
-        (ScratchGeometry(minimum_blocks=8, latent_copies=4), 524288),
-        (ScratchGeometry(fixed_tokens=8192, mirror_kv=True), 139264),
-    ],
-)
-def test_capabilities_advertise_the_provisioned_scratch_capacity(scratch, expected):
-    capabilities = resolve_capabilities(_model(scratch), _deployment(token_capacity=131072))
+def test_explicit_kv_capacity_provisions_one_physical_page_pool():
+    capabilities = resolve_capabilities(_model(), _deployment(token_capacity=131072))
 
     assert capabilities.num_blocks * BLOCK_SIZE == 131072
-    assert capabilities.scratch_capacity_tokens == expected

@@ -123,6 +123,7 @@ class RuntimeStates:
         continuation_width: int,
         device: torch.device | str,
         logits_dtype: torch.dtype = torch.float32,
+        valid_cache_lengths: torch.Tensor | None = None,
     ) -> None:
         if request_pool_size < 1 or vocab_size < 1 or continuation_width < 1:
             raise ValueError("runtime-state geometry must be positive")
@@ -134,7 +135,18 @@ class RuntimeStates:
             raise ValueError("runtime prompt-logit dtype must be floating point")
         self.logits_dtype = logits_dtype
         rows = self.request_pool_size + 1
-        self.valid_cache_lengths = torch.zeros(rows, dtype=torch.int32, device=self.device)
+        if valid_cache_lengths is None:
+            self.valid_cache_lengths = torch.zeros(
+                rows, dtype=torch.int32, device=self.device
+            )
+        else:
+            if (
+                valid_cache_lengths.shape != (rows,)
+                or valid_cache_lengths.dtype != torch.int32
+                or valid_cache_lengths.device != self.device
+            ):
+                raise ValueError("runtime cache-length storage is incompatible")
+            self.valid_cache_lengths = valid_cache_lengths
         self.logical_lengths = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.sampling_positions = torch.zeros(rows, dtype=torch.int64, device=self.device)
         self.future_input_tokens = torch.ones(

@@ -464,8 +464,6 @@ pub struct GenerationResourceBounds {
     pub max_image_latent_bytes: u64,
     pub max_latent_feature_bytes: u64,
     pub max_vision_feature_bytes: u64,
-    pub max_scratch_units: u64,
-    pub max_host_scratch_tokens: u64,
     pub encoder_cache_keys: Vec<u64>,
     pub generated_feedback_makes_non_replayable: bool,
 }
@@ -485,9 +483,6 @@ pub struct GenerationRuntimeCapabilities {
     pub max_vision_feature_bytes: u64,
     pub commit_marker_tokens: u32,
     pub max_cfg_branches: u32,
-    pub scratch_capacity_tokens: u64,
-    #[serde(default)]
-    pub scratch_block_size: u32,
     pub encoder_cache_entries: u32,
 }
 
@@ -509,28 +504,6 @@ impl GenerationRuntimeCapabilities {
         }
         Ok(())
     }
-}
-
-pub fn denoise_scratch_tokens(
-    latent_tokens: u64,
-    marker_tokens: u64,
-    conditioning_tokens: u64,
-    negative_tokens: u64,
-    cfg_branches: u64,
-    block_size: u64,
-) -> u64 {
-    let block_size = block_size.max(1);
-    let branch_tokens = latent_tokens.saturating_add(marker_tokens);
-    let rounded_span = |prefix_tokens: u64| {
-        branch_tokens
-            .saturating_add(prefix_tokens)
-            .div_ceil(block_size)
-            .saturating_mul(block_size)
-    };
-    let branches = cfg_branches.max(1);
-    let conditioning = rounded_span(conditioning_tokens);
-    let auxiliary = rounded_span(conditioning_tokens.max(negative_tokens));
-    conditioning.saturating_add(auxiliary.saturating_mul(branches.saturating_sub(1)))
 }
 
 impl GenerationResourceBounds {
@@ -565,22 +538,6 @@ impl GenerationResourceBounds {
             };
             Ok(total.saturating_add(ingest_kv_bound(ingest, capabilities)?))
         })?;
-        let input_image_host_scratch_tokens = if context.iter().any(|segment| {
-            matches!(
-                segment,
-                ContextSegment::Image { ingest, .. }
-                    if ingest.steps.contains(&ImageIngestStep::VaeEncode)
-            )
-        }) {
-            if capabilities.max_vae_grid_tokens == 0 {
-                return Err(GenerationResourceError::MissingRuntimeBound {
-                    resource: "max_vae_grid_tokens",
-                });
-            }
-            u64::from(capabilities.max_vae_grid_tokens)
-        } else {
-            0
-        };
         let feedback_kv_per_image = if behavior.generated_image_feedback {
             match policy.feedback.as_ref() {
                 Some(feedback) => ingest_kv_bound(&feedback.ingest, capabilities)?,
@@ -666,11 +623,6 @@ impl GenerationResourceBounds {
                 resource: "max_cfg_branches",
             });
         }
-        if behavior.gen_output && capabilities.scratch_capacity_tokens == 0 {
-            return Err(GenerationResourceError::MissingRuntimeBound {
-                resource: "scratch_capacity_tokens",
-            });
-        }
         let latent_downsample = capabilities.latent_downsample.max(1);
         let requested_latent_units = u64::from(image.width / latent_downsample)
             .saturating_mul(u64::from(image.height / latent_downsample));
@@ -693,32 +645,12 @@ impl GenerationResourceBounds {
         } else {
             0
         };
-        let requested_scratch_units = u64::from(image.cfg_branch_count());
-        if behavior.gen_output && requested_scratch_units > u64::from(capabilities.max_cfg_branches)
+        let requested_cfg_branches = u64::from(image.cfg_branch_count());
+        if behavior.gen_output && requested_cfg_branches > u64::from(capabilities.max_cfg_branches)
         {
             return Err(GenerationResourceError::CfgBranchCapacity {
-                requested: requested_scratch_units,
+                requested: requested_cfg_branches,
                 available: capabilities.max_cfg_branches,
-            });
-        }
-        let requested_host_scratch_tokens = if behavior.gen_output {
-            denoise_scratch_tokens(
-                requested_latent_units,
-                u64::from(capabilities.commit_marker_tokens),
-                context_tokens as u64,
-                negative_tokens as u64,
-                requested_scratch_units,
-                u64::from(capabilities.scratch_block_size),
-            )
-        } else {
-            0
-        };
-        let max_host_scratch_tokens =
-            requested_host_scratch_tokens.max(input_image_host_scratch_tokens);
-        if max_host_scratch_tokens > capabilities.scratch_capacity_tokens {
-            return Err(GenerationResourceError::HostScratchCapacity {
-                requested: max_host_scratch_tokens,
-                available: capabilities.scratch_capacity_tokens,
             });
         }
 
@@ -727,7 +659,8 @@ impl GenerationResourceBounds {
             max_kv_tokens: context_tokens
                 .saturating_add(max_und_tokens)
                 .saturating_add(input_image_kv_tokens)
-                .saturating_add(generated_feedback_kv_tokens),
+                .saturating_add(generated_feedback_kv_tokens)
+                .saturating_add(behavior.gen_output.then_some(negative_tokens).unwrap_or(0)),
             max_image_latent_units: if behavior.gen_output {
                 requested_latent_units
             } else {
@@ -744,12 +677,6 @@ impl GenerationResourceBounds {
             } else {
                 0
             },
-            max_scratch_units: if behavior.gen_output {
-                requested_scratch_units
-            } else {
-                0
-            },
-            max_host_scratch_tokens,
             encoder_cache_keys,
             generated_feedback_makes_non_replayable: behavior.generated_image_feedback,
         })
@@ -781,16 +708,6 @@ impl GenerationResourceBounds {
                 "max_vision_feature_bytes",
                 self.max_vision_feature_bytes,
                 required.max_vision_feature_bytes,
-            ),
-            (
-                "max_scratch_units",
-                self.max_scratch_units,
-                required.max_scratch_units,
-            ),
-            (
-                "max_host_scratch_tokens",
-                self.max_host_scratch_tokens,
-                required.max_host_scratch_tokens,
             ),
         ] {
             if declared < required {
@@ -885,8 +802,6 @@ pub enum GenerationResourceError {
     CfgBranchCapacity { requested: u64, available: u32 },
     #[error("requested encoder-cache entries ({requested}) exceed runtime capacity ({available})")]
     EncoderCacheCapacity { requested: usize, available: u32 },
-    #[error("requested host scratch tokens ({requested}) exceed runtime capacity ({available})")]
-    HostScratchCapacity { requested: u64, available: u64 },
     #[error("declared {resource} bound ({declared}) is below the required bound ({required})")]
     DeclaredBoundTooSmall {
         resource: &'static str,
@@ -1226,8 +1141,6 @@ mod tests {
             max_vision_feature_bytes: 1 << 20,
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
-            scratch_capacity_tokens: 8_192,
-            scratch_block_size: 64,
             encoder_cache_entries: 4,
         }
     }
@@ -1456,10 +1369,8 @@ mod tests {
         .expect("bounded resources");
 
         assert_eq!(bounds.context_tokens, 4);
-        assert_eq!(bounds.max_kv_tokens, 4 + 16 + 64 + 32 + 2 * (64 + 64));
+        assert_eq!(bounds.max_kv_tokens, 4 + 16 + 64 + 32 + 2 * (64 + 64) + 1);
         assert_eq!(bounds.max_image_latent_units, 1_024);
-        assert_eq!(bounds.max_scratch_units, 2);
-        assert_eq!(bounds.max_host_scratch_tokens, 2_176);
         assert_eq!(bounds.encoder_cache_keys.len(), 2);
         assert!(bounds.generated_feedback_makes_non_replayable);
     }

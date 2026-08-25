@@ -1,97 +1,114 @@
 # KV cache management
 
-UniServe uses one scheduler-authored KV address space from allocation through model execution. The Rust scheduler allocates request slots and KV pages, while each Python worker owns the fixed tensors stored at those addresses. Every batch carries complete physical placement, so execution validates and applies an allocation decision without deriving another page map.
+UniServe uses one scheduler-owned physical page address space for every persistent KV sequence and one worker execution image of that state. Conversational history, generation conditioning, alternative classifier-free-guidance (CFG) prefixes, transfer installation, and recovery all use the same block-table contract.
 
 ## Ownership
 
 | Concern | Owner | Canonical representation |
 | --- | --- | --- |
-| Request slots, page leases, prefix sharing, eviction, and release order | Rust scheduler | Scheduler resource managers |
-| Request lineage, committed cursor, and logical KV lengths | Scheduler protocol and worker request table | `Admission`, `Operation`, ordered controls, completion records, and fixed `RequestRow` values |
-| Operation block tables, pages to zero, and KV extents | Rust scheduler | `BatchPartition.kv_placements` |
-| Generation branch tables and pages to zero | Rust scheduler | `BatchPartition.kv_branch_placements` |
-| Physical key/value tensors and quantization metadata | Python worker | `CachePool` |
-| Placement validation, row binding, and partition publication | `execution.step` | `PartitionState`, `CacheRow`, and partition commit functions |
-| Token-operation extent advancement | `execution.token` with step commit functions | Validated `CacheRow` extent transitions |
-| Attention metadata for a physical forward | `execution.attention` | `KvView` and `AttnPlan` |
-| Model-visible KV access | `ForwardBatch` | `ForwardBatch.kv` |
-| GPU staging and model invocation | `ModelRunner` | `ForwardRow` to `ForwardResult` |
-| Cross-stage KV publication and installation | Worker transfer layer | `TransferConnector`, bounded tickets, and `CachePublication` |
-| Administrative state serialization | Worker recovery layer | `SnapshotRecovery` |
+| Physical page availability and references | Scheduler `BlockPool` | Reference-counted physical page locations |
+| One cached sequence | Scheduler request or flow state | One `BlockTable` per cache group |
+| Prefix matching and cross-group retention | Scheduler `KvCacheCoordinator` | Prefix keys and group-specific matches |
+| Request-slot page mappings | Worker `ReqToTokenPool` | Group/request-indexed page-table tensor |
+| Materialized and allocated KV lengths | Worker `ReqToTokenPool` | `verified_lens` and `alloced_lens` |
+| Layer K/V tensors | Worker `CachePool` | Layer-major physical page storage |
+| Attention visibility for one call | `ForwardBatch` | Row-aligned `seq_lens` |
+| Current-token persistence | `ForwardBatch` | Packed `out_cache_loc` values |
+| Destination publication progress | Publication registry | Destination base and published extent |
+| Durable recovery data | Snapshot storage | Dense visible tensors and semantic request state |
 
-A model receives an immutable attention plan and a bounded cache view for the current `ForwardBatch`. Page allocation, block-table construction, prefix policy, committed-length changes, and recovery placement remain outside the model interface.
+The scheduler is authoritative for page ownership. A worker installs complete scheduler-issued block tables into `ReqToTokenPool`; kernel indices and attention metadata are derived from that execution image and are not persistent sequence state.
 
-## Physical address space
+## Physical page storage
 
-`CachePool` is created once from model cache geometry and worker deployment capacity. Key and value tensors use this logical shape:
+`CachePool` is created once from the model cache geometry and worker capacity. Its K/V tensors have the logical shape:
 
 ```text
 [layer, physical_page, page_token, kv_head, head_dimension]
 ```
 
-Page `0` is the permanent zero sentinel for padded graph rows and block-table tails. Positive request pages occupy the range below `scratch_page_offset`; generation scratch pages occupy the remaining range. Cache-group ranges partition the request-page axis, and every command names the group that owns its global page IDs. The same page ID addresses corresponding rank-local storage on every tensor-parallel rank.
+Page `0` is reserved as the padding sentinel. Positive page IDs belong to declared cache-group ranges, such as separate Full-attention and sliding-window-attention ranges. Request lifetime and flow lifetime do not create physical subspaces.
 
-The pool validates group ownership, page ranges, request and scratch regions, repeated real pages, layer indices, tensor geometry, and token spans before mutation. Its operations are physical: zero, copy, read, write, page view, and restore. Scheduler decisions determine which pages are assigned and when they may be reused.
+`CachePool` provides page-level reset, copy, read, write, export, and restore operations. It owns tensor storage and storage-dtype metadata; it does not own request slots, request page tables, logical sequence positions, or allocation policy.
 
-Optional FP8 storage uses group-, layer-, and page-indexed scale tables. Zeroing clears both values and scale state. The first subsequent write establishes the page scale, and later appends use that scale. An attention provider is selected only when it can consume the declared storage representation directly.
+## Scheduler tables and worker installation
 
-## Request and operation placement
+A scheduler `BlockTable` maps one cached sequence's logical blocks to physical pages and records its allocated token capacity. Scheduler request state owns the conversational tables. A distinct alternative CFG prefix owns ordinary tables for the lifetime of the flow operation. Reference-counted page handles keep shared prefixes live until their last owning table is released.
 
-`Admission` binds a request key to one stable `request_pool_idx`. Each token operation carries a finite KV capacity, and its aligned `KvPlacement` identifies the complete block table, exact `pages_to_zero`, prefix length, input length, visible length, and resulting length. Placement is execution metadata and does not contribute to admission, plan, semantic, or control identity.
+The wire representation of every table is:
+
+```text
+request_pool_idx
+group_id
+page_ids
+allocated_tokens
+```
+
+Newly allocated page IDs travel separately so the worker can reset their contents and quantization metadata before first use. `ReqToTokenPool` installs each complete table into the declared request slot, tracks its allocated and verified lengths, and clears the slot before reuse.
 
 ```mermaid
 flowchart LR
-    S["Scheduler allocation and prefix policy"] --> P["Batch placement sidecars"]
-    P --> V["execution.step validates identities, pages, and extents"]
-    V --> Z["CachePool applies declared zero and copy commands"]
-    Z --> R["execution.step binds request and CacheRow candidates"]
-    R --> A["execution.attention builds KvView and AttnPlan"]
-    A --> F["ForwardBatch exposes kv"]
-    F --> M["ModelRunner invokes the model"]
-    M --> E["execution.token validates and advances extents"]
-    E --> C["execution.step validates and publishes the partition"]
+    S["Scheduler BlockPool"] --> T["Request-owned BlockTable"]
+    T --> W["Wire table update"]
+    W --> R["Worker ReqToTokenPool"]
+    R --> F["ForwardBatch coordinates"]
+    F --> A["Attention backend"]
+    A --> C["CachePool tensors"]
 ```
 
-Before model execution, `execution.step` validates every placement against the operation, fixed pool geometry, request slot, capacity, and logical parent state. It zeroes exactly the declared pages and binds `CacheRow` candidates whose reserved, initialized, visible, committed, and published extents are bounded by the supplied block table.
+## Forward execution
 
-`execution.attention` constructs the appropriate paged decode, request-indexed decode, paged variable-length, or packed plan from the ready `ForwardRow` group. `CacheBatchView` derives block tables, cache sequence lengths, packed write coordinates, and layer tensors from the bound rows. The resulting `KvView` and `AttnPlan` enter `ModelRunner.forward` as explicit values and become `ForwardBatch.kv` and `ForwardBatch.attention`.
+`ForwardBatch` is the model-facing execution contract. Its KV core consists of `forward_mode`, `req_pool_indices`, `seq_lens`, `query_lens`, and `out_cache_loc`.
 
-Model code reads and writes K/V tensors through the bounded view. After a successful token forward, `execution.token` requests the validated extent transition and records the operation outcome. `execution.step` publishes those candidates only after the entire partition has passed completion, product, latent, encoder, runtime-state, and KV validation.
+Each packed current token has one `out_cache_loc`. Zero means its K/V is available to the current attention call but is not persisted. A positive value encodes a physical page and page offset in `CachePool`. Text extend and decode rows use positive destinations for selected current tokens; denoise image rows use zero destinations.
 
-## Prefix reuse and page hygiene
+`ForwardRow` is the CPU packing record for one model row. It carries the request-pool index, historical sequence length, query length, and persistence choice. Multiple rows may reference the same request slot, including CFG branches that share conversational conditioning.
 
-The scheduler partitions each cache group into fixed-size pages. Release decrements scheduler references, and an unreferenced page becomes eligible for reuse after ordered worker retirement.
+Sequence length has one owner for each meaning:
 
-Full prompt pages may be indexed by chained hashes containing the preceding hash, cache group, modality tag, token count, and exact tokens. Lookup walks from the start of the prompt and stops at the first miss. A hit is accepted only after exact token verification. Shared prefix holders use the same physical page IDs, while writable suffix pages remain exclusive.
+| Meaning | Source |
+| --- | --- |
+| Allocated capacity | Scheduler `BlockTable` and worker `ReqToTokenPool.alloced_lens` |
+| Contiguous computed KV | `ReqToTokenPool.verified_lens` |
+| Historical KV visible to one call | `ForwardBatch.seq_lens` |
+| Selected semantic KV position | Selected request version and completion `kv_visible_len` |
+| Materialized speculative position | Completion `kv_computed_len` |
+| Published destination progress | Publication registry extent |
 
-Every page assigned to unrelated content appears in `pages_to_zero`. The worker clears every layer, key, value, and quantization field for that page before the operation writes it. Prefix-hit pages retain their published content.
+Speculative verification may compute KV beyond the selected semantic point. In that case `kv_computed_len` and `verified_lens` record the materialized boundary while `kv_visible_len` records the selected boundary.
 
-## Candidate publication
+## Segmented attention
 
-Each partition binds isolated request-row candidates and resource-specific candidates. Validation covers all operation outcomes, completion bounds, KV extents, products, encoder entries, latent state, runtime-state rows, and branch rows before publication begins.
+Image-generation attention treats the paged conditioning prefix and dense current image K/V as segments of one logical sequence. Both segments evaluate the same query and return output with log-sum-exp state. A stable online-softmax merge combines those states, making the result equivalent to dense attention over `[prefix | current]`.
 
-KV writes target scheduler-reserved pages beyond the live logical extent. Successful partition publication assigns the complete request-row candidate and exposes the validated extents. On an ordinary failure, candidate rows and product bindings are discarded, latent imports are released, prepared transport locators are retired, and bytes outside the preceding published extent remain unreachable. A failure after publication begins is an invariant violation because ordinary request faults must resolve during prevalidation.
+The prefix length is independent of page boundaries. Causal text rows expose current positions incrementally; denoise rows expose the complete current image segment. Because denoise output locations are zero, image K/V participates only in the active forward and does not consume persistent pages.
 
-## Sequence and generation work
+Backend startup qualification selects segmented attention only when the provider supports paged-prefix attention, dense-current attention, LSE return, stable merge, the active dtype, and the active head geometry.
 
-Extend, decode, and verify operations declare their input span, finite growth bound, exact capacity, and physical placement. `execution.token` packs each ready operation into a `ForwardRow`. The ready-set combines compatible rows, `execution.attention` builds one plan for the physical group, and `ModelRunner.forward` returns aligned tensors. Token consumption validates the neural result, samples or verifies it, commits the row extent, and records the selected token effect.
+## Generation flow
 
-Generation branches receive `KvBranchPlacement` records in the scratch region. Conditional state reaches a named branch only through explicit physical page copies. Text-unconditional and image-unconditional branches use disjoint scheduler assignments and can participate in one packed forward. Scratch rows are operation-scoped and never become request allocation state.
+Every CFG branch resolves to a cached prefix slot:
 
-Tensorized mixed token and flow rows share one packed attention plan when their physical group key matches. Each row retains its own visibility bounds, write coordinates, route spans, and cache extent. Flow-prefix completion and Euler integration are causal readiness transitions around model forwards; neither changes KV ownership.
+1. A branch using conversational conditioning references the main request slot.
+2. Branches using the same conditioning share that slot and its pages.
+3. A distinct negative or alternative text prefix receives another request slot and ordinary pages from the common `BlockPool`.
+4. The distinct prefix is prefetched once and reused for each denoise step in the flow operation.
+5. Flow completion, cancellation, or failure releases its alternative-prefix slot and block tables while leaving request-owned conversational tables live.
 
-## Transfer
+Persistent KV admission therefore counts request pages plus pages for distinct materialized alternative prefixes. Dense denoise tokens and duplicate CFG views do not add persistent KV capacity.
 
-KV publication binds an exact product generation, fixed semantic version, source extent, destination, cache group, storage identity, and source-page prefix. Incremental publication sends only the suffix beyond the installed destination base. The descriptor carries the exact generation and a `CachePublication`; every referenced locator carries dtype, shape, byte count, and transport identity.
+## Publication and transfer
 
-The consumer prepares bounded asynchronous tickets, validates every locator before execution, and installs bytes into scheduler-assigned destination pages. Destination metadata becomes visible only with successful partition publication. Transfer readiness is observed by query, and ticket or byte exhaustion returns bounded backpressure.
+KV publication names a source request slot, cache group, semantic source version, destination, base extent, and published extent. The publication registry resolves the source pages through `ReqToTokenPool` and publishes only the suffix beyond the installed destination base.
+
+The immutable publication manifest contains transport locators, semantic versions, destination, extents, group identity, and storage identity. Physical source page IDs remain local to the source worker. Installation resolves the scheduler-assigned destination table, writes the transferred suffix into `CachePool`, advances the destination verified length, and reports the installed selected and computed lengths.
 
 ## Recovery
 
-Snapshot and restore are administrative operations. `SnapshotRecovery` serializes the committed request row and exact bytes selected by a scheduler-supplied `RecoveryPlacement`. Restore validates model identity, weight identity, snapshot digest, format, dtype, shape, byte count, and pool geometry before writing.
+Snapshot creation validates scheduler-supplied recovery tables against the committed request state, resolves their installed mappings through `ReqToTokenPool`, and serializes only the visible dense K/V range for each cache group. Semantic request state, publication state, latent state, and transport-owned assets retain their respective owners.
 
-Physical request slots and page IDs are placement rather than durable identity. The scheduler allocates destination slots and pages for recovery, and the worker restores bytes directly into those locations. A restored request becomes executable only after its complete request row and concrete owner state are installed.
+Restore receives fresh scheduler-issued block tables, installs them into `ReqToTokenPool`, writes the serialized tensors into the assigned `CachePool` pages, restores allocated and verified lengths, and then publishes the recovered request state. Physical page IDs and request slots are placement rather than durable identity.
 
-## Graph execution
+## CUDA graph execution
 
-Captured attention receives request-variable state through fixed pool bases and staged physical indices. Block-table padding repeats page `0`; each replay overwrites live entries, sequence lengths, write coordinates, and padded tails before execution. Since physical placement remains outside semantic identity, one qualified graph shape can execute different requests without embedding ownership in the capture.
+Captured forwards use fixed tensor bases and stage request-variable indices, sequence lengths, query lengths, output locations, and padded table tails before replay. Padding references page `0`. One qualified graph shape can therefore execute different scheduler placements without embedding request ownership into the capture.

@@ -21,8 +21,9 @@ from uniserve_worker.batch import (
     AttentionRegime,
     Batch,
     BatchPartition,
+    BlockTable,
     Bounds,
-    CacheGroupPlacement,
+    CachePageAllocation,
     Commit,
     CompletionRecord,
     DevicePoint,
@@ -34,7 +35,7 @@ from uniserve_worker.batch import (
     ExecutionCapability,
     FinishFlags,
     FixedPoint,
-    KvPlacement,
+    ForwardRow,
     LatentPlacement,
     LogicalLengths,
     Operation,
@@ -58,13 +59,13 @@ from uniserve_worker.batch import (
     Work,
     WorkVariant,
     control_from_wire,
-    mark_typed_wire,
     control_to_wire,
     decode_sampling_state_bytes,
     decode_token_product_bytes,
     encode_sampling_state_bytes,
     encode_token_product_bytes,
     execution_domain,
+    mark_typed_wire,
     protocol_layout_digest,
 )
 from uniserve_worker.foundation.errors import WorkerError
@@ -120,7 +121,6 @@ def _decode_operation(input_product: ProductRef | None = None) -> Operation:
         bounds=Bounds(max_points=1, max_tokens=1, max_kv_pages=1),
         inputs=(() if input_product is None else (input_product,)),
         outputs=(_token_output(),),
-        kv_capacity_pages=1,
         rng=Rng(seed=99, semantic_index_base=4, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
 
@@ -137,21 +137,10 @@ def _partition(*operations: Operation) -> BatchPartition:
         attention=AttentionRegime.CAUSAL,
         shape_class=0,
         operations=operations,
-        request_pool_indices=(8,) * len(operations),
-        kv_placements=tuple(
-            KvPlacement(
-                request_key=operation.request_key,
-                op_id=operation.op_id,
-                group_id=0,
-                block_table=(7,),
-                block_table_update=True,
-                pages_to_zero=(7,),
-                prefix_length=0,
-                input_length=1,
-                visible_length=0,
-                resulting_length=1,
-            )
-            for operation in operations
+        block_tables=(BlockTable(8, 0, (7,), 1),),
+        new_cache_pages=(CachePageAllocation(8, 0, (7,)),),
+        forward_rows=tuple(
+            ForwardRow(index, 8, 0, 1) for index, _operation in enumerate(operations)
         ),
     )
 
@@ -201,7 +190,6 @@ def _trajectory_operation(request_key: RequestKey, work: Work, *, op_id: int) ->
         bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=24),
         inputs=inputs,
         outputs=outputs,
-        kv_capacity_pages=0,
     )
 
 
@@ -223,7 +211,6 @@ def _trajectory_partition(
         attention=AttentionRegime.NONE,
         shape_class=0,
         operations=(operation,),
-        request_pool_indices=(int(operation.request_key.session_id),),
         latent_placements=(
             LatentPlacement(
                 request_key=operation.request_key,
@@ -291,21 +278,7 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
         ),
         start=1,
     ):
-        kv_placements = tuple(
-            KvPlacement(
-                request_key=item.request_key,
-                op_id=item.op_id,
-                group_id=0,
-                block_table=(placements[position],),
-                block_table_update=True,
-                pages_to_zero=(placements[position],),
-                prefix_length=0,
-                input_length=1,
-                visible_length=0,
-                resulting_length=1,
-            )
-            for position, item in enumerate(ordered)
-        )
+        slots = tuple(int(item.request_key.session_id) + index for item in ordered)
         batch = Batch(
             step_id=100 + index,
             partitions=(
@@ -319,10 +292,18 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
                     attention=AttentionRegime.CAUSAL,
                     shape_class=index,
                     operations=ordered,
-                    request_pool_indices=tuple(
-                        int(item.request_key.session_id) + index for item in ordered
+                    block_tables=tuple(
+                        BlockTable(slot, 0, (placements[position],), 1)
+                        for position, slot in enumerate(slots)
                     ),
-                    kv_placements=kv_placements,
+                    new_cache_pages=tuple(
+                        CachePageAllocation(slot, 0, (placements[position],))
+                        for position, slot in enumerate(slots)
+                    ),
+                    forward_rows=tuple(
+                        ForwardRow(position, slot, 0, 1)
+                        for position, slot in enumerate(slots)
+                    ),
                 ),
             ),
         )
@@ -379,7 +360,6 @@ def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() 
             attention=AttentionRegime.NONE,
             shape_class=0,
             operations=(first,),
-            request_pool_indices=(8,),
         )
 
     valid = _trajectory_partition(
@@ -403,7 +383,6 @@ def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() 
             attention=AttentionRegime.NONE,
             shape_class=0,
             operations=(first, second),
-            request_pool_indices=(8, 9),
             latent_placements=(
                 first_placement,
                 replace(
@@ -451,7 +430,7 @@ def test_recovery_placement_rejects_duplicate_latent_pages() -> None:
     placement = RecoveryPlacement(
         request_key=_request_key(),
         request_pool_idx=8,
-        cache_groups=(CacheGroupPlacement(group_id=0, page_ids=(1, 2), length=17),),
+        block_tables=(BlockTable(8, 0, (1, 2), 17),),
         latent_page_table=(7, 8),
     )
     with pytest.raises(WorkerError, match="identity"):

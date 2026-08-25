@@ -21,8 +21,8 @@ import torch.nn as nn
 from ..batch import WorkVariant
 from ..execution.forward_batch import (
     ForwardBatch,
+    ForwardMode,
     ForwardOutput,
-    PagedVarlenPlan,
     TokenSelection,
 )
 from ..loader.handles import WeightHandle
@@ -598,11 +598,10 @@ class Qwen3ForCausalLM(ExecutionModel):
 
     def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
         selections = forward_batch.token_selections
-        query_lens = forward_batch.query_lens
-        attention = forward_batch.attention
+        query_lens = forward_batch.query_lens_cpu
         dynamic_last = (
-            attention.output_indices
-            if isinstance(attention, PagedVarlenPlan)
+            forward_batch.output_indices
+            if forward_batch.forward_mode is ForwardMode.PAGED_VARLEN
             and all(selection is TokenSelection.LAST_LOGITS for selection in selections)
             else None
         )

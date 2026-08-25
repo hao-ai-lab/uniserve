@@ -17,11 +17,12 @@ from tests.python.fixtures.depth_one import (
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
     Admission,
+    BlockTable,
     Bounds,
+    CachePageAllocation,
     DeviceDim,
     Domain,
     DType,
-    KvPlacement,
     Operation,
     PointRange,
     ProductKind,
@@ -72,25 +73,21 @@ def _installation_operation(
             bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
             inputs=(source,),
             outputs=(product,),
-            kv_capacity_pages=1,
         ),
         product,
     )
 
 
-def _installation_placement(operation: Operation, length: int) -> KvPlacement:
-    return KvPlacement(
-        request_key=operation.request_key,
-        op_id=operation.op_id,
-        group_id=0,
-        block_table=(1,),
-        block_table_update=True,
-        pages_to_zero=(1,),
-        prefix_length=0,
-        input_length=int(length),
-        visible_length=0,
-        resulting_length=int(length),
-    )
+def _installation_placement(operation: Operation, length: int) -> dict[str, object]:
+    request_pool_idx = int(operation.request_key.session_id) + 1
+    return {
+        "block_tables": (
+            BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),
+        ),
+        "new_cache_pages": (
+            CachePageAllocation(request_pool_idx, 0, (1,)),
+        ),
+    }
 
 
 def test_tail_closure_precedes_exact_incremental_publication() -> None:
@@ -130,7 +127,6 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         bounds=closure_template.bounds,
         inputs=closure_template.inputs,
         outputs=(),
-        kv_capacity_pages=closure_template.kv_capacity_pages,
         control_seq=closure_template.control_seq,
     )
     closure_result = worker.execute(
@@ -145,7 +141,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     closure_record = closure_result.completions[0]
     assert closure_record.logical_lengths.token_len == 2
     assert closure_record.logical_lengths.kv_visible_len == 3
-    assert closure_record.logical_lengths.kv_initialized_len == 3
+    assert closure_record.logical_lengths.kv_computed_len == 3
 
     second_commit = commit_for_completion(closure, closure_result)
     publication, publication_product = _publication_operation(
@@ -166,7 +162,10 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     )
 
     assert publication_result.completions[0].selected_point == 0
-    assert publication_result.completions[0].logical_lengths.kv_published_len == 3
+    assert publication_result.completions[0].logical_lengths.kv_visible_len == 3
+    assert worker.execution.cache_publications.published_extent(
+        admission.request_key.session_id
+    ) == 3
     payload = publication_result.products[0]
     kind, descriptor, producer_plan_digest = decode_transfer_descriptor(payload.payload)
     assert kind == "kv"
@@ -195,7 +194,6 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         bounds=suffix_template.bounds,
         inputs=suffix_template.inputs,
         outputs=(),
-        kv_capacity_pages=suffix_template.kv_capacity_pages,
         control_seq=suffix_template.control_seq,
     )
     suffix_result = worker.execute(
@@ -286,7 +284,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
             admissions=(admission,),
             operations=(installation,),
             input_products=(published.products[0],),
-            kv_placements=(_installation_placement(installation, 2),),
+            **_installation_placement(installation, 2),
         )
         prepared = consumer.prepare_execute(batch)
         assert prepared is not None
@@ -316,7 +314,7 @@ def test_cross_stage_kv_install_uses_query_ready_exact_snapshot() -> None:
                 admissions=(admission,),
                 operations=(expired_install,),
                 input_products=(published.products[0],),
-                kv_placements=(_installation_placement(expired_install, 2),),
+                **_installation_placement(expired_install, 2),
             )
         )
         assert expired is not None
@@ -392,7 +390,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 admissions=(admission,),
                 operations=(installation,),
                 input_products=(payload,),
-                kv_placements=(_installation_placement(installation, 2),),
+                **_installation_placement(installation, 2),
             )
         )
         assert prepared is not None
@@ -418,7 +416,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 admissions=(admission,),
                 operations=(retry,),
                 input_products=(published,),
-                kv_placements=(_installation_placement(retry, 2),),
+                **_installation_placement(retry, 2),
             )
         )
         assert prepared_retry is not None

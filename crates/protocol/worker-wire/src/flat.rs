@@ -8,10 +8,10 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 
 use crate::schema::uniserve::wire as fbs;
 use crate::{
-    Admission, AttentionRegime, Batch, BatchPartition, Bounds, CacheCopy, CacheGroupPlacement,
-    CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound, Disposition, Domain,
-    DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags, GenAdmission,
-    GraphBucketCapability, KvAdmission, KvBranchPlacement, KvPlacement, LaneCapabilities,
+    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CacheCopy,
+    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound,
+    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
+    FinishFlags, ForwardRow, GenAdmission, GraphBucketCapability, LaneCapabilities,
     LatentPlacement, LogicalLengths, MixedExecutionCapability, OpId, OpStatus, Operation,
     PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
     RecoveryPlacement, RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure,
@@ -188,29 +188,17 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<Ba
             })
             .transpose()?
             .unwrap_or_default(),
-        request_pool_indices: partition
-            .request_pool_indices()
-            .map(|items| items.iter().collect())
+        block_tables: partition
+            .block_tables()
+            .map(|items| items.iter().map(block_table_from_table).collect())
             .unwrap_or_default(),
-        kv_placements: partition
-            .kv_placements()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(kv_placement_from_table)
-                    .collect::<anyhow::Result<_>>()
-            })
-            .transpose()?
+        new_cache_pages: partition
+            .new_cache_pages()
+            .map(|items| items.iter().map(cache_page_allocation_from_table).collect())
             .unwrap_or_default(),
-        kv_branch_placements: partition
-            .kv_branch_placements()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(kv_branch_placement_from_table)
-                    .collect::<anyhow::Result<_>>()
-            })
-            .transpose()?
+        forward_rows: partition
+            .forward_rows()
+            .map(|items| items.iter().map(forward_row_from_table).collect())
             .unwrap_or_default(),
         latent_placements: partition
             .latent_placements()
@@ -257,7 +245,7 @@ fn und_admission_from_table(admission: fbs::UndAdmission<'_>) -> anyhow::Result<
             .finish_token_ids()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
-        kv: kv_admission_from_table(admission.kv().context("und admission has no KV metadata")?),
+        initial_position: admission.initial_position(),
     })
 }
 
@@ -271,54 +259,38 @@ fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> anyhow::Result<
     })
 }
 
-fn kv_admission_from_table(admission: fbs::KvAdmission<'_>) -> KvAdmission {
-    KvAdmission {
-        prefix_len: admission.prefix_len(),
-        group_id: admission.group_id(),
+fn block_table_from_table(table: fbs::BlockTable<'_>) -> BlockTable {
+    BlockTable {
+        request_pool_idx: table.request_pool_idx(),
+        group_id: table.group_id(),
+        page_ids: table
+            .page_ids()
+            .map(|items| items.iter().map(BlockId).collect())
+            .unwrap_or_default(),
+        allocated_tokens: table.allocated_tokens(),
     }
 }
 
-fn kv_placement_from_table(placement: fbs::KvPlacement<'_>) -> anyhow::Result<KvPlacement> {
-    Ok(KvPlacement {
-        request_key: request_key_from_table(placement.request_key(), "KV placement.request_key")?,
-        op_id: OpId(placement.op_id()),
-        group_id: placement.group_id(),
-        block_table: placement
-            .block_table()
+fn cache_page_allocation_from_table(
+    allocation: fbs::CachePageAllocation<'_>,
+) -> CachePageAllocation {
+    CachePageAllocation {
+        request_pool_idx: allocation.request_pool_idx(),
+        group_id: allocation.group_id(),
+        page_ids: allocation
+            .page_ids()
             .map(|items| items.iter().map(BlockId).collect())
             .unwrap_or_default(),
-        block_table_update: placement.block_table_update(),
-        pages_to_zero: placement
-            .pages_to_zero()
-            .map(|items| items.iter().map(BlockId).collect())
-            .unwrap_or_default(),
-        prefix_length: placement.prefix_length(),
-        input_length: placement.input_length(),
-        visible_length: placement.visible_length(),
-        resulting_length: placement.resulting_length(),
-    })
+    }
 }
 
-fn kv_branch_placement_from_table(
-    placement: fbs::KvBranchPlacement<'_>,
-) -> anyhow::Result<KvBranchPlacement> {
-    Ok(KvBranchPlacement {
-        request_key: request_key_from_table(
-            placement.request_key(),
-            "KV branch placement.request_key",
-        )?,
-        op_id: OpId(placement.op_id()),
-        branch_index: placement.branch_index(),
-        group_id: placement.group_id(),
-        block_table: placement
-            .block_table()
-            .map(|items| items.iter().map(BlockId).collect())
-            .unwrap_or_default(),
-        pages_to_zero: placement
-            .pages_to_zero()
-            .map(|items| items.iter().map(BlockId).collect())
-            .unwrap_or_default(),
-    })
+fn forward_row_from_table(row: fbs::ForwardRow<'_>) -> ForwardRow {
+    ForwardRow {
+        operation_index: row.operation_index(),
+        request_pool_index: row.request_pool_index(),
+        seq_len: row.seq_len(),
+        query_len: row.query_len(),
+    }
 }
 
 fn latent_placement_from_table(
@@ -372,7 +344,6 @@ fn operation_from_table(operation: fbs::Operation<'_>) -> anyhow::Result<Operati
             })
             .transpose()?
             .unwrap_or_default(),
-        kv_capacity_pages: operation.kv_capacity_pages(),
         predicate: operation
             .predicate()
             .map(product_ref_from_table)
@@ -643,11 +614,8 @@ fn completion_record_from_table(
         logical_lengths: LogicalLengths {
             token_len: logical_lengths.token_len(),
             kv_visible_len: logical_lengths.kv_visible_len(),
+            kv_computed_len: logical_lengths.kv_computed_len(),
             latent_len: logical_lengths.latent_len(),
-            kv_reserved_len: logical_lengths.kv_reserved_len(),
-            kv_initialized_len: logical_lengths.kv_initialized_len(),
-            kv_committed_len: logical_lengths.kv_committed_len(),
-            kv_published_len: logical_lengths.kv_published_len(),
         },
         token_span: TokenSpan {
             base: token_span.base(),
@@ -716,7 +684,6 @@ fn capabilities_from_table(
         num_layers: caps.num_layers(),
         num_kv_heads: caps.num_kv_heads(),
         head_dim: caps.head_dim(),
-        scratch_capacity_tokens: caps.scratch_capacity_tokens(),
         supported_work: caps
             .supported_work()
             .map(|items| {
@@ -1027,21 +994,9 @@ fn recovery_placement_from_table(
             "recovery placement.request_key",
         )?,
         request_pool_idx: placement.request_pool_idx(),
-        cache_groups: placement
-            .cache_groups()
-            .map(|groups| {
-                groups
-                    .iter()
-                    .map(|group| CacheGroupPlacement {
-                        group_id: group.group_id(),
-                        page_ids: group
-                            .page_ids()
-                            .map(|pages| pages.iter().map(BlockId).collect())
-                            .unwrap_or_default(),
-                        length: group.length(),
-                    })
-                    .collect()
-            })
+        block_tables: placement
+            .block_tables()
+            .map(|tables| tables.iter().map(block_table_from_table).collect())
             .unwrap_or_default(),
         latent_page_table: placement
             .latent_page_table()
@@ -1315,19 +1270,25 @@ fn partition_to_fb(partition: &BatchPartition) -> anyhow::Result<fbs::BatchParti
                 .map(operation_to_fb)
                 .collect::<anyhow::Result<_>>()?,
         ),
-        request_pool_indices: Some(partition.request_pool_indices.clone()),
-        kv_placements: Some(
+        block_tables: Some(
             partition
-                .kv_placements
+                .block_tables
                 .iter()
-                .map(kv_placement_to_fb)
+                .map(block_table_to_fb)
                 .collect(),
         ),
-        kv_branch_placements: Some(
+        new_cache_pages: Some(
             partition
-                .kv_branch_placements
+                .new_cache_pages
                 .iter()
-                .map(kv_branch_placement_to_fb)
+                .map(cache_page_allocation_to_fb)
+                .collect(),
+        ),
+        forward_rows: Some(
+            partition
+                .forward_rows
+                .iter()
+                .map(forward_row_to_fb)
                 .collect(),
         ),
         latent_placements: Some(
@@ -1365,7 +1326,7 @@ fn und_admission_to_fb(admission: &UndAdmission) -> anyhow::Result<fbs::UndAdmis
         sampling: Some(Box::new(sampling_to_fb(&admission.sampling)?)),
         negative_token_ids: Some(admission.negative_token_ids.clone()),
         finish_token_ids: Some(admission.finish_token_ids.clone()),
-        kv: Some(Box::new(kv_admission_to_fb(&admission.kv))),
+        initial_position: admission.initial_position,
     })
 }
 
@@ -1375,67 +1336,44 @@ fn gen_admission_to_fb(admission: &GenAdmission) -> fbs::GenAdmissionT {
     }
 }
 
-fn kv_admission_to_fb(admission: &KvAdmission) -> fbs::KvAdmissionT {
-    fbs::KvAdmissionT {
-        prefix_len: admission.prefix_len,
-        group_id: admission.group_id,
-    }
-}
-
 fn recovery_placement_to_fb(placement: &RecoveryPlacement) -> fbs::RecoveryPlacementT {
     fbs::RecoveryPlacementT {
         request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
         request_pool_idx: placement.request_pool_idx,
-        cache_groups: Some(
+        block_tables: Some(
             placement
-                .cache_groups
+                .block_tables
                 .iter()
-                .map(|group| fbs::CacheGroupPlacementT {
-                    group_id: group.group_id,
-                    page_ids: Some(group.page_ids.iter().map(|page| page.0).collect()),
-                    length: group.length,
-                })
+                .map(block_table_to_fb)
                 .collect(),
         ),
         latent_page_table: Some(placement.latent_page_table.clone()),
     }
 }
 
-fn kv_placement_to_fb(placement: &KvPlacement) -> fbs::KvPlacementT {
-    fbs::KvPlacementT {
-        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
-        op_id: placement.op_id.0,
-        group_id: placement.group_id,
-        block_table: Some(placement.block_table.iter().map(|block| block.0).collect()),
-        block_table_update: placement.block_table_update,
-        pages_to_zero: Some(
-            placement
-                .pages_to_zero
-                .iter()
-                .map(|block| block.0)
-                .collect(),
-        ),
-        prefix_length: placement.prefix_length,
-        input_length: placement.input_length,
-        visible_length: placement.visible_length,
-        resulting_length: placement.resulting_length,
+fn block_table_to_fb(table: &BlockTable) -> fbs::BlockTableT {
+    fbs::BlockTableT {
+        request_pool_idx: table.request_pool_idx,
+        group_id: table.group_id,
+        page_ids: Some(table.page_ids.iter().map(|page| page.0).collect()),
+        allocated_tokens: table.allocated_tokens,
     }
 }
 
-fn kv_branch_placement_to_fb(placement: &KvBranchPlacement) -> fbs::KvBranchPlacementT {
-    fbs::KvBranchPlacementT {
-        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
-        op_id: placement.op_id.0,
-        branch_index: placement.branch_index,
-        group_id: placement.group_id,
-        block_table: Some(placement.block_table.iter().map(|block| block.0).collect()),
-        pages_to_zero: Some(
-            placement
-                .pages_to_zero
-                .iter()
-                .map(|block| block.0)
-                .collect(),
-        ),
+fn cache_page_allocation_to_fb(allocation: &CachePageAllocation) -> fbs::CachePageAllocationT {
+    fbs::CachePageAllocationT {
+        request_pool_idx: allocation.request_pool_idx,
+        group_id: allocation.group_id,
+        page_ids: Some(allocation.page_ids.iter().map(|page| page.0).collect()),
+    }
+}
+
+fn forward_row_to_fb(row: &ForwardRow) -> fbs::ForwardRowT {
+    fbs::ForwardRowT {
+        operation_index: row.operation_index,
+        request_pool_index: row.request_pool_index,
+        seq_len: row.seq_len,
+        query_len: row.query_len,
     }
 }
 
@@ -1465,7 +1403,6 @@ fn operation_to_fb(operation: &Operation) -> anyhow::Result<fbs::OperationT> {
         bounds: Some(Box::new(bounds_to_fb(&operation.bounds))),
         inputs: Some(operation.inputs.iter().map(product_ref_to_fb).collect()),
         outputs: Some(operation.outputs.iter().map(product_ref_to_fb).collect()),
-        kv_capacity_pages: operation.kv_capacity_pages,
         predicate: operation
             .predicate
             .as_ref()
@@ -1661,11 +1598,8 @@ fn completion_record_to_fb(record: &CompletionRecord) -> fbs::CompletionRecordT 
         logical_lengths: Some(Box::new(fbs::LogicalLengthsT {
             token_len: record.logical_lengths.token_len,
             kv_visible_len: record.logical_lengths.kv_visible_len,
+            kv_computed_len: record.logical_lengths.kv_computed_len,
             latent_len: record.logical_lengths.latent_len,
-            kv_reserved_len: record.logical_lengths.kv_reserved_len,
-            kv_initialized_len: record.logical_lengths.kv_initialized_len,
-            kv_committed_len: record.logical_lengths.kv_committed_len,
-            kv_published_len: record.logical_lengths.kv_published_len,
         })),
         token_span: Some(Box::new(fbs::TokenSpanT {
             base: record.token_span.base,
@@ -1813,7 +1747,6 @@ fn capabilities_to_fb(caps: &WorkerCapabilities) -> anyhow::Result<fbs::WorkerCa
         num_layers: caps.num_layers,
         num_kv_heads: caps.num_kv_heads,
         head_dim: caps.head_dim,
-        scratch_capacity_tokens: caps.scratch_capacity_tokens,
         supported_work: Some(
             caps.supported_work
                 .iter()
@@ -2398,7 +2331,6 @@ fn resource_class_to_fb(class: ResourceClass) -> fbs::ResourceClass {
         ResourceClass::KvBlock => fbs::ResourceClass::KvBlock,
         ResourceClass::EncoderOutput => fbs::ResourceClass::EncoderOutput,
         ResourceClass::ImageLatent => fbs::ResourceClass::ImageLatent,
-        ResourceClass::Scratch => fbs::ResourceClass::Scratch,
     }
 }
 
@@ -2409,8 +2341,6 @@ fn resource_class_from_fb(class: fbs::ResourceClass) -> anyhow::Result<ResourceC
         Ok(ResourceClass::EncoderOutput)
     } else if class == fbs::ResourceClass::ImageLatent {
         Ok(ResourceClass::ImageLatent)
-    } else if class == fbs::ResourceClass::Scratch {
-        Ok(ResourceClass::Scratch)
     } else {
         bail!("unknown resource class {}", class.0)
     }

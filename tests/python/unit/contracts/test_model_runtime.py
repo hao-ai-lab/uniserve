@@ -83,7 +83,6 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
         pipeline_depth=1,
         completion_payload_bytes=1024,
         num_blocks=2,
-        scratch_capacity_tokens=1,
         request_pool_size=4,
         num_latent_pages=5,
         latent_page_units=4,

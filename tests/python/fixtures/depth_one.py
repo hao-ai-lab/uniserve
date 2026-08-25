@@ -15,7 +15,9 @@ from uniserve_worker.batch import (
     AttentionRegime,
     Batch,
     BatchPartition,
+    BlockTable,
     Bounds,
+    CachePageAllocation,
     Commit,
     CompletionReport,
     Control,
@@ -27,11 +29,9 @@ from uniserve_worker.batch import (
     EncodeMode,
     ExecutionCapability,
     FixedPoint,
+    ForwardRow,
     GenAdmission,
     ImageParams,
-    KvAdmission,
-    KvBranchPlacement,
-    KvPlacement,
     LatentPlacement,
     Operation,
     OpStatus,
@@ -69,22 +69,33 @@ _OP_KV_LENGTHS: dict[tuple[RequestKey, int], tuple[int, int, int, int]] = {}
 _OP_KV_RESULTS: dict[tuple[RequestKey, int], int] = {}
 _OP_KV_VERIFY_BASES: dict[tuple[RequestKey, int], int] = {}
 _LATENT_STEPS: dict[ProductRef, int] = {}
-_SCRATCH_PAGES: tuple[int, ...] = ()
 _MAX_CFG_BRANCHES = 1
+_REQUEST_POOL_SIZE = 1
+_CACHE_PAGES = 1
+_BLOCK_SIZE = 1
+_COMMIT_MARKER_TOKENS = 1
 _LATENT_PAGE_UNITS = 1
 _LATENT_DOWNSAMPLE = 1
+_ALTERNATIVE_SLOTS: dict[RequestKey, int] = {}
+_ALTERNATIVE_PAGES: dict[RequestKey, tuple[int, ...]] = {}
 
 
 def configure_physical_pool(
     *,
-    request_pages: int,
-    scratch_pages: int,
+    cache_pages: int,
+    request_pool_size: int,
+    block_size: int,
+    commit_marker_tokens: int,
     max_cfg_branches: int,
     latent_page_units: int,
     latent_downsample: int,
 ) -> None:
-    global _SCRATCH_PAGES, _MAX_CFG_BRANCHES, _LATENT_PAGE_UNITS, _LATENT_DOWNSAMPLE
-    _SCRATCH_PAGES = tuple(range(int(request_pages), int(request_pages) + int(scratch_pages)))
+    global _CACHE_PAGES, _REQUEST_POOL_SIZE, _BLOCK_SIZE, _COMMIT_MARKER_TOKENS
+    global _MAX_CFG_BRANCHES, _LATENT_PAGE_UNITS, _LATENT_DOWNSAMPLE
+    _CACHE_PAGES = max(1, int(cache_pages))
+    _REQUEST_POOL_SIZE = max(1, int(request_pool_size))
+    _BLOCK_SIZE = max(1, int(block_size))
+    _COMMIT_MARKER_TOKENS = max(0, int(commit_marker_tokens))
     _MAX_CFG_BRANCHES = max(1, int(max_cfg_branches))
     _LATENT_PAGE_UNITS = max(1, int(latent_page_units))
     _LATENT_DOWNSAMPLE = max(1, int(latent_downsample))
@@ -94,6 +105,8 @@ def _reset_request(rk: RequestKey) -> None:
     _BLOCK_TABLES[rk] = []
     _REQUEST_POOL_INDICES.pop(rk, None)
     _UNBOUND_PAGES[rk] = []
+    _ALTERNATIVE_SLOTS.pop(rk, None)
+    _ALTERNATIVE_PAGES.pop(rk, None)
     _IMAGE_PARAMS.pop(rk, None)
     for table in (_PAGES_TO_ZERO, _OP_KV_LENGTHS, _OP_KV_RESULTS, _OP_KV_VERIFY_BASES):
         for identity in tuple(identity for identity in table if identity[0] == rk):
@@ -176,23 +189,40 @@ def _record_existing_kv(
     return len(block_table)
 
 
-def _branch_placements(operation: Operation) -> tuple[KvBranchPlacement, ...]:
-    if operation.work.variant is not WorkVariant.GEN_FLOW:
-        return ()
-    if not _SCRATCH_PAGES or len(_SCRATCH_PAGES) < _MAX_CFG_BRANCHES:
-        raise RuntimeError("test scheduler has no generation scratch placement")
-    width = len(_SCRATCH_PAGES) // _MAX_CFG_BRANCHES
-    return tuple(
-        KvBranchPlacement(
-            request_key=operation.request_key,
-            op_id=operation.op_id,
-            branch_index=index + 1,
-            group_id=0,
-            block_table=_SCRATCH_PAGES[index * width : (index + 1) * width],
-            pages_to_zero=_SCRATCH_PAGES[index * width : (index + 1) * width],
-        )
-        for index in range(_MAX_CFG_BRANCHES)
+def _alternative_slot(rk: RequestKey) -> int:
+    existing = _ALTERNATIVE_SLOTS.get(rk)
+    if existing is not None:
+        return existing
+    occupied = set(_REQUEST_POOL_INDICES.values()) | set(_ALTERNATIVE_SLOTS.values())
+    slot = next(
+        (candidate for candidate in range(_REQUEST_POOL_SIZE, 0, -1) if candidate not in occupied),
+        None,
     )
+    if slot is None:
+        raise RuntimeError("test scheduler has no request slot for a flow prefix")
+    _ALTERNATIVE_SLOTS[rk] = slot
+    return slot
+
+
+def _alternative_pages(rk: RequestKey, tokens: int) -> tuple[int, ...]:
+    needed = (int(tokens) + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    existing = _ALTERNATIVE_PAGES.get(rk, ())
+    if len(existing) >= needed:
+        return existing[:needed]
+    occupied = {
+        page
+        for pages in (*_BLOCK_TABLES.values(), *_ALTERNATIVE_PAGES.values())
+        for page in pages
+    }
+    selected = tuple(
+        candidate
+        for candidate in range(_CACHE_PAGES - 1, 0, -1)
+        if candidate not in occupied
+    )[:needed]
+    if len(selected) != needed:
+        raise RuntimeError("test scheduler has no ordinary KV pages for a flow prefix")
+    _ALTERNATIVE_PAGES[rk] = selected
+    return selected
 
 
 def execution_batch(
@@ -202,44 +232,36 @@ def execution_batch(
     operations: Sequence[Operation] = (),
     input_products: Sequence[ProductPayload] = (),
     controls: Sequence[Control] = (),
-    kv_placements: Sequence[KvPlacement] = (),
+    block_tables: Sequence[BlockTable] = (),
+    new_cache_pages: Sequence[CachePageAllocation] = (),
 ) -> Batch:
     """Build the explicit physical partitions used by ModelRunner behavior tests."""
 
     for admission in admissions:
         if admission.gen_admission is not None:
             _IMAGE_PARAMS[admission.request_key] = admission.gen_admission.image
+        _REQUEST_POOL_INDICES[admission.request_key] = int(admission.request_pool_idx)
     by_route: dict[int, list[Operation]] = {}
     for operation in operations:
         by_route.setdefault(int(operation.route), []).append(operation)
     partitions: list[BatchPartition] = []
-    explicit_kv: dict[tuple[RequestKey, int], list[KvPlacement]] = {}
-    for placement in kv_placements:
-        explicit_kv.setdefault((placement.request_key, placement.op_id), []).append(placement)
+    explicit_tables = {
+        (int(table.request_pool_idx), int(table.group_id)): table for table in block_tables
+    }
 
-    def placements_for(operation: Operation) -> tuple[KvPlacement, ...]:
-        explicit = explicit_kv.get((operation.request_key, operation.op_id))
+    def table_for(operation: Operation) -> BlockTable | None:
+        slot = _REQUEST_POOL_INDICES.get(
+            operation.request_key,
+            int(operation.request_key.session_id) + 1,
+        )
+        explicit = explicit_tables.get((slot, 0))
         if explicit is not None:
-            return tuple(explicit)
+            return explicit
         lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
         if lengths is None:
-            return ()
-        return (
-            KvPlacement(
-                request_key=operation.request_key,
-                op_id=operation.op_id,
-                group_id=0,
-                block_table=tuple(
-                    _BLOCK_TABLES.get(operation.request_key, ())[: operation.kv_capacity_pages]
-                ),
-                block_table_update=True,
-                pages_to_zero=_PAGES_TO_ZERO.get((operation.request_key, operation.op_id), ()),
-                prefix_length=lengths[0],
-                input_length=lengths[1],
-                visible_length=lengths[2],
-                resulting_length=lengths[3],
-            ),
-        )
+            return None
+        pages = tuple(_BLOCK_TABLES.get(operation.request_key, ()))
+        return BlockTable(slot, 0, pages, len(pages) * _BLOCK_SIZE)
 
     partition_id = 1
     for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
@@ -264,6 +286,79 @@ def execution_batch(
             domain_operations = tuple(
                 operation for operation in routed if operation.domain is domain
             )
+            tables: dict[tuple[int, int], BlockTable] = {}
+            allocations: dict[tuple[int, int], set[int]] = {}
+            forward_rows: list[ForwardRow] = []
+            for operation_index, operation in enumerate(domain_operations):
+                table = table_for(operation)
+                if table is not None:
+                    identity = (table.request_pool_idx, table.group_id)
+                    tables[identity] = table
+                    pages = _PAGES_TO_ZERO.get((operation.request_key, operation.op_id), ())
+                    if pages:
+                        allocations.setdefault(identity, set()).update(pages)
+                lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
+                if lengths is not None and lengths[1] > 0:
+                    forward_rows.append(
+                        ForwardRow(
+                            operation_index,
+                            _REQUEST_POOL_INDICES[operation.request_key],
+                            lengths[2],
+                            lengths[1],
+                        )
+                    )
+                if operation.work.variant is WorkVariant.GEN_FLOW:
+                    image = _IMAGE_PARAMS[operation.request_key]
+                    main_slot = _REQUEST_POOL_INDICES[operation.request_key]
+                    main_len = 0 if lengths is None else lengths[2]
+                    text_off = abs(float(image.cfg_text_scale) - 1.0) <= 1e-6
+                    image_off = abs(float(image.cfg_img_scale) - 1.0) <= 1e-6
+                    branches = 1 if text_off and image_off else 2 if text_off or image_off else 3
+                    branches = min(branches, _MAX_CFG_BRANCHES)
+                    query_len = (
+                        max(1, int(image.height) // _LATENT_DOWNSAMPLE)
+                        * max(1, int(image.width) // _LATENT_DOWNSAMPLE)
+                        + _COMMIT_MARKER_TOKENS
+                    )
+                    alternative: tuple[int, int] | None = None
+                    if branches > 1:
+                        alt_slot = _alternative_slot(operation.request_key)
+                        negative = next(
+                            (
+                                admission.und.negative_token_ids
+                                for admission in admissions
+                                if admission.request_key == operation.request_key
+                                and admission.und is not None
+                            ),
+                            (),
+                        )
+                        alt_pages = _alternative_pages(operation.request_key, len(negative))
+                        alt_table = BlockTable(
+                            alt_slot,
+                            0,
+                            alt_pages,
+                            len(alt_pages) * _BLOCK_SIZE,
+                        )
+                        tables[(alt_slot, 0)] = alt_table
+                        if alt_pages:
+                            allocations.setdefault((alt_slot, 0), set()).update(alt_pages)
+                        if negative:
+                            forward_rows.append(
+                                ForwardRow(operation_index, alt_slot, 0, len(negative))
+                            )
+                        alternative = (alt_slot, len(negative))
+                    for branch in range(branches):
+                        slot, seq_len = (
+                            (main_slot, main_len)
+                            if branch == 0 or alternative is None
+                            else alternative
+                        )
+                        forward_rows.append(
+                            ForwardRow(operation_index, slot, seq_len, query_len)
+                        )
+            for allocation in new_cache_pages:
+                identity = (allocation.request_pool_idx, allocation.group_id)
+                allocations.setdefault(identity, set()).update(allocation.page_ids)
             partitions.append(
                 BatchPartition(
                     partition_id=partition_id,
@@ -275,30 +370,13 @@ def execution_batch(
                     attention=attention,
                     shape_class=0,
                     operations=domain_operations,
-                    request_pool_indices=tuple(
-                        next(
-                            (
-                                admission.request_pool_idx
-                                for admission in admissions
-                                if admission.request_key == operation.request_key
-                            ),
-                            _REQUEST_POOL_INDICES.get(
-                                operation.request_key,
-                                int(operation.request_key.session_id) + 1,
-                            ),
-                        )
-                        for operation in domain_operations
+                    block_tables=tuple(tables.values()),
+                    new_cache_pages=tuple(
+                        CachePageAllocation(slot, group, tuple(sorted(pages)))
+                        for (slot, group), pages in allocations.items()
+                        if pages
                     ),
-                    kv_placements=tuple(
-                        placement
-                        for operation in domain_operations
-                        for placement in placements_for(operation)
-                    ),
-                    kv_branch_placements=tuple(
-                        placement
-                        for operation in domain_operations
-                        for placement in _branch_placements(operation)
-                    ),
+                    forward_rows=tuple(forward_rows),
                     latent_placements=tuple(
                         _latent_placement(operation)
                         for operation in domain_operations
@@ -345,7 +423,7 @@ def und_admission(
                 if sampling is not None
                 else SamplingParams(temperature=0.0, ignore_eos=True)
             ),
-            kv=KvAdmission(prefix_len=int(prefix_len)),
+            initial_position=int(prefix_len),
         ),
     )
 
@@ -560,7 +638,6 @@ def token_operation(
         ),
         inputs=(reference,),
         outputs=tuple(outputs),
-        kv_capacity_pages=len(block_table),
         predicate=predicate,
         rng=rng,
         control_seq=control_seq,
@@ -669,7 +746,7 @@ def gen_transition_operation(
         shape_bound=ShapeBound(),
         point_range=PointRange(),
     )
-    capacity = _record_existing_kv(rk, op_id, parent, 0)
+    _record_existing_kv(rk, op_id, parent, 0)
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -680,7 +757,6 @@ def gen_transition_operation(
         bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
         inputs=(conditioning,),
         outputs=(latent, ready),
-        kv_capacity_pages=capacity,
         rng=Rng(
             seed=int(seed),
             semantic_index_base=int(image_index),
@@ -713,7 +789,7 @@ def flow_operation(
         shape_bound=latent.shape_bound,
         point_range=PointRange(),
     )
-    capacity = _record_existing_kv(rk, op_id, parent, 0)
+    _record_existing_kv(rk, op_id, parent, 0)
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -724,7 +800,6 @@ def flow_operation(
         bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
         inputs=(conditioning, latent),
         outputs=(output,),
-        kv_capacity_pages=capacity,
         control_seq=control_seq,
     )
     _LATENT_STEPS[output] = _LATENT_STEPS.get(latent, 0) + int(steps)
@@ -749,7 +824,7 @@ def kv_publication_operation(
         shape_bound=ShapeBound((DeviceDim(1 << 20),)),
         point_range=PointRange(),
     )
-    capacity = _record_existing_kv(rk, op_id, parent, 0)
+    _record_existing_kv(rk, op_id, parent, 0)
     operation = Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -759,7 +834,6 @@ def kv_publication_operation(
         domain=Domain.PREFILL,
         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
         outputs=(product,),
-        kv_capacity_pages=capacity,
         control_seq=control_seq,
     )
     return operation, product
@@ -855,7 +929,7 @@ def visual_state_operation(
                 point_range=PointRange(),
             ),
         )
-    capacity = _record_existing_kv(rk, op_id, parent, max_tokens)
+    _record_existing_kv(rk, op_id, parent, max_tokens)
     return Operation.registered(
         request_key=rk,
         op_id=op_id,
@@ -866,7 +940,6 @@ def visual_state_operation(
         bounds=Bounds(max_points=1, max_tokens=max_tokens),
         inputs=(feature,),
         outputs=outputs,
-        kv_capacity_pages=capacity,
         control_seq=control_seq,
     )
 

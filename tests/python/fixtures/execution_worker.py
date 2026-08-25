@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from uniserve_worker.backends.attention import resolve_attention_selection
-from uniserve_worker.backends.attention import FlashInferTuningConfig
+from uniserve_worker.backends.attention import FlashInferTuningConfig, resolve_attention_selection
 from uniserve_worker.bootstrap.execution_config import ExecutionConfig
 from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.nn.mesh import DeviceMesh
@@ -66,8 +65,10 @@ def execution_worker(
     from .depth_one import configure_physical_pool
 
     configure_physical_pool(
-        request_pages=worker.cache_pool.request_pages,
-        scratch_pages=worker.cache_pool.scratch_pages,
+        cache_pages=worker.cache_pool.num_pages,
+        request_pool_size=worker.capabilities.max_request_pool_size,
+        block_size=worker.cache_pool.block_size,
+        commit_marker_tokens=worker.capabilities.commit_marker_tokens,
         max_cfg_branches=worker.capabilities.max_cfg_branches,
         latent_page_units=worker.capabilities.latent_page_units,
         latent_downsample=worker.capabilities.latent_downsample,

@@ -9,7 +9,6 @@ pub enum ResourceClass {
     KvBlock,
     EncoderOutput,
     ImageLatent,
-    Scratch,
 }
 
 impl ResourceClass {
@@ -18,7 +17,6 @@ impl ResourceClass {
             ResourceClass::KvBlock => "kv_block",
             ResourceClass::EncoderOutput => "encoder_output",
             ResourceClass::ImageLatent => "image_latent",
-            ResourceClass::Scratch => "scratch",
         }
     }
 
@@ -27,7 +25,6 @@ impl ResourceClass {
             ResourceClass::KvBlock => "pages",
             ResourceClass::EncoderOutput => "handles",
             ResourceClass::ImageLatent => "bytes",
-            ResourceClass::Scratch => "bytes",
         }
     }
 }

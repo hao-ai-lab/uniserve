@@ -13,18 +13,15 @@ import torch
 from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
     ForwardBatch,
+    ForwardMode,
     ForwardOutput,
-    NoAttention,
-    PackedAttentionPlan,
-    PagedDecodePlan,
-    PagedVarlenPlan,
-    RequestIndexedDecodePlan,
     TokenSelection,
     packed_tensor_views,
 )
 from uniserve_worker.execution.lane import verify_graph_context
 from uniserve_worker.foundation.math import bucketed_length
 from uniserve_worker.models.runtime import CacheGeometry
+from uniserve_worker.runtime.cache_pool import CachePool
 
 logger = logging.getLogger(__name__)
 TOKEN_CONTINUATION_BIT = 1 << 31
@@ -101,6 +98,8 @@ class CudaGraphRunner:
         enabled: bool,
         prefill_enabled: bool,
         cache: CacheGeometry,
+        cache_pool: CachePool,
+        attention: AttentionSelection,
         block_size: int,
         weight_digest: str,
         memory_budget_bytes: int,
@@ -124,6 +123,8 @@ class CudaGraphRunner:
         self.enabled = bool(enabled)
         self.prefill_enabled = bool(prefill_enabled)
         self.cache = cache
+        self.cache_pool = cache_pool
+        self.attention = attention
         self.block_size = int(block_size)
         self.weight_digest = str(weight_digest)
         self.memory_budget_bytes = int(memory_budget_bytes)
@@ -216,7 +217,9 @@ class CudaGraphRunner:
                         selections = signature[5] if len(signature) > 5 else ()
                         if query_lens and all(int(value) == 1 for value in query_lens):
                             family = "exact_decode"
-                        elif selections and all(value == TokenSelection.HIDDEN.value for value in selections):
+                        elif selections and all(
+                            value == TokenSelection.HIDDEN.value for value in selections
+                        ):
                             family = "exact_prefix"
                         else:
                             family = "exact_prefill"
@@ -246,16 +249,20 @@ class CudaGraphRunner:
         rows = batch.row_count
         if not eligible or not self.enabled or not _cuda_batch(batch):
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
-        if isinstance(batch.attention, PagedVarlenPlan) and (
+        if batch.forward_mode is ForwardMode.PAGED_VARLEN and (
             not self.prefill_enabled
             or any(
                 selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections
             )
         ):
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
-        if isinstance(batch.attention, PackedAttentionPlan) and not self.prefill_enabled:
+        if batch.forward_mode is ForwardMode.PACKED and not self.prefill_enabled:
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
-        if isinstance(batch.attention, PackedAttentionPlan) and _quantized_kv(batch):
+        if batch.forward_mode is ForwardMode.PACKED and _quantized_kv(self):
+            return GraphRun(self._eager(batch, forward), "eager", rows, rows)
+        try:
+            _graph_provider(self.attention, batch.forward_mode)
+        except _GraphMiss:
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
 
         decode = _decode_geometry(
@@ -276,7 +283,7 @@ class CudaGraphRunner:
             )
         )
         if decode is not None:
-            execution = _pad_decode_batch(batch, decode)
+            execution = _pad_decode_batch(batch, decode, self.block_size)
             state_key = _decode_signature(batch, decode)
             signature = state_key
             padded_rows = decode.bucket
@@ -328,10 +335,11 @@ class CudaGraphRunner:
             try:
                 eager_output = self._eager(execution, forward)
                 eager = self._snapshot_output(_trim_output(eager_output, rows))
-                eager_greedy = _clone_greedy(
-                    _trim_greedy(
-                        _greedy_decode(execution, eager_output, self.decode_predicates),
-                        rows,
+                force_finish = (
+                    None
+                    if execution.decode_force_finish is None
+                    else execution.decode_force_finish.detach().clone(
+                        memory_format=torch.preserve_format
                     )
                 )
                 state = self._capture(
@@ -344,17 +352,31 @@ class CudaGraphRunner:
                 self._warmed.remove(state_key)
                 self._warmed_exact.discard(state_key)
                 self.captures += 1
+                if force_finish is not None:
+                    execution.decode_force_finish.copy_(force_finish)
                 self._replay(state, execution)
                 self._queue_equivalence_check(
                     eager,
                     _trim_output(state.output, rows),
                     label=repr(state_key),
                 )
-                self._queue_greedy_equivalence_check(
-                    eager_greedy,
-                    _trim_greedy(state.greedy, rows),
-                    label=repr(state_key),
-                )
+                context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
+                with context:
+                    graph_greedy = _trim_greedy(
+                        _greedy_decode_values(
+                            state.batch,
+                            state.output,
+                            self.decode_predicates,
+                            force_finish,
+                            clear_force_finish=False,
+                        ),
+                        rows,
+                    )
+                    self._queue_greedy_equivalence_check(
+                        graph_greedy,
+                        _trim_greedy(state.greedy, rows),
+                        label=repr(state_key),
+                    )
             except Exception as error:
                 removed = self._states.pop(state_key, None)
                 if removed is not None:
@@ -451,7 +473,7 @@ class CudaGraphRunner:
                 startup_resident,
                 signature,
                 batch_leaves=tuple(_tensor_leaves(static)),
-                plan_leaves=tuple(_tensor_leaves(static.attention)),
+                plan_leaves=tuple(_attention_tensor_leaves(static)),
             )
         except Exception:
             for release in reversed(releases):
@@ -476,7 +498,11 @@ class CudaGraphRunner:
             if not state.startup_resident:
                 _copy_into_leaves(state.batch_leaves, execution, "forward")
             else:
-                _copy_into_leaves(state.plan_leaves, execution.attention, "attention")
+                _copy_into_leaves(
+                    state.plan_leaves,
+                    tuple(_attention_tensor_leaves(execution)),
+                    "attention",
+                )
             self._prepare_attention(state.batch, execution, capture=False)
             state.graph.replay()
 
@@ -550,33 +576,28 @@ class CudaGraphRunner:
         *,
         capture: bool,
     ) -> tuple[Callable[[], None], ...]:
-        static = static_batch.attention
-        live = live_batch.attention
-        if type(static) is not type(live):
+        static = static_batch
+        live = live_batch
+        if static.forward_mode is not live.forward_mode:
             raise _GraphMiss("attention form changed for a graph bucket")
-        if isinstance(static, (NoAttention, PackedAttentionPlan)):
+        if static.forward_mode in {ForwardMode.DENSE, ForwardMode.PACKED}:
             return ()
-        if not isinstance(static, (PagedDecodePlan, PagedVarlenPlan)) or not isinstance(
-            live, (PagedDecodePlan, PagedVarlenPlan)
-        ):
+        if static.forward_mode not in {ForwardMode.PAGED_DECODE, ForwardMode.PAGED_VARLEN}:
             return ()
         prepared = _live_attention(static, live)
-        providers = static.backends.providers
-        if len(providers) != 1:
-            raise _GraphMiss("graph execution requires one attention provider")
-        backend = providers[0]
-        key_cache, _value_cache = static_batch.kv.layer_kv(0)
+        backend = _graph_provider(self.attention, static.forward_mode)
+        key_cache, _value_cache = self.cache_pool.layer_cache(0, static.group_id)
         q_dtype = key_cache.dtype
         kv_dtype = key_cache.dtype
         releases: list[Callable[[], None]] = []
-        if isinstance(static, PagedDecodePlan) and isinstance(prepared, PagedDecodePlan):
+        if static.forward_mode is ForwardMode.PAGED_DECODE:
             prepare = getattr(backend, "prepare_paged_decode_cuda_graph", None)
             if callable(prepare):
                 prepare(
                     static.binding,
                     prepared,
-                    batch_size=int(static.block_table.shape[0]),
-                    max_indices=max(1, int(static.block_table.numel())),
+                    batch_size=int(cast(torch.Tensor, static.block_table).shape[0]),
+                    max_indices=max(1, int(cast(torch.Tensor, static.block_table).numel())),
                     num_q_heads=int(self.cache.num_attention_heads),
                     num_kv_heads=int(self.cache.num_kv_heads),
                     head_dim=int(self.cache.head_dim),
@@ -589,13 +610,17 @@ class CudaGraphRunner:
                     if callable(release):
                         releases.append(_release_call(release, static.binding))
             return tuple(releases)
-        if not isinstance(static, PagedVarlenPlan) or not isinstance(prepared, PagedVarlenPlan):
+        if static.forward_mode is not ForwardMode.PAGED_VARLEN:
             return ()
         bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
         prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
         if callable(bind) and callable(prepare):
             if capture:
-                bind(static.binding, static, device=static.block_table.device)
+                bind(
+                    static.binding,
+                    static,
+                    device=cast(torch.Tensor, static.block_table).device,
+                )
                 release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
                 if callable(release):
                     releases.append(_release_call(release, static.binding))
@@ -619,8 +644,7 @@ def _decode_geometry(
     block_size: int,
     context_blocks: int,
 ) -> _DecodeGeometry | None:
-    attention = batch.attention
-    if not isinstance(attention, PagedDecodePlan) or not batch_sizes:
+    if batch.forward_mode is not ForwardMode.PAGED_DECODE or not batch_sizes:
         return None
     rows = batch.row_count
     bucket = next((value for value in batch_sizes if value >= rows), None)
@@ -628,14 +652,15 @@ def _decode_geometry(
         return None
     if (
         batch.token_row_indices != tuple(range(rows))
-        or tuple(batch.query_lens) != (1,) * rows
+        or batch.query_lens_cpu != (1,) * rows
         or int(batch.input_ids.numel()) != rows
         or int(batch.positions.shape[-1]) != rows
         or len(set(batch.token_selections)) != 1
-        or not callable(getattr(batch.kv, "with_synthetic_row", None))
     ):
         return None
-    live_width = int(attention.block_table.shape[1])
+    if batch.block_table is None:
+        return None
+    live_width = int(batch.block_table.shape[1])
     if context_blocks > 0 and live_width > context_blocks:
         return None
     reserved_width = max(1, (int(bucket) + int(block_size) - 1) // int(block_size))
@@ -653,12 +678,11 @@ def _prefill_geometry(
     row_sizes: tuple[int, ...],
     context_blocks: int,
 ) -> _PrefillGeometry | None:
-    attention = batch.attention
-    if not isinstance(attention, PagedVarlenPlan) or not token_sizes:
+    if batch.forward_mode is not ForwardMode.PAGED_VARLEN or not token_sizes:
         return None
     rows = batch.row_count
     row_bucket = next((value for value in row_sizes if value > rows), None)
-    query_lens = tuple(int(value) for value in attention.query_lens_cpu)
+    query_lens = tuple(int(value) for value in batch.query_lens_cpu)
     if (
         row_bucket is None
         or (rows >= row_sizes[0] and all(value == 1 for value in query_lens))
@@ -667,17 +691,17 @@ def _prefill_geometry(
         or batch.token_row_indices != tuple(range(rows))
         or len(query_lens) != rows
         or any(value < 1 for value in query_lens)
-        or tuple(batch.query_lens) != query_lens
         or int(batch.input_ids.numel()) != sum(query_lens)
         or int(batch.positions.shape[-1]) != sum(query_lens)
-        or not callable(getattr(batch.kv, "with_synthetic_row", None))
     ):
         return None
     live_tokens = sum(query_lens)
     token_bucket = next((value for value in token_sizes if value >= live_tokens), None)
     if token_bucket is None:
         return None
-    live_width = int(attention.block_table.shape[1])
+    if batch.block_table is None:
+        return None
+    live_width = int(batch.block_table.shape[1])
     if context_blocks > 0 and live_width > context_blocks:
         return None
     previous = max((value for value in token_sizes if value < token_bucket), default=0)
@@ -695,8 +719,11 @@ def _prefill_geometry(
     )
 
 
-def _pad_decode_batch(batch: ForwardBatch, geometry: _DecodeGeometry) -> ForwardBatch:
-    attention = cast(PagedDecodePlan, batch.attention)
+def _pad_decode_batch(
+    batch: ForwardBatch,
+    geometry: _DecodeGeometry,
+    block_size: int,
+) -> ForwardBatch:
     bucket = geometry.bucket
     input_ids = _fixed_view(cast(torch.Tensor, batch.input_ids), (bucket,))
     positions = _expand_token_axis(cast(torch.Tensor, batch.positions), bucket)
@@ -711,31 +738,21 @@ def _pad_decode_batch(batch: ForwardBatch, geometry: _DecodeGeometry) -> Forward
     embedding_mask = (
         None if batch.embedding_mask is None else _fixed_view(batch.embedding_mask, (bucket,))
     )
-    kv = batch.kv
-    if geometry.padding:
-        kv = cast(Any, kv).with_synthetic_rows(
-            (0,),
-            count=geometry.padding,
-            base_len=0,
-            query_len=1,
-        )
-    padded_attention = replace(
-        attention,
-        block_table=_fixed_view(attention.block_table, (bucket, geometry.width)),
-        cache_seqlens=_fixed_view(attention.cache_seqlens, (bucket,)),
-        kv_seqlens=_fixed_view(attention.kv_seqlens, (bucket,)),
-        query_lens=_fixed_view(attention.query_lens, (bucket,)),
-        cache_seqlens_cpu=(*attention.cache_seqlens_cpu, *(0 for _ in range(geometry.padding))),
-        kv_seqlens_cpu=(*attention.kv_seqlens_cpu, *(1 for _ in range(geometry.padding))),
-        query_lens_cpu=(*attention.query_lens_cpu, *(1 for _ in range(geometry.padding))),
-        decode_page_ids=_fixed_view(attention.decode_page_ids, (bucket,)),
-        decode_page_offsets=_fixed_view(attention.decode_page_offsets, (bucket,)),
-        max_context_len=geometry.width * int(kv.block_size),
-    )
+    if batch.block_table is None or batch.kv_lens is None:
+        raise _GraphMiss("paged decode has incomplete tensors")
     return replace(
         batch,
         row_count=bucket,
-        request_pool_indices=_fixed_view(batch.request_pool_indices, (bucket,)),
+        req_pool_indices=_fixed_view(batch.req_pool_indices, (bucket,)),
+        seq_lens=_fixed_view(batch.seq_lens, (bucket,)),
+        query_lens=_fixed_view(batch.query_lens, (bucket,)),
+        out_cache_loc=_fixed_view(batch.out_cache_loc, (bucket,)),
+        block_table=_fixed_view(batch.block_table, (bucket, geometry.width)),
+        kv_lens=_fixed_view(batch.kv_lens, (bucket,)),
+        seq_lens_cpu=(*batch.seq_lens_cpu, *(0 for _ in range(geometry.padding))),
+        kv_lens_cpu=(*batch.kv_lens_cpu, *(1 for _ in range(geometry.padding))),
+        query_lens_cpu=(*batch.query_lens_cpu, *(1 for _ in range(geometry.padding))),
+        max_seqlen_k=geometry.width * int(block_size),
         decode_force_finish=(
             None
             if batch.decode_force_finish is None
@@ -746,15 +763,11 @@ def _pad_decode_batch(batch: ForwardBatch, geometry: _DecodeGeometry) -> Forward
         input_embeddings=input_embeddings,
         embedding_mask=embedding_mask,
         positions=positions,
-        query_lens=(1,) * bucket,
         token_selections=(batch.token_selections[0],) * bucket,
-        kv=kv,
-        attention=padded_attention,
     )
 
 
 def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> ForwardBatch:
-    attention = cast(PagedVarlenPlan, batch.attention)
     live_rows = batch.row_count
     dummy_rows = geometry.row_bucket - live_rows
     input_ids = _fixed_view(cast(torch.Tensor, batch.input_ids), (geometry.token_bucket,))
@@ -772,16 +785,24 @@ def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> Forwa
         if batch.embedding_mask is None
         else _fixed_view(batch.embedding_mask, (geometry.token_bucket,))
     )
+    if (
+        batch.block_table is None
+        or batch.kv_lens is None
+        or batch.cu_seqlens_q is None
+        or batch.cu_seqlens_k is None
+        or batch.output_indices is None
+    ):
+        raise _GraphMiss("paged prefill has incomplete tensors")
     block_table = _fixed_view(
-        attention.block_table,
+        batch.block_table,
         (geometry.row_bucket, geometry.width),
     )
-    cache_seqlens = _fixed_view(attention.cache_seqlens, (geometry.row_bucket,))
-    query_lens = _fixed_view(attention.query_lens, (geometry.row_bucket,))
-    kv_seqlens = _fixed_view(attention.kv_seqlens, (geometry.row_bucket,))
-    cu_seqlens_q = _fixed_view(attention.cu_seqlens_q, (geometry.row_bucket + 1,))
-    cu_seqlens_k = _fixed_view(attention.cu_seqlens_k, (geometry.row_bucket + 1,))
-    output_indices = _fixed_view(attention.output_indices, (geometry.row_bucket,))
+    cache_seqlens = _fixed_view(batch.seq_lens, (geometry.row_bucket,))
+    query_lens = _fixed_view(batch.query_lens, (geometry.row_bucket,))
+    kv_seqlens = _fixed_view(batch.kv_lens, (geometry.row_bucket,))
+    cu_seqlens_q = _fixed_view(batch.cu_seqlens_q, (geometry.row_bucket + 1,))
+    cu_seqlens_k = _fixed_view(batch.cu_seqlens_k, (geometry.row_bucket + 1,))
+    output_indices = _fixed_view(batch.output_indices, (geometry.row_bucket,))
     cache_seqlens[live_rows:].zero_()
     query_lens[live_rows:].zero_()
     kv_seqlens[live_rows:].zero_()
@@ -789,60 +810,42 @@ def _pad_prefill_batch(batch: ForwardBatch, geometry: _PrefillGeometry) -> Forwa
         query_lens[live_rows : live_rows + 1].fill_(geometry.padding)
         kv_seqlens[live_rows : live_rows + 1].fill_(geometry.padding)
     cu_seqlens_q[live_rows + 1 :].fill_(geometry.token_bucket)
-    padded_kv_tokens = sum(int(value) for value in attention.kv_seqlens_cpu) + geometry.padding
+    padded_kv_tokens = sum(int(value) for value in batch.kv_lens_cpu) + geometry.padding
     cu_seqlens_k[live_rows + 1 :].fill_(padded_kv_tokens)
     output_indices[live_rows:].zero_()
     if geometry.padding:
         output_indices[live_rows : live_rows + 1].fill_(geometry.token_bucket - 1)
     dummy_query_lens = (geometry.padding, *(0 for _ in range(dummy_rows - 1)))
-    kv = batch.kv
-    reserved = (0,) * max(
-        1,
-        (geometry.maximum_padding + int(kv.block_size) - 1) // int(kv.block_size),
-    )
-    for index in range(dummy_rows):
-        kv = cast(Any, kv).with_synthetic_row(
-            reserved if index == 0 else (),
-            base_len=0,
-            query_len=dummy_query_lens[index],
-        )
-    padded_attention = replace(
-        attention,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        query_lens=query_lens,
-        kv_seqlens=kv_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        output_indices=output_indices,
-        cache_seqlens_cpu=(*attention.cache_seqlens_cpu, *(0 for _ in range(dummy_rows))),
-        query_lens_cpu=(*attention.query_lens_cpu, *dummy_query_lens),
-        kv_seqlens_cpu=(*attention.kv_seqlens_cpu, *dummy_query_lens),
-        max_seqlen_q=geometry.max_query_len,
-        max_seqlen_k=geometry.max_key_len,
-        max_context_len=geometry.max_key_len,
-    )
     return replace(
         batch,
         row_count=geometry.row_bucket,
-        request_pool_indices=_fixed_view(
-            batch.request_pool_indices,
+        req_pool_indices=_fixed_view(
+            batch.req_pool_indices,
             (geometry.row_bucket,),
         ),
+        seq_lens=cache_seqlens,
+        query_lens=query_lens,
+        out_cache_loc=_fixed_view(batch.out_cache_loc, (geometry.token_bucket,)),
+        block_table=block_table,
+        kv_lens=kv_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        output_indices=output_indices,
+        seq_lens_cpu=(*batch.seq_lens_cpu, *(0 for _ in range(dummy_rows))),
+        query_lens_cpu=(*batch.query_lens_cpu, *dummy_query_lens),
+        kv_lens_cpu=(*batch.kv_lens_cpu, *dummy_query_lens),
+        max_seqlen_q=geometry.max_query_len,
+        max_seqlen_k=geometry.max_key_len,
         token_row_indices=tuple(range(geometry.row_bucket)),
         input_ids=input_ids,
         input_embeddings=input_embeddings,
         embedding_mask=embedding_mask,
         positions=positions,
-        query_lens=(*batch.query_lens, *dummy_query_lens),
         token_selections=(batch.token_selections[0],) * geometry.row_bucket,
-        kv=kv,
-        attention=padded_attention,
     )
 
 
 def _decode_signature(batch: ForwardBatch, geometry: _DecodeGeometry) -> tuple[object, ...]:
-    attention = cast(PagedDecodePlan, batch.attention)
     return (
         "paged_decode_bucket",
         batch.phase.value,
@@ -850,14 +853,13 @@ def _decode_signature(batch: ForwardBatch, geometry: _DecodeGeometry) -> tuple[o
         geometry.width,
         batch.token_selections[0].value,
         _batch_tensor_signature(batch),
-        attention.backends.identity,
-        bool(attention.causal),
+        bool(batch.causal),
+        bool(batch.has_cache_writes),
         _owner_signature(batch),
     )
 
 
 def _prefill_signature(batch: ForwardBatch, geometry: _PrefillGeometry) -> tuple[object, ...]:
-    attention = cast(PagedVarlenPlan, batch.attention)
     return (
         "paged_prefill_bucket",
         batch.phase.value,
@@ -868,8 +870,8 @@ def _prefill_signature(batch: ForwardBatch, geometry: _PrefillGeometry) -> tuple
         geometry.max_key_len,
         batch.token_selections[0].value,
         _batch_tensor_signature(batch),
-        attention.backends.identity,
-        bool(attention.causal),
+        bool(batch.causal),
+        bool(batch.has_cache_writes),
         _owner_signature(batch),
     )
 
@@ -889,7 +891,6 @@ def _batch_tensor_signature(batch: ForwardBatch) -> tuple[object, ...]:
 
 def _owner_signature(batch: ForwardBatch) -> tuple[object, ...]:
     return (
-        type(batch.kv).__qualname__,
         type(batch.mesh).__qualname__,
         type(batch.output).__qualname__,
     )
@@ -902,31 +903,24 @@ def _direct_key(key: Hashable) -> tuple[object, ...]:
 
 
 def _exact_signature(batch: ForwardBatch) -> tuple[object, ...]:
-    attention = batch.attention
-    attention_values: list[object] = [type(attention).__qualname__]
-    for field in fields(attention):
-        value = getattr(attention, field.name)
-        if field.name in {"binding", "query_lens_cpu", "key_lens_cpu"}:
-            continue
-        if field.name == "backends":
-            attention_values.append((field.name, value.identity))
-        elif isinstance(value, torch.Tensor):
-            attention_values.append((field.name, _tensor_signature(value)))
-        else:
-            attention_values.append((field.name, value))
     return (
         batch.phase.value,
         batch.row_count,
         batch.token_row_indices,
         batch.flow_row_indices,
-        batch.query_lens,
+        batch.forward_mode.value,
+        batch.query_lens_cpu,
         tuple(value.value for value in batch.token_selections),
         batch.flow_image_tokens,
         batch.flow_heights,
         batch.flow_widths,
         tuple(value is not None for value in batch.flow_conditioning),
         tuple(_tensor_signature(value) for value in _tensor_leaves(batch)),
-        tuple(attention_values),
+        batch.route_spans,
+        batch.causal_rows_cpu,
+        bool(batch.has_cache_writes),
+        batch.max_seqlen_q,
+        batch.max_seqlen_k,
         _owner_signature(batch),
     )
 
@@ -947,20 +941,20 @@ def _normalize_exact_batch(
     staged tensors carry the live lengths on every replay.
     """
 
-    attention = batch.attention
-    if not isinstance(attention, PackedAttentionPlan) or context_blocks <= 0:
+    if batch.forward_mode is not ForwardMode.PACKED or context_blocks <= 0:
         return batch
-    if int(attention.page_table.shape[1]) > context_blocks:
+    if batch.block_table is None:
+        raise _GraphMiss("packed attention has no block table")
+    if int(batch.block_table.shape[1]) > context_blocks:
         raise _GraphMiss("packed attention exceeds the configured context width")
-    normalized = replace(
-        attention,
-        page_table=_fixed_view(
-            attention.page_table,
-            (int(attention.page_table.shape[0]), int(context_blocks)),
+    return replace(
+        batch,
+        block_table=_fixed_view(
+            batch.block_table,
+            (int(batch.block_table.shape[0]), int(context_blocks)),
         ),
         max_seqlen_k=int(context_blocks) * int(block_size),
     )
-    return replace(batch, attention=normalized)
 
 
 def _tensor_signature(value: torch.Tensor) -> tuple[object, ...]:
@@ -980,16 +974,13 @@ def _graph_batch(
     graph_batch = _clone_value(batch) if own_inputs else batch
     if not isinstance(graph_batch, ForwardBatch):
         raise TypeError("graph input cloning did not preserve ForwardBatch")
-    attention = graph_batch.attention
-    if isinstance(attention, RequestIndexedDecodePlan):
+    if graph_batch.forward_mode is ForwardMode.REQUEST_INDEXED_DECODE:
         raise _GraphMiss("request-indexed decode metadata was not staged")
-    selection = _graph_selection(attention)
-    graph_attention: NoAttention | PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan
-    if isinstance(attention, NoAttention):
-        graph_attention = replace(attention, backends=selection)
-    else:
-        graph_attention = replace(attention, backends=selection, binding=int(binding))
-    return replace(graph_batch, attention=graph_attention)
+    return replace(
+        graph_batch,
+        binding=int(binding),
+        cuda_graph_capture=True,
+    )
 
 
 def _clone_value(value: Any) -> Any:
@@ -1062,32 +1053,40 @@ def _copy_into_leaves(
         raise _GraphMiss(f"{structure} tensor structure changed")
 
 
-def _graph_selection(plan: object) -> AttentionSelection:
-    selection = getattr(plan, "backends", None)
-    if not isinstance(selection, AttentionSelection):
-        raise _GraphMiss("attention plan has no resolved provider selection")
+def _graph_provider(selection: AttentionSelection, mode: ForwardMode):
+    capable_provider = False
     for provider in selection.providers:
         capabilities = provider.capabilities()
-        if isinstance(plan, PackedAttentionPlan):
-            safe = bool(getattr(capabilities, "visible_end_cuda_graph", False))
-        elif isinstance(plan, PagedVarlenPlan):
+        available = bool(getattr(capabilities, "available", True))
+        if mode is ForwardMode.PACKED:
+            capable = bool(getattr(capabilities, "segmented_attention", False))
+            safe = bool(getattr(capabilities, "segmented_attention_cuda_graph", False))
+        elif mode is ForwardMode.PAGED_VARLEN:
+            capable = bool(getattr(capabilities, "varlen_attention", False)) and bool(
+                getattr(capabilities, "varlen_paged_kv", False)
+            )
             safe = bool(getattr(capabilities, "paged_varlen_cuda_graph", False)) or (
                 callable(getattr(provider, "bind_paged_prefill_graph_wrapper", None))
                 and callable(getattr(provider, "prepare_paged_prefill_cuda_graph", None))
             )
-        elif isinstance(plan, PagedDecodePlan):
+        elif mode is ForwardMode.PAGED_DECODE:
+            capable = bool(getattr(capabilities, "paged_kv", False))
             safe = bool(getattr(capabilities, "paged_kv", False))
         else:
+            capable = True
             safe = True
-        if safe:
-            return AttentionSelection(
-                identity=f"{selection.identity}:graph:{provider.name}",
-                providers=(provider,),
-            )
+        if not available or not capable:
+            continue
+        capable_provider = True
+        if not safe:
+            continue
+        return provider
+    if capable_provider:
+        raise _GraphMiss("provisioned attention providers are not graph-safe")
     raise _GraphMiss("no provisioned attention provider is graph-safe")
 
 
-_PLAN_LENGTH_BOUNDS = frozenset({"max_seqlen_q", "max_seqlen_k", "max_context_len"})
+_PLAN_LENGTH_BOUNDS = frozenset({"max_seqlen_q", "max_seqlen_k"})
 
 
 def _live_attention(static: object, live: object) -> object:
@@ -1098,7 +1097,7 @@ def _live_attention(static: object, live: object) -> object:
         static_value = getattr(static, field.name)
         if (
             isinstance(static_value, torch.Tensor)
-            or field.name in {"binding", "backends"}
+            or field.name == "binding"
             or field.name in _PLAN_LENGTH_BOUNDS
         ):
             updates[field.name] = static_value
@@ -1147,9 +1146,27 @@ def _batch_device(batch: ForwardBatch) -> torch.device:
     raise _GraphMiss("forward batch carries no device tensors")
 
 
-def _quantized_kv(batch: ForwardBatch) -> bool:
-    pool = getattr(batch.kv, "pool", None)
-    return bool(getattr(pool, "is_quantized", False))
+def _attention_tensor_leaves(batch: ForwardBatch) -> Iterator[torch.Tensor]:
+    for name in (
+        "req_pool_indices",
+        "seq_lens",
+        "query_lens",
+        "out_cache_loc",
+        "block_table",
+        "kv_lens",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "output_indices",
+        "attention_indexes",
+        "visible_end",
+    ):
+        value = getattr(batch, name)
+        if isinstance(value, torch.Tensor):
+            yield value
+
+
+def _quantized_kv(runner: CudaGraphRunner) -> bool:
+    return bool(runner.cache_pool.is_quantized)
 
 
 def _private_pool_bytes(device: torch.device | None) -> int:
@@ -1175,9 +1192,25 @@ def _greedy_decode(
     output: ForwardOutput,
     predicate_state: torch.Tensor | None,
 ) -> GraphGreedyOutput | None:
-    force_finish = batch.decode_force_finish
+    return _greedy_decode_values(
+        batch,
+        output,
+        predicate_state,
+        batch.decode_force_finish,
+        clear_force_finish=True,
+    )
+
+
+def _greedy_decode_values(
+    batch: ForwardBatch,
+    output: ForwardOutput,
+    predicate_state: torch.Tensor | None,
+    force_finish: torch.Tensor | None,
+    *,
+    clear_force_finish: bool,
+) -> GraphGreedyOutput | None:
     if (
-        not isinstance(batch.attention, PagedDecodePlan)
+        batch.forward_mode is not ForwardMode.PAGED_DECODE
         or predicate_state is None
         or force_finish is None
         or len(output.values) != batch.row_count
@@ -1203,7 +1236,8 @@ def _greedy_decode(
             torch.zeros_like(tokens),
         )
     )
-    force_finish.zero_()
+    if clear_force_finish:
+        force_finish.zero_()
     return GraphGreedyOutput(
         request_pool_indices=batch.request_pool_indices,
         tokens=tokens,
@@ -1237,19 +1271,6 @@ def _trim_greedy(
         continuation=output.continuation[:rows],
         tagged_tokens=output.tagged_tokens[:rows],
         completion=completion,
-    )
-
-
-def _clone_greedy(output: GraphGreedyOutput | None) -> GraphGreedyOutput | None:
-    if output is None:
-        return None
-    return GraphGreedyOutput(
-        **{
-            field.name: getattr(output, field.name)
-            .detach()
-            .clone(memory_format=torch.preserve_format)
-            for field in fields(GraphGreedyOutput)
-        }
     )
 
 

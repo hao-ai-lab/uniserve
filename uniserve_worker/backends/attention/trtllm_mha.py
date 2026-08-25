@@ -7,10 +7,10 @@ from typing import Any, NamedTuple
 import torch
 
 from ...execution.forward_batch import ForwardBatch
-from .tuning import FlashInferTuningConfig
 from .base import AttentionCapabilities
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to
+from .tuning import FlashInferTuningConfig
 
 _flashinfer: Any | None
 try:  # pragma: no cover - depends on optional CUDA package availability.
@@ -112,9 +112,9 @@ class TRTLLMMHAAttentionBackend:
             inputs.q,
             k,
             v,
-            None if context is None else context.attention,
+            context,
         )
-        plan = None if context is None else context.attention
+        plan = context
         effective_seqlens = _decode_effective_seqlens(
             inputs.cache_seqlens,
             current_tokens,
@@ -168,7 +168,7 @@ class TRTLLMMHAAttentionBackend:
             seq_lens=kv_seqlens,
             max_q_len=max(1, int(max_seqlen_q)),
             max_kv_len=_metadata_context_len(
-                None if context is None else context.attention,
+                context,
                 max(1, int(max_seqlen_k)),
             ),
             bmm1_scale=float(scale),
@@ -290,7 +290,7 @@ def _hnd_kv_cache(
 
 
 def _metadata_context_len(plan: object | None, default: int) -> int:
-    value = getattr(plan, "max_context_len", 0)
+    value = getattr(plan, "max_seqlen_k", 0)
     try:
         parsed = int(value)
     except (TypeError, ValueError):

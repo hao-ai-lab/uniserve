@@ -41,7 +41,6 @@ class WorkerResourceConfig:
     max_batch_operations: int
     max_batch_tokens: int
     kv_token_capacity: int | None
-    generation_kv_capacity_tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -73,7 +72,7 @@ class WorkerLaunchConfig:
         worker_kind = WorkerKind(str(namespace.worker_kind))
         plan = resolve_worker_plan(worker_kind)
         device = _normalize_device(namespace.device)
-        tower_devices, generation_kv_capacity_tokens = _parse_mesh(
+        tower_devices = _parse_mesh(
             str(namespace.mesh or ""),
             device=device,
         )
@@ -81,7 +80,7 @@ class WorkerLaunchConfig:
         use_stub_model = bool(namespace.no_model)
         model_path = str(namespace.model or "").strip()
 
-        _validate_scalars(namespace, generation_kv_capacity_tokens)
+        _validate_scalars(namespace)
         if use_stub_model and not bool(namespace.allow_stub):
             raise ValueError("--no-model loads synthetic outputs and requires --allow-stub")
         if use_stub_model and plan.model_scope is not ModelLoadScope.WHOLE:
@@ -118,7 +117,6 @@ class WorkerLaunchConfig:
                     if namespace.kv_token_capacity is not None
                     else None
                 ),
-                generation_kv_capacity_tokens=generation_kv_capacity_tokens,
             ),
             model=(
                 ModelLaunchConfig(
@@ -138,10 +136,7 @@ class WorkerLaunchConfig:
         )
 
 
-def _validate_scalars(
-    namespace: argparse.Namespace,
-    generation_kv_capacity_tokens: int | None,
-) -> None:
+def _validate_scalars(namespace: argparse.Namespace) -> None:
     positive_fields = {
         "--block-size": namespace.block_size,
         "--max-batch-operations": namespace.max_batch_operations,
@@ -156,8 +151,6 @@ def _validate_scalars(
             raise ValueError(f"{option} must be positive")
     if namespace.kv_token_capacity is not None and int(namespace.kv_token_capacity) <= 0:
         raise ValueError("--kv-token-capacity must be positive when provided")
-    if generation_kv_capacity_tokens is not None and generation_kv_capacity_tokens <= 0:
-        raise ValueError("--mesh tower-kv-capacity must be positive when provided")
     if int(namespace.tp_rank) < 0 or int(namespace.tp_rank) >= int(namespace.tp_size):
         raise ValueError("--tp-rank must satisfy 0 <= rank < tp-size")
 
@@ -196,13 +189,12 @@ def _parse_mesh(
     spec: str,
     *,
     device: str,
-) -> tuple[tuple[str, str] | None, int | None]:
+) -> tuple[str, str] | None:
     text = spec.strip()
     if not text:
-        return None, None
+        return None
 
     tower_devices: tuple[str, str] | None = None
-    generation_kv_capacity_tokens: int | None = None
     seen: set[str] = set()
     for raw_entry in text.split(","):
         entry = raw_entry.strip()
@@ -215,11 +207,9 @@ def _parse_mesh(
         seen.add(normalized_key)
         if normalized_key == "tower":
             tower_devices = _parse_tower_placement(value, device=device)
-        elif normalized_key == "tower-kv-capacity":
-            generation_kv_capacity_tokens = int(value)
         else:
             raise ValueError(f"unknown --mesh key {key!r}")
-    return tower_devices, generation_kv_capacity_tokens
+    return tower_devices
 
 
 def _parse_tower_placement(value: str, *, device: str) -> tuple[str, str]:

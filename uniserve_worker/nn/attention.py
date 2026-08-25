@@ -1,4 +1,4 @@
-"""Stateless attention over an explicit forward context."""
+"""Attention over one row-aligned forward tensor contract."""
 
 from __future__ import annotations
 
@@ -7,19 +7,12 @@ from torch import nn
 
 import uniserve_worker.ops as ops
 
-from ..execution.forward_batch import (
-    EmptyKvView,
-    ForwardBatch,
-    NoAttention,
-    PackedAttentionPlan,
-    PagedDecodePlan,
-    PagedVarlenPlan,
-    RequestIndexedDecodePlan,
-)
+from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardMode
+from ..runtime.cache_pool import CachePool
 
 
 class RadixAttention(nn.Module):
-    """Attention equations selected solely by the supplied immutable plan."""
+    """Execute dense or paged attention using startup-owned resources."""
 
     def __init__(
         self,
@@ -37,6 +30,18 @@ class RadixAttention(nn.Module):
         self.head_dim = int(head_dim)
         self.layer_id = int(layer_id)
         self.scale = self.head_dim**-0.5
+        self._cache_pool: CachePool | None = None
+        self._selection: AttentionSelection | None = None
+
+    def bind(self, cache_pool: CachePool, selection: AttentionSelection) -> None:
+        self._cache_pool = cache_pool
+        self._selection = selection
+
+    @property
+    def selection(self) -> AttentionSelection:
+        if self._selection is None:
+            raise RuntimeError("attention module has not been bound to a startup backend")
+        return self._selection
 
     def forward(
         self,
@@ -49,17 +54,11 @@ class RadixAttention(nn.Module):
         scale: float | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Execute one closed attention-plan variant.
-
-        Cache access is available only through ``context.kv``; there is no
-        alternate cache argument or ambient execution context.
-        """
-
         effective_scale = self.scale if scale is None else float(scale)
-        plan = context.attention
-        if isinstance(plan, NoAttention):
-            if not isinstance(context.kv, EmptyKvView):
-                raise ValueError("dense attention must use an empty KV view")
+        selection = self._selection
+        if selection is None:
+            raise RuntimeError("attention module has not been bound to a startup backend")
+        if context.forward_mode is ForwardMode.DENSE:
             return ops.attention(
                 ops.DenseAttention(
                     q=q,
@@ -70,19 +69,20 @@ class RadixAttention(nn.Module):
                     attn_mask=attn_mask,
                     ctx=context,
                 ),
-                selection=plan.backends,
+                selection=selection,
             )
         if attn_mask is not None:
-            raise ValueError("paged attention plans do not accept a dense attention mask")
-        if isinstance(context.kv, EmptyKvView):
-            raise ValueError("paged attention requires a non-empty KV view")
-        if isinstance(plan, PagedDecodePlan):
-            return self._decode(q, k, v, context, plan, causal, effective_scale)
-        if isinstance(plan, PagedVarlenPlan):
-            return self._varlen(q, k, v, context, plan, causal, effective_scale)
-        if isinstance(plan, RequestIndexedDecodePlan):
+            raise ValueError("paged attention does not accept a dense attention mask")
+        pool = self._cache_pool
+        if pool is None or context.block_table is None:
+            raise RuntimeError("paged attention has no bound physical cache")
+        if context.forward_mode is ForwardMode.PAGED_DECODE:
+            return self._decode(q, k, v, context, causal, effective_scale, selection, pool)
+        if context.forward_mode is ForwardMode.PAGED_VARLEN:
+            return self._varlen(q, k, v, context, causal, effective_scale, selection, pool)
+        if context.forward_mode is ForwardMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode metadata was not staged")
-        return self._packed(q, k, v, context, plan, effective_scale)
+        return self._packed(q, k, v, context, effective_scale, selection, pool)
 
     def _decode(
         self,
@@ -90,32 +90,30 @@ class RadixAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         context: ForwardBatch,
-        plan: PagedDecodePlan,
         causal: bool,
         scale: float,
+        selection: AttentionSelection,
+        pool: CachePool,
     ) -> torch.Tensor:
-        if q.ndim != 3:
-            raise ValueError("paged decode expects [rows, heads, dim] queries")
-        if bool(causal) is not plan.causal:
-            raise ValueError("paged decode causal semantics do not match its plan")
-        if int(q.shape[0]) != int(plan.block_table.shape[0]):
+        if q.ndim != 3 or int(q.shape[0]) != int(context.block_table.shape[0]):
             raise ValueError("paged decode query rows do not match its page table")
-        k_cache, v_cache = context.kv.layer_kv(self.layer_id)
+        if context.kv_lens is None:
+            raise ValueError("paged decode requires resulting KV lengths")
+        if context.has_cache_writes:
+            pool.write_locations(self.layer_id, context.out_cache_loc, k, v)
+        k_cache, v_cache = pool.layer_cache(self.layer_id, context.group_id)
         out = ops.attention(
             ops.PagedDecodeAttention(
                 q=q.unsqueeze(2),
                 k=k_cache,
                 v=v_cache,
-                block_table=plan.block_table,
-                cache_seqlens=plan.cache_seqlens,
-                current_k=k.unsqueeze(2),
-                current_v=v.unsqueeze(2),
+                block_table=context.block_table,
+                cache_seqlens=context.kv_lens,
                 causal=causal,
                 scale=scale,
-                kv_cache=context.kv,
                 ctx=context,
             ),
-            selection=plan.backends,
+            selection=selection,
         )
         return out.squeeze(2) if out.ndim == 4 else out
 
@@ -125,44 +123,39 @@ class RadixAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         context: ForwardBatch,
-        plan: PagedVarlenPlan,
         causal: bool,
         scale: float,
+        selection: AttentionSelection,
+        pool: CachePool,
     ) -> torch.Tensor:
-        raw_tokens = sum(plan.query_lens_cpu)
-        if bool(causal) is not plan.causal:
-            raise ValueError("paged varlen causal semantics do not match its plan")
-        if q.ndim != 3 or raw_tokens < 1 or raw_tokens > int(q.shape[0]):
+        raw_tokens = sum(context.query_lens_cpu)
+        if (
+            q.ndim != 3
+            or raw_tokens < 1
+            or raw_tokens > int(q.shape[0])
+            or context.cu_seqlens_q is None
+            or context.cu_seqlens_k is None
+        ):
             raise ValueError("paged varlen query geometry is invalid")
-        q_run = q[:raw_tokens]
-        k_run = k[:raw_tokens]
-        v_run = v[:raw_tokens]
-        context.kv.append_varlen(
-            self.layer_id,
-            k_run,
-            v_run,
-            plan.query_lens_cpu,
-            block_table=plan.block_table,
-            cache_seqlens=plan.cache_seqlens,
-            query_offsets=plan.cu_seqlens_q,
-        )
-        k_cache, v_cache = context.kv.layer_kv(self.layer_id)
+        q_run, k_run, v_run = q[:raw_tokens], k[:raw_tokens], v[:raw_tokens]
+        if context.has_cache_writes:
+            pool.write_locations(self.layer_id, context.out_cache_loc[:raw_tokens], k_run, v_run)
+        k_cache, v_cache = pool.layer_cache(self.layer_id, context.group_id)
         out = ops.attention(
             ops.VarlenAttention(
                 q=q_run,
                 k=k_cache,
                 v=v_cache,
-                cu_seqlens_q=plan.cu_seqlens_q,
-                cu_seqlens_k=plan.cu_seqlens_k,
-                max_seqlen_q=plan.max_seqlen_q,
-                max_seqlen_k=plan.max_seqlen_k,
+                cu_seqlens_q=context.cu_seqlens_q,
+                cu_seqlens_k=context.cu_seqlens_k,
+                max_seqlen_q=context.max_seqlen_q,
+                max_seqlen_k=context.max_seqlen_k,
                 causal=causal,
                 scale=scale,
-                block_table=plan.block_table,
-                kv_cache=context.kv,
+                block_table=context.block_table,
                 ctx=context,
             ),
-            selection=plan.backends,
+            selection=selection,
         )
         if raw_tokens == int(q.shape[0]):
             return out
@@ -176,38 +169,46 @@ class RadixAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         context: ForwardBatch,
-        plan: PackedAttentionPlan,
         scale: float,
+        selection: AttentionSelection,
+        pool: CachePool,
     ) -> torch.Tensor:
-        if q.ndim != 3:
-            raise ValueError("packed attention expects [tokens, heads, dim] queries")
-        context.kv.append_packed(
-            self.layer_id,
-            k,
-            v,
-            page_ids=plan.write_page_ids,
-            page_offsets=plan.write_page_offsets,
-            token_indices=plan.write_token_indices,
-        )
-        k_cache, v_cache = context.kv.layer_kv(self.layer_id)
+        if (
+            q.ndim != 3
+            or context.cu_seqlens_q is None
+            or context.visible_end is None
+        ):
+            raise ValueError("packed attention geometry is invalid")
+        if context.has_cache_writes:
+            pool.write_locations(self.layer_id, context.out_cache_loc, k, v)
+        k_cache, v_cache = pool.layer_cache(self.layer_id, context.group_id)
         return ops.attention(
             ops.VisibleEndAttention(
                 q=q,
-                k=k_cache,
-                v=v_cache,
-                visible_end=plan.visible_end,
+                k=k,
+                v=v,
+                visible_end=context.visible_end,
                 scale=scale,
-                cu_seqlens_q=plan.cu_seqlens_q,
-                page_table=plan.page_table,
-                seqused_k=plan.seqused_k,
-                max_seqlen_q=plan.max_seqlen_q,
-                max_seqlen_k=plan.max_seqlen_k,
-                use_prefix_bounds=plan.use_prefix_bounds,
-                fully_visible=plan.fully_visible,
+                cu_seqlens_q=context.cu_seqlens_q,
+                page_table=context.block_table,
+                fully_visible=context.fully_visible,
+                prefix_k=k_cache,
+                prefix_v=v_cache,
+                prefix_lens=context.seq_lens,
                 ctx=context,
             ),
-            selection=plan.backends,
+            selection=selection,
         )
 
 
-__all__ = ["RadixAttention"]
+def bind_attention_modules(
+    model: nn.Module,
+    cache_pool: CachePool,
+    selection: AttentionSelection,
+) -> None:
+    for module in model.modules():
+        if isinstance(module, RadixAttention):
+            module.bind(cache_pool, selection)
+
+
+__all__ = ["RadixAttention", "bind_attention_modules"]

@@ -659,7 +659,7 @@ def _wrapper_device_context(wrapper: Any):
 def _cpu_paged_indptr(plan: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
     if plan is None:
         return None
-    kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_seqlens_cpu", ()) or ())
+    kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_lens_cpu", ()) or ())
     if len(kv_seqlens_cpu) != int(batch_size):
         return None
     page_size = max(1, int(page_size))
@@ -675,7 +675,7 @@ def _cpu_paged_indptr(plan: Any, batch_size: int, page_size: int) -> torch.Tenso
 def _cpu_last_page_len(plan: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
     if plan is None:
         return None
-    kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_seqlens_cpu", ()) or ())
+    kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_lens_cpu", ()) or ())
     if len(kv_seqlens_cpu) != int(batch_size):
         return None
     page_size = max(1, int(page_size))

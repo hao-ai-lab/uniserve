@@ -124,9 +124,7 @@ class WorkerServeLoop:
         response: dict[str, Any],
     ) -> None:
         self.inflight.append(response)
-        self._inflight_sessions[id(response)] = request_sessions | _response_session_ids(
-            response
-        )
+        self._inflight_sessions[id(response)] = request_sessions | _response_session_ids(response)
 
     def run(self) -> None:
         self._run()
@@ -211,9 +209,7 @@ class WorkerServeLoop:
         if request.get("kind") == RequestKind.SHUTDOWN.value:
             self.shutdown = self.worker_server.handle(request)
             return
-        self.waiting.append(
-            (request, _request_session_ids(request), self._starts_early(request))
-        )
+        self.waiting.append((request, _request_session_ids(request), self._starts_early(request)))
 
     def _starts_early(self, request: Mapping[str, Any]) -> bool:
         """Whether this request may launch ahead of older session-disjoint work.
@@ -253,23 +249,20 @@ class WorkerServeLoop:
             # session, and may only start once every overlapping in-flight
             # execution has published its request state.
             ordered_before = (
-                item[1]
-                for position, item in enumerate(items[:index])
-                if position not in launched
+                item[1] for position, item in enumerate(items[:index]) if position not in launched
             )
-            if (
-                any(not earlier.isdisjoint(sessions) for earlier in ordered_before)
-                or not all(
-                    self._inflight_sessions[id(response)].isdisjoint(sessions)
-                    or _response_execution_complete(response)
-                    for response in self.inflight
-                )
+            if any(not earlier.isdisjoint(sessions) for earlier in ordered_before) or not all(
+                self._inflight_sessions[id(response)].isdisjoint(sessions)
+                or _response_execution_complete(response)
+                for response in self.inflight
             ):
                 continue
             response = self.worker_server.handle(request)
             self._append_inflight(sessions, response)
             launched.add(index)
             started = True
+            if not self._launch_reorder:
+                break
         self.waiting = deque(
             item for position, item in enumerate(items) if position not in launched
         )

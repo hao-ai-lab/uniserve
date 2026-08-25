@@ -20,11 +20,9 @@ from uniserve_worker.execution.cuda_graph import (
     GraphGreedyOutput,
 )
 from uniserve_worker.execution.forward_batch import (
-    EmptyKvView,
     EmptyMeshView,
     ForwardBatch,
     ForwardOutput,
-    KvView,
     MeshView,
     ModelPhase,
     TokenSelection,
@@ -44,7 +42,6 @@ from uniserve_worker.foundation.errors import (
 )
 from uniserve_worker.models.runtime import WorkerDeployment
 
-from .forward_batch import AttnPlan
 from .input_buffers import InputBuffers
 from .lane import ExecutionPartitionRuntime, LaneConfig, create_green_contexts
 from .rows import ForwardRow
@@ -261,8 +258,7 @@ class ModelRunner:
         rows: tuple[ForwardRow, ...],
         *,
         device: torch.device | str,
-        kv: KvView | EmptyKvView,
-        attention: AttnPlan,
+        attention: dict[str, object],
         mesh: MeshView | EmptyMeshView,
         graph_shape: tuple[object, ...],
         graph_eligible: bool,
@@ -309,7 +305,7 @@ class ModelRunner:
                 batch = buffers.stage(
                     phase=phase,
                     row_count=len(tasks),
-                    request_pool_indices=tuple(task.request.request_pool_idx for task in tasks),
+                    request_pool_indices=tuple(task.request_pool_idx for task in tasks),
                     decode_force_finish=(
                         tuple(bool(task.decode_force_finish) for task in tasks)
                         if all(
@@ -398,7 +394,6 @@ class ModelRunner:
                         for task in tasks
                         if task.latent is not None and task.image_tokens == 0
                     ),
-                    kv=kv,
                     attention=attention,
                     mesh=mesh,
                 )

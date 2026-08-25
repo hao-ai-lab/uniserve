@@ -307,10 +307,6 @@ impl ZmqEngineCoreClient {
             combined.commit_marker_tokens =
                 combined.commit_marker_tokens.max(caps.commit_marker_tokens);
             combined.max_cfg_branches = combined.max_cfg_branches.min(caps.max_cfg_branches);
-            combined.scratch_capacity_tokens = combined
-                .scratch_capacity_tokens
-                .min(caps.scratch_capacity_tokens);
-            combined.scratch_block_size = combined.scratch_block_size.max(caps.scratch_block_size);
             combined.encoder_cache_entries = combined
                 .encoder_cache_entries
                 .min(caps.encoder_cache_entries);

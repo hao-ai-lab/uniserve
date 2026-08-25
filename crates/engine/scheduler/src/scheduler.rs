@@ -1,6 +1,6 @@
 //! Scheduler control loop: one owner thread drives the whole loop (single-owner,
 //! no locks on engine state) — drain commands, advance each running request's
-//! generation lifecycle, admit pending requests against the block and scratch budget,
+//! generation lifecycle, admit pending requests against the block budget,
 //! assemble a `ForwardBatch`, submit it asynchronously through the `Executor`,
 //! and resolve completed `ForwardResult`s into `GenEvent`s and cursor transitions.
 //! `ForwardBatch` assembly is lane-aware for text prefill/decode and may still
@@ -203,13 +203,14 @@ use uniserve_engine_api::{
     Command, EventTx, FinishReason, GenEvent, GenerationSubmission, PublicCommit, PublicModality,
     SemanticRoot,
 };
-use uniserve_kv::{BlockManager, EncoderCacheManager};
+use uniserve_kv::{BlockPool, BlockTable, EncoderCacheManager, KvCacheCoordinator};
 use uniserve_worker_wire::{
-    Admission, AttentionRegime, Batch, BatchPartition, CloseReason, CompletionRecord,
-    CompletionReport, Control, Disposition, ExecutionCapability, GenAdmission, KvAdmission,
-    KvBranchPlacement, KvPlacement, LatentPlacement, OpId, OpStatus, Operation, Point, ProductKind,
-    ProductPayload, ProductRef, RequestKey, ResourceClass, SamplingState, TimingCounters,
-    UndAdmission, VersionRef, WorkVariant, WorkerCapabilities, WorkerForwardStats,
+    Admission, AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable,
+    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, Disposition,
+    ExecutionCapability, ForwardRow as WireForwardRow, GenAdmission, LatentPlacement, OpId,
+    OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass,
+    SamplingState, TimingCounters, UndAdmission, VersionRef, WorkVariant, WorkerCapabilities,
+    WorkerForwardStats,
 };
 
 use crate::image_artifact::validate_png_artifact;
@@ -428,6 +429,10 @@ impl Default for SchedulerConfig {
 
 pub struct ReqState {
     pub req: GenerationRequest,
+    /// The cached sequence mappings. Each table owns its physical page
+    /// references and therefore has exactly the request's lifetime.
+    pub(crate) block_tables: Vec<BlockTable>,
+    flow_prefix: Option<FlowPrefixState>,
     /// Stable scheduler-assigned row used by every worker-side request-indexed
     /// state owner for this request epoch. Zero denotes a pending request that
     /// has not entered the running set.
@@ -486,6 +491,13 @@ pub struct ReqState {
     pub(crate) trace: crate::trace::RequestTrace,
 }
 
+struct FlowPrefixState {
+    request_pool_idx: u32,
+    block_tables: Vec<BlockTable>,
+    new_pages: Vec<(u32, Vec<BlockId>)>,
+    materialized: bool,
+}
+
 struct RequestSlotPool {
     free: Vec<u32>,
     live: Vec<bool>,
@@ -496,81 +508,6 @@ struct LatentPagePool {
     free: Vec<u32>,
     owners: Vec<Option<RequestId>>,
     allocations: HashMap<RequestId, Vec<u32>>,
-}
-
-struct KvScratchPagePool {
-    page_size: u32,
-    free: Vec<BlockId>,
-    allocations: HashMap<RequestId, Vec<BlockId>>,
-    pending_zero: HashMap<RequestId, Vec<BlockId>>,
-}
-
-impl KvScratchPagePool {
-    fn new(page_offset: u32, capacity_tokens: u64, page_size: u32) -> Self {
-        let page_size = page_size.max(1);
-        let page_count = capacity_tokens.div_ceil(u64::from(page_size));
-        let end = u64::from(page_offset)
-            .checked_add(page_count)
-            .and_then(|value| u32::try_from(value).ok())
-            .expect("KV scratch page range exceeds u32");
-        Self {
-            page_size,
-            free: (page_offset..end).rev().map(BlockId).collect(),
-            allocations: HashMap::new(),
-            pending_zero: HashMap::new(),
-        }
-    }
-
-    fn pages_needed(&self, tokens: u64) -> Option<usize> {
-        usize::try_from(tokens.div_ceil(u64::from(self.page_size))).ok()
-    }
-
-    fn can_reserve(&self, request_id: RequestId, tokens: u64) -> bool {
-        let Some(needed) = self.pages_needed(tokens) else {
-            return false;
-        };
-        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
-        needed.saturating_sub(held) <= self.free.len()
-    }
-
-    fn reserve(&mut self, request_id: RequestId, tokens: u64) -> bool {
-        if !self.can_reserve(request_id, tokens) {
-            return false;
-        }
-        let needed = self.pages_needed(tokens).unwrap_or_default();
-        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
-        let mut pages = Vec::with_capacity(needed.saturating_sub(held));
-        for _ in held..needed {
-            pages.push(self.free.pop().expect("KV scratch free-page invariant"));
-        }
-        self.pending_zero
-            .entry(request_id)
-            .or_default()
-            .extend(pages.iter().copied());
-        self.allocations
-            .entry(request_id)
-            .or_default()
-            .extend(pages);
-        true
-    }
-
-    fn pages_for(&self, request_id: RequestId) -> &[BlockId] {
-        self.allocations
-            .get(&request_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
-    fn take_pages_to_zero(&mut self, request_id: RequestId) -> Vec<BlockId> {
-        self.pending_zero.remove(&request_id).unwrap_or_default()
-    }
-
-    fn release(&mut self, request_id: RequestId) {
-        self.pending_zero.remove(&request_id);
-        if let Some(pages) = self.allocations.remove(&request_id) {
-            self.free.extend(pages.into_iter().rev());
-        }
-    }
 }
 
 impl LatentPagePool {
@@ -682,10 +619,11 @@ impl RequestSlotPool {
     }
 }
 
-#[derive(Clone, Copy)]
 struct RetiringSession {
     request_key: RequestKey,
     request_pool_idx: u32,
+    _block_tables: Vec<BlockTable>,
+    flow_prefix: Option<FlowPrefixState>,
 }
 
 #[derive(Clone)]
@@ -757,14 +695,13 @@ impl DerefMut for ReqState {
 pub struct Scheduler {
     executor: Box<dyn Executor>,
     caps: WorkerCapabilities,
-    bm: BlockManager,
+    block_pool: BlockPool,
+    kv_coordinator: KvCacheCoordinator,
     ctrl: ControlTokens,
     config: SchedulerConfig,
     /// Total allocatable blocks (the empty pool's free count) — the structural
     /// admission/rejection bound.
     usable_blocks: usize,
-    /// Automatic prefix caching: toggle, hash config, lookup, and reuse.
-    prefix_cache: crate::prefix_cache::PrefixCacheCoordinator,
     /// Pluggable host-side logits-processor pipeline.
     logits_pipeline: Vec<Arc<dyn crate::logits::LogitsProcessor>>,
     custom_logits_processors: usize,
@@ -774,7 +711,6 @@ pub struct Scheduler {
     reserved_encoder_entries: usize,
     request_slots: RequestSlotPool,
     latent_pages: LatentPagePool,
-    kv_scratch_pages: KvScratchPagePool,
     running: HashMap<RequestId, ReqState>,
     /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
@@ -1263,40 +1199,40 @@ impl Scheduler {
             .saturating_mul(max_batch_ops)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
+        let flow_slot_reserve = usize::from(caps.supported_work.contains(&WorkVariant::GenFlow));
+        let request_pool_capacity = caps.max_request_pool_size as usize;
+        let main_request_capacity = request_pool_capacity
+            .saturating_sub(flow_slot_reserve)
+            .max(1);
         config.max_num_seqs = config
             .max_num_seqs
             .clamp(1, MAX_NUM_SEQS)
-            .min(caps.max_request_pool_size as usize);
+            .min(main_request_capacity);
         config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
         // build from the worker's reported KV-cache groups (hybrid layouts);
         // Empty means one full-attention group.
-        let bm = if caps.groups.is_empty() {
-            BlockManager::new(caps.num_blocks as usize, caps.block_size as usize)
+        let block_pool = if caps.groups.is_empty() {
+            BlockPool::new(caps.num_blocks as usize, caps.block_size as usize)
         } else {
             let specs: Vec<(uniserve_core::KvGroupKind, u32, u32)> = caps
                 .groups
                 .iter()
                 .map(|g| (g.kind, g.block_offset, g.num_blocks))
                 .collect();
-            BlockManager::with_groups(caps.num_blocks as usize, caps.block_size as usize, &specs)
+            BlockPool::with_groups(caps.num_blocks as usize, caps.block_size as usize, &specs)
         };
-        let usable_blocks = bm.request_page_capacity();
+        let usable_blocks = block_pool.request_page_capacity();
         let stats = Arc::new(SchedStats::default());
         stats
             .kv_cache
             .num_blocks
             .store(usable_blocks, Ordering::Relaxed);
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
-        let request_slots = RequestSlotPool::new(config.max_num_seqs);
+        let request_slots = RequestSlotPool::new(request_pool_capacity);
         let latent_pages = LatentPagePool::new(caps.num_latent_pages, caps.latent_page_units);
-        let kv_scratch_pages = KvScratchPagePool::new(
-            caps.num_blocks,
-            caps.scratch_capacity_tokens,
-            caps.block_size,
-        );
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
@@ -1341,19 +1277,18 @@ impl Scheduler {
         Self {
             executor,
             caps,
-            bm,
+            block_pool,
+            kv_coordinator: KvCacheCoordinator::default(),
             ctrl,
             pending: make_queue(config.policy),
             config,
             usable_blocks,
-            prefix_cache: crate::prefix_cache::PrefixCacheCoordinator::new(),
             logits_pipeline: crate::logits::default_pipeline(),
             custom_logits_processors: 0,
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
             request_slots,
             latent_pages,
-            kv_scratch_pages,
             running: HashMap::new(),
             completed_outputs: HashMap::new(),
             retiring_sessions: HashMap::new(),
@@ -1400,10 +1335,10 @@ impl Scheduler {
         &self.config
     }
     pub fn set_prefix_cache(&mut self, on: bool) {
-        self.prefix_cache.set_enabled(on);
+        self.kv_coordinator.set_prefix_enabled(on);
     }
     pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        self.prefix_cache.set_hash_algo(algo);
+        self.kv_coordinator.set_hash_algo(algo);
     }
     /// Register an extra logits processor — no other scheduler code changes.
     pub fn with_logits_processor(mut self, p: Box<dyn crate::logits::LogitsProcessor>) -> Self {
@@ -1437,7 +1372,14 @@ impl Scheduler {
         self.config.long_prefill_threshold = n.max(1);
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
-        self.config.max_num_seqs = n.clamp(1, self.request_slots.capacity());
+        let flow_slot_reserve =
+            usize::from(self.caps.supported_work.contains(&WorkVariant::GenFlow));
+        let capacity = self
+            .request_slots
+            .capacity()
+            .saturating_sub(flow_slot_reserve)
+            .max(1);
+        self.config.max_num_seqs = n.clamp(1, capacity);
     }
     /// Cap waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
@@ -1458,7 +1400,7 @@ impl Scheduler {
         reason: crate::policy::PolicyReason,
         needed_blocks: usize,
     ) {
-        let free_blocks = self.bm.free_request_pages();
+        let free_blocks = self.block_pool.free_request_pages();
         self.decisions.record(crate::policy::PolicyDecision {
             request,
             reason,
@@ -1479,10 +1421,10 @@ impl Scheduler {
             waiting: self.pending.len(),
             running: self.running.len(),
             in_flight: self.executor.in_flight(),
-            free_blocks: self.bm.free_request_pages(),
+            free_blocks: self.block_pool.free_request_pages(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
-            cached_blocks: self.bm.cached_blocks(),
+            cached_blocks: self.block_pool.cached_blocks(),
             prefix_hit_rate: if pq > 0 { ph as f32 / pq as f32 } else { 0.0 },
             mm_cache_hit_rate: if mq > 0 { mh as f32 / mq as f32 } else { 0.0 },
             op_latency_us: self.latency.as_pairs(),
@@ -1569,7 +1511,7 @@ impl Scheduler {
             running: self.running.len(),
             pending: self.pending.len(),
             in_flight: self.executor.in_flight(),
-            free_blocks: self.bm.free_request_pages(),
+            free_blocks: self.block_pool.free_request_pages(),
             total_blocks: self.usable_blocks,
             reserved_blocks: self.reserved_blocks,
             completed_traces: self.completed_traces.len(),
@@ -1981,6 +1923,10 @@ impl Scheduler {
             uniserve_core::TraceId(req.request_id.0),
         );
         let st = ReqState {
+            block_tables: (0..self.block_pool.num_groups())
+                .map(|group| BlockTable::new(group, self.caps.block_size as usize))
+                .collect(),
+            flow_prefix: None,
             request_pool_idx: 0,
             epoch: self.next_epoch,
             version: 0,
@@ -2023,93 +1969,12 @@ impl Scheduler {
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
-    fn denoise_host_scratch_tokens(&self, st: &ReqState) -> u64 {
-        uniserve_core::denoise_scratch_tokens(
-            self.num_vae(&st.req.image),
-            u64::from(self.caps.commit_marker_tokens),
-            u64::from(st.und.physical_kv_len),
-            st.context.negative_prompt_ids.len() as u64,
-            u64::from(cfg_branch_count(&st.req.image)),
-            u64::from(self.caps.block_size),
-        )
-    }
-
-    fn kv_branch_placements_for(
-        &mut self,
-        request_id: RequestId,
-        request_key: RequestKey,
-        op_id: OpId,
-        conditioning_tokens: u32,
-    ) -> Result<Vec<KvBranchPlacement>, &'static str> {
-        let Some(state) = self.running.get(&request_id) else {
-            return Err("generation request lost its runtime state");
-        };
-        let branch_count = usize::from(cfg_branch_count(&state.req.image).max(1));
-        let block_size = u64::from(self.caps.block_size.max(1));
-        let branch_tokens = self
-            .num_vae(&state.req.image)
-            .saturating_add(u64::from(self.caps.commit_marker_tokens));
-        let conditioning_tokens = u64::from(conditioning_tokens);
-        let negative_tokens = state.context.negative_prompt_ids.len() as u64;
-        let branch_pages = |prefix_tokens: u64| {
-            usize::try_from(
-                branch_tokens
-                    .saturating_add(prefix_tokens)
-                    .div_ceil(block_size),
-            )
-            .map_err(|_| "generation scratch page count exceeds usize")
-        };
-        let primary_pages = branch_pages(conditioning_tokens)?;
-        let auxiliary_pages = branch_pages(conditioning_tokens.max(negative_tokens))?;
-        let pages = self.kv_scratch_pages.pages_for(request_id).to_vec();
-        let expected = primary_pages
-            .saturating_add(auxiliary_pages.saturating_mul(branch_count.saturating_sub(1)));
-        if pages.len() != expected {
-            return Err("generation scratch allocation disagrees with its branch geometry");
-        }
-        let pages_to_zero = self
-            .kv_scratch_pages
-            .take_pages_to_zero(request_id)
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let mut placements = Vec::with_capacity(branch_count);
-        let mut offset = 0usize;
-        for branch in 0..branch_count {
-            let width = if branch == 0 {
-                primary_pages
-            } else {
-                auxiliary_pages
-            };
-            let block_table = pages[offset..offset + width].to_vec();
-            let zero = block_table
-                .iter()
-                .copied()
-                .filter(|page| pages_to_zero.contains(page))
-                .collect();
-            placements.push(KvBranchPlacement {
-                request_key,
-                op_id,
-                branch_index: u32::try_from(branch + 1)
-                    .map_err(|_| "generation branch index exceeds u32")?,
-                group_id: 0,
-                block_table,
-                pages_to_zero: zero,
-            });
-            offset += width;
-        }
-        Ok(placements)
-    }
-
     fn cap_max_vae_grid_tokens(&self) -> usize {
         if self.caps.max_vae_grid_tokens > 0 {
             self.caps.max_vae_grid_tokens as usize
         } else {
             self.caps.latent_capacity_units().min(usize::MAX as u64) as usize
         }
-    }
-
-    fn cap_commit_marker_tokens(&self) -> usize {
-        self.caps.commit_marker_tokens.max(1) as usize
     }
 
     fn missing_required_capability(&self, request: &GenerationRequest) -> Option<&'static str> {
@@ -2155,17 +2020,77 @@ impl Scheduler {
             .unwrap_or(0);
         let worker_capacity_ok = !self.worker_tracks_image_latent()
             || self.latent_pages.can_reserve(id, requested_units);
-        let host_scratch_ok = self.running.get(&id).is_some_and(|st| {
-            st.resources.host_scratch_tokens > 0
-                || self
-                    .kv_scratch_pages
-                    .can_reserve(id, self.denoise_host_scratch_tokens(st))
+        worker_capacity_ok
+    }
+
+    fn ensure_flow_prefix(&mut self, id: RequestId) -> bool {
+        let (prefix_tokens, needs_alternative) = self
+            .running
+            .get(&id)
+            .map(|state| {
+                (
+                    state.context.negative_prompt_ids.len(),
+                    cfg_branch_count(&state.req.image) > 1,
+                )
+            })
+            .unwrap_or_default();
+        if !needs_alternative
+            || self
+                .running
+                .get(&id)
+                .is_some_and(|state| state.flow_prefix.is_some())
+        {
+            return true;
+        }
+        let Some(request_pool_idx) = self.request_slots.acquire() else {
+            return false;
+        };
+        let mut block_tables = (0..self.block_pool.num_groups())
+            .map(|group| BlockTable::new(group, self.caps.block_size as usize))
+            .collect::<Vec<_>>();
+        let Some(new_pages) =
+            self.kv_coordinator
+                .ensure_capacity(&self.block_pool, &mut block_tables, prefix_tokens)
+        else {
+            let _ = self.request_slots.release(request_pool_idx);
+            return false;
+        };
+        let Some(state) = self.running.get_mut(&id) else {
+            let _ = self.request_slots.release(request_pool_idx);
+            return false;
+        };
+        state.flow_prefix = Some(FlowPrefixState {
+            request_pool_idx,
+            block_tables,
+            new_pages,
+            materialized: false,
         });
-        worker_capacity_ok && host_scratch_ok
+        true
+    }
+
+    fn release_flow_prefix(&mut self, id: RequestId) {
+        let prefix = self
+            .running
+            .get_mut(&id)
+            .and_then(|state| state.flow_prefix.take());
+        if let Some(prefix) = prefix
+            && let Err(error) = self.request_slots.release(prefix.request_pool_idx)
+        {
+            tracing::error!(
+                request_id = id.0,
+                request_pool_idx = prefix.request_pool_idx,
+                error,
+                "failed to release scheduler flow-prefix slot"
+            );
+            self.fatal = true;
+        }
     }
 
     fn reserve_transition_resources(&mut self, transition: &mut PlannedTransition) -> bool {
         let id = transition.request_id;
+        if transition.operation_variant == WorkVariant::GenFlow && !self.ensure_flow_prefix(id) {
+            return false;
+        }
         let resources = &transition.resources;
         if resources.latent_units > 0
             && self.worker_tracks_image_latent()
@@ -2177,37 +2102,16 @@ impl Scheduler {
         if uses_transfer && self.inflight_transfers >= self.transfer_capacity {
             return false;
         }
-        let needs_host_scratch = self
-            .running
-            .get(&id)
-            .is_some_and(|st| st.resources.host_scratch_tokens == 0)
-            && resources.host_scratch_tokens > 0;
-        if needs_host_scratch
-            && !self
-                .kv_scratch_pages
-                .reserve(id, resources.host_scratch_tokens)
-        {
-            return false;
-        }
         if resources.latent_units > 0
             && self.worker_tracks_image_latent()
             && !self.latent_pages.reserve(id, resources.latent_units)
         {
-            if needs_host_scratch {
-                self.kv_scratch_pages.release(id);
-            }
             return false;
         }
         if uses_transfer {
             self.inflight_transfers += 1;
         }
         transition.reserved_us = uniserve_core::now_monotonic_us();
-        if let Some(st) = self.running.get_mut(&id) {
-            st.resources.host_scratch_tokens = st
-                .resources
-                .host_scratch_tokens
-                .max(resources.host_scratch_tokens);
-        }
         true
     }
 
@@ -2216,12 +2120,6 @@ impl Scheduler {
             match class {
                 uniserve_worker_wire::ResourceClass::ImageLatent => {
                     self.latent_pages.release(id);
-                }
-                uniserve_worker_wire::ResourceClass::Scratch => {
-                    self.kv_scratch_pages.release(id);
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.resources.host_scratch_tokens = 0;
-                    }
                 }
                 _ => {}
             }
@@ -2357,26 +2255,26 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.bm.free_request_pages(), Ordering::Relaxed);
+            .store(self.block_pool.free_request_pages(), Ordering::Relaxed);
         self.stats
             .general
             .in_flight
             .store(self.executor.in_flight(), Ordering::Relaxed);
         // drain the manager's event ring so it doesn't grow unbounded; the
         // counters below already aggregate it, but draining keeps memory bounded.
-        let _ = self.bm.drain_events();
+        let _ = self.block_pool.drain_events();
         self.stats
             .kv_cache
             .blocks_evicted
-            .store(self.bm.stats.evictions, Ordering::Relaxed);
+            .store(self.block_pool.stats().evictions, Ordering::Relaxed);
         self.stats
             .kv_cache
             .blocks_stored
-            .store(self.bm.stats.blocks_stored, Ordering::Relaxed);
+            .store(self.block_pool.stats().blocks_stored, Ordering::Relaxed);
         self.stats
             .kv_cache
             .cached_blocks
-            .store(self.bm.cached_blocks(), Ordering::Relaxed);
+            .store(self.block_pool.cached_blocks(), Ordering::Relaxed);
         self.stats
             .encoder
             .cache_queries
@@ -2408,22 +2306,26 @@ impl Scheduler {
         }
     }
 
-    /// Whether any request currently has a prefill op in flight. Prompt work
-    /// coalesces behind it: while one prefill batch runs, newly arrived
-    /// prompts wait (decode fills the slot) and merge into the next prefill
-    /// batch, so bursts cost one sweep instead of one sweep per arrival.
-    fn any_prefill_inflight(&self) -> bool {
-        self.inflight_ops
-            .values()
-            .flatten()
-            .any(|op| op.operation.work.variant() == WorkVariant::TokenExtend)
-    }
-
     fn any_denoise_inflight(&self) -> bool {
         self.inflight_ops
             .values()
             .flatten()
             .any(|op| op.operation.work.variant() == WorkVariant::GenFlow)
+    }
+
+    fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
+        let prefix_is_pending = self
+            .running
+            .get(&id)
+            .and_then(|state| state.flow_prefix.as_ref())
+            .is_some_and(|prefix| !prefix.materialized);
+        !prefix_is_pending
+            || !self
+                .inflight_ops
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .any(|op| op.operation.work.variant() == WorkVariant::GenFlow)
     }
 
     fn has_inflight(&self, id: RequestId) -> bool {
@@ -2705,7 +2607,7 @@ impl Scheduler {
         for control in controls {
             if let Control::Close { request_key, .. } = control {
                 let id = request_key.session_id;
-                let Some(retiring) = self.retiring_sessions.get(&id).copied() else {
+                let Some(retiring) = self.retiring_sessions.get(&id) else {
                     tracing::error!(
                         request_id = id.0,
                         epoch = request_key.epoch,
@@ -2723,16 +2625,30 @@ impl Scheduler {
                     self.fatal = true;
                     continue;
                 }
+                let request_pool_idx = retiring.request_pool_idx;
+                let flow_pool_idx = retiring
+                    .flow_prefix
+                    .as_ref()
+                    .map(|prefix| prefix.request_pool_idx);
                 match self.executor.control_wait(ControlOp::DropSession(id), None) {
                     Ok(_) => {
                         self.retiring_sessions.remove(&id);
-                        self.bm.release(id);
                         self.latent_pages.release(id);
-                        self.kv_scratch_pages.release(id);
-                        if let Err(error) = self.request_slots.release(retiring.request_pool_idx) {
+                        if let Some(index) = flow_pool_idx
+                            && let Err(error) = self.request_slots.release(index)
+                        {
                             tracing::error!(
                                 request_id = id.0,
-                                request_pool_idx = retiring.request_pool_idx,
+                                request_pool_idx = index,
+                                error,
+                                "failed to release scheduler flow-prefix slot"
+                            );
+                            self.fatal = true;
+                        }
+                        if let Err(error) = self.request_slots.release(request_pool_idx) {
+                            tracing::error!(
+                                request_id = id.0,
+                                request_pool_idx,
                                 error,
                                 "failed to release scheduler request slot"
                             );
@@ -3684,6 +3600,29 @@ impl Scheduler {
                     }
                     continue;
                 }
+                if record.status == OpStatus::Ok && !operation.advances_state {
+                    let completion_has_device_consumer =
+                        self.inflight_ops.get(&id).is_some_and(|queue| {
+                            queue.iter().any(|inflight| {
+                                inflight
+                                    .operation
+                                    .predicate
+                                    .as_ref()
+                                    .is_some_and(|predicate| {
+                                        predicate.producer_op_id == operation.op_id
+                                    })
+                            })
+                        });
+                    if !completion_has_device_consumer {
+                        let completed_predicates = operation
+                            .outputs
+                            .iter()
+                            .filter(|output| output.kind == ProductKind::Completion)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        self.release_products(completed_predicates);
+                    }
+                }
                 let semantic_blocked = self.running.get(&id).is_some_and(|state| state.cancelled)
                     || self.pending_finishes.contains_key(&id);
                 if semantic_blocked {
@@ -3792,7 +3731,31 @@ impl Scheduler {
                         self.queue_commit(id, expected_parent, selected, public_event_limit);
                     }
                 }
+                let release_flow_prefix = operation_variant == WorkVariant::GenFlow
+                    && record.status == OpStatus::Ok
+                    && match &apply.delta {
+                        TransitionDelta::DenoiseGen {
+                            start_step,
+                            step_count,
+                            ..
+                        } => self.running.get(&id).is_some_and(|state| {
+                            start_step.saturating_add(*step_count) >= state.req.image.steps
+                        }),
+                        _ => false,
+                    };
+                if operation_variant == WorkVariant::GenFlow
+                    && record.status == OpStatus::Ok
+                    && let Some(prefix) = self
+                        .running
+                        .get_mut(&id)
+                        .and_then(|state| state.flow_prefix.as_mut())
+                {
+                    prefix.materialized = true;
+                }
                 self.release_transition_resources(id, &apply);
+                if release_flow_prefix {
+                    self.release_flow_prefix(id);
+                }
                 if matches!(
                     operation_variant,
                     WorkVariant::GenFlow | WorkVariant::Materialize
@@ -4190,23 +4153,29 @@ impl Scheduler {
                     });
                     continue;
                 }
-                if self.bm.free_request_pages() >= need && encoder_ok {
+                if self.block_pool.free_request_pages() >= need && encoder_ok {
                     let st = self.pending.pop_request().unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
                     // Physically allocate the worst case now: nothing can take
                     // these blocks, so this request can never fail mid-flight.
-                    self.bm.ensure_capacity(id, need * bs);
+                    self.ensure_request_capacity(id, need * bs);
                     self.reserved_blocks += need;
                     self.record_decision(id, crate::policy::PolicyReason::Admitted, need);
                     continue;
                 }
             } else {
                 let n = head.context.prompt_ids.len();
-                let text_usable_blocks = self.bm.group_capacity(0);
-                let (cached_prefix_blocks, cached_prefix_free_blocks) = self
-                    .prefix_cache
-                    .cached_blocks_for_admission(head, &self.bm, bs);
+                let text_usable_blocks = (0..self.block_pool.num_groups())
+                    .map(|group| self.block_pool.group_capacity(group))
+                    .min()
+                    .unwrap_or_default();
+                let prefix_admission = crate::prefix_cache::cached_blocks_for_admission(
+                    &self.kv_coordinator,
+                    head,
+                    &self.block_pool,
+                );
+                let cached_prefix_blocks = prefix_admission.cached_blocks;
                 let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
                 let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
                 let uncached_remaining = n.saturating_sub(cached_prefix_tokens);
@@ -4240,11 +4209,17 @@ impl Scheduler {
                     });
                     continue;
                 }
-                let free_blocks_after_prefix_acquire = self
-                    .bm
-                    .free_blocks_in_group(0)
-                    .saturating_sub(cached_prefix_free_blocks);
-                if free_blocks_after_prefix_acquire >= first_chunk_blocks {
+                let capacity_available = prefix_admission.cached_free_blocks.len()
+                    == self.block_pool.num_groups()
+                    && prefix_admission.cached_free_blocks.iter().enumerate().all(
+                        |(group, cached_free)| {
+                            self.block_pool
+                                .free_blocks_in_group(group)
+                                .saturating_sub(*cached_free)
+                                >= first_chunk_blocks
+                        },
+                    );
+                if capacity_available {
                     let st = self.pending.pop_request().unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
@@ -4321,13 +4296,12 @@ impl Scheduler {
             "worstcase_blocks": worstcase_blocks,
             "running": self.running.len(),
             "pending": self.pending.len(),
-            "free_blocks": self.bm.free_request_pages(),
+            "free_blocks": self.block_pool.free_request_pages(),
             "reserved_blocks": self.reserved_blocks,
             "reserved_encoder_entries": self.reserved_encoder_entries,
         }));
-        let bs = self.caps.block_size as usize;
         if let Some(st) = self.running.get_mut(&id) {
-            self.prefix_cache.lookup(st, &mut self.bm, &self.stats, bs);
+            crate::prefix_cache::lookup(&self.kv_coordinator, st, &self.block_pool, &self.stats);
         }
     }
 
@@ -4412,7 +4386,9 @@ impl Scheduler {
                 }
             }
             if next_type == Some(WorkVariant::GenFlow)
-                && (denoise_occupies_decode_pipeline || !self.can_schedule_denoise(id))
+                && (denoise_occupies_decode_pipeline
+                    || !self.flow_prefix_is_schedulable(id)
+                    || !self.can_schedule_denoise(id))
             {
                 continue;
             }
@@ -4463,10 +4439,7 @@ impl Scheduler {
                             sampling: st.req.sampling.clone(),
                             negative_token_ids: st.context.negative_prompt_ids.clone(),
                             finish_token_ids,
-                            kv: KvAdmission {
-                                prefix_len: st.ingest.prompt_cursor,
-                                group_id: 0,
-                            },
+                            initial_position: st.ingest.prompt_cursor,
                         }),
                         st.req.behavior.gen_output.then(|| GenAdmission {
                             image: st.req.image.clone(),
@@ -4650,8 +4623,9 @@ impl Scheduler {
             .iter()
             .map(|admission| admission.request_key)
             .collect::<HashSet<_>>();
-        let mut kv_placements = HashMap::with_capacity(transitions.len());
-        let mut kv_branch_placements = HashMap::with_capacity(transitions.len());
+        let mut block_tables = HashMap::with_capacity(transitions.len());
+        let mut new_cache_pages = HashMap::with_capacity(transitions.len());
+        let mut forward_rows = HashMap::with_capacity(transitions.len());
         let mut latent_placements = HashMap::with_capacity(transitions.len());
         for mut transition in transitions {
             let oid = self.next_op_id;
@@ -4745,68 +4719,72 @@ impl Scheduler {
                 .map_or(0, |state| state.control_seq);
             let kv_lengths = transition_kv_lengths(&transition.delta);
             let new_page_count = transition.new_blocks.len();
-            transition.kv_capacity_pages = kv_lengths.map_or(0, |_| {
-                self.bm
-                    .blocks_for_group(request_id, 0)
-                    .len()
-                    .min(u32::MAX as usize) as u32
-            });
-            let mut operation_kv_placements = Vec::new();
+            let mut operation_block_tables = Vec::new();
+            let mut operation_new_cache_pages = Vec::new();
+            let mut operation_forward_rows = Vec::new();
             if let Some(lengths) = kv_lengths {
-                let block_table_update =
+                let table_changed =
                     admitted_request_keys.contains(&request_key) || new_page_count > 0;
-                for group_id in 0..self.bm.num_groups() {
-                    let (block_table, pages_to_zero) = if block_table_update {
-                        let block_table = self
-                            .bm
-                            .blocks_for_group(request_id, group_id)
-                            .iter()
-                            .take(transition.kv_capacity_pages as usize)
-                            .copied()
-                            .collect::<Vec<_>>();
-                        if block_table.len() != transition.kv_capacity_pages as usize {
-                            tracing::error!(
-                                request_id = request_id.0,
-                                group_id,
-                                expected_pages = transition.kv_capacity_pages,
-                                actual_pages = block_table.len(),
-                                "KV groups disagree on request capacity"
-                            );
-                            self.fatal = true;
-                            return false;
-                        }
-                        let pages_to_zero = if admitted_request_keys.contains(&request_key) {
-                            let retained_pages = if group_id == 0 {
-                                self.running
-                                    .get(&request_id)
-                                    .map(|state| {
-                                        (state.ingest.prompt_cursor as usize)
-                                            .div_ceil(self.caps.block_size as usize)
-                                    })
-                                    .unwrap_or_default()
-                                    .min(block_table.len())
-                            } else {
-                                0
-                            };
-                            block_table[retained_pages..].to_vec()
+                for group_id in 0..self.block_pool.num_groups() {
+                    let page_ids = self
+                        .running
+                        .get(&request_id)
+                        .and_then(|state| state.block_tables.get(group_id))
+                        .map(BlockTable::page_ids)
+                        .unwrap_or_default();
+                    let request_pool_idx = self
+                        .running
+                        .get(&request_id)
+                        .map(|state| state.request_pool_idx)
+                        .expect("registered request has a live slot");
+                    if table_changed {
+                        operation_block_tables.push(WireBlockTable {
+                            request_pool_idx,
+                            group_id: group_id as u32,
+                            allocated_tokens: u32::try_from(
+                                page_ids.len().saturating_mul(self.caps.block_size as usize),
+                            )
+                            .unwrap_or(u32::MAX),
+                            page_ids: page_ids.clone(),
+                        });
+                    }
+                    let fresh_pages = if admitted_request_keys.contains(&request_key) {
+                        let retained_pages = if group_id == 0 {
+                            self.running
+                                .get(&request_id)
+                                .map(|state| {
+                                    (state.ingest.prompt_cursor as usize)
+                                        .div_ceil(self.caps.block_size as usize)
+                                })
+                                .unwrap_or_default()
+                                .min(page_ids.len())
                         } else {
-                            block_table[block_table.len().saturating_sub(new_page_count)..].to_vec()
+                            0
                         };
-                        (block_table, pages_to_zero)
+                        page_ids[retained_pages..].to_vec()
+                    } else if new_page_count > 0 {
+                        page_ids[page_ids.len().saturating_sub(new_page_count)..].to_vec()
                     } else {
-                        (Vec::new(), Vec::new())
+                        Vec::new()
                     };
-                    operation_kv_placements.push(KvPlacement {
-                        request_key,
-                        op_id: OpId(oid),
-                        group_id: group_id as u32,
-                        block_table,
-                        block_table_update,
-                        pages_to_zero,
-                        prefix_length: lengths.prefix,
-                        input_length: lengths.input,
-                        visible_length: lengths.visible,
-                        resulting_length: lengths.resulting,
+                    if !fresh_pages.is_empty() {
+                        operation_new_cache_pages.push(CachePageAllocation {
+                            request_pool_idx,
+                            group_id: group_id as u32,
+                            page_ids: fresh_pages,
+                        });
+                    }
+                }
+                if lengths.input > 0 {
+                    operation_forward_rows.push(WireForwardRow {
+                        operation_index: 0,
+                        request_pool_index: self
+                            .running
+                            .get(&request_id)
+                            .map(|state| state.request_pool_idx)
+                            .expect("registered request has a live slot"),
+                        seq_len: lengths.visible,
+                        query_len: lengths.input,
                     });
                 }
             }
@@ -4833,12 +4811,7 @@ impl Scheduler {
                     return false;
                 }
             };
-            if !operation_kv_placements.is_empty() {
-                kv_placements.insert(
-                    (operation.request_key, operation.op_id),
-                    operation_kv_placements,
-                );
-            }
+            let operation_identity = (operation.request_key, operation.op_id);
             if operation.work.variant() == WorkVariant::GenFlow {
                 let conditioning_tokens = match &apply.delta {
                     TransitionDelta::DenoiseGen {
@@ -4846,24 +4819,79 @@ impl Scheduler {
                     } => *physical_kv_len,
                     _ => unreachable!("generation flow has a non-flow scheduler delta"),
                 };
-                let placements = match self.kv_branch_placements_for(
-                    request_id,
-                    operation.request_key,
-                    operation.op_id,
-                    conditioning_tokens,
-                ) {
-                    Ok(placements) => placements,
-                    Err(error) => {
-                        tracing::error!(
-                            request_id = request_id.0,
-                            error,
-                            "invalid generation KV branch placement"
-                        );
-                        self.fatal = true;
-                        return false;
-                    }
+                let query_len = u32::try_from(
+                    self.running
+                        .get(&request_id)
+                        .map(|state| self.num_vae(&state.req.image))
+                        .unwrap_or_default()
+                        .saturating_add(u64::from(self.caps.commit_marker_tokens)),
+                )
+                .unwrap_or(u32::MAX);
+                let Some(state) = self.running.get_mut(&request_id) else {
+                    self.fatal = true;
+                    return false;
                 };
-                kv_branch_placements.insert((operation.request_key, operation.op_id), placements);
+                let main_slot = state.request_pool_idx;
+                let mut alternative = None;
+                if let Some(prefix) = state.flow_prefix.as_mut() {
+                    let allocated_tokens = prefix
+                        .block_tables
+                        .first()
+                        .map(|table| table.capacity_tokens())
+                        .unwrap_or_default();
+                    if !prefix.materialized || !prefix.new_pages.is_empty() {
+                        for table in &prefix.block_tables {
+                            operation_block_tables.push(WireBlockTable {
+                                request_pool_idx: prefix.request_pool_idx,
+                                group_id: table.group_id() as u32,
+                                page_ids: table.page_ids(),
+                                allocated_tokens: u32::try_from(allocated_tokens)
+                                    .unwrap_or(u32::MAX),
+                            });
+                        }
+                    }
+                    for (group_id, pages) in std::mem::take(&mut prefix.new_pages) {
+                        if !pages.is_empty() {
+                            operation_new_cache_pages.push(CachePageAllocation {
+                                request_pool_idx: prefix.request_pool_idx,
+                                group_id,
+                                page_ids: pages,
+                            });
+                        }
+                    }
+                    let prefix_len = state.context.negative_prompt_ids.len() as u32;
+                    if prefix_len > 0 && !prefix.materialized {
+                        operation_forward_rows.push(WireForwardRow {
+                            operation_index: 0,
+                            request_pool_index: prefix.request_pool_idx,
+                            seq_len: 0,
+                            query_len: prefix_len,
+                        });
+                    }
+                    alternative = Some((prefix.request_pool_idx, prefix_len));
+                }
+                for branch in 0..usize::from(cfg_branch_count(&state.req.image).max(1)) {
+                    let (request_pool_index, seq_len) = if branch == 0 {
+                        (main_slot, conditioning_tokens)
+                    } else {
+                        alternative.unwrap_or((main_slot, conditioning_tokens))
+                    };
+                    operation_forward_rows.push(WireForwardRow {
+                        operation_index: 0,
+                        request_pool_index,
+                        seq_len,
+                        query_len,
+                    });
+                }
+            }
+            if !operation_block_tables.is_empty() {
+                block_tables.insert(operation_identity, operation_block_tables);
+            }
+            if !operation_new_cache_pages.is_empty() {
+                new_cache_pages.insert(operation_identity, operation_new_cache_pages);
+            }
+            if !operation_forward_rows.is_empty() {
+                forward_rows.insert(operation_identity, operation_forward_rows);
             }
             if matches!(
                 operation.work.variant(),
@@ -4993,7 +5021,7 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.bm.free_request_pages(), Ordering::Relaxed);
+            .store(self.block_pool.free_request_pages(), Ordering::Relaxed);
         let mixed = wire_ops.first().is_some_and(|first| {
             wire_ops
                 .iter()
@@ -5037,7 +5065,7 @@ impl Scheduler {
                 "running": self.running.len(),
                 "pending": self.pending.len(),
                 "in_flight_before_submit": self.executor.in_flight(),
-                "free_blocks": self.bm.free_request_pages(),
+                "free_blocks": self.block_pool.free_request_pages(),
                 "reserved_blocks": self.reserved_blocks,
                 "worker_image_latent_active": self.worker_image_latent_used(),
                 "worker_image_latent_capacity": self.caps.latent_capacity_units(),
@@ -5070,8 +5098,9 @@ impl Scheduler {
         controls.extend(releases);
         let partitions = self.partition_batch(
             wire_ops,
-            &kv_placements,
-            &kv_branch_placements,
+            &block_tables,
+            &new_cache_pages,
+            &forward_rows,
             &latent_placements,
         );
         let partition_accounting = partitions
@@ -5119,8 +5148,9 @@ impl Scheduler {
     fn partition_batch(
         &mut self,
         operations: Vec<Operation>,
-        kv_placements: &HashMap<(RequestKey, OpId), Vec<KvPlacement>>,
-        kv_branch_placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
+        block_tables: &HashMap<(RequestKey, OpId), Vec<WireBlockTable>>,
+        new_cache_pages: &HashMap<(RequestKey, OpId), Vec<CachePageAllocation>>,
+        forward_rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
         latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     ) -> Vec<BatchPartition> {
         let mut routes: RouteDomainOperations = Vec::new();
@@ -5169,7 +5199,7 @@ impl Scheduler {
             while let Some(mixed_group) = extract_mixed_group(
                 &mut mixed_candidates,
                 &self.caps.mixed_buckets,
-                kv_branch_placements,
+                forward_rows,
                 latent_placements,
             ) {
                 let collective_seq = {
@@ -5184,10 +5214,10 @@ impl Scheduler {
                         .collect::<Vec<_>>(),
                 );
                 for (domain, operations) in mixed_group {
-                    let request_pool_indices = self.request_pool_indices(&operations);
-                    let kv_placements = self.kv_placements(&operations, kv_placements);
-                    let kv_branch_placements =
-                        self.kv_branch_placements(&operations, kv_branch_placements);
+                    let partition_block_tables = self.block_tables(&operations, block_tables);
+                    let partition_new_cache_pages =
+                        self.new_cache_pages(&operations, new_cache_pages);
+                    let partition_forward_rows = self.forward_rows(&operations, forward_rows);
                     let latent_placements = self.latent_placements(&operations, latent_placements);
                     partitions.push(BatchPartition {
                         partition_id: next_partition_id,
@@ -5199,9 +5229,9 @@ impl Scheduler {
                         attention,
                         shape_class: 0,
                         operations,
-                        request_pool_indices,
-                        kv_placements,
-                        kv_branch_placements,
+                        block_tables: partition_block_tables,
+                        new_cache_pages: partition_new_cache_pages,
+                        forward_rows: partition_forward_rows,
                         latent_placements,
                     });
                     next_partition_id = next_partition_id.saturating_add(1);
@@ -5219,10 +5249,9 @@ impl Scheduler {
                     self.next_collective_seq = value.saturating_add(1);
                     value
                 };
-                let request_pool_indices = self.request_pool_indices(&operations);
-                let kv_placements = self.kv_placements(&operations, kv_placements);
-                let kv_branch_placements =
-                    self.kv_branch_placements(&operations, kv_branch_placements);
+                let partition_block_tables = self.block_tables(&operations, block_tables);
+                let partition_new_cache_pages = self.new_cache_pages(&operations, new_cache_pages);
+                let partition_forward_rows = self.forward_rows(&operations, forward_rows);
                 let latent_placements = self.latent_placements(&operations, latent_placements);
                 partitions.push(BatchPartition {
                     partition_id: next_partition_id,
@@ -5234,9 +5263,9 @@ impl Scheduler {
                     attention: partition_attention(&operations),
                     shape_class: 0,
                     operations,
-                    request_pool_indices,
-                    kv_placements,
-                    kv_branch_placements,
+                    block_tables: partition_block_tables,
+                    new_cache_pages: partition_new_cache_pages,
+                    forward_rows: partition_forward_rows,
                     latent_placements,
                 });
                 next_partition_id = next_partition_id.saturating_add(1);
@@ -5246,34 +5275,57 @@ impl Scheduler {
         partitions
     }
 
-    fn request_pool_indices(&self, operations: &[Operation]) -> Vec<u32> {
-        operations
-            .iter()
-            .map(|operation| {
-                self.running
-                    .get(&operation.request_key.session_id)
-                    .map(|state| state.request_pool_idx)
-                    .expect("registered operation has a live request slot")
-            })
-            .collect()
-    }
-
-    fn kv_placements(
+    fn block_tables(
         &self,
         operations: &[Operation],
-        placements: &HashMap<(RequestKey, OpId), Vec<KvPlacement>>,
-    ) -> Vec<KvPlacement> {
+        tables: &HashMap<(RequestKey, OpId), Vec<WireBlockTable>>,
+    ) -> Vec<WireBlockTable> {
         operations
             .iter()
-            .filter(|operation| operation.kv_capacity_pages > 0)
             .flat_map(|operation| {
-                placements
+                tables
                     .get(&(operation.request_key, operation.op_id))
                     .into_iter()
                     .flatten()
                     .cloned()
-                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn new_cache_pages(
+        &self,
+        operations: &[Operation],
+        allocations: &HashMap<(RequestKey, OpId), Vec<CachePageAllocation>>,
+    ) -> Vec<CachePageAllocation> {
+        operations
+            .iter()
+            .flat_map(|operation| {
+                allocations
+                    .get(&(operation.request_key, operation.op_id))
                     .into_iter()
+                    .flatten()
+                    .cloned()
+            })
+            .collect()
+    }
+
+    fn forward_rows(
+        &self,
+        operations: &[Operation],
+        rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
+    ) -> Vec<WireForwardRow> {
+        operations
+            .iter()
+            .enumerate()
+            .flat_map(|(operation_index, operation)| {
+                rows.get(&(operation.request_key, operation.op_id))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .map(move |mut row| {
+                        row.operation_index = operation_index as u32;
+                        row
+                    })
             })
             .collect()
     }
@@ -5288,23 +5340,6 @@ impl Scheduler {
             .filter_map(|operation| {
                 placements
                     .get(&(operation.request_key, operation.op_id))
-                    .cloned()
-            })
-            .collect()
-    }
-
-    fn kv_branch_placements(
-        &self,
-        operations: &[Operation],
-        placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
-    ) -> Vec<KvBranchPlacement> {
-        operations
-            .iter()
-            .flat_map(|operation| {
-                placements
-                    .get(&(operation.request_key, operation.op_id))
-                    .into_iter()
-                    .flatten()
                     .cloned()
             })
             .collect()
@@ -5350,13 +5385,30 @@ impl Scheduler {
                 .matches_generated(st.effective_prompt())
     }
 
+    fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
+        let Some(state) = self.running.get_mut(&id) else {
+            return false;
+        };
+        self.kv_coordinator
+            .ensure_capacity(&self.block_pool, &mut state.block_tables, total_tokens)
+            .is_some()
+    }
+
+    fn activate_request_tables(&self, id: RequestId) {
+        if let Some(state) = self.running.get(&id) {
+            for table in &state.block_tables {
+                table.activate(&self.block_pool);
+            }
+        }
+    }
+
     /// The block-id delta since the last op for this request (the stateful-diff
     /// contract): everything `blocks_for` holds beyond what already crossed.
     fn take_new_blocks(&mut self, id: RequestId) -> Vec<BlockId> {
-        let all = self.bm.blocks_for_group(id, 0);
         let Some(st) = self.running.get_mut(&id) else {
             return Vec::new();
         };
+        let all = st.block_tables[0].page_ids();
         let sent = st.resources.blocks_sent.min(all.len());
         let new = all[sent..].to_vec();
         st.resources.blocks_sent = all.len();
@@ -5437,7 +5489,7 @@ impl Scheduler {
                 let end = (cursor + chunk_cap.max(1))
                     .min(n)
                     .min(segment_end.max(cursor + 1));
-                if !self.bm.ensure_capacity(id, end) {
+                if !self.ensure_request_capacity(id, end) {
                     return None;
                 }
                 let chunk: Vec<u32> = prompt[cursor..end].to_vec();
@@ -5476,7 +5528,7 @@ impl Scheduler {
                 let pos = projection.logical_pos;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let capacity_target = self.decode_capacity_target(pos as usize, 0);
-                if !self.bm.ensure_capacity(id, capacity_target) {
+                if !self.ensure_request_capacity(id, capacity_target) {
                     return None;
                 }
                 let new_blocks = self.take_new_blocks(id);
@@ -5494,16 +5546,15 @@ impl Scheduler {
                 )
             }
             Phase::CloseKv => {
-                let st = self.running.get(&id)?;
+                let token = self.running.get(&id)?.und.next_token;
                 let capacity_target =
                     self.decode_capacity_target(projection.physical_kv_len as usize, 0);
-                if !self.bm.ensure_capacity(id, capacity_target) {
+                if !self.ensure_request_capacity(id, capacity_target) {
                     return None;
                 }
                 let image_id = projected_branch.image_id;
                 let position = projection.logical_pos;
                 let physical_position = projection.physical_kv_len;
-                let token = st.und.next_token;
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
@@ -5547,16 +5598,6 @@ impl Scheduler {
                 // is host-driven off the committed step count, not a worker
                 // completion flag.
                 let st = self.running.get(&id)?;
-                let cond_pos = projected_branch.conditioning_position;
-                let nvae = self.num_vae(&st.req.image) as usize;
-                if st.req.image.retain_images
-                    && !self.bm.ensure_capacity(
-                        id,
-                        cond_pos as usize + nvae + self.cap_commit_marker_tokens(),
-                    )
-                {
-                    return None;
-                }
                 let timestep = projected_branch.steps_done;
                 let remaining = st.req.image.steps.saturating_sub(timestep);
                 if remaining == 0 {
@@ -5565,7 +5606,6 @@ impl Scheduler {
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
-                let host_scratch_tokens = self.denoise_host_scratch_tokens(st);
                 let image_id = projected_branch.image_id;
                 let conditioning = projected_branch.conditioning.clone()?;
                 let latent = projected_branch.latent.clone()?;
@@ -5579,7 +5619,6 @@ impl Scheduler {
                         step_count: denoise_step_count,
                         cfg,
                         latent_units,
-                        host_scratch_tokens,
                         conditioning,
                         latent,
                     },
@@ -5694,7 +5733,7 @@ impl Scheduler {
                         uniserve_core::ImageIngestStep::VitEncode => self.caps.max_vit_grid_tokens,
                     },
                 };
-                if !self.bm.ensure_capacity(
+                if !self.ensure_request_capacity(
                     id,
                     projection.physical_kv_len.saturating_add(physical_bound) as usize,
                 ) {
@@ -5776,10 +5815,7 @@ impl Scheduler {
             .min(prompt.len())
             .min(segment_end)
             .min(next_image.max(cursor + 1));
-        if !self
-            .bm
-            .ensure_capacity(id, projection.physical_kv_len as usize + end - cursor)
-        {
+        if !self.ensure_request_capacity(id, projection.physical_kv_len as usize + end - cursor) {
             return None;
         }
         let sampling_state = self.sampling_state(id, 0);
@@ -5952,7 +5988,7 @@ impl Scheduler {
         view: SequenceView,
         prefix_versions: &[VersionRef],
     ) {
-        self.bm.activate(id);
+        self.activate_request_tables(id);
         if self
             .running
             .get(&id)
@@ -6069,7 +6105,7 @@ impl Scheduler {
         }
         match operation_variant {
             WorkVariant::TokenExtend => {
-                self.bm.activate(id);
+                self.activate_request_tables(id);
                 match &apply.delta {
                     crate::generation::TransitionDelta::CloseKv { .. } => return,
                     crate::generation::TransitionDelta::IngestImageState {
@@ -6208,9 +6244,8 @@ impl Scheduler {
                 }
                 // the prompt is fully prefilled now — publish its full
                 // blocks to the prefix cache for later requests to reuse.
-                let bs = self.caps.block_size as usize;
                 if let Some(st) = self.running.get_mut(&id) {
-                    self.prefix_cache.cache_blocks(st, &mut self.bm, bs);
+                    crate::prefix_cache::cache_blocks(&self.kv_coordinator, st, &self.block_pool);
                 }
                 // A description-lowered prefix may already end at a branch trigger.
                 // Treat that boundary exactly like a sampled trigger.
@@ -6319,7 +6354,7 @@ impl Scheduler {
                     let root = self.fixed_version(id);
                     self.emit_visible(id, event, root.as_ref(), PublicModality::Image);
                 }
-                self.bm.activate(id);
+                self.activate_request_tables(id);
                 let (continues_after_gen_commit, feedback_source) = {
                     let st = self.running.get(&id).unwrap();
                     (
@@ -6525,7 +6560,11 @@ impl Scheduler {
         }) else {
             return false;
         };
-        let allocated_blocks = self.bm.blocks_for_group(id, 0).len();
+        let allocated_blocks = self
+            .running
+            .get(&id)
+            .and_then(|state| state.block_tables.first())
+            .map_or(0, BlockTable::len);
         if !reserves_envelope || allocated_blocks < required_blocks {
             self.trace_record(json!({
                 "event": "gen_branch_reservation_rejected",
@@ -6546,7 +6585,7 @@ impl Scheduler {
             "request_id": id.0,
             "required_blocks": required_blocks,
             "allocated_blocks": allocated_blocks,
-            "free_blocks": self.bm.free_request_pages(),
+            "free_blocks": self.block_pool.free_request_pages(),
             "reserved_blocks": self.reserved_blocks,
         }));
         true
@@ -6897,8 +6936,13 @@ impl Scheduler {
         }
         let mut awaits_close = false;
         let mut request_pool_idx = None;
+        let mut flow_pool_idx = None;
         if let Some(mut st) = self.running.remove(&id) {
             request_pool_idx = Some(st.request_pool_idx);
+            flow_pool_idx = st
+                .flow_prefix
+                .as_ref()
+                .map(|prefix| prefix.request_pool_idx);
             if let Some(key) = st.cpu_pending.take() {
                 self.cpu_deadlines.remove(&key);
             }
@@ -6924,6 +6968,8 @@ impl Scheduler {
                     RetiringSession {
                         request_key,
                         request_pool_idx: st.request_pool_idx,
+                        _block_tables: std::mem::take(&mut st.block_tables),
+                        flow_prefix: st.flow_prefix.take(),
                     },
                 );
                 awaits_close = true;
@@ -6985,9 +7031,10 @@ impl Scheduler {
             }
         }
         if !awaits_close {
-            self.bm.release(id);
             self.latent_pages.release(id);
-            self.kv_scratch_pages.release(id);
+            if let Some(index) = flow_pool_idx {
+                let _ = self.request_slots.release(index);
+            }
             if let Some(index) = request_pool_idx
                 && let Err(error) = self.request_slots.release(index)
             {
@@ -7005,10 +7052,8 @@ impl Scheduler {
 
 #[derive(Clone, Copy)]
 struct KvLengths {
-    prefix: u32,
     input: u32,
     visible: u32,
-    resulting: u32,
 }
 
 fn transition_kv_lengths(delta: &TransitionDelta) -> Option<KvLengths> {
@@ -7056,10 +7101,8 @@ fn transition_kv_lengths(delta: &TransitionDelta) -> Option<KvLengths> {
         | TransitionDelta::EncodeFeedbackStep { .. } => return None,
     };
     Some(KvLengths {
-        prefix,
         input,
         visible: prefix,
-        resulting: prefix.saturating_add(input),
     })
 }
 
@@ -7127,7 +7170,7 @@ fn tensorized_mixed_runner_work(variant: WorkVariant) -> bool {
 
 fn flow_matches_mixed_bucket(
     operation: &Operation,
-    kv_branch_placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
+    forward_rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     bucket: &uniserve_worker_wire::MixedExecutionCapability,
 ) -> bool {
@@ -7138,16 +7181,16 @@ fn flow_matches_mixed_bucket(
     latent_placements.get(&identity).is_some_and(|placement| {
         placement.height == bucket.height
             && placement.width == bucket.width
-            && kv_branch_placements
+            && forward_rows
                 .get(&identity)
-                .is_some_and(|placements| placements.len() == bucket.cfg_branches as usize)
+                .is_some_and(|rows| rows.len() >= bucket.cfg_branches as usize)
     })
 }
 
 fn extract_mixed_group(
     candidates: &mut [(uniserve_worker_wire::Domain, Vec<Operation>)],
     buckets: &[uniserve_worker_wire::MixedExecutionCapability],
-    kv_branch_placements: &HashMap<(RequestKey, OpId), Vec<KvBranchPlacement>>,
+    forward_rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
 ) -> Option<Vec<(uniserve_worker_wire::Domain, Vec<Operation>)>> {
     let decode_index = candidates
@@ -7165,12 +7208,7 @@ fn extract_mixed_group(
             flow_operations
                 .iter()
                 .filter(|operation| {
-                    flow_matches_mixed_bucket(
-                        operation,
-                        kv_branch_placements,
-                        latent_placements,
-                        bucket,
-                    )
+                    flow_matches_mixed_bucket(operation, forward_rows, latent_placements, bucket)
                 })
                 .count()
                 >= bucket.flow_rows as usize
@@ -7192,12 +7230,7 @@ fn extract_mixed_group(
     let mut remaining_flow = Vec::with_capacity(candidates[flow_index].1.len());
     for operation in std::mem::take(&mut candidates[flow_index].1) {
         if flow.len() < bucket.flow_rows as usize
-            && flow_matches_mixed_bucket(
-                &operation,
-                kv_branch_placements,
-                latent_placements,
-                &bucket,
-            )
+            && flow_matches_mixed_bucket(&operation, forward_rows, latent_placements, &bucket)
         {
             flow.push(operation);
         } else {

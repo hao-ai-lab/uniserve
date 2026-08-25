@@ -18,7 +18,7 @@ import torch
 from ...execution.forward_batch import ForwardBatch
 from ...foundation.math import ceil_div
 from ..paged_kv_math import paged_kv_write, write_locations
-from .base import AttentionCapabilities
+from .base import AttentionCapabilities, merge_attention_states
 from .layout import QKVLayout, normalize_kv, normalize_to
 
 __all__ = [
@@ -99,6 +99,8 @@ class Fa4CuteAttentionBackend:
             available=available,
             paged_kv=available,
             visible_end=available,
+            segmented_attention=available,
+            segmented_attention_cuda_graph=available,
             visible_end_cuda_graph=available,
             paged_block_size_multiple=1,
             trunk_geometries=_SUPPORTED_TRUNK_GEOMETRIES,
@@ -171,11 +173,11 @@ class Fa4CuteAttentionBackend:
                 raise ValueError("current paged K/V must match q batch and each other")
             _write_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, k_blh, v_blh)
             live_seqlens += int(k_blh.shape[1])
-        max_seqlen_k = _metadata_context_len(None if context is None else context.attention)
+        max_seqlen_k = _metadata_context_len(context)
         if max_seqlen_k <= 0:
             raise ValueError(
                 "fa4_cute paged forward requires a positive host-known "
-                "plan.max_context_len; a plan without one is a scheduling bug"
+                "maximum KV length"
             )
 
         out = _fa4_output(
@@ -255,6 +257,76 @@ class Fa4CuteAttentionBackend:
             kwargs["mask_mod"] = _hybrid_multimodal_mask
         return _fa4_output(_fa4_flash_attn_fwd(q, k, v, **kwargs))
 
+    def forward_segmented(
+        self,
+        q: torch.Tensor,
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        visible_current_end: torch.Tensor,
+        scale: float,
+        fully_visible_current: bool,
+        context: ForwardBatch | None = None,
+    ) -> torch.Tensor:
+        del context
+        _require_fa4()
+        if q.ndim != 3 or current_k.shape != current_v.shape or current_k.ndim != 3:
+            raise ValueError("FA4 segmented attention expects packed current Q/K/V")
+        _validate_unified_trunk_geometry(
+            q.shape[-1], current_k.shape[-1], current_v.shape[-1], scale=scale
+        )
+        cu_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32).contiguous()
+        pages = page_table.to(device=q.device, dtype=torch.int32).contiguous()
+        prefix_lengths = prefix_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        max_query = int(visible_current_end.shape[1])
+        current_kwargs: dict[str, Any] = {
+            "cu_seqlens_q": cu_q,
+            "cu_seqlens_k": cu_q,
+            "max_seqlen_q": max_query,
+            "max_seqlen_k": max_query,
+            "softmax_scale": scale,
+            "tile_mn": _FA4_TILE_MN,
+            "num_threads": _FA4_NUM_THREADS,
+            "return_lse": True,
+        }
+        if not fully_visible_current:
+            visible = visible_current_end.to(device=q.device, dtype=torch.int32).contiguous()
+            setattr(visible, "__leading_dim__", 1)
+            setattr(visible, "__assumed_align__", 4)
+            current_kwargs["aux_tensors"] = [visible]
+            current_kwargs["mask_mod"] = _hybrid_multimodal_mask
+        current_output, current_lse = _fa4_state(
+            _fa4_flash_attn_fwd(q, current_k, current_v, **current_kwargs)
+        )
+        prefix_output, prefix_lse = _fa4_state(
+            _fa4_flash_attn_fwd(
+                q,
+                prefix_k,
+                prefix_v,
+                cu_seqlens_q=cu_q,
+                page_table=pages,
+                seqused_k=prefix_lengths,
+                max_seqlen_q=max_query,
+                max_seqlen_k=int(pages.shape[1]) * int(prefix_k.shape[1]),
+                softmax_scale=scale,
+                tile_mn=_FA4_TILE_MN,
+                num_threads=_FA4_NUM_THREADS,
+                return_lse=True,
+            )
+        )
+        output, _ = merge_attention_states(
+            current_output,
+            current_lse,
+            prefix_output,
+            prefix_lse,
+        )
+        return output
+
 
 def _require_fa4() -> None:
     if _fa4_flash_attn_fwd is None:
@@ -270,6 +342,17 @@ def _fa4_output(result: Any) -> torch.Tensor:
     if isinstance(result, tuple):
         return result[0]
     return result
+
+
+def _fa4_state(result: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(result, tuple) or len(result) < 2 or result[1] is None:
+        raise RuntimeError("FA4 segmented attention did not return log-sum-exp state")
+    output, lse = result[0], result[1]
+    if lse.ndim == 2 and tuple(lse.shape) == (int(output.shape[1]), int(output.shape[0])):
+        lse = lse.transpose(0, 1).contiguous()
+    if tuple(lse.shape) != tuple(output.shape[:2]):
+        raise RuntimeError("FA4 segmented attention returned an unexpected LSE layout")
+    return output, lse
 
 
 def _cached_prefix_bounds(
@@ -398,7 +481,7 @@ def _write_paged_kv_cache(
 
 
 def _metadata_context_len(plan: object | None) -> int:
-    value = getattr(plan, "max_context_len", 0)
+    value = getattr(plan, "max_seqlen_k", 0)
     try:
         return max(0, int(value))
     except (TypeError, ValueError):

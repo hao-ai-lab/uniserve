@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from typing import cast
 
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
 from ..foundation.errors import capability_mismatch, compute_error, invalid_descriptor
-from ..foundation.math import bucketed_length
 from ..nn.quant.kv_cache import (
     dequantize_fp8_block,
     fp8_quantize,
@@ -18,90 +15,8 @@ from ..nn.quant.kv_cache import (
     resolve_kv_store_dtype,
     scale_for_fp8_block,
 )
-from .device import HostStagingRing, cpu_int_staging_buffer, fill_cpu_ints
 
-__all__ = ["CacheBatchView", "CacheExtents", "CachePool", "CacheRow"]
-
-
-@dataclass(frozen=True, slots=True)
-class CacheExtents:
-    reserved: int
-    initialized: int
-    visible: int
-    committed: int
-    published: int
-
-    def __post_init__(self) -> None:
-        if not (
-            0
-            <= self.published
-            <= self.committed
-            <= self.visible
-            <= self.initialized
-            <= self.reserved
-        ):
-            raise invalid_descriptor("KV extents are not monotonically contained")
-
-
-@dataclass(slots=True)
-class CacheRow:
-    """One operation-local cursor over an explicit scheduler block table."""
-
-    block_table: tuple[int, ...]
-    length: int
-    capacity: int
-    group_id: int = 0
-    initialized_length: int | None = None
-    committed_length: int | None = None
-    published_length: int = 0
-
-    def __post_init__(self) -> None:
-        initialized = self.length if self.initialized_length is None else self.initialized_length
-        committed = self.length if self.committed_length is None else self.committed_length
-        self.initialized_length = int(initialized)
-        self.committed_length = int(committed)
-        if not (
-            0
-            <= self.published_length
-            <= self.committed_length
-            <= self.length
-            <= self.initialized_length
-            <= self.capacity
-        ):
-            raise invalid_descriptor("KV row lengths are outside the scheduler placement")
-        if self.group_id < 0 or (not self.block_table and self.capacity != 0):
-            raise invalid_descriptor("KV row has no scheduler placement")
-
-    def advance(self, tokens: int) -> None:
-        resulting = self.length + int(tokens)
-        if resulting < self.length or resulting > self.capacity:
-            raise invalid_descriptor("KV row advance exceeds scheduler placement")
-        self.length = resulting
-        self.initialized_length = max(cast(int, self.initialized_length), resulting)
-
-    def initialize(self, tokens: int) -> int:
-        resulting = self.length + int(tokens)
-        if resulting < self.length or resulting > self.capacity:
-            raise invalid_descriptor("KV row initialization exceeds scheduler placement")
-        self.initialized_length = max(cast(int, self.initialized_length), resulting)
-        return resulting
-
-    def select(self, length: int) -> None:
-        selected = int(length)
-        if selected < cast(int, self.committed_length) or selected > cast(
-            int, self.initialized_length
-        ):
-            raise invalid_descriptor("KV row selection is outside initialized state")
-        self.length = selected
-
-    def extents(self) -> CacheExtents:
-        return CacheExtents(
-            reserved=self.capacity,
-            initialized=cast(int, self.initialized_length),
-            visible=self.length,
-            committed=cast(int, self.committed_length),
-            published=self.published_length,
-        )
+__all__ = ["CachePool"]
 
 
 class CachePool:
@@ -111,30 +26,21 @@ class CachePool:
         self,
         *,
         num_layers: int,
-        request_pages: int,
-        scratch_pages: int,
+        num_pages: int,
         page_size: int,
         num_kv_heads: int,
         head_dim: int,
-        request_pool_size: int,
-        max_blocks_per_request: int,
         device: torch.device | str,
         dtype: torch.dtype,
         store_dtype: torch.dtype | str | None = None,
         group_ranges: Sequence[tuple[int, int]] | None = None,
-        staging_depth: int = 1,
     ) -> None:
         self.num_layers = int(num_layers)
-        self.request_pages = int(request_pages)
-        self.scratch_pages = int(scratch_pages)
-        self.scratch_page_offset = self.request_pages
-        self.num_pages = self.request_pages + self.scratch_pages
+        self.num_pages = int(num_pages)
         self.num_blocks = self.num_pages
         self.block_size = int(page_size)
         self.n_kv = int(num_kv_heads)
         self.head_dim = int(head_dim)
-        self.request_pool_size = int(request_pool_size)
-        self.max_blocks_per_request = int(max_blocks_per_request)
         self.group_ranges = self._group_ranges(group_ranges)
         self.group_count = len(self.group_ranges)
         self.dtype = dtype
@@ -143,13 +49,10 @@ class CachePool:
         self.supports_paged_attention_storage = not self.is_quantized
         if (
             self.num_layers < 1
-            or self.request_pages < 1
-            or self.scratch_pages < 0
+            or self.num_pages < 1
             or self.block_size < 1
             or self.n_kv < 1
             or self.head_dim < 1
-            or self.request_pool_size < 1
-            or self.max_blocks_per_request < 1
         ):
             raise invalid_descriptor("CachePool geometry is invalid")
         shape = (
@@ -181,111 +84,24 @@ class CachePool:
             torch.zeros(scale_flags, device=device, dtype=torch.bool) if self.is_quantized else None
         )
         self._validated_page_tuples: dict[
-            tuple[tuple[int, ...], bool, bool | None, int | None], tuple[int, ...]
+            tuple[tuple[int, ...], bool, int | None], tuple[int, ...]
         ] = {}
-        request_rows = self.request_pool_size + 1
-        self.request_page_tables = torch.zeros(
-            (self.group_count, request_rows, self.max_blocks_per_request),
-            dtype=torch.int32,
-            device=self.k.device,
-        )
-        self._request_page_staging = torch.empty(
-            (self.request_pool_size, self.max_blocks_per_request),
-            dtype=torch.int32,
-            device=self.k.device,
-        )
-        self._request_slot_staging = torch.empty(
-            self.request_pool_size,
-            dtype=torch.int64,
-            device=self.k.device,
-        )
-        self._request_group_staging = torch.empty_like(self._request_slot_staging)
-        self._request_page_staging_host = HostStagingRing(
-            (self.request_pool_size, self.max_blocks_per_request),
-            dtype=torch.int32,
-            depth=staging_depth,
-            device=self.k.device,
-        )
-        self._request_slot_staging_host = HostStagingRing(
-            self.request_pool_size,
-            dtype=torch.int64,
-            depth=staging_depth,
-            device=self.k.device,
-        )
-        self._request_group_staging_host = HostStagingRing(
-            self.request_pool_size,
-            dtype=torch.int64,
-            depth=staging_depth,
-            device=self.k.device,
-        )
-
-    def publish_request_placements(
-        self,
-        placements: Sequence[tuple[int, int, Sequence[int]]],
-    ) -> None:
-        """Publish complete scheduler page-table updates to request-indexed device rows."""
-
-        count = len(placements)
-        if count == 0:
-            return
-        if count > self.request_pool_size:
-            raise invalid_descriptor("request cache placement exceeds staging capacity")
-        rows: list[tuple[int, ...]] = []
-        groups: list[int] = []
-        slots: list[int] = []
-        for raw_slot, raw_group, raw_pages in placements:
-            slot = int(raw_slot)
-            group = self.validate_group(int(raw_group))
-            if slot < 1 or slot > self.request_pool_size:
-                raise invalid_descriptor("request cache placement slot is outside capacity")
-            pages = self.validate_pages(raw_pages, scratch=False, group=group)
-            if len(pages) > self.max_blocks_per_request:
-                raise invalid_descriptor("request cache placement exceeds block-table capacity")
-            rows.append(pages)
-            groups.append(group)
-            slots.append(slot)
-        pages_slot, pages_buffer = self._request_page_staging_host.acquire()
-        slot_slot, slot_buffer = self._request_slot_staging_host.acquire()
-        group_slot, group_buffer = self._request_group_staging_host.acquire()
-        pages_host = pages_buffer[:count]
-        pages_host.zero_()
-        fill_cpu_ints(group_buffer[:count], groups)
-        fill_cpu_ints(slot_buffer[:count], slots)
-        for row, pages in enumerate(rows):
-            fill_cpu_ints(pages_host[row, : len(pages)], pages)
-        non_blocking = self.k.device.type == "cuda"
-        self._request_page_staging[:count].copy_(pages_host, non_blocking=non_blocking)
-        self._request_group_staging[:count].copy_(
-            group_buffer[:count],
-            non_blocking=non_blocking,
-        )
-        self._request_slot_staging[:count].copy_(
-            slot_buffer[:count],
-            non_blocking=non_blocking,
-        )
-        self._request_page_staging_host.release(pages_slot)
-        self._request_group_staging_host.release(group_slot)
-        self._request_slot_staging_host.release(slot_slot)
-        self.request_page_tables[
-            self._request_group_staging[:count],
-            self._request_slot_staging[:count],
-        ] = self._request_page_staging[:count]
 
     def _group_ranges(
         self,
         declared: Sequence[tuple[int, int]] | None,
     ) -> tuple[tuple[int, int], ...]:
         ranges = (
-            ((0, self.request_pages),)
+            ((0, self.num_pages),)
             if declared is None
             else tuple((int(offset), int(count)) for offset, count in declared)
         )
         if not ranges:
             raise invalid_descriptor("CachePool declares no KV groups")
-        covered = [False] * self.request_pages
+        covered = [False] * self.num_pages
         for group, (offset, count) in enumerate(ranges):
             end = offset + count
-            if offset < 0 or count < 1 or end > self.request_pages:
+            if offset < 0 or count < 1 or end > self.num_pages:
                 raise invalid_descriptor(f"KV group {group} has invalid physical page bounds")
             for page in range(offset, end):
                 if covered[page]:
@@ -303,7 +119,7 @@ class CachePool:
             )
         return value
 
-    def request_page_ids(self, group: int) -> range:
+    def page_ids(self, group: int) -> range:
         group_id = self.validate_group(group)
         offset, count = self.group_ranges[group_id]
         return range(max(1, offset), offset + count)
@@ -313,15 +129,14 @@ class CachePool:
         page_ids: Iterable[int],
         *,
         allow_sentinel: bool = False,
-        scratch: bool | None = None,
         group: int | None = None,
     ) -> tuple[int, ...]:
         pages = tuple(int(page) for page in page_ids)
-        key = (pages, bool(allow_sentinel), scratch, group)
+        key = (pages, bool(allow_sentinel), group)
         cached = self._validated_page_tuples.get(key)
         if cached is not None:
             return cached
-        validated = self._validate_page_tuple(pages, allow_sentinel, scratch, group)
+        validated = self._validate_page_tuple(pages, allow_sentinel, group)
         if len(self._validated_page_tuples) >= 16_384:
             self._validated_page_tuples.clear()
         self._validated_page_tuples[key] = validated
@@ -331,7 +146,6 @@ class CachePool:
         self,
         pages: tuple[int, ...],
         allow_sentinel: bool,
-        scratch: bool | None,
         group: int | None,
     ) -> tuple[int, ...]:
         real_pages = tuple(page for page in pages if page != 0)
@@ -341,19 +155,12 @@ class CachePool:
         upper = self.num_pages
         if pages and (min(pages) < lower or max(pages) >= upper):
             raise invalid_descriptor("KV placement exceeds the fixed physical pool")
-        if scratch is False and any(page >= self.scratch_page_offset for page in pages):
-            raise invalid_descriptor("request KV placement addresses generation scratch storage")
-        if scratch is True and any(page < self.scratch_page_offset for page in pages):
-            raise invalid_descriptor("generation KV placement addresses request storage")
         if group is not None:
             group_id = self.validate_group(group)
             offset, count = self.group_ranges[group_id]
             end = offset + count
-            request = tuple(page for page in real_pages if page < self.scratch_page_offset)
-            if any(page < offset or page >= end for page in request):
+            if any(page < offset or page >= end for page in real_pages):
                 raise invalid_descriptor("KV placement addresses another cache group")
-            if any(page >= self.scratch_page_offset for page in real_pages) and group_id != 0:
-                raise invalid_descriptor("generation KV scratch belongs to cache group zero")
         return pages
 
     def zero_pages(self, group: int, page_ids: Iterable[int]) -> None:
@@ -540,6 +347,67 @@ class CachePool:
             )
             written += count
 
+    def write_locations(
+        self,
+        layer: int,
+        locations: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """Persist selected packed tokens at encoded physical token locations."""
+
+        layer_id = self._validate_layer(layer)
+        flat_locations = locations.reshape(-1).to(device=k.device, dtype=torch.int64)
+        if k.shape != v.shape or k.ndim != 3 or int(k.shape[0]) != int(flat_locations.numel()):
+            raise invalid_descriptor("KV output locations do not align with current K/V")
+        if not self.is_quantized:
+            persists = flat_locations > 0
+            pages = torch.where(
+                persists,
+                torch.div(flat_locations, self.block_size, rounding_mode="floor"),
+                -1,
+            )
+            offsets = torch.remainder(flat_locations, self.block_size)
+            paged_kv_write(
+                self.k[layer_id],
+                self.v[layer_id],
+                pages,
+                offsets,
+                k,
+                v,
+                cast=k.dtype != self.k.dtype or v.dtype != self.v.dtype,
+            )
+            return
+        selected = torch.nonzero(flat_locations > 0, as_tuple=False).reshape(-1)
+        if int(selected.numel()) == 0:
+            return
+        encoded = flat_locations.index_select(0, selected)
+        pages = torch.div(encoded, self.block_size, rounding_mode="floor")
+        offsets = torch.remainder(encoded, self.block_size)
+        selected_k = k.index_select(0, selected)
+        selected_v = v.index_select(0, selected)
+        for index in range(int(selected.numel())):
+            page = int(pages[index].item())
+            offset = int(offsets[index].item())
+            self._write_span(
+                self.k,
+                self.k_scale,
+                self.k_scale_set,
+                layer_id,
+                page,
+                offset,
+                selected_k[index : index + 1],
+            )
+            self._write_span(
+                self.v,
+                self.v_scale,
+                self.v_scale_set,
+                layer_id,
+                page,
+                offset,
+                selected_v[index : index + 1],
+            )
+
     def _validate_layer(self, layer: int) -> int:
         value = int(layer)
         if value < 0 or value >= self.num_layers:
@@ -611,372 +479,3 @@ class CachePool:
         scales[layer, page] = scale.to(device=scales.device)
         scale_set[layer, page] = True
         store[layer, page, offset : offset + count] = fp8_quantize(values_f32, scale)
-
-
-class CacheBatchView:
-    """Ephemeral model-facing view over operation-local cache rows."""
-
-    def __init__(
-        self,
-        pool: CachePool,
-        rows: Sequence[CacheRow],
-        query_lengths: Sequence[int] | None = None,
-        write_rows: Sequence[bool] | None = None,
-    ) -> None:
-        if not rows:
-            raise invalid_descriptor("KV batch view requires at least one row")
-        self._pool = pool
-        self._rows = tuple(rows)
-        self._block_ids = tuple(
-            pool.validate_pages(
-                row.block_table,
-                allow_sentinel=True,
-                group=row.group_id,
-            )
-            for row in rows
-        )
-        self._base_lens = tuple(int(row.length) for row in rows)
-        self._query_lens = (
-            None if query_lengths is None else tuple(int(value) for value in query_lengths)
-        )
-        if self._query_lens is not None and len(self._query_lens) != len(rows):
-            raise invalid_descriptor("KV query lengths do not align with rows")
-        self._write_rows = (
-            (True,) * len(rows)
-            if write_rows is None
-            else tuple(bool(value) for value in write_rows)
-        )
-        if len(self._write_rows) != len(rows):
-            raise invalid_descriptor("KV write predicates do not align with rows")
-        for row, query, write in zip(
-            rows,
-            self._query_lens or (0,) * len(rows),
-            self._write_rows,
-            strict=True,
-        ):
-            required = row.length + query if write else row.length
-            if required > row.capacity:
-                raise invalid_descriptor("KV row exceeds scheduler capacity")
-        self._block_table_width = bucketed_length(max(map(len, self._block_ids)))
-        self._block_tables: dict[torch.device, torch.Tensor] = {}
-        self._cache_lengths: dict[torch.device, torch.Tensor] = {}
-
-    @classmethod
-    def from_validated_rows(
-        cls,
-        pool: CachePool,
-        rows: Sequence[CacheRow],
-        query_lengths: Sequence[int] | None = None,
-        write_rows: Sequence[bool] | None = None,
-    ) -> CacheBatchView:
-        """Build a model view from rows validated at partition registration."""
-
-        if not rows:
-            raise invalid_descriptor("KV batch view requires at least one row")
-        view = cls.__new__(cls)
-        view._pool = pool
-        view._rows = tuple(rows)
-        view._block_ids = tuple(row.block_table for row in rows)
-        view._base_lens = tuple(int(row.length) for row in rows)
-        view._query_lens = (
-            None if query_lengths is None else tuple(int(value) for value in query_lengths)
-        )
-        if view._query_lens is not None and len(view._query_lens) != len(rows):
-            raise invalid_descriptor("KV query lengths do not align with rows")
-        view._write_rows = (
-            (True,) * len(rows)
-            if write_rows is None
-            else tuple(bool(value) for value in write_rows)
-        )
-        if len(view._write_rows) != len(rows):
-            raise invalid_descriptor("KV write predicates do not align with rows")
-        for row, query, write in zip(
-            rows,
-            view._query_lens or (0,) * len(rows),
-            view._write_rows,
-            strict=True,
-        ):
-            required = row.length + query if write else row.length
-            if required > row.capacity:
-                raise invalid_descriptor("KV row exceeds scheduler capacity")
-        view._block_table_width = bucketed_length(max(map(len, view._block_ids)))
-        view._block_tables = {}
-        view._cache_lengths = {}
-        return view
-
-    @property
-    def block_size(self) -> int:
-        return self._pool.block_size
-
-    @property
-    def pool(self) -> CachePool:
-        return self._pool
-
-    @property
-    def supports_paged_attention_storage(self) -> bool:
-        return self._pool.supports_paged_attention_storage
-
-    @property
-    def base_lens(self) -> tuple[int, ...]:
-        return self._base_lens
-
-    @property
-    def query_lens(self) -> tuple[int, ...]:
-        if self._query_lens is None:
-            raise invalid_descriptor("KV view has no packed query lengths")
-        return self._query_lens
-
-    @property
-    def block_table_width(self) -> int:
-        return self._block_table_width
-
-    def with_synthetic_row(
-        self,
-        block_ids: Sequence[int],
-        *,
-        base_len: int,
-        query_len: int,
-    ) -> CacheBatchView:
-        return self.with_synthetic_rows(
-            block_ids,
-            count=1,
-            base_len=base_len,
-            query_len=query_len,
-        )
-
-    def with_synthetic_rows(
-        self,
-        block_ids: Sequence[int],
-        *,
-        count: int,
-        base_len: int,
-        query_len: int,
-    ) -> CacheBatchView:
-        """Extend a validated view with repeated bounded padding rows."""
-
-        if self._query_lens is None:
-            raise invalid_descriptor("synthetic KV rows require declared query lengths")
-        row_count = int(count)
-        if row_count < 0:
-            raise invalid_descriptor("synthetic KV row count must not be negative")
-        if row_count == 0:
-            return self
-        pages = self._pool.validate_pages(
-            block_ids,
-            allow_sentinel=True,
-            group=self._rows[0].group_id,
-        )
-        rows = tuple(
-            CacheRow(
-                pages,
-                int(base_len),
-                len(pages) * self.block_size,
-                group_id=self._rows[0].group_id,
-            )
-            for _ in range(row_count)
-        )
-        return CacheBatchView.from_validated_rows(
-            self._pool,
-            (*self._rows, *rows),
-            (*self._query_lens, *((int(query_len),) * row_count)),
-            (*self._write_rows, *((True,) * row_count)),
-        )
-
-    def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        groups = {row.group_id for row in self._rows}
-        if len(groups) != 1:
-            raise invalid_descriptor("one attention call cannot mix KV groups")
-        return self._pool.layer_cache(layer, groups.pop())
-
-    def append(self, layer: int, key: torch.Tensor, value: torch.Tensor) -> None:
-        if key.shape != value.shape or key.ndim != 4 or int(key.shape[0]) != len(self._rows):
-            raise invalid_descriptor("batched KV append tensors do not align with rows")
-        for index, row in enumerate(self._rows):
-            if self._write_rows[index]:
-                self._pool.write(
-                    layer,
-                    row.block_table,
-                    group=row.group_id,
-                    start=row.length,
-                    k=key[index],
-                    v=value[index],
-                )
-
-    def append_varlen(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        row_lengths: Sequence[int],
-        *,
-        block_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-        query_offsets: torch.Tensor,
-    ) -> None:
-        lengths = tuple(int(item) for item in row_lengths)
-        if key.shape != value.shape or key.ndim != 3 or sum(lengths) != int(key.shape[0]):
-            raise invalid_descriptor("ragged KV append tensors do not align with rows")
-        if not self._pool.is_quantized and all(self._write_rows):
-            row_count = len(lengths)
-            token_count = int(key.shape[0])
-            if (
-                block_table.ndim != 2
-                or int(block_table.shape[0]) != row_count
-                or tuple(cache_seqlens.shape) != (row_count,)
-                or tuple(query_offsets.shape) != (row_count + 1,)
-            ):
-                raise invalid_descriptor("ragged KV write metadata does not align with rows")
-            token_indices = torch.arange(token_count, device=key.device, dtype=torch.int64)
-            offsets = query_offsets.to(device=key.device, dtype=torch.int64)
-            row_indices = torch.searchsorted(offsets[1:], token_indices, right=True)
-            positions = cache_seqlens.to(device=key.device, dtype=torch.int64).index_select(
-                0, row_indices
-            )
-            positions += token_indices - offsets.index_select(0, row_indices)
-            page_slots = torch.div(positions, self.block_size, rounding_mode="floor")
-            page_ids = block_table.to(device=key.device).to(dtype=torch.int64)[
-                row_indices, page_slots
-            ]
-            key_cache, value_cache = self.layer_kv(layer)
-            paged_kv_write(
-                key_cache,
-                value_cache,
-                page_ids,
-                torch.remainder(positions, self.block_size),
-                key,
-                value,
-                cast=key.dtype != key_cache.dtype or value.dtype != value_cache.dtype,
-            )
-            return
-        offset = 0
-        for row, length, write in zip(self._rows, lengths, self._write_rows, strict=True):
-            if write and length:
-                self._pool.write(
-                    layer,
-                    row.block_table,
-                    group=row.group_id,
-                    start=row.length,
-                    k=key[offset : offset + length],
-                    v=value[offset : offset + length],
-                )
-            offset += length
-
-    def append_packed(
-        self,
-        layer: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        page_ids: torch.Tensor,
-        page_offsets: torch.Tensor,
-        token_indices: torch.Tensor,
-    ) -> None:
-        if key.shape != value.shape or key.ndim != 3:
-            raise invalid_descriptor("packed KV values must align as [tokens, heads, dim]")
-        written = sum(
-            query for query, write in zip(self.query_lens, self._write_rows, strict=True) if write
-        )
-        if not all(
-            tuple(tensor.shape) == (written,) for tensor in (page_ids, page_offsets, token_indices)
-        ):
-            raise invalid_descriptor("packed KV write plan does not match writable tokens")
-        if not self._pool.is_quantized:
-            key_cache, value_cache = self.layer_kv(layer)
-            source_key = key.index_select(0, token_indices)
-            source_value = value.index_select(0, token_indices)
-            paged_kv_write(
-                key_cache,
-                value_cache,
-                page_ids,
-                page_offsets,
-                source_key,
-                source_value,
-                cast=source_key.dtype != key_cache.dtype or source_value.dtype != value_cache.dtype,
-            )
-            return
-        offset = 0
-        for row, query, write in zip(self._rows, self.query_lens, self._write_rows, strict=True):
-            end = offset + query
-            if write:
-                self._pool.write(
-                    layer,
-                    row.block_table,
-                    group=row.group_id,
-                    start=row.length,
-                    k=key[offset:end],
-                    v=value[offset:end],
-                )
-            offset = end
-
-    def block_table(
-        self,
-        device: torch.device,
-    ) -> torch.Tensor:
-        target = torch.device(device)
-        cached = self._block_tables.get(target)
-        if cached is not None:
-            return cached
-        cpu = cpu_int_staging_buffer(
-            len(self._rows) * self._block_table_width,
-            dtype=torch.int32,
-            pin=target.type == "cuda",
-        )
-        offset = 0
-        for pages in self._block_ids:
-            count = len(pages)
-            fill_cpu_ints(cpu[offset : offset + count], pages)
-            cpu[offset + count : offset + self._block_table_width].zero_()
-            offset += self._block_table_width
-        result = cpu.to(
-            device=target,
-            non_blocking=target.type == "cuda" and bool(cpu.is_pinned()),
-        ).view(len(self._rows), self._block_table_width)
-        self._block_tables[target] = result
-        return result
-
-    def cache_seqlens(
-        self,
-        device: torch.device,
-    ) -> torch.Tensor:
-        target = torch.device(device)
-        cached = self._cache_lengths.get(target)
-        if cached is not None:
-            return cached
-        cpu = cpu_int_staging_buffer(
-            len(self._base_lens),
-            dtype=torch.int32,
-            pin=target.type == "cuda",
-        )
-        fill_cpu_ints(cpu, self._base_lens)
-        result = cpu.to(
-            device=target,
-            non_blocking=target.type == "cuda" and bool(cpu.is_pinned()),
-        )
-        self._cache_lengths[target] = result
-        return result
-
-    def seqused_k(self, device: torch.device) -> torch.Tensor:
-        return torch.tensor(
-            [row.length + query for row, query in zip(self._rows, self.query_lens, strict=True)],
-            dtype=torch.int32,
-            device=device,
-        )
-
-    def write_plan(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pages: list[int] = []
-        offsets: list[int] = []
-        selected: list[int] = []
-        flat = 0
-        for row, query, write in zip(self._rows, self.query_lens, self._write_rows, strict=True):
-            if write:
-                for local in range(query):
-                    position = row.length + local
-                    pages.append(row.block_table[position // self.block_size])
-                    offsets.append(position % self.block_size)
-                    selected.append(flat + local)
-            flat += query
-        return (
-            torch.tensor(pages, dtype=torch.int64, device=device),
-            torch.tensor(offsets, dtype=torch.int64, device=device),
-            torch.tensor(selected, dtype=torch.long, device=device),
-        )

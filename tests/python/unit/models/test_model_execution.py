@@ -2,21 +2,16 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from torch import nn
 
 from uniserve_worker.batch import WorkVariant
 from uniserve_worker.execution.forward_batch import (
-    AttentionSelection,
-    EmptyKvView,
     EmptyMeshView,
     ForwardBatch,
+    ForwardMode,
     ModelPhase,
-    PagedDecodePlan,
-    PagedVarlenPlan,
     TokenSelection,
 )
 from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
@@ -114,42 +109,46 @@ def _sensenova_config() -> NeoChatConfig:
     )
 
 
-def _decode_attention(rows: int) -> PagedDecodePlan:
-    provider = SimpleNamespace(name="test")
-    return PagedDecodePlan(
-        backends=AttentionSelection("test", (provider,)),
-        block_table=torch.zeros((rows, 1), dtype=torch.int32),
-        cache_seqlens=torch.zeros(rows, dtype=torch.int32),
-        kv_seqlens=torch.ones(rows, dtype=torch.int32),
-        query_lens=torch.ones(rows, dtype=torch.int32),
-        cache_seqlens_cpu=(0,) * rows,
-        kv_seqlens_cpu=(1,) * rows,
-        query_lens_cpu=(1,) * rows,
-        decode_page_ids=torch.zeros(rows, dtype=torch.long),
-        decode_page_offsets=torch.zeros(rows, dtype=torch.long),
-        max_context_len=1,
-        causal=True,
-        binding=1,
-    )
-
-
 def _text_batch(
     query_lens: tuple[int, ...],
     *,
-    attention: PagedDecodePlan | PagedVarlenPlan,
+    forward_mode: ForwardMode,
 ) -> ForwardBatch:
     rows = len(query_lens)
+    total = sum(query_lens)
+    cumulative = torch.tensor(
+        [0, *[sum(query_lens[: index + 1]) for index in range(rows)]],
+        dtype=torch.int32,
+    )
     return ForwardBatch(
         phase=ModelPhase.TEXT,
         row_count=rows,
-        request_pool_indices=torch.arange(1, rows + 1),
+        forward_mode=forward_mode,
+        req_pool_indices=torch.arange(1, rows + 1),
+        seq_lens=torch.zeros(rows, dtype=torch.int32),
+        query_lens=torch.tensor(query_lens, dtype=torch.int32),
+        out_cache_loc=torch.zeros(total, dtype=torch.int64),
+        block_table=torch.zeros((rows, 1), dtype=torch.int32),
+        kv_lens=torch.tensor(query_lens, dtype=torch.int32),
+        cu_seqlens_q=(cumulative if forward_mode is ForwardMode.PAGED_VARLEN else None),
+        cu_seqlens_k=(cumulative if forward_mode is ForwardMode.PAGED_VARLEN else None),
+        output_indices=(
+            torch.tensor(
+                [sum(query_lens[: index + 1]) - 1 for index in range(rows)],
+                dtype=torch.int64,
+            )
+            if forward_mode is ForwardMode.PAGED_VARLEN
+            else None
+        ),
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(query_lens),
+        seq_lens_cpu=(0,) * rows,
+        query_lens_cpu=query_lens,
+        kv_lens_cpu=query_lens,
         token_row_indices=tuple(range(rows)),
-        input_ids=torch.zeros(sum(query_lens), dtype=torch.long),
-        positions=torch.arange(sum(query_lens), dtype=torch.long),
-        query_lens=query_lens,
+        input_ids=torch.zeros(total, dtype=torch.long),
+        positions=torch.arange(total, dtype=torch.long),
         token_selections=(TokenSelection.LAST_LOGITS,) * rows,
-        kv=EmptyKvView(),
-        attention=attention,
         mesh=EmptyMeshView(),
     )
 
@@ -191,7 +190,7 @@ def test_qwen_decode_projection_preserves_row_alignment():
     model = Qwen3ForCausalLM(_qwen_config(), layer_spec=_layer_spec())
     weight = _projection_weight(model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
-    batch = _text_batch((1, 1, 1, 1), attention=_decode_attention(4))
+    batch = _text_batch((1, 1, 1, 1), forward_mode=ForwardMode.PAGED_DECODE)
 
     output = model.project(hidden, batch)
 
@@ -203,7 +202,7 @@ def test_sensenova_decode_projection_preserves_row_alignment():
     model = NEOChatModel(_sensenova_config(), layer_spec=_layer_spec())
     weight = _projection_weight(model.language_model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
-    batch = _text_batch((1, 1, 1, 1), attention=_decode_attention(4))
+    batch = _text_batch((1, 1, 1, 1), forward_mode=ForwardMode.PAGED_DECODE)
 
     output = model.project(hidden, batch)
 
@@ -214,27 +213,8 @@ def test_sensenova_decode_projection_preserves_row_alignment():
 def test_qwen_prefill_selects_the_last_logit_for_each_ragged_row():
     model = Qwen3ForCausalLM(_qwen_config(), layer_spec=_layer_spec())
     weight = _projection_weight(model.lm_head)
-    provider = SimpleNamespace(name="test")
-    attention = PagedVarlenPlan(
-        backends=AttentionSelection("test", (provider,)),
-        block_table=torch.zeros((2, 1), dtype=torch.int32),
-        cache_seqlens=torch.zeros(2, dtype=torch.int32),
-        query_lens=torch.tensor([2, 5], dtype=torch.int32),
-        kv_seqlens=torch.tensor([2, 5], dtype=torch.int32),
-        cu_seqlens_q=torch.tensor([0, 2, 7], dtype=torch.int32),
-        cu_seqlens_k=torch.tensor([0, 2, 7], dtype=torch.int32),
-        output_indices=torch.tensor([1, 6], dtype=torch.int64),
-        cache_seqlens_cpu=(0, 0),
-        query_lens_cpu=(2, 5),
-        kv_seqlens_cpu=(2, 5),
-        max_seqlen_q=5,
-        max_seqlen_k=5,
-        max_context_len=8,
-        causal=True,
-        binding=1,
-    )
     hidden = torch.arange(56, dtype=torch.float32).view(7, 8)
-    batch = _text_batch((2, 5), attention=attention)
+    batch = _text_batch((2, 5), forward_mode=ForwardMode.PAGED_VARLEN)
 
     output = model.project(hidden, batch)
 

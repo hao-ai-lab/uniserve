@@ -4,11 +4,10 @@ from __future__ import annotations
 import torch
 
 from ..backends.attention.base import AttentionCapabilities
-from ..execution.forward_batch import AttentionSelection, PagedDecodePlan
+from ..execution.forward_batch import AttentionSelection, ForwardMode
 from .core import Dispatcher, Operator
 from .requests import (
     AttentionReq,
-    DenseAttention,
     PagedDecodeAttention,
     VarlenAttention,
     VisibleEndAttention,
@@ -29,6 +28,10 @@ def _capabilities(backend) -> AttentionCapabilities:
         varlen_paged_kv=bool(getattr(caps, "varlen_paged_kv", False)),
         requires_paged_varlen=bool(getattr(caps, "requires_paged_varlen", False)),
         visible_end=bool(getattr(caps, "visible_end", False)),
+        segmented_attention=bool(getattr(caps, "segmented_attention", False)),
+        segmented_attention_cuda_graph=bool(
+            getattr(caps, "segmented_attention_cuda_graph", False)
+        ),
         paged_block_size_multiple=int(getattr(caps, "paged_block_size_multiple", 1) or 1),
         min_head_dim=int(getattr(caps, "min_head_dim", 1) or 1),
         paged_decode_only=bool(getattr(caps, "paged_decode_only", False)),
@@ -47,6 +50,8 @@ def _head_dim(req: AttentionReq) -> int:
 
 
 def _kv_dims(req: AttentionReq) -> tuple[int, int]:
+    if isinstance(req, VisibleEndAttention) and req.prefix_k is not None and req.prefix_v is not None:
+        return int(req.prefix_k.shape[-1]), int(req.prefix_v.shape[-1])
     if isinstance(req, PagedDecodeAttention):
         k = req.current_k if req.current_k is not None else req.k
         v = req.current_v if req.current_v is not None else req.v
@@ -75,9 +80,10 @@ def _paged_storage_supported(caps: AttentionCapabilities, req: AttentionReq) -> 
             return False
         block_size = int(view_block_size or 0)
     elif block_table is not None:
-        if not isinstance(req.k, torch.Tensor) or req.k.ndim != 4:
+        paged_k = req.prefix_k if isinstance(req, VisibleEndAttention) and req.prefix_k is not None else req.k
+        if not isinstance(paged_k, torch.Tensor) or paged_k.ndim != 4:
             return False
-        block_size = int(req.k.shape[1])
+        block_size = int(paged_k.shape[1])
     else:
         return True
     if block_size <= 0:
@@ -88,9 +94,9 @@ def _paged_storage_supported(caps: AttentionCapabilities, req: AttentionReq) -> 
 
 def _is_one_token_decode(req: PagedDecodeAttention) -> bool:
     if req.q.ndim == 3:
-        plan = getattr(req.ctx, "attention", None) if req.ctx is not None else None
+        plan = req.ctx
         query_lens = getattr(plan, "query_lens_cpu", ()) or ()
-        if isinstance(plan, PagedDecodePlan) and len(query_lens) == int(req.q.shape[0]):
+        if getattr(plan, "forward_mode", None) is ForwardMode.PAGED_DECODE and len(query_lens) == int(req.q.shape[0]):
             return all(int(length) == 1 for length in query_lens)
         return int(req.q.shape[0]) == 1
     if req.q.ndim == 4:
@@ -120,6 +126,15 @@ class AttentionProvider(Operator):
         if not caps.supports_trunk_geometry(_head_dim(req), k_dim, v_dim):
             return False
         if isinstance(req, VisibleEndAttention):
+            if req.prefix_k is not None:
+                return (
+                    bool(caps.segmented_attention)
+                    and (
+                        not bool(getattr(req.ctx, "cuda_graph_capture", False))
+                        or bool(caps.segmented_attention_cuda_graph)
+                    )
+                    and _paged_storage_supported(caps, req)
+                )
             return bool(caps.visible_end)
         if isinstance(req, VarlenAttention):
             if req.block_table is not None:
@@ -144,6 +159,23 @@ class AttentionProvider(Operator):
         return int(req.q.ndim) in caps.dense_ranks
 
     def run(self, req: AttentionReq) -> torch.Tensor:
+        if isinstance(req, VisibleEndAttention) and req.prefix_k is not None:
+            if req.prefix_v is None or req.prefix_lens is None or req.cu_seqlens_q is None:
+                raise ValueError("segmented attention metadata is incomplete")
+            return self.backend.forward_segmented(
+                req.q,
+                req.k,
+                req.v,
+                req.prefix_k,
+                req.prefix_v,
+                page_table=req.page_table,
+                prefix_lens=req.prefix_lens,
+                cu_seqlens_q=req.cu_seqlens_q,
+                visible_current_end=req.visible_end,
+                scale=req.scale,
+                fully_visible_current=req.fully_visible,
+                context=req.ctx,
+            )
         if isinstance(req, VisibleEndAttention):
             return self.backend.forward_visible_end(
                 req.q,
@@ -210,5 +242,16 @@ def can_run_attention(selection: AttentionSelection, req: AttentionReq) -> bool:
     return any(provider.can_run(req) for provider in attention_dispatcher(selection).ordered())
 
 
+def _segmented_graph_provider(selection: AttentionSelection) -> str | None:
+    for backend in selection.providers:
+        caps = _capabilities(backend)
+        if caps.available and caps.segmented_attention and caps.segmented_attention_cuda_graph:
+            return str(backend.name)
+    return None
+
+
 def run_attention(selection: AttentionSelection, req: AttentionReq) -> torch.Tensor:
-    return attention_dispatcher(selection).run(req)
+    override = None
+    if isinstance(req, VisibleEndAttention) and req.prefix_k is not None:
+        override = _segmented_graph_provider(selection)
+    return attention_dispatcher(selection).run(req, override=override)

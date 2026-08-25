@@ -100,8 +100,6 @@ fn generation_request(
         max_vision_feature_bytes: 1 << 20,
         commit_marker_tokens: 2,
         max_cfg_branches: 3,
-        scratch_capacity_tokens: 1 << 20,
-        scratch_block_size: 64,
         encoder_cache_entries: 256,
     };
     let resources = GenerationResourceBounds::conservative(

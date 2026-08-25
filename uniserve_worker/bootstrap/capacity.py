@@ -9,7 +9,8 @@ from ..models.generation import GenerationPipeline
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..runtime.device_products import device_product_capacity_bytes
 
-_PRODUCTS_PER_OPERATION = 5
+_DEVICE_PRODUCTS_PER_OPERATION = 6
+_DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
 _MAX_TRANSFER_ENTRIES = 256
 _CPU_TASKS = 256
 
@@ -101,7 +102,6 @@ def model_arena_capacity(
     pipeline_depth: int,
     completion_payload_bytes: int,
     num_blocks: int,
-    scratch_capacity_tokens: int,
     request_pool_size: int,
     num_latent_pages: int,
     latent_page_units: int,
@@ -158,7 +158,8 @@ def model_arena_capacity(
         1,
         artifact_bytes,
     )
-    device_products = _PRODUCTS_PER_OPERATION * slots
+    device_product_slots = slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
+    device_products = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
     device_count = len(
         {
             str(deployment.device),

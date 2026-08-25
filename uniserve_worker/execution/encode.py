@@ -320,12 +320,16 @@ def state_outcome(
     products: tuple[ProductPayload, ...] = (),
 ) -> Outcome:
     session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    row = scope.cache_rows.get((operation.request_key, operation.op_id, 0))
+    cache = ops._cache_coordinates(runtime, operation, scope)
+    selected = scope.runtime_cache_lengths.get(cache[0], cache[2])
+    if not isinstance(selected, int):
+        raise RuntimeError("visual state completion has a dynamic KV length")
+    cache = (cache[0], cache[1], selected, cache[3])
     span_base = session.logical_position if base is None else int(base)
     return Outcome(
         status=OpStatus.OK,
         selected_point=1 if operation.advances_state else 0,
-        logical_lengths=ops._logical_lengths(runtime, operation, session, row),
+        logical_lengths=ops._logical_lengths(runtime, operation, session, cache),
         token_span=TokenSpan(base=span_base, len=outcome.sampled_tokens),
         finish_flags=FinishFlags(),
         product_generations=ops._output_generations(operation),
@@ -343,12 +347,11 @@ def non_state_outcome(
     completion_tasks: tuple[_CompletionImagePayload, ...] = (),
 ) -> Outcome:
     session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    row = scope.cache_rows.get((operation.request_key, operation.op_id, 0))
     base = session.logical_position
     return Outcome(
         status=OpStatus.OK,
         selected_point=1 if operation.advances_state else 0,
-        logical_lengths=ops._logical_lengths(runtime, operation, session, row),
+        logical_lengths=ops._logical_lengths(runtime, operation, session, None),
         token_span=TokenSpan(base=base, len=0),
         finish_flags=FinishFlags(),
         product_generations=ops._output_generations(operation),
@@ -422,6 +425,7 @@ def vision_state_row(
     logits: bool,
 ) -> ForwardRow:
     session = ops._request_row(runtime, scope, operation.request_key.session_id)
+    cache = ops._cache_coordinates(runtime, operation, scope)
     injection = ops._image_processor(
         runtime,
     ).feature_injection
@@ -468,7 +472,9 @@ def vision_state_row(
         token_embedding_mask=embedding_mask,
         positions=positions,
         selection=TokenSelection.LAST_LOGITS if logits else TokenSelection.HIDDEN,
-        entry=ops._cache_row(runtime, operation, scope),
+        request_pool_idx=cache[0],
+        seq_len=cache[2],
+        group_id=cache[1],
         write_kv=True,
         causal=False,
         attention_indexes=positions_as_three_axis(positions, query),
@@ -564,6 +570,7 @@ def latent_state_row(
     temporal[0] = conditioning_position
     temporal[-1] = conditioning_position + int(flow.rope_advance)
     indexes = torch.stack((temporal, torch.zeros_like(temporal), torch.zeros_like(temporal)))
+    cache = ops._cache_coordinates(runtime, operation, scope)
     return ForwardRow(
         operation=operation,
         request=session,
@@ -577,8 +584,10 @@ def latent_state_row(
         image_tokens=query,
         image_height=height,
         image_width=width,
-        entry=ops._cache_row(runtime, operation, scope),
-        write_kv=True,
+        request_pool_idx=cache[0],
+        seq_len=cache[2],
+        group_id=cache[1],
+        write_kv=False,
         causal=False,
         attention_indexes=indexes,
         text_local_indices=(0, query - 1),

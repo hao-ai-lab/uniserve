@@ -32,7 +32,6 @@ pub struct PolicySnapshot {
 pub enum PolicyReason {
     Admitted,
     DelayedNoBlocks,
-    DelayedScratch,
     DelayedMaxSeqs,
     RejectedTooLarge,
 }
@@ -42,7 +41,6 @@ impl PolicyReason {
         match self {
             PolicyReason::Admitted => "admitted",
             PolicyReason::DelayedNoBlocks => "delayed_no_blocks",
-            PolicyReason::DelayedScratch => "delayed_scratch",
             PolicyReason::DelayedMaxSeqs => "delayed_max_seqs",
             PolicyReason::RejectedTooLarge => "rejected_too_large",
         }
@@ -127,9 +125,7 @@ impl DecisionLog {
         match d.reason {
             PolicyReason::Admitted => self.admitted += 1,
             PolicyReason::RejectedTooLarge => self.rejected += 1,
-            PolicyReason::DelayedNoBlocks
-            | PolicyReason::DelayedScratch
-            | PolicyReason::DelayedMaxSeqs => self.delayed += 1,
+            PolicyReason::DelayedNoBlocks | PolicyReason::DelayedMaxSeqs => self.delayed += 1,
         }
         if self.ring.len() >= self.cap {
             self.ring.pop_front();

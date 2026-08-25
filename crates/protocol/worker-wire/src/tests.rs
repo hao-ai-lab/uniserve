@@ -114,7 +114,6 @@ fn token_decode_operation() -> Operation {
             accepted_span_product(OpId(11)),
             continuation_product(OpId(11)),
         ],
-        1,
         None,
         Some(Rng {
             seed: 99,
@@ -139,7 +138,6 @@ fn operation_for(work: Work, op_id: OpId, advances: bool) -> Operation {
         },
         Vec::new(),
         Vec::new(),
-        0,
         None,
         None,
         0,
@@ -156,6 +154,7 @@ fn completion_record() -> CompletionRecord {
         logical_lengths: LogicalLengths {
             token_len: 5,
             kv_visible_len: 5,
+            kv_computed_len: 5,
             latent_len: 0,
             ..LogicalLengths::default()
         },
@@ -181,7 +180,7 @@ fn admission() -> Admission {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
-            kv: KvAdmission::default(),
+            initial_position: 0,
         }),
         None,
     )
@@ -210,26 +209,38 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
         .into_iter()
         .enumerate()
         .map(|(index, (domain, route, operations))| {
-            let request_pool_indices = operations
-                .iter()
-                .map(|operation| u32::try_from(operation.request_key.session_id.0).unwrap())
-                .collect();
-            let kv_placements = operations
-                .iter()
-                .filter(|operation| operation.kv_capacity_pages > 0)
-                .map(|operation| KvPlacement {
-                    request_key: operation.request_key,
-                    op_id: operation.op_id,
-                    group_id: 0,
-                    block_table: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
-                    block_table_update: true,
-                    pages_to_zero: (1..=operation.kv_capacity_pages).map(BlockId).collect(),
-                    prefix_length: 0,
-                    input_length: 0,
-                    visible_length: 0,
-                    resulting_length: 0,
-                })
-                .collect();
+            let mut block_tables = Vec::new();
+            let mut new_cache_pages = Vec::new();
+            let mut forward_rows = Vec::new();
+            for (operation_index, operation) in operations.iter().enumerate() {
+                let capacity_pages = operation.bounds.max_kv_pages;
+                if capacity_pages == 0 {
+                    continue;
+                }
+                let request_pool_idx = u32::try_from(operation.request_key.session_id.0).unwrap();
+                let page_ids = (1..=capacity_pages).map(BlockId).collect::<Vec<_>>();
+                if !block_tables.iter().any(|table: &BlockTable| {
+                    table.request_pool_idx == request_pool_idx && table.group_id == 0
+                }) {
+                    block_tables.push(BlockTable {
+                        request_pool_idx,
+                        group_id: 0,
+                        page_ids: page_ids.clone(),
+                        allocated_tokens: operation.bounds.max_tokens.max(1),
+                    });
+                    new_cache_pages.push(CachePageAllocation {
+                        request_pool_idx,
+                        group_id: 0,
+                        page_ids,
+                    });
+                }
+                forward_rows.push(ForwardRow {
+                    operation_index: operation_index as u32,
+                    request_pool_index: request_pool_idx,
+                    seq_len: 0,
+                    query_len: operation.bounds.max_tokens.max(1),
+                });
+            }
             let latent_placements = operations
                 .iter()
                 .filter(|operation| {
@@ -262,9 +273,9 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 attention: AttentionRegime::Hybrid,
                 shape_class: 0,
                 operations,
-                request_pool_indices,
-                kv_placements,
-                kv_branch_placements: Vec::new(),
+                block_tables,
+                new_cache_pages,
+                forward_rows,
                 latent_placements,
             }
         })
@@ -374,7 +385,6 @@ fn version_ref_device_point_round_trips() {
         },
         Vec::new(),
         vec![output_product(OpId(12))],
-        0,
         None,
         None,
         0,
@@ -384,25 +394,21 @@ fn version_ref_device_point_round_trips() {
 }
 
 #[test]
-fn logical_capacity_and_placement_round_trip_independently() {
+fn block_table_placement_round_trips_without_changing_operation_identity() {
     let base = token_decode_operation();
-    assert_eq!(base.kv_capacity_pages, 1);
     let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
     assert_eq!(batch.operations().next().unwrap(), &base);
     assert_eq!(
-        batch.partitions[0].kv_placements[0].block_table,
+        batch.partitions[0].block_tables[0].page_ids,
         vec![BlockId(1)]
     );
     let mut relocated = batch.clone();
-    relocated.partitions[0].kv_placements[0].block_table = vec![BlockId(17)];
-    relocated.partitions[0].kv_placements[0].pages_to_zero = vec![BlockId(17)];
+    relocated.partitions[0].block_tables[0].page_ids = vec![BlockId(17)];
+    relocated.partitions[0].new_cache_pages[0].page_ids = vec![BlockId(17)];
     assert_eq!(
         relocated.operations().next().unwrap().plan_digest,
         base.plan_digest
     );
-    let mut more = token_decode_operation();
-    more.kv_capacity_pages = 2;
-    assert_ne!(more.compute_plan_digest(), base.plan_digest);
 }
 
 #[test]
@@ -999,7 +1005,6 @@ fn comprehensive_batch() -> Batch {
                 product_for(key, op_id, 0, ProductKind::Token),
                 product_for(key, op_id, 1, ProductKind::Kv),
             ],
-            3,
             Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
             Some(Rng {
                 seed: 99 + index as u64,
@@ -1020,10 +1025,7 @@ fn comprehensive_batch() -> Batch {
             sampling: full_sampling(),
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
-            kv: KvAdmission {
-                prefix_len: 128,
-                group_id: 1,
-            },
+            initial_position: 128,
         }),
         None,
     )
@@ -1101,10 +1103,11 @@ fn recovery_placement_fixture() -> RecoveryPlacement {
     RecoveryPlacement {
         request_key: RequestKey::new(1, RequestId(9), 3),
         request_pool_idx: 4,
-        cache_groups: vec![CacheGroupPlacement {
+        block_tables: vec![BlockTable {
+            request_pool_idx: 4,
             group_id: 0,
             page_ids: vec![BlockId(5), BlockId(6)],
-            length: 17,
+            allocated_tokens: 17,
         }],
         latent_page_table: vec![7, 8],
     }
@@ -1263,10 +1266,7 @@ fn full_completion_report() -> CompletionReport {
             token_len: 5,
             kv_visible_len: 6,
             latent_len: 7,
-            kv_reserved_len: 64,
-            kv_initialized_len: 8,
-            kv_committed_len: 6,
-            kv_published_len: 5,
+            kv_computed_len: 8,
         },
         token_span: TokenSpan { base: 4, len: 2 },
         committed_tokens: vec![271, 272],

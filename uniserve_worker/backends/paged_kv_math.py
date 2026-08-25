@@ -43,15 +43,16 @@ if triton is not None:
         columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
         page_id = tl.load(page_ids_ptr + row)
         page_offset = tl.load(offsets_ptr + row)
-        valid_address = (page_id >= 0) & (page_id < num_pages)
-        valid_address &= (page_offset >= 0) & (page_offset < page_size)
-        tl.device_assert(valid_address, "paged KV write index out of bounds")
+        persists = page_id >= 0
+        valid_address = (page_id < num_pages) & (page_offset >= 0)
+        valid_address &= page_offset < page_size
+        tl.device_assert((~persists) | valid_address, "paged KV write index out of bounds")
 
         k_source_offsets = row * k_row_stride + columns
         v_source_offsets = row * v_row_stride + columns
         cache_row = page_id * page_size + page_offset
         cache_offsets = cache_row * row_width + columns
-        mask = valid_address & (columns < row_width)
+        mask = persists & valid_address & (columns < row_width)
         k = tl.load(k_src_ptr + k_source_offsets, mask=mask, other=0.0)
         v = tl.load(v_src_ptr + v_source_offsets, mask=mask, other=0.0)
         tl.store(k_cache_ptr + cache_offsets, k, mask=mask)
@@ -186,7 +187,8 @@ def paged_kv_write(
     leading addressing shape (``[batch, n]`` and ``[batch, n, heads, dim]``, or
     a flat ``[N]`` and ``[N, heads, dim]``). When ``cast`` is set, the source is
     cast to the cache dtype before writing; otherwise the source dtype must match
-    the cache. Out-of-range indices are left to surface as a device index error.
+    the cache. A negative page ID masks that row without a write; other
+    out-of-range indices surface as a device index error.
     """
 
     page_size = int(k_cache.shape[1])
@@ -209,6 +211,13 @@ def paged_kv_write(
     ):
         _triton_paged_kv_write(k_cache, v_cache, page_ids, offsets, k_src, v_src)
         return
+    selected = torch.nonzero(page_ids >= 0, as_tuple=False).reshape(-1)
+    if int(selected.numel()) == 0:
+        return
+    page_ids = page_ids.index_select(0, selected)
+    offsets = offsets.index_select(0, selected)
+    k_src = k_src.index_select(0, selected)
+    v_src = v_src.index_select(0, selected)
     if cast:
         k_src = k_src.to(dtype=k_cache.dtype)
         v_src = v_src.to(dtype=v_cache.dtype)

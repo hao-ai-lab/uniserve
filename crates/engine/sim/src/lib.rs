@@ -270,7 +270,7 @@ impl SimSession {
         let prefix_len = admission
             .und
             .as_ref()
-            .map_or(0, |branch| branch.kv.prefix_len);
+            .map_or(0, |branch| branch.initial_position);
         Self {
             admission,
             point_index: 0,
@@ -367,7 +367,7 @@ impl SimEngine {
                     })
                 })
                 .collect(),
-            resource_classes: vec![ResourceClass::ImageLatent, ResourceClass::Scratch],
+            resource_classes: vec![ResourceClass::ImageLatent],
             model_identity: "0".repeat(64),
             weight_digest: "1".repeat(64),
             ..WorkerCapabilities::default()
@@ -757,10 +757,7 @@ impl SimEngine {
             logical_lengths: LogicalLengths {
                 token_len: session.logical_position,
                 kv_visible_len: session.kv_visible_len,
-                kv_reserved_len: session.kv_visible_len,
-                kv_initialized_len: session.kv_visible_len,
-                kv_committed_len: session.kv_visible_len,
-                kv_published_len: session.kv_published_len,
+                kv_computed_len: session.kv_visible_len,
                 ..LogicalLengths::default()
             },
             token_span: TokenSpan {
@@ -841,12 +838,9 @@ fn operation_sampling_state(
     decode_sampling_state_bytes(&payload.bytes).map(Some)
 }
 
-fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, committed: u32, published: u32) {
-    lengths.kv_reserved_len = visible;
-    lengths.kv_initialized_len = visible;
+fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, _committed: u32, _published: u32) {
     lengths.kv_visible_len = visible;
-    lengths.kv_committed_len = committed;
-    lengths.kv_published_len = published;
+    lengths.kv_computed_len = visible;
 }
 
 /// The declared output-product reference for a value packed into a completion.
@@ -1083,8 +1077,8 @@ impl ModelEngine for SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_wire::{
-        AttentionRegime, BatchPartition, Bounds, DType, Domain, ExecutionCapability, KvAdmission,
-        OpId, PointRange, ProductRef, RequestKey, RouteId, ShapeBound, StorageClass, UndAdmission,
+        AttentionRegime, BatchPartition, Bounds, DType, Domain, ExecutionCapability, OpId,
+        PointRange, ProductRef, RequestKey, RouteId, ShapeBound, StorageClass, UndAdmission,
         VersionRef,
     };
 
@@ -1100,7 +1094,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
-                kv: KvAdmission::default(),
+                initial_position: 0,
             }),
             None,
         )
@@ -1149,7 +1143,6 @@ mod tests {
             },
             Vec::new(),
             token_outputs(OpId(op_id)),
-            0,
             None,
             None,
             0,
@@ -1167,9 +1160,9 @@ mod tests {
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![operation],
-                request_pool_indices: vec![1],
-                kv_placements: Vec::new(),
-                kv_branch_placements: Vec::new(),
+                block_tables: Vec::new(),
+                new_cache_pages: Vec::new(),
+                forward_rows: Vec::new(),
                 latent_placements: Vec::new(),
             }],
         )

@@ -12,8 +12,8 @@ import torch.nn as nn
 from ..batch import WorkVariant
 from ..execution.forward_batch import (
     ForwardBatch,
+    ForwardMode,
     ForwardOutput,
-    PagedDecodePlan,
     TokenSelection,
 )
 from ..loader.handles import WeightHandle
@@ -60,7 +60,6 @@ from .runtime import (
     ExecutionModel,
     PositionLayout,
     ResourceGeometry,
-    ScratchGeometry,
 )
 
 __all__ = [
@@ -541,7 +540,6 @@ class BagelForConditionalGeneration(ExecutionModel):
         self.resource_geometry = ResourceGeometry(
             encoder_cache_entries=256,
             latent_downsample=int(self.cfg.latent_downsample),
-            scratch=ScratchGeometry(fixed_tokens=65536, mirror_kv=True),
         )
         self.supported_work = frozenset(
             {
@@ -577,7 +575,7 @@ class BagelForConditionalGeneration(ExecutionModel):
     ) -> torch.Tensor:
         batch = forward_batch
         decode_positions: torch.Tensor | None = None
-        if isinstance(batch.attention, PagedDecodePlan):
+        if batch.forward_mode is ForwardMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("BAGEL paged decode accepts token rows only")
             decode_positions = positions
@@ -592,7 +590,11 @@ class BagelForConditionalGeneration(ExecutionModel):
             )
         chunks: list[torch.Tensor | None] = [None] * batch.row_count
         token_offset = 0
-        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+        for row_index, count in zip(
+            batch.token_row_indices,
+            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
+            strict=True,
+        ):
             chunks[row_index] = token_embeds[token_offset : token_offset + count]
             token_offset += count
         for flow_index, row_index in enumerate(batch.flow_row_indices):
@@ -625,7 +627,11 @@ class BagelForConditionalGeneration(ExecutionModel):
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
         row_lengths = [0] * batch.row_count
-        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+        for row_index, count in zip(
+            batch.token_row_indices,
+            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
+            strict=True,
+        ):
             row_lengths[row_index] = count
         for flow_index, row_index in enumerate(batch.flow_row_indices):
             row_lengths[row_index] = int(batch.flow_image_tokens[flow_index])

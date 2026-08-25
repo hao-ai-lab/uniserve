@@ -114,7 +114,6 @@ def _with_sampling_state(
         bounds=operation.bounds,
         inputs=(*operation.inputs, reference),
         outputs=operation.outputs,
-        kv_capacity_pages=operation.kv_capacity_pages,
         predicate=operation.predicate,
         rng=operation.rng,
         control_seq=operation.control_seq,
@@ -355,10 +354,8 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
     completion = result.completions[0]
     assert completion.committed_tokens == (_next_token(prime.completions[0].committed_tokens[0]),)
     assert completion.selected_point == 1
-    assert completion.logical_lengths.kv_initialized_len == 5
+    assert completion.logical_lengths.kv_computed_len == 5
     assert completion.logical_lengths.kv_visible_len == 3
-    assert completion.logical_lengths.kv_committed_len == 2
-    assert completion.logical_lengths.kv_published_len == 0
 
 
 def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> None:
@@ -521,7 +518,6 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         bounds=invalid.bounds,
         inputs=invalid.inputs,
         outputs=invalid_outputs,
-        kv_capacity_pages=invalid.kv_capacity_pages,
         predicate=invalid.predicate,
         rng=invalid.rng,
         control_seq=invalid.control_seq,

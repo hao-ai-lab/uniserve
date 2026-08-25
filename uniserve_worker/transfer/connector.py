@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 
 from ..batch import FixedPoint, ProductKind, ProductRef, RequestKey, VersionRef
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.math import ceil_div
-from ..runtime.cache_pool import CachePool, CacheRow
+from ..runtime.cache_pool import CachePool
+from ..runtime.req_to_token_pool import ReqToTokenPool
 from .tickets import Locator, Transport, fetch_locator, make_transport
 
 __all__ = [
@@ -63,7 +63,6 @@ class CachePublication:
     base_version: VersionRef | None
     base_extent: int
     published_extent: int
-    page_ids: tuple[int, ...]
     group_id: int
     scale_identity: str
 
@@ -77,8 +76,6 @@ class CachePublication:
             raise invalid_descriptor("KV publication base identity disagrees with its extent")
         if self.group_id < 0 or not self.scale_identity:
             raise invalid_descriptor("KV publication storage identity is invalid")
-        if any(page < 1 for page in self.page_ids) or len(set(self.page_ids)) != len(self.page_ids):
-            raise invalid_descriptor("KV publication page identity is invalid")
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -89,7 +86,6 @@ class CachePublication:
             "base_version": None if self.base_version is None else self.base_version.to_wire(),
             "base_extent": self.base_extent,
             "published_extent": self.published_extent,
-            "page_ids": list(self.page_ids),
             "group_id": self.group_id,
             "scale_identity": self.scale_identity,
         }
@@ -98,14 +94,6 @@ class CachePublication:
     def from_wire(cls, value: object) -> CachePublication:
         if not isinstance(value, Mapping):
             raise invalid_descriptor("KV publication descriptor is not a mapping")
-        raw_pages = value.get("page_ids", ())
-        if not isinstance(raw_pages, Sequence) or isinstance(raw_pages, (str, bytes, bytearray)):
-            raise invalid_descriptor("KV publication pages are not a sequence")
-        pages: list[int] = []
-        for page in raw_pages:
-            if not isinstance(page, int) or isinstance(page, bool):
-                raise invalid_descriptor("KV publication contains a non-integer page")
-            pages.append(page)
         raw_locators = value.get("locators", ())
         if not isinstance(raw_locators, Sequence) or isinstance(
             raw_locators,
@@ -126,7 +114,6 @@ class CachePublication:
             else VersionRef.from_wire(base, "KV publication.base_version"),
             base_extent=int(value.get("base_extent", 0)),
             published_extent=int(value.get("published_extent", 0)),
-            page_ids=tuple(pages),
             group_id=int(value.get("group_id", 0)),
             scale_identity=str(value.get("scale_identity", "")),
         )
@@ -149,10 +136,11 @@ class _CachePublicationCommit:
 
 
 class CachePublications:
-    """Bounded semantic publication records over explicit physical pages."""
+    """Semantic publication progress over request-indexed cache tables."""
 
-    def __init__(self, pool: CachePool) -> None:
+    def __init__(self, pool: CachePool, request_tables: ReqToTokenPool) -> None:
         self.pool = pool
+        self.request_tables = request_tables
         self._products: dict[ProductRef, CachePublication] = {}
         self._destination_bases: dict[tuple[int, str], tuple[VersionRef, int]] = {}
         self._installed_bases: dict[tuple[int, str], tuple[VersionRef, int]] = {}
@@ -172,8 +160,10 @@ class CachePublications:
 
     def publish(
         self,
-        row: CacheRow,
         *,
+        request_pool_idx: int,
+        group_id: int,
+        visible_length: int,
         source_version: VersionRef,
         source_digest: str,
         destination: str,
@@ -196,9 +186,13 @@ class CachePublications:
             installed_version, base_extent = installed
             if installed_version != expected_base:
                 raise invalid_descriptor("KV publication expected base does not match destination")
-        if row.length < base_extent:
+        pages = self.request_tables.pages(request_pool_idx, group_id)
+        visible = int(visible_length)
+        if visible > self.request_tables.allocated_length(request_pool_idx):
+            raise invalid_descriptor("KV publication exceeds its scheduler block table")
+        if visible < base_extent:
             raise invalid_descriptor("KV publication destination is ahead of its source")
-        suffix = row.length - base_extent
+        suffix = visible - base_extent
         if suffix and not bool(getattr(transport, "supports_async_publication", False)):
             raise capability_mismatch("KV publication requires asynchronous transport")
         locators: list[Locator] = []
@@ -207,8 +201,8 @@ class CachePublications:
                 for layer in range(self.pool.num_layers):
                     key, value = self.pool.read(
                         layer,
-                        row.block_table,
-                        group=row.group_id,
+                        pages,
+                        group=group_id,
                         start=base_extent,
                         length=suffix,
                     )
@@ -224,7 +218,6 @@ class CachePublications:
             for locator in locators:
                 transport.release(locator)
             raise
-        pages = ceil_div(row.length, self.pool.block_size)
         publication = CachePublication(
             locators=tuple(locator.to_wire_json() for locator in locators),
             source_version=source_version,
@@ -232,9 +225,8 @@ class CachePublications:
             destination=destination,
             base_version=expected_base,
             base_extent=base_extent,
-            published_extent=row.length,
-            page_ids=tuple(row.block_table[:pages]),
-            group_id=row.group_id,
+            published_extent=visible,
+            group_id=int(group_id),
             scale_identity=str(self.pool.store_dtype),
         )
         return publication
@@ -252,25 +244,30 @@ class CachePublications:
         self,
         session_id: int,
         product: ProductRef,
-        row: CacheRow,
+        *,
+        request_pool_idx: int,
+        group_id: int,
+        visible_length: int,
         publication: CachePublication | None = None,
     ) -> CachePublication:
         publication = self.publication(product) if publication is None else publication
         if int(product.request_key.session_id) != int(session_id):
             raise invalid_descriptor("KV conditioning product belongs to another session")
-        pages = ceil_div(publication.published_extent, self.pool.block_size)
         if (
-            row.length < publication.published_extent
-            or tuple(row.block_table[:pages]) != publication.page_ids[:pages]
-            or row.group_id != publication.group_id
+            int(visible_length) < publication.published_extent
+            or int(group_id) != publication.group_id
+            or self.request_tables.allocated_length(request_pool_idx)
+            < publication.published_extent
         ):
             raise invalid_descriptor("KV conditioning placement disagrees with its publication")
+        self.request_tables.pages(request_pool_idx, group_id)
         return publication
 
     def install(
         self,
-        row: CacheRow,
         *,
+        request_pool_idx: int,
+        group_id: int,
         session_id: int,
         source: ProductRef,
         installed_product: ProductRef,
@@ -291,6 +288,11 @@ class CachePublications:
         elif installed != (publication.base_version, publication.base_extent):
             raise invalid_descriptor("KV installation base does not match destination")
         suffix = publication.published_extent - publication.base_extent
+        if int(group_id) != publication.group_id:
+            raise invalid_descriptor("KV installation group disagrees with publication")
+        pages = self.request_tables.pages(request_pool_idx, group_id)
+        if self.request_tables.allocated_length(request_pool_idx) < publication.published_extent:
+            raise invalid_descriptor("KV installation exceeds its scheduler block table")
         expected_locators = 2 * self.pool.num_layers if suffix else 0
         if len(publication.locators) != expected_locators:
             raise invalid_descriptor("KV publication locator count does not match cache layers")
@@ -311,29 +313,20 @@ class CachePublications:
                 raise invalid_descriptor("KV transfer tensor shape does not match publication")
             self.pool.write(
                 layer,
-                row.block_table,
-                group=row.group_id,
+                pages,
+                group=group_id,
                 start=publication.base_extent,
                 k=key,
                 v=value,
             )
-        row.length = publication.published_extent
-        row.initialized_length = max(
-            int(row.initialized_length or 0),
-            publication.published_extent,
+        self.request_tables.set_verified(
+            torch.tensor((request_pool_idx,), device=self.request_tables.page_tables.device),
+            torch.tensor(
+                (publication.published_extent,),
+                device=self.request_tables.page_tables.device,
+            ),
         )
-        row.committed_length = max(
-            int(row.committed_length or 0),
-            publication.published_extent,
-        )
-        pages = ceil_div(row.length, self.pool.block_size)
-        local = replace(
-            publication,
-            page_ids=tuple(row.block_table[:pages]),
-            group_id=row.group_id,
-            scale_identity=str(self.pool.store_dtype),
-        )
-        return local
+        return publication
 
     def prepare_commit(
         self,
@@ -483,25 +476,21 @@ class CachePublications:
     def restore(
         self,
         state: CachePublicationState,
-        rows: Mapping[int, CacheRow],
+        request_pool_idx: int,
         transport: Transport,
     ) -> None:
         self.drop(state.session_id)
         for product, publication in state.products:
-            row = rows.get(publication.group_id)
-            if row is None or row.length < publication.published_extent:
+            if (
+                self.request_tables.allocated_length(request_pool_idx)
+                < publication.published_extent
+            ):
                 raise invalid_descriptor("restored KV publication has no cache placement")
-            pages = ceil_div(publication.published_extent, self.pool.block_size)
-            restored = replace(
-                publication,
-                page_ids=tuple(row.block_table[:pages]),
-                group_id=row.group_id,
-                scale_identity=str(self.pool.store_dtype),
-            )
-            self._products[product] = restored
-            if restored.locators:
+            self.request_tables.pages(request_pool_idx, publication.group_id)
+            self._products[product] = publication
+            if publication.locators:
                 self._locators[(state.session_id, int(product.producer_op_id))] = (
-                    tuple(Locator.from_wire_json(raw) for raw in restored.locators),
+                    tuple(Locator.from_wire_json(raw) for raw in publication.locators),
                     transport,
                 )
         for destination, version, extent in state.destination_bases:

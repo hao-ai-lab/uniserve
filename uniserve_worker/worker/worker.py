@@ -19,13 +19,14 @@ from ..batch import (
     AttentionRegime,
     Batch,
     BatchPartition,
+    BlockTable,
     CacheCopy,
+    CachePageAllocation,
     CompletionReport,
     Domain,
     ExecutionCapability,
+    ForwardRow,
     ImageParams,
-    KvBranchPlacement,
-    KvPlacement,
     LatentPlacement,
     Operation,
     OpStatus,
@@ -90,6 +91,7 @@ from ..runtime.device_events import DeviceEventPool
 from ..runtime.device_products import DeviceProducts
 from ..runtime.encoder_cache import EncoderCache
 from ..runtime.latent_pool import LatentPool
+from ..runtime.req_to_token_pool import ReqToTokenPool
 from ..runtime.runtime_states import RuntimeStates
 from ..server.completion import (
     CompletionArena,
@@ -232,9 +234,9 @@ def _warmup_batch(
     step_id: int,
     admissions: tuple[Admission, ...],
     operations: tuple[Operation, ...],
-    request_pool_indices: dict[RequestKey, int],
-    kv_placements: dict[tuple[RequestKey, int], tuple[KvPlacement, ...]],
-    kv_branch_placements: dict[tuple[RequestKey, int], tuple[KvBranchPlacement, ...]],
+    block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]],
+    new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]],
+    forward_rows: dict[tuple[RequestKey, int], tuple[ForwardRow, ...]],
     latent_placements: dict[tuple[RequestKey, int], LatentPlacement],
     input_products: tuple[ProductPayload, ...] = (),
     tensorized_mixed: bool = False,
@@ -271,25 +273,26 @@ def _warmup_batch(
             attention=AttentionRegime.HYBRID,
             shape_class=0,
             operations=tuple(members),
-            request_pool_indices=tuple(
-                request_pool_indices[operation.request_key] for operation in members
-            ),
-            kv_placements=tuple(
-                placement
+            block_tables=tuple(
+                table
                 for operation in members
-                for placement in kv_placements.get(
+                for table in block_tables.get(
                     (operation.request_key, operation.op_id),
                     (),
                 )
-                if (operation.request_key, operation.op_id) in kv_placements
             ),
-            kv_branch_placements=tuple(
-                placement
+            new_cache_pages=tuple(
+                allocation
                 for operation in members
-                for placement in kv_branch_placements.get(
+                for allocation in new_cache_pages.get(
                     (operation.request_key, operation.op_id),
                     (),
                 )
+            ),
+            forward_rows=tuple(
+                replace(row, operation_index=operation_index)
+                for operation_index, operation in enumerate(members)
+                for row in forward_rows.get((operation.request_key, operation.op_id), ())
             ),
             latent_placements=tuple(
                 latent_placements[(operation.request_key, operation.op_id)]
@@ -356,7 +359,8 @@ class Worker:
     latent_pool: LatentPool | None
     snapshot_recovery: SnapshotRecovery | None
     _warmup_kv_pages: dict[tuple[RequestKey, int], list[int]]
-    _warmup_scratch_pages: dict[RequestKey, list[int]]
+    _warmup_prefix_pages: dict[RequestKey, list[int]]
+    _warmup_prefix_slots: dict[RequestKey, int]
     _warmup_latent_pages: dict[RequestKey, list[int]]
 
     @classmethod
@@ -465,7 +469,6 @@ class Worker:
             pipeline_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
             num_blocks=int(declared.num_blocks),
-            scratch_capacity_tokens=int(declared.scratch_capacity_tokens),
             request_pool_size=int(declared.max_request_pool_size),
             num_latent_pages=int(declared.num_latent_pages),
             latent_page_units=int(declared.latent_page_units),
@@ -507,23 +510,13 @@ class Worker:
         max_blocks_per_row = max(
             1,
             ceil_div(int(model.text_max_tokens), int(deployment.block_size)),
-            ceil_div(
-                int(self._capabilities.scratch_capacity_tokens),
-                int(deployment.block_size),
-            ),
         )
         self.cache_pool = CachePool(
             num_layers=int(cache.num_layers),
-            request_pages=int(self._capabilities.num_blocks),
-            scratch_pages=ceil_div(
-                int(self._capabilities.scratch_capacity_tokens),
-                int(self._capabilities.block_size),
-            ),
+            num_pages=int(self._capabilities.num_blocks),
             page_size=int(self._capabilities.block_size),
             num_kv_heads=int(cache.num_kv_heads),
             head_dim=int(cache.head_dim),
-            request_pool_size=int(self._capabilities.max_request_pool_size),
-            max_blocks_per_request=max_blocks_per_row,
             device=deployment.device,
             dtype=cache_dtype,
             store_dtype=cache.store_dtype,
@@ -535,8 +528,30 @@ class Worker:
                 if self._capabilities.groups
                 else None
             ),
+        )
+        if WorkVariant.GEN_FLOW in self._effective_work_variants and not _supports_flow_attention(
+            attention,
+            cache,
+            self.cache_pool,
+            torch.device(deployment.device),
+        ):
+            raise capability_mismatch(
+                "image generation requires paged-prefix plus dense-current attention"
+            )
+        self.req_to_token_pool = ReqToTokenPool(
+            group_count=self.cache_pool.group_count,
+            request_pool_size=int(self._capabilities.max_request_pool_size),
+            max_blocks_per_request=max_blocks_per_row,
+            block_size=int(self._capabilities.block_size),
+            device=deployment.device,
             staging_depth=int(pipeline_depth),
         )
+        from ..nn.attention import bind_attention_modules
+
+        bind_attention_modules(model, self.cache_pool, attention)
+        bind_cache_pool = getattr(model, "bind_cache_pool", None)
+        if callable(bind_cache_pool):
+            bind_cache_pool(self.cache_pool)
         self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
         torch_dtype = getattr(
             torch,
@@ -551,6 +566,7 @@ class Worker:
             continuation_width=1,
             device=deployment.device,
             logits_dtype=torch_dtype,
+            valid_cache_lengths=self.req_to_token_pool.verified_lens,
         )
         flow = model.generation
         latent_dtype = getattr(
@@ -949,6 +965,8 @@ class Worker:
                 enabled=execution.cuda_graph,
                 prefill_enabled=execution.prefill_cuda_graph,
                 cache=model.cache_geometry,
+                cache_pool=self.cache_pool,
+                attention=attention,
                 block_size=deployment.block_size,
                 weight_digest=self.weight_digest,
                 memory_budget_bytes=graph_budget,
@@ -1138,6 +1156,7 @@ class Worker:
             requests=self.requests,
             runtime_states=self.runtime_states,
             cache_pool=self.cache_pool,
+            req_to_token_pool=self.req_to_token_pool,
             latent_pool=self.latent_pool,
             device_products=self.device_products,
             encoder_cache=self.encoder_cache,
@@ -1154,7 +1173,8 @@ class Worker:
             trace=self.trace,
         )
         self._warmup_kv_pages = {}
-        self._warmup_scratch_pages = {}
+        self._warmup_prefix_pages = {}
+        self._warmup_prefix_slots = {}
         self._warmup_latent_pages = {}
         self._warmup_step_id = 0
         self.snapshot_recovery = None
@@ -1180,6 +1200,7 @@ class Worker:
                 device=deployment.device,
                 requests=self.requests,
                 cache_pool=self.cache_pool,
+                req_to_token_pool=self.req_to_token_pool,
                 cache_publications=self.execution.cache_publications,
                 latent_pool=self.latent_pool,
                 device_products=self.device_products,
@@ -1209,7 +1230,7 @@ class Worker:
         if max_tokens < 1:
             return 0
         blocks = (max_tokens + int(deployment.block_size) - 1) // int(deployment.block_size)
-        return min(blocks, max(0, int(self.cache_pool.request_pages) - 1))
+        return min(blocks, max(0, int(self.cache_pool.num_pages) - 1))
 
     def execute(self, batch: Batch) -> CompletionReport:
         with self._model_call():
@@ -1342,8 +1363,11 @@ class Worker:
         admissions_by_key = {admission.request_key: admission for admission in admissions}
         occupied_blocks = {page for pages in self._warmup_kv_pages.values() for page in pages}
         request_pool_indices: dict[RequestKey, int] = {}
-        kv_placements: dict[tuple[RequestKey, int], tuple[KvPlacement, ...]] = {}
-        kv_branch_placements: dict[tuple[RequestKey, int], tuple[KvBranchPlacement, ...]] = {}
+        block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]] = {}
+        new_cache_pages: dict[
+            tuple[RequestKey, int], tuple[CachePageAllocation, ...]
+        ] = {}
+        forward_rows: dict[tuple[RequestKey, int], tuple[ForwardRow, ...]] = {}
         latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
         for operation in operations:
             session = self.requests.peek(int(operation.request_key.session_id))
@@ -1370,7 +1394,7 @@ class Worker:
                 session is None
                 and admission is not None
                 and admission.und is not None
-                and admission.und.kv.prefix_len != 0
+                and admission.und.initial_position != 0
             ):
                 raise invalid_descriptor("warmup KV admission requires an empty prefix")
             visible = 0
@@ -1388,37 +1412,55 @@ class Worker:
                 }
                 else 0
             )
-            placements: list[KvPlacement] = []
+            tables: list[BlockTable] = []
+            allocations: list[CachePageAllocation] = []
             for group_id in range(self.cache_pool.group_count):
                 lease_key = (operation.request_key, group_id)
                 block_table = self._warmup_kv_pages.setdefault(lease_key, [])
-                missing = int(operation.kv_capacity_pages) - len(block_table)
+                target_pages = ceil_div(
+                    visible + input_length,
+                    int(self.cache_pool.block_size),
+                )
+                missing = target_pages - len(block_table)
                 if missing < 0:
                     raise invalid_descriptor("warmup operation regresses its KV capacity")
                 allocated = tuple(
                     candidate
-                    for candidate in self.cache_pool.request_page_ids(group_id)
+                    for candidate in self.cache_pool.page_ids(group_id)
                     if candidate not in occupied_blocks
                 )[:missing]
                 if len(allocated) != missing:
                     raise invalid_descriptor("warmup KV placement exceeds resident capacity")
                 block_table.extend(allocated)
                 occupied_blocks.update(allocated)
-                placements.append(
-                    KvPlacement(
-                        request_key=operation.request_key,
-                        op_id=operation.op_id,
+                tables.append(
+                    BlockTable(
+                        request_pool_idx=request_pool_indices[operation.request_key],
                         group_id=group_id,
-                        block_table=tuple(block_table),
-                        block_table_update=True,
-                        pages_to_zero=allocated,
-                        prefix_length=visible,
-                        input_length=input_length,
-                        visible_length=visible,
-                        resulting_length=visible + input_length,
+                        page_ids=tuple(block_table),
+                        allocated_tokens=len(block_table) * self.cache_pool.block_size,
                     )
                 )
-            kv_placements[(operation.request_key, operation.op_id)] = tuple(placements)
+                if allocated:
+                    allocations.append(
+                        CachePageAllocation(
+                            request_pool_idx=request_pool_indices[operation.request_key],
+                            group_id=group_id,
+                            page_ids=allocated,
+                        )
+                    )
+            identity = (operation.request_key, operation.op_id)
+            block_tables[identity] = tuple(tables)
+            new_cache_pages[identity] = tuple(allocations)
+            if input_length > 0:
+                forward_rows[identity] = (
+                    ForwardRow(
+                        operation_index=0,
+                        request_pool_index=request_pool_indices[operation.request_key],
+                        seq_len=visible,
+                        query_len=input_length,
+                    ),
+                )
         height, width = image_geometry or self._warmup_image_geometry()
         latent_units = max(
             1,
@@ -1466,27 +1508,42 @@ class Worker:
                 ),
             )
             if operation.work.variant is WorkVariant.GEN_FLOW:
-                kv_branch_placements[(operation.request_key, operation.op_id)] = (
-                    self._warmup_branch_placements(operation, height, width)
+                extra_tables, extra_allocations, flow_rows = self._warmup_flow_tables(
+                    operation,
+                    request_pool_indices[operation.request_key],
+                    height,
+                    width,
                 )
+                identity = (operation.request_key, operation.op_id)
+                block_tables[identity] = (*block_tables.get(identity, ()), *extra_tables)
+                new_cache_pages[identity] = (
+                    *new_cache_pages.get(identity, ()),
+                    *extra_allocations,
+                )
+                forward_rows[identity] = flow_rows
         return _warmup_batch(
             step_id=self._warmup_step_id,
             admissions=admissions,
             operations=operations,
-            request_pool_indices=request_pool_indices,
-            kv_placements=kv_placements,
-            kv_branch_placements=kv_branch_placements,
+            block_tables=block_tables,
+            new_cache_pages=new_cache_pages,
+            forward_rows=forward_rows,
             latent_placements=latent_placements,
             input_products=input_products,
             tensorized_mixed=tensorized_mixed,
         )
 
-    def _warmup_branch_placements(
+    def _warmup_flow_tables(
         self,
         operation: Operation,
+        main_slot: int,
         height: int,
         width: int,
-    ) -> tuple[KvBranchPlacement, ...]:
+    ) -> tuple[
+        tuple[BlockTable, ...],
+        tuple[CachePageAllocation, ...],
+        tuple[ForwardRow, ...],
+    ]:
         session = self.requests.get(operation.request_key.session_id)
         image = session.image
         generation = self.model.generation
@@ -1503,7 +1560,7 @@ class Worker:
         runtime = parent_runtime(self.execution, operation, session)
         query = generation.physical_tokens(height, width)
         image_prompt = image.image_prompts[0] if image.image_prompts else ""
-        prefix_lengths = []
+        branch_prefixes: list[tuple[tuple[int, ...], bool]] = []
         for branch in guide.branches:
             prefix, copy_conditioning = generation.prefix(
                 generation.branch_source(branch),
@@ -1512,50 +1569,77 @@ class Worker:
                 negative_token_ids=session.negative_token_ids,
                 tokenizer=self.execution.tokenizer,
             )
-            prefix_lengths.append(int(runtime.kv_visible_len) if copy_conditioning else len(prefix))
-        widths = tuple(
-            ceil_div(query + prefix_length, self.cache_pool.block_size)
-            for prefix_length in prefix_lengths
-        )
-        required = sum(widths)
-        lease = self._warmup_scratch_pages.setdefault(operation.request_key, [])
+            branch_prefixes.append((prefix, copy_conditioning))
+        alternatives = {
+            prefix for prefix, copy_conditioning in branch_prefixes if not copy_conditioning
+        }
+        if len(alternatives) > 1:
+            raise invalid_descriptor("warmup flow has multiple distinct alternative prefixes")
+        alternative = next(iter(alternatives), ())
+        required = ceil_div(len(alternative), self.cache_pool.block_size)
+        lease = self._warmup_prefix_pages.setdefault(operation.request_key, [])
         missing = required - len(lease)
-        if missing < 0:
-            raise invalid_descriptor("warmup generation scratch geometry changed")
         occupied = {
             page
-            for request_key, pages in self._warmup_scratch_pages.items()
+            for request_key, pages in self._warmup_prefix_pages.items()
             if request_key != operation.request_key
             for page in pages
         }
+        occupied.update(page for pages in self._warmup_kv_pages.values() for page in pages)
         allocated = tuple(
             page
-            for page in range(
-                self.cache_pool.scratch_page_offset,
-                self.cache_pool.num_pages,
-            )
+            for page in self.cache_pool.page_ids(0)
             if page not in occupied
         )[:missing]
         if len(allocated) != missing:
-            raise invalid_descriptor("warmup generation scratch exceeds fixed capacity")
+            raise invalid_descriptor("warmup alternative prefix exceeds KV capacity")
         lease.extend(allocated)
-        fresh = set(allocated)
-        placements: list[KvBranchPlacement] = []
-        offset = 0
-        for branch_index, width in enumerate(widths, start=1):
-            block_table = tuple(lease[offset : offset + width])
-            placements.append(
-                KvBranchPlacement(
-                    request_key=operation.request_key,
-                    op_id=operation.op_id,
-                    branch_index=branch_index,
+        tables: tuple[BlockTable, ...] = ()
+        allocations: tuple[CachePageAllocation, ...] = ()
+        alternative_slot = main_slot
+        rows: list[ForwardRow] = []
+        if alternative:
+            alternative_slot = self._warmup_prefix_slots.setdefault(
+                operation.request_key,
+                int(self._capabilities.max_request_pool_size)
+                - len(self._warmup_prefix_slots),
+            )
+            if alternative_slot == main_slot or alternative_slot < 1:
+                raise invalid_descriptor("warmup has no request slot for an alternative prefix")
+            tables = (
+                BlockTable(
+                    request_pool_idx=alternative_slot,
                     group_id=0,
-                    block_table=block_table,
-                    pages_to_zero=tuple(page for page in block_table if page in fresh),
+                    page_ids=tuple(lease),
+                    allocated_tokens=len(lease) * self.cache_pool.block_size,
+                ),
+            )
+            if allocated:
+                allocations = (
+                    CachePageAllocation(
+                        request_pool_idx=alternative_slot,
+                        group_id=0,
+                        page_ids=allocated,
+                    ),
+                )
+            rows.append(
+                ForwardRow(
+                    operation_index=0,
+                    request_pool_index=alternative_slot,
+                    seq_len=0,
+                    query_len=len(alternative),
                 )
             )
-            offset += width
-        return tuple(placements)
+        for prefix, copy_conditioning in branch_prefixes:
+            rows.append(
+                ForwardRow(
+                    operation_index=0,
+                    request_pool_index=main_slot if copy_conditioning else alternative_slot,
+                    seq_len=int(runtime.kv_visible_len) if copy_conditioning else len(prefix),
+                    query_len=query,
+                )
+            )
+        return tables, allocations, tuple(rows)
 
     def warmup(self) -> None:
         """Complete pre-admission kernel JIT and open the serving epoch.
@@ -1616,7 +1700,6 @@ class Worker:
             Domain,
             DType,
             FixedPoint,
-            KvAdmission,
             Operation,
             PointRange,
             ProductKind,
@@ -1658,7 +1741,7 @@ class Worker:
         )
         batch_sizes = tuple(
             sorted(
-                {int(value) for value in configured if 0 < int(value) < int(pool.request_pages)},
+                {int(value) for value in configured if 0 < int(value) < int(pool.num_pages)},
                 reverse=True,
             )
         )
@@ -1673,7 +1756,7 @@ class Worker:
                 request_pool_idx=sid,
                 und=UndAdmission(
                     sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                    kv=KvAdmission(),
+                    initial_position=0,
                 ),
             )
             for sid in session_ids
@@ -1711,7 +1794,6 @@ class Worker:
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
                 inputs=(token_ref,),
                 outputs=outputs,
-                kv_capacity_pages=1,
             )
             return operation, ProductPayload(
                 product=token_ref, payload=encode_token_product_bytes(tokens)
@@ -1737,7 +1819,6 @@ class Worker:
                 domain=Domain.DECODE,
                 bounds=Bounds(max_points=1, max_tokens=1),
                 outputs=outputs,
-                kv_capacity_pages=ceil_div(op_id, int(pool.block_size)),
                 predicate=token_output,
             )
 
@@ -1803,7 +1884,6 @@ class Worker:
             Domain,
             DType,
             FixedPoint,
-            KvAdmission,
             Operation,
             PointRange,
             ProductKind,
@@ -1827,7 +1907,7 @@ class Worker:
         max_route_tokens = int(self.model.text_max_tokens)
         capacity = min(
             max_route_tokens,
-            max(0, int(pool.request_pages) - 1) * int(pool.block_size),
+            max(0, int(pool.num_pages) - 1) * int(pool.block_size),
         )
         token_buckets = tuple(
             sorted(
@@ -1874,7 +1954,6 @@ class Worker:
                 input_products: list[ProductPayload] = []
                 active_sessions: list[int] = []
                 for row, token_count in enumerate(token_counts):
-                    block_count = ceil_div(token_count, int(pool.block_size))
                     tokens = (0,) * token_count
                     session_id += 1
                     active_sessions.append(session_id)
@@ -1884,7 +1963,7 @@ class Worker:
                         request_pool_idx=row + 1,
                         und=UndAdmission(
                             sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                            kv=KvAdmission(),
+                            initial_position=0,
                         ),
                     )
                     token_ref = ProductRef(
@@ -1909,7 +1988,6 @@ class Worker:
                             bounds=Bounds(max_points=1, max_tokens=token_count),
                             inputs=(token_ref,),
                             outputs=_warmup_token_outputs(rk, 1, 2),
-                            kv_capacity_pages=block_count,
                         )
                     )
                     admissions.append(admission)
@@ -1944,7 +2022,6 @@ class Worker:
             DType,
             FixedPoint,
             GenAdmission,
-            KvAdmission,
             Operation,
             PointRange,
             ProductKind,
@@ -2044,7 +2121,7 @@ class Worker:
                     request_pool_idx=batch_size + index,
                     und=UndAdmission(
                         sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                        kv=KvAdmission(),
+                        initial_position=0,
                     ),
                 )
                 for index, session_id in enumerate(text_session_ids, start=1)
@@ -2124,7 +2201,6 @@ class Worker:
                             bounds=Bounds(max_points=1, max_tokens=1),
                             inputs=(token_ref,),
                             outputs=prompt_outputs,
-                            kv_capacity_pages=1,
                         )
                         prompt_operations.append(operation)
                         prompt_payloads.append(
@@ -2294,9 +2370,6 @@ class Worker:
                                     domain=Domain.DECODE,
                                     bounds=Bounds(max_points=1, max_tokens=1),
                                     outputs=token_outputs,
-                                    kv_capacity_pages=ceil_div(
-                                        op_id, int(self.cache_pool.block_size)
-                                    ),
                                     predicate=token_output,
                                 )
                             )
@@ -2384,7 +2457,8 @@ class Worker:
         if session is not None:
             for group_id in range(self.cache_pool.group_count):
                 self._warmup_kv_pages.pop((session.request_key, group_id), None)
-            self._warmup_scratch_pages.pop(session.request_key, None)
+            self._warmup_prefix_pages.pop(session.request_key, None)
+            self._warmup_prefix_slots.pop(session.request_key, None)
             self._warmup_latent_pages.pop(session.request_key, None)
         if self.snapshot_recovery is not None:
             self.snapshot_recovery.drop_session(session_id)
@@ -2472,6 +2546,42 @@ class Worker:
         self.completion_arena.set_completion_wake(wake_on_stream)
         self.cpu_tasks.set_completion_wake(wake)
         self.transfers.set_completion_wake(wake)
+
+
+def _supports_flow_attention(
+    selection: AttentionSelection,
+    geometry: object,
+    pool: CachePool,
+    device: torch.device,
+) -> bool:
+    if not pool.supports_paged_attention_storage:
+        return False
+    head_dim = int(getattr(geometry, "head_dim"))
+    for provider in selection.providers:
+        capabilities = provider.capabilities()
+        if not bool(getattr(capabilities, "available", True)) or not bool(
+            getattr(capabilities, "segmented_attention", False)
+        ):
+            continue
+        if head_dim < int(getattr(capabilities, "min_head_dim", 1) or 1):
+            continue
+        multiple = int(getattr(capabilities, "paged_block_size_multiple", 1) or 1)
+        if pool.block_size % max(1, multiple) != 0:
+            continue
+        supports_geometry = getattr(capabilities, "supports_trunk_geometry", None)
+        if callable(supports_geometry) and not supports_geometry(head_dim, head_dim, head_dim):
+            continue
+        if bool(getattr(capabilities, "cuda_only", False)) and device.type != "cuda":
+            continue
+        minimum = getattr(capabilities, "min_cuda_capability", None)
+        if minimum is not None:
+            if device.type != "cuda":
+                continue
+            major, minor = torch.cuda.get_device_capability(device)
+            if (int(major), int(minor)) < (int(minimum[0]), int(minimum[1])):
+                continue
+        return True
+    return False
 
 
 def _pressure(resource_class: str, used: int, total: int) -> dict[str, object]:

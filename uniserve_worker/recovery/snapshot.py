@@ -26,7 +26,7 @@ from ..batch import (
     VersionRef,
 )
 from ..foundation.errors import invalid_descriptor
-from ..runtime.cache_pool import CachePool, CacheRow
+from ..runtime.cache_pool import CachePool
 from ..runtime.device_products import (
     DeviceProductMetadata,
     DeviceProducts,
@@ -35,12 +35,13 @@ from ..runtime.device_products import (
 )
 from ..runtime.encoder_cache import EncoderCache, EncoderMetadata, EncoderSnapshot
 from ..runtime.latent_pool import LatentPool, LatentSnapshot
+from ..runtime.req_to_token_pool import ReqToTokenPool
 from ..runtime.runtime_states import RuntimeStates, RuntimeStateSnapshot
 from ..server.request_state import RequestRow, RequestRuntime, RequestTable
 from ..transfer.connector import CachePublication, CachePublications, CachePublicationState
 from ..transfer.tickets import Locator, Transport
 
-SNAPSHOT_FORMAT_VERSION = 15
+SNAPSHOT_FORMAT_VERSION = 17
 _ASSET_REFERENCE = "asset:"
 
 
@@ -88,6 +89,7 @@ class SnapshotRecovery:
         device: str | torch.device,
         requests: RequestTable,
         cache_pool: CachePool,
+        req_to_token_pool: ReqToTokenPool,
         cache_publications: CachePublications,
         latent_pool: LatentPool | None,
         device_products: DeviceProducts,
@@ -104,6 +106,7 @@ class SnapshotRecovery:
         self.device = torch.device(device)
         self.requests = requests
         self.cache_pool = cache_pool
+        self.req_to_token_pool = req_to_token_pool
         self.cache_publications = cache_publications
         self.latent_pool = latent_pool
         self.device_products = device_products
@@ -176,7 +179,10 @@ class SnapshotRecovery:
                 cache=tuple(
                     (
                         request.session_id,
-                        self._read_cache(placement_by_session[request.session_id]),
+                        self._read_cache(
+                            request,
+                            placement_by_session[request.session_id],
+                        ),
                     )
                     for request in requests
                 ),
@@ -260,15 +266,16 @@ class SnapshotRecovery:
         if runtime is None:
             raise invalid_descriptor("recovery session has no committed runtime")
         expected_groups = set(range(self.cache_pool.group_count))
-        actual_groups = {int(group.group_id) for group in placement.cache_groups}
+        actual_groups = {int(table.group_id) for table in placement.block_tables}
         if actual_groups != expected_groups:
             raise invalid_descriptor("recovery placement does not cover every cache group")
-        for group in placement.cache_groups:
-            self.cache_pool.validate_group(group.group_id)
-            pages = self.cache_pool.validate_pages(group.page_ids, scratch=False)
+        for table in placement.block_tables:
+            self.cache_pool.validate_group(table.group_id)
+            pages = self.cache_pool.validate_pages(table.page_ids, group=table.group_id)
             if (
-                int(group.length) != int(runtime.kv_visible_len)
-                or int(group.length) > len(pages) * self.cache_pool.block_size
+                int(table.request_pool_idx) != int(placement.request_pool_idx)
+                or int(table.allocated_tokens) > len(pages) * self.cache_pool.block_size
+                or int(runtime.kv_visible_len) > int(table.allocated_tokens)
             ):
                 raise invalid_descriptor("recovery KV extent disagrees with committed visibility")
 
@@ -291,15 +298,37 @@ class SnapshotRecovery:
             raise invalid_descriptor("trajectory metadata disagrees with committed session state")
         return snapshot
 
-    def _read_cache(self, placement: RecoveryPlacement) -> tuple[_CacheGroupImage, ...]:
-        return tuple(
-            _CacheGroupImage(
-                group_id=int(group.group_id),
-                length=int(group.length),
-                tensors=self.cache_pool.page_view(group.group_id, group.page_ids),
-            )
-            for group in placement.cache_groups
-        )
+    def _read_cache(
+        self,
+        session: RequestRow,
+        placement: RecoveryPlacement,
+    ) -> tuple[_CacheGroupImage, ...]:
+        runtime = session.runtime_for(session.committed_version())
+        if runtime is None:
+            raise invalid_descriptor("recovery session has no committed runtime")
+        length = int(runtime.kv_visible_len)
+        images: list[_CacheGroupImage] = []
+        for table in placement.block_tables:
+            tensors: list[torch.Tensor] = []
+            for layer in range(self.cache_pool.num_layers):
+                if length == 0:
+                    empty = self.cache_pool.k.new_empty(
+                        (0, self.cache_pool.n_kv, self.cache_pool.head_dim)
+                    )
+                    tensors.extend((empty, empty.clone()))
+                    continue
+                key, value = self.cache_pool.read(
+                    layer,
+                    table.page_ids,
+                    group=table.group_id,
+                    start=0,
+                    length=length,
+                )
+                if key is None or value is None:
+                    raise invalid_descriptor("visible KV snapshot span is incomplete")
+                tensors.extend((key.contiguous(), value.contiguous()))
+            images.append(_CacheGroupImage(int(table.group_id), length, tuple(tensors)))
+        return tuple(images)
 
     def _write_cache(
         self,
@@ -310,32 +339,46 @@ class SnapshotRecovery:
             placement = placements.get(int(session_id))
             if placement is None:
                 raise invalid_descriptor("cache restore has no scheduler placement")
-            destinations = {int(group.group_id): group for group in placement.cache_groups}
+            self.req_to_token_pool.install(
+                tuple(
+                    (
+                        table.request_pool_idx,
+                        table.group_id,
+                        table.page_ids,
+                        table.allocated_tokens,
+                    )
+                    for table in placement.block_tables
+                )
+            )
+            destinations = {int(table.group_id): table for table in placement.block_tables}
             if set(destinations) != {group.group_id for group in groups}:
                 raise invalid_descriptor("cache restore groups disagree with scheduler placement")
             for group in groups:
                 destination = destinations[group.group_id]
-                if int(destination.length) != int(group.length):
+                if int(destination.allocated_tokens) < int(group.length):
                     raise invalid_descriptor(
                         "cache restore extent disagrees with scheduler placement"
                     )
                 self.cache_pool.validate_group(group.group_id)
-                self.cache_pool.validate_pages(destination.page_ids, scratch=False)
-                self.cache_pool.restore_pages(group.group_id, destination.page_ids, group.tensors)
-
-    def _cache_rows(self, placement: RecoveryPlacement) -> dict[int, CacheRow]:
-        return {
-            int(group.group_id): CacheRow(
-                block_table=group.page_ids,
-                length=int(group.length),
-                capacity=len(group.page_ids) * self.cache_pool.block_size,
-                group_id=int(group.group_id),
-                initialized_length=int(group.length),
-                committed_length=int(group.length),
-                published_length=int(group.length),
+                self.cache_pool.validate_pages(destination.page_ids, group=group.group_id)
+                if len(group.tensors) != 2 * self.cache_pool.num_layers:
+                    raise invalid_descriptor("cache restore tensor count disagrees with layers")
+                for layer in range(self.cache_pool.num_layers):
+                    self.cache_pool.write(
+                        layer,
+                        destination.page_ids,
+                        group=group.group_id,
+                        start=0,
+                        k=group.tensors[2 * layer],
+                        v=group.tensors[2 * layer + 1],
+                    )
+            lengths = {int(group.length) for group in groups}
+            if len(lengths) != 1:
+                raise invalid_descriptor("cache groups disagree on restored verified length")
+            self.req_to_token_pool.set_verified(
+                torch.tensor((placement.request_pool_idx,), device=self.device),
+                torch.tensor((lengths.pop(),), device=self.device),
             )
-            for group in placement.cache_groups
-        }
 
     def _restore_image(
         self,
@@ -378,7 +421,7 @@ class SnapshotRecovery:
             for state in image.cache_publications:
                 self.cache_publications.restore(
                     state,
-                    self._cache_rows(placements[state.session_id]),
+                    placements[state.session_id].request_pool_idx,
                     self.transport,
                 )
             self.device_products.restore_entries(session_ids, image.device_products)
@@ -421,6 +464,12 @@ class SnapshotRecovery:
                         for placement in placements.values()
                     )
                 )
+            self.req_to_token_pool.release(
+                tuple(
+                    int(placement.request_pool_idx)
+                    for placement in placements.values()
+                )
+            )
             self.requests.restore_rows((), session_ids)
             self._release_assets(image.published_assets)
             raise
@@ -1332,11 +1381,8 @@ def _runtime_to_json(runtime: RequestRuntime) -> dict[str, object]:
             None if runtime.latent_product is None else runtime.latent_product.to_wire()
         ),
         "flow_step": runtime.flow_step,
-        "kv_reserved_len": runtime.kv_reserved_len,
-        "kv_initialized_len": runtime.kv_initialized_len,
         "kv_visible_len": runtime.kv_visible_len,
-        "kv_committed_len": runtime.kv_committed_len,
-        "kv_published_len": runtime.kv_published_len,
+        "kv_computed_len": runtime.kv_computed_len,
     }
 
 
@@ -1351,20 +1397,8 @@ def _runtime_from_json(value: object, where: str) -> RequestRuntime:
             else ProductRef.from_wire(data["latent_product"], f"{where}.latent_product")
         ),
         flow_step=_uint(data.get("flow_step"), f"{where}.flow_step"),
-        kv_reserved_len=_uint(data.get("kv_reserved_len"), f"{where}.kv_reserved_len"),
-        kv_initialized_len=_uint(
-            data.get("kv_initialized_len"),
-            f"{where}.kv_initialized_len",
-        ),
         kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),
-        kv_committed_len=_uint(
-            data.get("kv_committed_len"),
-            f"{where}.kv_committed_len",
-        ),
-        kv_published_len=_uint(
-            data.get("kv_published_len"),
-            f"{where}.kv_published_len",
-        ),
+        kv_computed_len=_uint(data.get("kv_computed_len"), f"{where}.kv_computed_len"),
     )
 
 

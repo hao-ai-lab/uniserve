@@ -53,11 +53,7 @@ from uniserve_worker.batch import (
 from uniserve_worker.capabilities import MixedExecutionCapability
 from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
-    AttnPlan,
-    EmptyKvView,
-    KvView,
     ModelPhase,
-    NoAttention,
     RouteMeshView,
 )
 from uniserve_worker.execution.trace import (
@@ -91,7 +87,7 @@ from uniserve_worker.nn.diffusion.schedule import (
     x_pred_to_velocity,
 )
 from uniserve_worker.nn.mesh import BroadcastTransport, DeviceMesh
-from uniserve_worker.runtime.cache_pool import CachePool, CacheRow
+from uniserve_worker.runtime.cache_pool import CachePool
 from uniserve_worker.runtime.device import canonical_device
 from uniserve_worker.runtime.device_products import (
     DeviceProductMetadata,
@@ -109,6 +105,7 @@ from uniserve_worker.runtime.latent_pool import (
     LatentPool,
     LatentSnapshot,
 )
+from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
 from uniserve_worker.runtime.runtime_states import RuntimeStates
 from uniserve_worker.server.completion import (
     CompletionArena,
@@ -134,8 +131,8 @@ from uniserve_worker.transfer.tickets import (
     decode_transfer_descriptor,
 )
 
-from .attention import plan as _attention_plan
-from .attention import selection as _attention_selection
+from .attention import columns as _attention_columns
+from .attention import dense_columns as _dense_attention_columns
 from .cuda_graph import GraphExecutionError
 from .model_runner import ForwardResult, ModelRunner, RunObservation, RunPath
 from .rows import (
@@ -186,6 +183,7 @@ class ExecutionResources:
     requests: RequestTable
     runtime_states: RuntimeStates
     cache_pool: CachePool
+    req_to_token_pool: ReqToTokenPool
     cache_publications: CachePublications
     latent_pool: LatentPool | None
     device_products: DeviceProducts
@@ -208,10 +206,7 @@ class ExecutionResources:
     _transport_publications: dict[OperationIdentity, tuple[Locator, ...]] = field(
         default_factory=dict
     )
-    _branch_cache_rows: dict[tuple[RequestKey, int, int], CacheRow] = field(default_factory=dict)
-    _request_cache_pages: dict[tuple[RequestKey, int], tuple[int, ...]] = field(
-        default_factory=dict
-    )
+    _flow_prefix_slots: dict[RequestKey, set[int]] = field(default_factory=dict)
 
 
 def create_execution_resources(
@@ -223,6 +218,7 @@ def create_execution_resources(
     requests: RequestTable,
     runtime_states: RuntimeStates,
     cache_pool: CachePool,
+    req_to_token_pool: ReqToTokenPool,
     latent_pool: LatentPool | None,
     device_products: DeviceProducts,
     encoder_cache: EncoderCache,
@@ -264,7 +260,8 @@ def create_execution_resources(
         requests=requests,
         runtime_states=runtime_states,
         cache_pool=cache_pool,
-        cache_publications=CachePublications(cache_pool),
+        req_to_token_pool=req_to_token_pool,
+        cache_publications=CachePublications(cache_pool, req_to_token_pool),
         latent_pool=latent_pool,
         device_products=device_products,
         encoder_cache=encoder_cache,
@@ -287,7 +284,7 @@ def create_execution_resources(
 def close_execution(runtime: ExecutionResources) -> None:
     runtime._collective_history.clear()
     runtime._transport_publications.clear()
-    runtime._request_cache_pages.clear()
+    runtime._flow_prefix_slots.clear()
     runtime._qualified_mixed_buckets.clear()
 
 
@@ -988,10 +985,22 @@ def _open_partition(
         payload for payload in batch.input_products if payload.product in declared_inputs
     )
     try:
+        admission_slots = {
+            admission.request_key: int(admission.request_pool_idx) for admission in admissions
+        }
+        request_pool_indices: list[int] = []
+        for operation in operations:
+            slot = admission_slots.get(operation.request_key)
+            resident = runtime.requests.peek(operation.request_key.session_id)
+            if slot is None and resident is not None and resident.request_key == operation.request_key:
+                slot = int(resident.request_pool_idx)
+            if slot is None:
+                raise invalid_descriptor("operation request is not resident or admitted")
+            request_pool_indices.append(slot)
         candidates, bases = runtime.requests.stage_partition(
             operations,
             admissions,
-            partition.request_pool_indices,
+            tuple(request_pool_indices),
         )
         for operation, request in zip(operations, candidates, strict=True):
             request.install_runtime(_parent_runtime(runtime, operation, request))
@@ -1040,13 +1049,13 @@ def _open_partition(
         _reserve_cpu_tasks(runtime, active_operations, scope)
         active_partition = _active_partition(runtime, partition, active_operations)
         if active_partition is not None:
-            _bind_cache_rows(runtime, active_partition, scope)
+            _bind_cache_tables(runtime, active_partition, scope)
         scope.layout = PartitionLayout(
             operations=operations,
             requests=candidates,
-            cache_rows=tuple(
-                scope.cache_rows.get((operation.request_key, operation.op_id, 0))
-                for operation in operations
+            seq_lens=tuple(
+                int(_parent_runtime(runtime, operation, request).kv_visible_len)
+                for operation, request in zip(operations, candidates, strict=True)
             ),
             weights=(
                 _weights(
@@ -1092,28 +1101,19 @@ def _active_partition(
     if operations is partition.operations:
         return partition
     identities = {_operation_identity(operation) for operation in operations}
-    indices = tuple(
-        request_pool_idx
-        for operation, request_pool_idx in zip(
-            partition.operations,
-            partition.request_pool_indices,
-            strict=True,
+    old_to_new = {
+        index: selected
+        for selected, (index, operation) in enumerate(
+            (item for item in enumerate(partition.operations) if _operation_identity(item[1]) in identities)
         )
-        if _operation_identity(operation) in identities
-    )
+    }
     return replace(
         partition,
         operations=operations,
-        request_pool_indices=indices,
-        kv_placements=tuple(
-            placement
-            for placement in partition.kv_placements
-            if (placement.request_key, int(placement.op_id)) in identities
-        ),
-        kv_branch_placements=tuple(
-            placement
-            for placement in partition.kv_branch_placements
-            if (placement.request_key, int(placement.op_id)) in identities
+        forward_rows=tuple(
+            replace(row, operation_index=old_to_new[row.operation_index])
+            for row in partition.forward_rows
+            if row.operation_index in old_to_new
         ),
         latent_placements=tuple(
             placement
@@ -1226,15 +1226,37 @@ def _run_ready_set(
 
     while any(live(state) for state in states):
         forward: list[tuple[OperationState, object]] = []
-        for state in states:
-            if not live(state) or not dependencies_ready(state, producers):
-                continue
+        ready = tuple(
+            state
+            for state in states
+            if live(state) and dependencies_ready(state, producers)
+        )
+        flow_ready = tuple(
+            state
+            for state in ready
+            if state.operation.work.variant is WorkVariant.GEN_FLOW
+        )
+        flow_ready_ids = {id(state) for state in flow_ready}
+        for state in flow_ready:
             try:
                 rows = _pack_state_forward(runtime, state)
             except BaseException as error:
                 errors[state.partition.partition.partition_id] = error
                 continue
             forward.extend((state, row) for row in rows)
+        preparing_flow_prefix = any(
+            live(state) and state.phase == "prefix_pending" for state in flow_ready
+        )
+        if not preparing_flow_prefix:
+            for state in ready:
+                if id(state) in flow_ready_ids or not live(state):
+                    continue
+                try:
+                    rows = _pack_state_forward(runtime, state)
+                except BaseException as error:
+                    errors[state.partition.partition.partition_id] = error
+                    continue
+                forward.extend((state, row) for row in rows)
         if forward:
             outputs = _run_partitioned_wave(
                 runtime,
@@ -1439,11 +1461,8 @@ def _commit_partition(
             rng_counter=request.rng_counter,
             latent_product=request.latent_product,
             flow_step=request.flow_step,
-            kv_reserved_len=outcome.logical_lengths.kv_reserved_len,
-            kv_initialized_len=outcome.logical_lengths.kv_initialized_len,
             kv_visible_len=outcome.logical_lengths.kv_visible_len,
-            kv_committed_len=outcome.logical_lengths.kv_committed_len,
-            kv_published_len=outcome.logical_lengths.kv_published_len,
+            kv_computed_len=outcome.logical_lengths.kv_computed_len,
         )
     _record_component(scope, "commit_partition", commit_started)
     partition_report = PartitionCompletion(
@@ -1480,8 +1499,6 @@ def _commit_partition(
             scope.latent_releases,
         )
     runtime.cache_publications.apply_commit(cache_commit)
-    for branch_identity, branch_row in scope.branch_publications.items():
-        runtime._branch_cache_rows[branch_identity] = branch_row
     for publication_identity, locators in scope.stage_publications.items():
         runtime._transport_publications[publication_identity] = locators
     _commit_runtime_states(runtime, scope)
@@ -1739,8 +1756,8 @@ def _finalize_speculative_runtime(
         raise RuntimeError("speculative completion selection is inconsistent")
     selected_kv = selection.base_kv_visible + selected_point
     if (
-        record.logical_lengths.kv_initialized_len != selection.initialized_kv
-        or selected_kv > record.logical_lengths.kv_initialized_len
+        record.logical_lengths.kv_computed_len != selection.initialized_kv
+        or selected_kv > record.logical_lengths.kv_computed_len
     ):
         raise RuntimeError("speculative KV selection is outside initialized state")
     prefixes: list[tuple[VersionRef, RequestRuntime]] = []
@@ -1766,11 +1783,8 @@ def _finalize_speculative_runtime(
             rng_counter=selection.base_rng_counter + point_index,
             latent_product=request.latent_product,
             flow_step=request.flow_step,
-            kv_reserved_len=record.logical_lengths.kv_reserved_len,
-            kv_initialized_len=record.logical_lengths.kv_initialized_len,
             kv_visible_len=selection.base_kv_visible + point_index,
-            kv_committed_len=record.logical_lengths.kv_committed_len,
-            kv_published_len=record.logical_lengths.kv_published_len,
+            kv_computed_len=record.logical_lengths.kv_computed_len,
         )
         prefixes.append(
             (
@@ -1803,7 +1817,10 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
     if any(
         index > runtime.deployment.max_request_pool_size
         for partition in batch.partitions
-        for index in partition.request_pool_indices
+        for index in (
+            *(table.request_pool_idx for table in partition.block_tables),
+            *(row.request_pool_index for row in partition.forward_rows),
+        )
     ):
         raise invalid_descriptor("execution batch exceeds request-slot capacity")
     groups: dict[int, list[BatchPartition]] = defaultdict(list)
@@ -1900,9 +1917,25 @@ def _mixed_capability(
         for placement in partition.latent_placements
     }
     branch_counts: dict[tuple[RequestKey, int], int] = defaultdict(int)
+    generation = runtime.model.generation
+    if flow_operations and generation is None:
+        raise invalid_descriptor("tensorized mixed flow has no generation runtime")
     for partition in partitions:
-        for placement in partition.kv_branch_placements:
-            branch_counts[(placement.request_key, int(placement.op_id))] += 1
+        for index, operation in enumerate(partition.operations):
+            placement = flow_placements.get((operation.request_key, int(operation.op_id)))
+            query_len = (
+                None
+                if placement is None or generation is None
+                else generation.physical_tokens(int(placement.height), int(placement.width))
+            )
+            branch_counts[(operation.request_key, int(operation.op_id))] = min(
+                0 if generation is None else int(generation.max_cfg_branches),
+                sum(
+                    row.operation_index == index
+                    and (query_len is None or int(row.query_len) == int(query_len))
+                    for row in partition.forward_rows
+                ),
+            )
     geometries = {
         (
             int(flow_placements[(operation.request_key, int(operation.op_id))].height),
@@ -2212,6 +2245,13 @@ def _apply_release_controls(runtime, batch: Batch) -> None:
     runtime.device_products.release_operations(releases)
     runtime.encoder_cache.release_operations(releases)
     runtime.cache_publications.release_operations(releases)
+    consumed_predicates = tuple(
+        int(predicate.generation)
+        for operation in batch.operations
+        if (predicate := operation.predicate) is not None
+        and predicate.producer_op_id != operation.parent.producer_op_id
+    )
+    runtime.device_products.release_generations(consumed_predicates)
     if runtime.transport is not None:
         for identity in releases:
             _release_locators(runtime, runtime._transport_publications.pop(identity, ()))
@@ -2221,23 +2261,15 @@ def drop_session(runtime, session_id: int) -> None:
     """Release stage publications owned by one dropped request."""
 
     session = runtime.requests.peek(int(session_id))
-    if session is not None and runtime.runtime_states is not None:
-        runtime.runtime_states.release((int(session.request_pool_idx),))
+    if session is not None:
+        if runtime.runtime_states is not None:
+            runtime.runtime_states.release((int(session.request_pool_idx),))
+        runtime.req_to_token_pool.release((int(session.request_pool_idx),))
     runtime.cache_publications.drop(session_id)
-    branch_rows = tuple(
-        identity
-        for identity in runtime._branch_cache_rows
-        if int(identity[0].session_id) == int(session_id)
-    )
-    for branch_identity in branch_rows:
-        del runtime._branch_cache_rows[branch_identity]
-    request_rows = tuple(
-        identity
-        for identity in runtime._request_cache_pages
-        if int(identity[0].session_id) == int(session_id)
-    )
-    for request_identity in request_rows:
-        del runtime._request_cache_pages[request_identity]
+    if session is not None:
+        runtime.req_to_token_pool.release(
+            tuple(runtime._flow_prefix_slots.pop(session.request_key, ()))
+        )
     if runtime.transport is None:
         return
     selected = tuple(
@@ -2260,12 +2292,11 @@ def _bind_latent_rows(
     if pool is None:
         raise capability_mismatch("scheduler latent placement has no worker physical pool")
     operations = {
-        _operation_identity(operation): (operation, int(request_pool_idx))
-        for operation, request_pool_idx in zip(
-            partition.operations,
-            partition.request_pool_indices,
-            strict=True,
+        _operation_identity(operation): (
+            operation,
+            int(_request_row(runtime, scope, operation.request_key.session_id).request_pool_idx),
         )
+        for operation in partition.operations
     }
     rows: list[tuple[OperationIdentity, LatentPlacement, int]] = []
     for placement in partition.latent_placements:
@@ -2338,190 +2369,70 @@ def _latent_row(runtime, operation: Operation, scope: PartitionState) -> LatentE
     return row
 
 
-def _bind_cache_rows(
+def _bind_cache_tables(
     runtime,
     partition: BatchPartition,
     scope: PartitionState,
 ) -> None:
-    """Validate scheduler placement and zero exactly its declared fresh pages."""
+    """Install scheduler tables and retain row-aligned forward coordinates."""
 
-    bc_started = time.perf_counter_ns()
-    bc_zero_ns = 0
-    operations = {
-        (operation.request_key, operation.op_id): operation for operation in partition.operations
-    }
-    cache_rows: list[tuple[tuple[RequestKey, int, int], CacheRow, tuple[int, ...]]] = []
-    placement_updates: dict[tuple[RequestKey, int], tuple[int, int, tuple[int, ...]]] = {}
-    placement_contexts: list[
-        tuple[RequestRow, RequestRuntime, RequestRuntime, tuple[int, ...]]
-    ] = []
-    for placement in partition.kv_placements:
-        operation = operations.get((placement.request_key, placement.op_id))
-        if operation is None:
-            raise invalid_descriptor("KV placement names an operation outside its partition")
-        session = _request_row(runtime, scope, placement.request_key.session_id)
-        parent_runtime = _parent_runtime(runtime, operation, session)
-        committed_runtime = session.runtime_for(session.committed_version())
-        if committed_runtime is None:
-            raise invalid_descriptor("KV placement session has no committed runtime")
-        placement_identity = (placement.request_key, int(placement.group_id))
-        if placement.block_table_update:
-            pages = runtime.cache_pool.validate_pages(
-                placement.block_table,
-                scratch=False,
-                group=placement.group_id,
-            )
-            update = (
-                int(session.request_pool_idx),
-                int(placement.group_id),
+    started = time.perf_counter_ns()
+    tables = []
+    for table in partition.block_tables:
+        pages = runtime.cache_pool.validate_pages(table.page_ids, group=table.group_id)
+        if int(table.allocated_tokens) > len(pages) * runtime.cache_pool.block_size:
+            raise invalid_descriptor("block-table allocation exceeds physical capacity")
+        tables.append(
+            (
+                int(table.request_pool_idx),
+                int(table.group_id),
                 pages,
-            )
-            existing_update = placement_updates.get(placement_identity)
-            if existing_update is not None and existing_update != update:
-                raise invalid_descriptor("one batch changes a request page table more than once")
-            placement_updates[placement_identity] = update
-        else:
-            pending = placement_updates.get(placement_identity)
-            stored_pages = (
-                pending[2]
-                if pending is not None
-                else runtime._request_cache_pages.get(placement_identity)
-            )
-            if stored_pages is None:
-                raise invalid_descriptor(
-                    "KV placement reference has no published request page table"
-                )
-            pages = stored_pages
-        if len(pages) != int(operation.kv_capacity_pages):
-            raise invalid_descriptor(
-                "KV placement request page table does not match operation capacity"
-            )
-        placement_contexts.append((session, parent_runtime, committed_runtime, pages))
-    _record_component(scope, "bc_placements", bc_started)
-    bc_rows_started = time.perf_counter_ns()
-    for placement, (session, parent_runtime, committed_runtime, pages) in zip(
-        partition.kv_placements,
-        placement_contexts,
-        strict=True,
-    ):
-        zero_started = time.perf_counter_ns()
-        pages_to_zero = runtime.cache_pool.validate_pages(
-            placement.pages_to_zero,
-            scratch=False,
-            group=placement.group_id,
-        )
-        bc_zero_ns += time.perf_counter_ns() - zero_started
-        if placement.resulting_length > len(pages) * runtime.cache_pool.block_size:
-            raise invalid_descriptor("KV placement resulting extent exceeds its block table")
-        if placement.prefix_length != placement.visible_length:
-            raise invalid_descriptor("KV placement write cursor differs from its visible extent")
-        if placement.visible_length != parent_runtime.kv_visible_len:
-            raise invalid_descriptor("KV placement visible extent disagrees with its parent")
-        if committed_runtime.kv_visible_len > placement.visible_length:
-            raise invalid_descriptor("KV placement precedes the committed KV extent")
-        cache_rows.append(
-            (
-                (placement.request_key, placement.op_id, placement.group_id),
-                CacheRow(
-                    block_table=pages,
-                    length=placement.visible_length,
-                    capacity=len(pages) * runtime.cache_pool.block_size,
-                    group_id=placement.group_id,
-                    initialized_length=max(
-                        placement.visible_length,
-                        parent_runtime.kv_initialized_len,
-                    ),
-                    committed_length=committed_runtime.kv_visible_len,
-                    published_length=min(
-                        committed_runtime.kv_visible_len,
-                        max(
-                            parent_runtime.kv_published_len,
-                            runtime.cache_publications.published_extent(
-                                placement.request_key.session_id
-                            ),
-                        ),
-                    ),
-                ),
-                pages_to_zero,
+                int(table.allocated_tokens),
             )
         )
-    scope.component_us["bc_zero_validate"] = (
-        scope.component_us.get("bc_zero_validate", 0) + bc_zero_ns // 1000
-    )
-    _record_component(scope, "bc_rows", bc_rows_started)
-    bc_tail_started = time.perf_counter_ns()
-    branch_rows: list[
-        tuple[
-            tuple[RequestKey, int, int],
-            tuple[RequestKey, int, int, int],
-            CacheRow,
-            tuple[int, ...],
-        ]
-    ] = []
-    for branch_placement in partition.kv_branch_placements:
+    runtime.req_to_token_pool.install(tuple(tables))
+    for allocation in partition.new_cache_pages:
         pages = runtime.cache_pool.validate_pages(
-            branch_placement.block_table,
-            scratch=True,
-            group=branch_placement.group_id,
+            allocation.page_ids,
+            group=allocation.group_id,
         )
-        pages_to_zero = runtime.cache_pool.validate_pages(
-            branch_placement.pages_to_zero,
-            scratch=True,
-            group=branch_placement.group_id,
+        installed = runtime.req_to_token_pool.pages(
+            allocation.request_pool_idx, allocation.group_id
         )
-        persistent_identity = (
-            branch_placement.request_key,
-            branch_placement.branch_index,
-            branch_placement.group_id,
+        if not set(pages).issubset(installed):
+            raise invalid_descriptor("new cache pages are outside the installed block table")
+        runtime.cache_pool.zero_pages(allocation.group_id, pages)
+
+    rows_by_operation: dict[int, list] = defaultdict(list)
+    for row in partition.forward_rows:
+        rows_by_operation[int(row.operation_index)].append(row)
+
+    for operation_index, operation in enumerate(partition.operations):
+        session = _request_row(runtime, scope, operation.request_key.session_id)
+        main_slot = int(session.request_pool_idx)
+        parent_runtime = _parent_runtime(runtime, operation, session)
+        operation_rows = rows_by_operation.get(operation_index, [])
+        scope.forward_rows[_operation_identity(operation)] = tuple(operation_rows)
+        main_descriptor = next(
+            (row for row in operation_rows if int(row.request_pool_index) == main_slot),
+            None,
         )
-        if pages_to_zero:
-            if set(pages_to_zero) != set(pages):
-                raise invalid_descriptor(
-                    "fresh generation KV placement must initialize its complete block table"
-                )
-            row = CacheRow(
-                block_table=pages,
-                length=0,
-                capacity=len(pages) * runtime.cache_pool.block_size,
-                group_id=branch_placement.group_id,
-            )
-        else:
-            continued_row = runtime._branch_cache_rows.get(persistent_identity)
-            if continued_row is None:
-                raise invalid_descriptor(
-                    "generation KV placement continues an unknown physical branch"
-                )
-            row = replace(continued_row)
-            if row.block_table != pages or row.group_id != branch_placement.group_id:
-                raise invalid_descriptor(
-                    "generation KV continuation changes its physical branch placement"
-                )
-        branch_rows.append(
-            (
-                persistent_identity,
-                (
-                    branch_placement.request_key,
-                    branch_placement.op_id,
-                    branch_placement.branch_index,
-                    branch_placement.group_id,
-                ),
-                row,
-                pages_to_zero,
-            )
-        )
-    for identity, (_slot, _group, pages) in placement_updates.items():
-        runtime._request_cache_pages[identity] = pages
-    runtime.cache_pool.publish_request_placements(tuple(placement_updates.values()))
-    for cache_identity, row, pages_to_zero in cache_rows:
-        if pages_to_zero:
-            runtime.cache_pool.zero_pages(row.group_id, pages_to_zero)
-        scope.cache_rows[cache_identity] = row
-    for persistent_identity, branch_identity, row, pages_to_zero in branch_rows:
-        if pages_to_zero:
-            runtime.cache_pool.zero_pages(row.group_id, pages_to_zero)
-        scope.branch_publications[persistent_identity] = row
-        scope.branch_rows[branch_identity] = row
-    _record_component(scope, "bc_tail", bc_tail_started)
+        if main_descriptor is not None and int(main_descriptor.seq_len) != int(
+            parent_runtime.kv_visible_len
+        ):
+            raise invalid_descriptor("forward row sequence length disagrees with its parent")
+        for descriptor in operation_rows:
+            slot = int(descriptor.request_pool_index)
+            runtime.req_to_token_pool.pages(slot, 0)
+            if (
+                slot != main_slot
+                and int(descriptor.seq_len)
+                > runtime.req_to_token_pool.allocated_length(slot)
+            ):
+                raise invalid_descriptor("forward row exceeds alternative-prefix capacity")
+            if slot != main_slot:
+                runtime._flow_prefix_slots.setdefault(operation.request_key, set()).add(slot)
+    _record_component(scope, "bc_tables", started)
 
 
 def _request_row(runtime, scope: PartitionState, session_id: int) -> RequestRow:
@@ -2605,49 +2516,50 @@ def parent_runtime(runtime, operation: Operation, request: RequestRow) -> Reques
     return _parent_runtime(runtime, operation, request)
 
 
-def _cache_row(
+def _cache_coordinates(
     runtime,
     operation: Operation,
     scope: PartitionState,
     *,
     group_id: int = 0,
-) -> CacheRow:
-    row = scope.cache_rows.get((operation.request_key, operation.op_id, int(group_id)))
-    if row is None:
-        raise invalid_descriptor("operation has no scheduler KV placement")
-    return row
+) -> tuple[int, int, int, int]:
+    request = _request_row(runtime, scope, operation.request_key.session_id)
+    slot = int(request.request_pool_idx)
+    rows = scope.forward_rows.get(_operation_identity(operation), ())
+    descriptor = next(
+        (row for row in rows if int(row.request_pool_index) == slot),
+        None,
+    )
+    parent = _parent_runtime(runtime, operation, request)
+    visible = int(parent.kv_visible_len) if descriptor is None else int(descriptor.seq_len)
+    runtime.req_to_token_pool.pages(slot, group_id)
+    capacity = runtime.req_to_token_pool.allocated_length(slot)
+    if visible > capacity:
+        raise invalid_descriptor("operation visibility exceeds scheduler block table")
+    return slot, int(group_id), visible, capacity
 
 
 def _logical_lengths(
     runtime,
     operation: Operation,
     session: RequestRow,
-    row: CacheRow | None,
+    cache: tuple[int, int, int, int] | None,
     *,
     latent_len: int | None = None,
+    computed_len: int | None = None,
 ) -> LogicalLengths:
-    if row is None:
-        runtime = _parent_runtime(runtime, operation, session)
-        reserved = runtime.kv_reserved_len
-        initialized = runtime.kv_initialized_len
-        visible = runtime.kv_visible_len
-        committed = runtime.kv_committed_len
-        published = runtime.kv_published_len
+    parent = _parent_runtime(runtime, operation, session)
+    if cache is None:
+        visible = parent.kv_visible_len
+        computed = parent.kv_computed_len
     else:
-        extents = row.extents()
-        reserved = extents.reserved
-        initialized = extents.initialized
-        visible = extents.visible
-        committed = extents.committed
-        published = extents.published
+        _slot, _group, visible, _capacity = cache
+        computed = visible if computed_len is None else int(computed_len)
     return LogicalLengths(
         token_len=session.logical_position,
         kv_visible_len=visible,
+        kv_computed_len=computed,
         latent_len=session.flow_step if latent_len is None else int(latent_len),
-        kv_reserved_len=reserved,
-        kv_initialized_len=initialized,
-        kv_committed_len=committed,
-        kv_published_len=published,
     )
 
 
@@ -3123,7 +3035,6 @@ def _group_key(runtime, task: ForwardRow) -> tuple[object, ...]:
             and not runtime.runner.uses_lanes
             else _task_shape(runtime, task)
         ),
-        bool(task.write_kv),
     )
 
 
@@ -3143,25 +3054,15 @@ def _run_forward_group(
 ) -> ForwardResult:
     target = _phase_device(runtime, tasks[0].phase)
     scope.completion.register_device(target)
-    kv_tasks = tuple(task for task in tasks if task.write_kv)
-    if kv_tasks and len(kv_tasks) != len(tasks):
-        raise invalid_descriptor("one physical call cannot mix KV and non-KV rows")
-    kv_view: KvView | EmptyKvView
-    attention: AttnPlan
-    if kv_tasks:
-        kv_view, attention = _attention_plan(runtime, tasks)
-    else:
-        kv_view = EmptyKvView()
-        attention = NoAttention(
-            backends=_attention_selection(
-                runtime,
-            )
-        )
+    attention = (
+        _attention_columns(runtime, tasks)
+        if all(task.phase in {ModelPhase.TEXT, ModelPhase.DENOISE} for task in tasks)
+        else _dense_attention_columns(len(tasks), tuple(task.query_tokens for task in tasks))
+    )
     mesh = RouteMeshView(runtime.mesh, _phase_topology(runtime, tasks[0].phase))
     result = runtime.runner.forward(
         tasks,
         device=target,
-        kv=kv_view,
         attention=attention,
         mesh=mesh,
         graph_shape=_group_graph_shape(runtime, tasks),

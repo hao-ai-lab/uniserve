@@ -509,7 +509,6 @@ impl GenerationCursor {
                 blocks_sent: 0,
                 reserve_worstcase,
                 worstcase_blocks,
-                host_scratch_tokens: 0,
             },
             replay: ReplayCursor {
                 block_hashes: Vec::new(),
@@ -802,12 +801,11 @@ pub struct ResourceCursor {
     pub(crate) blocks_sent: usize,
     pub(crate) reserve_worstcase: bool,
     pub(crate) worstcase_blocks: usize,
-    pub(crate) host_scratch_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayCursor {
-    pub(crate) block_hashes: Vec<u64>,
+    pub(crate) block_hashes: Vec<Vec<u64>>,
     pub(crate) prefix_cached_blocks: usize,
     pub(crate) blocks_cached: bool,
     pub(crate) generated_ids: Vec<u32>,
@@ -976,7 +974,6 @@ pub(crate) enum TransitionIntent {
         step_count: u16,
         cfg: CfgParams,
         latent_units: u64,
-        host_scratch_tokens: u64,
         conditioning: ProductRef,
         latent: ProductRef,
     },
@@ -1109,14 +1106,7 @@ impl GenerationPlanner {
     ) -> Result<PlannedTransition, PlanningError> {
         let und_visibility = request.behavior.und_tokens;
         let image_visible = request.behavior.gen_output;
-        let (
-            wire,
-            delta,
-            encoder_pins,
-            replayability_after_apply,
-            latent_units,
-            host_scratch_tokens,
-        ) = match intent {
+        let (wire, delta, encoder_pins, replayability_after_apply, latent_units, _) = match intent {
             TransitionIntent::IngestText {
                 segment_index,
                 prompt_start,
@@ -1471,7 +1461,6 @@ impl GenerationPlanner {
                 step_count,
                 cfg,
                 latent_units,
-                host_scratch_tokens,
                 conditioning,
                 latent,
             } => {
@@ -1511,7 +1500,7 @@ impl GenerationPlanner {
                     Vec::new(),
                     Replayability::NotReplayable,
                     latent_units,
-                    host_scratch_tokens,
+                    0,
                 )
             }
             TransitionIntent::CommitGen { image_id, latent } => {
@@ -1681,7 +1670,6 @@ impl GenerationPlanner {
             }
         };
         let operation_variant = wire.work.variant();
-        let is_flow = operation_variant == WorkVariant::GenFlow;
         let produces_latent = matches!(
             operation_variant,
             WorkVariant::GenTransition | WorkVariant::GenFlow
@@ -1728,13 +1716,12 @@ impl GenerationPlanner {
         let resources = TransitionResources {
             new_blocks: new_blocks_len,
             kv_target_tokens,
-            host_scratch_tokens: if is_flow { host_scratch_tokens } else { 0 },
             latent_units: if produces_latent { latent_units } else { 0 },
             cfg_branches: wire.cfg_branches,
             encoder_pins,
             replayability_after_apply,
             release_on_apply: if is_materialize {
-                vec![ResourceClass::ImageLatent, ResourceClass::Scratch]
+                vec![ResourceClass::ImageLatent]
             } else {
                 Vec::new()
             },
@@ -1850,7 +1837,6 @@ impl GenerationPlanner {
             planned_us: uniserve_core::now_monotonic_us(),
             reserved_us: 0,
             new_blocks: wire.new_blocks,
-            kv_capacity_pages: 0,
             token_cost: wire.token_cost,
             input_tokens: wire.input_tokens,
             input_image_bytes: wire.input_image_bytes,
@@ -2031,7 +2017,6 @@ pub(crate) struct PlannedTransition {
     pub(crate) planned_us: u64,
     pub(crate) reserved_us: u64,
     pub(crate) new_blocks: Vec<BlockId>,
-    pub(crate) kv_capacity_pages: u32,
     pub(crate) token_cost: usize,
     /// Host-known input token values the operation's forward consumes.
     pub(crate) input_tokens: Vec<u32>,
@@ -2162,7 +2147,6 @@ impl PlannedTransition {
             self.bounds,
             inputs,
             outputs,
-            self.kv_capacity_pages,
             self.predicate,
             self.rng,
             self.control_seq,
@@ -2340,7 +2324,6 @@ impl TransitionDelta {
 pub(crate) struct TransitionResources {
     pub(crate) new_blocks: usize,
     pub(crate) kv_target_tokens: Option<usize>,
-    pub(crate) host_scratch_tokens: u64,
     pub(crate) latent_units: u64,
     /// CFG branch count for a denoise operation; the physical denoise token cost
     /// multiplies the latent geometry by this. One for every other work variant.
@@ -2793,6 +2776,7 @@ mod tests {
             logical_lengths: LogicalLengths {
                 token_len: 1,
                 kv_visible_len: 2,
+                kv_computed_len: 2,
                 latent_len: 0,
                 ..LogicalLengths::default()
             },

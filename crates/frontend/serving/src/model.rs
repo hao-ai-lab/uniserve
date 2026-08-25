@@ -583,8 +583,6 @@ impl Qwen3Desc {
         let resource_accounting = ResourceAccounting {
             expected_kv_tokens: resources.max_kv_tokens as u64,
             image_latent_units: 0,
-            scratch_units: 0,
-            host_scratch_tokens: 0,
             encoder_cache_pins: 0,
             replayable: true,
         };

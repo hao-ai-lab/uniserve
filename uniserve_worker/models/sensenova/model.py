@@ -15,9 +15,8 @@ from ...batch import WorkVariant
 from ...execution.forward_batch import (
     ExpertRoute,
     ForwardBatch,
+    ForwardMode,
     ForwardOutput,
-    PackedAttentionPlan,
-    PagedDecodePlan,
     RouteSpan,
     TokenSelection,
 )
@@ -67,7 +66,6 @@ from ..runtime import (
     ExecutionModel,
     PositionLayout,
     ResourceGeometry,
-    ScratchGeometry,
 )
 from .config import NeoChatConfig, NeoLlmConfig, NeoVisionConfig
 
@@ -567,17 +565,16 @@ class _SenseDecoder(nn.Module):
         if inputs.ndim != 2:
             raise ValueError("SenseNova decoder inputs must have shape [tokens, hidden]")
         token_count = int(inputs.shape[0])
-        attention = context.attention
         spans: tuple[RouteSpan, ...]
         indexes: torch.Tensor
         causal: bool
-        if isinstance(attention, PackedAttentionPlan):
-            if tuple(attention.indexes.shape) != (3, token_count):
+        if context.forward_mode is ForwardMode.PACKED:
+            if context.attention_indexes is None or tuple(context.attention_indexes.shape) != (3, token_count):
                 raise ValueError("SenseNova positions must have shape [3, tokens]")
-            spans = attention.route_spans
-            indexes = attention.indexes
+            spans = context.route_spans
+            indexes = context.attention_indexes
             causal = False
-        elif isinstance(attention, PagedDecodePlan):
+        elif context.forward_mode is ForwardMode.PAGED_DECODE:
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("SenseNova paged decode positions must align with text tokens")
             spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)
@@ -800,7 +797,6 @@ class NEOChatModel(ExecutionModel):
         self.resource_geometry = ResourceGeometry(
             encoder_cache_entries=256,
             latent_downsample=latent_downsample,
-            scratch=ScratchGeometry(minimum_blocks=8, mirror_kv=True, latent_copies=4),
         )
         self.supported_work = frozenset(
             {
@@ -912,9 +908,8 @@ class NEOChatModel(ExecutionModel):
         positions: torch.Tensor,
         batch: ForwardBatch,
     ) -> torch.Tensor:
-        attention = batch.attention
         decode_positions: torch.Tensor | None = None
-        if isinstance(attention, PagedDecodePlan):
+        if batch.forward_mode is ForwardMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("SenseNova paged decode accepts token rows only")
             decode_positions = positions
@@ -930,7 +925,11 @@ class NEOChatModel(ExecutionModel):
         flow_embeddings = self._flow_embeddings(batch) if batch.flow_row_indices else {}
         chunks: list[torch.Tensor | None] = [None] * batch.row_count
         token_offset = 0
-        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+        for row_index, count in zip(
+            batch.token_row_indices,
+            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
+            strict=True,
+        ):
             chunks[row_index] = token_embeds[token_offset : token_offset + count]
             token_offset += count
         for row_index in batch.flow_row_indices:
@@ -948,7 +947,11 @@ class NEOChatModel(ExecutionModel):
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
         row_lengths = [0] * batch.row_count
-        for row_index, count in zip(batch.token_row_indices, batch.query_lens, strict=True):
+        for row_index, count in zip(
+            batch.token_row_indices,
+            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
+            strict=True,
+        ):
             row_lengths[row_index] = count
         for row_index, count in zip(batch.flow_row_indices, batch.flow_image_tokens, strict=True):
             row_lengths[row_index] = count

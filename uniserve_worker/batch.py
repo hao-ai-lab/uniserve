@@ -241,9 +241,9 @@ def native_partition(
     attention: AttentionRegime,
     shape_class: int,
     operations: tuple[Operation, ...],
-    request_pool_indices: tuple[int, ...],
-    kv_placements: tuple[KvPlacement, ...],
-    kv_branch_placements: Sequence[object],
+    block_tables: tuple[BlockTable, ...],
+    new_cache_pages: tuple[CachePageAllocation, ...],
+    forward_rows: tuple[ForwardRow, ...],
     latent_placements: Sequence[object],
 ) -> BatchPartition:
     """Assemble a partition from transport-constructed members.
@@ -264,16 +264,9 @@ def native_partition(
     set_field(partition, "attention", attention)
     set_field(partition, "shape_class", shape_class)
     set_field(partition, "operations", operations)
-    set_field(partition, "request_pool_indices", request_pool_indices)
-    set_field(partition, "kv_placements", kv_placements)
-    set_field(
-        partition,
-        "kv_branch_placements",
-        tuple(
-            KvBranchPlacement.from_wire(item, f"partition.kv_branch_placements[{index}]")
-            for index, item in enumerate(kv_branch_placements)
-        ),
-    )
+    set_field(partition, "block_tables", block_tables)
+    set_field(partition, "new_cache_pages", new_cache_pages)
+    set_field(partition, "forward_rows", forward_rows)
     set_field(
         partition,
         "latent_placements",
@@ -419,7 +412,6 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "bounds",
         "inputs",
         "outputs",
-        "kv_capacity_pages",
         "predicate",
         "rng",
         "control_seq",
@@ -453,31 +445,17 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "timing_counters",
     ),
     ("version", "digest", "locator"),
-    ("prefix_len", "group_id"),
-    ("sampling", "negative_token_ids", "finish_token_ids", "kv"),
+    ("sampling", "negative_token_ids", "finish_token_ids", "initial_position"),
     ("request_key", "request_pool_idx", "digest", "und", "gen_admission"),
     (
-        "request_key",
-        "op_id",
+        "request_pool_idx",
         "group_id",
-        "block_table",
-        "block_table_update",
-        "pages_to_zero",
-        "prefix_length",
-        "input_length",
-        "visible_length",
-        "resulting_length",
+        "page_ids",
+        "allocated_tokens",
     ),
-    (
-        "request_key",
-        "op_id",
-        "branch_index",
-        "group_id",
-        "block_table",
-        "pages_to_zero",
-    ),
-    ("group_id", "page_ids", "length"),
-    ("request_key", "request_pool_idx", "cache_groups", "latent_page_table"),
+    ("request_pool_idx", "group_id", "page_ids"),
+    ("operation_index", "request_pool_index", "seq_len", "query_len"),
+    ("request_key", "request_pool_idx", "block_tables", "latent_page_table"),
     ("group_id", "source_page", "destination_page"),
     (
         "request_key",
@@ -499,9 +477,9 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "attention",
         "shape_class",
         "operations",
-        "request_pool_indices",
-        "kv_placements",
-        "kv_branch_placements",
+        "block_tables",
+        "new_cache_pages",
+        "forward_rows",
         "latent_placements",
     ),
     (
@@ -510,7 +488,6 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "num_layers",
         "num_kv_heads",
         "head_dim",
-        "scratch_capacity_tokens",
         "supported_work",
         "latent_page_units",
         "num_latent_pages",
@@ -571,11 +548,8 @@ def protocol_layout_digest() -> str:
     logical_lengths = (
         "token_len",
         "kv_visible_len",
+        "kv_computed_len",
         "latent_len",
-        "kv_reserved_len",
-        "kv_initialized_len",
-        "kv_committed_len",
-        "kv_published_len",
     )
     digest.u64(len(logical_lengths))
     for name in logical_lengths:
@@ -808,30 +782,6 @@ class ImageParams:
             "max_images": self.max_images,
             "image_prompts": list(self.image_prompts),
             "retain_images": self.retain_images,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class KvAdmission:
-    prefix_len: int = 0
-    group_id: int = 0
-
-    def __post_init__(self) -> None:
-        _nonnegative(self.prefix_len, "kv.prefix_len")
-        _nonnegative(self.group_id, "kv.group_id")
-
-    @classmethod
-    def from_wire(cls, value: object, where: str = "kv") -> KvAdmission:
-        data = _map(value, where)
-        return cls(
-            prefix_len=_uint(data.get("prefix_len", 0), f"{where}.prefix_len"),
-            group_id=_uint(data.get("group_id", 0), f"{where}.group_id"),
-        )
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "prefix_len": self.prefix_len,
-            "group_id": self.group_id,
         }
 
 
@@ -1250,7 +1200,6 @@ class Operation:
     bounds: Bounds
     inputs: tuple[ProductRef, ...]
     outputs: tuple[ProductRef, ...]
-    kv_capacity_pages: int
     predicate: ProductRef | None
     rng: Rng | None
     control_seq: int
@@ -1269,7 +1218,6 @@ class Operation:
         bounds: Bounds,
         inputs: tuple[ProductRef, ...] = (),
         outputs: tuple[ProductRef, ...] = (),
-        kv_capacity_pages: int = 0,
         predicate: ProductRef | None = None,
         rng: Rng | None = None,
         control_seq: int = 0,
@@ -1285,7 +1233,6 @@ class Operation:
             bounds=bounds,
             inputs=inputs,
             outputs=outputs,
-            kv_capacity_pages=kv_capacity_pages,
             predicate=predicate,
             rng=rng,
             control_seq=control_seq,
@@ -1313,7 +1260,6 @@ class Operation:
         buf += _PACK_Q(len(self.outputs))
         for product in self.outputs:
             _digest_product_ref(digest, product)
-        digest.u32(self.kv_capacity_pages)
         if self.predicate is None:
             buf += b"\x00"
         else:
@@ -1340,8 +1286,6 @@ class Operation:
             raise invalid_descriptor("operation parent belongs to another request lineage")
         if self.work.requires_fixed_parent and not isinstance(self.parent.point, FixedPoint):
             raise invalid_descriptor("operation requires a fixed semantic parent")
-        if self.bounds.max_kv_pages > self.kv_capacity_pages:
-            raise invalid_descriptor("operation KV growth bound exceeds its logical capacity")
         output_indices: set[int] = set()
         for product in self.outputs:
             if product.request_key != self.request_key or product.producer_op_id != self.op_id:
@@ -1485,9 +1429,6 @@ class Operation:
                 ProductRef.from_wire(item, f"{where}.outputs[{index}]")
                 for index, item in enumerate(_seq(data.get("outputs", ()), f"{where}.outputs"))
             )
-        kv_capacity_pages = get("kv_capacity_pages", 0)
-        if not (type(kv_capacity_pages) is int and kv_capacity_pages >= 0):
-            kv_capacity_pages = _uint(kv_capacity_pages, f"{where}.kv_capacity_pages")
         predicate_raw = get("predicate")
         if predicate_raw is None:
             predicate = None
@@ -1521,7 +1462,6 @@ class Operation:
             set_field(operation, "bounds", bounds)
             set_field(operation, "inputs", inputs)
             set_field(operation, "outputs", outputs)
-            set_field(operation, "kv_capacity_pages", kv_capacity_pages)
             set_field(operation, "predicate", predicate)
             set_field(operation, "rng", rng)
             set_field(operation, "control_seq", control_seq)
@@ -1538,7 +1478,6 @@ class Operation:
             bounds=bounds,
             inputs=inputs,
             outputs=outputs,
-            kv_capacity_pages=kv_capacity_pages,
             predicate=predicate,
             rng=rng,
             control_seq=control_seq,
@@ -1559,7 +1498,6 @@ class Operation:
             "bounds": self.bounds.to_wire(),
             "inputs": [product.to_wire() for product in self.inputs],
             "outputs": [product.to_wire() for product in self.outputs],
-            "kv_capacity_pages": self.kv_capacity_pages,
             "predicate": None if self.predicate is None else self.predicate.to_wire(),
             "rng": None if self.rng is None else self.rng.to_wire(),
             "control_seq": self.control_seq,
@@ -1571,11 +1509,8 @@ class Operation:
 class LogicalLengths:
     token_len: int = 0
     kv_visible_len: int = 0
+    kv_computed_len: int = 0
     latent_len: int = 0
-    kv_reserved_len: int = 0
-    kv_initialized_len: int = 0
-    kv_committed_len: int = 0
-    kv_published_len: int = 0
 
     @classmethod
     def from_wire(cls, value: object, where: str = "logical_lengths") -> LogicalLengths:
@@ -1583,24 +1518,16 @@ class LogicalLengths:
         return cls(
             token_len=_uint(data.get("token_len"), f"{where}.token_len"),
             kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),
+            kv_computed_len=_uint(data.get("kv_computed_len"), f"{where}.kv_computed_len"),
             latent_len=_uint(data.get("latent_len"), f"{where}.latent_len"),
-            kv_reserved_len=_uint(data.get("kv_reserved_len", 0), f"{where}.kv_reserved_len"),
-            kv_initialized_len=_uint(
-                data.get("kv_initialized_len", 0), f"{where}.kv_initialized_len"
-            ),
-            kv_committed_len=_uint(data.get("kv_committed_len", 0), f"{where}.kv_committed_len"),
-            kv_published_len=_uint(data.get("kv_published_len", 0), f"{where}.kv_published_len"),
         )
 
     def to_wire(self) -> dict[str, object]:
         return {
             "token_len": self.token_len,
             "kv_visible_len": self.kv_visible_len,
+            "kv_computed_len": self.kv_computed_len,
             "latent_len": self.latent_len,
-            "kv_reserved_len": self.kv_reserved_len,
-            "kv_initialized_len": self.kv_initialized_len,
-            "kv_committed_len": self.kv_committed_len,
-            "kv_published_len": self.kv_published_len,
         }
 
 
@@ -1706,6 +1633,8 @@ class CompletionRecord:
     def validate(self) -> None:
         if self.op_id < 1:
             raise invalid_descriptor("completion op id must be positive")
+        if self.logical_lengths.kv_visible_len > self.logical_lengths.kv_computed_len:
+            raise invalid_descriptor("completion selected KV length exceeds computed length")
         if self.completion_slot_generation < 1:
             raise invalid_descriptor("completion slot generation must be positive")
         if not _is_digest(self.semantic_digest):
@@ -1780,11 +1709,8 @@ class CompletionRecord:
             "logical_lengths": {
                 "token_len": lengths.token_len,
                 "kv_visible_len": lengths.kv_visible_len,
+                "kv_computed_len": lengths.kv_computed_len,
                 "latent_len": lengths.latent_len,
-                "kv_reserved_len": lengths.kv_reserved_len,
-                "kv_initialized_len": lengths.kv_initialized_len,
-                "kv_committed_len": lengths.kv_committed_len,
-                "kv_published_len": lengths.kv_published_len,
             },
             "token_span": {"base": span.base, "len": span.len},
             "committed_tokens": list(self.committed_tokens),
@@ -1956,9 +1882,10 @@ class UndAdmission:
     sampling: SamplingParams = field(default_factory=SamplingParams)
     negative_token_ids: tuple[int, ...] = ()
     finish_token_ids: tuple[int, ...] = ()
-    kv: KvAdmission = field(default_factory=KvAdmission)
+    initial_position: int = 0
 
     def __post_init__(self) -> None:
+        _nonnegative(self.initial_position, "und admission initial position")
         if any(
             left >= right
             for left, right in zip(
@@ -1978,7 +1905,9 @@ class UndAdmission:
                 data.get("negative_token_ids", ()), f"{where}.negative_token_ids"
             ),
             finish_token_ids=_uints(data.get("finish_token_ids", ()), f"{where}.finish_token_ids"),
-            kv=KvAdmission.from_wire(data.get("kv", {}), f"{where}.kv"),
+            initial_position=_uint(
+                data.get("initial_position", 0), f"{where}.initial_position"
+            ),
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -1986,7 +1915,7 @@ class UndAdmission:
             "sampling": self.sampling.to_wire(),
             "negative_token_ids": list(self.negative_token_ids),
             "finish_token_ids": list(self.finish_token_ids),
-            "kv": self.kv.to_wire(),
+            "initial_position": self.initial_position,
         }
 
 
@@ -2076,211 +2005,151 @@ class Admission:
 
 
 @dataclass(frozen=True, slots=True)
-class KvPlacement:
-    request_key: RequestKey
-    op_id: int
-    group_id: int
-    block_table: tuple[int, ...]
-    block_table_update: bool
-    pages_to_zero: tuple[int, ...]
-    prefix_length: int
-    input_length: int
-    visible_length: int
-    resulting_length: int
-
-    def __post_init__(self) -> None:
-        if self.op_id < 1:
-            raise invalid_descriptor("KV placement operation id must be positive")
-        if self.group_id < 0:
-            raise invalid_descriptor("KV placement contains an invalid group")
-        if type(self.block_table_update) is not bool:
-            raise invalid_descriptor("KV placement block-table update flag must be boolean")
-        if self.block_table_update:
-            if any(value < 1 for value in self.block_table):
-                raise invalid_descriptor("KV placement carries the reserved page zero")
-            if any(value < 1 for value in self.pages_to_zero):
-                raise invalid_descriptor("KV placement carries the reserved page zero")
-            if len(set(self.block_table)) != len(self.block_table):
-                raise invalid_descriptor("KV placement repeats a page in its block table")
-            if len(set(self.pages_to_zero)) != len(self.pages_to_zero):
-                raise invalid_descriptor("KV placement repeats a page-to-zero")
-            if not set(self.pages_to_zero).issubset(self.block_table):
-                raise invalid_descriptor("KV placement zeroes a page outside its block table")
-        elif self.block_table or self.pages_to_zero:
-            raise invalid_descriptor("KV placement reference carries a block-table update")
-        if (
-            self.visible_length < self.prefix_length
-            or self.resulting_length < self.visible_length
-            or self.prefix_length + self.input_length != self.resulting_length
-        ):
-            raise invalid_descriptor("KV placement lengths are inconsistent")
-
-    @classmethod
-    def from_wire(
-        cls,
-        value: object,
-        where: str = "KV placement",
-        *,
-        _validated_wire: bool = False,
-    ) -> KvPlacement:
-        data = _map(value, where)
-        request_key = _fast_request_key(data.get("request_key"))
-        if request_key is None:
-            request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.request_key")
-
-        def uint_field(name: str) -> int:
-            raw = data.get(name)
-            return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
-
-        block_table = _fast_uints(data.get("block_table", ()))
-        if block_table is None:
-            block_table = _uints(data.get("block_table", ()), f"{where}.block_table")
-        pages_to_zero = _fast_uints(data.get("pages_to_zero", ()))
-        if pages_to_zero is None:
-            pages_to_zero = _uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero")
-        fields = (
-            request_key,
-            uint_field("op_id"),
-            uint_field("group_id"),
-            block_table,
-            _bool(data.get("block_table_update"), f"{where}.block_table_update"),
-            pages_to_zero,
-            uint_field("prefix_length"),
-            uint_field("input_length"),
-            uint_field("visible_length"),
-            uint_field("resulting_length"),
-        )
-        if _validated_wire:
-            placement = object.__new__(cls)
-            for name, item in zip(cls.__slots__, fields, strict=True):
-                object.__setattr__(placement, name, item)
-            return placement
-        return cls(*fields)
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "request_key": self.request_key.to_wire(),
-            "op_id": self.op_id,
-            "group_id": self.group_id,
-            "block_table": list(self.block_table),
-            "block_table_update": self.block_table_update,
-            "pages_to_zero": list(self.pages_to_zero),
-            "prefix_length": self.prefix_length,
-            "input_length": self.input_length,
-            "visible_length": self.visible_length,
-            "resulting_length": self.resulting_length,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class KvBranchPlacement:
-    request_key: RequestKey
-    op_id: int
-    branch_index: int
-    group_id: int
-    block_table: tuple[int, ...]
-    pages_to_zero: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if self.op_id < 1 or self.branch_index < 1 or self.group_id < 0:
-            raise invalid_descriptor("KV branch placement identity is invalid")
-        if (
-            not self.block_table
-            or any(page < 1 for page in self.block_table)
-            or len(set(self.block_table)) != len(self.block_table)
-        ):
-            raise invalid_descriptor(
-                "KV branch placement is empty, repeats a page, or carries page zero"
-            )
-        if (
-            any(page < 1 for page in self.pages_to_zero)
-            or len(set(self.pages_to_zero)) != len(self.pages_to_zero)
-            or not set(self.pages_to_zero).issubset(self.block_table)
-        ):
-            raise invalid_descriptor("KV branch placement zero set is invalid")
-
-    @classmethod
-    def from_wire(
-        cls,
-        value: object,
-        where: str = "KV branch placement",
-        *,
-        _validated_wire: bool = False,
-    ) -> KvBranchPlacement:
-        data = _map(value, where)
-        request_key = _fast_request_key(data.get("request_key"))
-        if request_key is None:
-            request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.request_key")
-
-        def uint_field(name: str) -> int:
-            raw = data.get(name)
-            return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
-
-        block_table = _fast_uints(data.get("block_table", ()))
-        if block_table is None:
-            block_table = _uints(data.get("block_table", ()), f"{where}.block_table")
-        pages_to_zero = _fast_uints(data.get("pages_to_zero", ()))
-        if pages_to_zero is None:
-            pages_to_zero = _uints(data.get("pages_to_zero", ()), f"{where}.pages_to_zero")
-        fields = (
-            request_key,
-            uint_field("op_id"),
-            uint_field("branch_index"),
-            uint_field("group_id"),
-            block_table,
-            pages_to_zero,
-        )
-        if _validated_wire:
-            placement = object.__new__(cls)
-            for name, item in zip(cls.__slots__, fields, strict=True):
-                object.__setattr__(placement, name, item)
-            return placement
-        return cls(*fields)
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "request_key": self.request_key.to_wire(),
-            "op_id": self.op_id,
-            "branch_index": self.branch_index,
-            "group_id": self.group_id,
-            "block_table": list(self.block_table),
-            "pages_to_zero": list(self.pages_to_zero),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class CacheGroupPlacement:
+class BlockTable:
+    request_pool_idx: int
     group_id: int
     page_ids: tuple[int, ...]
-    length: int
+    allocated_tokens: int
 
     def __post_init__(self) -> None:
         if (
-            self.group_id < 0
-            or self.length < 0
+            self.request_pool_idx < 1
+            or self.group_id < 0
+            or self.allocated_tokens < 0
+            or any(page < 1 for page in self.page_ids)
+            or len(set(self.page_ids)) != len(self.page_ids)
+            or (not self.page_ids and self.allocated_tokens != 0)
+        ):
+            raise invalid_descriptor("block table is invalid")
+
+    @classmethod
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "block table",
+        *,
+        _validated_wire: bool = False,
+    ) -> BlockTable:
+        data = _map(value, where)
+        def uint_field(name: str) -> int:
+            raw = data.get(name)
+            return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
+
+        page_ids = _fast_uints(data.get("page_ids", ()))
+        if page_ids is None:
+            page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
+        fields = (
+            uint_field("request_pool_idx"),
+            uint_field("group_id"),
+            page_ids,
+            uint_field("allocated_tokens"),
+        )
+        if _validated_wire:
+            placement = object.__new__(cls)
+            for name, item in zip(cls.__slots__, fields, strict=True):
+                object.__setattr__(placement, name, item)
+            return placement
+        return cls(*fields)
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_pool_idx": self.request_pool_idx,
+            "group_id": self.group_id,
+            "page_ids": list(self.page_ids),
+            "allocated_tokens": self.allocated_tokens,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CachePageAllocation:
+    request_pool_idx: int
+    group_id: int
+    page_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.request_pool_idx < 1
+            or self.group_id < 0
+            or not self.page_ids
             or any(page < 1 for page in self.page_ids)
             or len(set(self.page_ids)) != len(self.page_ids)
         ):
-            raise invalid_descriptor("cache recovery placement is invalid")
+            raise invalid_descriptor("cache-page allocation is invalid")
 
     @classmethod
     def from_wire(
         cls,
         value: object,
-        where: str = "cache recovery placement",
-    ) -> CacheGroupPlacement:
+        where: str = "cache-page allocation",
+        *,
+        _validated_wire: bool = False,
+    ) -> CachePageAllocation:
+        data = _map(value, where)
+        def uint_field(name: str) -> int:
+            raw = data.get(name)
+            return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
+
+        page_ids = _fast_uints(data.get("page_ids", ()))
+        if page_ids is None:
+            page_ids = _uints(data.get("page_ids", ()), f"{where}.page_ids")
+        fields = (
+            uint_field("request_pool_idx"),
+            uint_field("group_id"),
+            page_ids,
+        )
+        if _validated_wire:
+            placement = object.__new__(cls)
+            for name, item in zip(cls.__slots__, fields, strict=True):
+                object.__setattr__(placement, name, item)
+            return placement
+        return cls(*fields)
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_pool_idx": self.request_pool_idx,
+            "group_id": self.group_id,
+            "page_ids": list(self.page_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardRow:
+    operation_index: int
+    request_pool_index: int
+    seq_len: int
+    query_len: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.operation_index < 0
+            or self.request_pool_index < 1
+            or self.seq_len < 0
+            or self.query_len < 1
+        ):
+            raise invalid_descriptor("forward row is invalid")
+
+    @classmethod
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "forward row",
+    ) -> ForwardRow:
         data = _map(value, where)
         return cls(
-            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
-            page_ids=_uints(data.get("page_ids", ()), f"{where}.page_ids"),
-            length=_uint(data.get("length"), f"{where}.length"),
+            operation_index=_uint(data.get("operation_index"), f"{where}.operation_index"),
+            request_pool_index=_uint(
+                data.get("request_pool_index"), f"{where}.request_pool_index"
+            ),
+            seq_len=_uint(data.get("seq_len"), f"{where}.seq_len"),
+            query_len=_uint(data.get("query_len"), f"{where}.query_len"),
         )
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "group_id": self.group_id,
-            "page_ids": list(self.page_ids),
-            "length": self.length,
+            "operation_index": self.operation_index,
+            "request_pool_index": self.request_pool_index,
+            "seq_len": self.seq_len,
+            "query_len": self.query_len,
         }
 
 
@@ -2288,14 +2157,15 @@ class CacheGroupPlacement:
 class RecoveryPlacement:
     request_key: RequestKey
     request_pool_idx: int
-    cache_groups: tuple[CacheGroupPlacement, ...]
+    block_tables: tuple[BlockTable, ...]
     latent_page_table: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        groups = tuple(group.group_id for group in self.cache_groups)
+        groups = tuple(table.group_id for table in self.block_tables)
         if (
             self.request_pool_idx < 1
             or len(set(groups)) != len(groups)
+            or any(table.request_pool_idx != self.request_pool_idx for table in self.block_tables)
             or any(page < 1 for page in self.latent_page_table)
             or len(set(self.latent_page_table)) != len(self.latent_page_table)
         ):
@@ -2314,10 +2184,10 @@ class RecoveryPlacement:
                 data.get("request_pool_idx"),
                 f"{where}.request_pool_idx",
             ),
-            cache_groups=tuple(
-                CacheGroupPlacement.from_wire(item, f"{where}.cache_groups[{index}]")
+            block_tables=tuple(
+                BlockTable.from_wire(item, f"{where}.block_tables[{index}]")
                 for index, item in enumerate(
-                    _seq(data.get("cache_groups", ()), f"{where}.cache_groups")
+                    _seq(data.get("block_tables", ()), f"{where}.block_tables")
                 )
             ),
             latent_page_table=_uints(
@@ -2330,7 +2200,7 @@ class RecoveryPlacement:
         return {
             "request_key": self.request_key.to_wire(),
             "request_pool_idx": self.request_pool_idx,
-            "cache_groups": [group.to_wire() for group in self.cache_groups],
+            "block_tables": [table.to_wire() for table in self.block_tables],
             "latent_page_table": list(self.latent_page_table),
         }
 
@@ -2428,9 +2298,9 @@ class BatchPartition:
     attention: AttentionRegime
     shape_class: int
     operations: tuple[Operation, ...]
-    request_pool_indices: tuple[int, ...]
-    kv_placements: tuple[KvPlacement, ...] = ()
-    kv_branch_placements: tuple[KvBranchPlacement, ...] = ()
+    block_tables: tuple[BlockTable, ...] = ()
+    new_cache_pages: tuple[CachePageAllocation, ...] = ()
+    forward_rows: tuple[ForwardRow, ...] = ()
     latent_placements: tuple[LatentPlacement, ...] = ()
 
     def __post_init__(self) -> None:
@@ -2447,12 +2317,6 @@ class BatchPartition:
             raise invalid_descriptor("batch partition route and shape class must be unsigned")
         if not self.operations:
             raise invalid_descriptor("batch partition must carry at least one operation")
-        if len(self.request_pool_indices) != len(self.operations):
-            raise invalid_descriptor(
-                "batch partition request-pool indices are not aligned with operations"
-            )
-        if any(index < 1 for index in self.request_pool_indices):
-            raise invalid_descriptor("batch partition carries request-pool index zero")
         if any(
             operation.domain is not self.domain or operation.route != self.route
             for operation in self.operations
@@ -2461,53 +2325,25 @@ class BatchPartition:
         operations = {
             (operation.request_key, operation.op_id): operation for operation in self.operations
         }
-        placements: set[tuple[RequestKey, int, int]] = set()
-        for kv_placement in self.kv_placements:
-            kv_identity = (
-                kv_placement.request_key,
-                kv_placement.op_id,
-                kv_placement.group_id,
-            )
-            if kv_identity in placements:
-                raise invalid_descriptor("batch partition repeats a KV placement identity")
-            placements.add(kv_identity)
-            operation = operations.get(kv_identity[:2])
-            if operation is None:
-                raise invalid_descriptor("KV placement does not name a partition operation")
-            if (
-                kv_placement.block_table_update
-                and len(kv_placement.block_table) != operation.kv_capacity_pages
-            ):
+        tables = {(table.request_pool_idx, table.group_id): table for table in self.block_tables}
+        if len(tables) != len(self.block_tables):
+            raise invalid_descriptor("batch partition repeats a block table")
+        allocation_ids: set[tuple[int, int]] = set()
+        for allocation in self.new_cache_pages:
+            identity = (allocation.request_pool_idx, allocation.group_id)
+            if identity in allocation_ids:
+                raise invalid_descriptor("batch partition repeats a cache-page allocation")
+            allocation_ids.add(identity)
+            table = tables.get(identity)
+            if table is None or not set(allocation.page_ids).issubset(table.page_ids):
                 raise invalid_descriptor(
-                    "KV placement update does not establish operation capacity"
+                    "cache-page allocation has no matching block table"
                 )
-        if any(
-            operation.kv_capacity_pages > 0
-            and not any(
-                request_key == operation.request_key and op_id == operation.op_id
-                for request_key, op_id, _group_id in placements
-            )
-            for operation in self.operations
-        ):
-            raise invalid_descriptor("operation with logical KV capacity has no placement")
-        branch_ids: set[tuple[RequestKey, int, int, int]] = set()
-        branch_pages: set[int] = set()
-        for placement in self.kv_branch_placements:
-            identity = (
-                placement.request_key,
-                placement.op_id,
-                placement.branch_index,
-                placement.group_id,
-            )
-            if identity in branch_ids:
-                raise invalid_descriptor("batch partition repeats a KV branch placement identity")
-            branch_ids.add(identity)
-            operation = operations.get(identity[:2])
-            if operation is None or operation.work.variant is not WorkVariant.GEN_FLOW:
-                raise invalid_descriptor("KV branch placement does not name generation flow")
-            if not branch_pages.isdisjoint(placement.block_table):
-                raise invalid_descriptor("KV branch placements overlap physical pages")
-            branch_pages.update(placement.block_table)
+        for row in self.forward_rows:
+            if row.operation_index >= len(self.operations):
+                raise invalid_descriptor(
+                    "forward row operation index is outside its partition"
+                )
         latent_ids: set[tuple[RequestKey, int]] = set()
         latent_pages: set[int] = set()
 
@@ -2569,30 +2405,30 @@ class BatchPartition:
                     _seq(data.get("operations", ()), f"{where}.operations")
                 )
             ),
-            request_pool_indices=_uints(
-                data.get("request_pool_indices", ()), f"{where}.request_pool_indices"
-            ),
-            kv_placements=tuple(
-                KvPlacement.from_wire(
+            block_tables=tuple(
+                BlockTable.from_wire(
                     item,
-                    f"{where}.kv_placements[{index}]",
+                    f"{where}.block_tables[{index}]",
                     _validated_wire=_validated_wire,
                 )
                 for index, item in enumerate(
-                    _seq(data.get("kv_placements", ()), f"{where}.kv_placements")
+                    _seq(data.get("block_tables", ()), f"{where}.block_tables")
                 )
             ),
-            kv_branch_placements=tuple(
-                KvBranchPlacement.from_wire(
+            new_cache_pages=tuple(
+                CachePageAllocation.from_wire(
                     item,
-                    f"{where}.kv_branch_placements[{index}]",
+                    f"{where}.new_cache_pages[{index}]",
                     _validated_wire=_validated_wire,
                 )
                 for index, item in enumerate(
-                    _seq(
-                        data.get("kv_branch_placements", ()),
-                        f"{where}.kv_branch_placements",
-                    )
+                    _seq(data.get("new_cache_pages", ()), f"{where}.new_cache_pages")
+                )
+            ),
+            forward_rows=tuple(
+                ForwardRow.from_wire(item, f"{where}.forward_rows[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("forward_rows", ()), f"{where}.forward_rows")
                 )
             ),
             latent_placements=tuple(
@@ -2620,11 +2456,9 @@ class BatchPartition:
             "attention": self.attention.value,
             "shape_class": self.shape_class,
             "operations": [operation.to_wire() for operation in self.operations],
-            "request_pool_indices": list(self.request_pool_indices),
-            "kv_placements": [placement.to_wire() for placement in self.kv_placements],
-            "kv_branch_placements": [
-                placement.to_wire() for placement in self.kv_branch_placements
-            ],
+            "block_tables": [table.to_wire() for table in self.block_tables],
+            "new_cache_pages": [allocation.to_wire() for allocation in self.new_cache_pages],
+            "forward_rows": [row.to_wire() for row in self.forward_rows],
             "latent_placements": [placement.to_wire() for placement in self.latent_placements],
         }
 
@@ -2697,19 +2531,6 @@ class Batch:
             raise invalid_descriptor(
                 "a submission batch carries multiple operations for one request"
             )
-        request_slots = {
-            operation.request_key: request_pool_idx
-            for partition in self.partitions
-            for operation, request_pool_idx in zip(
-                partition.operations,
-                partition.request_pool_indices,
-                strict=True,
-            )
-        }
-        if len(set(request_slots.values())) != len(request_slots):
-            raise invalid_descriptor(
-                "a submission batch assigns one request-pool index to multiple requests"
-            )
         admitted = [admission.request_key for admission in self.admissions]
         if len(set(admitted)) != len(admitted):
             raise invalid_descriptor("a submission batch carries a duplicate admission")
@@ -2717,10 +2538,6 @@ class Batch:
             admission.validate()
             if admission.request_key not in request_keys:
                 raise invalid_descriptor("a submission batch admits a request without an operation")
-            if request_slots[admission.request_key] != admission.request_pool_idx:
-                raise invalid_descriptor(
-                    "an admission disagrees with its operation request-pool index"
-                )
         identities: dict[tuple[RequestKey, int | None, int], Control] = {}
         for control in self.controls:
             seq = control.control_seq if isinstance(control, (Commit, Close)) else None
@@ -3350,8 +3167,7 @@ def _digest_und_admission(digest: _Digest, value: UndAdmission) -> None:
     _digest_sampling(digest, value.sampling)
     digest.u32s(value.negative_token_ids)
     digest.u32s(value.finish_token_ids)
-    digest.u32(value.kv.prefix_len)
-    digest.u32(value.kv.group_id)
+    digest.u32(value.initial_position)
 
 
 # ---------------------------------------------------------------------------

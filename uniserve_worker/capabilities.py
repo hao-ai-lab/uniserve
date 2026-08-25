@@ -58,7 +58,6 @@ class ResourceClass(StrEnum):
     KV_BLOCK = "kv_block"
     ENCODER_OUTPUT = "encoder_output"
     IMAGE_LATENT = "image_latent"
-    SCRATCH = "scratch"
 
 
 class KvGroupKind(StrEnum):
@@ -300,7 +299,6 @@ class WorkerCapabilities:
     num_layers: int
     num_kv_heads: int
     head_dim: int
-    scratch_capacity_tokens: int
     supported_work: tuple[WorkVariant, ...]
     latent_page_units: int
     num_latent_pages: int
@@ -352,7 +350,6 @@ class WorkerCapabilities:
             "latent_downsample",
             "bytes_per_token",
             "pipeline_depth",
-            "commit_marker_tokens",
             "gen_rope_advance",
             "max_cfg_branches",
             "max_batch_operations",
@@ -379,7 +376,6 @@ class WorkerCapabilities:
                     "capabilities.groups must cover the physical request page pool"
                 )
         for name in (
-            "scratch_capacity_tokens",
             "latent_page_units",
             "num_latent_pages",
             "latent_width",
@@ -458,9 +454,6 @@ class WorkerCapabilities:
             num_layers=_uint(data.get("num_layers"), f"{where}.num_layers"),
             num_kv_heads=_uint(data.get("num_kv_heads"), f"{where}.num_kv_heads"),
             head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
-            scratch_capacity_tokens=_uint(
-                data.get("scratch_capacity_tokens"), f"{where}.scratch_capacity_tokens"
-            ),
             supported_work=tuple(
                 _enum(WorkVariant, item, f"{where}.supported_work[{index}]")
                 for index, item in enumerate(
@@ -551,7 +544,6 @@ class WorkerCapabilities:
             "num_layers": self.num_layers,
             "num_kv_heads": self.num_kv_heads,
             "head_dim": self.head_dim,
-            "scratch_capacity_tokens": self.scratch_capacity_tokens,
             "supported_work": [value.value for value in self.supported_work],
             "latent_page_units": self.latent_page_units,
             "num_latent_pages": self.num_latent_pages,

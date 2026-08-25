@@ -28,7 +28,6 @@ from uniserve_worker.batch import (
 )
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
-from uniserve_worker.runtime.cache_pool import CacheRow
 from uniserve_worker.runtime.device_products import (
     DeviceProductScalarBatch,
     DeviceProductWrite,
@@ -328,9 +327,7 @@ def consume_sample(runtime: object, state: OperationState, value: object) -> Non
         )
     else:
         draft = state.data["draft"]
-        if task.entry is None:
-            raise RuntimeError("verification task has no scheduler KV row")
-        initialized = task.entry.initialize(task.query_tokens)
+        initialized = task.seq_len + task.query_tokens
         publish_token_product(runtime, operation, sampled, partition)
         accepted = sampled.num_accepted_tokens
         selected_point = _CompletionSpeculativePoint(accepted, sample_work.terminal_draft_prefix)
@@ -344,7 +341,7 @@ def consume_sample(runtime: object, state: OperationState, value: object) -> Non
                 raise RuntimeError("speculative sampling lost its selected point")
             device_selected = accepted_device.to(dtype=torch.int32) + 1
         partition.runtime_cache_lengths[int(session.request_pool_idx)] = device_selected + int(
-            initialized - task.query_tokens
+            task.seq_len
         )
         publish_runtime_samples(
             runtime,
@@ -506,29 +503,29 @@ def decode_batch(
         raise RuntimeError("partition lost its aligned request-row view")
     if layout.operations == operations:
         requests = layout.requests
-        cache_rows = layout.cache_rows
+        seq_lens = layout.seq_lens
         weights = layout.weights
     else:
         aligned = {
-            identity: (request, cache_row, weight)
-            for identity, request, cache_row, weight in zip(
+            identity: (request, seq_len, weight)
+            for identity, request, seq_len, weight in zip(
                 layout.identities,
                 layout.requests,
-                layout.cache_rows,
+                layout.seq_lens,
                 layout.weights,
                 strict=True,
             )
         }
         selected = tuple(aligned[ops._operation_identity(operation)] for operation in operations)
         requests = tuple(value[0] for value in selected)
-        cache_rows = tuple(value[1] for value in selected)
+        seq_lens = tuple(value[1] for value in selected)
         weights = tuple(value[2] for value in selected)
     starts.extend(int(request.logical_position) for request in requests)
     tasks = _decode_forward_tasks(
         runtime,
         operations,
         requests,
-        cache_rows,
+        seq_lens,
         weights,
         starts,
         scope,
@@ -552,7 +549,7 @@ def decode_batch(
         runtime,
         operations,
         requests,
-        cache_rows,
+        seq_lens,
         tasks,
         starts,
         graph_greedy,
@@ -605,10 +602,11 @@ def decode_batch(
     finalize_started = time.perf_counter_ns()
     publish_token_products(runtime, operations, samples, scope)
     outcomes: list[Outcome] = []
-    for operation, session, entry, start, sampled in zip(
+    for operation, session, seq_len, task, start, sampled in zip(
         operations,
         requests,
-        cache_rows,
+        seq_lens,
+        tasks,
         starts,
         samples,
         strict=True,
@@ -625,7 +623,7 @@ def decode_batch(
                 operation,
                 scope,
                 session=session,
-                kv_entry=entry,
+                task=task,
                 base=start,
                 tokens=1,
                 committed_tokens=(sampled.token_id,),
@@ -651,7 +649,7 @@ def _decode_forward_tasks(
     runtime,
     operations: tuple[Operation, ...],
     requests: tuple[RequestRow, ...],
-    cache_rows: tuple[CacheRow | None, ...],
+    seq_lens: tuple[int, ...],
     weights: tuple[WeightSet, ...],
     starts: list[int],
     scope: PartitionState,
@@ -660,27 +658,24 @@ def _decode_forward_tasks(
     predicates = tuple(
         scope.predicate_values.get(ops._operation_identity(operation)) for operation in operations
     )
-    entries = tuple(row for row in cache_rows if row is not None)
     request_indexed = (
         states is not None
         and states.device.type == "cuda"
-        and runtime.cache_pool.request_page_tables.device == states.device
-        and len(entries) == len(operations)
-        and len({row.group_id for row in entries}) == 1
+        and runtime.req_to_token_pool.page_tables.device == states.device
         and all(value is not None and value[1] for value in predicates)
     )
     if request_indexed:
         placeholder = states.future_input_tokens[0, :1]
         tasks: list[ForwardRow] = []
-        for operation, request, entry, weight, predicate in zip(
+        for operation, request, seq_len, weight, predicate in zip(
             operations,
             requests,
-            cache_rows,
+            seq_lens,
             weights,
             predicates,
             strict=True,
         ):
-            if request.sampling is None or entry is None or predicate is None:
+            if request.sampling is None or predicate is None:
                 raise RuntimeError("request-indexed decode lost its aligned row state")
             sampling_state = scope.sampling_states.get(
                 ops._operation_identity(operation), SamplingState()
@@ -694,7 +689,8 @@ def _decode_forward_tasks(
                     token_ids=placeholder,
                     positions=placeholder,
                     selection=TokenSelection.LAST_LOGITS,
-                    entry=entry,
+                    request_pool_idx=int(request.request_pool_idx),
+                    seq_len=int(seq_len),
                     write_kv=True,
                     causal=True,
                     decode_predicate=predicate[0],
@@ -716,14 +712,14 @@ def _decode_forward_tasks(
             position_values[index : index + 1],
             TokenSelection.LAST_LOGITS,
             scope,
-            entry=entry,
+            seq_len=seq_len,
             weights=weight,
         )
-        for index, (operation, request, entry, weight, current) in enumerate(
+        for index, (operation, request, seq_len, weight, current) in enumerate(
             zip(
                 operations,
                 requests,
-                cache_rows,
+                seq_lens,
                 weights,
                 current_tokens,
                 strict=True,
@@ -736,7 +732,7 @@ def project_graph_decode(
     runtime,
     operations: tuple[Operation, ...],
     requests: tuple[RequestRow, ...],
-    cache_rows: tuple[CacheRow | None, ...],
+    seq_lens: tuple[int, ...],
     tasks: tuple[ForwardRow, ...],
     starts: list[int],
     output: GraphGreedyOutput | None,
@@ -747,7 +743,7 @@ def project_graph_decode(
     if output is None:
         return None
     count = len(operations)
-    columns = (requests, cache_rows, tasks, starts)
+    columns = (requests, seq_lens, tasks, starts)
     vectors = (
         output.request_pool_indices,
         output.tokens,
@@ -867,27 +863,25 @@ def project_graph_decode(
     )
 
     outcomes: list[Outcome] = []
-    for index, (operation, request, cache_row, start) in enumerate(
-        zip(operations, requests, cache_rows, starts, strict=True)
+    for index, (operation, request, seq_len, task, start) in enumerate(
+        zip(operations, requests, seq_lens, tasks, starts, strict=True)
     ):
-        if cache_row is None:
-            raise RuntimeError("graph decode lost its scheduler cache row")
         request.rng_counter += 1
         request.logical_position = int(start) + 1
-        extents = cache_row.extents()
+        cache = ops._cache_coordinates(runtime, operation, scope)
+        cache = (cache[0], cache[1], int(seq_len) + 1, cache[3])
+        lengths = ops._logical_lengths(
+            runtime,
+            operation,
+            request,
+            cache,
+            computed_len=int(task.seq_len) + 1,
+        )
         outcomes.append(
             Outcome(
                 status=OpStatus.OK,
                 selected_point=1,
-                logical_lengths=LogicalLengths(
-                    token_len=request.logical_position,
-                    kv_visible_len=extents.visible,
-                    latent_len=request.flow_step,
-                    kv_reserved_len=extents.reserved,
-                    kv_initialized_len=extents.initialized,
-                    kv_committed_len=extents.committed,
-                    kv_published_len=extents.published,
-                ),
+                logical_lengths=replace(lengths, token_len=request.logical_position),
                 token_span=TokenSpan(base=int(start), len=1),
                 finish_flags=FinishFlags(),
                 product_generations=ops._output_generations(operation),
@@ -979,7 +973,7 @@ def token_outcome(
     scope: PartitionState,
     *,
     session: RequestRow | None = None,
-    kv_entry: CacheRow | None = None,
+    task: ForwardRow | None = None,
     base: int,
     tokens: int | _CompletionDerivedInteger | _CompletionSpeculativePoint,
     committed_tokens: tuple[int | _CompletionToken, ...],
@@ -988,10 +982,32 @@ def token_outcome(
 ) -> Outcome:
     if session is None:
         session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    row = ops._cache_row(runtime, operation, scope) if kv_entry is None else kv_entry
-    extents = row.extents()
+    cache = ops._cache_coordinates(runtime, operation, scope)
+    initialized = cache[2]
+    if selection is None:
+        published_length = scope.runtime_cache_lengths.get(
+            cache[0],
+            int(task.seq_len) + int(tokens) if task is not None else cache[2],
+        )
+        if isinstance(published_length, torch.Tensor):
+            raise RuntimeError("dynamic KV length requires a speculative selection")
+        visible_value: int | _CompletionDerivedInteger = int(published_length)
+        initialized = visible_value
+    else:
+        visible_value = _CompletionDerivedInteger(
+            cast(_CompletionInteger, selection.selected_point),
+            selection.base_kv_visible,
+        )
+        initialized = selection.initialized_kv
+    lengths = ops._logical_lengths(
+        runtime,
+        operation,
+        session,
+        (cache[0], cache[1], cache[2] if selection is not None else int(visible_value), cache[3]),
+        computed_len=initialized,
+    )
     visible = (
-        extents.visible
+        visible_value
         if selection is None
         else _CompletionDerivedInteger(
             cast(_CompletionInteger, selection.selected_point),
@@ -1013,7 +1029,7 @@ def token_outcome(
             sample,
             scope,
             logical_position=session.logical_position,
-            kv_visible=extents.visible,
+            kv_visible=cache[2],
             selection=selection,
         )
     return Outcome(
@@ -1022,10 +1038,7 @@ def token_outcome(
         logical_lengths=LogicalLengths(
             token_len=cast(int, token_len),
             kv_visible_len=cast(int, visible),
-            kv_reserved_len=extents.reserved,
-            kv_initialized_len=extents.initialized,
-            kv_committed_len=extents.committed,
-            kv_published_len=extents.published,
+            kv_computed_len=lengths.kv_computed_len,
         ),
         token_span=TokenSpan(base=base, len=cast(int, tokens)),
         finish_flags=FinishFlags(),
@@ -1045,7 +1058,7 @@ def token_task(
     selection: TokenSelection,
     scope: PartitionState,
     *,
-    entry: CacheRow | None = None,
+    seq_len: int | None = None,
     weights: WeightSet | None = None,
 ) -> ForwardRow:
     if len(token_ids) != len(positions) or not token_ids:
@@ -1059,6 +1072,10 @@ def token_task(
         )
     predicate_value = scope.predicate_values.get(ops._operation_identity(operation))
     sampling_state = scope.sampling_states.get(ops._operation_identity(operation), SamplingState())
+    cache = ops._cache_coordinates(runtime, operation, scope)
+    visible = cache[2] if seq_len is None else int(seq_len)
+    if visible != cache[2]:
+        raise invalid_descriptor("token row visibility disagrees with wire metadata")
     return ForwardRow(
         operation=operation,
         request=session,
@@ -1075,7 +1092,9 @@ def token_task(
             else torch.tensor(positions, dtype=torch.long)
         ),
         selection=selection,
-        entry=ops._cache_row(runtime, operation, scope) if entry is None else entry,
+        request_pool_idx=cache[0],
+        seq_len=visible,
+        group_id=cache[1],
         write_kv=True,
         causal=True,
         decode_predicate=None if predicate_value is None else predicate_value[0],
@@ -1097,12 +1116,11 @@ def commit_kv(
         raise RuntimeError("KV commit count is outside the task query span")
     if count == 0:
         return
-    if task.entry is None:
-        raise RuntimeError("KV task has no scheduler cache row")
-    task.entry.advance(count)
+    resulting = int(task.seq_len) + count
+    if resulting > runtime.req_to_token_pool.allocated_length(task.request_pool_idx):
+        raise RuntimeError("KV task exceeds its scheduler block table")
     if publish_runtime and runtime.runtime_states is not None:
-        slot = int(task.request.request_pool_idx)
-        scope.runtime_cache_lengths[slot] = int(task.entry.length)
+        scope.runtime_cache_lengths[int(task.request_pool_idx)] = resulting
 
 
 def operation_token_ids(
