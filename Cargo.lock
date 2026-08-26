@@ -4244,22 +4244,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
 
 [[package]]
-name = "uniserve-benchmarks"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "uniserve-serving",
-]
-
-[[package]]
-name = "uniserve-cli"
+name = "uniserve"
 version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "educe",
+ "libc",
  "mimalloc",
  "serde",
  "serde_json",
@@ -4270,112 +4261,54 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uniserve-core",
- "uniserve-engine-gateway",
- "uniserve-engine-process",
- "uniserve-engine-runtime",
- "uniserve-managed-engine",
+ "uniserve-engine",
  "uniserve-server",
- "uniserve-worker-ipc",
 ]
 
 [[package]]
-name = "uniserve-config"
+name = "uniserve-benchmarks"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
- "tempfile",
- "thiserror 2.0.18",
+ "uniserve-server",
 ]
 
 [[package]]
 name = "uniserve-core"
 version = "0.2.0"
 dependencies = [
+ "bytes",
+ "rmp-serde",
+ "rmpv",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "uniserve-engine-api"
-version = "0.2.0"
-dependencies = [
- "crossbeam-channel",
- "serde",
- "tokio",
- "uniserve-core",
-]
-
-[[package]]
-name = "uniserve-engine-gateway"
-version = "0.2.0"
-dependencies = [
- "arc-swap",
- "bytes",
- "futures",
- "hex",
- "parking_lot",
- "task-local",
+ "serde_tuple",
  "thiserror 2.0.18",
  "thiserror-ext",
- "tokio",
- "tokio-util",
- "tracing",
- "uniserve-core",
- "uniserve-engine-api",
- "uniserve-engine-wire",
- "uniserve-observability",
- "zeromq",
 ]
 
 [[package]]
-name = "uniserve-engine-process"
+name = "uniserve-engine"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
+ "crossbeam-channel",
+ "libc",
+ "png",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uniserve-core",
- "uniserve-engine-gateway",
- "uniserve-engine-runtime",
- "uniserve-engine-wire",
- "uniserve-scheduler",
- "uniserve-sim",
- "zeromq",
-]
-
-[[package]]
-name = "uniserve-engine-runtime"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "tracing",
- "uniserve-core",
- "uniserve-engine-api",
- "uniserve-executor",
- "uniserve-scheduler",
  "uniserve-worker-ipc",
- "uniserve-worker-wire",
-]
-
-[[package]]
-name = "uniserve-engine-wire"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_tuple",
- "thiserror 2.0.18",
- "thiserror-ext",
- "uniserve-core",
- "uniserve-engine-api",
+ "zeromq",
 ]
 
 [[package]]
@@ -4385,16 +4318,6 @@ dependencies = [
  "futures",
  "serde_json",
  "uniserve-server",
- "uniserve-serving",
-]
-
-[[package]]
-name = "uniserve-executor"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "uniserve-core",
- "uniserve-worker-wire",
 ]
 
 [[package]]
@@ -4407,51 +4330,7 @@ dependencies = [
  "pyo3",
  "pythonize",
  "uniserve-core",
- "uniserve-worker-ipc-core",
- "uniserve-worker-wire",
-]
-
-[[package]]
-name = "uniserve-kv"
-version = "0.2.0"
-dependencies = [
- "sha2",
- "uniserve-core",
- "uniserve-worker-wire",
-]
-
-[[package]]
-name = "uniserve-managed-engine"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "libc",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "uniserve-model-profile"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "criterion",
- "expect-test",
- "fastokens",
- "hf-hub 0.5.0",
- "serde",
- "serde_json",
- "serde_with",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "thiserror-ext",
- "tokenizers",
- "tokio",
- "tracing",
- "uniserve-config",
- "uniserve-core",
- "winnow 1.0.3",
+ "uniserve-worker-ipc",
 ]
 
 [[package]]
@@ -4472,127 +4351,57 @@ dependencies = [
 ]
 
 [[package]]
-name = "uniserve-protocol-adapters"
-version = "0.2.0"
-dependencies = [
- "asynk-strim-attr",
- "axum",
- "futures",
- "itertools 0.14.0",
- "llm-multimodal",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror-ext",
- "tracing",
- "uniserve-serving",
- "validator",
-]
-
-[[package]]
-name = "uniserve-scheduler"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "crossbeam-channel",
- "libc",
- "png",
- "serde",
- "serde_json",
- "sha2",
- "tracing",
- "tracing-subscriber",
- "uniserve-core",
- "uniserve-engine-api",
- "uniserve-engine-wire",
- "uniserve-executor",
- "uniserve-kv",
- "uniserve-worker-ipc",
- "uniserve-worker-wire",
-]
-
-[[package]]
 name = "uniserve-server"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "axum",
- "futures",
- "http-body",
- "libc",
- "serde",
- "serde_json",
- "socket2",
- "thiserror-ext",
- "tokio",
- "tokio-util",
- "tower-http",
- "tracing",
- "tracing-futures",
- "uniserve-core",
- "uniserve-engine-api",
- "uniserve-engine-gateway",
- "uniserve-engine-runtime",
- "uniserve-executor",
- "uniserve-model-profile",
- "uniserve-observability",
- "uniserve-protocol-adapters",
- "uniserve-scheduler",
- "uniserve-serving",
- "uniserve-sim",
- "uniserve-worker-ipc",
- "uuid",
- "validator",
-]
-
-[[package]]
-name = "uniserve-serving"
-version = "0.2.0"
-dependencies = [
+ "arc-swap",
  "asynk-strim-attr",
+ "axum",
  "base64 0.22.1",
+ "bytes",
+ "criterion",
  "easy-ext",
  "expect-test",
+ "fastokens",
  "futures",
+ "hex",
+ "hf-hub 0.5.0",
+ "http-body",
  "image",
  "indexmap 2.14.0",
  "itertools 0.14.0",
+ "libc",
  "llm-multimodal",
  "minijinja",
  "minijinja-contrib",
+ "parking_lot",
  "serde",
  "serde-json-fmt",
  "serde_json",
  "serde_with",
+ "sha2",
+ "socket2",
  "subenum",
+ "task-local",
  "tempfile",
  "thiserror 2.0.18",
  "thiserror-ext",
  "tokenizers",
  "tokio",
+ "tokio-util",
+ "tower-http",
  "tracing",
+ "tracing-futures",
+ "tracing-subscriber",
  "trait-set",
  "uniserve-core",
- "uniserve-engine-gateway",
- "uniserve-model-profile",
+ "uniserve-engine",
+ "uniserve-observability",
  "uuid",
-]
-
-[[package]]
-name = "uniserve-sim"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "crossbeam-channel",
- "png",
- "uniserve-core",
- "uniserve-engine-api",
- "uniserve-executor",
- "uniserve-scheduler",
- "uniserve-worker-ipc",
- "uniserve-worker-wire",
+ "validator",
+ "winnow 1.0.3",
+ "zeromq",
 ]
 
 [[package]]
@@ -4600,34 +4409,11 @@ name = "uniserve-worker-ipc"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "libc",
- "serde",
- "serde_json",
- "tracing",
- "uniserve-core",
- "uniserve-executor",
- "uniserve-worker-ipc-core",
- "uniserve-worker-wire",
-]
-
-[[package]]
-name = "uniserve-worker-ipc-core"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "iceoryx2",
- "iceoryx2-bb-elementary-traits",
- "uniserve-worker-wire",
-]
-
-[[package]]
-name = "uniserve-worker-wire"
-version = "0.2.0"
-dependencies = [
- "anyhow",
  "flatbuffers",
  "flatbuffers-build",
  "flatc-fork",
+ "iceoryx2",
+ "iceoryx2-bb-elementary-traits",
  "serde",
  "serde_bytes",
  "serde_json",

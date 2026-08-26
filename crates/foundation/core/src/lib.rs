@@ -6,10 +6,21 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod codec;
+mod events;
 pub mod generation;
 pub mod philox;
 pub mod product_blob;
 pub mod sampling;
+pub use codec::{
+    AcknowledgeAt, CancelAt, EngineRequest, EngineRequestKind, GenerationEventBatch,
+    GenerationRequestEnvelope, MediaRequestEnvelope, RoutedGenerationEvent, StopAt, decode_msgpack,
+    encode_msgpack,
+};
+pub use events::{
+    FinishReason, GenEvent, MediaEvent, MediaRequest, PositionLogprobs, PublicCommit,
+    PublicModality, SemanticRoot, TokenLogprob,
+};
 pub use generation::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,

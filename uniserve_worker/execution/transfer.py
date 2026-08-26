@@ -172,7 +172,7 @@ def _transfer(runtime: object, state: OperationState) -> None:
             partition.published.append(Locator.from_wire_json(encoded))
         payload = _CompletionTransferPayload(
             "kv",
-            {"generation": int(outputs[0].generation), "snapshot": snapshot.to_wire()},
+            {"generation": int(outputs[0].generation), "snapshot": snapshot.to_mapping()},
             tuple(Locator.from_wire_json(encoded) for encoded in snapshot.locators),
             operation.plan_digest,
             transport,
@@ -304,7 +304,7 @@ def publish_product(
         raise invalid_descriptor("product transfer value disagrees with its output bound")
     scope.published.append(locator)
     scope.stage_publications[ops._operation_identity(operation)] = (locator,)
-    descriptor_value["locator"] = locator.to_wire()
+    descriptor_value["locator"] = locator.to_mapping()
     descriptor = _CompletionTransferPayload(
         descriptor_kind,
         descriptor_value,

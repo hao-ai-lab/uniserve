@@ -15,8 +15,7 @@ libc.workspace = true
 pyo3.workspace = true
 pythonize.workspace = true
 uniserve-core.workspace = true
-uniserve-worker-ipc-core.workspace = true
-uniserve-worker-wire.workspace = true
+uniserve-worker-ipc.workspace = true
 
 [lints]
 workspace = true

@@ -166,12 +166,15 @@ The serving benchmark protocol is documented in [`docs/benchmark-protocol.md`](d
 ## Repository layout
 
 ```text
-crates/foundation/       Shared runtime types, configuration, and observability
-crates/protocol/         Engine and worker wire contracts
-crates/engine/           Scheduler, executor, worker transport, and engine process
-crates/frontend/         Model profiles, serving request funnel, and OpenAI adapters
-crates/server/           Configured HTTP application
-crates/bin/uniserve/     `uniserve` CLI
+crates/foundation/core/                  Shared values and the engine-process codec
+crates/foundation/observability/         Runtime metrics and process registry
+crates/foundation/observability-derive/  Metrics proc-macro
+crates/protocol/worker-ipc/              Worker execution algebra, codec, and iceoryx endpoints
+crates/protocol/worker-ipc-py/           Python worker IPC extension
+crates/engine/                           Scheduler, KV pool, executors, simulator, and engine process
+crates/server/                           Model profiles, serving funnel, OpenAI API, HTTP, and engine clients
+crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
+crates/support/                          Examples and benchmark support packages
 uniserve_worker/         Forward-only Python model workers
 uniserve_eval/           Public-protocol serving evaluator
 specs/                   Builder-facing runtime and serving contracts

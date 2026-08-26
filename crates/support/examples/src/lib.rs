@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use futures::TryStreamExt as _;
 use uniserve_server::ModelDescription;
-use uniserve_server::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
-use uniserve_serving::{
+use uniserve_server::serving::{
     GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection, OutputContract,
     SamplingConfig, ServeEvent, ServeRequestId, ServingRuntime,
 };
+use uniserve_server::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 
 /// Build a local GPU-free HTTP serving config suitable for examples and smoke
 /// tests.
@@ -116,7 +116,7 @@ pub fn semantic_interleaved_request(
 pub async fn run_semantic_request(
     runtime: &ServingRuntime,
     request: GenerateReqInput,
-) -> uniserve_serving::Result<Vec<ServeEvent>> {
+) -> uniserve_server::serving::Result<Vec<ServeEvent>> {
     runtime.generate(request).await?.try_collect().await
 }
 

@@ -207,7 +207,7 @@ class SnapshotRecovery:
             entries = cast(dict[str, object], catalog["requests"])
             for reference in references:
                 session_id = int(reference.version.request_key.session_id)
-                entries[str(session_id)] = reference.to_wire()
+                entries[str(session_id)] = reference.to_mapping()
                 self._current_refs[session_id] = reference
             self._write_catalog(catalog)
             replacements = {
@@ -602,9 +602,9 @@ class SnapshotRecovery:
                         "session_id": state.session_id,
                         "products": [
                             {
-                                "product": product.to_wire(),
+                                "product": product.to_mapping(),
                                 "publication": {
-                                    **publication.to_wire(),
+                                    **publication.to_mapping(),
                                     "locators": [
                                         locator(
                                             raw,
@@ -619,7 +619,7 @@ class SnapshotRecovery:
                         "destination_bases": [
                             {
                                 "destination": destination,
-                                "version": version.to_wire(),
+                                "version": version.to_mapping(),
                                 "extent": extent,
                             }
                             for destination, version, extent in state.destination_bases
@@ -627,7 +627,7 @@ class SnapshotRecovery:
                         "installed_bases": [
                             {
                                 "destination": destination,
-                                "version": version.to_wire(),
+                                "version": version.to_mapping(),
                                 "extent": extent,
                             }
                             for destination, version, extent in state.installed_bases
@@ -653,7 +653,7 @@ class SnapshotRecovery:
                 "device_products": [
                     {
                         "session_id": item.reference.request_key.session_id,
-                        "reference": item.reference.to_wire(),
+                        "reference": item.reference.to_mapping(),
                         "producer_plan_digest": item.producer_plan_digest,
                         "device": item.device,
                         "metadata": _device_metadata_to_json(item.metadata),
@@ -664,7 +664,7 @@ class SnapshotRecovery:
                 "encoder_features": [
                     {
                         "session_id": item.reference.request_key.session_id,
-                        "reference": item.reference.to_wire(),
+                        "reference": item.reference.to_mapping(),
                         "producer_plan_digest": item.producer_plan_digest,
                         "device": item.device,
                         "height": item.metadata.height,
@@ -956,8 +956,8 @@ class SnapshotRecovery:
             "resolved_runtime": _runtime_to_json(runtime),
             "committed_point": session.committed_point,
             "admission_digest": session.admission_digest,
-            "sampling": None if session.sampling is None else session.sampling.to_wire(),
-            "image": None if session.image is None else session.image.to_wire(),
+            "sampling": None if session.sampling is None else session.sampling.to_mapping(),
+            "image": None if session.image is None else session.image.to_mapping(),
             "negative_token_ids": list(session.negative_token_ids),
             "finish_token_ids": list(session.finish_token_ids),
             "committed_op_id": session.committed_op_id,
@@ -978,7 +978,7 @@ class SnapshotRecovery:
                 }
             ),
             "latent_product": (
-                None if session.latent_product is None else session.latent_product.to_wire()
+                None if session.latent_product is None else session.latent_product.to_mapping()
             ),
             "prompt_logits_ready": session.prompt_logits_ready,
             "logical_position": session.logical_position,
@@ -1051,12 +1051,12 @@ class SnapshotRecovery:
             sampling=(
                 None
                 if data.get("sampling") is None
-                else SamplingParams.from_wire(data["sampling"], "snapshot session.sampling")
+                else SamplingParams.from_mapping(data["sampling"], "snapshot session.sampling")
             ),
             image=(
                 None
                 if data.get("image") is None
-                else ImageParams.from_wire(data["image"], "snapshot session.image")
+                else ImageParams.from_mapping(data["image"], "snapshot session.image")
             ),
             negative_token_ids=_uint_tuple(
                 data.get("negative_token_ids"),
@@ -1100,7 +1100,7 @@ class SnapshotRecovery:
             latent_product=(
                 None
                 if data.get("latent_product") is None
-                else ProductRef.from_wire(
+                else ProductRef.from_mapping(
                     data["latent_product"],
                     "snapshot session.latent_product",
                 )
@@ -1184,11 +1184,11 @@ class SnapshotRecovery:
             ]
             products.append(
                 (
-                    ProductRef.from_wire(
+                    ProductRef.from_mapping(
                         item.get("product"),
                         "snapshot cache publication.product",
                     ),
-                    CachePublication.from_wire(publication),
+                    CachePublication.from_mapping(publication),
                 )
             )
 
@@ -1196,7 +1196,7 @@ class SnapshotRecovery:
             return tuple(
                 (
                     _string(item.get("destination"), f"snapshot {name}.destination"),
-                    VersionRef.from_wire(item.get("version"), f"snapshot {name}.version"),
+                    VersionRef.from_mapping(item.get("version"), f"snapshot {name}.version"),
                     _uint(item.get("extent"), f"snapshot {name}.extent"),
                 )
                 for raw in _sequence(data.get(name), f"snapshot {name}")
@@ -1244,7 +1244,7 @@ class SnapshotRecovery:
     ) -> DeviceProductSnapshot:
         data = _mapping(value, "snapshot device product")
         return DeviceProductSnapshot(
-            reference=ProductRef.from_wire(
+            reference=ProductRef.from_mapping(
                 data.get("reference"), "snapshot device product.reference"
             ),
             producer_plan_digest=_digest(
@@ -1267,7 +1267,7 @@ class SnapshotRecovery:
     ) -> EncoderSnapshot:
         data = _mapping(value, "snapshot encoder feature")
         return EncoderSnapshot(
-            reference=ProductRef.from_wire(
+            reference=ProductRef.from_mapping(
                 data.get("reference"), "snapshot encoder feature.reference"
             ),
             producer_plan_digest=_digest(
@@ -1378,7 +1378,7 @@ def _runtime_to_json(runtime: RequestRuntime) -> dict[str, object]:
         "logical_position": runtime.logical_position,
         "rng_counter": runtime.rng_counter,
         "latent_product": (
-            None if runtime.latent_product is None else runtime.latent_product.to_wire()
+            None if runtime.latent_product is None else runtime.latent_product.to_mapping()
         ),
         "flow_step": runtime.flow_step,
         "kv_visible_len": runtime.kv_visible_len,
@@ -1394,7 +1394,7 @@ def _runtime_from_json(value: object, where: str) -> RequestRuntime:
         latent_product=(
             None
             if data.get("latent_product") is None
-            else ProductRef.from_wire(data["latent_product"], f"{where}.latent_product")
+            else ProductRef.from_mapping(data["latent_product"], f"{where}.latent_product")
         ),
         flow_step=_uint(data.get("flow_step"), f"{where}.flow_step"),
         kv_visible_len=_uint(data.get("kv_visible_len"), f"{where}.kv_visible_len"),

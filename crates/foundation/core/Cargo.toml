@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes.workspace = true
+messagepack-serde.workspace = true
+rmpv.workspace = true
 serde.workspace = true
+serde_tuple.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+thiserror-ext.workspace = true

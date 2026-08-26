@@ -7,15 +7,17 @@
 use std::time::Duration;
 
 use uniserve_core::{
-    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
-    UndVisibility,
+    ContextSegment, FinishReason, GenEvent, GenerationBehaviorDescriptor, GenerationConstraint,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
+    RequestId, SamplingParams, UndVisibility,
 };
-use uniserve_engine_gateway::transport::{
-    EngineCoreClient, GenEvent, GenerationFinishReason, GenerationSubmission, TransportMode,
-    ZmqClientConfig,
+use uniserve_server::engine_client::{
+    EngineClient, GenerationSubmission, TransportMode, ZmqClientConfig,
 };
-use uniserve_managed_engine::{ManagedEngineConfig, ManagedEngineHandle, allocate_handshake_port};
+
+#[path = "../src/managed_engine.rs"]
+mod managed_engine;
+use managed_engine::{ManagedEngineConfig, ManagedEngineHandle, allocate_handshake_port};
 
 fn text_generation_request() -> GenerationRequest {
     let constraint = GenerationConstraint::UndOnly;
@@ -64,7 +66,7 @@ async fn managed_sim_engine_serves_and_shuts_down() {
     .await
     .expect("spawn managed sim engine");
 
-    let client = EngineCoreClient::connect_zmq(ZmqClientConfig {
+    let client = EngineClient::connect_zmq(ZmqClientConfig {
         transport_mode: TransportMode::HandshakeOwner {
             handshake_address: format!("tcp://{host}:{port}"),
             advertised_host: host.clone(),
@@ -108,7 +110,7 @@ async fn managed_sim_engine_serves_and_shuts_down() {
         }
     }
     assert!(tokens >= 1);
-    assert_eq!(finish, Some(GenerationFinishReason::Eos));
+    assert_eq!(finish, Some(FinishReason::Eos));
 
     client.shutdown().await.expect("shutdown client");
 

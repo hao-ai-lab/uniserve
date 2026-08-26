@@ -7,7 +7,7 @@
 //! payloads stay on the `bytes` path.
 //!
 //! [`execute_request_to_py`] produces the mapping consumed by
-//! `Batch.from_wire`. [`try_completion_response_from_py`] accepts the exact
+//! `Batch.from_mapping`. [`try_completion_response_from_py`] accepts the exact
 //! completion-report mapping emitted by the Python worker. Administrative frame
 //! kinds are handled by the schema-derived converter in the caller.
 
@@ -17,7 +17,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
-use uniserve_worker_wire::{
+use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CacheCopy, CachePageAllocation,
     CloseReason, CompletionRecord, CompletionReport, Control, DType, DecodeKind, DecodePlacement,
     DimBound, Disposition, Domain, DrawLayout, EncodeMode, ErrorCode, ErrorOperationIdentity,
@@ -30,7 +30,7 @@ use uniserve_worker_wire::{
 };
 
 #[cfg(test)]
-use uniserve_worker_wire::Bounds;
+use uniserve_worker_ipc::Bounds;
 
 // ---------------------------------------------------------------------------
 // Request -> Python (recv hot path)
@@ -1695,7 +1695,7 @@ mod tests {
 
     use pythonize::pythonize;
     use uniserve_core::{BlockId, RequestId};
-    use uniserve_worker_ipc_core::ClientEndpoint;
+    use uniserve_worker_ipc::ClientEndpoint;
 
     use super::*;
 
@@ -1760,7 +1760,7 @@ mod tests {
             OpId(1),
             VersionRef::admission_root(request_key, OpId(0), admission.digest.clone()),
             Work::Token(TokenMode::Extend),
-            uniserve_worker_wire::RouteId(0),
+            uniserve_worker_ipc::RouteId(0),
             Domain::Prefill,
             Bounds {
                 max_points: 1,
@@ -1779,7 +1779,7 @@ mod tests {
             submission_group: 1,
             collective_seq: 1,
             domain: Domain::Prefill,
-            route: uniserve_worker_wire::RouteId(0),
+            route: uniserve_worker_ipc::RouteId(0),
             execution: ExecutionCapability::DomainHomogeneous,
             attention: AttentionRegime::Causal,
             shape_class: 0,
@@ -1802,12 +1802,13 @@ mod tests {
                 query_len: 2,
             }],
             latent_placements: Vec::new(),
+            decode_placements: Vec::new(),
         };
         let mut request = WorkerRequest::execute(
             Batch::new(11, vec![admission], vec![partition]).with_input_products(vec![
                 ProductPayload {
                     product: input,
-                    bytes: uniserve_worker_wire::encode_token_product_bytes(&[7, 8]),
+                    bytes: uniserve_worker_ipc::encode_token_product_bytes(&[7, 8]),
                 },
             ]),
         );
@@ -1899,8 +1900,8 @@ mod tests {
                 .getattr("Batch")
                 .unwrap()
                 .call_method1(
-                    "from_wire",
-                    (native_batch.call_method0("to_wire").unwrap(),),
+                    "from_mapping",
+                    (native_batch.call_method0("to_mapping").unwrap(),),
                 )
                 .unwrap();
             assert!(

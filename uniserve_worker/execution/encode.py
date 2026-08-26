@@ -166,7 +166,7 @@ def _consume_encode(runtime: object, state: OperationState, output: torch.Tensor
             "encoder",
             {
                 "generation": int(feature_output.generation),
-                "locator": locator.to_wire(),
+                "locator": locator.to_mapping(),
                 "payload_kind": feature_output.kind.value,
                 "height": prepared.height,
                 "width": prepared.width,

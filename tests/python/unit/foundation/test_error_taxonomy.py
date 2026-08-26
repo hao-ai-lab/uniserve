@@ -115,7 +115,7 @@ def test_to_wire_emits_canonical_error_context():
         details={"device": 0},
     )
 
-    wire = err.to_wire()
+    wire = err.to_mapping()
 
     assert wire["kind"] == "error"
     assert wire["code"] == "ResourceError"
@@ -130,7 +130,7 @@ def test_to_wire_emits_canonical_error_context():
 def test_to_wire_coerces_truthy_flags_to_bool():
     # to_wire normalizes retryable/fatal through bool(): non-bool truthy/falsey
     # inputs surface on the wire as real booleans.
-    wire = WorkerError(code="ResourceError", message="m", retryable=1, fatal=0).to_wire()
+    wire = WorkerError(code="ResourceError", message="m", retryable=1, fatal=0).to_mapping()
 
     assert wire["retryable"] is True
     assert wire["fatal"] is False

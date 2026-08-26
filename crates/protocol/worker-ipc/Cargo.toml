@@ -1,0 +1,28 @@
+[package]
+name = "uniserve-worker-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["flatbuffers-build", "flatc-fork", "serde_bytes"]
+
+[dependencies]
+anyhow.workspace = true
+flatbuffers.workspace = true
+iceoryx2.workspace = true
+iceoryx2-bb-elementary-traits.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+sha2.workspace = true
+uniserve-core.workspace = true
+
+[build-dependencies]
+flatbuffers-build.workspace = true
+flatc-fork.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

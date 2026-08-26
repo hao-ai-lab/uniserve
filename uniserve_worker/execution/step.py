@@ -363,7 +363,7 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
             raw_locator = value["locator"]
             if not isinstance(raw_locator, dict):
                 raise invalid_descriptor("encoder transfer entry locator is invalid")
-            main = Locator.from_wire(raw_locator)
+            main = Locator.from_mapping(raw_locator)
             locators = (main,)
             raw_payload_kind = value["payload_kind"]
             height = transfer.metadata_uint(value, "height", 0)
@@ -407,7 +407,7 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
             raw_locator = value["locator"]
             if not isinstance(raw_locator, dict):
                 raise invalid_descriptor("device-product transfer locator is invalid")
-            main = Locator.from_wire(raw_locator)
+            main = Locator.from_mapping(raw_locator)
             locators = (main,)
             generation = transfer.metadata_uint(value, "generation", 0)
             height = transfer.metadata_uint(value, "height", 0)
@@ -459,7 +459,7 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
             raw_locator = value["locator"]
             if not isinstance(raw_locator, dict):
                 raise invalid_descriptor("latent transfer entry locator is invalid")
-            main = Locator.from_wire(raw_locator)
+            main = Locator.from_mapping(raw_locator)
             locators = (main,)
             height = transfer.metadata_uint(value, "height", 0)
             width = transfer.metadata_uint(value, "width", 0)
@@ -499,7 +499,7 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
             if set(value) != {"generation", "snapshot"}:
                 raise invalid_descriptor("KV transfer entry has an invalid shape")
             generation = transfer.metadata_uint(value, "generation", 0)
-            snapshot = CachePublication.from_wire(value["snapshot"])
+            snapshot = CachePublication.from_mapping(value["snapshot"])
             if (
                 entry.product.kind is not ProductKind.KV
                 or entry.product.storage_class is not StorageClass.PAGED_KV

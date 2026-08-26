@@ -1,15 +1,16 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod cli;
 mod logging;
+mod managed_engine;
 
 use std::env;
 use std::process::ExitStatus;
 use std::time::Duration;
 
+use crate::managed_engine::{ManagedEngineConfig, ManagedEngineHandle, allocate_handshake_port};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use uniserve_managed_engine::{ManagedEngineConfig, ManagedEngineHandle, allocate_handshake_port};
 
 use crate::cli::{Cli, Command, ServeArgs};
 
@@ -117,7 +118,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         // One headless engine process behind the engine wire protocol.
         Command::Engine(args) => {
-            uniserve_engine_process::run_engine_proc(args.to_proc_config(), shutdown_signal()).await
+            uniserve_engine::process::run_engine_proc(args.to_proc_config(), shutdown_signal())
+                .await
         }
     }
 }

@@ -36,7 +36,7 @@ test-python-integration:
 # Build the debug binary if missing
 [private]
 build-debug:
-    {{cargo}} build -p uniserve-cli
+    {{cargo}} build -p uniserve
 
 # End-to-end Python tests (no GPU)
 test-python-e2e: build-debug

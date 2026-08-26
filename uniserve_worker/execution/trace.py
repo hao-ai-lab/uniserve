@@ -43,7 +43,7 @@ class ExecutionEvent:
     error_class: str | None = None
     execution_path: str | None = None
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "phase": self.phase.value,
             "operations": [
@@ -111,7 +111,7 @@ class ExecutionTrace:
         # keeping this off the hot path at the default INFO level. The in-memory
         # trace above remains the durable record.
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("model execution phase", extra={"execution_event": event.to_wire()})
+            logger.debug("model execution phase", extra={"execution_event": event.to_mapping()})
         return event
 
     def snapshot(self) -> tuple[ExecutionEvent, ...]:

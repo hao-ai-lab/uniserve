@@ -1,5 +1,5 @@
 [package]
-name = "uniserve-cli"
+name = "uniserve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,25 +12,22 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 educe.workspace = true
+libc.workspace = true
 mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror-ext.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["process", "signal"] }
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-uniserve-engine-runtime.workspace = true
-uniserve-engine-process.workspace = true
-uniserve-worker-ipc.workspace = true
-uniserve-managed-engine.workspace = true
+uniserve-engine.workspace = true
 uniserve-server.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-uniserve-engine-gateway.workspace = true
 uniserve-core.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }

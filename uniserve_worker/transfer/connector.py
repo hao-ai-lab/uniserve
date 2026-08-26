@@ -77,13 +77,13 @@ class CachePublication:
         if self.group_id < 0 or not self.scale_identity:
             raise invalid_descriptor("KV publication storage identity is invalid")
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "locators": list(self.locators),
-            "source_version": self.source_version.to_wire(),
+            "source_version": self.source_version.to_mapping(),
             "source_digest": self.source_digest,
             "destination": self.destination,
-            "base_version": None if self.base_version is None else self.base_version.to_wire(),
+            "base_version": None if self.base_version is None else self.base_version.to_mapping(),
             "base_extent": self.base_extent,
             "published_extent": self.published_extent,
             "group_id": self.group_id,
@@ -91,7 +91,7 @@ class CachePublication:
         }
 
     @classmethod
-    def from_wire(cls, value: object) -> CachePublication:
+    def from_mapping(cls, value: object) -> CachePublication:
         if not isinstance(value, Mapping):
             raise invalid_descriptor("KV publication descriptor is not a mapping")
         raw_locators = value.get("locators", ())
@@ -103,7 +103,7 @@ class CachePublication:
         base = value.get("base_version")
         return cls(
             locators=tuple(str(item) for item in raw_locators),
-            source_version=VersionRef.from_wire(
+            source_version=VersionRef.from_mapping(
                 value.get("source_version"),
                 "KV publication.source_version",
             ),
@@ -111,7 +111,7 @@ class CachePublication:
             destination=str(value.get("destination", "")),
             base_version=None
             if base is None
-            else VersionRef.from_wire(base, "KV publication.base_version"),
+            else VersionRef.from_mapping(base, "KV publication.base_version"),
             base_extent=int(value.get("base_extent", 0)),
             published_extent=int(value.get("published_extent", 0)),
             group_id=int(value.get("group_id", 0)),

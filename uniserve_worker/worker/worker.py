@@ -1171,7 +1171,7 @@ class Worker:
                 model_identity=self.identity.architecture_digest,
                 weight_digest=self.weight_digest,
                 topology={
-                    "rank": caps.rank.to_wire(),
+                    "rank": caps.rank.to_mapping(),
                     "model_scope": deployment.model_scope,
                     "block_size": caps.block_size,
                     "num_blocks": caps.num_blocks,

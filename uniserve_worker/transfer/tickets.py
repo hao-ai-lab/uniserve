@@ -94,7 +94,7 @@ class Locator:
             raise invalid_descriptor("decoded object is not a Locator")
         return loc
 
-    def to_wire(self) -> dict[str, Any]:
+    def to_mapping(self) -> dict[str, Any]:
         return {
             "version": 1,
             "transport": self.transport,
@@ -108,7 +108,7 @@ class Locator:
         }
 
     @staticmethod
-    def from_wire(raw: dict[str, Any]) -> "Locator":
+    def from_mapping(raw: dict[str, Any]) -> "Locator":
         if int(raw.get("version", 1)) != 1:
             raise invalid_descriptor("unsupported locator wire version")
         return Locator(
@@ -123,14 +123,14 @@ class Locator:
         )
 
     def to_wire_json(self) -> str:
-        return json.dumps(self.to_wire(), separators=(",", ":"), sort_keys=True)
+        return json.dumps(self.to_mapping(), separators=(",", ":"), sort_keys=True)
 
     @staticmethod
     def from_wire_json(raw: str) -> "Locator":
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise invalid_descriptor("locator wire value must be a JSON object")
-        return Locator.from_wire(value)
+        return Locator.from_mapping(value)
 
 
 def encode_transfer_descriptor(

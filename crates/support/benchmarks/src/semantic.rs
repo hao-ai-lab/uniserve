@@ -1,4 +1,4 @@
-use uniserve_serving::{FinishStatus, GenerateReqInput, SamplingConfig, ServeEvent};
+use uniserve_server::serving::{FinishStatus, GenerateReqInput, SamplingConfig, ServeEvent};
 
 pub fn text_fixture(request_id: &str, prompt: &str, max_tokens: u32) -> GenerateReqInput {
     let mut request = GenerateReqInput::text(request_id, prompt);
@@ -45,7 +45,7 @@ pub fn has_terminal_success(events: &[ServeEvent]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_serving::{CandidateId, FinishStatus};
+    use uniserve_server::serving::{CandidateId, FinishStatus};
 
     use super::*;
 

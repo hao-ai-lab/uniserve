@@ -1,8 +1,8 @@
 """Worker protocol conformance for the Python record mirror.
 
 The digest-parity case reads the canonical fixture emitted by the Rust
-``worker-wire`` crate test ``emit_digest_parity_fixture`` (run
-``cargo test -p uniserve-worker-wire`` first), reconstructs the records from
+``uniserve-worker-ipc`` crate test ``emit_digest_parity_fixture`` (run
+``cargo test -p uniserve-worker-ipc`` first), reconstructs the records from
 their wire form, recomputes both host digests, and asserts they are
 byte-identical to the Rust-computed digests.
 """
@@ -79,7 +79,7 @@ def _fixture() -> dict:
     if not _FIXTURE.exists():
         raise AssertionError(
             f"missing digest-parity fixture {_FIXTURE}; run "
-            "`cargo test -p uniserve-worker-wire` to emit it"
+            "`cargo test -p uniserve-worker-ipc` to emit it"
         )
     return json.loads(_FIXTURE.read_text())
 
@@ -231,14 +231,14 @@ def _trajectory_partition(
 
 def test_plan_digest_matches_rust() -> None:
     fixture = _fixture()
-    operation = Operation.from_wire(fixture["operation"])
+    operation = Operation.from_mapping(fixture["operation"])
     assert operation.plan_digest == fixture["plan_digest"]
     assert operation.compute_plan_digest() == fixture["plan_digest"]
 
 
 def test_semantic_digest_matches_rust() -> None:
     fixture = _fixture()
-    completion = CompletionRecord.from_wire(fixture["completion"])
+    completion = CompletionRecord.from_mapping(fixture["completion"])
     assert completion.committed_tokens, "fixture must exercise non-empty committed tokens"
     recomputed = completion.compute_semantic_digest(
         fixture["parent_semantic_digest"], fixture["plan_digest"]
@@ -307,14 +307,14 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
                 ),
             ),
         )
-        restored = Batch.from_wire(batch.to_wire())
+        restored = Batch.from_mapping(batch.to_mapping())
         target = next(
             item for item in restored.operations if item.request_key == operation.request_key
         )
         assert target.plan_digest == expected_plan
 
     fixture = _fixture()
-    completion = CompletionRecord.from_wire(fixture["completion"])
+    completion = CompletionRecord.from_mapping(fixture["completion"])
     other_completion = replace(completion, request_key=other_key, op_id=12)
     plans = {
         operation.request_key: operation.plan_digest,
@@ -565,10 +565,10 @@ def test_batch_rejects_two_operations_for_one_request() -> None:
 
 
 def test_operation_rejects_a_forged_plan_digest() -> None:
-    wire = _decode_operation().to_wire()
+    wire = _decode_operation().to_mapping()
     wire["plan_digest"] = "00" * 32
     with pytest.raises(WorkerError):
-        Operation.from_wire(wire)
+        Operation.from_mapping(wire)
 
 
 def test_operation_accepts_shared_encoder_features_but_not_foreign_lineage_state() -> None:
@@ -586,7 +586,7 @@ def test_operation_accepts_shared_encoder_features_but_not_foreign_lineage_state
     invalid = replace(operation, inputs=(foreign_token,))
     invalid = replace(invalid, plan_digest=invalid.compute_plan_digest())
     with pytest.raises(WorkerError, match="request-local input"):
-        Operation.from_wire(invalid.to_wire())
+        Operation.from_mapping(invalid.to_mapping())
 
 
 def test_admission_payload_digest_is_invariant_to_pool_index() -> None:
@@ -645,7 +645,7 @@ def test_batch_carries_host_supplied_input_products() -> None:
         partitions=(_partition(_decode_operation(token_input)),),
         input_products=(payload,),
     )
-    restored = Batch.from_wire(batch.to_wire())
+    restored = Batch.from_mapping(batch.to_mapping())
     assert restored.input_products == (payload,)
     assert decode_token_product_bytes(restored.input_products[0].payload) == (7, 8, 9)
 
@@ -671,13 +671,13 @@ def test_host_visible_output_fits_the_operation_completion_bound() -> None:
     invalid = replace(invalid, plan_digest=invalid.compute_plan_digest())
 
     with pytest.raises(WorkerError, match="host-visible output"):
-        Operation.from_wire(invalid.to_wire())
+        Operation.from_mapping(invalid.to_mapping())
 
 
 def test_typed_wire_batch_decodes_to_the_validated_batch() -> None:
     batch = Batch(step_id=7, partitions=(_partition(_decode_operation()),))
-    wire = batch.to_wire()
-    validated = Batch.from_wire(wire)
+    wire = batch.to_mapping()
+    validated = Batch.from_mapping(wire)
     typed = dict(wire)
     mark_typed_wire(typed)
-    assert Batch.from_wire(typed) == validated
+    assert Batch.from_mapping(typed) == validated

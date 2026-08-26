@@ -9,7 +9,6 @@ publish = false
 futures.workspace = true
 serde_json.workspace = true
 uniserve-server.workspace = true
-uniserve-serving.workspace = true
 
 [lints]
 workspace = true

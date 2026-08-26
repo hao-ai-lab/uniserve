@@ -170,7 +170,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     kind, descriptor, producer_plan_digest = decode_transfer_descriptor(payload.payload)
     assert kind == "kv"
     assert producer_plan_digest == publication.plan_digest
-    snapshot = CachePublication.from_wire(descriptor["snapshot"])
+    snapshot = CachePublication.from_mapping(descriptor["snapshot"])
     assert payload.product == publication_product
     assert snapshot.source_version == second_commit.selected
     assert snapshot.base_extent == 0
@@ -227,7 +227,7 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
     kind, descriptor, producer_plan_digest = decode_transfer_descriptor(incremental_payload.payload)
     assert kind == "kv"
     assert producer_plan_digest == incremental.plan_digest
-    incremental_snapshot = CachePublication.from_wire(descriptor["snapshot"])
+    incremental_snapshot = CachePublication.from_mapping(descriptor["snapshot"])
     assert incremental_payload.product == incremental_product
     assert incremental_snapshot.source_version == suffix_commit.selected
     assert incremental_snapshot.base_version == second_commit.selected
@@ -363,7 +363,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             )
         ).products[0]
         kind, value, producer_digest = decode_transfer_descriptor(published.payload)
-        snapshot = CachePublication.from_wire(value["snapshot"])
+        snapshot = CachePublication.from_mapping(value["snapshot"])
         first = Locator.from_wire_json(snapshot.locators[0])
         missing = replace(first, handle=b"uniserve-missing-transfer-segment")
         broken = replace(
@@ -374,7 +374,7 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
             product=published.product,
             payload=encode_transfer_descriptor(
                 kind,
-                {"generation": value["generation"], "snapshot": broken.to_wire()},
+                {"generation": value["generation"], "snapshot": broken.to_mapping()},
                 producer_digest,
             ),
         )

@@ -3,15 +3,11 @@ resolver = "3"
 members = [
     "crates/foundation/*",
     "crates/protocol/*",
-    "crates/engine/*",
-    "crates/frontend/*",
-    "crates/server/*",
-    "crates/bin/*",
+    "crates/engine",
+    "crates/server",
+    "crates/bin/uniserve",
     "crates/support/*",
 ]
-# `crates/protocol/vocab/` holds the canonical cross-language vocabulary schema
-# (data, not a crate); exclude it from the `crates/protocol/*` member glob.
-exclude = ["crates/protocol/vocab"]
 
 [workspace.package]
 version = "0.2.0"
@@ -21,36 +17,18 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-# ---- engine-tier crates ----
 uniserve-core = { path = "crates/foundation/core" }
-uniserve-config = { path = "crates/foundation/config" }
 uniserve-observability = { path = "crates/foundation/observability" }
 uniserve-observability-derive = { path = "crates/foundation/observability-derive" }
-uniserve-worker-wire = { path = "crates/protocol/worker-wire" }
-uniserve-worker-ipc-core = { path = "crates/protocol/worker-ipc-core" }
-uniserve-engine-wire = { path = "crates/protocol/engine-wire" }
-uniserve-engine-process = { path = "crates/engine/process" }
-uniserve-engine-runtime = { path = "crates/engine/runtime" }
-uniserve-engine-api = { path = "crates/protocol/engine-api" }
-uniserve-executor = { path = "crates/engine/executor" }
-uniserve-kv = { path = "crates/engine/kv" }
-uniserve-scheduler = { path = "crates/engine/scheduler" }
-uniserve-sim = { path = "crates/engine/sim" }
-uniserve-worker-ipc = { path = "crates/engine/worker-ipc" }
+uniserve-worker-ipc = { path = "crates/protocol/worker-ipc" }
+uniserve-engine = { path = "crates/engine" }
+uniserve-server = { path = "crates/server" }
 
-# ---- frontend-tier crates ----
-uniserve-engine-gateway = { path = "crates/frontend/engine-gateway" }
-uniserve-model-profile = { path = "crates/frontend/model-profile" }
-uniserve-protocol-adapters = { path = "crates/frontend/protocol-adapters" }
-uniserve-serving = { path = "crates/frontend/serving" }
-uniserve-managed-engine = { path = "crates/bin/managed-engine" }
-uniserve-server = { path = "crates/server/app" }
-
-# ---- engine-tier third-party deps ----
+# ---- engine third-party deps ----
 crossbeam-channel = "0.5"
 sha2 = "0.10"
 
-# ---- frontend-tier third-party deps ----
+# ---- server third-party deps ----
 anyhow = "1.0.100"
 arc-swap = "1.9.0"
 asynk-strim-attr = "0.1.0"

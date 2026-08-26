@@ -217,7 +217,7 @@ def batch_identity(batch: Batch) -> str:
 
     digest = hashlib.sha256()
     digest.update(b"uniserve-worker-step\0")
-    digest.update(_canonical_bytes(batch.to_wire()))
+    digest.update(_canonical_bytes(batch.to_mapping()))
     return digest.hexdigest()
 
 
@@ -606,7 +606,7 @@ def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
     finalized = dict(response)
     report = finalized.get("completion_report")
     if isinstance(report, CompletionReport):
-        finalized["completion_report"] = report.to_wire()
+        finalized["completion_report"] = report.to_mapping()
     return finalized
 
 
@@ -622,7 +622,7 @@ def _control(worker: Worker, kind: RequestKind, request: Mapping[str, Any]) -> d
             raise invalid_descriptor("copy_kv copies must be a list")
         worker.copy_kv(
             tuple(
-                CacheCopy.from_wire(value, f"copy_kv copies[{index}]")
+                CacheCopy.from_mapping(value, f"copy_kv copies[{index}]")
                 for index, value in enumerate(raw_copies)
             )
         )
@@ -630,13 +630,13 @@ def _control(worker: Worker, kind: RequestKind, request: Mapping[str, Any]) -> d
         worker.release_products(_integers(request, "product_handles", kind))
     elif kind is RequestKind.SNAPSHOT_SESSION:
         reference = worker.snapshot_session(
-            RecoveryPlacement.from_wire(_required(request, "recovery_placement", kind))
+            RecoveryPlacement.from_mapping(_required(request, "recovery_placement", kind))
         )
-        return _response(ResponseKind.SNAPSHOT, snapshot=reference.to_wire())
+        return _response(ResponseKind.SNAPSHOT, snapshot=reference.to_mapping())
     elif kind is RequestKind.RESTORE_SESSION:
         worker.restore_session(
-            SnapshotRef.from_wire(_required(request, "snapshot", kind)),
-            RecoveryPlacement.from_wire(_required(request, "recovery_placement", kind)),
+            SnapshotRef.from_mapping(_required(request, "snapshot", kind)),
+            RecoveryPlacement.from_mapping(_required(request, "recovery_placement", kind)),
         )
     else:
         raise unsupported_control(kind.value)
@@ -650,7 +650,7 @@ def dispatch(worker: Worker, request: Mapping[str, Any]) -> dict[str, Any]:
     if kind is RequestKind.GET_CAPABILITIES:
         return _response(
             ResponseKind.CAPABILITIES,
-            capabilities=worker.capabilities.to_wire(),
+            capabilities=worker.capabilities.to_mapping(),
         )
     if kind is RequestKind.GET_PRESSURE:
         return _response(ResponseKind.PRESSURE, pressure=worker.resource_pressure())
@@ -760,7 +760,7 @@ class WorkerServer:
         error: WorkerError,
         request: Mapping[str, Any],
     ) -> dict[str, Any]:
-        fields = error.to_wire()
+        fields = error.to_mapping()
         fields.pop("kind", None)
         return self._with_call_id(_response(ResponseKind.ERROR, **fields), request)
 
@@ -842,7 +842,7 @@ class WorkerServer:
                     else -1
                 )
                 with profile_range(self._profile_name("batch_wire", step_id=raw_step_id)):
-                    batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_wire(raw_batch)
+                    batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_mapping(raw_batch)
                 identity = batch_identity(batch)
                 sessions = _batch_lineage(batch)[0]
                 early = self._starts_early(batch)

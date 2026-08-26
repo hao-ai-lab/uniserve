@@ -75,7 +75,7 @@ class KvGroupSpec:
     sink: int
 
     @classmethod
-    def from_wire(cls, value: object, where: str) -> KvGroupSpec:
+    def from_mapping(cls, value: object, where: str) -> KvGroupSpec:
         data = _map(value, where)
         kind_data = _map(data.get("kind"), f"{where}.kind")
         return cls(
@@ -87,7 +87,7 @@ class KvGroupSpec:
             sink=_uint(kind_data.get("sink", 0), f"{where}.kind.sink"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         kind: dict[str, object] = {"kind": self.kind.value}
         if self.kind is KvGroupKind.SLIDING_WINDOW:
             kind.update(window=self.window, sink=self.sink)
@@ -109,14 +109,14 @@ class RankInfo:
             raise invalid_descriptor("rank.tp must satisfy 0 <= rank < size")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "rank") -> RankInfo:
+    def from_mapping(cls, value: object, where: str = "rank") -> RankInfo:
         data = _map(value, where)
         return cls(
             tp_rank=_uint(data.get("tp_rank", 0), f"{where}.tp_rank"),
             tp_size=_uint(data.get("tp_size", 1), f"{where}.tp_size"),
         )
 
-    def to_wire(self) -> dict[str, int]:
+    def to_mapping(self) -> dict[str, int]:
         return {
             "tp_rank": self.tp_rank,
             "tp_size": self.tp_size,
@@ -143,7 +143,7 @@ class GraphBucketCapability:
             raise invalid_descriptor("graph bucket image dimensions are invalid")
 
     @classmethod
-    def from_wire(cls, value: object, where: str) -> GraphBucketCapability:
+    def from_mapping(cls, value: object, where: str) -> GraphBucketCapability:
         data = _map(value, where)
         return cls(
             phase=_str(data.get("phase"), f"{where}.phase"),
@@ -156,7 +156,7 @@ class GraphBucketCapability:
             layout=_str(data.get("layout", ""), f"{where}.layout"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "phase": self.phase,
             "batch_size": self.batch_size,
@@ -188,7 +188,7 @@ class MixedExecutionCapability:
             raise invalid_descriptor("mixed execution capability dimensions must be positive")
 
     @classmethod
-    def from_wire(cls, value: object, where: str) -> MixedExecutionCapability:
+    def from_mapping(cls, value: object, where: str) -> MixedExecutionCapability:
         data = _map(value, where)
         return cls(
             decode_rows=_uint(data.get("decode_rows"), f"{where}.decode_rows"),
@@ -198,7 +198,7 @@ class MixedExecutionCapability:
             cfg_branches=_uint(data.get("cfg_branches"), f"{where}.cfg_branches"),
         )
 
-    def to_wire(self) -> dict[str, int]:
+    def to_mapping(self) -> dict[str, int]:
         return {
             "decode_rows": self.decode_rows,
             "flow_rows": self.flow_rows,
@@ -243,7 +243,7 @@ class LaneCapabilities:
             raise invalid_descriptor("lane capability repeats a graph bucket")
 
     @classmethod
-    def from_wire(cls, value: object, where: str) -> LaneCapabilities:
+    def from_mapping(cls, value: object, where: str) -> LaneCapabilities:
         data = _map(value, where)
         return cls(
             lane_id=_str(data.get("lane_id"), f"{where}.lane_id"),
@@ -264,7 +264,7 @@ class LaneCapabilities:
             max_batch_tokens=_uint(data.get("max_batch_tokens"), f"{where}.max_batch_tokens"),
             max_inflight=_uint(data.get("max_inflight"), f"{where}.max_inflight"),
             graph_buckets=tuple(
-                GraphBucketCapability.from_wire(item, f"{where}.graph_buckets[{index}]")
+                GraphBucketCapability.from_mapping(item, f"{where}.graph_buckets[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("graph_buckets", ()), f"{where}.graph_buckets")
                 )
@@ -278,7 +278,7 @@ class LaneCapabilities:
             ),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "lane_id": self.lane_id,
             "domains": [domain.value for domain in self.domains],
@@ -288,7 +288,7 @@ class LaneCapabilities:
             "max_batch_operations": self.max_batch_operations,
             "max_batch_tokens": self.max_batch_tokens,
             "max_inflight": self.max_inflight,
-            "graph_buckets": [bucket.to_wire() for bucket in self.graph_buckets],
+            "graph_buckets": [bucket.to_mapping() for bucket in self.graph_buckets],
             "eager_max_batch_operations": self.eager_max_batch_operations,
             "eager_max_batch_tokens": self.eager_max_batch_tokens,
         }
@@ -473,7 +473,7 @@ class WorkerCapabilities:
         object.__setattr__(self, "protocol_layout_digest", protocol_layout_digest())
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "capabilities") -> WorkerCapabilities:
+    def from_mapping(cls, value: object, where: str = "capabilities") -> WorkerCapabilities:
         data = _map(value, where)
         return cls(
             block_size=_uint(data.get("block_size"), f"{where}.block_size"),
@@ -511,13 +511,13 @@ class WorkerCapabilities:
             max_cfg_branches=_uint(data.get("max_cfg_branches"), f"{where}.max_cfg_branches"),
             bytes_per_token=_uint(data.get("bytes_per_token"), f"{where}.bytes_per_token"),
             groups=tuple(
-                KvGroupSpec.from_wire(item, f"{where}.groups[{index}]")
+                KvGroupSpec.from_mapping(item, f"{where}.groups[{index}]")
                 for index, item in enumerate(_seq(data.get("groups", ()), f"{where}.groups"))
             ),
             kv_dtype=_str(data.get("kv_dtype"), f"{where}.kv_dtype"),
             model_dtype=_str(data.get("model_dtype"), f"{where}.model_dtype"),
             attention_backend=_str(data.get("attention_backend"), f"{where}.attention_backend"),
-            rank=RankInfo.from_wire(data.get("rank"), f"{where}.rank"),
+            rank=RankInfo.from_mapping(data.get("rank"), f"{where}.rank"),
             pipeline_depth=_uint(data.get("pipeline_depth"), f"{where}.pipeline_depth"),
             encoder_cache_budget=_uint(
                 data.get("encoder_cache_budget"), f"{where}.encoder_cache_budget"
@@ -542,7 +542,7 @@ class WorkerCapabilities:
                 data.get("incremental_kv_publication"), f"{where}.incremental_kv_publication"
             ),
             mixed_buckets=tuple(
-                MixedExecutionCapability.from_wire(item, f"{where}.mixed_buckets[{index}]")
+                MixedExecutionCapability.from_mapping(item, f"{where}.mixed_buckets[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("mixed_buckets", ()), f"{where}.mixed_buckets")
                 )
@@ -559,12 +559,12 @@ class WorkerCapabilities:
             model_identity=_str(data.get("model_identity", ""), f"{where}.model_identity"),
             weight_digest=_str(data.get("weight_digest", ""), f"{where}.weight_digest"),
             lanes=tuple(
-                LaneCapabilities.from_wire(item, f"{where}.lanes[{index}]")
+                LaneCapabilities.from_mapping(item, f"{where}.lanes[{index}]")
                 for index, item in enumerate(_seq(data.get("lanes", ()), f"{where}.lanes"))
             ),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
@@ -585,11 +585,11 @@ class WorkerCapabilities:
             "gen_rope_advance": self.gen_rope_advance,
             "max_cfg_branches": self.max_cfg_branches,
             "bytes_per_token": self.bytes_per_token,
-            "groups": [value.to_wire() for value in self.groups],
+            "groups": [value.to_mapping() for value in self.groups],
             "kv_dtype": self.kv_dtype,
             "model_dtype": self.model_dtype,
             "attention_backend": self.attention_backend,
-            "rank": self.rank.to_wire(),
+            "rank": self.rank.to_mapping(),
             "pipeline_depth": self.pipeline_depth,
             "encoder_cache_budget": self.encoder_cache_budget,
             "supported_controls": [value.value for value in self.supported_controls],
@@ -598,13 +598,13 @@ class WorkerCapabilities:
             "max_request_pool_size": self.max_request_pool_size,
             "max_unresolved_window": self.max_unresolved_window,
             "incremental_kv_publication": self.incremental_kv_publication,
-            "mixed_buckets": [bucket.to_wire() for bucket in self.mixed_buckets],
+            "mixed_buckets": [bucket.to_mapping() for bucket in self.mixed_buckets],
             "sampling_ownership": self.sampling_ownership.value,
             "resource_classes": [value.value for value in self.resource_classes],
             "model_identity": self.model_identity,
             "weight_digest": self.weight_digest,
             "protocol_layout_digest": self.protocol_layout_digest,
-            "lanes": [lane.to_wire() for lane in self.lanes],
+            "lanes": [lane.to_mapping() for lane in self.lanes],
         }
 
 

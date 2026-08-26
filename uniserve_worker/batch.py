@@ -7,7 +7,7 @@ variant, one exact parent version, and its declared input and output products.
 Two host-computed digests fix identity: :meth:`Operation.compute_plan_digest`
 over immutable registration fields, and
 :meth:`CompletionRecord.compute_semantic_digest` over the selected result. The
-digest byte layout matches the Rust ``worker-wire`` crate exactly so both sides
+digest byte layout matches the Rust ``uniserve-worker-ipc`` crate exactly so both sides
 compute identical digests.
 """
 
@@ -285,7 +285,7 @@ def native_partition(
         partition,
         "latent_placements",
         tuple(
-            LatentPlacement.from_wire(item, f"partition.latent_placements[{index}]")
+            LatentPlacement.from_mapping(item, f"partition.latent_placements[{index}]")
             for index, item in enumerate(latent_placements)
         ),
     )
@@ -293,7 +293,7 @@ def native_partition(
         partition,
         "decode_placements",
         tuple(
-            DecodePlacement.from_wire(item, f"partition.decode_placements[{index}]")
+            DecodePlacement.from_mapping(item, f"partition.decode_placements[{index}]")
             for index, item in enumerate(decode_placements)
         ),
     )
@@ -316,7 +316,7 @@ def native_batch(
         batch,
         "admissions",
         tuple(
-            Admission.from_wire(item, f"batch.admissions[{index}]")
+            Admission.from_mapping(item, f"batch.admissions[{index}]")
             for index, item in enumerate(admissions)
         ),
     )
@@ -326,7 +326,7 @@ def native_batch(
         batch,
         "input_products",
         tuple(
-            ProductPayload.from_wire(item, f"batch.input_products[{index}]")
+            ProductPayload.from_mapping(item, f"batch.input_products[{index}]")
             for index, item in enumerate(input_products)
         ),
     )
@@ -338,7 +338,7 @@ def mark_typed_wire(batch: MutableMapping[str, object]) -> None:
 
     The typed wire is produced by the engine's own encoder, so each operation
     map already carries the plan digest the scheduler registered it under.
-    Marking the map lets `Batch.from_wire` build operations, partitions, and
+    Marking the map lets `Batch.from_mapping` build operations, partitions, and
     controls directly instead of re-deriving that digest per operation.
     """
 
@@ -553,7 +553,7 @@ def protocol_layout_digest() -> str:
     """The canonical protocol-layout digest over the closed ``Work`` and
     ``Control`` variants and the fixed record field layouts.
 
-    Mirrors the Rust ``worker-wire`` ``protocol_layout_digest`` byte-for-byte so
+    Mirrors the Rust ``uniserve-worker-ipc`` ``protocol_layout_digest`` byte-for-byte so
     a scheduler, worker, and frontend agree at admission.
     """
 
@@ -638,7 +638,7 @@ class SamplingParams:
             _nonnegative(self.seed, "sampling.seed")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "sampling") -> SamplingParams:
+    def from_mapping(cls, value: object, where: str = "sampling") -> SamplingParams:
         data = _map(value, where)
         return cls(
             temperature=_float(data.get("temperature", 0.0), f"{where}.temperature"),
@@ -690,7 +690,7 @@ class SamplingParams:
             forced_token_ids=_uints(data.get("forced_token_ids", ()), f"{where}.forced_token_ids"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "temperature": self.temperature,
             "top_k": self.top_k,
@@ -763,7 +763,7 @@ class ImageParams:
             _nonnegative(self.seed, "image.seed")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "image") -> ImageParams:
+    def from_mapping(cls, value: object, where: str = "image") -> ImageParams:
         data = _map(value, where)
         interval = _pair(data.get("cfg_interval", (0.0, 1.0)), f"{where}.cfg_interval")
         return cls(
@@ -791,7 +791,7 @@ class ImageParams:
             retain_images=_bool(data.get("retain_images", True), f"{where}.retain_images"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "steps": self.steps,
             "cfg_text_scale": self.cfg_text_scale,
@@ -822,7 +822,7 @@ class RequestKey:
         _nonnegative(self.epoch, "request_key.epoch")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "request_key") -> RequestKey:
+    def from_mapping(cls, value: object, where: str = "request_key") -> RequestKey:
         key = _fast_request_key(value)
         if key is not None:
             return key
@@ -833,7 +833,7 @@ class RequestKey:
             epoch=_uint(data.get("epoch"), f"{where}.epoch"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "authority_id": self.authority_id,
             "session_id": self.session_id,
@@ -873,7 +873,7 @@ class ShapeBound:
         return elements
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "shape_bound") -> ShapeBound:
+    def from_mapping(cls, value: object, where: str = "shape_bound") -> ShapeBound:
         data = _map(value, where)
         dims: list[DimBound] = []
         for index, item in enumerate(_seq(data.get("dims", ()), f"{where}.dims")):
@@ -887,7 +887,7 @@ class ShapeBound:
                 raise invalid_descriptor(f"{where}.dims[{index}] has unknown variant {kind!r}")
         return cls(tuple(dims))
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {"dims": [_dim_to_wire(dim) for dim in self.dims]}
 
 
@@ -903,7 +903,7 @@ class PointRange:
     max_points: int = 0
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "point_range") -> PointRange:
+    def from_mapping(cls, value: object, where: str = "point_range") -> PointRange:
         point_range = _fast_point_range(value)
         if point_range is not None:
             return point_range
@@ -913,7 +913,7 @@ class PointRange:
             max_points=_uint(data.get("max_points"), f"{where}.max_points"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {"base_point": self.base_point, "max_points": self.max_points}
 
 
@@ -949,34 +949,34 @@ class ProductRef:
         return self.shape_bound.max_elements * element_bytes
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "product_ref") -> ProductRef:
+    def from_mapping(cls, value: object, where: str = "product_ref") -> ProductRef:
         reference = _fast_product_ref(value)
         if reference is not None:
             return reference
         data = _map(value, where)
         return cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             producer_op_id=_uint(data.get("producer_op_id"), f"{where}.producer_op_id"),
             output_index=_uint(data.get("output_index"), f"{where}.output_index"),
             generation=_uint(data.get("generation"), f"{where}.generation"),
             kind=_enum(ProductKind, data.get("kind"), f"{where}.kind"),
             storage_class=_enum(StorageClass, data.get("storage_class"), f"{where}.storage_class"),
             dtype=_enum(DType, data.get("dtype"), f"{where}.dtype"),
-            shape_bound=ShapeBound.from_wire(data.get("shape_bound"), f"{where}.shape_bound"),
-            point_range=PointRange.from_wire(data.get("point_range"), f"{where}.point_range"),
+            shape_bound=ShapeBound.from_mapping(data.get("shape_bound"), f"{where}.shape_bound"),
+            point_range=PointRange.from_mapping(data.get("point_range"), f"{where}.point_range"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "request_key": self.request_key.to_wire(),
+            "request_key": self.request_key.to_mapping(),
             "producer_op_id": self.producer_op_id,
             "output_index": self.output_index,
             "generation": self.generation,
             "kind": self.kind.value,
             "storage_class": self.storage_class.value,
             "dtype": self.dtype.value,
-            "shape_bound": self.shape_bound.to_wire(),
-            "point_range": self.point_range.to_wire(),
+            "shape_bound": self.shape_bound.to_mapping(),
+            "point_range": self.point_range.to_mapping(),
         }
 
 
@@ -1006,7 +1006,7 @@ class VersionRef:
         return isinstance(self.point, FixedPoint)
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "version_ref") -> VersionRef:
+    def from_mapping(cls, value: object, where: str = "version_ref") -> VersionRef:
         reference = _fast_version_ref(value)
         if reference is not None:
             return reference
@@ -1027,7 +1027,7 @@ class VersionRef:
                 selected_point=(
                     None
                     if inner.get("selected_point") is None
-                    else ProductRef.from_wire(
+                    else ProductRef.from_mapping(
                         inner.get("selected_point"), f"{where}.point.value.selected_point"
                     )
                 ),
@@ -1039,12 +1039,12 @@ class VersionRef:
         else:
             raise invalid_descriptor(f"{where}.point has unknown variant {kind!r}")
         return cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             producer_op_id=_uint(data.get("producer_op_id"), f"{where}.producer_op_id"),
             point=point,
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         if isinstance(self.point, FixedPoint):
             point = {
                 "kind": "fixed",
@@ -1061,13 +1061,13 @@ class VersionRef:
                     "selected_point": (
                         None
                         if self.point.selected_point is None
-                        else self.point.selected_point.to_wire()
+                        else self.point.selected_point.to_mapping()
                     ),
                     "producer_plan_digest": self.point.producer_plan_digest,
                 },
             }
         return {
-            "request_key": self.request_key.to_wire(),
+            "request_key": self.request_key.to_mapping(),
             "producer_op_id": self.producer_op_id,
             "point": point,
         }
@@ -1087,18 +1087,18 @@ class SnapshotRef:
         if not _is_digest(self.digest) or self.locator != self.digest:
             raise invalid_descriptor("snapshot reference artifact digest or locator is invalid")
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "version": self.version.to_wire(),
+            "version": self.version.to_mapping(),
             "digest": self.digest,
             "locator": self.locator,
         }
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "snapshot") -> SnapshotRef:
+    def from_mapping(cls, value: object, where: str = "snapshot") -> SnapshotRef:
         data = _map(value, where)
         return cls(
-            version=VersionRef.from_wire(data.get("version"), f"{where}.version"),
+            version=VersionRef.from_mapping(data.get("version"), f"{where}.version"),
             digest=_str(data.get("digest"), f"{where}.digest"),
             locator=_str(data.get("locator"), f"{where}.locator"),
         )
@@ -1134,7 +1134,7 @@ class Work:
         return cls("token", mode.value)
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "work") -> Work:
+    def from_mapping(cls, value: object, where: str = "work") -> Work:
         work = _fast_work(value)
         if work is not None:
             return work
@@ -1142,7 +1142,7 @@ class Work:
         mode = None if payload is None else _str(payload, f"{where}.value")
         return cls(kind, mode)
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         if self.mode is None:
             return {"kind": self.kind}
         return {"kind": self.kind, "value": self.mode}
@@ -1158,7 +1158,7 @@ class Bounds:
     max_transfer_bytes: int = 0
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "bounds") -> Bounds:
+    def from_mapping(cls, value: object, where: str = "bounds") -> Bounds:
         bounds = _fast_bounds(value)
         if bounds is not None:
             return bounds
@@ -1174,7 +1174,7 @@ class Bounds:
             max_transfer_bytes=_uint(data.get("max_transfer_bytes"), f"{where}.max_transfer_bytes"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "max_points": self.max_points,
             "max_tokens": self.max_tokens,
@@ -1192,7 +1192,7 @@ class Rng:
     draw_layout: DrawLayout
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "rng") -> Rng:
+    def from_mapping(cls, value: object, where: str = "rng") -> Rng:
         rng = _fast_rng(value)
         if rng is not None:
             return rng
@@ -1205,7 +1205,7 @@ class Rng:
             draw_layout=_enum(DrawLayout, data.get("draw_layout"), f"{where}.draw_layout"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "seed": self.seed,
             "semantic_index_base": self.semantic_index_base,
@@ -1405,7 +1405,7 @@ class Operation:
             raise invalid_descriptor("operation plan digest does not match its registration fields")
 
     @classmethod
-    def from_wire(
+    def from_mapping(
         cls,
         value: object,
         where: str = "operation",
@@ -1419,16 +1419,16 @@ class Operation:
         get = data.get
         request_key = _fast_request_key(get("request_key"))
         if request_key is None:
-            request_key = RequestKey.from_wire(get("request_key"), f"{where}.request_key")
+            request_key = RequestKey.from_mapping(get("request_key"), f"{where}.request_key")
         op_id = get("op_id")
         if not (type(op_id) is int and op_id >= 0):
             op_id = _uint(op_id, f"{where}.op_id")
         parent = _fast_version_ref(get("parent"))
         if parent is None:
-            parent = VersionRef.from_wire(get("parent"), f"{where}.parent")
+            parent = VersionRef.from_mapping(get("parent"), f"{where}.parent")
         work = _fast_work(get("work"))
         if work is None:
-            work = Work.from_wire(get("work"), f"{where}.work")
+            work = Work.from_mapping(get("work"), f"{where}.work")
         route = get("route")
         if not (type(route) is int and route >= 0):
             route = _uint(route, f"{where}.route")
@@ -1441,17 +1441,17 @@ class Operation:
             advances_state = _bool(advances_state, f"{where}.advances_state")
         bounds = _fast_bounds(get("bounds"))
         if bounds is None:
-            bounds = Bounds.from_wire(get("bounds"), f"{where}.bounds")
+            bounds = Bounds.from_mapping(get("bounds"), f"{where}.bounds")
         inputs = _fast_product_refs(get("inputs", ()))
         if inputs is None:
             inputs = tuple(
-                ProductRef.from_wire(item, f"{where}.inputs[{index}]")
+                ProductRef.from_mapping(item, f"{where}.inputs[{index}]")
                 for index, item in enumerate(_seq(data.get("inputs", ()), f"{where}.inputs"))
             )
         outputs = _fast_product_refs(get("outputs", ()))
         if outputs is None:
             outputs = tuple(
-                ProductRef.from_wire(item, f"{where}.outputs[{index}]")
+                ProductRef.from_mapping(item, f"{where}.outputs[{index}]")
                 for index, item in enumerate(_seq(data.get("outputs", ()), f"{where}.outputs"))
             )
         predicate_raw = get("predicate")
@@ -1460,14 +1460,14 @@ class Operation:
         else:
             predicate = _fast_product_ref(predicate_raw)
             if predicate is None:
-                predicate = ProductRef.from_wire(predicate_raw, f"{where}.predicate")
+                predicate = ProductRef.from_mapping(predicate_raw, f"{where}.predicate")
         rng_raw = get("rng")
         if rng_raw is None:
             rng = None
         else:
             rng = _fast_rng(rng_raw)
             if rng is None:
-                rng = Rng.from_wire(rng_raw, f"{where}.rng")
+                rng = Rng.from_mapping(rng_raw, f"{where}.rng")
         control_seq = get("control_seq")
         if not (type(control_seq) is int and control_seq >= 0):
             control_seq = _uint(control_seq, f"{where}.control_seq")
@@ -1511,20 +1511,20 @@ class Operation:
         operation.validate()
         return operation
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "request_key": self.request_key.to_wire(),
+            "request_key": self.request_key.to_mapping(),
             "op_id": self.op_id,
-            "parent": self.parent.to_wire(),
-            "work": self.work.to_wire(),
+            "parent": self.parent.to_mapping(),
+            "work": self.work.to_mapping(),
             "route": self.route,
             "domain": self.domain.value,
             "advances_state": self.advances_state,
-            "bounds": self.bounds.to_wire(),
-            "inputs": [product.to_wire() for product in self.inputs],
-            "outputs": [product.to_wire() for product in self.outputs],
-            "predicate": None if self.predicate is None else self.predicate.to_wire(),
-            "rng": None if self.rng is None else self.rng.to_wire(),
+            "bounds": self.bounds.to_mapping(),
+            "inputs": [product.to_mapping() for product in self.inputs],
+            "outputs": [product.to_mapping() for product in self.outputs],
+            "predicate": None if self.predicate is None else self.predicate.to_mapping(),
+            "rng": None if self.rng is None else self.rng.to_mapping(),
             "control_seq": self.control_seq,
             "plan_digest": self.plan_digest,
         }
@@ -1538,7 +1538,7 @@ class LogicalLengths:
     latent_len: int = 0
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "logical_lengths") -> LogicalLengths:
+    def from_mapping(cls, value: object, where: str = "logical_lengths") -> LogicalLengths:
         data = _map(value, where)
         return cls(
             token_len=_uint(data.get("token_len"), f"{where}.token_len"),
@@ -1547,7 +1547,7 @@ class LogicalLengths:
             latent_len=_uint(data.get("latent_len"), f"{where}.latent_len"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "token_len": self.token_len,
             "kv_visible_len": self.kv_visible_len,
@@ -1562,14 +1562,14 @@ class TokenSpan:
     len: int = 0
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "token_span") -> TokenSpan:
+    def from_mapping(cls, value: object, where: str = "token_span") -> TokenSpan:
         data = _map(value, where)
         return cls(
             base=_uint(data.get("base"), f"{where}.base"),
             len=_uint(data.get("len"), f"{where}.len"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {"base": self.base, "len": self.len}
 
 
@@ -1580,7 +1580,7 @@ class FinishFlags:
     stop: bool = False
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "finish_flags") -> FinishFlags:
+    def from_mapping(cls, value: object, where: str = "finish_flags") -> FinishFlags:
         data = _map(value, where)
         return cls(
             eos=_bool(data.get("eos", False), f"{where}.eos"),
@@ -1588,7 +1588,7 @@ class FinishFlags:
             stop=_bool(data.get("stop", False), f"{where}.stop"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {"eos": self.eos, "length": self.length, "stop": self.stop}
 
 
@@ -1600,7 +1600,7 @@ class TimingCounters:
     host_us: int = 0
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "timing_counters") -> TimingCounters:
+    def from_mapping(cls, value: object, where: str = "timing_counters") -> TimingCounters:
         data = _map(value, where)
         return cls(
             queued_us=_uint(data.get("queued_us", 0), f"{where}.queued_us"),
@@ -1609,7 +1609,7 @@ class TimingCounters:
             host_us=_uint(data.get("host_us", 0), f"{where}.host_us"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "queued_us": self.queued_us,
             "device_us": self.device_us,
@@ -1682,22 +1682,22 @@ class CompletionRecord:
             )
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "completion") -> CompletionRecord:
+    def from_mapping(cls, value: object, where: str = "completion") -> CompletionRecord:
         data = _map(value, where)
         record = cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             op_id=_uint(data.get("op_id"), f"{where}.op_id"),
             completion_slot_generation=_uint(
                 data.get("completion_slot_generation"), f"{where}.completion_slot_generation"
             ),
             status=_enum(OpStatus, data.get("status"), f"{where}.status"),
             selected_point=_uint(data.get("selected_point"), f"{where}.selected_point"),
-            logical_lengths=LogicalLengths.from_wire(
+            logical_lengths=LogicalLengths.from_mapping(
                 data.get("logical_lengths"), f"{where}.logical_lengths"
             ),
-            token_span=TokenSpan.from_wire(data.get("token_span"), f"{where}.token_span"),
+            token_span=TokenSpan.from_mapping(data.get("token_span"), f"{where}.token_span"),
             committed_tokens=_uints(data.get("committed_tokens", ()), f"{where}.committed_tokens"),
-            finish_flags=FinishFlags.from_wire(data.get("finish_flags"), f"{where}.finish_flags"),
+            finish_flags=FinishFlags.from_mapping(data.get("finish_flags"), f"{where}.finish_flags"),
             product_generations=_uints(
                 data.get("product_generations", ()), f"{where}.product_generations"
             ),
@@ -1707,14 +1707,14 @@ class CompletionRecord:
                 if data.get("error_code") is None
                 else _enum(ErrorCode, data["error_code"], f"{where}.error_code")
             ),
-            timing_counters=TimingCounters.from_wire(
+            timing_counters=TimingCounters.from_mapping(
                 data.get("timing_counters"), f"{where}.timing_counters"
             ),
         )
         record.validate()
         return record
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         key = self.request_key
         lengths = self.logical_lengths
         span = self.token_span
@@ -1822,19 +1822,19 @@ def control_from_wire(
     data = _map(payload, f"{where}.value")
     request_key = _fast_request_key(data.get("request_key"))
     if request_key is None:
-        request_key = RequestKey.from_wire(data.get("request_key"), f"{where}.value.request_key")
+        request_key = RequestKey.from_mapping(data.get("request_key"), f"{where}.value.request_key")
     cached_digest = envelope.get("_content_digest") if _validated_wire else None
     if cached_digest is not None and not _is_digest(cached_digest):
         raise invalid_descriptor(f"{where} has an invalid trusted content digest")
     if kind == "commit":
         expected_parent = _fast_version_ref(data.get("expected_parent"))
         if expected_parent is None:
-            expected_parent = VersionRef.from_wire(
+            expected_parent = VersionRef.from_mapping(
                 data.get("expected_parent"), f"{where}.value.expected_parent"
             )
         selected = _fast_version_ref(data.get("selected"))
         if selected is None:
-            selected = VersionRef.from_wire(data.get("selected"), f"{where}.value.selected")
+            selected = VersionRef.from_mapping(data.get("selected"), f"{where}.value.selected")
         commit = Commit(
             request_key=request_key,
             control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
@@ -1852,7 +1852,7 @@ def control_from_wire(
     elif kind == "close":
         cutoff = _fast_version_ref(data.get("cutoff"))
         if cutoff is None:
-            cutoff = VersionRef.from_wire(data.get("cutoff"), f"{where}.value.cutoff")
+            cutoff = VersionRef.from_mapping(data.get("cutoff"), f"{where}.value.cutoff")
         control = Close(
             request_key=request_key,
             control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
@@ -1878,10 +1878,10 @@ def control_to_wire(control: Control) -> dict[str, object]:
         return {
             "kind": "commit",
             "value": {
-                "request_key": control.request_key.to_wire(),
+                "request_key": control.request_key.to_mapping(),
                 "control_seq": control.control_seq,
-                "expected_parent": control.expected_parent.to_wire(),
-                "selected": control.selected.to_wire(),
+                "expected_parent": control.expected_parent.to_mapping(),
+                "selected": control.selected.to_mapping(),
                 "public_event_limit": control.public_event_limit,
                 "disposition": control.disposition.value,
             },
@@ -1890,15 +1890,15 @@ def control_to_wire(control: Control) -> dict[str, object]:
         return {
             "kind": "close",
             "value": {
-                "request_key": control.request_key.to_wire(),
+                "request_key": control.request_key.to_mapping(),
                 "control_seq": control.control_seq,
-                "cutoff": control.cutoff.to_wire(),
+                "cutoff": control.cutoff.to_mapping(),
                 "reason": control.reason.value,
             },
         }
     return {
         "kind": "release",
-        "value": {"request_key": control.request_key.to_wire(), "op_id": control.op_id},
+        "value": {"request_key": control.request_key.to_mapping(), "op_id": control.op_id},
     }
 
 
@@ -1922,10 +1922,10 @@ class UndAdmission:
             raise invalid_descriptor("und admission finish token ids are not canonical")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "und admission") -> UndAdmission:
+    def from_mapping(cls, value: object, where: str = "und admission") -> UndAdmission:
         data = _map(value, where)
         return cls(
-            sampling=SamplingParams.from_wire(data.get("sampling", {}), f"{where}.sampling"),
+            sampling=SamplingParams.from_mapping(data.get("sampling", {}), f"{where}.sampling"),
             negative_token_ids=_uints(
                 data.get("negative_token_ids", ()), f"{where}.negative_token_ids"
             ),
@@ -1935,9 +1935,9 @@ class UndAdmission:
             ),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "sampling": self.sampling.to_wire(),
+            "sampling": self.sampling.to_mapping(),
             "negative_token_ids": list(self.negative_token_ids),
             "finish_token_ids": list(self.finish_token_ids),
             "initial_position": self.initial_position,
@@ -1949,12 +1949,12 @@ class GenAdmission:
     image: ImageParams = field(default_factory=ImageParams)
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "gen admission") -> GenAdmission:
+    def from_mapping(cls, value: object, where: str = "gen admission") -> GenAdmission:
         data = _map(value, where)
-        return cls(image=ImageParams.from_wire(data.get("image", {}), f"{where}.image"))
+        return cls(image=ImageParams.from_mapping(data.get("image", {}), f"{where}.image"))
 
-    def to_wire(self) -> dict[str, object]:
-        return {"image": self.image.to_wire()}
+    def to_mapping(self) -> dict[str, object]:
+        return {"image": self.image.to_mapping()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1972,7 +1972,7 @@ class MediaAdmission:
             raise invalid_descriptor("media admission output path must not be empty")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "media admission") -> MediaAdmission:
+    def from_mapping(cls, value: object, where: str = "media admission") -> MediaAdmission:
         data = _map(value, where)
         return cls(
             prompt=_str(data.get("prompt"), f"{where}.prompt"),
@@ -1981,7 +1981,7 @@ class MediaAdmission:
             output_path=_str(data.get("output_path"), f"{where}.output_path"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "prompt": self.prompt,
             "seed": self.seed,
@@ -2021,26 +2021,26 @@ class Admission:
         return replace(value, digest=value.payload_digest())
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "admission") -> Admission:
+    def from_mapping(cls, value: object, where: str = "admission") -> Admission:
         data = _map(value, where)
         admission = cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             request_pool_idx=_uint(data.get("request_pool_idx"), f"{where}.request_pool_idx"),
             digest=_str(data.get("digest"), f"{where}.digest"),
             und=(
                 None
                 if data.get("und") is None
-                else UndAdmission.from_wire(data["und"], f"{where}.und")
+                else UndAdmission.from_mapping(data["und"], f"{where}.und")
             ),
             gen_admission=(
                 None
                 if data.get("gen_admission") is None
-                else GenAdmission.from_wire(data["gen_admission"], f"{where}.gen_admission")
+                else GenAdmission.from_mapping(data["gen_admission"], f"{where}.gen_admission")
             ),
             media=(
                 None
                 if data.get("media") is None
-                else MediaAdmission.from_wire(data["media"], f"{where}.media")
+                else MediaAdmission.from_mapping(data["media"], f"{where}.media")
             ),
         )
         admission.validate()
@@ -2070,14 +2070,14 @@ class Admission:
         )
         return digest.finish()
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "request_key": self.request_key.to_wire(),
+            "request_key": self.request_key.to_mapping(),
             "request_pool_idx": self.request_pool_idx,
             "digest": self.digest,
-            "und": None if self.und is None else self.und.to_wire(),
-            "gen_admission": None if self.gen_admission is None else self.gen_admission.to_wire(),
-            "media": None if self.media is None else self.media.to_wire(),
+            "und": None if self.und is None else self.und.to_mapping(),
+            "gen_admission": None if self.gen_admission is None else self.gen_admission.to_mapping(),
+            "media": None if self.media is None else self.media.to_mapping(),
         }
 
 
@@ -2100,7 +2100,7 @@ class BlockTable:
             raise invalid_descriptor("block table is invalid")
 
     @classmethod
-    def from_wire(
+    def from_mapping(
         cls,
         value: object,
         where: str = "block table",
@@ -2128,7 +2128,7 @@ class BlockTable:
             return placement
         return cls(*fields)
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "request_pool_idx": self.request_pool_idx,
             "group_id": self.group_id,
@@ -2154,7 +2154,7 @@ class CachePageAllocation:
             raise invalid_descriptor("cache-page allocation is invalid")
 
     @classmethod
-    def from_wire(
+    def from_mapping(
         cls,
         value: object,
         where: str = "cache-page allocation",
@@ -2181,7 +2181,7 @@ class CachePageAllocation:
             return placement
         return cls(*fields)
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "request_pool_idx": self.request_pool_idx,
             "group_id": self.group_id,
@@ -2206,7 +2206,7 @@ class ForwardRow:
             raise invalid_descriptor("forward row is invalid")
 
     @classmethod
-    def from_wire(
+    def from_mapping(
         cls,
         value: object,
         where: str = "forward row",
@@ -2221,7 +2221,7 @@ class ForwardRow:
             query_len=_uint(data.get("query_len"), f"{where}.query_len"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "operation_index": self.operation_index,
             "request_pool_index": self.request_pool_index,
@@ -2249,20 +2249,20 @@ class RecoveryPlacement:
             raise invalid_descriptor("recovery placement identity is invalid")
 
     @classmethod
-    def from_wire(
+    def from_mapping(
         cls,
         value: object,
         where: str = "recovery placement",
     ) -> RecoveryPlacement:
         data = _map(value, where)
         return cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             request_pool_idx=_uint(
                 data.get("request_pool_idx"),
                 f"{where}.request_pool_idx",
             ),
             block_tables=tuple(
-                BlockTable.from_wire(item, f"{where}.block_tables[{index}]")
+                BlockTable.from_mapping(item, f"{where}.block_tables[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("block_tables", ()), f"{where}.block_tables")
                 )
@@ -2273,11 +2273,11 @@ class RecoveryPlacement:
             ),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "request_key": self.request_key.to_wire(),
+            "request_key": self.request_key.to_mapping(),
             "request_pool_idx": self.request_pool_idx,
-            "block_tables": [table.to_wire() for table in self.block_tables],
+            "block_tables": [table.to_mapping() for table in self.block_tables],
             "latent_page_table": list(self.latent_page_table),
         }
 
@@ -2293,7 +2293,7 @@ class CacheCopy:
             raise invalid_descriptor("cache copy identity is invalid")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "cache copy") -> CacheCopy:
+    def from_mapping(cls, value: object, where: str = "cache copy") -> CacheCopy:
         data = _map(value, where)
         return cls(
             group_id=_uint(data.get("group_id"), f"{where}.group_id"),
@@ -2304,7 +2304,7 @@ class CacheCopy:
             ),
         )
 
-    def to_wire(self) -> dict[str, int]:
+    def to_mapping(self) -> dict[str, int]:
         return {
             "group_id": self.group_id,
             "source_page": self.source_page,
@@ -2338,10 +2338,10 @@ class LatentPlacement:
             )
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "latent placement") -> LatentPlacement:
+    def from_mapping(cls, value: object, where: str = "latent placement") -> LatentPlacement:
         data = _map(value, where)
         return cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             op_id=_uint(data.get("op_id"), f"{where}.op_id"),
             page_table=_uints(data.get("page_table", ()), f"{where}.page_table"),
             latent_units=_uint(data.get("latent_units"), f"{where}.latent_units"),
@@ -2351,9 +2351,9 @@ class LatentPlacement:
             step_count=_uint(data.get("step_count"), f"{where}.step_count"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "request_key": self.request_key.to_wire(),
+            "request_key": self.request_key.to_mapping(),
             "op_id": self.op_id,
             "page_table": list(self.page_table),
             "latent_units": self.latent_units,
@@ -2378,19 +2378,19 @@ class DecodePlacement:
         _nonnegative(self.start_unit, "decode placement start unit")
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "decode placement") -> DecodePlacement:
+    def from_mapping(cls, value: object, where: str = "decode placement") -> DecodePlacement:
         data = _map(value, where)
         return cls(
-            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             op_id=_uint(data.get("op_id"), f"{where}.op_id"),
             kind=_enum(DecodeKind, data.get("kind"), f"{where}.kind"),
             start_unit=_uint(data.get("start_unit"), f"{where}.start_unit"),
             unit_count=_uint(data.get("unit_count"), f"{where}.unit_count"),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "request_key": self.request_key.to_wire(),
+            "request_key": self.request_key.to_mapping(),
             "op_id": self.op_id,
             "kind": self.kind.value,
             "start_unit": self.start_unit,
@@ -2507,7 +2507,7 @@ class BatchPartition:
             raise invalid_descriptor("GenDecode operation has no decode placement")
 
     @classmethod
-    def from_wire(
+    def from_mapping(
         cls,
         value: object,
         where: str = "batch partition",
@@ -2525,7 +2525,7 @@ class BatchPartition:
             attention=AttentionRegime(_str(data.get("attention"), f"{where}.attention")),
             shape_class=_uint(data.get("shape_class"), f"{where}.shape_class"),
             operations=tuple(
-                Operation.from_wire(
+                Operation.from_mapping(
                     item,
                     f"{where}.operations[{index}]",
                     _validated_wire=_validated_wire,
@@ -2535,7 +2535,7 @@ class BatchPartition:
                 )
             ),
             block_tables=tuple(
-                BlockTable.from_wire(
+                BlockTable.from_mapping(
                     item,
                     f"{where}.block_tables[{index}]",
                     _validated_wire=_validated_wire,
@@ -2545,7 +2545,7 @@ class BatchPartition:
                 )
             ),
             new_cache_pages=tuple(
-                CachePageAllocation.from_wire(
+                CachePageAllocation.from_mapping(
                     item,
                     f"{where}.new_cache_pages[{index}]",
                     _validated_wire=_validated_wire,
@@ -2555,19 +2555,19 @@ class BatchPartition:
                 )
             ),
             forward_rows=tuple(
-                ForwardRow.from_wire(item, f"{where}.forward_rows[{index}]")
+                ForwardRow.from_mapping(item, f"{where}.forward_rows[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("forward_rows", ()), f"{where}.forward_rows")
                 )
             ),
             latent_placements=tuple(
-                LatentPlacement.from_wire(item, f"{where}.latent_placements[{index}]")
+                LatentPlacement.from_mapping(item, f"{where}.latent_placements[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("latent_placements", ()), f"{where}.latent_placements")
                 )
             ),
             decode_placements=tuple(
-                DecodePlacement.from_wire(item, f"{where}.decode_placements[{index}]")
+                DecodePlacement.from_mapping(item, f"{where}.decode_placements[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("decode_placements", ()), f"{where}.decode_placements")
                 )
@@ -2580,7 +2580,7 @@ class BatchPartition:
             return partition
         return cls(**cast(Any, fields))
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "partition_id": self.partition_id,
             "submission_group": self.submission_group,
@@ -2590,12 +2590,12 @@ class BatchPartition:
             "execution": self.execution.value,
             "attention": self.attention.value,
             "shape_class": self.shape_class,
-            "operations": [operation.to_wire() for operation in self.operations],
-            "block_tables": [table.to_wire() for table in self.block_tables],
-            "new_cache_pages": [allocation.to_wire() for allocation in self.new_cache_pages],
-            "forward_rows": [row.to_wire() for row in self.forward_rows],
-            "latent_placements": [placement.to_wire() for placement in self.latent_placements],
-            "decode_placements": [placement.to_wire() for placement in self.decode_placements],
+            "operations": [operation.to_mapping() for operation in self.operations],
+            "block_tables": [table.to_mapping() for table in self.block_tables],
+            "new_cache_pages": [allocation.to_mapping() for allocation in self.new_cache_pages],
+            "forward_rows": [row.to_mapping() for row in self.forward_rows],
+            "latent_placements": [placement.to_mapping() for placement in self.latent_placements],
+            "decode_placements": [placement.to_mapping() for placement in self.decode_placements],
         }
 
 
@@ -2737,18 +2737,18 @@ class Batch:
                 raise invalid_descriptor("a host-staging operation input has no product payload")
 
     @classmethod
-    def from_wire(cls, value: object) -> Batch:
+    def from_mapping(cls, value: object) -> Batch:
         data = _map(value, "execute batch")
         validated_wire = data.get(_WIRE_VALIDATION_KEY) is _WIRE_VALIDATION_TOKEN
         step_id = _uint(data.get("step_id"), "execute batch.step_id")
         admissions = tuple(
-            Admission.from_wire(item, f"execute batch.admissions[{index}]")
+            Admission.from_mapping(item, f"execute batch.admissions[{index}]")
             for index, item in enumerate(
                 _seq(data.get("admissions", ()), "execute batch.admissions")
             )
         )
         partitions = tuple(
-            BatchPartition.from_wire(
+            BatchPartition.from_mapping(
                 item,
                 f"execute batch.partitions[{index}]",
                 _validated_wire=validated_wire,
@@ -2767,7 +2767,7 @@ class Batch:
             for index, item in enumerate(_seq(data.get("controls", ()), "execute batch.controls"))
         )
         input_products = tuple(
-            ProductPayload.from_wire(item, f"execute batch.input_products[{index}]")
+            ProductPayload.from_mapping(item, f"execute batch.input_products[{index}]")
             for index, item in enumerate(
                 _seq(data.get("input_products", ()), "execute batch.input_products")
             )
@@ -2789,13 +2789,13 @@ class Batch:
             input_products=input_products,
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "step_id": self.step_id,
-            "admissions": [value.to_wire() for value in self.admissions],
-            "partitions": [value.to_wire() for value in self.partitions],
+            "admissions": [value.to_mapping() for value in self.admissions],
+            "partitions": [value.to_mapping() for value in self.partitions],
             "controls": [control_to_wire(value) for value in self.controls],
-            "input_products": [value.to_wire() for value in self.input_products],
+            "input_products": [value.to_mapping() for value in self.input_products],
         }
 
 
@@ -2804,11 +2804,11 @@ class RegistrationAck:
     visible: bool = False
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "registration") -> RegistrationAck:
+    def from_mapping(cls, value: object, where: str = "registration") -> RegistrationAck:
         data = _map(value, where)
         return cls(visible=_bool(data.get("visible", False), f"{where}.visible"))
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {"visible": self.visible}
 
 
@@ -2818,10 +2818,10 @@ class ProductPayload:
     payload: bytes
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "product payload") -> ProductPayload:
+    def from_mapping(cls, value: object, where: str = "product payload") -> ProductPayload:
         data = _map(value, where)
         return cls(
-            product=ProductRef.from_wire(data.get("product"), f"{where}.product"),
+            product=ProductRef.from_mapping(data.get("product"), f"{where}.product"),
             payload=(
                 raw
                 if type(raw := data.get("bytes", b"")) is bytes
@@ -2831,15 +2831,15 @@ class ProductPayload:
             ),
         )
 
-    def to_wire(self) -> dict[str, object]:
-        return {"product": self.product.to_wire(), "bytes": self.payload}
+    def to_mapping(self) -> dict[str, object]:
+        return {"product": self.product.to_mapping(), "bytes": self.payload}
 
 
 def encode_token_product_bytes(tokens: Sequence[int]) -> bytes:
     """Encode a ``ProductKind.TOKEN`` product value.
 
     The layout is a little-endian ``u32`` count followed by that many
-    little-endian ``u32`` token ids, matching the Rust ``worker-wire`` codec so
+    little-endian ``u32`` token ids, matching the Rust ``uniserve-worker-ipc`` codec so
     the scheduler and worker share one exact format.
     """
 
@@ -2984,7 +2984,7 @@ class WorkerForwardStats:
     spec_verify_path_counts: Mapping[str, int] = field(default_factory=dict)
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "worker forward stats") -> WorkerForwardStats:
+    def from_mapping(cls, value: object, where: str = "worker forward stats") -> WorkerForwardStats:
         data = _map(value, where)
 
         def counter_map(name: str) -> dict[str, int]:
@@ -3069,7 +3069,7 @@ class WorkerForwardStats:
             spec_verify_path_counts=map_fields["spec_verify_path_counts"],
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             name: dict(value) if isinstance(value, Mapping) else value
             for name, value in ((name, getattr(self, name)) for name in self.__dataclass_fields__)
@@ -3086,7 +3086,7 @@ class PartitionCompletion:
     forward_stats: WorkerForwardStats | None = None
 
     @classmethod
-    def from_wire(
+    def from_mapping(
         cls,
         value: object,
         where: str = "partition completion",
@@ -3095,34 +3095,34 @@ class PartitionCompletion:
         return cls(
             partition_id=_uint(data.get("partition_id"), f"{where}.partition_id"),
             completions=tuple(
-                CompletionRecord.from_wire(item, f"{where}.completions[{index}]")
+                CompletionRecord.from_mapping(item, f"{where}.completions[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("completions", ()), f"{where}.completions")
                 )
             ),
             products=tuple(
-                ProductPayload.from_wire(item, f"{where}.products[{index}]")
+                ProductPayload.from_mapping(item, f"{where}.products[{index}]")
                 for index, item in enumerate(_seq(data.get("products", ()), f"{where}.products"))
             ),
-            registration=RegistrationAck.from_wire(
+            registration=RegistrationAck.from_mapping(
                 data.get("registration", {}), f"{where}.registration"
             ),
             worker_exec_us=_optional_uint(data.get("worker_exec_us"), f"{where}.worker_exec_us"),
             forward_stats=(
                 None
                 if data.get("forward_stats") is None
-                else WorkerForwardStats.from_wire(data["forward_stats"], f"{where}.forward_stats")
+                else WorkerForwardStats.from_mapping(data["forward_stats"], f"{where}.forward_stats")
             ),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "partition_id": self.partition_id,
-            "completions": [value.to_wire() for value in self.completions],
-            "products": [value.to_wire() for value in self.products],
-            "registration": self.registration.to_wire(),
+            "completions": [value.to_mapping() for value in self.completions],
+            "products": [value.to_mapping() for value in self.products],
+            "registration": self.registration.to_mapping(),
             "worker_exec_us": self.worker_exec_us,
-            "forward_stats": None if self.forward_stats is None else self.forward_stats.to_wire(),
+            "forward_stats": None if self.forward_stats is None else self.forward_stats.to_mapping(),
         }
 
 
@@ -3158,22 +3158,22 @@ class CompletionReport:
         return None if not values else max(values)
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "completion report") -> CompletionReport:
+    def from_mapping(cls, value: object, where: str = "completion report") -> CompletionReport:
         data = _map(value, where)
         return cls(
             step_id=_uint(data.get("step_id"), f"{where}.step_id"),
             partitions=tuple(
-                PartitionCompletion.from_wire(item, f"{where}.partitions[{index}]")
+                PartitionCompletion.from_mapping(item, f"{where}.partitions[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("partitions", ()), f"{where}.partitions")
                 )
             ),
         )
 
-    def to_wire(self) -> dict[str, object]:
+    def to_mapping(self) -> dict[str, object]:
         return {
             "step_id": self.step_id,
-            "partitions": [partition.to_wire() for partition in self.partitions],
+            "partitions": [partition.to_mapping() for partition in self.partitions],
         }
 
 

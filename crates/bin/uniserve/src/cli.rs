@@ -11,7 +11,8 @@ use educe::Educe;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
-use uniserve_engine_runtime::{
+use uniserve_engine::worker::{LaneConfig, WorkerLaunchConfig};
+use uniserve_engine::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
 };
@@ -19,7 +20,6 @@ use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
     ModelDescription, SchedulingPolicy,
 };
-use uniserve_worker_ipc::{LaneConfig, WorkerLaunchConfig};
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
@@ -191,12 +191,12 @@ impl EngineArgs {
     /// Build the engine-proc configuration. Control tokens default to the
     /// sim-compatible values and are overridden by the frontend's INIT
     /// generation control tokens during the handshake.
-    pub(crate) fn to_proc_config(&self) -> uniserve_engine_process::EngineProcConfig {
-        let mut core = uniserve_engine_runtime::EngineCoreConfig::sim(self.resolved_model());
+    pub(crate) fn to_proc_config(&self) -> uniserve_engine::process::EngineProcConfig {
+        let mut core = uniserve_engine::EngineCoreConfig::sim(self.resolved_model());
         core.backend = if self.sim {
-            uniserve_engine_runtime::EngineBackend::Sim
+            uniserve_engine::EngineBackend::Sim
         } else {
-            uniserve_engine_runtime::EngineBackend::Worker
+            uniserve_engine::EngineBackend::Worker
         };
         core.device = self.device.clone();
         core.attention_backend = self.attention_backend.clone();
@@ -233,7 +233,7 @@ impl EngineArgs {
         } else {
             core.resp_slot_cap = self.resp_slot_cap;
         }
-        uniserve_engine_process::EngineProcConfig {
+        uniserve_engine::process::EngineProcConfig {
             handshake_address: self.handshake_address.clone(),
             engine_index: self.engine_index,
             init_timeout: std::time::Duration::from_secs(self.init_timeout),

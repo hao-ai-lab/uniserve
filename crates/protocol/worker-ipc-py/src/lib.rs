@@ -6,7 +6,7 @@
 //!
 //! 1. The shared-memory wire boundary (iceoryx2), which carries flatbuffer
 //!    bytes. `Frame::decode_request` / `ServerEndpoint::respond` handle this
-//!    via the zero-copy-friendly flatbuffer codec in `worker-wire::flat`.
+//!    via the zero-copy-friendly flatbuffer codec in `uniserve-worker-ipc::codec`.
 //! 2. The Rust↔Python FFI boundary, crossed once on the inbound path
 //!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
 //!    path ([`PyServer::respond`]).
@@ -28,8 +28,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
 use pythonize::{depythonize, pythonize};
-use uniserve_worker_ipc_core::{ServerEndpoint, WakeSender};
-use uniserve_worker_wire::{RequestKind, WorkerRequest, WorkerResponse};
+use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
+use uniserve_worker_ipc::{ServerEndpoint, WakeSender};
 
 #[pyclass(name = "Server")]
 struct PyServer {

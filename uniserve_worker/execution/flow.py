@@ -388,7 +388,7 @@ def publish_latent_transfer(
     scope.stage_publications[ops._operation_identity(operation)] = (locator,)
     descriptor = _CompletionTransferPayload(
         "latent",
-        {"locator": locator.to_wire(), **metadata},
+        {"locator": locator.to_mapping(), **metadata},
         (locator,),
         operation.plan_digest,
         transport,

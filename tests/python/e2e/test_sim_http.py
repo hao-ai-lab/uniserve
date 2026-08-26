@@ -175,7 +175,7 @@ def active_sensenova_control_ids(model: Path) -> dict[str, int]:
     }
 
     assert frontend_ids == added_token_ids == tokenizer_config_ids == worker_ids, (
-        "active SenseNova checkpoint has divergent frontend/worker image-control IDs: "
+        "active SenseNova checkpoint has divergent server/worker image-control IDs: "
         f"frontend={frontend_ids}, added_tokens={added_token_ids}, "
         f"tokenizer_config={tokenizer_config_ids}, worker={worker_ids}"
     )

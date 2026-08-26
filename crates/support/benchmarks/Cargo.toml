@@ -8,7 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-uniserve-serving.workspace = true
+uniserve-server.workspace = true
 
 [lints]
 workspace = true

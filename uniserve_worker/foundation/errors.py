@@ -109,7 +109,7 @@ class WorkerError(Exception):
     def __post_init__(self) -> None:
         Exception.__init__(self, f"{self.code}: {self.message}")
 
-    def to_wire(self) -> dict[str, Any]:
+    def to_mapping(self) -> dict[str, Any]:
         # Only the fields modeled on the Rust WorkerResponse cross the wire.
         # Richer context (req_id, op_id, op_kind, details) stays local
         # for logging and metrics.
