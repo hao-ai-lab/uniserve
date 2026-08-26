@@ -12,6 +12,7 @@ import numpy as np
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
 from ..load import GpuMemorySampler, WarmupFailure, run_load
+from ..load.arrival import MeasurementWindow
 from ..tasks import get_task
 from ..transport import send_request
 from ..types import BenchmarkPoint, Example, RequestRecord, RunResult, selected_rows_identity
@@ -25,6 +26,7 @@ async def run_point(
     *,
     launch: dict[str, Any] | None = None,
     timeout_s: float = 6 * 60 * 60.0,
+    measurement: MeasurementWindow | None = None,
 ) -> RunResult:
     output_path = Path(output_dir)
     if output_path.exists() and any(output_path.iterdir()):
@@ -96,6 +98,7 @@ async def run_point(
                     max_concurrency=point.load.max_concurrency,
                     submit=submit,
                     warmup_requests=point.load.warmup_requests,
+                    measurement=measurement,
                 )
             except WarmupFailure as error:
                 warmup_records = cast(list[RequestRecord], list(error.outputs))
@@ -178,6 +181,8 @@ def _write_records(
     for record in records:
         for image in record.decoded_images:
             writer.write_image_sample(image)
+        if record.decoded_video is not None:
+            writer.write_video_sample(record.decoded_video)
     writer.write_jsonl(name, [record.record_dict() for record in records])
 
 

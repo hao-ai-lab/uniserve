@@ -79,6 +79,8 @@ pub(crate) enum ModelDescriptionArg {
     #[value(name = "sensenova")]
     SenseNova,
     Bagel,
+    #[value(name = "minimax-h3")]
+    MiniMaxH3,
 }
 
 impl From<ModelDescriptionArg> for ModelDescription {
@@ -87,6 +89,7 @@ impl From<ModelDescriptionArg> for ModelDescription {
             ModelDescriptionArg::Qwen3 => ModelDescription::Qwen3,
             ModelDescriptionArg::SenseNova => ModelDescription::SenseNova,
             ModelDescriptionArg::Bagel => ModelDescription::Bagel,
+            ModelDescriptionArg::MiniMaxH3 => ModelDescription::MiniMaxH3,
         }
     }
 }
@@ -172,6 +175,9 @@ pub(crate) struct EngineArgs {
     /// Response-ring slot capacity in bytes for the worker IPC transport.
     #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub resp_slot_cap: usize,
+    /// Shared server/worker directory for completed media artifacts.
+    #[arg(long, hide = true)]
+    pub media_spool: Option<std::path::PathBuf>,
     /// Explicit Python worker launch/runtime arguments.
     #[command(flatten)]
     pub worker_launch: WorkerLaunchArgs,
@@ -215,8 +221,18 @@ impl EngineArgs {
         core.worker_ranks = self.worker_ranks;
         core.workers = self.workers.clone();
         core.transfer = self.transfer.clone();
-        core.worker_launch = self.worker_launch.to_config();
-        core.resp_slot_cap = self.resp_slot_cap;
+        let mut worker_launch = self.worker_launch.to_config();
+        worker_launch.media_spool = self
+            .media_spool
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        core.worker_launch = worker_launch;
+        if self.media_spool.is_some() {
+            core.req_slot_cap = EngineSettings::MEDIA_IPC_SLOT_CAP;
+            core.resp_slot_cap = EngineSettings::MEDIA_IPC_SLOT_CAP;
+        } else {
+            core.resp_slot_cap = self.resp_slot_cap;
+        }
         uniserve_engine_process::EngineProcConfig {
             handshake_address: self.handshake_address.clone(),
             engine_index: self.engine_index,
@@ -284,6 +300,10 @@ pub(crate) struct SharedRuntimeArgs {
     /// Closed model description that owns configured preprocessing and output behavior.
     #[arg(long, value_enum)]
     pub model_description: ModelDescriptionArg,
+
+    /// Shared absolute directory used for generated media files.
+    #[arg(long, default_value = "/tmp/uniserve-media")]
+    pub media_spool: std::path::PathBuf,
 
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
@@ -446,6 +466,10 @@ impl SharedRuntimeArgs {
 
     /// Build the UniServe Rust-engine settings from these CLI arguments.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
+        let is_media = matches!(self.model_description, ModelDescriptionArg::MiniMaxH3);
+        let mut worker_launch = self.worker_launch.to_config();
+        worker_launch.media_spool =
+            is_media.then(|| self.media_spool.to_string_lossy().into_owned());
         EngineSettings {
             connection: uniserve_server::EngineConnection::InProcess,
             backend: if self.sim {
@@ -467,18 +491,28 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             kv_token_capacity: self.kv_token_capacity,
-            resp_slot_cap: self.resp_slot_cap,
+            resp_slot_cap: if is_media {
+                EngineSettings::MEDIA_IPC_SLOT_CAP
+            } else {
+                self.resp_slot_cap
+            },
             worker_python: self.worker_python.clone(),
             worker_ranks: self.worker_ranks,
             workers: self.workers.clone(),
             transfer: self.transfer.clone(),
-            worker_launch: self.worker_launch.to_config(),
+            worker_launch,
         }
     }
 
     /// CLI arguments forwarded verbatim to each managed `uniserve engine`
     /// subprocess (the engine-tier settings of this serve invocation).
     pub(crate) fn engine_cli_args(&self) -> Vec<String> {
+        let is_media = matches!(self.model_description, ModelDescriptionArg::MiniMaxH3);
+        let resp_slot_cap = if is_media {
+            EngineSettings::MEDIA_IPC_SLOT_CAP
+        } else {
+            self.resp_slot_cap
+        };
         let mut args = vec![
             "--device".to_string(),
             self.device.clone(),
@@ -503,7 +537,7 @@ impl SharedRuntimeArgs {
             "--schedule-policy".to_string(),
             format!("{:?}", self.scheduler_policy).to_ascii_lowercase(),
             "--resp-slot-cap".to_string(),
-            self.resp_slot_cap.to_string(),
+            resp_slot_cap.to_string(),
         ];
         if let Some(len) = self.max_model_len {
             args.push("--max-model-len".to_string());
@@ -520,6 +554,10 @@ impl SharedRuntimeArgs {
         if let Some(transfer) = &self.transfer {
             args.push("--transfer".to_string());
             args.push(transfer.clone());
+        }
+        if is_media {
+            args.push("--media-spool".to_string());
+            args.push(self.media_spool.to_string_lossy().into_owned());
         }
         self.worker_launch.append_engine_cli_args(&mut args);
         if self.sim {
@@ -540,6 +578,7 @@ impl SharedRuntimeArgs {
             model,
             model_description: self.model_description.into(),
             served_model_name: self.served_model_name,
+            media_spool: self.media_spool,
             listener_mode,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
@@ -650,6 +689,7 @@ impl WorkerLaunchArgs {
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
             flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
             snapshot_dir: self.snapshot_dir.clone(),
+            media_spool: None,
         }
     }
 

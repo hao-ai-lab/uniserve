@@ -36,6 +36,7 @@ _ROUTES = {
             WorkVariant.TOKEN_VERIFY,
             WorkVariant.GEN_TRANSITION,
             WorkVariant.GEN_FLOW,
+            WorkVariant.GEN_DECODE,
             WorkVariant.MATERIALIZE,
             WorkVariant.TRANSFER_KV_PUBLISH,
             WorkVariant.TRANSFER_KV_INSTALL,
@@ -56,6 +57,7 @@ _ROUTES = {
         {
             WorkVariant.GEN_TRANSITION,
             WorkVariant.GEN_FLOW,
+            WorkVariant.GEN_DECODE,
             WorkVariant.MATERIALIZE,
         }
     ),

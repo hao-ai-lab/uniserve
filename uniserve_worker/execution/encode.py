@@ -649,7 +649,7 @@ def artifact_product(operation: Operation) -> ProductRef:
     for output in operation.outputs:
         if (
             output.kind is ProductKind.ARTIFACT
-            and output.storage_class is StorageClass.COMPLETION_ARENA
+            and output.storage_class is StorageClass.PINNED_OUTPUT
         ):
             return output
     raise invalid_descriptor("materialize operation has no host-visible artifact output")

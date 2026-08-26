@@ -66,4 +66,7 @@ pub struct HandshakeInitMessage {
     /// Model control-token ids resolved by the frontend tokenizer for scheduler
     /// lifecycle decisions.
     pub generation_controls: Option<crate::generation::GenerationControlTokens>,
+    /// Shared filesystem namespace required by media-capable engines.
+    #[serde(default)]
+    pub media_spool: Option<String>,
 }

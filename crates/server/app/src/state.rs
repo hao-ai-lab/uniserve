@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,6 +19,7 @@ pub struct AppState {
     api_key: Option<String>,
     request_timeout: Option<Duration>,
     max_concurrent_requests: Option<u64>,
+    media_spool: PathBuf,
     server_load: AtomicU64,
 }
 
@@ -40,6 +42,7 @@ impl AppState {
             api_key: None,
             request_timeout: None,
             max_concurrent_requests: None,
+            media_spool: PathBuf::from("/tmp/uniserve-media"),
             server_load: AtomicU64::new(0),
         }
     }
@@ -67,6 +70,15 @@ impl AppState {
     pub fn with_max_concurrent_requests(mut self, limit: Option<u64>) -> Self {
         self.max_concurrent_requests = limit;
         self
+    }
+
+    pub fn with_media_spool(mut self, path: PathBuf) -> Self {
+        self.media_spool = path;
+        self
+    }
+
+    pub fn media_spool(&self) -> &Path {
+        &self.media_spool
     }
 
     pub fn runtime(&self) -> &ServingRuntime {

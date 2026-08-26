@@ -277,6 +277,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 new_cache_pages,
                 forward_rows,
                 latent_placements,
+                decode_placements: Vec::new(),
             }
         })
         .collect()
@@ -788,6 +789,30 @@ fn capabilities_round_trip_with_the_canonical_layout() {
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
     let decoded = decoded.capabilities.unwrap();
     assert_eq!(decoded, caps);
+}
+
+#[test]
+fn kv_free_capabilities_round_trip_without_kv_geometry() {
+    let caps = WorkerCapabilities {
+        block_size: 0,
+        num_blocks: 0,
+        num_layers: 0,
+        num_kv_heads: 0,
+        head_dim: 0,
+        supported_work: vec![WorkVariant::GenTransition, WorkVariant::GenFlow],
+        latent_page_units: 64,
+        num_latent_pages: 3,
+        latent_width: 1,
+        latent_dtype: "float32".into(),
+        bytes_per_token: 0,
+        groups: Vec::new(),
+        kv_dtype: String::new(),
+        resource_classes: vec![ResourceClass::ImageLatent],
+        ..WorkerCapabilities::default()
+    };
+    let response = WorkerResponse::capabilities(caps.clone());
+    let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+    assert_eq!(decoded.capabilities.unwrap(), caps);
 }
 
 #[test]
@@ -1304,7 +1329,7 @@ fn full_completion_report() -> CompletionReport {
         stop: true,
     };
     let mut artifact = product_for(session_key(102), OpId(13), 3, ProductKind::Artifact);
-    artifact.storage_class = StorageClass::CompletionArena;
+    artifact.storage_class = StorageClass::PinnedOutput;
     artifact.dtype = DType::U8;
     artifact.shape_bound = ShapeBound {
         dims: vec![DimBound::Static(256)],
@@ -1329,8 +1354,8 @@ fn full_completion_report() -> CompletionReport {
     )
 }
 
-/// One fixture per `ResponseKind`, plus a second capabilities frame that fills
-/// every optional field the default leaves empty.
+/// One fixture per `ResponseKind`, plus a second capabilities frame that
+/// exercises non-default capability values.
 fn response_fixtures() -> Vec<WorkerResponse> {
     let bare = |kind: ResponseKind| WorkerResponse {
         kind,

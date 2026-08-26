@@ -19,13 +19,14 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_wire::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CacheCopy, CachePageAllocation,
-    CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound, Disposition, Domain,
-    DrawLayout, EncodeMode, ErrorCode, ErrorOperationIdentity, ExecutionCapability, FinishFlags,
-    ForwardRow, GenAdmission, GenMode, LatentPlacement, LogicalLengths, OpId, OpStatus, Operation,
-    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    RecoveryPlacement, RegistrationAck, RequestKey, RequestKind, ResponseKind, ShapeBound,
-    SnapshotRef, StorageClass, TimingCounters, TokenMode, TokenSpan, TransferMode, UndAdmission,
-    VersionRef, Work, WorkerForwardStats, WorkerRequest, WorkerResponse,
+    CloseReason, CompletionRecord, CompletionReport, Control, DType, DecodeKind, DecodePlacement,
+    DimBound, Disposition, Domain, DrawLayout, EncodeMode, ErrorCode, ErrorOperationIdentity,
+    ExecutionCapability, FinishFlags, ForwardRow, GenAdmission, GenMode, LatentPlacement,
+    LogicalLengths, MediaAdmission, MediaProfileId, OpId, OpStatus, Operation, PartitionCompletion,
+    Point, PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
+    RequestKey, RequestKind, ResponseKind, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
+    TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats,
+    WorkerRequest, WorkerResponse,
 };
 
 #[cfg(test)]
@@ -129,7 +130,7 @@ struct NativeRequestTypes {
     draw_layouts: [Py<PyAny>; 3],
     execution_capabilities: [Py<PyAny>; 2],
     attention_regimes: [Py<PyAny>; 4],
-    works: [Py<PyAny>; 12],
+    works: [Py<PyAny>; 13],
 }
 
 static NATIVE_REQUEST_TYPES: std::sync::OnceLock<NativeRequestTypes> = std::sync::OnceLock::new();
@@ -207,7 +208,7 @@ impl NativeRequestTypes {
                     "paged_kv",
                     "latent_arena",
                     "host_staging",
-                    "completion_arena",
+                    "pinned_output",
                 ],
             )?,
             dtypes: enum_members(
@@ -249,6 +250,7 @@ impl NativeRequestTypes {
                 work_variant("gen", Some("transition"))?,
                 work_variant("gen", Some("flow"))?,
                 work_variant("materialize", None)?,
+                work_variant("gen", Some("decode"))?,
             ],
         })
     }
@@ -284,6 +286,7 @@ impl NativeRequestTypes {
             Work::Gen(GenMode::Transition) => 9,
             Work::Gen(GenMode::Flow) => 10,
             Work::Materialize => 11,
+            Work::Gen(GenMode::Decode) => 12,
         };
         self.works[index].bind(py).clone()
     }
@@ -314,7 +317,7 @@ impl NativeRequestTypes {
             StorageClass::PagedKv => 1,
             StorageClass::LatentArena => 2,
             StorageClass::HostStaging => 3,
-            StorageClass::CompletionArena => 4,
+            StorageClass::PinnedOutput => 4,
         };
         self.storage_classes[index].bind(py).clone()
     }
@@ -670,6 +673,10 @@ impl<'py> NativeRequestConversion<'py> {
                     latent_placement_to_py(py, placement, context)
                 })?
                 .into_any(),
+                dict_list(py, &partition.decode_placements, |placement| {
+                    decode_placement_to_py(py, placement, context)
+                })?
+                .into_any(),
             ],
         )?;
         self.types.native_partition.bind(py).call1(arguments)
@@ -724,6 +731,29 @@ fn latent_placement_to_py<'py>(
     dict.set_item(intern!(py, "width"), placement.width)?;
     dict.set_item(intern!(py, "start_step"), placement.start_step)?;
     dict.set_item(intern!(py, "step_count"), placement.step_count)?;
+    Ok(dict)
+}
+
+fn decode_placement_to_py<'py>(
+    py: Python<'py>,
+    placement: &DecodePlacement,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        intern!(py, "request_key"),
+        context.request_key(placement.request_key)?,
+    )?;
+    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
+    dict.set_item(
+        intern!(py, "kind"),
+        match placement.kind {
+            DecodeKind::Video => "video",
+            DecodeKind::Audio => "audio",
+        },
+    )?;
+    dict.set_item(intern!(py, "start_unit"), placement.start_unit)?;
+    dict.set_item(intern!(py, "unit_count"), placement.unit_count)?;
     Ok(dict)
 }
 
@@ -822,6 +852,14 @@ fn admission_to_py<'py>(
             .map(|branch| gen_admission_to_py(py, branch))
             .transpose()?,
     )?;
+    dict.set_item(
+        intern!(py, "media"),
+        admission
+            .media
+            .as_ref()
+            .map(|media| media_admission_to_py(py, media))
+            .transpose()?,
+    )?;
     Ok(dict)
 }
 
@@ -846,6 +884,23 @@ fn gen_admission_to_py<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "image"), image_to_py(py, &branch.image)?)?;
+    Ok(dict)
+}
+
+fn media_admission_to_py<'py>(
+    py: Python<'py>,
+    media: &MediaAdmission,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "prompt"), media.prompt.as_str())?;
+    dict.set_item(intern!(py, "seed"), media.seed)?;
+    dict.set_item(
+        intern!(py, "profile"),
+        match media.profile {
+            MediaProfileId::MinimaxH3T2va => "minimax_h3_t2va",
+        },
+    )?;
+    dict.set_item(intern!(py, "output_path"), media.output_path.as_str())?;
     Ok(dict)
 }
 
@@ -1163,7 +1218,7 @@ fn storage_class_py<'py>(py: Python<'py>, class: StorageClass) -> &'py Bound<'py
         StorageClass::PagedKv => intern!(py, "paged_kv"),
         StorageClass::LatentArena => intern!(py, "latent_arena"),
         StorageClass::HostStaging => intern!(py, "host_staging"),
-        StorageClass::CompletionArena => intern!(py, "completion_arena"),
+        StorageClass::PinnedOutput => intern!(py, "pinned_output"),
     }
 }
 
@@ -1460,7 +1515,7 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
         "paged_kv" => StorageClass::PagedKv,
         "latent_arena" => StorageClass::LatentArena,
         "host_staging" => StorageClass::HostStaging,
-        "completion_arena" => StorageClass::CompletionArena,
+        "pinned_output" => StorageClass::PinnedOutput,
         _ => return None,
     };
     let dtype = str_field(dict, intern!(py, "dtype"))?;

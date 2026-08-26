@@ -76,6 +76,7 @@ async fn managed_sim_engine_serves_and_shuts_down() {
         model_name: "sim-model".to_string(),
         client_index: 0,
         generation_controls: None,
+        media_spool: None,
     })
     .await
     .expect("connect to managed engine");

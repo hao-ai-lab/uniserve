@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "UniServe optional CUTE/Triton kernel provider pack"
 requires-python = ">=3.10"
 dependencies = [
+  "fastvideo-kernel==0.3.4",
   "flash-attn-4[cu13]==4.0.0b24",
   "nvidia-cutlass-dsl[cu13]==4.6.0.dev0",
   "torch>=2.13,<2.14",

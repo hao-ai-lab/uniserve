@@ -77,23 +77,25 @@ class KvGroupSpec:
     @classmethod
     def from_wire(cls, value: object, where: str) -> KvGroupSpec:
         data = _map(value, where)
+        kind_data = _map(data.get("kind"), f"{where}.kind")
         return cls(
             group_id=_uint(data.get("group_id"), f"{where}.group_id"),
             block_offset=_uint(data.get("block_offset"), f"{where}.block_offset"),
             num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
-            kind=_enum(KvGroupKind, data.get("kind"), f"{where}.kind"),
-            window=_uint(data.get("window"), f"{where}.window"),
-            sink=_uint(data.get("sink"), f"{where}.sink"),
+            kind=_enum(KvGroupKind, kind_data.get("kind"), f"{where}.kind.kind"),
+            window=_uint(kind_data.get("window", 0), f"{where}.kind.window"),
+            sink=_uint(kind_data.get("sink", 0), f"{where}.kind.sink"),
         )
 
     def to_wire(self) -> dict[str, object]:
+        kind: dict[str, object] = {"kind": self.kind.value}
+        if self.kind is KvGroupKind.SLIDING_WINDOW:
+            kind.update(window=self.window, sink=self.sink)
         return {
             "group_id": self.group_id,
             "block_offset": self.block_offset,
             "num_blocks": self.num_blocks,
-            "kind": self.kind.value,
-            "window": self.window,
-            "sink": self.sink,
+            "kind": kind,
         }
 
 
@@ -338,17 +340,30 @@ class WorkerCapabilities:
     def latent_capacity_units(self) -> int:
         return max(0, self.num_latent_pages - 1) * self.latent_page_units
 
+    @property
+    def uses_kv(self) -> bool:
+        return (
+            any(
+                variant
+                in {
+                    WorkVariant.TOKEN_EXTEND,
+                    WorkVariant.TOKEN_DECODE,
+                    WorkVariant.TOKEN_VERIFY,
+                    WorkVariant.DRAFT,
+                    WorkVariant.TRANSFER_KV_PUBLISH,
+                    WorkVariant.TRANSFER_KV_INSTALL,
+                }
+                for variant in self.supported_work
+            )
+            or RequestKind.COPY_KV in self.supported_controls
+            or ResourceClass.KV_BLOCK in self.resource_classes
+        )
+
     def __post_init__(self) -> None:
         if self.model_dtype not in {"float16", "bfloat16", "float32"}:
             raise invalid_descriptor("model_dtype must use the canonical runtime vocabulary")
         for name in (
-            "block_size",
-            "num_blocks",
-            "num_layers",
-            "num_kv_heads",
-            "head_dim",
             "latent_downsample",
-            "bytes_per_token",
             "pipeline_depth",
             "gen_rope_advance",
             "max_cfg_branches",
@@ -359,7 +374,17 @@ class WorkerCapabilities:
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"capabilities.{name} must be positive")
-        if self.groups:
+        kv_values = (
+            self.block_size,
+            self.num_blocks,
+            self.num_layers,
+            self.num_kv_heads,
+            self.head_dim,
+            self.bytes_per_token,
+        )
+        if self.uses_kv:
+            if any(value < 1 for value in kv_values) or not self.groups or not self.kv_dtype:
+                raise invalid_descriptor("capabilities declare incomplete KV geometry")
             next_offset = 0
             for index, group in enumerate(self.groups):
                 if (
@@ -375,6 +400,8 @@ class WorkerCapabilities:
                 raise invalid_descriptor(
                     "capabilities.groups must cover the physical request page pool"
                 )
+        elif any(kv_values) or self.groups or self.kv_dtype:
+            raise invalid_descriptor("KV-free capabilities must carry zero KV geometry")
         for name in (
             "latent_page_units",
             "num_latent_pages",

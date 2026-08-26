@@ -108,8 +108,8 @@ from uniserve_worker.runtime.latent_pool import (
 from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
 from uniserve_worker.runtime.runtime_states import RuntimeStates
 from uniserve_worker.server.completion import (
-    CompletionArena,
-    CompletionCapture,
+    PinnedOutputBuffer,
+    PinnedTokenCapture,
     _CompletionImagePayload,
     _CompletionLogprobPayload,
     _CompletionTransferPayload,
@@ -188,7 +188,7 @@ class ExecutionResources:
     latent_pool: LatentPool | None
     device_products: DeviceProducts
     encoder_cache: EncoderCache
-    _completions: CompletionArena
+    _device_events: DeviceEventPool
     _cpu_tasks: BoundedCpuTaskPool
     weights: WeightSet
     mesh: DeviceMesh
@@ -222,7 +222,7 @@ def create_execution_resources(
     latent_pool: LatentPool | None,
     device_products: DeviceProducts,
     encoder_cache: EncoderCache,
-    completion_arena: CompletionArena,
+    device_events: DeviceEventPool,
     cpu_tasks: BoundedCpuTaskPool,
     weights: WeightSet,
     mesh: DeviceMesh,
@@ -265,7 +265,7 @@ def create_execution_resources(
         latent_pool=latent_pool,
         device_products=device_products,
         encoder_cache=encoder_cache,
-        _completions=completion_arena,
+        _device_events=device_events,
         _cpu_tasks=cpu_tasks,
         weights=weights,
         mesh=mesh,
@@ -554,12 +554,13 @@ def _prepare_predicates(
     if not operations:
         return None
     transferred = {transfer.product: transfer for transfer in transfers}
-    lease = runtime._completions.reserve(
+    buffer = PinnedOutputBuffer(
         len(operations),
         token_capacity=len(operations),
         devices=tuple(_operation_device(runtime, operation) for operation in operations),
+        event_pool=runtime._device_events,
     )
-    captures: list[tuple[OperationIdentity, CompletionCapture, int]] = []
+    captures: list[tuple[OperationIdentity, PinnedTokenCapture, int]] = []
     pending: list[tuple[OperationIdentity, PreparedTransferInput, int]] = []
     recorded: list[DeviceProductRead] = []
     try:
@@ -593,19 +594,19 @@ def _prepare_predicates(
             recorded.extend(reads)
             for operation, read in zip(device_operations, reads, strict=True):
                 identity = _operation_identity(operation)
-                captures.append((identity, lease.capture(read.tensor), rows[identity]))
+                captures.append((identity, buffer.capture(read.tensor), rows[identity]))
             runtime.device_products.record_readers(reads, device=device)
         sealed = not pending
         if sealed:
-            lease.seal()
+            buffer.seal()
     except BaseException:
         unrecorded = tuple(read for read in recorded if not read._recorded)
         if unrecorded:
             runtime.device_products.record_readers(unrecorded)
-        lease.abandon()
+        buffer.abandon()
         raise
     return PreparedPredicateBatch(
-        lease=lease,
+        buffer=buffer,
         entries=captures,
         transferred=tuple(pending),
         sealed=sealed,
@@ -1004,10 +1005,11 @@ def _open_partition(
         )
         for operation, request in zip(operations, candidates, strict=True):
             request.install_runtime(_parent_runtime(runtime, operation, request))
-        completion = runtime._completions.reserve(
+        completion = PinnedOutputBuffer(
             len(operations),
             token_capacity=_partition_completion_words(runtime, operations),
             devices=_completion_devices(runtime, operations),
+            event_pool=runtime._device_events,
         )
     except BaseException as error:
         runtime.trace.emit(
@@ -2081,14 +2083,14 @@ def _validate_completion_products(
         transferred = isinstance(product.payload, _CompletionTransferPayload)
         if transferred and reference.storage_class in {
             StorageClass.HOST_STAGING,
-            StorageClass.COMPLETION_ARENA,
+            StorageClass.PINNED_OUTPUT,
         }:
             raise invalid_descriptor("host-visible output cannot carry a transfer entry")
         if not transferred and payload_bound > int(reference.max_bytes):
             raise invalid_descriptor("completion product exceeds its registered product byte bound")
         if reference.storage_class in (
             StorageClass.HOST_STAGING,
-            StorageClass.COMPLETION_ARENA,
+            StorageClass.PINNED_OUTPUT,
         ) and payload_bound > int(operation.bounds.max_completion_bytes):
             raise invalid_descriptor("completion product exceeds its registered byte bound")
 

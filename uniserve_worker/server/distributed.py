@@ -60,13 +60,27 @@ def build_device_mesh(
 
     axes: list[MeshAxis] = []
     if tp_size > 1:
+        tp_axis = _build_tp_axis(
+            tp_rank,
+            tp_size,
+            local_device,
+            backend_override=tp_backend,
+            init_method_override=tp_init_method,
+        )
+        axes.append(tp_axis)
+        tp_transport = tp_axis.transport
+        assert isinstance(tp_transport, CollectiveTransport)
         axes.append(
-            _build_tp_axis(
-                tp_rank,
-                tp_size,
-                local_device,
-                backend_override=tp_backend,
-                init_method_override=tp_init_method,
+            MeshAxis(
+                name="sp",
+                size=tp_size,
+                coord=tp_rank,
+                transport=CollectiveTransport(
+                    axis="sp",
+                    _size=tp_size,
+                    _coord=tp_rank,
+                    group=tp_transport.group,
+                ),
             )
         )
     tower_axis = _build_tower_axis(tower_devices, tower_primary)

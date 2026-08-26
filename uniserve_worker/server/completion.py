@@ -1,9 +1,10 @@
-"""Bounded completion staging and immutable host materialization."""
+"""Pinned completion staging, immutable step outputs, and retained outcomes."""
 
 from __future__ import annotations
 
 import struct
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Final, cast, overload
@@ -36,26 +37,18 @@ from .image_codec import uint8_image_to_png_base64_bytes
 from .request_state import RequestRuntime
 
 __all__ = [
-    "CompletionArena",
-    "CompletionByteCapture",
-    "CompletionCapture",
-    "CompletionLease",
+    "CompletedStepCache",
+    "PinnedByteCapture",
+    "PinnedOutputBuffer",
+    "PinnedTokenCapture",
+    "StepOutputs",
     "completion_report_ready",
-    "completion_word_capacity",
     "finalize_completion_report",
     "partition_completion_ready",
 ]
 
-_MAX_GENERATION: Final[int] = (1 << 32) - 1
 _SAMPLING_FIELDS_PER_OPERATION: Final[int] = 4
-
-
-def completion_word_capacity(max_operations: int, payload_bytes: int) -> int:
-    operations = int(max_operations)
-    payload = int(payload_bytes)
-    if operations < 1 or payload < 1:
-        raise ValueError("completion geometry must be positive")
-    return _SAMPLING_FIELDS_PER_OPERATION * operations + (payload + 3) // 4
+_next_buffer_generation = 1
 
 
 def _invariant(message: str) -> WorkerError:
@@ -66,94 +59,285 @@ def _invariant(message: str) -> WorkerError:
     )
 
 
-@dataclass(slots=True)
-class _CompletionSlot:
-    host_tokens: torch.Tensor
-    start_events: dict[str, torch.cuda.Event]
-    producer_events: dict[str, torch.cuda.Event]
-    events: dict[str, torch.cuda.Event]
-    devices: set[torch.device] | None = None
-    generation: int = 0
-    owner: int = 0
-    rows: int = 0
-    observed: set[int] | None = None
-    sealed: bool = False
-    abandoned: bool = False
-    reserved_ns: int = 0
-    device_started_ns: int = 0
-    copy_started_ns: int = 0
-    sealed_ns: int = 0
-    ready_ns: int = 0
-    token_offset: int = 0
-    token_capacity: int = 0
+class CompletedStepCache:
+    """Weighted LRU ownership for quiescent terminal step records."""
+
+    def __init__(self, capacity: int) -> None:
+        value = int(capacity)
+        if value < 1:
+            raise ValueError("completed step cache capacity must be positive")
+        self.capacity = value
+        self._steps: OrderedDict[int, Any] = OrderedDict()
+        self._weight = 0
+
+    def __contains__(self, step_id: object) -> bool:
+        return step_id in self._steps
+
+    def take(self, step_id: int) -> Any | None:
+        step = self._steps.pop(int(step_id), None)
+        if step is not None:
+            self._weight -= int(step.weight)
+        return step
+
+    def touch(self, step_id: int) -> None:
+        key = int(step_id)
+        if key in self._steps:
+            self._steps.move_to_end(key)
+
+    def put(self, step: Any) -> tuple[Any, ...]:
+        key = int(step.step_id)
+        existing = self._steps.pop(key, None)
+        if existing is not None:
+            self._weight -= int(existing.weight)
+        self._steps[key] = step
+        self._weight += int(step.weight)
+        evicted: list[Any] = []
+        while self._weight > self.capacity:
+            _key, victim = self._steps.popitem(last=False)
+            self._weight -= int(victim.weight)
+            evicted.append(victim)
+        return tuple(evicted)
+
+    def remove(self, step_id: int) -> Any | None:
+        return self.take(step_id)
+
+    def values(self) -> tuple[Any, ...]:
+        return tuple(self._steps.values())
+
+
+class StepOutputs:
+    """One independent response cursor over an execution step's partition order."""
+
+    __slots__ = (
+        "_step",
+        "_sent_partitions",
+        "_empty_sent",
+        "_error_sent",
+        "_closed",
+        "_on_close",
+    )
+
+    def __init__(self, step: Any, on_close: Callable[[StepOutputs], None]) -> None:
+        self._step = step
+        self._sent_partitions: set[int] = set()
+        self._empty_sent = False
+        self._error_sent = False
+        self._closed = False
+        self._on_close = on_close
+
+    @property
+    def step_id(self) -> int:
+        return int(self._current().step_id)
+
+    @property
+    def session_ids(self) -> frozenset[int]:
+        return frozenset(int(value) for value in self._current().session_ids)
+
+    @property
+    def source(self) -> object | None:
+        return getattr(self._current(), "source", None)
+
+    @property
+    def error(self) -> WorkerError | None:
+        return getattr(self._current(), "error", None)
+
+    @property
+    def complete(self) -> bool:
+        return bool(self._current().complete)
+
+    def _current(self) -> Any:
+        current = self._step.current()
+        if current is not self._step:
+            self._step = current
+        return current
+
+    def ready(self) -> bool:
+        current = self._current()
+        current.advance_materialization()
+        current = self._current()
+        if current.error is not None:
+            return not self._error_sent
+        partitions = current.materialized_partitions()
+        if any(
+            int(partition.partition_id) not in self._sent_partitions
+            for partition in partitions
+        ):
+            return True
+        return bool(current.complete and not current.partition_order and not self._empty_sent)
+
+    def execution_complete(self) -> bool:
+        current = self._current()
+        complete = bool(current.advance_execution())
+        self._current()
+        return complete
+
+    def take_ready(self) -> CompletionReport:
+        current = self._current()
+        current.advance_materialization()
+        current = self._current()
+        if current.error is not None:
+            raise RuntimeError("terminal error must be consumed through take_error")
+        partitions = tuple(
+            partition
+            for partition in current.materialized_partitions()
+            if int(partition.partition_id) not in self._sent_partitions
+        )
+        if partitions:
+            self._sent_partitions.update(
+                int(partition.partition_id) for partition in partitions
+            )
+            return CompletionReport(step_id=int(current.step_id), partitions=partitions)
+        if current.complete and not current.partition_order and not self._empty_sent:
+            self._empty_sent = True
+            return CompletionReport(step_id=int(current.step_id), partitions=())
+        raise RuntimeError("step output cursor has no query-ready partition")
+
+    def take_error(self) -> WorkerError:
+        error = self.error
+        if error is None or self._error_sent:
+            raise RuntimeError("step output cursor has no unread terminal error")
+        self._error_sent = True
+        return error
+
+    def pending(self) -> bool:
+        current = self._current()
+        if current.error is not None:
+            return not self._error_sent
+        if not current.complete:
+            return True
+        if not current.partition_order:
+            return not self._empty_sent
+        return any(
+            int(partition.partition_id) not in self._sent_partitions
+            for partition in current.materialized_partitions()
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._on_close(self)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True, slots=True)
-class CompletionCapture:
-    """One bounded token range copied into a completion lease's pinned slab."""
+class PinnedTokenCapture:
+    """One token range copied into a partition's pinned output buffer."""
 
-    lease: CompletionLease
+    buffer: PinnedOutputBuffer
     offset: int
     count: int
 
     def ready(self) -> bool:
-        return self.lease.ready()
+        return self.buffer.ready()
 
     def values(self) -> tuple[int, ...]:
-        return self.lease.read_tokens(self)
+        return self.buffer.read_tokens(self)
 
 
 @dataclass(frozen=True, slots=True)
-class CompletionByteCapture:
-    """One shaped byte range copied into a completion generation's pinned slab."""
+class PinnedByteCapture:
+    """One shaped byte range copied into a partition's pinned output buffer."""
 
-    lease: CompletionLease
+    buffer: PinnedOutputBuffer
     offset: int
     count: int
     shape: tuple[int, ...]
+    external: torch.Tensor | None = None
 
     def ready(self) -> bool:
-        return self.lease.ready()
+        return self.buffer.ready()
 
     def tensor(self) -> torch.Tensor:
-        return self.lease.read_bytes(self)
+        return self.buffer.read_bytes(self)
 
     def numpy(self) -> Any:
         return self.tensor().numpy()
 
 
-class CompletionLease:
-    """Exclusive generation-tagged ownership of one completion arena slab."""
+class PinnedOutputBuffer:
+    """Pinned host storage and completion events for one partition commit."""
 
     __slots__ = (
-        "_arena",
-        "_slot_index",
-        "_owner",
-        "_generation",
+        "event_pool",
+        "devices",
         "_rows",
+        "_generation",
+        "_host",
         "_token_cursor",
         "_byte_cursor",
         "_token_cache",
+        "_start_events",
+        "_producer_events",
+        "_events",
+        "_observed",
+        "_sealed",
+        "_abandoned",
+        "_events_released",
+        "_deferred",
+        "_reserved_ns",
+        "_device_started_ns",
+        "_copy_started_ns",
+        "_sealed_ns",
+        "_ready_ns",
         "_timing",
+        "_retained_until_ready",
     )
 
     def __init__(
         self,
-        arena: CompletionArena,
-        slot_index: int,
-        owner: int,
-        generation: int,
         rows: int,
+        *,
+        token_capacity: int,
+        devices: Sequence[torch.device | str] = (),
+        event_pool: DeviceEventPool,
     ) -> None:
-        self._arena = arena
-        self._slot_index = int(slot_index)
-        self._owner = int(owner)
-        self._generation = int(generation)
-        self._rows = int(rows)
+        global _next_buffer_generation
+        count = int(rows)
+        capacity = int(token_capacity)
+        if count < 1:
+            raise ValueError("a pinned output buffer must contain at least one operation row")
+        if capacity < count:
+            raise resource_error("completion row count exceeds pinned output capacity")
+        normalized: list[torch.device] = []
+        for value in devices:
+            device = canonical_device(value)
+            if device.type == "cuda" and device not in normalized:
+                normalized.append(device)
+        self.event_pool = event_pool
+        self.devices = tuple(normalized)
+        self._rows = count
+        self._generation = _next_buffer_generation
+        _next_buffer_generation += 1
+        self._host = torch.empty(
+            capacity,
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=bool(self.devices),
+        )
         self._token_cursor = 0
         self._byte_cursor = 0
         self._token_cache: dict[tuple[int, int], tuple[int, ...]] = {}
+        self._start_events: dict[str, torch.cuda.Event] = {}
+        self._producer_events: dict[str, torch.cuda.Event] = {}
+        self._events: dict[str, torch.cuda.Event] = {}
+        self._observed: set[int] = set()
+        self._sealed = False
+        self._abandoned = False
+        self._events_released = False
+        self._deferred = False
+        self._reserved_ns = time.perf_counter_ns()
+        self._device_started_ns = 0
+        self._copy_started_ns = 0
+        self._sealed_ns = 0
+        self._ready_ns = 0
         self._timing: tuple[int, int, int, int] | None = None
+        self._retained_until_ready: list[object] = []
 
     @property
     def generation(self) -> int:
@@ -164,68 +348,55 @@ class CompletionLease:
         return self._rows
 
     def register_device(self, device: torch.device | str) -> None:
-        slot = self._arena._require_slot(self)
-        if slot.sealed:
-            raise _invariant("completion device was registered after its slot was sealed")
+        if self._sealed:
+            raise _invariant("completion device was registered after its buffer was sealed")
         target = canonical_device(device)
-        if target.type != "cuda":
-            return
-        if target not in self._arena.devices:
+        if target.type == "cuda" and target not in self.devices:
             raise _invariant("completion work uses an undeclared CUDA device")
-        if slot.devices is None:
-            raise _invariant("completion slot has no device readiness set")
-        slot.devices.add(target)
 
     def begin_device(self, device: torch.device | str) -> None:
-        """Record this generation's first device-work boundary."""
-
-        slot = self._arena._require_slot(self)
-        if slot.sealed:
-            raise _invariant("completion device timing began after its slot was sealed")
+        if self._sealed:
+            raise _invariant("completion device timing began after its buffer was sealed")
         target = canonical_device(device)
-        if slot.device_started_ns == 0:
-            slot.device_started_ns = time.perf_counter_ns()
+        if self._device_started_ns == 0:
+            self._device_started_ns = time.perf_counter_ns()
         if target.type != "cuda":
             return
         self.register_device(target)
-        device_name = str(target)
-        if device_name in slot.start_events:
+        name = str(target)
+        if name in self._start_events:
             return
-        event = self._arena.event_pool.acquire(target, timing=True)
-        self._arena.event_pool.retain(event, target)
-        self._arena.event_pool.record(event, target)
-        slot.start_events[device_name] = event
+        event = self.event_pool.acquire(target, timing=True)
+        self.event_pool.retain(event, target)
+        self.event_pool.record(event, target)
+        self._start_events[name] = event
 
     def _mark_copy_started(self, device: torch.device) -> None:
-        slot = self._arena._require_slot(self)
-        if slot.copy_started_ns == 0:
-            slot.copy_started_ns = time.perf_counter_ns()
-        device_name = str(device)
-        if device_name in slot.producer_events:
+        if self._copy_started_ns == 0:
+            self._copy_started_ns = time.perf_counter_ns()
+        name = str(device)
+        if name in self._producer_events:
             return
-        if device_name not in slot.start_events:
+        if name not in self._start_events:
             self.begin_device(device)
-        event = self._arena.event_pool.acquire(device, timing=True)
-        self._arena.event_pool.retain(event, device)
-        self._arena.event_pool.record(event, device)
-        slot.producer_events[device_name] = event
+        event = self.event_pool.acquire(device, timing=True)
+        self.event_pool.retain(event, device)
+        self.event_pool.record(event, device)
+        self._producer_events[name] = event
 
-    def capture(self, tokens: torch.Tensor) -> CompletionCapture:
+    def capture(self, tokens: torch.Tensor) -> PinnedTokenCapture:
+        if self._sealed:
+            raise _invariant("completion capture was registered after its buffer was sealed")
         flat = tokens.reshape(-1).to(dtype=torch.long)
         count = int(flat.numel())
         offset = self._token_cursor
         end = offset + count
-        slot = self._arena._require_slot(self)
-        if slot.sealed:
-            raise _invariant("completion capture was registered after its slot was sealed")
-        if end * int(slot.host_tokens.element_size()) > self._byte_floor(slot):
-            raise resource_error("completion token span exceeds its reserved pinned-host capacity")
-        host = slot.host_tokens[offset:end]
+        if end * int(self._host.element_size()) > self._byte_floor():
+            raise resource_error("completion token span exceeds pinned output capacity")
+        host = self._host[offset:end]
         if flat.device.type == "cuda":
             if not bool(host.is_pinned()):
                 raise _invariant("CUDA completion copy targets pageable host storage")
-            if slot.devices is None:
-                raise _invariant("completion slot has no device readiness set")
             device = canonical_device(flat.device)
             self.register_device(device)
             self._mark_copy_started(device)
@@ -233,26 +404,22 @@ class CompletionLease:
         else:
             host.copy_(flat.to(device="cpu"))
         self._token_cursor = end
-        return CompletionCapture(self, offset, count)
+        return PinnedTokenCapture(self, offset, count)
 
-    def capture_bytes(self, value: torch.Tensor) -> CompletionByteCapture:
-        """Enqueue one contiguous uint8 D2H copy into this generation's byte tail."""
-
+    def capture_bytes(self, value: torch.Tensor) -> PinnedByteCapture:
         if value.dtype is not torch.uint8:
             raise ValueError("completion byte capture requires uint8 storage")
+        if self._sealed:
+            raise _invariant("completion byte capture was registered after its buffer was sealed")
         contiguous = value.detach().contiguous()
         count = int(contiguous.numel())
         if count < 1:
             raise ValueError("completion byte capture must not be empty")
-        slot = self._arena._require_slot(self)
-        if slot.sealed:
-            raise _invariant("completion byte capture was registered after its slot was sealed")
-        end = self._byte_floor(slot)
+        end = self._byte_floor()
         offset = end - count
-        token_bytes = self._token_cursor * int(slot.host_tokens.element_size())
-        if offset < token_bytes:
-            raise resource_error("completion byte span exceeds its reserved pinned-host capacity")
-        host = slot.host_tokens.view(torch.uint8)[offset:end]
+        if offset < self._token_cursor * int(self._host.element_size()):
+            raise resource_error("completion byte span exceeds pinned output capacity")
+        host = self._host.view(torch.uint8)[offset:end]
         flat = contiguous.reshape(-1)
         if flat.device.type == "cuda":
             if not bool(host.is_pinned()):
@@ -264,323 +431,140 @@ class CompletionLease:
         else:
             host.copy_(flat.to(device="cpu"))
         self._byte_cursor += count
-        return CompletionByteCapture(self, offset, count, tuple(int(v) for v in value.shape))
-
-    def _byte_floor(self, slot: _CompletionSlot) -> int:
-        return (
-            int(slot.host_tokens.numel()) * int(slot.host_tokens.element_size()) - self._byte_cursor
+        return PinnedByteCapture(
+            self,
+            offset,
+            count,
+            tuple(int(value) for value in contiguous.shape),
         )
 
+    def capture_bytes_into(
+        self,
+        value: torch.Tensor,
+        storage: torch.Tensor,
+    ) -> PinnedByteCapture:
+        """Copy bytes into caller-owned pinned storage under this buffer's events."""
+
+        if value.dtype is not torch.uint8:
+            raise ValueError("completion byte capture requires uint8 storage")
+        if self._sealed:
+            raise _invariant("completion byte capture was registered after its buffer was sealed")
+        if storage.device.type != "cpu" or storage.dtype is not torch.uint8:
+            raise ValueError("external completion storage must be a CPU uint8 tensor")
+        contiguous = value.detach().contiguous()
+        count = int(contiguous.numel())
+        if count < 1:
+            raise ValueError("completion byte capture must not be empty")
+        if int(storage.numel()) < count:
+            raise resource_error("external completion byte storage is too small")
+        host = storage.reshape(-1)[:count]
+        flat = contiguous.reshape(-1)
+        if flat.device.type == "cuda":
+            if not bool(host.is_pinned()):
+                raise _invariant("CUDA completion byte copy targets pageable host storage")
+            device = canonical_device(flat.device)
+            self.register_device(device)
+            self._mark_copy_started(device)
+            host.copy_(flat, non_blocking=True)
+        else:
+            host.copy_(flat.to(device="cpu"))
+        return PinnedByteCapture(
+            self,
+            0,
+            count,
+            tuple(int(item) for item in contiguous.shape),
+            host,
+        )
+
+    def _byte_floor(self) -> int:
+        return int(self._host.numel()) * int(self._host.element_size()) - self._byte_cursor
+
     def seal(self) -> None:
-        slot = self._arena._require_slot(self)
-        if slot.sealed:
+        if self._sealed:
             return
-        for device in slot.devices or ():
-            device_name = str(device)
-            if device_name not in slot.start_events:
+        for device in self.devices:
+            name = str(device)
+            if name not in self._start_events:
                 self.begin_device(device)
-            if device_name not in slot.producer_events:
+            if name not in self._producer_events:
                 self._mark_copy_started(device)
-            event = slot.events.get(device_name)
-            if event is None:
-                event = self._arena.event_pool.acquire(device, timing=True)
-                self._arena.event_pool.retain(event, device)
-                slot.events[device_name] = event
-            self._arena.event_pool.record(event, device)
-            self._arena.schedule_completion_wake(device, event)
-        slot.sealed = True
-        slot.sealed_ns = time.perf_counter_ns()
+            event = self.event_pool.acquire(device, timing=True)
+            self.event_pool.retain(event, device)
+            self.event_pool.record(event, device)
+            self._events[name] = event
+            self.event_pool.schedule_completion_wake(device, event)
+        self._sealed = True
+        self._sealed_ns = time.perf_counter_ns()
 
     def ready(self) -> bool:
-        slot = self._arena._require_slot(self)
-        if not slot.sealed:
+        if not self._sealed:
             return False
-        if slot.ready_ns != 0:
+        if self._ready_ns:
             return True
-        for event in slot.events.values():
-            if not bool(event.query()):
-                return False
-        if slot.ready_ns == 0:
-            slot.ready_ns = time.perf_counter_ns()
+        if any(not bool(event.query()) for event in self._events.values()):
+            return False
+        self._ready_ns = time.perf_counter_ns()
+        self._retained_until_ready.clear()
         return True
 
-    def read_tokens(self, capture: CompletionCapture) -> tuple[int, ...]:
-        if capture.lease is not self:
-            raise _invariant("completion capture belongs to a different arena lease")
+    def retain_until_ready(self, owner: object) -> None:
+        """Keep an external resource alive until every registered copy completes."""
+
+        if self.ready():
+            return
+        self._retained_until_ready.append(owner)
+
+    def read_tokens(self, capture: PinnedTokenCapture) -> tuple[int, ...]:
+        if capture.buffer is not self:
+            raise _invariant("completion capture belongs to a different pinned output buffer")
         key = (int(capture.offset), int(capture.count))
         cached = self._token_cache.get(key)
         if cached is not None:
             return cached
         if not self.ready():
             raise _invariant("completion storage was observed before its copy event was ready")
-        slot = self._arena._require_slot(self)
         end = capture.offset + capture.count
         if capture.offset < 0 or end > self._token_cursor:
             raise _invariant("completion capture range is outside its registered token extent")
-        values = tuple(int(value) for value in slot.host_tokens[capture.offset : end].tolist())
+        values = tuple(int(value) for value in self._host[capture.offset:end].tolist())
         self._token_cache[key] = values
         return values
 
-    def read_bytes(self, capture: CompletionByteCapture) -> torch.Tensor:
-        if capture.lease is not self:
-            raise _invariant("completion byte capture belongs to a different arena lease")
+    def read_bytes(self, capture: PinnedByteCapture) -> torch.Tensor:
+        if capture.buffer is not self:
+            raise _invariant("completion byte capture belongs to a different pinned output buffer")
         if not self.ready():
             raise _invariant("completion byte storage was observed before its copy event was ready")
-        slot = self._arena._require_slot(self)
+        if capture.external is not None:
+            if int(capture.external.numel()) != int(capture.count):
+                raise _invariant("external completion byte storage has an invalid extent")
+            return capture.external.view(capture.shape)
         end = int(capture.offset) + int(capture.count)
-        total = int(slot.host_tokens.numel()) * int(slot.host_tokens.element_size())
+        total = int(self._host.numel()) * int(self._host.element_size())
         if capture.offset < 0 or end > total:
             raise _invariant("completion byte range is outside its registered extent")
-        return slot.host_tokens.view(torch.uint8)[capture.offset : end].view(capture.shape)
+        return self._host.view(torch.uint8)[capture.offset:end].view(capture.shape)
 
     def observe(self, row: int, generation: int) -> tuple[int, int]:
-        timing = self._arena._observe(
-            self,
-            row,
-            generation,
-            timing=self._timing,
-        )
-        if self._timing is None:
-            self._timing = timing
-        return timing[2], timing[3]
-
-    def timing(self) -> tuple[int, int, int, int]:
-        if self._timing is None:
-            raise _invariant("completion timing was read before observation")
-        return self._timing
-
-    def discard(self, row: int, generation: int) -> None:
-        self._arena._discard(self, row, generation)
-
-    def abandon(self) -> None:
-        self._arena._abandon(self)
-
-
-class CompletionArena:
-    """Fixed-capacity pinned completion slabs matched to execution pipeline depth.
-
-    A lease never waits for a prior generation. Exhaustion is reported as
-    backpressure, and abandoned generations become reusable only after every
-    recorded event reports ready through ``query``.
-    """
-
-    def __init__(
-        self,
-        *,
-        depth: int,
-        token_capacity: int,
-        total_token_capacity: int | None = None,
-        devices: tuple[torch.device | str, ...] = (),
-        event_pool: DeviceEventPool | None = None,
-    ) -> None:
-        self.depth = max(1, int(depth))
-        self.token_capacity = max(1, int(token_capacity))
-        self.total_token_capacity = (
-            self.depth * self.token_capacity
-            if total_token_capacity is None
-            else int(total_token_capacity)
-        )
-        if self.total_token_capacity < 1:
-            raise ValueError("completion arena total token capacity must be positive")
-        normalized: list[torch.device] = []
-        for value in devices:
-            device = canonical_device(value)
-            if device.type == "cuda" and device not in normalized:
-                normalized.append(device)
-        self.devices = tuple(normalized)
-        self._owns_event_pool = event_pool is None
-        self.event_pool = DeviceEventPool() if event_pool is None else event_pool
-        pin = bool(self.devices)
-        self._host_tokens = torch.empty(
-            self.total_token_capacity,
-            dtype=torch.long,
-            device="cpu",
-            pin_memory=pin,
-        )
-        self._slots = [
-            _CompletionSlot(
-                host_tokens=self._host_tokens[:0],
-                start_events={},
-                producer_events={},
-                events={},
-                devices=set(),
-            )
-            for _ in range(self.depth)
-        ]
-        self._free_token_ranges = [(0, self.total_token_capacity)]
-        self._cursor = 0
-        self._next_owner = 1
-        self._closed = False
-        self._wake_on_stream: Callable[[int], None] | None = None
-        self._wake_streams: dict[str, torch.cuda.Stream] = {}
-
-    def set_completion_wake(self, wake_on_stream: Callable[[int], None]) -> None:
-        self._wake_on_stream = wake_on_stream
-
-    def schedule_completion_wake(
-        self,
-        device: torch.device,
-        event: torch.cuda.Event,
-    ) -> None:
-        wake_on_stream = self._wake_on_stream
-        if wake_on_stream is None:
-            return
-        device_name = str(device)
-        stream = self._wake_streams.get(device_name)
-        if stream is None:
-            stream = torch.cuda.Stream(device=device)
-            self._wake_streams[device_name] = stream
-        stream.wait_event(event)
-        wake_on_stream(int(stream.cuda_stream))
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        for stream in self._wake_streams.values():
-            stream.synchronize()
-        self._wake_streams.clear()
-        for slot in self._slots:
-            for event in (
-                *slot.start_events.values(),
-                *slot.producer_events.values(),
-                *slot.events.values(),
-            ):
-                if bool(event.query()):
-                    self.event_pool.release(event)
-            slot.start_events.clear()
-            slot.producer_events.clear()
-            slot.events.clear()
-        self._slots.clear()
-        self._free_token_ranges.clear()
-        self._host_tokens = torch.empty(0, dtype=torch.long)
-        self._closed = True
-        if self._owns_event_pool:
-            self.event_pool.close()
-
-    def reserve(
-        self,
-        rows: int,
-        *,
-        token_capacity: int | None = None,
-        devices: tuple[torch.device | str, ...] = (),
-    ) -> CompletionLease:
-        if self._closed:
-            raise RuntimeError("completion arena is closed")
-        count = int(rows)
-        requested_tokens = self.token_capacity if token_capacity is None else int(token_capacity)
-        if count < 1:
-            raise ValueError("a completion lease must contain at least one operation row")
-        if requested_tokens < 1:
-            raise ValueError("a completion lease token capacity must be positive")
-        if count > requested_tokens or requested_tokens > self.token_capacity:
-            raise resource_error("completion row count exceeds the arena capacity")
-        selected_devices: set[torch.device] = set()
-        for value in devices:
-            device = canonical_device(value)
-            if device.type != "cuda":
-                continue
-            if device not in self.devices:
-                raise _invariant("completion lease names an undeclared CUDA device")
-            selected_devices.add(device)
-        for offset in range(self.depth):
-            index = (self._cursor + offset) % self.depth
-            slot = self._slots[index]
-            self._reclaim_if_ready(slot)
-            if slot.owner != 0:
-                continue
-            allocation = self._allocate_tokens(requested_tokens)
-            if allocation is None:
-                break
-            token_offset, token_count = allocation
-            generation = slot.generation + 1
-            if generation > _MAX_GENERATION:
-                generation = 1
-            owner = self._next_owner
-            self._next_owner += 1
-            slot.generation = generation
-            slot.owner = owner
-            slot.rows = count
-            slot.observed = set()
-            slot.devices = selected_devices
-            slot.sealed = False
-            slot.abandoned = False
-            slot.reserved_ns = time.perf_counter_ns()
-            slot.device_started_ns = 0
-            slot.copy_started_ns = 0
-            slot.sealed_ns = 0
-            slot.ready_ns = 0
-            slot.token_offset = token_offset
-            slot.token_capacity = token_count
-            slot.host_tokens = self._host_tokens[token_offset : token_offset + token_count]
-            self._cursor = (index + 1) % self.depth
-            return CompletionLease(self, index, owner, generation, count)
-        raise resource_error("completion arena has no query-ready slot and byte capacity")
-
-    def _allocate_tokens(self, count: int) -> tuple[int, int] | None:
-        for index, (offset, available) in enumerate(self._free_token_ranges):
-            if available < count:
-                continue
-            if available == count:
-                del self._free_token_ranges[index]
-            else:
-                self._free_token_ranges[index] = (offset + count, available - count)
-            return offset, count
-        return None
-
-    def _release_tokens(self, offset: int, count: int) -> None:
-        if count < 1:
-            return
-        ranges = sorted((*self._free_token_ranges, (offset, count)))
-        merged: list[tuple[int, int]] = []
-        for current_offset, current_count in ranges:
-            if merged and merged[-1][0] + merged[-1][1] == current_offset:
-                prior_offset, prior_count = merged[-1]
-                merged[-1] = (prior_offset, prior_count + current_count)
-            else:
-                merged.append((current_offset, current_count))
-        self._free_token_ranges = merged
-
-    def _require_slot(self, lease: CompletionLease) -> _CompletionSlot:
-        if lease._arena is not self:
-            raise _invariant("completion lease belongs to a different arena")
-        if self._closed or lease._slot_index < 0 or lease._slot_index >= len(self._slots):
-            raise _invariant("completion lease belongs to a closed arena")
-        slot = self._slots[lease._slot_index]
-        if slot.owner != lease._owner or slot.generation != lease._generation:
-            raise _invariant("stale completion-slot generation")
-        return slot
-
-    def _observe(
-        self,
-        lease: CompletionLease,
-        row: int,
-        generation: int,
-        *,
-        timing: tuple[int, int, int, int] | None,
-    ) -> tuple[int, int, int, int]:
-        slot = self._require_slot(lease)
         index = int(row)
-        if int(generation) != slot.generation:
-            raise _invariant("completion record carries a stale slot generation")
-        if index < 0 or index >= slot.rows:
-            raise _invariant("completion record row is outside its reserved slot")
-        if not lease.ready():
+        if int(generation) != self._generation:
+            raise _invariant("completion record carries a stale buffer generation")
+        if index < 0 or index >= self._rows:
+            raise _invariant("completion record row is outside its pinned output buffer")
+        if not self.ready():
             raise _invariant("completion record was observed before query-ready")
-        observed = slot.observed
-        if observed is None:
-            raise _invariant("completion slot has no observation state")
         observed_ns = time.perf_counter_ns()
-        if timing is None:
+        if self._timing is None:
             queued_us = (
-                max(0, slot.device_started_ns - slot.reserved_ns) // 1000
-                if slot.device_started_ns > 0
+                max(0, self._device_started_ns - self._reserved_ns) // 1000
+                if self._device_started_ns
                 else 0
             )
             device_us = 0
             copy_us = 0
-            for device_name, end_event in slot.events.items():
-                start_event = slot.start_events.get(device_name)
-                producer_event = slot.producer_events.get(device_name)
+            for name, end_event in self._events.items():
+                start_event = self._start_events.get(name)
+                producer_event = self._producer_events.get(name)
                 if start_event is None or producer_event is None:
                     raise _invariant("completion timing events are incomplete")
                 device_us = max(
@@ -591,87 +575,76 @@ class CompletionArena:
                     copy_us,
                     max(0, round(float(producer_event.elapsed_time(end_event)) * 1000.0)),
                 )
-            if not slot.events and slot.device_started_ns > 0:
-                copy_started_ns = slot.copy_started_ns or slot.sealed_ns
-                device_us = max(0, copy_started_ns - slot.device_started_ns) // 1000
-                copy_us = max(0, slot.sealed_ns - copy_started_ns) // 1000
-            ready_to_observed_us = max(0, observed_ns - slot.ready_ns) // 1000
-            timing = (queued_us, device_us, copy_us, ready_to_observed_us)
-        observed.add(index)
-        if len(observed) == slot.rows:
-            self._release(slot)
-        return timing
+            if not self._events and self._device_started_ns:
+                copy_started_ns = self._copy_started_ns or self._sealed_ns
+                device_us = max(0, copy_started_ns - self._device_started_ns) // 1000
+                copy_us = max(0, self._sealed_ns - copy_started_ns) // 1000
+            ready_to_observed_us = max(0, observed_ns - self._ready_ns) // 1000
+            self._timing = (queued_us, device_us, copy_us, ready_to_observed_us)
+        self._observed.add(index)
+        if len(self._observed) == self._rows:
+            self._release_events()
+        return self._timing[2], self._timing[3]
 
-    def _abandon(self, lease: CompletionLease) -> None:
-        try:
-            slot = self._require_slot(lease)
-        except WorkerError:
-            return
-        if not slot.sealed:
-            lease.seal()
-        slot.abandoned = True
-        self._reclaim_if_ready(slot)
+    def timing(self) -> tuple[int, int, int, int]:
+        if self._timing is None:
+            raise _invariant("completion timing was read before observation")
+        return self._timing
 
-    def _discard(self, lease: CompletionLease, row: int, generation: int) -> None:
-        try:
-            slot = self._require_slot(lease)
-        except WorkerError:
-            return
+    def discard(self, row: int, generation: int) -> None:
         index = int(row)
-        if int(generation) != slot.generation or index < 0 or index >= slot.rows:
+        if int(generation) != self._generation or index < 0 or index >= self._rows:
             return
-        observed = slot.observed
-        if observed is None:
+        self._observed.add(index)
+        if len(self._observed) == self._rows:
+            if self.ready():
+                self._release_events()
+            else:
+                self._defer_release()
+
+    def abandon(self) -> None:
+        if self._abandoned:
             return
-        observed.add(index)
-        if len(observed) != slot.rows:
-            return
-        if slot.sealed and all(bool(event.query()) for event in slot.events.values()):
-            self._release(slot)
+        if not self._sealed:
+            self.seal()
+        self._abandoned = True
+        if self.ready():
+            self._release_events()
         else:
-            slot.abandoned = True
+            self._defer_release()
 
-    def _release(self, slot: _CompletionSlot) -> None:
-        for event in (
-            *slot.start_events.values(),
-            *slot.producer_events.values(),
-            *slot.events.values(),
-        ):
+    def _all_events(self) -> tuple[torch.cuda.Event, ...]:
+        return tuple(
+            (
+                *self._start_events.values(),
+                *self._producer_events.values(),
+                *self._events.values(),
+            )
+        )
+
+    def _release_events(self) -> None:
+        if self._events_released or self._deferred:
+            return
+        for event in self._all_events():
             self.event_pool.release(event)
-        slot.start_events.clear()
-        slot.producer_events.clear()
-        slot.events.clear()
-        slot.owner = 0
-        slot.rows = 0
-        slot.observed = None
-        slot.devices = None
-        slot.sealed = False
-        slot.abandoned = False
-        slot.reserved_ns = 0
-        slot.device_started_ns = 0
-        slot.copy_started_ns = 0
-        slot.sealed_ns = 0
-        slot.ready_ns = 0
-        self._release_tokens(slot.token_offset, slot.token_capacity)
-        slot.token_offset = 0
-        slot.token_capacity = 0
-        slot.host_tokens = self._host_tokens[:0]
+        self._events_released = True
 
-    def _reclaim_if_ready(self, slot: _CompletionSlot) -> None:
-        if (
-            slot.owner != 0
-            and slot.abandoned
-            and slot.sealed
-            and all(bool(event.query()) for event in slot.events.values())
-        ):
-            self._release(slot)
+    def _defer_release(self) -> None:
+        if self._events_released or self._deferred:
+            return
+        events = self._all_events()
+        if events:
+            self._deferred = True
+            self.event_pool.defer_release(events, self)
+        else:
+            self._events_released = True
 
 class _CompletionTokenSpan:
     """One token vector backed exclusively by host-observation storage."""
 
     __slots__ = ("capture", "count", "_values")
 
-    def __init__(self, capture: CompletionCapture) -> None:
+    def __init__(self, capture: PinnedTokenCapture) -> None:
         self.capture = capture
         self.count = int(capture.count)
         self._values: tuple[int, ...] | None = None
@@ -732,7 +705,7 @@ class _CompletionSampleSpan:
 
     def __init__(
         self,
-        capture: CompletionCapture | None,
+        capture: PinnedTokenCapture | None,
         count: int,
         values: tuple[int, ...] | None = None,
     ) -> None:
@@ -916,7 +889,7 @@ class _CompletionLogprobBatch:
 
     def __init__(
         self,
-        capture: CompletionCapture | None,
+        capture: PinnedTokenCapture | None,
         rows: tuple[int, ...],
         counts: tuple[int, ...],
         requested_ids: tuple[tuple[int, ...], ...],
@@ -1189,7 +1162,7 @@ class _CompletionImagePayload:
 
     def __init__(
         self,
-        capture: CompletionByteCapture,
+        capture: PinnedByteCapture,
         reservation: CpuTaskReservation,
         max_bytes: int,
     ) -> None:
@@ -1247,9 +1220,9 @@ class _PendingDigest:
     """A semantic digest finalized from a query-ready completion generation.
 
     The digest includes committed tokens copied asynchronously into the pinned
-    completion arena. Resolution reads that host storage only after every copy
-    event reports ready, validates the physical slot generation, and releases
-    the observed row. A device-parent successor may retain its predecessor's
+    output buffer. Resolution reads that host storage only after every copy
+    event reports ready, validates the buffer generation, and releases the
+    observed row. A device-parent successor may retain its predecessor's
     pending digest, so resolution follows the request lineage while unrelated
     completions remain independently dispatchable.
     """
@@ -1258,7 +1231,7 @@ class _PendingDigest:
         "_record",
         "_parent",
         "_plan_digest",
-        "_lease",
+        "_buffer",
         "_row",
         "_generation",
         "_completion_timing",
@@ -1279,7 +1252,7 @@ class _PendingDigest:
         record: CompletionRecord,
         parent: object,
         plan_digest: str,
-        lease: CompletionLease,
+        buffer: PinnedOutputBuffer,
         row: int,
         predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]],
         resolved_callback: Callable[[CompletionRecord, str, str], None] | None = None,
@@ -1288,7 +1261,7 @@ class _PendingDigest:
         self._record = record
         self._parent = parent
         self._plan_digest = plan_digest
-        self._lease: CompletionLease | None = lease
+        self._buffer: PinnedOutputBuffer | None = buffer
         self._row = int(row)
         self._generation = int(record.completion_slot_generation)
         self._completion_timing: tuple[int, int, int, int] | None = None
@@ -1310,7 +1283,7 @@ class _PendingDigest:
             return True
         if isinstance(self._parent, _PendingDigest) and not self._parent.ready():
             return False
-        if self._lease is None or not self._lease.ready():
+        if self._buffer is None or not self._buffer.ready():
             return False
         for task in self._completion_tasks:
             if not task.ready():
@@ -1357,13 +1330,13 @@ class _PendingDigest:
                             parent_semantic=cast(str, parent),
                             plan_digest=self._plan_digest,
                         )
-            lease = self._lease
-            if lease is None:
-                raise RuntimeError("completion digest lost its arena lease")
-            lease.observe(self._row, self._generation)
-            self._completion_timing = lease.timing()
+            buffer = self._buffer
+            if buffer is None:
+                raise RuntimeError("completion digest lost its pinned output buffer")
+            buffer.observe(self._row, self._generation)
+            self._completion_timing = buffer.timing()
             self._observed = True
-            self._lease = None
+            self._buffer = None
         resolved = self._value
         if resolved is None:
             raise RuntimeError("completion digest resolved without a value")
@@ -1432,9 +1405,9 @@ class _PendingDigest:
         return self
 
     def __del__(self) -> None:
-        lease = self._lease
-        if lease is not None and not self._observed:
-            lease.discard(self._row, self._generation)
+        buffer = self._buffer
+        if buffer is not None and not self._observed:
+            buffer.discard(self._row, self._generation)
 
 
 class _PendingErrorDigest:

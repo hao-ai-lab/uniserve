@@ -46,6 +46,7 @@ fn runtime_control_tokens(
         ModelProfile::Qwen3(_) => None,
         ModelProfile::SenseNova(profile) => Some(&profile.preprocessing.controls),
         ModelProfile::Bagel(profile) => Some(&profile.preprocessing.controls),
+        ModelProfile::MiniMaxH3(_) => None,
     };
     let bos = controls.map_or(0, |value| value.bos);
     let start_of_image = controls.map_or(0, |value| value.start_of_image);
@@ -89,7 +90,21 @@ fn load_tokenizer(files: &ResolvedModelFiles) -> Result<DynTokenizer> {
 
 async fn resolve_model_assets(
     config: &Config,
-) -> Result<(ModelProfile, DynTokenizer, HfChatRenderer, u32)> {
+) -> Result<(
+    ModelProfile,
+    Option<DynTokenizer>,
+    Option<HfChatRenderer>,
+    u32,
+)> {
+    if config.model_description == ModelDescription::MiniMaxH3 {
+        let max_model_tokens = config.engine.max_model_len.unwrap_or(1);
+        return Ok((
+            ModelProfile::minimax_h3(&config.model),
+            None,
+            None,
+            max_model_tokens,
+        ));
+    }
     let files = ResolvedModelFiles::new(&config.model)
         .await
         .with_context(|| format!("failed to resolve model files for `{}`", config.model))?;
@@ -125,12 +140,46 @@ async fn resolve_model_assets(
         None,
     )
     .context("failed to load the configured Hugging Face chat template")?;
-    Ok((profile, tokenizer, renderer, max_model_tokens))
+    Ok((profile, Some(tokenizer), Some(renderer), max_model_tokens))
 }
 
 /// Build the shared application state for one resolved model and one engine
 /// gateway.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
+    if config.model_description == ModelDescription::MiniMaxH3 {
+        std::fs::create_dir_all(&config.media_spool).with_context(|| {
+            format!(
+                "failed to create media spool {}",
+                config.media_spool.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&config.media_spool, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                format!(
+                    "failed to secure media spool {}",
+                    config.media_spool.display()
+                )
+            })?;
+        }
+        let probe = config
+            .media_spool
+            .join(format!(".probe-{}", uuid::Uuid::new_v4()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .with_context(|| {
+                format!(
+                    "media spool {} is not writable",
+                    config.media_spool.display()
+                )
+            })?;
+        std::fs::remove_file(&probe)
+            .with_context(|| format!("failed to remove media spool probe {}", probe.display()))?;
+    }
     let (mut profile, tokenizer, renderer, effective_max_model_len) =
         resolve_model_assets(config).await?;
     let control_tokens = runtime_control_tokens(&profile, config.engine.backend);
@@ -168,7 +217,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 workers: config.engine.workers.clone(),
                 transfer: config.engine.transfer.clone(),
                 worker_launch: config.engine.worker_launch.clone(),
-                req_slot_cap: 1 << 20,
+                req_slot_cap: if config.model_description == ModelDescription::MiniMaxH3 {
+                    EngineSettings::MEDIA_IPC_SLOT_CAP
+                } else {
+                    1 << 20
+                },
                 resp_slot_cap: config.engine.resp_slot_cap,
                 bos: control_tokens.bos,
                 eos,
@@ -251,6 +304,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 model_name: config.model.clone(),
                 client_index: 0,
                 generation_controls: Some(controls),
+                media_spool: matches!(&profile, ModelProfile::MiniMaxH3(_))
+                    .then(|| config.media_spool.to_string_lossy().into_owned()),
             })
             .await
             .context("failed to connect to the UniServe engine cores")?
@@ -262,14 +317,18 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let snapshot = gateway.snapshot();
     let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
     profile.common_mut().context_limits.max_model_tokens = Some(route_max_model_len);
-    let model = ResolvedModel::resolve(
-        profile,
-        tokenizer,
-        renderer,
-        snapshot.generation_capabilities,
-        route_max_model_len,
-        config.reasoning_parsing,
-    )
+    let model = if matches!(&profile, ModelProfile::MiniMaxH3(_)) {
+        ResolvedModel::resolve_media(profile)
+    } else {
+        ResolvedModel::resolve(
+            profile,
+            tokenizer.expect("text model resolved a tokenizer"),
+            renderer.expect("text model resolved a renderer"),
+            snapshot.generation_capabilities,
+            route_max_model_len,
+            config.reasoning_parsing,
+        )
+    }
     .context("failed to bind the configured model description")?;
     let public_model_name = config
         .served_model_name
@@ -283,6 +342,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_request_id_headers(config.enable_request_id_headers)
             .with_api_key(config.api_key.clone())
             .with_request_timeout(config.request_timeout)
-            .with_max_concurrent_requests(config.max_concurrent_requests),
+            .with_max_concurrent_requests(config.max_concurrent_requests)
+            .with_media_spool(config.media_spool.clone()),
     ))
 }

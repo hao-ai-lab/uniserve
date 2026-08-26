@@ -101,6 +101,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(openai::list_models))
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/images/generations", post(openai::images_generations))
+        .route("/v1/videos/sync", post(openai::videos_sync))
         .with_state(Arc::clone(&state));
 
     if let Some(timeout) = request_timeout {

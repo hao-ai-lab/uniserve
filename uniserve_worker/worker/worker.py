@@ -94,9 +94,7 @@ from ..runtime.latent_pool import LatentPool
 from ..runtime.req_to_token_pool import ReqToTokenPool
 from ..runtime.runtime_states import RuntimeStates
 from ..server.completion import (
-    CompletionArena,
     completion_report_ready,
-    completion_word_capacity,
     finalize_completion_report,
 )
 from ..server.cpu_tasks import BoundedCpuTaskPool
@@ -616,18 +614,6 @@ class Worker:
                 int(self._capabilities.max_latent_feature_bytes),
                 int(self._capabilities.max_vision_feature_bytes),
             ),
-            devices=owner_devices,
-            event_pool=self.device_events,
-        )
-        completion_words = completion_word_capacity(
-            int(self._capabilities.max_batch_operations),
-            int(completion_payload_bytes),
-        )
-        self.completion_arena = CompletionArena(
-            depth=int(pipeline_depth) * (int(self._capabilities.max_batch_operations) + 1),
-            token_capacity=completion_words,
-            total_token_capacity=int(pipeline_depth)
-            * (completion_words + int(self._capabilities.max_batch_operations)),
             devices=owner_devices,
             event_pool=self.device_events,
         )
@@ -1160,7 +1146,7 @@ class Worker:
             latent_pool=self.latent_pool,
             device_products=self.device_products,
             encoder_cache=self.encoder_cache,
-            completion_arena=self.completion_arena,
+            device_events=self.device_events,
             cpu_tasks=self.cpu_tasks,
             weights=self.weights,
             mesh=mesh,
@@ -2530,7 +2516,6 @@ class Worker:
         close_execution(self.execution)
         self.runner.close()
         self.cpu_tasks.close()
-        self.completion_arena.close()
         self.transfers.close()
         if self.latent_pool is not None:
             self.latent_pool.close()
@@ -2543,7 +2528,7 @@ class Worker:
         wake: Callable[[], None],
         wake_on_stream: Callable[[int], None],
     ) -> None:
-        self.completion_arena.set_completion_wake(wake_on_stream)
+        self.device_events.set_completion_wake(wake_on_stream)
         self.cpu_tasks.set_completion_wake(wake)
         self.transfers.set_completion_wake(wake)
 

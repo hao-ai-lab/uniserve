@@ -34,6 +34,7 @@ use crate::{CacheAccounting, ResourceAccounting, Result, ServeError, cache_isola
 pub enum ServedEndpoint {
     ChatCompletions,
     ImageGenerations,
+    VideoGenerations,
 }
 
 /// Public input or output modality admitted by one resolved description.
@@ -41,6 +42,8 @@ pub enum ServedEndpoint {
 pub enum ServedModality {
     Text,
     Image,
+    Video,
+    Audio,
 }
 
 /// Public behavior whose semantics are owned by the resolved description and
@@ -112,6 +115,7 @@ pub enum ResolvedModel {
     Qwen3(Qwen3Desc),
     SenseNova(SenseNovaDesc),
     Bagel(BagelDesc),
+    MiniMaxH3(MiniMaxH3Desc),
 }
 
 /// Text chat description: HF tokenization + chat template + fixed Qwen3 parser
@@ -147,6 +151,10 @@ pub struct BagelDesc {
     capabilities: GenerationRuntimeCapabilities,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
+}
+
+pub struct MiniMaxH3Desc {
+    identity: ModelIdentity,
 }
 
 impl ResolvedModel {
@@ -231,6 +239,20 @@ impl ResolvedModel {
                     max_model_tokens,
                 }))
             }
+            ModelProfile::MiniMaxH3(_) => Err(ServeError::ModelResolution(
+                "MiniMax H3 must be resolved through the media-only composition root".to_string(),
+            )),
+        }
+    }
+
+    pub fn resolve_media(profile: ModelProfile) -> Result<Self> {
+        match profile {
+            ModelProfile::MiniMaxH3(profile) => Ok(Self::MiniMaxH3(MiniMaxH3Desc {
+                identity: profile.common.identity,
+            })),
+            _ => Err(ServeError::ModelResolution(
+                "media composition root requires a media model profile".to_string(),
+            )),
         }
     }
 
@@ -240,6 +262,7 @@ impl ResolvedModel {
             Self::Qwen3(d) => &d.identity,
             Self::SenseNova(d) => &d.identity,
             Self::Bagel(d) => &d.identity,
+            Self::MiniMaxH3(d) => &d.identity,
         }
     }
 
@@ -258,27 +281,37 @@ impl ResolvedModel {
     }
 
     /// Tokenizer bound into the resolved description.
-    pub fn tokenizer(&self) -> DynTokenizer {
+    pub fn tokenizer(&self) -> Option<DynTokenizer> {
         match self {
-            Self::Qwen3(d) => std::sync::Arc::clone(&d.tokenizer),
-            Self::SenseNova(d) => std::sync::Arc::clone(&d.tokenizer),
-            Self::Bagel(d) => std::sync::Arc::clone(&d.tokenizer),
+            Self::Qwen3(d) => Some(std::sync::Arc::clone(&d.tokenizer)),
+            Self::SenseNova(d) => Some(std::sync::Arc::clone(&d.tokenizer)),
+            Self::Bagel(d) => Some(std::sync::Arc::clone(&d.tokenizer)),
+            Self::MiniMaxH3(_) => None,
         }
     }
 
     /// True when the description supports image output.
     pub fn supports_image_output(&self) -> bool {
-        !matches!(self, Self::Qwen3(_))
+        matches!(self, Self::SenseNova(_) | Self::Bagel(_))
     }
 
     /// True when the description supports image input.
     pub fn supports_image_input(&self) -> bool {
-        !matches!(self, Self::Qwen3(_))
+        matches!(self, Self::SenseNova(_) | Self::Bagel(_))
     }
 
     /// Exact route capabilities exposed by model discovery and enforced by
     /// request admission.
     pub fn served_capabilities(&self) -> ServedModelCapabilities {
+        if matches!(self, Self::MiniMaxH3(_)) {
+            return ServedModelCapabilities {
+                endpoints: vec![ServedEndpoint::VideoGenerations],
+                input_modalities: vec![ServedModality::Text],
+                output_modalities: vec![ServedModality::Video, ServedModality::Audio],
+                features: Vec::new(),
+                sampling_controls: Vec::new(),
+            };
+        }
         let mut endpoints = vec![ServedEndpoint::ChatCompletions];
         let mut input_modalities = vec![ServedModality::Text];
         let mut output_modalities = vec![ServedModality::Text];
@@ -304,6 +337,7 @@ impl ResolvedModel {
                 input_modalities.push(ServedModality::Image);
                 output_modalities.push(ServedModality::Image);
             }
+            Self::MiniMaxH3(_) => unreachable!("media capabilities returned above"),
         }
         ServedModelCapabilities {
             endpoints,
@@ -320,6 +354,9 @@ impl ResolvedModel {
             request_id: request.request_id.clone(),
             capability,
         };
+        if matches!(self, Self::MiniMaxH3(_)) {
+            return Err(reject("generation_endpoint"));
+        }
         let has_input_image = request.has_input_image();
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
@@ -361,6 +398,7 @@ impl ResolvedModel {
                     request,
                 ),
             ),
+            Self::MiniMaxH3(_) => unreachable!("media generation was rejected above"),
         };
         if let Err(capability) = capabilities.covers(&needs) {
             return Err(reject(capability));
@@ -393,6 +431,10 @@ impl ResolvedModel {
                 self.event_identity(),
                 request,
             ),
+            Self::MiniMaxH3(_) => Err(ServeError::UnsupportedCapability {
+                request_id: request.request_id,
+                capability: "generation_endpoint",
+            }),
         }
     }
 }

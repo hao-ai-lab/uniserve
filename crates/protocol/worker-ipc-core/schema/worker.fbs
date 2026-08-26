@@ -15,8 +15,12 @@ enum WorkVariant : ubyte {
   TransferKvInstall,
   GenTransition,
   GenFlow,
-  Materialize
+  Materialize,
+  GenDecode
 }
+
+enum DecodeKind : ubyte { Video, Audio }
+enum MediaProfileId : ubyte { MinimaxH3T2va }
 
 enum Domain : ubyte { Prefill, Decode, Flow }
 enum ExecutionCapability : ubyte { DomainHomogeneous, TensorizedMixed }
@@ -45,7 +49,7 @@ enum StorageClass : ubyte {
   PagedKv,
   LatentArena,
   HostStaging,
-  CompletionArena
+  PinnedOutput
 }
 
 enum DType : ubyte { U8, U16, U32, I32, I64, F16, BF16, F32 }
@@ -349,6 +353,14 @@ table LatentPlacement {
   step_count:uint;
 }
 
+table DecodePlacement {
+  request_key:RequestKey;
+  op_id:ulong;
+  kind:DecodeKind;
+  start_unit:uint;
+  unit_count:uint;
+}
+
 table LogicalLengths {
   token_len:uint;
   kv_visible_len:uint;
@@ -426,12 +438,20 @@ table UndAdmission {
 
 table GenAdmission { image:ImageParams; }
 
+table MediaAdmission {
+  prompt:string;
+  seed:ulong;
+  profile:MediaProfileId;
+  output_path:string;
+}
+
 table Admission {
   request_key:RequestKey;
   request_pool_idx:uint;
   digest:string;
   und:UndAdmission;
   gen_admission:GenAdmission;
+  media:MediaAdmission;
 }
 
 table BatchPartition {
@@ -448,6 +468,7 @@ table BatchPartition {
   new_cache_pages:[CachePageAllocation];
   forward_rows:[ForwardRow];
   latent_placements:[LatentPlacement];
+  decode_placements:[DecodePlacement];
 }
 
 table Batch {

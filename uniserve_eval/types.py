@@ -13,6 +13,7 @@ from typing import Any, Literal, TypeGuard
 
 CHAT_COMPLETIONS = "/v1/chat/completions"
 IMAGES_GENERATIONS = "/v1/images/generations"
+VIDEOS_SYNC = "/v1/videos/sync"
 DEFAULT_I2T_QUESTION = "Describe this image in detail."
 
 MetricDirection = Literal["higher", "lower"]
@@ -24,6 +25,7 @@ class TaskName(StrEnum):
     I2I = "i2i"
     I2T = "i2t"
     INTERLEAVE = "interleave"
+    VIDEO = "video"
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,57 @@ class DecodedImage:
         }
 
 
+@dataclass(frozen=True)
+class DecodedVideo:
+    data: bytes
+    sha256: str
+    byte_size: int
+    mime: str
+    width: int
+    height: int
+    frame_count: int
+    fps_numerator: int
+    fps_denominator: int
+    video_codec: str
+    audio_codec: str
+    audio_channels: int
+    audio_sample_rate: int
+    audio_samples: int
+    sample_filename: str
+
+    @property
+    def fps(self) -> float:
+        return self.fps_numerator / self.fps_denominator
+
+    @property
+    def video_duration_s(self) -> float:
+        return self.frame_count / self.fps
+
+    @property
+    def audio_duration_s(self) -> float:
+        return self.audio_samples / self.audio_sample_rate
+
+    def metadata_dict(self) -> dict[str, float | int | str]:
+        return {
+            "sha256": self.sha256,
+            "byte_size": self.byte_size,
+            "mime": self.mime,
+            "width": self.width,
+            "height": self.height,
+            "frame_count": self.frame_count,
+            "fps_numerator": self.fps_numerator,
+            "fps_denominator": self.fps_denominator,
+            "video_codec": self.video_codec,
+            "audio_codec": self.audio_codec,
+            "audio_channels": self.audio_channels,
+            "audio_sample_rate": self.audio_sample_rate,
+            "audio_samples": self.audio_samples,
+            "video_duration_s": self.video_duration_s,
+            "audio_duration_s": self.audio_duration_s,
+            "sample_filename": self.sample_filename,
+        }
+
+
 @dataclass
 class RequestRecord:
     request_id: str
@@ -175,6 +228,7 @@ class RequestRecord:
     first_image_latency: float | None = None
     image_steps: list[int] = field(default_factory=list)
     decoded_images: list[DecodedImage] = field(default_factory=list, repr=False)
+    decoded_video: DecodedVideo | None = field(default=None, repr=False)
     status_code: int | None = None
     finish_reason: str | None = None
     stop_reason: str | None = None
@@ -347,6 +401,9 @@ class RequestRecord:
             ),
             "image_latencies_ms": [value * 1000.0 for value in self.image_latencies],
             "image_steps": list(self.image_steps),
+            "video_output": (
+                self.decoded_video.metadata_dict() if self.decoded_video is not None else None
+            ),
             "status_code": self.status_code,
             "finish_reason": self.finish_reason,
             "stop_reason": self.stop_reason,

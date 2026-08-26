@@ -397,6 +397,7 @@ pub struct ModelCapabilities {
 pub enum ModelEndpoint {
     ChatCompletions,
     ImageGenerations,
+    VideoGenerations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +405,8 @@ pub enum ModelEndpoint {
 pub enum ModelModality {
     Text,
     Image,
+    Video,
+    Audio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

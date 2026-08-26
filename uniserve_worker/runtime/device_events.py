@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from threading import RLock
 
@@ -37,13 +38,45 @@ class _EventState:
     recorded: bool = False
 
 
+@dataclass(slots=True)
+class _DeferredRelease:
+    events: tuple[torch.cuda.Event, ...]
+    owner: object
+
+
 class DeviceEventPool:
     """Own CUDA events until every store reference is query-ready and released."""
 
     def __init__(self) -> None:
         self._available: dict[tuple[str, bool], deque[torch.cuda.Event]] = {}
         self._active: dict[int, _EventState] = {}
+        self._deferred: list[_DeferredRelease] = []
+        self._wake_on_stream: Callable[[int], None] | None = None
+        self._wake_streams: dict[str, torch.cuda.Stream] = {}
         self._lock = RLock()
+
+    def set_completion_wake(self, wake_on_stream: Callable[[int], None]) -> None:
+        self._wake_on_stream = wake_on_stream
+
+    def schedule_completion_wake(
+        self,
+        device: torch.device | str,
+        event: torch.cuda.Event,
+    ) -> None:
+        wake_on_stream = self._wake_on_stream
+        if wake_on_stream is None:
+            return
+        target = _resolved_device(device)
+        device_name = str(target)
+        with self._lock:
+            self._require_locked(event, target)
+            stream = self._wake_streams.get(device_name)
+            if stream is None:
+                stream = torch.cuda.Stream(device=target)
+                self._wake_streams[device_name] = stream
+            stream.wait_event(event)
+            stream_id = int(stream.cuda_stream)
+        wake_on_stream(stream_id)
 
     def acquire(
         self,
@@ -57,6 +90,7 @@ class DeviceEventPool:
         device_name = str(target)
         key = (device_name, bool(timing))
         with self._lock:
+            self._reap_locked()
             available = self._available.get(key)
             event = (
                 available.pop()
@@ -139,13 +173,56 @@ class DeviceEventPool:
                 return
             if not state.recorded or not bool(event.query()):
                 raise _invariant("device event was released before it became query-ready")
-            self._active.pop(id(event))
-            self._available.setdefault((state.device_name, state.timing), deque()).append(event)
+            self._recycle_locked(state)
+
+    def defer_release(
+        self,
+        events: Sequence[torch.cuda.Event],
+        owner: object,
+    ) -> None:
+        retained = tuple(events)
+        if not retained:
+            return
+        with self._lock:
+            for event in retained:
+                state = self._active.get(id(event))
+                if state is None or state.event is not event or state.references != 1:
+                    raise _invariant("deferred device event has invalid ownership")
+            self._deferred.append(_DeferredRelease(retained, owner))
+            self._reap_locked()
+
+    def reap(self) -> None:
+        with self._lock:
+            self._reap_locked()
 
     def close(self) -> None:
+        for stream in self._wake_streams.values():
+            stream.synchronize()
         with self._lock:
+            self._wake_streams.clear()
+            self._deferred.clear()
             self._active.clear()
             self._available.clear()
+
+    def _reap_locked(self) -> None:
+        pending: list[_DeferredRelease] = []
+        for deferred in self._deferred:
+            if not all(bool(event.query()) for event in deferred.events):
+                pending.append(deferred)
+                continue
+            for event in deferred.events:
+                state = self._active.get(id(event))
+                if state is None or state.event is not event or state.references != 1:
+                    raise _invariant("deferred device event lost its ownership")
+                state.references = 0
+                self._recycle_locked(state)
+        self._deferred = pending
+
+    def _recycle_locked(self, state: _EventState) -> None:
+        self._active.pop(id(state.event))
+        self._available.setdefault((state.device_name, state.timing), deque()).append(
+            state.event
+        )
 
     def _require_locked(
         self,

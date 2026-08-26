@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import numpy as np
 
@@ -14,6 +14,12 @@ from ..types import Example
 
 T = TypeVar("T")
 Submit = Callable[[Example, float | None], Coroutine[Any, Any, T]]
+
+
+class MeasurementWindow(Protocol):
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,7 @@ async def run_load(
     max_concurrency: int | None,
     submit: Submit[T],
     warmup_requests: int = 1,
+    measurement: MeasurementWindow | None = None,
 ) -> LoadResult:
     if not rows:
         return LoadResult((), (), 0.0)
@@ -76,11 +83,17 @@ async def run_load(
         async with semaphore:
             return await submit(row, scheduled)
 
+    if measurement is not None:
+        measurement.start()
     benchmark_start_time = time.perf_counter()
-    tasks: list[asyncio.Task[T]] = []
-    async for row in get_request(rows, request_rate):
-        tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
-    outputs = await asyncio.gather(*tasks)
+    try:
+        tasks: list[asyncio.Task[T]] = []
+        async for row in get_request(rows, request_rate):
+            tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
+        outputs = await asyncio.gather(*tasks)
+    finally:
+        if measurement is not None:
+            measurement.stop()
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),

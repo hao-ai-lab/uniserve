@@ -7,6 +7,7 @@ from .i2t import I2TTask
 from .interleave import InterleaveTask
 from .t2i import T2ITask
 from .text import TextTask
+from .video import VideoTask
 
 TASKS: dict[str, type[BenchmarkTask]] = {
     TaskName.TEXT.value: TextTask,
@@ -14,6 +15,7 @@ TASKS: dict[str, type[BenchmarkTask]] = {
     TaskName.I2I.value: I2ITask,
     TaskName.I2T.value: I2TTask,
     TaskName.INTERLEAVE.value: InterleaveTask,
+    TaskName.VIDEO.value: VideoTask,
 }
 
 
@@ -38,6 +40,7 @@ __all__ = [
     "InterleaveTask",
     "T2ITask",
     "TextTask",
+    "VideoTask",
     "get_task",
     "list_tasks",
 ]

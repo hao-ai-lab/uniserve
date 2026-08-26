@@ -11,6 +11,7 @@ pub mod images;
 pub mod logprobs;
 mod types;
 pub mod utils;
+pub mod videos;
 
 pub use error::{ApiError, Result, serve_error_to_api};
 pub use types::*;

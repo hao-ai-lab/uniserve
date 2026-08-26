@@ -16,6 +16,7 @@ use uniserve_engine_wire::generation::GenerationControlTokens;
 use crate::client::{StreamControl, StreamControlRequest};
 use crate::error::{Error, Result};
 use crate::generation::{GenerationEventStream, GenerationSubmission};
+use crate::media::{MediaEvent, MediaEventStream, MediaSubmission};
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::{EngineRequest, ModelDtype};
 use crate::zmq::imp::{ClientInner, run_output_dispatcher_loop, run_stream_control_loop};
@@ -79,6 +80,8 @@ pub struct ZmqClientConfig {
     /// Control-token ids resolved from the tokenizer, shipped to each engine
     /// in the handshake INIT.
     pub generation_controls: Option<GenerationControlTokens>,
+    /// Shared media path required from every engine in handshake mode.
+    pub media_spool: Option<String>,
 }
 
 impl ZmqClientConfig {
@@ -97,6 +100,7 @@ impl ZmqClientConfig {
             model_name: String::new(),
             client_index: 0,
             generation_controls: None,
+            media_spool: None,
         }
     }
 
@@ -149,6 +153,7 @@ impl ZmqEngineCoreClient {
                     local_input_address.as_deref(),
                     local_output_address.as_deref(),
                     config.generation_controls.clone(),
+                    config.media_spool.clone(),
                     *ready_timeout,
                 )
                 .await?
@@ -384,6 +389,48 @@ impl ZmqEngineCoreClient {
             },
             acknowledge_on_receive,
         ))
+    }
+
+    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventStream> {
+        let request = submission.into_envelope(self.config.client_index);
+        request.validate()?;
+        let request_id = request.external_request_id.clone();
+        let data_parallel_rank = request.data_parallel_rank;
+        let (engine_id, mut rx) = self
+            .inner
+            .register_request(request_id.clone(), data_parallel_rank)?;
+        if let Err(error) = self
+            .inner
+            .send_to_engine(&engine_id, EngineRequest::SubmitMedia(Box::new(request)))
+            .await
+        {
+            self.inner.rollback_request(&request_id);
+            return Err(error);
+        }
+        let (tx, media_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let event = match rx.recv().await {
+                Some(crate::GenEvent::MediaCompleted { bytes }) => MediaEvent::Completed { bytes },
+                Some(crate::GenEvent::MediaFailed { message })
+                | Some(crate::GenEvent::Rejected { message })
+                | Some(crate::GenEvent::Error { message }) => MediaEvent::Failed { message },
+                Some(crate::GenEvent::MediaAborted) | None => MediaEvent::Aborted,
+                Some(other) => MediaEvent::Failed {
+                    message: format!("unexpected media engine event: {other:?}"),
+                },
+            };
+            let _ = tx.send(event).await;
+        });
+        let cancel_tx = self.control_tx.clone();
+        Ok(MediaEventStream::with_cancel(media_rx, move || {
+            let _ = cancel_tx.send(StreamControlRequest {
+                request_id,
+                control: StreamControl::Cancel {
+                    cause: crate::client::StreamCancelCause::DroppedStream,
+                    output_token_count: 0,
+                },
+            });
+        }))
     }
 
     /// Abort currently in-flight requests by request ID.

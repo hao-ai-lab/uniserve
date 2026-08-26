@@ -62,6 +62,7 @@ fn client_config(handshake_address: &str, engine_count: usize) -> ZmqClientConfi
         model_name: "sim-model".to_string(),
         client_index: 0,
         generation_controls: None,
+        media_spool: None,
     }
 }
 

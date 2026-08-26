@@ -7,6 +7,7 @@ use std::sync::Arc;
 mod client;
 mod error;
 pub mod generation;
+pub mod media;
 pub mod metrics;
 pub mod zmq;
 
@@ -22,6 +23,7 @@ pub use generation::{
     GenerationFinishReason, GenerationPositionLogprobs, GenerationSubmission,
     GenerationTokenLogprob, ImageParams, PublicCommit, PublicModality, SemanticRoot,
 };
+pub use media::{MediaEvent, MediaEventStream, MediaSubmission};
 pub use zmq::{EngineId, TransportMode, ZmqClientConfig, ZmqEngineCoreClient};
 
 /// Runtime transport seam for generation submission and request control.
@@ -75,6 +77,10 @@ impl EngineGateway {
         self.client().submit_generation(submission).await
     }
 
+    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventStream> {
+        self.client().submit_media(submission).await
+    }
+
     /// Cancel an in-flight request because its caller no longer needs output.
     pub async fn cancel(&self, request_id: &str) -> Result<()> {
         self.client().cancel(&[request_id.to_string()]).await
@@ -101,9 +107,9 @@ pub mod transport {
     pub use super::{
         EngineCoreClient, EngineId, EngineSamplingParams, EngineStatus, Error, GenEvent,
         GenerationConstraint, GenerationEventStream, GenerationFinishReason, GenerationSubmission,
-        ImageParams, InProcessEngineClient, PublicCommit, PublicModality, Result, SemanticRoot,
-        StreamCancelCause, StreamControl, StreamControlRequest, TransportMode, ZmqClientConfig,
-        ZmqEngineCoreClient,
+        ImageParams, InProcessEngineClient, MediaEvent, MediaEventStream, MediaSubmission,
+        PublicCommit, PublicModality, Result, SemanticRoot, StreamCancelCause, StreamControl,
+        StreamControlRequest, TransportMode, ZmqClientConfig, ZmqEngineCoreClient,
     };
     pub use super::{generation, metrics, zmq};
 }

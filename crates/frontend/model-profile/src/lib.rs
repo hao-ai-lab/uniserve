@@ -31,6 +31,7 @@ pub enum ModelDescription {
     #[serde(rename = "sensenova")]
     SenseNova,
     Bagel,
+    MiniMaxH3,
 }
 
 impl ModelDescription {
@@ -39,6 +40,7 @@ impl ModelDescription {
             Self::Qwen3 => "qwen3",
             Self::SenseNova => "sensenova",
             Self::Bagel => "bagel",
+            Self::MiniMaxH3 => "minimax_h3",
         }
     }
 
@@ -47,6 +49,7 @@ impl ModelDescription {
             Self::Qwen3 => "qwen3",
             Self::SenseNova => "neo_chat",
             Self::Bagel => "bagel",
+            Self::MiniMaxH3 => "minimax_h3",
         }
     }
 }
@@ -114,15 +117,41 @@ pub struct BagelModelProfile {
     pub preprocessing: BagelProfile,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MiniMaxH3ModelProfile {
+    pub common: CommonModelProfile,
+}
+
 /// The closed resolved profile value consumed by the serving model description.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelProfile {
     Qwen3(Qwen3ModelProfile),
     SenseNova(SenseNovaModelProfile),
     Bagel(BagelModelProfile),
+    MiniMaxH3(MiniMaxH3ModelProfile),
 }
 
 impl ModelProfile {
+    pub fn minimax_h3(model_id: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"uniserve-minimax-h3-t2va-v0.2\0");
+        hasher.update(model_id.as_bytes());
+        let config_fingerprint = format!("{:x}", hasher.finalize());
+        Self::MiniMaxH3(MiniMaxH3ModelProfile {
+            common: CommonModelProfile {
+                identity: ModelIdentity {
+                    model_id: model_id.to_string(),
+                    profile_id: format!("minimax_h3:{}", &config_fingerprint[..16]),
+                    description_id: "minimax_h3".to_string(),
+                    config_fingerprint,
+                },
+                generation_defaults: GenerationDefaultsDescriptor::default(),
+                context_limits: ContextLimits::default(),
+                stop_tokens: StopTokenPolicy::default(),
+            },
+        })
+    }
+
     pub fn resolve(
         description: ModelDescription,
         model_id: &str,
@@ -172,6 +201,7 @@ impl ModelProfile {
                 common,
                 preprocessing: BagelProfile::resolve(tokenizer)?,
             })),
+            ModelDescription::MiniMaxH3 => Ok(Self::minimax_h3(model_id)),
         }
     }
 
@@ -180,6 +210,7 @@ impl ModelProfile {
             Self::Qwen3(profile) => &profile.common,
             Self::SenseNova(profile) => &profile.common,
             Self::Bagel(profile) => &profile.common,
+            Self::MiniMaxH3(profile) => &profile.common,
         }
     }
 
@@ -188,6 +219,7 @@ impl ModelProfile {
             Self::Qwen3(profile) => &mut profile.common,
             Self::SenseNova(profile) => &mut profile.common,
             Self::Bagel(profile) => &mut profile.common,
+            Self::MiniMaxH3(profile) => &mut profile.common,
         }
     }
 }

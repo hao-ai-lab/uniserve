@@ -142,6 +142,7 @@ pub(crate) async fn connect_handshake(
     local_input_address: Option<&str>,
     local_output_address: Option<&str>,
     generation_controls: Option<GenerationControlTokens>,
+    media_spool: Option<String>,
     ready_timeout: Duration,
 ) -> Result<ConnectedTransport> {
     if engine_count == 0 {
@@ -196,6 +197,7 @@ pub(crate) async fn connect_handshake(
                     &input_address,
                     &output_address,
                     generation_controls.clone(),
+                    media_spool.clone(),
                 )
                 .await?;
                 debug!(handshake_address, ?engine_id, "sent INIT to engine");
@@ -367,6 +369,7 @@ async fn send_init_message(
     input_address: &str,
     output_address: &str,
     generation_controls: Option<GenerationControlTokens>,
+    media_spool: Option<String>,
 ) -> Result<()> {
     let init_message = HandshakeInitMessage {
         addresses: HandshakeAddresses {
@@ -378,6 +381,7 @@ async fn send_init_message(
         },
         parallel_config: Default::default(),
         generation_controls,
+        media_spool,
     };
     let payload = encode_msgpack(&init_message)?;
     let message = ZmqMessage::try_from(vec![engine_id.to_frame(), Bytes::from(payload)]).map_err(

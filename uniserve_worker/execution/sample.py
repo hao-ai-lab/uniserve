@@ -21,7 +21,7 @@ from uniserve_worker.runtime.device_products import (
     DeviceProductWrite,
 )
 from uniserve_worker.server.completion import (
-    CompletionLease,
+    PinnedOutputBuffer,
     _CompletionInteger,
     _CompletionLogprobBatch,
     _CompletionLogprobValue,
@@ -157,7 +157,7 @@ def graph_greedy_compatible(
 @torch.inference_mode()
 def sample(
     tasks: Sequence[SampleWork],
-    completion: CompletionLease | None = None,
+    completion: PinnedOutputBuffer | None = None,
     *,
     device_products: DeviceProducts | None = None,
     device_reads: tuple[DeviceProductRead, ...] = (),
@@ -275,7 +275,7 @@ def sample(
 
 def sample_device_greedy_group(
     tasks: tuple[SampleWork, ...],
-    completion: CompletionLease | None,
+    completion: PinnedOutputBuffer | None,
     *,
     apply_suppression: bool,
     device_products: DeviceProducts | None,
@@ -573,7 +573,7 @@ def _fused_top_k(task: SampleWork, vocab: int) -> int:
 def _sample_fused_top_k_group(
     tasks: tuple[SampleWork, ...],
     top_k: int,
-    completion: CompletionLease | None,
+    completion: PinnedOutputBuffer | None,
     *,
     device_products: DeviceProducts | None,
     device_reads: tuple[DeviceProductRead, ...],
@@ -673,7 +673,7 @@ def _run_fused_top_k_sampling(
 
 def _sample_task_group(
     tasks: tuple[SampleWork, ...],
-    completion: CompletionLease | None,
+    completion: PinnedOutputBuffer | None,
     *,
     device_products: DeviceProducts | None,
     device_reads: tuple[DeviceProductRead, ...],
@@ -821,7 +821,7 @@ def _capture_sample_span(
     active: torch.Tensor,
     tokens: torch.Tensor,
     accepted: torch.Tensor,
-    completion: CompletionLease | None,
+    completion: PinnedOutputBuffer | None,
 ) -> _CompletionSampleSpan:
     count = int(tokens.numel())
     if (
@@ -856,7 +856,7 @@ def _capture_sample_span(
 
 def capture_preselected_span(
     output: GraphGreedyOutput,
-    completion: CompletionLease | None,
+    completion: PinnedOutputBuffer | None,
 ) -> _CompletionSampleSpan:
     count = int(output.tokens.numel())
     if int(output.completion.numel()) != SAMPLING_COMPLETION_FIELDS * count:
@@ -1450,7 +1450,7 @@ def logprob_details(
     output_rows: torch.Tensor,
     output_tokens: torch.Tensor,
     rows: Sequence[SampleRow],
-    completion: CompletionLease | None,
+    completion: PinnedOutputBuffer | None,
 ) -> Mapping[
     int,
     tuple[

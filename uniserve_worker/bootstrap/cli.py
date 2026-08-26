@@ -119,6 +119,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--allow-stub", action="store_true", default=False)
     parser.add_argument("--snapshot-dir", default=None)
+    parser.add_argument("--media-spool", default=None)
     return parser
 
 

@@ -7,6 +7,7 @@ from .base import Dataset
 from .beans import BeansDataset
 from .jsonl import JsonlDataset
 from .mjhq import MJHQDataset
+from .minimax_h3 import MiniMaxH3Dataset
 from .pie_bench import PieBenchDataset
 from .sharegpt import ShareGPTDataset
 from .ueval import UEvalDataset
@@ -18,6 +19,7 @@ DATASETS: dict[str, type[Dataset]] = {
     "ueval": UEvalDataset,
     "pie-bench": PieBenchDataset,
     "jsonl": JsonlDataset,
+    "minimax-h3": MiniMaxH3Dataset,
 }
 
 
@@ -61,6 +63,7 @@ __all__ = [
     "Dataset",
     "JsonlDataset",
     "MJHQDataset",
+    "MiniMaxH3Dataset",
     "PieBenchDataset",
     "ShareGPTDataset",
     "UEvalDataset",

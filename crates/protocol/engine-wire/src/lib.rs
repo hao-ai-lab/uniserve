@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 use thiserror_ext::AsReport as _;
 use uniserve_core::GenerationRequest;
-pub use uniserve_engine_api::GenEvent;
+use uniserve_engine_api::MediaRequest;
+pub use uniserve_engine_api::{GenEvent, MediaEvent};
 
 use crate::stats::SchedulerStats;
 
@@ -37,6 +38,7 @@ pub enum EngineRequestKind {
     CancelAt = 3,
     AcknowledgeAt = 4,
     StopAt = 5,
+    SubmitMedia = 6,
 }
 
 impl EngineRequestKind {
@@ -55,6 +57,7 @@ impl EngineRequestKind {
             Self::CancelAt,
             Self::AcknowledgeAt,
             Self::StopAt,
+            Self::SubmitMedia,
         ]
         .into_iter()
         .find(|kind| kind.as_byte() == *value)
@@ -96,6 +99,37 @@ impl GenerationRequestEnvelope {
     }
 }
 
+/// Physical transport metadata around one fixed-profile media request.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct MediaRequestEnvelope {
+    pub external_request_id: String,
+    pub arrival_time: f64,
+    pub client_index: u32,
+    pub data_parallel_rank: Option<u32>,
+    pub trace_headers: Option<BTreeMap<String, String>>,
+    pub request: MediaRequest,
+}
+
+impl MediaRequestEnvelope {
+    pub fn validate(&self) -> Result<()> {
+        if self.external_request_id.is_empty() {
+            return Err(Error::InvalidGenerationRequest {
+                message: "external request id must not be empty".to_string(),
+            });
+        }
+        if !self.arrival_time.is_finite() || self.arrival_time < 0.0 {
+            return Err(Error::InvalidGenerationRequest {
+                message: "arrival time must be finite and nonnegative".to_string(),
+            });
+        }
+        self.request
+            .validate()
+            .map_err(|message| Error::InvalidGenerationRequest {
+                message: message.to_string(),
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
 pub struct CancelAt {
     pub external_request_id: String,
@@ -118,6 +152,7 @@ pub struct StopAt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineRequest {
     Submit(Box<GenerationRequestEnvelope>),
+    SubmitMedia(Box<MediaRequestEnvelope>),
     Abort(Vec<String>),
     Cancel(Vec<String>),
     CancelAt(Vec<CancelAt>),
@@ -129,6 +164,7 @@ impl EngineRequest {
     pub fn kind(&self) -> EngineRequestKind {
         match self {
             Self::Submit(_) => EngineRequestKind::Submit,
+            Self::SubmitMedia(_) => EngineRequestKind::SubmitMedia,
             Self::Abort(_) => EngineRequestKind::Abort,
             Self::Cancel(_) => EngineRequestKind::Cancel,
             Self::CancelAt(_) => EngineRequestKind::CancelAt,
@@ -140,6 +176,7 @@ impl EngineRequest {
     pub fn encode_frames(&self) -> Result<(Bytes, Vec<u8>)> {
         let payload = match self {
             Self::Submit(request) => encode_msgpack(request.as_ref())?,
+            Self::SubmitMedia(request) => encode_msgpack(request.as_ref())?,
             Self::Abort(request_ids) | Self::Cancel(request_ids) => encode_msgpack(request_ids)?,
             Self::CancelAt(requests) => encode_msgpack(requests)?,
             Self::AcknowledgeAt(requests) => encode_msgpack(requests)?,
@@ -153,6 +190,8 @@ impl EngineRequest {
         Some(match kind {
             EngineRequestKind::Submit => decode_msgpack::<GenerationRequestEnvelope>(payload)
                 .map(|request| Self::Submit(Box::new(request))),
+            EngineRequestKind::SubmitMedia => decode_msgpack::<MediaRequestEnvelope>(payload)
+                .map(|request| Self::SubmitMedia(Box::new(request))),
             EngineRequestKind::Abort => decode_msgpack::<Vec<String>>(payload).map(Self::Abort),
             EngineRequestKind::Cancel => decode_msgpack::<Vec<String>>(payload).map(Self::Cancel),
             EngineRequestKind::CancelAt => {
@@ -177,7 +216,12 @@ impl RoutedGenerationEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.event,
-            GenEvent::Finished { .. } | GenEvent::Rejected { .. } | GenEvent::Error { .. }
+            GenEvent::Finished { .. }
+                | GenEvent::Rejected { .. }
+                | GenEvent::Error { .. }
+                | GenEvent::MediaCompleted { .. }
+                | GenEvent::MediaFailed { .. }
+                | GenEvent::MediaAborted
         )
     }
 }

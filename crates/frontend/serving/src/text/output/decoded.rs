@@ -364,10 +364,13 @@ pub async fn decoded_text_event_stream(
             GenEvent::ImageBegin { .. }
             | GenEvent::ImageStep { .. }
             | GenEvent::ImageCommit { .. }
-            | GenEvent::ImageDone { .. } => {
+            | GenEvent::ImageDone { .. }
+            | GenEvent::MediaCompleted { .. }
+            | GenEvent::MediaFailed { .. }
+            | GenEvent::MediaAborted => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
-                    message: "text-only request received an image lifecycle event".to_string(),
+                    message: "text-only request received a non-text lifecycle event".to_string(),
                 });
             }
         }

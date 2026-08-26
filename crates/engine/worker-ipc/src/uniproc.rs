@@ -114,6 +114,7 @@ pub struct WorkerLaunchConfig {
     pub flashinfer_disable_split_kv: bool,
     pub flashinfer_fast_decode_plan: bool,
     pub snapshot_dir: Option<String>,
+    pub media_spool: Option<String>,
 }
 
 impl Default for WorkerLaunchConfig {
@@ -145,6 +146,7 @@ impl Default for WorkerLaunchConfig {
             flashinfer_disable_split_kv: false,
             flashinfer_fast_decode_plan: true,
             snapshot_dir: None,
+            media_spool: None,
         }
     }
 }
@@ -224,6 +226,9 @@ impl WorkerLaunchConfig {
         }
         if let Some(value) = &self.snapshot_dir {
             cmd.arg("--snapshot-dir").arg(value);
+        }
+        if let Some(value) = &self.media_spool {
+            cmd.arg("--media-spool").arg(value);
         }
     }
 }

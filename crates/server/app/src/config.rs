@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -161,6 +162,8 @@ pub struct Config {
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
+    /// Shared filesystem namespace used for media outputs.
+    pub media_spool: PathBuf,
     /// HTTP listener setup.
     pub listener_mode: HttpListenerMode,
     /// Server-default chat template override, as a file path or inline
@@ -201,6 +204,7 @@ impl Default for Config {
             model: String::new(),
             model_description: ModelDescription::Qwen3,
             served_model_name: None,
+            media_spool: PathBuf::from("/tmp/uniserve-media"),
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),
                 port: 8000,
@@ -226,6 +230,19 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.validate_listener()?;
         self.engine.validate()?;
+        anyhow::ensure!(
+            self.media_spool.is_absolute(),
+            "media spool path must be absolute"
+        );
+        if self.model_description == ModelDescription::MiniMaxH3 {
+            anyhow::ensure!(
+                !matches!(
+                    self.engine.connection,
+                    EngineConnection::Bootstrapped { .. }
+                ),
+                "MiniMax H3 requires an in-process or handshake-managed engine so the media spool can be verified"
+            );
+        }
 
         Ok(())
     }
@@ -259,6 +276,10 @@ impl EngineSettings {
     /// Default response-ring slot capacity in bytes for the worker IPC
     /// transport (64 MiB).
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
+
+    /// H3 carries only compact descriptors and completion records over worker
+    /// IPC; encoded media remains in the shared spool.
+    pub const MEDIA_IPC_SLOT_CAP: usize = 64 << 10;
 
     /// Reject numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`

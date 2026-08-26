@@ -101,6 +101,22 @@ pub enum TransferMode {
 pub enum GenMode {
     Transition,
     Flow,
+    Decode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum DecodeKind {
+    Video,
+    Audio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum MediaProfileId {
+    MinimaxH3T2va,
 }
 
 /// The single closed work algebra. The state effect and role of each variant
@@ -134,10 +150,11 @@ pub enum WorkVariant {
     GenTransition = 9,
     GenFlow = 10,
     Materialize = 11,
+    GenDecode = 12,
 }
 
 impl WorkVariant {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::TokenExtend,
         Self::TokenDecode,
         Self::TokenVerify,
@@ -150,6 +167,7 @@ impl WorkVariant {
         Self::GenTransition,
         Self::GenFlow,
         Self::Materialize,
+        Self::GenDecode,
     ];
 
     /// Whether a variant advances the authoritative request lineage.
@@ -161,6 +179,7 @@ impl WorkVariant {
                 | Self::TokenVerify
                 | Self::GenTransition
                 | Self::GenFlow
+                | Self::GenDecode
         )
     }
 
@@ -173,7 +192,9 @@ impl WorkVariant {
     pub const fn domain(self) -> Domain {
         match self {
             Self::TokenDecode | Self::TokenVerify | Self::Draft => Domain::Decode,
-            Self::GenTransition | Self::GenFlow | Self::Materialize => Domain::Flow,
+            Self::GenTransition | Self::GenFlow | Self::GenDecode | Self::Materialize => {
+                Domain::Flow
+            }
             Self::TokenExtend
             | Self::EncodeVision
             | Self::EncodeLatent
@@ -197,6 +218,7 @@ impl WorkVariant {
             Self::GenTransition => "gen_transition",
             Self::GenFlow => "gen_flow",
             Self::Materialize => "materialize",
+            Self::GenDecode => "gen_decode",
         }
     }
 }
@@ -215,6 +237,7 @@ impl Work {
             Self::Transfer(TransferMode::KvInstall) => WorkVariant::TransferKvInstall,
             Self::Gen(GenMode::Transition) => WorkVariant::GenTransition,
             Self::Gen(GenMode::Flow) => WorkVariant::GenFlow,
+            Self::Gen(GenMode::Decode) => WorkVariant::GenDecode,
             Self::Materialize => WorkVariant::Materialize,
         }
     }
@@ -232,6 +255,7 @@ impl Work {
             WorkVariant::TransferKvInstall => Self::Transfer(TransferMode::KvInstall),
             WorkVariant::GenTransition => Self::Gen(GenMode::Transition),
             WorkVariant::GenFlow => Self::Gen(GenMode::Flow),
+            WorkVariant::GenDecode => Self::Gen(GenMode::Decode),
             WorkVariant::Materialize => Self::Materialize,
         }
     }
@@ -276,7 +300,7 @@ pub enum StorageClass {
     PagedKv = 1,
     LatentArena = 2,
     HostStaging = 3,
-    CompletionArena = 4,
+    PinnedOutput = 4,
 }
 
 /// Element type of a product's backing storage.
@@ -686,7 +710,7 @@ impl Operation {
                     output.max_bytes() <= self.bounds.max_latent_bytes,
                     "a latent-arena output exceeds the operation latent-byte bound"
                 ),
-                StorageClass::HostStaging | StorageClass::CompletionArena => anyhow::ensure!(
+                StorageClass::HostStaging | StorageClass::PinnedOutput => anyhow::ensure!(
                     output.max_bytes() <= self.bounds.max_completion_bytes,
                     "a host-visible output exceeds the operation completion-byte bound"
                 ),
@@ -1066,6 +1090,14 @@ pub struct GenAdmission {
     pub image: ImageParams,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaAdmission {
+    pub prompt: String,
+    pub seed: u64,
+    pub profile: MediaProfileId,
+    pub output_path: String,
+}
+
 /// Session establishment framing. Carries the per-domain parameters a lineage
 /// needs before its operations run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1077,6 +1109,7 @@ pub struct Admission {
     pub digest: Digest,
     pub und: Option<UndAdmission>,
     pub gen_admission: Option<GenAdmission>,
+    pub media: Option<MediaAdmission>,
 }
 
 impl Admission {
@@ -1097,8 +1130,28 @@ impl Admission {
             digest: String::new(),
             und,
             gen_admission,
+            media: None,
         };
         admission.digest = admission.payload_digest();
+        Ok(admission)
+    }
+
+    pub fn new_media(
+        request_key: RequestKey,
+        request_pool_idx: u32,
+        media: MediaAdmission,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(request_pool_idx > 0, "request-pool index must be positive");
+        let mut admission = Self {
+            request_key,
+            request_pool_idx,
+            digest: String::new(),
+            und: None,
+            gen_admission: None,
+            media: Some(media),
+        };
+        admission.digest = admission.payload_digest();
+        admission.validate()?;
         Ok(admission)
     }
 
@@ -1114,6 +1167,12 @@ impl Admission {
         digest.option(self.gen_admission.as_ref(), |digest, branch| {
             digest.image(&branch.image)
         });
+        digest.option(self.media.as_ref(), |digest, media| {
+            digest.string(&media.prompt);
+            digest.u64(media.seed);
+            digest.u8(media.profile as u8);
+            digest.string(&media.output_path);
+        });
         digest.finish()
     }
 
@@ -1123,8 +1182,8 @@ impl Admission {
             "request-pool index must be positive"
         );
         anyhow::ensure!(
-            self.und.is_some() || self.gen_admission.is_some(),
-            "admission must declare an understanding or generation branch"
+            self.und.is_some() || self.gen_admission.is_some() || self.media.is_some(),
+            "admission must declare an understanding, generation, or media branch"
         );
         anyhow::ensure!(
             is_digest(&self.digest),
@@ -1145,6 +1204,16 @@ impl Admission {
         }
         if let Some(branch) = &self.gen_admission {
             branch.image.validate()?;
+        }
+        if let Some(media) = &self.media {
+            anyhow::ensure!(
+                !media.prompt.is_empty(),
+                "media admission prompt must not be empty"
+            );
+            anyhow::ensure!(
+                !media.output_path.is_empty(),
+                "media admission output path must not be empty"
+            );
         }
         Ok(())
     }
@@ -1179,6 +1248,8 @@ pub struct BatchPartition {
     /// Complete scheduler-owned latent mappings for operations that address a
     /// generation trajectory.
     pub latent_placements: Vec<LatentPlacement>,
+    /// Fixed-profile media decode units owned by GenDecode operations.
+    pub decode_placements: Vec<DecodePlacement>,
 }
 
 /// One scheduler-owned request-slot block table.
@@ -1348,6 +1419,29 @@ impl LatentPlacement {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodePlacement {
+    pub request_key: RequestKey,
+    pub op_id: OpId,
+    pub kind: DecodeKind,
+    pub start_unit: u32,
+    pub unit_count: u32,
+}
+
+impl DecodePlacement {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.op_id.0 > 0,
+            "decode placement operation id must be positive"
+        );
+        anyhow::ensure!(
+            self.unit_count > 0,
+            "decode placement unit count must be positive"
+        );
+        Ok(())
+    }
+}
+
 impl BatchPartition {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.partition_id > 0, "batch partition id must be positive");
@@ -1453,6 +1547,29 @@ impl BatchPartition {
             anyhow::ensure!(
                 !needs_latent || latent_ids.contains(&(operation.request_key, operation.op_id)),
                 "operation that addresses a trajectory has no latent placement"
+            );
+        }
+        let mut decode_ids = HashSet::with_capacity(self.decode_placements.len());
+        for placement in &self.decode_placements {
+            placement.validate()?;
+            let identity = (placement.request_key, placement.op_id);
+            anyhow::ensure!(
+                decode_ids.insert(identity),
+                "batch partition repeats a decode placement identity"
+            );
+            let operation = operations.get(&identity).ok_or_else(|| {
+                anyhow::anyhow!("decode placement does not name a partition operation")
+            })?;
+            anyhow::ensure!(
+                operation.work.variant() == WorkVariant::GenDecode,
+                "decode placement does not name a GenDecode operation"
+            );
+        }
+        for operation in &self.operations {
+            anyhow::ensure!(
+                operation.work.variant() != WorkVariant::GenDecode
+                    || decode_ids.contains(&(operation.request_key, operation.op_id)),
+                "GenDecode operation has no decode placement"
             );
         }
         Ok(())
@@ -1783,7 +1900,7 @@ impl ProductPayload {
         if is_transfer_descriptor(&self.bytes) {
             anyhow::ensure!(
                 self.product.storage_class != StorageClass::HostStaging
-                    && self.product.storage_class != StorageClass::CompletionArena
+                    && self.product.storage_class != StorageClass::PinnedOutput
                     && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
                 "output transfer descriptor has an invalid storage class or byte bound"
             );
@@ -2137,6 +2254,21 @@ impl WorkerCapabilities {
             .saturating_mul(u64::from(self.latent_page_units))
     }
 
+    pub fn uses_kv(&self) -> bool {
+        self.supported_work.iter().any(|variant| {
+            matches!(
+                variant,
+                WorkVariant::TokenExtend
+                    | WorkVariant::TokenDecode
+                    | WorkVariant::TokenVerify
+                    | WorkVariant::Draft
+                    | WorkVariant::TransferKvPublish
+                    | WorkVariant::TransferKvInstall
+            )
+        }) || self.supported_controls.contains(&RequestKind::CopyKv)
+            || self.resource_classes.contains(&ResourceClass::KvBlock)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.supported_work.is_empty(),
@@ -2230,16 +2362,21 @@ impl WorkerCapabilities {
             );
         }
         anyhow::ensure!(
-            self.block_size > 0
-                && self.num_blocks > 1
-                && self.num_layers > 0
-                && self.num_kv_heads > 0
-                && self.head_dim > 0
-                && self.pipeline_depth > 0
-                && self.bytes_per_token > 0,
-            "worker capabilities declare invalid cache geometry"
+            self.pipeline_depth > 0,
+            "worker pipeline depth must be positive"
         );
-        if !self.groups.is_empty() {
+        if self.uses_kv() {
+            anyhow::ensure!(
+                self.block_size > 0
+                    && self.num_blocks > 0
+                    && self.num_layers > 0
+                    && self.num_kv_heads > 0
+                    && self.head_dim > 0
+                    && self.bytes_per_token > 0
+                    && !self.groups.is_empty()
+                    && !self.kv_dtype.is_empty(),
+                "worker capabilities declare incomplete KV geometry"
+            );
             let mut next_offset = 0u64;
             for (index, group) in self.groups.iter().enumerate() {
                 anyhow::ensure!(
@@ -2255,6 +2392,18 @@ impl WorkerCapabilities {
             anyhow::ensure!(
                 next_offset == u64::from(self.num_blocks),
                 "worker KV groups do not cover the physical request page pool"
+            );
+        } else {
+            anyhow::ensure!(
+                self.block_size == 0
+                    && self.num_blocks == 0
+                    && self.num_layers == 0
+                    && self.num_kv_heads == 0
+                    && self.head_dim == 0
+                    && self.bytes_per_token == 0
+                    && self.groups.is_empty()
+                    && self.kv_dtype.is_empty(),
+                "KV-free worker capabilities must carry zero KV geometry"
             );
         }
         let has_latent_geometry = self.latent_page_units > 0
@@ -2343,7 +2492,12 @@ impl Default for WorkerCapabilities {
             gen_rope_advance: 2,
             max_cfg_branches: 3,
             bytes_per_token: 57_344,
-            groups: Vec::new(),
+            groups: vec![KvCacheGroupSpec {
+                group_id: 0,
+                block_offset: 0,
+                num_blocks: 4096,
+                kind: Default::default(),
+            }],
             kv_dtype: "bfloat16".into(),
             model_dtype: "bfloat16".into(),
             attention_backend: "flashinfer".into(),
@@ -2399,7 +2553,7 @@ pub fn protocol_layout_digest() -> Digest {
         digest.string(control);
     }
     // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 16] = [
+    let record_layouts: [&[&str]; 18] = [
         &[
             "request_key",
             "op_id",
@@ -2450,12 +2604,14 @@ pub fn protocol_layout_digest() -> Digest {
             "finish_token_ids",
             "initial_position",
         ],
+        &["prompt", "seed", "profile", "output_path"],
         &[
             "request_key",
             "request_pool_idx",
             "digest",
             "und",
             "gen_admission",
+            "media",
         ],
         &[
             "request_pool_idx",
@@ -2487,6 +2643,7 @@ pub fn protocol_layout_digest() -> Digest {
             "start_step",
             "step_count",
         ],
+        &["request_key", "op_id", "kind", "start_unit", "unit_count"],
         &[
             "partition_id",
             "submission_group",
@@ -2501,6 +2658,7 @@ pub fn protocol_layout_digest() -> Digest {
             "new_cache_pages",
             "forward_rows",
             "latent_placements",
+            "decode_placements",
         ],
         &[
             "block_size",

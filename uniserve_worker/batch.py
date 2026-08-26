@@ -60,6 +60,16 @@ class TransferMode(StrEnum):
 class GenMode(StrEnum):
     TRANSITION = "transition"
     FLOW = "flow"
+    DECODE = "decode"
+
+
+class DecodeKind(StrEnum):
+    VIDEO = "video"
+    AUDIO = "audio"
+
+
+class MediaProfileId(StrEnum):
+    MINIMAX_H3_T2VA = "minimax_h3_t2va"
 
 
 class WorkVariant(StrEnum):
@@ -75,6 +85,7 @@ class WorkVariant(StrEnum):
     GEN_TRANSITION = "gen_transition"
     GEN_FLOW = "gen_flow"
     MATERIALIZE = "materialize"
+    GEN_DECODE = "gen_decode"
 
 
 class Domain(StrEnum):
@@ -96,6 +107,7 @@ _DOMAIN_BY_WORK_VARIANT = {
     WorkVariant.GEN_TRANSITION: Domain.FLOW,
     WorkVariant.GEN_FLOW: Domain.FLOW,
     WorkVariant.MATERIALIZE: Domain.FLOW,
+    WorkVariant.GEN_DECODE: Domain.FLOW,
 }
 
 
@@ -143,7 +155,7 @@ class StorageClass(StrEnum):
     PAGED_KV = "paged_kv"
     LATENT_ARENA = "latent_arena"
     HOST_STAGING = "host_staging"
-    COMPLETION_ARENA = "completion_arena"
+    PINNED_OUTPUT = "pinned_output"
 
 
 class DType(StrEnum):
@@ -205,8 +217,9 @@ _WORK_VARIANTS: tuple[tuple[str, str | None], ...] = (
     ("gen", "transition"),
     ("gen", "flow"),
     ("materialize", None),
+    ("gen", "decode"),
 )
-_STATE_ADVANCING_WORK = frozenset({0, 1, 2, 9, 10})
+_STATE_ADVANCING_WORK = frozenset({0, 1, 2, 9, 10, 12})
 
 # Canonical variant-index tables. Digest byte layouts index enum members by
 # declaration order (mirroring the Rust codec); precomputing the tables keeps
@@ -245,6 +258,7 @@ def native_partition(
     new_cache_pages: tuple[CachePageAllocation, ...],
     forward_rows: tuple[ForwardRow, ...],
     latent_placements: Sequence[object],
+    decode_placements: Sequence[object],
 ) -> BatchPartition:
     """Assemble a partition from transport-constructed members.
 
@@ -273,6 +287,14 @@ def native_partition(
         tuple(
             LatentPlacement.from_wire(item, f"partition.latent_placements[{index}]")
             for index, item in enumerate(latent_placements)
+        ),
+    )
+    set_field(
+        partition,
+        "decode_placements",
+        tuple(
+            DecodePlacement.from_wire(item, f"partition.decode_placements[{index}]")
+            for index, item in enumerate(decode_placements)
         ),
     )
     return partition
@@ -446,7 +468,8 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
     ),
     ("version", "digest", "locator"),
     ("sampling", "negative_token_ids", "finish_token_ids", "initial_position"),
-    ("request_key", "request_pool_idx", "digest", "und", "gen_admission"),
+    ("prompt", "seed", "profile", "output_path"),
+    ("request_key", "request_pool_idx", "digest", "und", "gen_admission", "media"),
     (
         "request_pool_idx",
         "group_id",
@@ -467,6 +490,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "start_step",
         "step_count",
     ),
+    ("request_key", "op_id", "kind", "start_unit", "unit_count"),
     (
         "partition_id",
         "submission_group",
@@ -481,6 +505,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
         "new_cache_pages",
         "forward_rows",
         "latent_placements",
+        "decode_placements",
     ),
     (
         "block_size",
@@ -1304,7 +1329,7 @@ class Operation:
                     "a latent-arena output exceeds the operation latent-byte bound"
                 )
             if (
-                product.storage_class in (StorageClass.HOST_STAGING, StorageClass.COMPLETION_ARENA)
+                product.storage_class in (StorageClass.HOST_STAGING, StorageClass.PINNED_OUTPUT)
                 and product.max_bytes > self.bounds.max_completion_bytes
             ):
                 raise invalid_descriptor(
@@ -1933,18 +1958,54 @@ class GenAdmission:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaAdmission:
+    prompt: str
+    seed: int
+    profile: MediaProfileId
+    output_path: str
+
+    def __post_init__(self) -> None:
+        if not self.prompt:
+            raise invalid_descriptor("media admission prompt must not be empty")
+        _nonnegative(self.seed, "media admission seed")
+        if not self.output_path:
+            raise invalid_descriptor("media admission output path must not be empty")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "media admission") -> MediaAdmission:
+        data = _map(value, where)
+        return cls(
+            prompt=_str(data.get("prompt"), f"{where}.prompt"),
+            seed=_uint(data.get("seed"), f"{where}.seed"),
+            profile=_enum(MediaProfileId, data.get("profile"), f"{where}.profile"),
+            output_path=_str(data.get("output_path"), f"{where}.output_path"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "prompt": self.prompt,
+            "seed": self.seed,
+            "profile": self.profile.value,
+            "output_path": self.output_path,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Admission:
     request_key: RequestKey
     request_pool_idx: int
     digest: str
     und: UndAdmission | None
     gen_admission: GenAdmission | None
+    media: MediaAdmission | None = None
 
     def __post_init__(self) -> None:
         if self.request_pool_idx < 1:
             raise invalid_descriptor("request-pool index must be positive")
-        if self.und is None and self.gen_admission is None:
-            raise invalid_descriptor("admission must declare an understanding or generation branch")
+        if self.und is None and self.gen_admission is None and self.media is None:
+            raise invalid_descriptor(
+                "admission must declare an understanding, generation, or media branch"
+            )
 
     @classmethod
     def create(
@@ -1954,8 +2015,9 @@ class Admission:
         request_pool_idx: int,
         und: UndAdmission | None = None,
         gen_admission: GenAdmission | None = None,
+        media: MediaAdmission | None = None,
     ) -> Admission:
-        value = cls(request_key, request_pool_idx, "", und, gen_admission)
+        value = cls(request_key, request_pool_idx, "", und, gen_admission, media)
         return replace(value, digest=value.payload_digest())
 
     @classmethod
@@ -1975,6 +2037,11 @@ class Admission:
                 if data.get("gen_admission") is None
                 else GenAdmission.from_wire(data["gen_admission"], f"{where}.gen_admission")
             ),
+            media=(
+                None
+                if data.get("media") is None
+                else MediaAdmission.from_wire(data["media"], f"{where}.media")
+            ),
         )
         admission.validate()
         return admission
@@ -1992,6 +2059,15 @@ class Admission:
         _digest_request_key(digest, self.request_key)
         digest.option(self.und, lambda value: _digest_und_admission(digest, value))
         digest.option(self.gen_admission, lambda value: _digest_image(digest, value.image))
+        digest.option(
+            self.media,
+            lambda value: (
+                digest.string(value.prompt),
+                digest.u64(value.seed),
+                digest.u8(tuple(MediaProfileId).index(value.profile)),
+                digest.string(value.output_path),
+            ),
+        )
         return digest.finish()
 
     def to_wire(self) -> dict[str, object]:
@@ -2001,6 +2077,7 @@ class Admission:
             "digest": self.digest,
             "und": None if self.und is None else self.und.to_wire(),
             "gen_admission": None if self.gen_admission is None else self.gen_admission.to_wire(),
+            "media": None if self.media is None else self.media.to_wire(),
         }
 
 
@@ -2288,6 +2365,40 @@ class LatentPlacement:
 
 
 @dataclass(frozen=True, slots=True)
+class DecodePlacement:
+    request_key: RequestKey
+    op_id: int
+    kind: DecodeKind
+    start_unit: int
+    unit_count: int
+
+    def __post_init__(self) -> None:
+        if self.op_id < 1 or self.unit_count < 1:
+            raise invalid_descriptor("decode placement identity and unit count must be positive")
+        _nonnegative(self.start_unit, "decode placement start unit")
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "decode placement") -> DecodePlacement:
+        data = _map(value, where)
+        return cls(
+            request_key=RequestKey.from_wire(data.get("request_key"), f"{where}.request_key"),
+            op_id=_uint(data.get("op_id"), f"{where}.op_id"),
+            kind=_enum(DecodeKind, data.get("kind"), f"{where}.kind"),
+            start_unit=_uint(data.get("start_unit"), f"{where}.start_unit"),
+            unit_count=_uint(data.get("unit_count"), f"{where}.unit_count"),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "request_key": self.request_key.to_wire(),
+            "op_id": self.op_id,
+            "kind": self.kind.value,
+            "start_unit": self.start_unit,
+            "unit_count": self.unit_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class BatchPartition:
     partition_id: int
     submission_group: int
@@ -2302,6 +2413,7 @@ class BatchPartition:
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
     forward_rows: tuple[ForwardRow, ...] = ()
     latent_placements: tuple[LatentPlacement, ...] = ()
+    decode_placements: tuple[DecodePlacement, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -2376,6 +2488,23 @@ class BatchPartition:
             raise invalid_descriptor(
                 "operation that addresses a trajectory has no latent placement"
             )
+        decode_ids: set[tuple[RequestKey, int]] = set()
+        for placement in self.decode_placements:
+            identity = (placement.request_key, placement.op_id)
+            if identity in decode_ids:
+                raise invalid_descriptor("batch partition repeats a decode placement identity")
+            decode_ids.add(identity)
+            operation = operations.get(identity)
+            if operation is None or operation.work.variant is not WorkVariant.GEN_DECODE:
+                raise invalid_descriptor(
+                    "decode placement does not name a GenDecode partition operation"
+                )
+        if any(
+            operation.work.variant is WorkVariant.GEN_DECODE
+            and (operation.request_key, operation.op_id) not in decode_ids
+            for operation in self.operations
+        ):
+            raise invalid_descriptor("GenDecode operation has no decode placement")
 
     @classmethod
     def from_wire(
@@ -2437,6 +2566,12 @@ class BatchPartition:
                     _seq(data.get("latent_placements", ()), f"{where}.latent_placements")
                 )
             ),
+            decode_placements=tuple(
+                DecodePlacement.from_wire(item, f"{where}.decode_placements[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("decode_placements", ()), f"{where}.decode_placements")
+                )
+            ),
         )
         if _validated_wire:
             partition = object.__new__(cls)
@@ -2460,6 +2595,7 @@ class BatchPartition:
             "new_cache_pages": [allocation.to_wire() for allocation in self.new_cache_pages],
             "forward_rows": [row.to_wire() for row in self.forward_rows],
             "latent_placements": [placement.to_wire() for placement in self.latent_placements],
+            "decode_placements": [placement.to_wire() for placement in self.decode_placements],
         }
 
 

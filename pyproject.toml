@@ -23,6 +23,8 @@ dependencies = [
     "tqdm",
     "sentencepiece",
     "huggingface_hub",
+    "diffusers>=0.36",
+    "av>=14",
 ]
 
 [project.optional-dependencies]

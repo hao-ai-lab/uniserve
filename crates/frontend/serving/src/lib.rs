@@ -34,7 +34,9 @@ use tokio::sync::{Notify, mpsc};
 use uniserve_engine_gateway::transport::{
     GenEvent, GenerationEventStream, GenerationFinishReason, StreamCancelCause,
 };
-use uniserve_engine_gateway::{EngineGateway, GenerationSubmission};
+use uniserve_engine_gateway::{
+    EngineGateway, GenerationSubmission, MediaEventStream, MediaSubmission,
+};
 pub use uniserve_engine_gateway::{PublicCommit, PublicModality, SemanticRoot};
 
 pub use input::{
@@ -215,6 +217,14 @@ pub struct ServingRuntime {
     requests: Arc<RuntimeRequestRegistry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoGenerationInput {
+    pub request_id: ServeRequestId,
+    pub prompt: String,
+    pub seed: u64,
+    pub output_path: String,
+}
+
 impl ServingRuntime {
     pub fn new(model: ResolvedModel, gateway: EngineGateway) -> Self {
         Self {
@@ -236,8 +246,38 @@ impl ServingRuntime {
         self.model.served_model_name()
     }
 
-    pub fn tokenizer(&self) -> crate::text::tokenizer::DynTokenizer {
+    pub fn tokenizer(&self) -> Option<crate::text::tokenizer::DynTokenizer> {
         self.model.tokenizer()
+    }
+
+    pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<MediaEventStream> {
+        if !self
+            .model
+            .served_capabilities()
+            .endpoints
+            .contains(&ServedEndpoint::VideoGenerations)
+        {
+            return Err(ServeError::UnsupportedCapability {
+                request_id: request.request_id,
+                capability: "video_generation",
+            });
+        }
+        if request.prompt.trim().is_empty() {
+            return Err(ServeError::Tokenize {
+                request_id: request.request_id,
+                message: "video prompt must not be empty".to_string(),
+            });
+        }
+        let submission = MediaSubmission::new(
+            request.request_id.to_string(),
+            request.prompt,
+            request.seed,
+            request.output_path,
+        );
+        self.gateway
+            .submit_media(submission)
+            .await
+            .map_err(|error| ServeError::Engine(error.to_string()))
     }
 
     pub fn runtime_id(&self) -> u64 {
@@ -355,13 +395,20 @@ impl ServingRuntime {
         let mut gateway_submission = GenerationSubmission::new(request_id.to_string(), request);
         gateway_submission.trace_headers = submission.trace_headers;
 
+        let tokenizer =
+            self.model
+                .tokenizer()
+                .ok_or_else(|| ServeError::UnsupportedCapability {
+                    request_id: request_id.clone(),
+                    capability: "text_generation",
+                })?;
         let stream_result: Result<ServeEventStream> =
             match self.gateway.submit_generation(gateway_submission).await {
                 Ok(stream) => Ok(Box::pin(assemble_event_stream(
                     request_id.clone(),
                     event_context,
                     prompt_token_ids,
-                    self.model.tokenizer(),
+                    tokenizer,
                     prompt_logprobs_requested,
                     generated_logprobs_requested,
                     emit_token_ids,
@@ -2242,6 +2289,14 @@ async fn assemble_event_stream(
                 })
                 .await;
                 return Ok(());
+            }
+            GenEvent::MediaCompleted { .. }
+            | GenEvent::MediaFailed { .. }
+            | GenEvent::MediaAborted => {
+                return Err(ServeError::OutputProcessing {
+                    request_id,
+                    message: "generation request received a media lifecycle event".to_string(),
+                });
             }
         }
     }

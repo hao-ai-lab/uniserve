@@ -696,6 +696,7 @@ impl SimEngine {
                 // advanced through every scheduled step.
                 record.finish_flags.length = session.flow_step >= total;
             }
+            Work::Gen(GenMode::Decode) => {}
             Work::Materialize => {
                 session.flow_step = 0;
                 if let Some(image) = session.image().cloned() {

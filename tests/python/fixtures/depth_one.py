@@ -855,7 +855,7 @@ def materialize_operation(
             output_index=0,
             generation=op_id * 3,
             kind=ProductKind.ARTIFACT,
-            storage_class=StorageClass.COMPLETION_ARENA,
+            storage_class=StorageClass.PINNED_OUTPUT,
             dtype=DType.U8,
             shape_bound=ShapeBound((DeviceDim(65_536),)),
             point_range=PointRange(),

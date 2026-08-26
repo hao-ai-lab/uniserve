@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         model_name: "stub-model".into(),
         client_index: 0,
         generation_controls: None,
+        media_spool: None,
     })
     .await?;
     println!("connected; submitting a request the worker will die under...");

@@ -14,7 +14,8 @@ def run_worker(config: WorkerLaunchConfig) -> None:
 
     from ..server.app import WorkerServer
     from ..server.ipc import WorkerIpcEndpoint
-    from ..worker import Worker
+    from ..worker import MediaWorker, Worker
+    from ..worker.media_worker import is_h3_checkpoint
 
     endpoint = WorkerIpcEndpoint(
         config.ipc.service_name,
@@ -30,7 +31,12 @@ def run_worker(config: WorkerLaunchConfig) -> None:
             "worker_kind": config.worker_kind.value,
         },
     )
-    worker = Worker.from_config(config)
+    model_path = "" if config.model is None else config.model.path
+    worker = (
+        MediaWorker.from_config(config)
+        if model_path and is_h3_checkpoint(model_path)
+        else Worker.from_config(config)
+    )
     # Admission begins only after the configured first-use kernel work succeeds
     # and the worker opens a clean serving collective epoch.
     worker.warmup()

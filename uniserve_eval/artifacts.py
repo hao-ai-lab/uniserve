@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .transport.images import inspect_image_bytes
-from .types import DecodedImage
+from .transport.video import inspect_video_bytes
+from .types import DecodedImage, DecodedVideo
 
 
 class ArtifactWriter:
@@ -85,6 +86,34 @@ class ArtifactWriter:
             ) as handle:
                 temporary_path = Path(handle.name)
                 handle.write(image.data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return path
+
+    def write_video_sample(self, video: DecodedVideo) -> Path:
+        inspected = inspect_video_bytes(video.data, declared_mime=video.mime)
+        if inspected.metadata_dict() != video.metadata_dict():
+            raise ValueError("generated video metadata does not match its response bytes")
+        path = self.samples_dir / video.sample_filename
+        if path.exists():
+            if path.read_bytes() != video.data:
+                raise ValueError("content-addressed video sample collision")
+            return path
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(video.data)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, path)

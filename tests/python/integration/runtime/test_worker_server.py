@@ -21,7 +21,6 @@ from uniserve_worker.batch import (
     TokenMode,
 )
 from uniserve_worker.server.app import WorkerServer
-from uniserve_worker.server.process import WorkerServeLoop
 
 pytestmark = pytest.mark.integration
 
@@ -84,7 +83,7 @@ def _by_call(endpoint: _Endpoint) -> dict[int, dict[str, object]]:
     }
 
 
-def test_inflight_join_and_completed_replay_return_one_terminal_report() -> None:
+def test_inflight_and_terminal_duplicates_return_one_terminal_report() -> None:
     _admission, _operation, _payload, batch = _token_batch(
         session_id=11,
         op_id=21,
@@ -101,7 +100,7 @@ def test_inflight_join_and_completed_replay_return_one_terminal_report() -> None
     )
     server = WorkerServer(execution_worker(pipeline_depth=2), endpoint)
 
-    WorkerServeLoop(server, endpoint).run()
+    server.serve()
 
     responses = _by_call(endpoint)
     first = responses[1]["completion_report"]
@@ -109,7 +108,7 @@ def test_inflight_join_and_completed_replay_return_one_terminal_report() -> None
     assert responses[3]["completion_report"] == first
 
 
-def test_conflicting_digest_and_mixed_registration_fail_before_new_admission() -> None:
+def test_conflicting_step_identity_fails_before_new_admission() -> None:
     admission, operation, payload, batch = _token_batch(
         session_id=12,
         op_id=31,
@@ -124,18 +123,18 @@ def test_conflicting_digest_and_mixed_registration_fail_before_new_admission() -
         tokens=(4, 5, 6),
     )
     conflicting_batch = execution_batch(
-        step_id=9,
+        step_id=8,
         operations=(conflicting,),
         input_products=(conflicting_payload,),
     )
     next_admission, next_operation, next_payload, _next_batch = _token_batch(
         session_id=13,
         op_id=32,
-        step_id=10,
+        step_id=8,
         tokens=(7,),
     )
     mixed_batch = execution_batch(
-        step_id=10,
+        step_id=8,
         admissions=(next_admission,),
         operations=(operation, next_operation),
         input_products=(payload, next_payload),
@@ -150,7 +149,7 @@ def test_conflicting_digest_and_mixed_registration_fail_before_new_admission() -
     )
     server = WorkerServer(execution_worker(pipeline_depth=3), endpoint)
 
-    WorkerServeLoop(server, endpoint).run()
+    server.serve()
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "result"
@@ -160,7 +159,7 @@ def test_conflicting_digest_and_mixed_registration_fail_before_new_admission() -
     assert responses[3]["code"] == "InvalidDescriptor"
 
 
-def test_completed_report_remains_replayable_after_later_execution() -> None:
+def test_completed_report_remains_retained_after_later_execution() -> None:
     _first_admission, first_operation, _first_payload, first_batch = _token_batch(
         session_id=5,
         op_id=41,
@@ -195,16 +194,16 @@ def test_completed_report_remains_replayable_after_later_execution() -> None:
             max_request_pool_size=8,
         ),
         endpoint,
-        replay_capacity=4,
+        step_cache_capacity=4,
     )
 
-    WorkerServeLoop(server, endpoint).run()
+    server.serve()
 
     responses = _by_call(endpoint)
     first = responses[1]["completion_report"]
-    replayed = responses[4]["completion_report"]
+    retained = responses[4]["completion_report"]
     assert responses[3]["kind"] == "result"
-    assert replayed == first
+    assert retained == first
 
 
 def test_prompt_launches_after_an_earlier_queued_same_session_control() -> None:
@@ -223,14 +222,14 @@ def test_prompt_launches_after_an_earlier_queued_same_session_control() -> None:
     )
     server = WorkerServer(execution_worker(pipeline_depth=2), endpoint)
 
-    WorkerServeLoop(server, endpoint).run()
+    server.serve()
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "ok"
     assert responses[2]["kind"] == "result"
 
 
-def test_atomic_replay_remains_available_until_every_participant_epoch_ends() -> None:
+def test_atomic_step_remains_available_until_every_participant_epoch_ends() -> None:
     first_admission, first_operation, first_payload, _first_batch = _token_batch(
         session_id=6,
         op_id=51,
@@ -266,7 +265,7 @@ def test_atomic_replay_remains_available_until_every_participant_epoch_ends() ->
         endpoint,
     )
 
-    WorkerServeLoop(server, endpoint).run()
+    server.serve()
 
     responses = _by_call(endpoint)
     assert responses[2]["kind"] == "ok"

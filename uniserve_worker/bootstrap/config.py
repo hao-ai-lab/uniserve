@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..loader.config import LoadConfig
 from ..server.worker_kind import WorkerKind
@@ -66,6 +67,7 @@ class WorkerLaunchConfig:
     load: LoadConfig
     use_stub_model: bool
     snapshot_dir: str | None
+    media_spool: str | None
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerLaunchConfig":
@@ -133,6 +135,7 @@ class WorkerLaunchConfig:
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
             snapshot_dir=_optional_text(namespace.snapshot_dir),
+            media_spool=_optional_absolute_path(namespace.media_spool, "--media-spool"),
         )
 
 
@@ -153,6 +156,16 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         raise ValueError("--kv-token-capacity must be positive when provided")
     if int(namespace.tp_rank) < 0 or int(namespace.tp_rank) >= int(namespace.tp_size):
         raise ValueError("--tp-rank must satisfy 0 <= rank < tp-size")
+
+
+def _optional_absolute_path(value: object, option: str) -> str | None:
+    text = _optional_text(value)
+    if text is None:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{option} must be an absolute path")
+    return str(path)
 
 
 def _load_config(namespace: argparse.Namespace) -> LoadConfig:

@@ -1702,7 +1702,7 @@ impl GenerationPlanner {
             .filter(|output| {
                 matches!(
                     output.storage_class,
-                    StorageClass::CompletionArena | StorageClass::HostStaging
+                    StorageClass::PinnedOutput | StorageClass::HostStaging
                 )
             })
             .map(product_bound_bytes)
@@ -1865,7 +1865,7 @@ fn materialize_outputs(
     let mut outputs = vec![bounded_product(
         0,
         ProductKind::Artifact,
-        StorageClass::CompletionArena,
+        StorageClass::PinnedOutput,
         DType::U8,
         dynamic_element_bound(public_bytes, DType::U8)?,
     )];
@@ -3171,11 +3171,7 @@ mod tests {
                 transition.outputs[0].storage_class,
                 transition.outputs[0].dtype,
             ),
-            (
-                ProductKind::Artifact,
-                StorageClass::CompletionArena,
-                DType::U8,
-            )
+            (ProductKind::Artifact, StorageClass::PinnedOutput, DType::U8,)
         );
         assert_eq!(
             (

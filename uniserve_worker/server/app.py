@@ -1,16 +1,23 @@
-"""Typed worker-protocol dispatch around one assembled execution worker."""
+"""Event-driven worker protocol serving with exact-once step execution."""
 
 from __future__ import annotations
 
+import gc
+import hashlib
 import logging
 import os
-from collections.abc import Mapping
-from typing import Any
+import struct
+import time
+from collections import deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from ..batch import (
     Batch,
     CacheCopy,
     CompletionReport,
+    PartitionCompletion,
     RecoveryPlacement,
     SnapshotRef,
 )
@@ -20,25 +27,54 @@ from ..foundation.errors import (
     WorkerError,
     classify,
     invalid_descriptor,
+    resource_error,
     should_capture_trace,
     unsupported_control,
 )
 from ..worker import Worker
-from .process import WorkerIpcTransport
+from .completion import (
+    CompletedStepCache,
+    StepOutputs,
+    _completion_payload_ready,
+    _record_ready,
+    finalize_completion_report,
+    partition_completion_ready,
+)
 from .profiler import WorkerProfiler, profile_range
-from .replay import CompletionDelivery, ReplayCoordinator
 
-__all__ = ["WorkerServer", "dispatch"]
+__all__ = [
+    "InflightStep",
+    "PendingRequest",
+    "PendingResponse",
+    "TerminalStep",
+    "WorkerIpcTransport",
+    "WorkerServer",
+    "batch_identity",
+    "dispatch",
+]
 
 logger = logging.getLogger(__name__)
 
+_OperationKey = tuple[int, int, int]
+_EpochKey = tuple[int, int]
+
+
+class WorkerIpcTransport(Protocol):
+    def recv(self) -> dict[str, Any]: ...
+
+    def try_recv(self) -> dict[str, Any] | None: ...
+
+    def respond(self, response: dict[str, Any]) -> None: ...
+
+    def wait_incoming(self, timeout_us: int) -> None: ...
+
+    def wake(self) -> None: ...
+
+    def wake_on_stream(self, stream: int) -> None: ...
+
 
 class _PendingExecution:
-    def __init__(
-        self,
-        worker: Worker,
-        prepared: object,
-    ) -> None:
+    def __init__(self, worker: Worker, prepared: object) -> None:
         self.worker = worker
         self.prepared = prepared
 
@@ -60,18 +96,7 @@ class _PendingExecution:
         return result
 
     def record_failure(self, error: BaseException) -> WorkerError:
-        classified = classify(error, context="execute")
-        include_trace = should_capture_trace(str(classified.code))
-        log = logger.exception if include_trace else logger.warning
-        log(
-            "deferred worker execution failed: %s [code=%s session_id=%s op_id=%s operation=%s]",
-            classified.message,
-            classified.code,
-            classified.req_id,
-            classified.op_id,
-            classified.op_kind,
-        )
-        return classified
+        return classify(error, context="execute")
 
 
 def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
@@ -139,134 +164,458 @@ def _request_kind(request: Mapping[str, Any]) -> RequestKind:
         raise invalid_descriptor(f"unknown worker request kind {raw!r}") from None
 
 
-def _execute(
-    worker: Worker,
-    request: Mapping[str, Any],
-    replay: ReplayCoordinator,
-) -> dict[str, Any]:
-    raw_batch = _required(request, "batch", RequestKind.EXECUTE)
-    with profile_range("uniserve.worker.batch_wire"):
-        batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_wire(raw_batch)
-    supported = frozenset(worker.capabilities.supported_work)
-    unsupported = tuple(
-        operation.work.variant
-        for operation in batch.operations
-        if operation.work.variant not in supported
-    )
-    if unsupported:
-        names = sorted({value.value for value in unsupported})
-        raise invalid_descriptor(
-            f"execution batch contains work variants outside worker capabilities: {names!r}"
-        )
-    if not batch.operations:
-        result = worker.execute(batch)
-        return _response(ResponseKind.RESULT, completion_report=result)
-    with profile_range("uniserve.worker.replay_register"):
-        registration = replay.register(batch)
-    if not registration.execute:
-        return _response(
-            ResponseKind.RESULT,
-            completion_report=registration.delivery,
-        )
-    try:
-        prepare = getattr(worker, "prepare_execute", None)
-        prepared = prepare(batch) if callable(prepare) else None
-        if prepared is not None:
-            source: object = _PendingExecution(
-                worker,
-                prepared,
-            )
+def _canonical_bytes(value: object) -> bytes:
+    encoded = bytearray()
+
+    def write(item: object) -> None:
+        if item is None:
+            encoded.extend(b"n")
+        elif type(item) is bool:
+            encoded.extend(b"t" if item else b"f")
+        elif type(item) is int:
+            raw = str(item).encode("ascii")
+            encoded.extend(b"i")
+            encoded.extend(struct.pack("<I", len(raw)))
+            encoded.extend(raw)
+        elif type(item) is float:
+            encoded.extend(b"d")
+            encoded.extend(struct.pack("<d", item))
+        elif type(item) is str:
+            raw = item.encode("utf-8")
+            encoded.extend(b"s")
+            encoded.extend(struct.pack("<I", len(raw)))
+            encoded.extend(raw)
+        elif type(item) is bytes:
+            encoded.extend(b"b")
+            encoded.extend(struct.pack("<Q", len(item)))
+            encoded.extend(item)
+        elif isinstance(item, Mapping):
+            encoded.extend(b"m")
+            pairs = sorted(item.items(), key=lambda pair: str(pair[0]))
+            encoded.extend(struct.pack("<I", len(pairs)))
+            for key, child in pairs:
+                if not isinstance(key, str):
+                    raise invalid_descriptor("canonical batch mapping keys must be strings")
+                write(key)
+                write(child)
+        elif isinstance(item, Sequence):
+            encoded.extend(b"q")
+            encoded.extend(struct.pack("<I", len(item)))
+            for child in item:
+                write(child)
         else:
-            with profile_range("uniserve.worker.model_execute"):
-                source = worker.execute(batch)
-        replay.attach(registration, source)
-    except BaseException as error:
-        replay.abort(registration, error)
-        raise
-    return _response(
-        ResponseKind.RESULT,
-        completion_report=registration.delivery,
+            raise invalid_descriptor(
+                f"canonical batch identity cannot encode {type(item).__name__}"
+            )
+
+    write(value)
+    return bytes(encoded)
+
+
+def batch_identity(batch: Batch) -> str:
+    """Stable digest of the complete execution meaning of one batch."""
+
+    digest = hashlib.sha256()
+    digest.update(b"uniserve-worker-step\0")
+    digest.update(_canonical_bytes(batch.to_wire()))
+    return digest.hexdigest()
+
+
+def _operation_key(operation: object) -> _OperationKey:
+    request = getattr(operation, "request_key")
+    return (
+        int(request.session_id),
+        int(request.epoch),
+        int(getattr(operation, "op_id")),
     )
 
 
-def _response_ready(response: dict[str, Any]) -> bool:
-    """Whether a response can be serialized without stalling on a deferred token.
-
-    A completion report's committed tokens and semantic digest are read only
-    after its pinned copy events report ready. A response polled before that
-    stays pending rather than blocking the transport thread.
-    """
-
-    result = response.get("completion_report")
-    if isinstance(result, CompletionDelivery):
-        try:
-            return result.ready()
-        except BaseException as error:
-            _record_delivery_failure(response, result, error)
-            return True
-    if isinstance(result, CompletionReport):
-        return True
-    return True
+def _batch_lineage(batch: Batch) -> tuple[frozenset[int], frozenset[_EpochKey]]:
+    request_keys = tuple(
+        (
+            *(admission.request_key for admission in batch.admissions),
+            *(operation.request_key for operation in batch.operations),
+            *(control.request_key for control in batch.controls),
+        )
+    )
+    epochs = frozenset(
+        (int(request.session_id), int(request.epoch)) for request in request_keys
+    )
+    return frozenset(session_id for session_id, _epoch in epochs), epochs
 
 
-def _response_execution_complete(response: dict[str, Any]) -> bool:
-    """Advance a response source until its request-state publication point."""
+def _raw_request_sessions(request: Mapping[str, Any]) -> frozenset[int]:
+    sessions: set[int] = set()
+    direct = request.get("session_id")
+    if isinstance(direct, int) and not isinstance(direct, bool):
+        sessions.add(int(direct))
+    batch = request.get("batch")
+    if isinstance(batch, Batch):
+        return _batch_lineage(batch)[0] | sessions
+    if not isinstance(batch, Mapping):
+        return frozenset(sessions)
+    groups: list[object] = [
+        batch.get("admissions", ()),
+        batch.get("controls", ()),
+    ]
+    partitions = batch.get("partitions", ())
+    if isinstance(partitions, Sequence):
+        groups.extend(
+            partition.get("operations", ())
+            for partition in partitions
+            if isinstance(partition, Mapping)
+        )
+    for group in groups:
+        if not isinstance(group, Sequence):
+            continue
+        for item in group:
+            if not isinstance(item, Mapping):
+                continue
+            value = item.get("value", item)
+            if not isinstance(value, Mapping):
+                continue
+            key = value.get("request_key")
+            session_id = key.get("session_id") if isinstance(key, Mapping) else None
+            if isinstance(session_id, int) and not isinstance(session_id, bool):
+                sessions.add(int(session_id))
+    return frozenset(sessions)
 
-    if response.get("kind") == ResponseKind.ERROR.value:
-        return False
-    result = response.get("completion_report")
-    if not isinstance(result, CompletionDelivery):
-        return True
-    try:
-        return result.execution_complete()
-    except BaseException as error:
-        _record_delivery_failure(response, result, error)
-        return False
+
+def _report_partition_order(batch: Batch) -> tuple[int, ...]:
+    return tuple(int(partition.partition_id) for partition in batch.partitions)
 
 
-def _record_delivery_failure(
-    response: dict[str, Any],
-    result: CompletionDelivery,
-    error: BaseException,
+def _report_operation_keys(batch: Batch) -> tuple[tuple[_OperationKey, ...], ...]:
+    return tuple(
+        tuple(_operation_key(operation) for operation in partition.operations)
+        for partition in batch.partitions
+    )
+
+
+def _validate_report_shape(
+    report: CompletionReport,
+    *,
+    step_id: int,
+    partition_order: tuple[int, ...],
+    partition_operation_keys: tuple[tuple[_OperationKey, ...], ...],
 ) -> None:
-    source = result.source
-    classified = (
-        source.record_failure(error)
-        if isinstance(source, _PendingExecution)
-        else classify(error, context="completion materialization")
+    if int(report.step_id) != int(step_id):
+        raise invalid_descriptor("terminal report step identity does not match its submission")
+    actual_order = tuple(int(partition.partition_id) for partition in report.partitions)
+    if actual_order != partition_order:
+        raise invalid_descriptor("terminal report partition identity does not match its submission")
+    for partition, expected_keys in zip(
+        report.partitions,
+        partition_operation_keys,
+        strict=True,
+    ):
+        actual_keys = tuple(
+            (
+                int(record.request_key.session_id),
+                int(record.request_key.epoch),
+                int(record.op_id),
+            )
+            for record in partition.completions
+        )
+        if actual_keys != expected_keys:
+            raise invalid_descriptor("terminal report operations do not align with their partition")
+        expected = set(expected_keys)
+        for product in partition.products:
+            reference = product.product
+            key = (
+                int(reference.request_key.session_id),
+                int(reference.request_key.epoch),
+                int(reference.producer_op_id),
+            )
+            if key not in expected:
+                raise invalid_descriptor(
+                    "terminal product does not belong to its completion partition"
+                )
+
+
+def _materialize_partition(step_id: int, partition: PartitionCompletion) -> PartitionCompletion:
+    if not partition_completion_ready(partition):
+        raise RuntimeError("completion partition was materialized before query readiness")
+    report = finalize_completion_report(
+        CompletionReport(step_id=int(step_id), partitions=(partition,))
     )
-    fields = classified.to_wire()
-    fields.pop("kind", None)
-    call_id = response.get("call_id")
-    response.clear()
-    response.update(_response(ResponseKind.ERROR, **fields))
-    response["call_id"] = call_id
+    if len(report.partitions) != 1:
+        raise RuntimeError("completion materialization changed partition cardinality")
+    materialized = report.partitions[0]
+    if any(type(record.semantic_digest) is not str for record in materialized.completions):
+        raise RuntimeError("materialized completion carries an unresolved semantic digest")
+    if any(
+        type(token) is not int
+        for record in materialized.completions
+        for token in record.committed_tokens
+    ):
+        raise RuntimeError("materialized completion carries an unresolved committed token")
+    if any(type(product.payload) is not bytes for product in materialized.products):
+        raise RuntimeError("materialized completion contains a non-byte product payload")
+    return materialized
+
+
+@dataclass(slots=True)
+class TerminalStep:
+    step_id: int
+    identity: str
+    session_ids: frozenset[int]
+    epochs: frozenset[_EpochKey]
+    partition_order: tuple[int, ...]
+    weight: int
+    report: CompletionReport | None
+    error: WorkerError | None
+    partial_partitions: tuple[PartitionCompletion, ...]
+    active_cursors: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return True
+
+    @property
+    def source(self) -> None:
+        return None
+
+    def current(self) -> TerminalStep:
+        return self
+
+    def advance_execution(self) -> bool:
+        return True
+
+    def advance_materialization(self) -> None:
+        return None
+
+    def materialized_partitions(self) -> tuple[PartitionCompletion, ...]:
+        if self.report is not None:
+            return self.report.partitions
+        return self.partial_partitions
+
+
+class InflightStep:
+    """One exact-once execution source and its host materialization progress."""
+
+    def __init__(
+        self,
+        batch: Batch,
+        identity: str,
+        *,
+        on_terminal: Any,
+    ) -> None:
+        sessions, epochs = _batch_lineage(batch)
+        self.step_id = int(batch.step_id)
+        self.identity = identity
+        self.session_ids = sessions
+        self.epochs = epochs
+        self.partition_order = _report_partition_order(batch)
+        self.partition_operation_keys = _report_operation_keys(batch)
+        self.weight = max(1, len(batch.operations))
+        self.active_cursors = 0
+        self.state = "QUEUED"
+        self.error: WorkerError | None = None
+        self.source: object | None = None
+        self._raw_report: CompletionReport | None = None
+        self._materialized: dict[int, PartitionCompletion] = {}
+        self._ready_cursor: dict[int, tuple[int, int]] = {}
+        self._terminal: TerminalStep | None = None
+        self._on_terminal = on_terminal
+
+    @property
+    def complete(self) -> bool:
+        return self._terminal is not None
+
+    def current(self) -> InflightStep | TerminalStep:
+        return self if self._terminal is None else self._terminal
+
+    def attach(self, source: object) -> None:
+        if self.source is not None or self._terminal is not None:
+            raise RuntimeError("execution step already has an execution source")
+        if not isinstance(source, CompletionReport):
+            ready = getattr(source, "ready", None)
+            resolve = getattr(source, "resolve", None)
+            if not callable(ready) or not callable(resolve):
+                raise invalid_descriptor(
+                    "in-flight execution source has no readiness and resolution contract"
+                )
+        self.source = source
+        self.state = "RUNNING"
+
+    def fail(self, error: BaseException, *, context: str = "execute") -> TerminalStep:
+        if self._terminal is not None:
+            return self._terminal
+        source = self.source
+        classified = (
+            error
+            if isinstance(error, WorkerError)
+            else source.record_failure(error)
+            if isinstance(source, _PendingExecution)
+            else classify(error, context=context)
+        )
+        return self._terminalize(error=classified)
+
+    def advance_execution(self) -> bool:
+        if self._terminal is not None:
+            return True
+        if self._raw_report is not None:
+            return True
+        source = self.source
+        if source is None:
+            return False
+        try:
+            if isinstance(source, CompletionReport):
+                report = source
+            else:
+                if not bool(getattr(source, "ready")()):
+                    return False
+                report = getattr(source, "resolve")()
+                if not isinstance(report, CompletionReport):
+                    raise RuntimeError(
+                        "in-flight execution resolved to an invalid completion report"
+                    )
+            _validate_report_shape(
+                report,
+                step_id=self.step_id,
+                partition_order=self.partition_order,
+                partition_operation_keys=self.partition_operation_keys,
+            )
+            self._raw_report = report
+            self.source = None
+            self.state = "MATERIALIZING"
+            return True
+        except BaseException as error:
+            self.fail(error, context="execute")
+            return True
+
+    def advance_materialization(self) -> None:
+        if self._terminal is not None or not self.advance_execution():
+            return
+        report = self._raw_report
+        if report is None:
+            return
+        try:
+            for partition in report.partitions:
+                partition_id = int(partition.partition_id)
+                if partition_id in self._materialized:
+                    continue
+                if self._partition_ready(partition_id, partition):
+                    self._materialized[partition_id] = _materialize_partition(
+                        self.step_id,
+                        partition,
+                    )
+            if len(self._materialized) != len(self.partition_order):
+                return
+            ordered = tuple(
+                self._materialized[partition_id] for partition_id in self.partition_order
+            )
+            host_report = CompletionReport(step_id=self.step_id, partitions=ordered)
+            _validate_report_shape(
+                host_report,
+                step_id=self.step_id,
+                partition_order=self.partition_order,
+                partition_operation_keys=self.partition_operation_keys,
+            )
+            self._terminalize(report=host_report)
+        except BaseException as error:
+            self.fail(error, context="completion materialization")
+
+    def _partition_ready(
+        self,
+        partition_id: int,
+        partition: PartitionCompletion,
+    ) -> bool:
+        record_cursor, product_cursor = self._ready_cursor.get(partition_id, (0, 0))
+        while (
+            record_cursor < len(partition.completions)
+            and _record_ready(partition.completions[record_cursor])
+        ):
+            record_cursor += 1
+        while (
+            product_cursor < len(partition.products)
+            and _completion_payload_ready(partition.products[product_cursor].payload)
+        ):
+            product_cursor += 1
+        self._ready_cursor[partition_id] = (record_cursor, product_cursor)
+        return (
+            record_cursor == len(partition.completions)
+            and product_cursor == len(partition.products)
+        )
+
+    def materialized_partitions(self) -> tuple[PartitionCompletion, ...]:
+        if self._terminal is not None:
+            return self._terminal.materialized_partitions()
+        return tuple(
+            self._materialized[partition_id]
+            for partition_id in self.partition_order
+            if partition_id in self._materialized
+        )
+
+    def _terminalize(
+        self,
+        *,
+        report: CompletionReport | None = None,
+        error: WorkerError | None = None,
+    ) -> TerminalStep:
+        if self._terminal is not None:
+            return self._terminal
+        partial = tuple(
+            self._materialized[partition_id]
+            for partition_id in self.partition_order
+            if partition_id in self._materialized
+        )
+        terminal = TerminalStep(
+            step_id=self.step_id,
+            identity=self.identity,
+            session_ids=self.session_ids,
+            epochs=self.epochs,
+            partition_order=self.partition_order,
+            weight=self.weight,
+            report=report,
+            error=error,
+            partial_partitions=partial,
+            active_cursors=self.active_cursors,
+        )
+        self.error = error
+        self._raw_report = None
+        self.source = None
+        self.state = "TERMINAL"
+        self._terminal = terminal
+        self._on_terminal(self, terminal)
+        return terminal
+
+
+@dataclass(slots=True)
+class PendingRequest:
+    sequence: int
+    request: dict[str, Any]
+    sessions: frozenset[int]
+    kind: RequestKind
+    batch: Batch | None = None
+    identity: str | None = None
+    early_launch: bool = False
+
+
+@dataclass(slots=True)
+class PendingResponse:
+    sequence: int
+    sessions: frozenset[int]
+    response: dict[str, Any]
+    cursor: StepOutputs | None = None
+    origin: RequestKind | None = None
 
 
 def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
     finalized = dict(response)
-    result = finalized.get("completion_report")
-    if isinstance(result, CompletionReport):
-        finalized["completion_report"] = result.to_wire()
+    report = finalized.get("completion_report")
+    if isinstance(report, CompletionReport):
+        finalized["completion_report"] = report.to_wire()
     return finalized
 
 
-def _control(
-    worker: Worker,
-    kind: RequestKind,
-    request: Mapping[str, Any],
-    replay: ReplayCoordinator | None,
-) -> dict[str, Any] | None:
+def _control(worker: Worker, kind: RequestKind, request: Mapping[str, Any]) -> dict[str, Any] | None:
     supported = frozenset(worker.capabilities.supported_controls)
     if kind not in supported:
         raise unsupported_control(kind.value)
     if kind is RequestKind.DROP_SESSION:
-        session_id = _integer(request, "session_id", kind)
-        if replay is not None:
-            replay.ensure_session_idle(session_id)
-        worker.drop_session(session_id)
-        if replay is not None:
-            replay.drop_session(session_id)
+        worker.drop_session(_integer(request, "session_id", kind))
     elif kind is RequestKind.COPY_KV:
         raw_copies = _required(request, "copies", kind)
         if not isinstance(raw_copies, list):
@@ -294,12 +643,8 @@ def _control(
     return None
 
 
-def dispatch(
-    worker: Worker,
-    request: Mapping[str, Any],
-    replay: ReplayCoordinator | None = None,
-) -> dict[str, Any]:
-    """Dispatch one validated worker-protocol request without performing transport I/O."""
+def dispatch(worker: Worker, request: Mapping[str, Any]) -> dict[str, Any]:
+    """Pure request-to-response dispatch for non-execution worker controls."""
 
     kind = _request_kind(request)
     if kind is RequestKind.GET_CAPABILITIES:
@@ -307,124 +652,117 @@ def dispatch(
             ResponseKind.CAPABILITIES,
             capabilities=worker.capabilities.to_wire(),
         )
-    if kind is RequestKind.EXECUTE:
-        if replay is None:
-            raise invalid_descriptor("execution dispatch requires a server replay coordinator")
-        return _execute(worker, request, replay)
-    if kind is RequestKind.POLL_COMPLETIONS:
-        raise invalid_descriptor("completion polling is owned by the worker server")
     if kind is RequestKind.GET_PRESSURE:
         return _response(ResponseKind.PRESSURE, pressure=worker.resource_pressure())
     if kind is RequestKind.SHUTDOWN:
         return _response(ResponseKind.OK)
-    response = _control(worker, kind, request, replay)
+    if kind in {RequestKind.EXECUTE, RequestKind.POLL_COMPLETIONS}:
+        raise invalid_descriptor(f"{kind.value} is owned by the worker server")
+    response = _control(worker, kind, request)
     return _response(ResponseKind.OK) if response is None else response
 
 
 class WorkerServer:
-    """Classify, observe, and transport canonical worker requests and responses."""
+    """Own transport credit, execution steps, ordering, and response transmission."""
 
     def __init__(
         self,
         worker: Worker,
         ipc_endpoint: WorkerIpcTransport | None,
         *,
-        replay_capacity: int | None = None,
+        step_cache_capacity: int | None = None,
     ) -> None:
         self.worker = worker
         self.ipc_endpoint = ipc_endpoint
         self.profiler = WorkerProfiler.from_env()
+        self.pipeline_depth = max(1, int(worker.capabilities.pipeline_depth))
+        max_operations = max(1, int(worker.capabilities.max_batch_operations))
+        capacity = (
+            env_int(
+                "UNISERVE_WORKER_STEP_CACHE_CAPACITY",
+                default=max(4096, max_operations),
+                strict=True,
+            )
+            if step_cache_capacity is None
+            else int(step_cache_capacity)
+        )
+        if capacity < max_operations:
+            raise ValueError(
+                "completed step cache capacity must hold one maximum-sized submission"
+            )
+        self.completed_steps = CompletedStepCache(capacity)
+        self.steps: dict[int, InflightStep | TerminalStep] = {}
+        self.poll_outputs: dict[int, StepOutputs] = {}
+        self.waiting_requests: deque[PendingRequest] = deque()
+        self.pending_responses: deque[PendingResponse] = deque()
+        self._ended_epochs: set[_EpochKey] = set()
+        self._next_sequence = 1
+        self._shutdown_response: dict[str, Any] | None = None
+        self._accepting_closed = False
+        self._fatal_shutdown = False
+        self._launch_reorder = int(worker.capabilities.rank.tp_size) == 1
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
         self._terminate_rank = env_optional_int("UNISERVE_STUB_DIE_RANK")
         if self._terminate_rank is not None and self._terminate_rank < 0:
             raise ValueError("UNISERVE_STUB_DIE_RANK must be non-negative")
-        self.pipeline_depth = max(1, int(worker.capabilities.pipeline_depth))
-        max_operations = max(1, int(worker.capabilities.max_batch_operations))
-        completed_capacity = (
-            env_int(
-                "UNISERVE_WORKER_REPLAY_CAPACITY",
-                default=max(4096, max_operations),
-                strict=True,
-            )
-            if replay_capacity is None
-            else int(replay_capacity)
+        profile_dir = os.environ.get("UNISERVE_SERVE_LOOP_CPROFILE_DIR")
+        self._profile_state: tuple[Any, float | None, str] | None = None
+        self._profile_executes = 0
+        self._profile_start_execute = int(
+            os.environ.get("UNISERVE_SERVE_LOOP_CPROFILE_START_EXECUTE", "1")
         )
-        if completed_capacity < max_operations:
-            raise ValueError(
-                "completed replay capacity must hold one maximum-sized submission"
-            )
-        self.replay = ReplayCoordinator(
-            in_flight_capacity=self.pipeline_depth * max_operations,
-            completed_capacity=completed_capacity,
-        )
-        self._pending_completion_reports: dict[int, CompletionDelivery] = {}
+        if profile_dir:
+            import cProfile
 
-    def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        raw_kind = request.get("kind")
-        terminate_this_rank = self._terminate_rank in {
-            None,
-            int(self.worker.capabilities.rank.tp_rank),
-        }
-        if (
-            raw_kind == RequestKind.EXECUTE.value
-            and self._terminate_after
-            and terminate_this_rank
-        ):
-            self._execute_count += 1
-            if self._execute_count > self._terminate_after:
-                os._exit(1)
-        try:
-            if raw_kind == RequestKind.EXECUTE.value:
-                with self.profiler.step("uniserve.worker.execute"):
-                    response = dispatch(
-                        self.worker,
-                        request,
-                        self.replay,
-                    )
-            else:
-                request_name = raw_kind if isinstance(raw_kind, str) else "unknown"
-                with profile_range(f"uniserve.worker.{request_name}"):
-                    if raw_kind == RequestKind.POLL_COMPLETIONS.value:
-                        step_id = request.get("step_id")
-                        if (
-                            not isinstance(step_id, int)
-                            or isinstance(step_id, bool)
-                            or step_id < 0
-                        ):
-                            raise invalid_descriptor(
-                                "poll_completions requires an unsigned step id"
-                            )
-                        delivery = self._pending_completion_reports.get(step_id)
-                        if delivery is None:
-                            raise invalid_descriptor(
-                                f"poll_completions names step {step_id} with no pending partitions"
-                            )
-                        response = _response(
-                            ResponseKind.RESULT,
-                            completion_report=delivery,
-                        )
-                    else:
-                        response = dispatch(
-                            self.worker,
-                            request,
-                            self.replay,
-                        )
-        except WorkerError as error:
-            self._record_failure(raw_kind, error)
-            fields = error.to_wire()
-            fields.pop("kind", None)
-            response = _response(ResponseKind.ERROR, **fields)
-        except Exception as error:  # noqa: BLE001 - every process-boundary failure is typed.
-            classified = classify(error, context=str(raw_kind) if raw_kind is not None else None)
-            self._record_failure(raw_kind, classified, unexpected=True)
-            fields = classified.to_wire()
-            fields.pop("kind", None)
-            response = _response(ResponseKind.ERROR, **fields)
-        call_id = request.get("call_id")
+            self._profile_state = (cProfile.Profile(), None, profile_dir)
+        if ipc_endpoint is not None:
+            wake = getattr(ipc_endpoint, "wake", None)
+            wake_on_stream = getattr(ipc_endpoint, "wake_on_stream", None)
+            install = getattr(worker, "set_completion_wake", None)
+            if callable(wake) and callable(wake_on_stream) and callable(install):
+                install(wake, wake_on_stream)
+
+    def _profile_tick(self) -> None:
+        if self._profile_state is None:
+            return
+        profiler, deadline, directory = self._profile_state
+        if deadline is None:
+            window = float(os.environ.get("UNISERVE_SERVE_LOOP_CPROFILE_SECONDS", "15"))
+            self._profile_state = (profiler, time.monotonic() + window, directory)
+            profiler.enable()
+            return
+        if time.monotonic() < deadline:
+            return
+        from pathlib import Path
+
+        profiler.disable()
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        profiler.dump_stats(str(target / f"serve-loop-{os.getpid()}.cprofile"))
+        self._profile_state = None
+
+    def _call_id(self, request: Mapping[str, Any]) -> object:
+        return request.get("call_id")
+
+    def _with_call_id(
+        self,
+        response: dict[str, Any],
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        call_id = self._call_id(request)
         if call_id is not None:
             response["call_id"] = call_id
         return response
+
+    def _error_response(
+        self,
+        error: WorkerError,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        fields = error.to_wire()
+        fields.pop("kind", None)
+        return self._with_call_id(_response(ResponseKind.ERROR, **fields), request)
 
     def _record_failure(
         self,
@@ -445,35 +783,510 @@ class WorkerServer:
             error.op_kind,
         )
 
-    def respond(self, response: dict[str, Any]) -> None:
-        with profile_range("uniserve.worker.respond"):
-            self._respond(response)
+    def _boxed_error(
+        self,
+        request: Mapping[str, Any],
+        error: BaseException,
+    ) -> dict[str, Any]:
+        classified = (
+            error
+            if isinstance(error, WorkerError)
+            else classify(error, context=str(request.get("kind", "unknown")))
+        )
+        self._record_failure(
+            request.get("kind"),
+            classified,
+            unexpected=not isinstance(error, WorkerError),
+        )
+        return self._error_response(classified, request)
 
-    def _respond(self, response: dict[str, Any]) -> None:
+    def _accept(self, request: dict[str, Any]) -> int:
+        sequence = self._next_sequence
+        self._next_sequence += 1
+        sessions = _raw_request_sessions(request)
+        try:
+            kind = _request_kind(request)
+            if kind is RequestKind.SHUTDOWN:
+                self._accepting_closed = True
+                self._shutdown_response = self._with_call_id(
+                    dispatch(self.worker, request),
+                    request,
+                )
+                return sequence
+            batch: Batch | None = None
+            identity: str | None = None
+            early = False
+            if kind is RequestKind.EXECUTE:
+                self._profile_executes += 1
+                if self._profile_state is not None and (
+                    self._profile_executes >= self._profile_start_execute
+                ):
+                    self._profile_tick()
+                terminate_this_rank = self._terminate_rank in {
+                    None,
+                    int(self.worker.capabilities.rank.tp_rank),
+                }
+                self._execute_count += 1
+                if (
+                    self._terminate_after
+                    and terminate_this_rank
+                    and self._execute_count > self._terminate_after
+                ):
+                    os._exit(1)
+                raw_batch = _required(request, "batch", kind)
+                raw_step_id = (
+                    int(raw_batch.step_id)
+                    if isinstance(raw_batch, Batch)
+                    else int(raw_batch.get("step_id", -1))
+                    if isinstance(raw_batch, Mapping)
+                    else -1
+                )
+                with profile_range(self._profile_name("batch_wire", step_id=raw_step_id)):
+                    batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_wire(raw_batch)
+                identity = batch_identity(batch)
+                sessions = _batch_lineage(batch)[0]
+                early = self._starts_early(batch)
+            self.waiting_requests.append(
+                PendingRequest(
+                    sequence=sequence,
+                    request=request,
+                    sessions=sessions,
+                    kind=kind,
+                    batch=batch,
+                    identity=identity,
+                    early_launch=early,
+                )
+            )
+        except BaseException as error:
+            self.pending_responses.append(
+                PendingResponse(
+                    sequence=sequence,
+                    sessions=sessions,
+                    response=self._boxed_error(request, error),
+                )
+            )
+        return sequence
+
+    def _starts_early(self, batch: Batch) -> bool:
+        if not self._launch_reorder:
+            return False
+        return any(
+            operation.work.kind == "encode"
+            or (operation.work.kind == "token" and operation.work.mode == "extend")
+            for operation in batch.operations
+        )
+
+    def _transport_window_open(self) -> bool:
+        return (
+            len(self.waiting_requests) + len(self.pending_responses)
+            < self.pipeline_depth
+        )
+
+    def _live_execution_count(self) -> int:
+        return sum(isinstance(step, InflightStep) for step in self.steps.values())
+
+    def _is_execution_miss(self, pending: PendingRequest) -> bool:
+        if pending.kind is not RequestKind.EXECUTE:
+            return False
+        batch = pending.batch
+        if batch is None:
+            return False
+        return int(batch.step_id) not in self.steps
+
+    def _session_gate(self, index: int, pending: PendingRequest) -> bool:
+        for earlier in tuple(self.waiting_requests)[:index]:
+            if not earlier.sessions.isdisjoint(pending.sessions):
+                return False
+        for step in tuple(self.steps.values()):
+            if not isinstance(step, InflightStep):
+                continue
+            if step.session_ids.isdisjoint(pending.sessions):
+                continue
+            if not step.advance_execution():
+                return False
+        return True
+
+    def _launch_one_ready_request(self) -> bool:
+        if not self.waiting_requests:
+            return False
+        items = tuple(self.waiting_requests)
+        misses = [
+            index for index, pending in enumerate(items) if self._is_execution_miss(pending)
+        ]
+        non_sources = [
+            index for index, pending in enumerate(items) if index not in set(misses)
+        ]
+        for index in non_sources:
+            pending = items[index]
+            if self._session_gate(index, pending):
+                self._remove_waiting(index)
+                self._launch(pending)
+                return True
+        if self._live_execution_count() >= self.pipeline_depth or not misses:
+            return False
+        if self._launch_reorder:
+            ordered_misses = [
+                index for index in misses if items[index].early_launch
+            ] + [
+                index for index in misses if not items[index].early_launch
+            ]
+        else:
+            ordered_misses = misses[:1]
+        for index in ordered_misses:
+            pending = items[index]
+            if self._session_gate(index, pending):
+                self._remove_waiting(index)
+                self._launch(pending)
+                return True
+        return False
+
+    def _remove_waiting(self, index: int) -> None:
+        items = tuple(self.waiting_requests)
+        self.waiting_requests = deque(
+            item for position, item in enumerate(items) if position != index
+        )
+
+    def _launch(self, pending: PendingRequest) -> None:
+        try:
+            if pending.kind is RequestKind.EXECUTE:
+                self._launch_execute(pending)
+            elif pending.kind is RequestKind.POLL_COMPLETIONS:
+                self._launch_poll(pending)
+            else:
+                self._launch_control(pending)
+        except BaseException as error:
+            self.pending_responses.append(
+                PendingResponse(
+                    sequence=pending.sequence,
+                    sessions=pending.sessions,
+                    response=self._boxed_error(pending.request, error),
+                )
+            )
+
+    def _launch_execute(self, pending: PendingRequest) -> None:
+        batch = pending.batch
+        identity = pending.identity
+        if batch is None or identity is None:
+            raise RuntimeError("accepted execute request lost its canonical batch")
+        step_id = int(batch.step_id)
+        existing = self.steps.get(step_id)
+        if existing is not None:
+            current = existing.current()
+            if current is not existing:
+                self.steps[step_id] = current
+                existing = current
+            if existing.identity != identity:
+                raise invalid_descriptor(
+                    f"execution step {step_id} conflicts with its canonical batch identity"
+                )
+            self.completed_steps.touch(step_id)
+            cursor = self._new_cursor(existing)
+        else:
+            step = InflightStep(batch, identity, on_terminal=self._step_terminal)
+            self.steps[step_id] = step
+            cursor = self._new_cursor(step)
+            self._start_execution(step, batch)
+        response = self._with_call_id(
+            _response(ResponseKind.RESULT, completion_report=cursor),
+            pending.request,
+        )
+        self.pending_responses.append(
+            PendingResponse(
+                sequence=pending.sequence,
+                sessions=pending.sessions | cursor.session_ids,
+                response=response,
+                cursor=cursor,
+                origin=RequestKind.EXECUTE,
+            )
+        )
+
+    def _start_execution(self, step: InflightStep, batch: Batch) -> None:
+        try:
+            supported = frozenset(self.worker.capabilities.supported_work)
+            unsupported = tuple(
+                operation.work.variant
+                for operation in batch.operations
+                if operation.work.variant not in supported
+            )
+            if unsupported:
+                names = sorted({value.value for value in unsupported})
+                raise invalid_descriptor(
+                    "execution batch contains work variants outside worker capabilities: "
+                    f"{names!r}"
+                )
+            prepare = getattr(self.worker, "prepare_execute", None)
+            prepared = prepare(batch) if batch.operations and callable(prepare) else None
+            if prepared is not None:
+                source: object = _PendingExecution(self.worker, prepared)
+            else:
+                with profile_range(
+                    self._profile_name("model_execute", step_id=int(batch.step_id))
+                ):
+                    source = self.worker.execute(batch)
+            step.attach(source)
+        except BaseException as error:
+            step.fail(error)
+
+    def _launch_poll(self, pending: PendingRequest) -> None:
+        step_id = _integer(pending.request, "step_id", RequestKind.POLL_COMPLETIONS)
+        cursor = self.poll_outputs.pop(step_id, None)
+        if cursor is None:
+            raise invalid_descriptor(
+                f"poll_completions names step {step_id} with no pending partitions"
+            )
+        response = self._with_call_id(
+            _response(ResponseKind.RESULT, completion_report=cursor),
+            pending.request,
+        )
+        self.pending_responses.append(
+            PendingResponse(
+                sequence=pending.sequence,
+                sessions=pending.sessions | cursor.session_ids,
+                response=response,
+                cursor=cursor,
+                origin=RequestKind.POLL_COMPLETIONS,
+            )
+        )
+
+    def _launch_control(self, pending: PendingRequest) -> None:
+        if pending.kind is RequestKind.DROP_SESSION:
+            session_id = _integer(pending.request, "session_id", pending.kind)
+            self._ensure_session_idle(session_id)
+            response = dispatch(self.worker, pending.request)
+            self._drop_session_steps(session_id)
+        else:
+            response = dispatch(self.worker, pending.request)
+        self.pending_responses.append(
+            PendingResponse(
+                sequence=pending.sequence,
+                sessions=pending.sessions,
+                response=self._with_call_id(response, pending.request),
+            )
+        )
+
+    def _new_cursor(self, step: InflightStep | TerminalStep) -> StepOutputs:
+        current = step.current()
+        if isinstance(current, TerminalStep):
+            self.completed_steps.take(current.step_id)
+        current.active_cursors += 1
+        return StepOutputs(current, self._cursor_closed)
+
+    def _cursor_closed(self, cursor: StepOutputs) -> None:
+        current = cursor._current()
+        if current.active_cursors < 1:
+            raise RuntimeError("step cursor ownership underflow")
+        current.active_cursors -= 1
+        if isinstance(current, TerminalStep) and current.active_cursors == 0:
+            self._retain_terminal(current)
+
+    def _step_terminal(self, inflight: InflightStep, terminal: TerminalStep) -> None:
+        if self.steps.get(inflight.step_id) is inflight:
+            self.steps[inflight.step_id] = terminal
+        if terminal.active_cursors == 0:
+            self._retain_terminal(terminal)
+
+    def _retain_terminal(self, terminal: TerminalStep) -> None:
+        if terminal.epochs and terminal.epochs.issubset(self._ended_epochs):
+            if self.steps.get(terminal.step_id) is terminal:
+                del self.steps[terminal.step_id]
+            self.completed_steps.remove(terminal.step_id)
+            self._prune_ended_epochs()
+            return
+        evicted = self.completed_steps.put(terminal)
+        for victim in evicted:
+            if self.steps.get(victim.step_id) is victim:
+                del self.steps[victim.step_id]
+        self._prune_ended_epochs()
+
+    def _ensure_session_idle(self, session_id: int) -> None:
+        target = int(session_id)
+        if any(
+            isinstance(step, InflightStep) and target in step.session_ids
+            for step in self.steps.values()
+        ):
+            raise resource_error(
+                f"session {target} still has an in-flight execution step"
+            )
+
+    def _drop_session_steps(self, session_id: int) -> None:
+        target = int(session_id)
+        self._ended_epochs.update(
+            epoch
+            for step in self.steps.values()
+            for epoch in step.epochs
+            if epoch[0] == target
+        )
+        for step_id, step in tuple(self.steps.items()):
+            if not isinstance(step, TerminalStep) or step.active_cursors:
+                continue
+            if step.epochs and step.epochs.issubset(self._ended_epochs):
+                self.completed_steps.remove(step_id)
+                del self.steps[step_id]
+        self._prune_ended_epochs()
+
+    def _prune_ended_epochs(self) -> None:
+        referenced = {
+            epoch
+            for step in self.steps.values()
+            if isinstance(step, TerminalStep)
+            for epoch in step.epochs
+        }
+        self._ended_epochs.intersection_update(referenced)
+
+    def _pending_ready(self, pending: PendingResponse) -> bool:
+        cursor = pending.cursor
+        if cursor is None:
+            return True
+        try:
+            with profile_range(
+                self._profile_name("completion", step_id=int(cursor.step_id))
+            ):
+                return cursor.ready()
+        except BaseException as error:
+            pending.response = self._boxed_error(pending.response, error)
+            cursor.close()
+            pending.cursor = None
+            return True
+
+    def _send_one_ready_response(self) -> bool:
+        earlier_sessions: set[int] = set()
+        for index, pending in enumerate(self.pending_responses):
+            lineage_ready = earlier_sessions.isdisjoint(pending.sessions)
+            if lineage_ready and self._pending_ready(pending):
+                del self.pending_responses[index]
+                self._send_pending(pending)
+                return True
+            earlier_sessions.update(pending.sessions)
+        return False
+
+    def _send_pending(self, pending: PendingResponse) -> None:
+        response = dict(pending.response)
+        cursor = pending.cursor
+        step_id = int(cursor.step_id) if cursor is not None else None
+        if cursor is not None:
+            if cursor.error is not None:
+                error = cursor.take_error()
+                response = self._error_response(error, pending.response)
+            else:
+                response["completion_report"] = cursor.take_ready()
+            if cursor.pending():
+                existing = self.poll_outputs.setdefault(cursor.step_id, cursor)
+                if existing is not cursor:
+                    cursor.close()
+            else:
+                if self.poll_outputs.get(cursor.step_id) is cursor:
+                    del self.poll_outputs[cursor.step_id]
+                cursor.close()
+        fatal = bool(response.get("fatal"))
+        with profile_range(self._profile_name("finalize_response", step_id=step_id)):
+            finalized = _finalize_response(response)
+        self._transport_respond(finalized)
+        if fatal:
+            self._accepting_closed = True
+            self._fatal_shutdown = True
+
+    def _transport_respond(self, response: dict[str, Any]) -> None:
         if self.ipc_endpoint is None:
             raise RuntimeError("worker server has no IPC endpoint")
-        result = response.get("completion_report")
-        if isinstance(result, CompletionDelivery):
-            ready = result.take_ready()
-            existing = self._pending_completion_reports.get(result.step_id)
-            if result.pending():
-                if existing is None:
-                    self._pending_completion_reports[result.step_id] = result
-                elif existing.submission_token != result.submission_token:
-                    raise RuntimeError(
-                        "one execution step has multiple pending completion submissions"
-                    )
-            elif existing is result:
-                self._pending_completion_reports.pop(result.step_id, None)
-            response = dict(response)
-            response["completion_report"] = ready
-        with profile_range("uniserve.worker.finalize_response"):
-            finalized = _finalize_response(response)
-        self.ipc_endpoint.respond(finalized)
+        with profile_range("uniserve.worker.respond"):
+            self.ipc_endpoint.respond(response)
+
+    def _profile_name(self, boundary: str, *, step_id: int | None = None) -> str:
+        name = f"uniserve.worker.{boundary} rank={int(self.worker.capabilities.rank.tp_rank)}"
+        return f"{name} step={step_id}" if step_id is not None and step_id >= 0 else name
+
+    def _reap_device_events(self) -> None:
+        event_pool = getattr(self.worker, "device_events", None)
+        reap = getattr(event_pool, "reap", None)
+        if callable(reap):
+            reap()
+
+    def _drain_continuations(self) -> None:
+        for step_id, cursor in tuple(self.poll_outputs.items()):
+            try:
+                cursor.ready()
+            except BaseException:
+                pass
+            if cursor.complete:
+                del self.poll_outputs[step_id]
+                cursor.close()
+
+    def _drained(self) -> bool:
+        return (
+            not self.waiting_requests
+            and not self.pending_responses
+            and not any(isinstance(step, InflightStep) for step in self.steps.values())
+            and not self.poll_outputs
+        )
+
+    def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Accept and launch one request without performing transport I/O."""
+
+        sequence = self._accept(dict(request))
+        while self._launch_one_ready_request():
+            if any(item.sequence == sequence for item in self.pending_responses):
+                break
+        for index, pending in enumerate(self.pending_responses):
+            if pending.sequence == sequence:
+                del self.pending_responses[index]
+                return pending.response
+        if self._shutdown_response is not None:
+            return dict(self._shutdown_response)
+        raise RuntimeError("worker request did not become launchable")
+
+    def respond(self, response: dict[str, Any]) -> None:
+        cursor = response.get("completion_report")
+        pending = PendingResponse(
+            sequence=0,
+            sessions=frozenset() if not isinstance(cursor, StepOutputs) else cursor.session_ids,
+            response=response,
+            cursor=cursor if isinstance(cursor, StepOutputs) else None,
+            origin=RequestKind.EXECUTE,
+        )
+        if not self._pending_ready(pending):
+            raise RuntimeError("worker response is not query-ready")
+        self._send_pending(pending)
 
     def serve(self) -> None:
-        from .process import WorkerServeLoop
-
         if self.ipc_endpoint is None:
             raise RuntimeError("worker server has no IPC endpoint")
-        WorkerServeLoop(self, self.ipc_endpoint).run()
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            while True:
+                self._reap_device_events()
+                if self._send_one_ready_response():
+                    continue
+                if self._launch_one_ready_request():
+                    continue
+                if self._accepting_closed:
+                    self._drain_continuations()
+                    if self._drained():
+                        if self._shutdown_response is not None:
+                            self._transport_respond(self._shutdown_response)
+                        return
+                if not self._accepting_closed and self._transport_window_open():
+                    try_receive = getattr(self.ipc_endpoint, "try_recv", None)
+                    if callable(try_receive):
+                        request = try_receive()
+                        if request is not None:
+                            self._accept(request)
+                            continue
+                if (
+                    self.waiting_requests
+                    or self.pending_responses
+                    or self.poll_outputs
+                    or any(isinstance(step, InflightStep) for step in self.steps.values())
+                ):
+                    self.ipc_endpoint.wait_incoming(60_000_000)
+                    continue
+                if self._accepting_closed:
+                    return
+                self._accept(self.ipc_endpoint.recv())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            self.profiler.close()
+            close = getattr(self.worker, "close", None)
+            if callable(close):
+                close()

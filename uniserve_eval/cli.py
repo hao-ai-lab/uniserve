@@ -10,6 +10,7 @@ from pathlib import Path
 from .config import DEFAULT_CONFIG, load_config, server_launch
 from .pipeline.run import run_point
 from .pipeline.setup import applied_environment, describe_launch, host_lock, prepare_launch
+from .nsys import NsysCapture
 from .server import ManagedServer
 
 
@@ -66,17 +67,32 @@ def run(args: argparse.Namespace) -> None:
             launch = prepare_launch(config, point, args.executable)
             point_dir = output_root / point.name
             log_path = output_root / "server-logs" / f"{point.name}.log"
+            capture = (
+                NsysCapture(point.name, output_root / "nsys" / point.name)
+                if args.nsys
+                else None
+            )
+            if capture is not None:
+                launch = capture.wrap_launch(launch)
+            launch_record = describe_launch(launch)
+            if capture is not None:
+                launch_record["nsys"] = capture.describe()
             with applied_environment(launch.environment):
-                with ManagedServer(server, launch, log_path, timeout_s=args.launch_timeout_s):
-                    result = asyncio.run(
-                        run_point(
-                            server.base_url,
-                            point,
-                            point_dir,
-                            launch=describe_launch(launch),
-                            timeout_s=args.request_timeout_s,
+                try:
+                    with ManagedServer(server, launch, log_path, timeout_s=args.launch_timeout_s):
+                        result = asyncio.run(
+                            run_point(
+                                server.base_url,
+                                point,
+                                point_dir,
+                                launch=launch_record,
+                                timeout_s=args.request_timeout_s,
+                                measurement=capture,
+                            )
                         )
-                    )
+                finally:
+                    if capture is not None:
+                        capture.finalize()
             print(
                 f"{point.name}: {'pass' if result.summary['validation']['valid'] else 'fail'} "
                 f"({result.summary['ok_count']}/{result.summary['request_count']} requests)"
@@ -113,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--output-root", type=Path)
     command.add_argument("--launch-timeout-s", type=float, default=1800)
     command.add_argument("--request-timeout-s", type=float, default=6 * 60 * 60)
+    command.add_argument(
+        "--nsys",
+        action="store_true",
+        help="capture the warmed measurement window with Nsight Systems",
+    )
     command.set_defaults(function=run)
     return parser
 

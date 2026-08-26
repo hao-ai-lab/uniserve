@@ -37,8 +37,8 @@ from uniserve_worker.runtime.device_products import (
 from uniserve_worker.runtime.encoder_cache import EncoderRead, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentPublication, LatentRelease, LatentStaging
 from uniserve_worker.server.completion import (
-    CompletionCapture,
-    CompletionLease,
+    PinnedOutputBuffer,
+    PinnedTokenCapture,
     _CompletionImagePayload,
     _CompletionInteger,
     _CompletionLogprobValue,
@@ -247,8 +247,8 @@ class PreparedTransferInput:
 
 @dataclass(slots=True)
 class PreparedPredicateBatch:
-    lease: CompletionLease
-    entries: list[tuple[OperationIdentity, CompletionCapture, int]]
+    buffer: PinnedOutputBuffer
+    entries: list[tuple[OperationIdentity, PinnedTokenCapture, int]]
     transferred: tuple[tuple[OperationIdentity, PreparedTransferInput, int], ...]
     sealed: bool
     _values: dict[OperationIdentity, bool] | None = None
@@ -266,37 +266,37 @@ class PreparedPredicateBatch:
                         raise invalid_descriptor(
                             "transferred operation predicate has an invalid tensor set"
                         )
-                    self.entries.append((identity, self.lease.capture(tensors[0]), row))
-                self.lease.seal()
+                    self.entries.append((identity, self.buffer.capture(tensors[0]), row))
+                self.buffer.seal()
             except BaseException:
-                self.lease.abandon()
+                self.buffer.abandon()
                 raise
             self.sealed = True
-        return self.lease.ready()
+        return self.buffer.ready()
 
     def resolve(self) -> dict[OperationIdentity, bool]:
         if self._values is not None:
             return self._values
-        if not self.lease.ready():
+        if not self.buffer.ready():
             raise RuntimeError("prepared predicates were observed before readiness")
         values: dict[OperationIdentity, bool] = {}
-        generation = self.lease.generation
+        generation = self.buffer.generation
         try:
             for identity, capture, row in sorted(self.entries, key=lambda entry: entry[2]):
                 captured = capture.values()
                 if len(captured) != 1 or captured[0] not in {0, 1}:
                     raise invalid_descriptor("operation predicate is not a canonical boolean")
                 values[identity] = bool(captured[0])
-                self.lease.observe(row, generation)
+                self.buffer.observe(row, generation)
         except BaseException:
-            self.lease.abandon()
+            self.buffer.abandon()
             raise
         self._values = values
         return values
 
     def abandon(self) -> None:
         if self._values is None:
-            self.lease.abandon()
+            self.buffer.abandon()
 
     def __del__(self) -> None:
         try:
@@ -357,7 +357,7 @@ class PartitionState:
     request_candidates: tuple[RequestRow, ...]
     request_bases: tuple[RequestRow | None, ...]
     request_rows: dict[int, RequestRow]
-    completion: CompletionLease
+    completion: PinnedOutputBuffer
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
     forward_rows: dict[OperationIdentity, tuple[WireForwardRow, ...]] = field(default_factory=dict)

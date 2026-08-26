@@ -16,6 +16,15 @@ command = ["target/release/uniserve", "serve", "${UNISERVE_SENSENOVA_MODEL}", "-
 [servers.sensenova.environment]
 CUDA_VISIBLE_DEVICES = "0"
 
+[servers.minimax-h3]
+host = "127.0.0.1"
+port = 18083
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-description", "minimax-h3", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--tp-size", "4", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--media-spool", "/tmp/uniserve-eval-minimax-h3", "--dtype", "bfloat16"]
+
+[servers.minimax-h3.environment]
+CUDA_VISIBLE_DEVICES = "0,1,2,3"
+NCCL_CUMEM_HOST_ENABLE = "1"
+
 [benchmarks.qwen-uniserve-sharegpt-r16]
 server = "qwen"
 task = "text"
@@ -249,8 +258,46 @@ timestep_shift = 3.0
 images_per_second = "higher"
 "image_latency_ms.mean" = "lower"
 
+[benchmarks.minimax-h3-uncontended]
+server = "minimax-h3"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+
+[benchmarks.minimax-h3-uncontended.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.minimax-h3-uncontended.metrics]
+videos_per_second = "higher"
+"video_latency_ms.mean" = "lower"
+
+[benchmarks.minimax-h3-contended]
+server = "minimax-h3"
+task = "video"
+model = "MiniMax-H3"
+dataset = "minimax-h3"
+
+[benchmarks.minimax-h3-contended.load]
+num_prompts = 4
+request_rate = inf
+max_concurrency = 4
+warmup_requests = 1
+seed = 1000
+
+[benchmarks.minimax-h3-contended.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
 [suites.decode-runtime]
 points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-c32", "sensenova-uniserve-t2i-c32", "sensenova-uniserve-interleave-c4"]
 
 [suites.serving-runtime]
 points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-stream", "sensenova-uniserve-t2i-image", "sensenova-uniserve-interleave-c4"]
+
+[suites.minimax-h3]
+points = ["minimax-h3-uncontended", "minimax-h3-contended"]

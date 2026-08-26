@@ -59,6 +59,7 @@ fn endpoint(value: ServedEndpoint) -> ModelEndpoint {
     match value {
         ServedEndpoint::ChatCompletions => ModelEndpoint::ChatCompletions,
         ServedEndpoint::ImageGenerations => ModelEndpoint::ImageGenerations,
+        ServedEndpoint::VideoGenerations => ModelEndpoint::VideoGenerations,
     }
 }
 
@@ -66,6 +67,8 @@ fn modality(value: ServedModality) -> ModelModality {
     match value {
         ServedModality::Text => ModelModality::Text,
         ServedModality::Image => ModelModality::Image,
+        ServedModality::Video => ModelModality::Video,
+        ServedModality::Audio => ModelModality::Audio,
     }
 }
 

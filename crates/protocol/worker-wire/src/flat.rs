@@ -9,15 +9,16 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 use crate::schema::uniserve::wire as fbs;
 use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CacheCopy,
-    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, DType, DimBound,
-    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
-    FinishFlags, ForwardRow, GenAdmission, GraphBucketCapability, LaneCapabilities,
-    LatentPlacement, LogicalLengths, MixedExecutionCapability, OpId, OpStatus, Operation,
-    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    RecoveryPlacement, RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure,
-    ResponseKind, Rng, RouteId, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass,
-    TimingCounters, TokenSpan, UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities,
-    WorkerForwardStats, WorkerRequest, WorkerResponse,
+    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, DType,
+    DecodeKind, DecodePlacement, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
+    ErrorOperationIdentity, ExecutionCapability, FinishFlags, ForwardRow, GenAdmission,
+    GraphBucketCapability, LaneCapabilities, LatentPlacement, LogicalLengths, MediaAdmission,
+    MediaProfileId, MixedExecutionCapability, OpId, OpStatus, Operation, PartitionCompletion,
+    Point, PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
+    RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId,
+    SamplingOwnership, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenSpan,
+    UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities, WorkerForwardStats,
+    WorkerRequest, WorkerResponse,
 };
 
 pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -210,6 +211,16 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> anyhow::Result<Ba
             })
             .transpose()?
             .unwrap_or_default(),
+        decode_placements: partition
+            .decode_placements()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(decode_placement_from_table)
+                    .collect::<anyhow::Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
     };
     partition.validate()?;
     Ok(partition)
@@ -224,6 +235,10 @@ fn admission_from_table(admission: fbs::Admission<'_>) -> anyhow::Result<Admissi
         gen_admission: admission
             .gen_admission()
             .map(gen_admission_from_table)
+            .transpose()?,
+        media: admission
+            .media()
+            .map(media_admission_from_table)
             .transpose()?,
     };
     admission.validate()?;
@@ -256,6 +271,17 @@ fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> anyhow::Result<
                 .image()
                 .context("gen admission has no image spec")?,
         )?,
+    })
+}
+
+fn media_admission_from_table(
+    admission: fbs::MediaAdmission<'_>,
+) -> anyhow::Result<MediaAdmission> {
+    Ok(MediaAdmission {
+        prompt: required_str(admission.prompt(), "media admission.prompt")?,
+        seed: admission.seed(),
+        profile: media_profile_from_fb(admission.profile())?,
+        output_path: required_str(admission.output_path(), "media admission.output_path")?,
     })
 }
 
@@ -311,6 +337,21 @@ fn latent_placement_from_table(
         width: placement.width(),
         start_step: placement.start_step(),
         step_count: placement.step_count(),
+    })
+}
+
+fn decode_placement_from_table(
+    placement: fbs::DecodePlacement<'_>,
+) -> anyhow::Result<DecodePlacement> {
+    Ok(DecodePlacement {
+        request_key: request_key_from_table(
+            placement.request_key(),
+            "decode placement.request_key",
+        )?,
+        op_id: OpId(placement.op_id()),
+        kind: decode_kind_from_fb(placement.kind())?,
+        start_unit: placement.start_unit(),
+        unit_count: placement.unit_count(),
     })
 }
 
@@ -717,7 +758,7 @@ fn capabilities_from_table(
             })
             .transpose()?
             .unwrap_or_default(),
-        kv_dtype: required_str(caps.kv_dtype(), "capabilities.kv_dtype")?,
+        kv_dtype: caps.kv_dtype().unwrap_or_default().to_string(),
         model_dtype: canonical_model_dtype(required_str(
             caps.model_dtype(),
             "capabilities.model_dtype",
@@ -1298,6 +1339,13 @@ fn partition_to_fb(partition: &BatchPartition) -> anyhow::Result<fbs::BatchParti
                 .map(latent_placement_to_fb)
                 .collect(),
         ),
+        decode_placements: Some(
+            partition
+                .decode_placements
+                .iter()
+                .map(decode_placement_to_fb)
+                .collect(),
+        ),
     })
 }
 
@@ -1318,6 +1366,11 @@ fn admission_to_fb(admission: &Admission) -> anyhow::Result<fbs::AdmissionT> {
             .as_ref()
             .map(gen_admission_to_fb)
             .map(Box::new),
+        media: admission
+            .media
+            .as_ref()
+            .map(media_admission_to_fb)
+            .map(Box::new),
     })
 }
 
@@ -1333,6 +1386,15 @@ fn und_admission_to_fb(admission: &UndAdmission) -> anyhow::Result<fbs::UndAdmis
 fn gen_admission_to_fb(admission: &GenAdmission) -> fbs::GenAdmissionT {
     fbs::GenAdmissionT {
         image: Some(Box::new(image_to_fb(&admission.image))),
+    }
+}
+
+fn media_admission_to_fb(admission: &MediaAdmission) -> fbs::MediaAdmissionT {
+    fbs::MediaAdmissionT {
+        prompt: Some(admission.prompt.clone()),
+        seed: admission.seed,
+        profile: media_profile_to_fb(admission.profile),
+        output_path: Some(admission.output_path.clone()),
     }
 }
 
@@ -1387,6 +1449,16 @@ fn latent_placement_to_fb(placement: &LatentPlacement) -> fbs::LatentPlacementT 
         width: placement.width,
         start_step: placement.start_step,
         step_count: placement.step_count,
+    }
+}
+
+fn decode_placement_to_fb(placement: &DecodePlacement) -> fbs::DecodePlacementT {
+    fbs::DecodePlacementT {
+        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
+        op_id: placement.op_id.0,
+        kind: decode_kind_to_fb(placement.kind),
+        start_unit: placement.start_unit,
+        unit_count: placement.unit_count,
     }
 }
 
@@ -2006,6 +2078,38 @@ fn work_to_fb(variant: WorkVariant) -> fbs::WorkVariant {
         WorkVariant::GenTransition => fbs::WorkVariant::GenTransition,
         WorkVariant::GenFlow => fbs::WorkVariant::GenFlow,
         WorkVariant::Materialize => fbs::WorkVariant::Materialize,
+        WorkVariant::GenDecode => fbs::WorkVariant::GenDecode,
+    }
+}
+
+fn decode_kind_to_fb(kind: DecodeKind) -> fbs::DecodeKind {
+    match kind {
+        DecodeKind::Video => fbs::DecodeKind::Video,
+        DecodeKind::Audio => fbs::DecodeKind::Audio,
+    }
+}
+
+fn decode_kind_from_fb(kind: fbs::DecodeKind) -> anyhow::Result<DecodeKind> {
+    if kind == fbs::DecodeKind::Video {
+        Ok(DecodeKind::Video)
+    } else if kind == fbs::DecodeKind::Audio {
+        Ok(DecodeKind::Audio)
+    } else {
+        bail!("unknown decode kind {}", kind.0)
+    }
+}
+
+fn media_profile_to_fb(profile: MediaProfileId) -> fbs::MediaProfileId {
+    match profile {
+        MediaProfileId::MinimaxH3T2va => fbs::MediaProfileId::MinimaxH3T2va,
+    }
+}
+
+fn media_profile_from_fb(profile: fbs::MediaProfileId) -> anyhow::Result<MediaProfileId> {
+    if profile == fbs::MediaProfileId::MinimaxH3T2va {
+        Ok(MediaProfileId::MinimaxH3T2va)
+    } else {
+        bail!("unknown media profile {}", profile.0)
     }
 }
 
@@ -2136,7 +2240,7 @@ fn storage_class_to_fb(class: StorageClass) -> fbs::StorageClass {
         StorageClass::PagedKv => fbs::StorageClass::PagedKv,
         StorageClass::LatentArena => fbs::StorageClass::LatentArena,
         StorageClass::HostStaging => fbs::StorageClass::HostStaging,
-        StorageClass::CompletionArena => fbs::StorageClass::CompletionArena,
+        StorageClass::PinnedOutput => fbs::StorageClass::PinnedOutput,
     }
 }
 
@@ -2146,7 +2250,7 @@ fn storage_class_from_fb(class: fbs::StorageClass) -> anyhow::Result<StorageClas
         fbs::StorageClass::PagedKv => StorageClass::PagedKv,
         fbs::StorageClass::LatentArena => StorageClass::LatentArena,
         fbs::StorageClass::HostStaging => StorageClass::HostStaging,
-        fbs::StorageClass::CompletionArena => StorageClass::CompletionArena,
+        fbs::StorageClass::PinnedOutput => StorageClass::PinnedOutput,
         other => bail!("unknown storage class {}", other.0),
     })
 }

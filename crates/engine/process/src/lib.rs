@@ -28,8 +28,8 @@ use tracing::{debug, info, warn};
 use uniserve_core::RequestId;
 use uniserve_engine_wire::handshake::{HandshakeInitMessage, ReadyMessage};
 use uniserve_engine_wire::{
-    EngineRequest, GenEvent, GenerationEventBatch, GenerationRequestEnvelope,
-    RoutedGenerationEvent, decode_msgpack, encode_msgpack,
+    EngineRequest, GenEvent, GenerationEventBatch, GenerationRequestEnvelope, MediaEvent,
+    MediaRequestEnvelope, RoutedGenerationEvent, decode_msgpack, encode_msgpack,
 };
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
@@ -222,6 +222,13 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
     if let Some(ctrl) = &init.generation_controls {
         apply_generation_controls(&mut core_cfg, ctrl);
     }
+    if let Some(expected_spool) = init.media_spool.as_deref() {
+        anyhow::ensure!(
+            core_cfg.worker_launch.media_spool.as_deref() == Some(expected_spool),
+            "engine media spool {:?} does not match frontend media spool {expected_spool:?}",
+            core_cfg.worker_launch.media_spool,
+        );
+    }
 
     // ---- 3. Build the runtime: spawns the worker/sim and waits on the
     // worker's get_caps (model load can take minutes for the real worker). ----
@@ -358,6 +365,9 @@ async fn run_input_loop(
 
         match request {
             EngineRequest::Submit(req) => handle_submit(core, active, out_tx, *req).await,
+            EngineRequest::SubmitMedia(req) => {
+                handle_submit_media(core, active, out_tx, *req).await
+            }
             EngineRequest::Abort(ids) => {
                 let handle = core.handle();
                 let active = lock_active(active);
@@ -411,6 +421,71 @@ async fn run_input_loop(
             }
         }
     }
+}
+
+async fn handle_submit_media(
+    core: &Arc<EngineCore>,
+    active: &SharedActiveRequests,
+    out_tx: &mpsc::Sender<OutMsg>,
+    mut envelope: MediaRequestEnvelope,
+) {
+    let request_id = envelope.external_request_id.clone();
+    if let Err(error) = envelope.validate() {
+        let _ = out_tx
+            .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                external_request_id: request_id,
+                event: GenEvent::MediaFailed {
+                    message: error.to_string(),
+                },
+            })))
+            .await;
+        return;
+    }
+    let rid = core.next_request_id();
+    if !insert_active_request(active, &request_id, rid) {
+        let _ = out_tx
+            .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                external_request_id: request_id,
+                event: GenEvent::MediaFailed {
+                    message: "request id is already active".to_string(),
+                },
+            })))
+            .await;
+        return;
+    }
+    envelope.request.request_id = rid;
+    let mut event_rx = match core.handle().submit_media(envelope.request) {
+        Ok(event_rx) => event_rx,
+        Err(error) => {
+            remove_active_request(active, &request_id, rid);
+            let _ = out_tx
+                .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                    external_request_id: request_id,
+                    event: GenEvent::MediaFailed { message: error },
+                })))
+                .await;
+            return;
+        }
+    };
+    event_rx.delegate_cancellation();
+    let out_tx = out_tx.clone();
+    let active = Arc::clone(active);
+    tokio::spawn(async move {
+        let event = match event_rx.recv().await {
+            Some(MediaEvent::Completed { bytes }) => GenEvent::MediaCompleted { bytes },
+            Some(MediaEvent::Rejected { message }) | Some(MediaEvent::Failed { message }) => {
+                GenEvent::MediaFailed { message }
+            }
+            Some(MediaEvent::Aborted) | None => GenEvent::MediaAborted,
+        };
+        let _ = out_tx
+            .send(OutMsg::Event(Box::new(RoutedGenerationEvent {
+                external_request_id: request_id.clone(),
+                event,
+            })))
+            .await;
+        remove_active_request(&active, &request_id, rid);
+    });
 }
 
 /// Register and submit one canonical request, then forward its event stream.

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+futures.workspace = true
 http-body.workspace = true
 libc.workspace = true
 serde.workspace = true

@@ -6,6 +6,40 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 import torch
 
+from ..server.profiler import profile_range
+
+
+@torch.library.custom_op(
+    "uniserve_worker::all_to_all_single_into",
+    mutates_args=("output",),
+)
+def _all_to_all_single_into_custom(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+) -> None:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    with profile_range(f"uniserve.h3.collective kind=all_to_all rank={rank}"):
+        work = torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            async_op=True,
+        )
+        work.block_current_stream()
+
+
+@_all_to_all_single_into_custom.register_fake
+def _all_to_all_single_into_custom_fake(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+) -> None:
+    del output, input, output_splits, input_splits
+
 __all__ = [
     'divide',
     'AxisTransport',
@@ -47,6 +81,14 @@ class CollectiveAxisTransport(AxisTransport, Protocol):
 
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor: ...
     def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor: ...
+    def all_to_all_single_into(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_splits: tuple[int, ...] | list[int],
+        input_splits: tuple[int, ...] | list[int],
+    ) -> Any: ...
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> Any: ...
 
 
 @runtime_checkable
@@ -109,6 +151,44 @@ class CollectiveTransport:
         chunks = [torch.empty_like(t) for _ in range(self.size)]
         torch.distributed.all_gather(chunks, t.contiguous(), group=group)
         return torch.cat(chunks, dim=dim)
+
+    def all_to_all_single_into(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_splits: tuple[int, ...] | list[int],
+        input_splits: tuple[int, ...] | list[int],
+    ) -> Any:
+        group = self._require()
+        if group is None:
+            _all_to_all_single_into_custom(
+                output,
+                input,
+                list(output_splits),
+                list(input_splits),
+            )
+            return None
+        work = torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=list(output_splits),
+            input_split_sizes=list(input_splits),
+            group=group,
+            async_op=True,
+        )
+        work.block_current_stream()
+        return work
+
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> Any:
+        group = self._require()
+        work = torch.distributed.all_gather_into_tensor(
+            output,
+            input,
+            group=group,
+            async_op=True,
+        )
+        work.block_current_stream()
+        return work
 
     def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor:
         group = self._require()
@@ -205,6 +285,71 @@ class DeviceMesh:
         if ax is None or ax.transport is None:
             raise RuntimeError(f"mesh axis {name!r} has no transport")
         return ax.transport
+
+    def all_reduce(self, tensor: torch.Tensor, group: str = "tp") -> torch.Tensor:
+        """Reduce one tensor in place on a named collective axis."""
+
+        if self.is_trivial(group):
+            return tensor
+        transport = self.transport(group)
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(f"mesh axis {group!r} does not support collectives")
+        return transport.all_reduce(tensor)
+
+    def all_to_all_single_into(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_splits: tuple[int, ...] | list[int],
+        input_splits: tuple[int, ...] | list[int],
+        group: str = "sp",
+    ) -> Any:
+        """Enqueue one caller-buffered all-to-all on a named mesh axis."""
+
+        if self.is_trivial(group):
+            output.copy_(input, non_blocking=input.device.type == "cuda")
+            return None
+        transport = self.transport(group)
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(f"mesh axis {group!r} does not support collectives")
+        return transport.all_to_all_single_into(
+            output,
+            input,
+            output_splits,
+            input_splits,
+        )
+
+    def all_gather_into_tensor(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: str = "sp",
+    ) -> Any:
+        """Enqueue one caller-buffered all-gather on a named mesh axis."""
+
+        if self.is_trivial(group):
+            output.copy_(input, non_blocking=input.device.type == "cuda")
+            return None
+        transport = self.transport(group)
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(f"mesh axis {group!r} does not support collectives")
+        return transport.all_gather_into_tensor(output, input)
+
+    def broadcast(
+        self,
+        tensor: torch.Tensor,
+        *,
+        src: int,
+        group: str = "tp",
+    ) -> torch.Tensor:
+        """Broadcast one caller-owned tensor on a named mesh axis."""
+
+        if self.is_trivial(group):
+            return tensor
+        transport = self.transport(group)
+        if not isinstance(transport, BroadcastTransport):
+            raise RuntimeError(f"mesh axis {group!r} does not support broadcast")
+        return transport.broadcast(tensor, src=src)
 
     @property
     def tp_size(self) -> int:

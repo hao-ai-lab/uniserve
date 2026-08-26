@@ -121,6 +121,15 @@ def summarize(
         ]
         if ttfi:
             summary["time_to_first_image_ms"] = distribution(ttfi, scale=1000)
+    videos = [record.decoded_video for record in successful if record.decoded_video is not None]
+    if videos:
+        summary["completed_videos"] = len(videos)
+        summary["videos_per_second"] = len(videos) / duration
+        summary["media_bytes_per_second"] = sum(video.byte_size for video in videos) / duration
+        summary["video_latency_ms"] = distribution(
+            [record.latency for record in successful if record.decoded_video is not None],
+            scale=1000,
+        )
     return summary
 
 

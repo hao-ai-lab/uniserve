@@ -1,5 +1,4 @@
-//! Northbound engine contract: submit a [`GenerationSubmission`] and receive a stream
-//! of [`GenEvent`]s over a per-request channel. Supports text and image events.
+//! Northbound engine contract for streamed generation and terminal media requests.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use tokio::sync::mpsc;
@@ -138,6 +137,14 @@ pub enum GenEvent {
         pixels_png_b64: String,
         public_commit: Option<PublicCommit>,
     },
+    /// Terminal media lifecycle values used by the headless-engine transport.
+    MediaCompleted {
+        bytes: u64,
+    },
+    MediaFailed {
+        message: String,
+    },
+    MediaAborted,
     Finished {
         reason: FinishReason,
         /// The matched stop string or stop token, when `reason == Stop`.
@@ -243,7 +250,12 @@ impl EventRx {
                     });
                 }
             }
-            GenEvent::Finished { .. } | GenEvent::Rejected { .. } | GenEvent::Error { .. } => {
+            GenEvent::Finished { .. }
+            | GenEvent::Rejected { .. }
+            | GenEvent::Error { .. }
+            | GenEvent::MediaCompleted { .. }
+            | GenEvent::MediaFailed { .. }
+            | GenEvent::MediaAborted => {
                 self.cancellation = None;
             }
             _ => {}
@@ -289,6 +301,105 @@ pub struct GenerationSubmission {
     pub event_tx: EventTx,
 }
 
+/// Fixed-profile media request. Media bytes stay in the shared spool named by
+/// `output_path`; the engine protocol carries only lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MediaRequest {
+    pub request_id: RequestId,
+    pub prompt: String,
+    pub seed: u64,
+    pub priority: i32,
+    pub output_path: String,
+}
+
+impl MediaRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.prompt.trim().is_empty() {
+            return Err("media prompt must not be empty");
+        }
+        if self.output_path.is_empty() {
+            return Err("media output path must not be empty");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MediaEvent {
+    Completed { bytes: u64 },
+    Rejected { message: String },
+    Failed { message: String },
+    Aborted,
+}
+
+impl MediaEvent {
+    pub fn is_terminal(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+pub struct MediaEventTx {
+    inner: mpsc::Sender<MediaEvent>,
+}
+
+impl MediaEventTx {
+    pub fn send(&self, event: MediaEvent) -> Result<(), MediaEvent> {
+        self.inner
+            .try_send(event)
+            .map_err(|error| error.into_inner())
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+pub struct MediaEventRx {
+    inner: mpsc::Receiver<MediaEvent>,
+    waker: uniserve_core::CommandWaker,
+    cancellation: Option<EventCancellation>,
+}
+
+impl MediaEventRx {
+    pub async fn recv(&mut self) -> Option<MediaEvent> {
+        let event = self.inner.recv().await;
+        if event.is_some() {
+            self.cancellation = None;
+            self.waker.wake();
+        }
+        event
+    }
+
+    pub fn delegate_cancellation(&mut self) {
+        self.cancellation = None;
+    }
+}
+
+impl Drop for MediaEventRx {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            let _ = cancellation.tx.send(Command::Cancel {
+                request_id: cancellation.request_id,
+                output_token_count: None,
+            });
+        }
+        self.waker.wake();
+    }
+}
+
+pub struct MediaSubmission {
+    pub request: MediaRequest,
+    pub event_tx: MediaEventTx,
+}
+
+impl MediaSubmission {
+    pub fn new(request: MediaRequest, event_tx: MediaEventTx) -> Self {
+        Self { request, event_tx }
+    }
+}
+
 impl GenerationSubmission {
     pub fn new(request: GenerationRequest, event_tx: EventTx) -> Self {
         Self { request, event_tx }
@@ -298,6 +409,7 @@ impl GenerationSubmission {
 /// Command sent from a frontend handler to the scheduler thread.
 pub enum Command {
     Submit(Box<GenerationSubmission>),
+    SubmitMedia(Box<MediaSubmission>),
     /// Client-side cancel → `FinishReason::Cancelled`.
     Cancel {
         request_id: RequestId,
@@ -374,6 +486,26 @@ impl EngineHandle {
             request, event_tx,
         ))))
         .map_err(|e| e.to_string())?;
+        Ok(event_rx)
+    }
+
+    pub fn submit_media(&self, request: MediaRequest) -> Result<MediaEventRx, String> {
+        let request_id = request.request_id;
+        let (tx, rx) = mpsc::channel(1);
+        let event_tx = MediaEventTx { inner: tx };
+        let event_rx = MediaEventRx {
+            inner: rx,
+            waker: self.waker.clone(),
+            cancellation: Some(EventCancellation {
+                tx: self.tx.clone(),
+                request_id,
+                acknowledge_on_receive: false,
+            }),
+        };
+        self.send(Command::SubmitMedia(Box::new(MediaSubmission::new(
+            request, event_tx,
+        ))))
+        .map_err(|error| error.to_string())?;
         Ok(event_rx)
     }
     pub fn cancel(&self, id: RequestId) {

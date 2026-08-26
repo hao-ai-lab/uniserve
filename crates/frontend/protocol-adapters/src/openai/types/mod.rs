@@ -1,6 +1,7 @@
 mod chat_completions;
 mod common;
 mod images;
+mod videos;
 
 pub use chat_completions::{
     AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
@@ -16,3 +17,4 @@ pub use common::{
     ToolCallDelta, ToolChoice, ToolChoiceValue, TopLogProb, Usage,
 };
 pub use images::{GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse};
+pub use videos::VideoGenerationRequest;

@@ -93,7 +93,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
         BlockId(1),
         0,
     );
-    assert_execution_error(&mut executor, conflicting, "plan digest")?;
+    assert_execution_error(&mut executor, conflicting, "canonical batch identity")?;
 
     let selected = fixed_completion(first_record);
     let commit = Control::Commit {
@@ -931,6 +931,7 @@ fn token_batch(
             query_len: input_length.max(1),
         }],
         latent_placements: Vec::new(),
+        decode_placements: Vec::new(),
     };
     Batch::new(step_id, admission.into_iter().collect(), vec![partition]).with_input_products(vec![
         ProductPayload {

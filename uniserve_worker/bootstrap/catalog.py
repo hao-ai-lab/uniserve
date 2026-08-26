@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from torch import nn
 
@@ -10,9 +11,15 @@ from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..models.bagel import BagelForConditionalGeneration
 from ..models.qwen3 import Qwen3ForCausalLM
 from ..models.sensenova.model import NEOChatModel
+from ..models.minimax_h3 import MiniMaxH3Model
 from .plan import ModelLoadScope
 
-__all__ = ["CatalogEntry", "resolve_catalog_entry"]
+__all__ = ["CatalogEntry", "ExecutionKind", "resolve_catalog_entry"]
+
+
+class ExecutionKind(StrEnum):
+    MODEL = "model"
+    MEDIA = "media"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +30,7 @@ class CatalogEntry:
     model_class: type[nn.Module]
     scopes: tuple[ModelLoadScope, ...] = (ModelLoadScope.WHOLE,)
     sidecars: tuple[str, ...] = ("config.json",)
+    execution_kind: ExecutionKind = ExecutionKind.MODEL
 
     def __post_init__(self) -> None:
         if not self.architecture:
@@ -67,6 +75,20 @@ SENSENOVA_ENTRY = CatalogEntry(
         "chat_template.jinja",
     ),
 )
+MINIMAX_H3_ENTRY = CatalogEntry(
+    architecture="MiniMaxH3Transformer3DModel",
+    model_class=MiniMaxH3Model,
+    sidecars=(
+        "modular_model_index.json",
+        "transformer/config.json",
+        "text_encoder/config.json",
+        "vae/config.json",
+        "audio_vae/config.json",
+        "scheduler/scheduler_config.json",
+        "audio_scheduler/scheduler_config.json",
+    ),
+    execution_kind=ExecutionKind.MEDIA,
+)
 
 
 def resolve_catalog_entry(architectures: list[str] | tuple[str, ...]) -> CatalogEntry:
@@ -79,8 +101,11 @@ def resolve_catalog_entry(architectures: list[str] | tuple[str, ...]) -> Catalog
             return BAGEL_ENTRY
         case ("NEOChatModel",):
             return SENSENOVA_ENTRY
+        case ("MiniMaxH3Transformer3DModel",):
+            return MINIMAX_H3_ENTRY
     raise capability_mismatch(
         "configured checkpoint must declare exactly one architecture from "
-        "Qwen3ForCausalLM, BagelForConditionalGeneration, or NEOChatModel; "
+        "Qwen3ForCausalLM, BagelForConditionalGeneration, NEOChatModel, or "
+        "MiniMaxH3Transformer3DModel; "
         f"found {architectures!r}"
     )

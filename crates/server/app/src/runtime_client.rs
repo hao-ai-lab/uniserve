@@ -7,8 +7,8 @@ use tracing::warn;
 use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, RequestId};
 use uniserve_engine_api::{EngineHandle, GenEvent};
 use uniserve_engine_gateway::transport::{
-    Error, GenerationEventStream, GenerationSubmission, InProcessEngineClient, Result,
-    StreamCancelCause,
+    Error, GenerationEventStream, GenerationSubmission, InProcessEngineClient, MediaEventStream,
+    MediaSubmission, Result, StreamCancelCause,
 };
 use uniserve_engine_runtime::EngineCore;
 use uniserve_executor::Executor;
@@ -206,6 +206,58 @@ impl InProcessEngineClient for RuntimeEngineClient {
             },
             !decoder_ack_required,
         ))
+    }
+
+    fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventStream> {
+        let MediaSubmission {
+            external_request_id,
+            prompt,
+            seed,
+            priority,
+            output_path,
+            ..
+        } = submission;
+        let rid = self.core.next_request_id();
+        {
+            let mut active = lock_active(&self.active);
+            if active.contains_key(&external_request_id) {
+                return Err(Error::DuplicateRequestId {
+                    request_id: external_request_id,
+                });
+            }
+            active.insert(external_request_id.clone(), rid);
+        }
+        let request = uniserve_engine_api::MediaRequest {
+            request_id: rid,
+            prompt,
+            seed,
+            priority,
+            output_path,
+        };
+        let mut scheduler_rx = self
+            .core
+            .handle()
+            .submit_media(request)
+            .map_err(|message| {
+                remove_active_request(&self.active, &external_request_id, rid);
+                Error::ClientClosed { message }
+            })?;
+        scheduler_rx.delegate_cancellation();
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let active = Arc::clone(&self.active);
+        let active_id = external_request_id.clone();
+        tokio::spawn(async move {
+            let event = scheduler_rx
+                .recv()
+                .await
+                .unwrap_or(uniserve_engine_api::MediaEvent::Aborted);
+            let _ = event_tx.send(event).await;
+            remove_active_request(&active, &active_id, rid);
+        });
+        let handle = self.handle();
+        Ok(MediaEventStream::with_cancel(event_rx, move || {
+            handle.cancel(rid);
+        }))
     }
 
     fn abort(&self, ids: &[String]) -> Result<()> {

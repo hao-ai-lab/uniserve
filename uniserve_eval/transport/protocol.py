@@ -7,10 +7,11 @@ from typing import Any
 
 import httpx
 
-from ..types import IMAGES_GENERATIONS, RequestRecord, TaskRequest
+from ..types import IMAGES_GENERATIONS, VIDEOS_SYNC, RequestRecord, TaskRequest
 from .images import ImageOutputError, decode_openai_image_parts
 from .openai import OpenAIChat
 from .sse import aiter_sse_events
+from .video import VideoOutputError, inspect_video_bytes
 
 
 class ProtocolTransport:
@@ -246,7 +247,40 @@ class ChatSseTransport(ProtocolTransport):
         self.attach_decoded(record, image_parts)
 
 
+class VideoTransport(ProtocolTransport):
+    async def send(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        payload: dict[str, Any],
+        record: RequestRecord,
+        *,
+        prompt_len: int = 0,
+        output_len_fallback: int = 0,
+    ) -> None:
+        async with client.stream("POST", url, json=payload) as response:
+            record.note_http(response.status_code)
+            body = await response.aread()
+            record.close_now()
+            if response.status_code >= 400:
+                record.mark_failure(
+                    f"transport_status_{response.status_code}",
+                    body.decode("utf-8", errors="replace")[:500],
+                )
+                return
+            try:
+                record.decoded_video = inspect_video_bytes(
+                    body, declared_mime=response.headers.get("content-type", "")
+                )
+            except VideoOutputError as error:
+                record.mark_failure(error.classifier, str(error))
+                return
+            record.mark_success()
+
+
 def transport_for(request: TaskRequest) -> ProtocolTransport:
+    if request.endpoint == VIDEOS_SYNC:
+        return VideoTransport()
     if request.endpoint == IMAGES_GENERATIONS:
         return ImagesGenerationsTransport()
     if request.stream:

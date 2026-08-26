@@ -19,6 +19,7 @@ pub fn sim_http_config(model: impl Into<String>) -> Config {
         model: model.into(),
         model_description: ModelDescription::SenseNova,
         served_model_name: None,
+        media_spool: "/tmp/uniserve-media".into(),
         listener_mode: HttpListenerMode::BindTcp {
             host: "127.0.0.1".to_string(),
             port: 8000,

@@ -66,6 +66,10 @@ pub trait InProcessEngineClient: Send + Sync {
         &self,
         submission: crate::generation::GenerationSubmission,
     ) -> Result<GenerationEventStream>;
+    fn submit_media(
+        &self,
+        submission: crate::media::MediaSubmission,
+    ) -> Result<crate::media::MediaEventStream>;
     fn cancel(&self, ids: &[String]) -> Result<()>;
     fn abort(&self, ids: &[String]) -> Result<()>;
     fn engine_count(&self) -> usize;
@@ -152,6 +156,16 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.submit_generation(submission),
             Self::Zmq(c) => c.submit_generation(submission).await,
+        }
+    }
+
+    pub async fn submit_media(
+        &self,
+        submission: crate::media::MediaSubmission,
+    ) -> Result<crate::media::MediaEventStream> {
+        match self {
+            Self::InProcess(client) => client.submit_media(submission),
+            Self::Zmq(client) => client.submit_media(submission).await,
         }
     }
 

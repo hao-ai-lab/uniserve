@@ -200,16 +200,18 @@ use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_engine_api::{
-    Command, EventTx, FinishReason, GenEvent, GenerationSubmission, PublicCommit, PublicModality,
-    SemanticRoot,
+    Command, EventTx, FinishReason, GenEvent, GenerationSubmission, MediaEvent, MediaEventTx,
+    MediaRequest, MediaSubmission, PublicCommit, PublicModality, SemanticRoot,
 };
 use uniserve_kv::{BlockPool, BlockTable, EncoderCacheManager, KvCacheCoordinator};
 use uniserve_worker_wire::{
-    Admission, AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable,
-    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, Disposition,
-    ExecutionCapability, ForwardRow as WireForwardRow, GenAdmission, LatentPlacement, OpId,
-    OpStatus, Operation, Point, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass,
-    SamplingState, TimingCounters, UndAdmission, VersionRef, WorkVariant, WorkerCapabilities,
+    Admission, AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable, Bounds,
+    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, DType,
+    DecodeKind, DecodePlacement, DimBound, Disposition, ExecutionCapability,
+    ForwardRow as WireForwardRow, GenAdmission, GenMode, LatentPlacement, MediaAdmission,
+    MediaProfileId, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
+    ProductRef, RequestKey, ResourceClass, RouteId, SamplingState, ShapeBound, StorageClass,
+    TimingCounters, UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities,
     WorkerForwardStats,
 };
 
@@ -692,16 +694,228 @@ impl DerefMut for ReqState {
     }
 }
 
+struct KvSchedulerState {
+    block_pool: BlockPool,
+    coordinator: KvCacheCoordinator,
+    usable_blocks: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MediaCursor {
+    prepared: bool,
+    denoise_step: u32,
+    video_unit: u32,
+    audio_done: bool,
+    materialized: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaQuantum {
+    Transition,
+    Flow { step: u32 },
+    Video { unit: u32 },
+    Audio,
+    Materialize,
+}
+
+#[derive(Default)]
+struct MediaPlanner;
+
+impl MediaPlanner {
+    fn next(&self, cursor: MediaCursor) -> Option<MediaQuantum> {
+        const DENOISE_STEPS: u32 = 4;
+        // The fixed 124-frame profile is 17 * 7 + 5. Each decode unit owns
+        // one finalized 17-frame temporal chunk plus the checkpoint-defined
+        // five-frame tail/overlap geometry.
+        const VIDEO_UNITS: u32 = 7;
+        if !cursor.prepared {
+            Some(MediaQuantum::Transition)
+        } else if cursor.denoise_step < DENOISE_STEPS {
+            Some(MediaQuantum::Flow {
+                step: cursor.denoise_step,
+            })
+        } else if cursor.video_unit < VIDEO_UNITS {
+            Some(MediaQuantum::Video {
+                unit: cursor.video_unit,
+            })
+        } else if !cursor.audio_done {
+            Some(MediaQuantum::Audio)
+        } else if !cursor.materialized {
+            Some(MediaQuantum::Materialize)
+        } else {
+            None
+        }
+    }
+
+    fn advance(&self, mut cursor: MediaCursor, quantum: MediaQuantum) -> MediaCursor {
+        match quantum {
+            MediaQuantum::Transition => cursor.prepared = true,
+            MediaQuantum::Flow { step } => cursor.denoise_step = step.saturating_add(1),
+            MediaQuantum::Video { unit } => cursor.video_unit = unit.saturating_add(1),
+            MediaQuantum::Audio => cursor.audio_done = true,
+            MediaQuantum::Materialize => cursor.materialized = true,
+        }
+        cursor
+    }
+
+    fn work(&self, quantum: MediaQuantum) -> Work {
+        match quantum {
+            MediaQuantum::Transition => Work::Gen(GenMode::Transition),
+            MediaQuantum::Flow { .. } => Work::Gen(GenMode::Flow),
+            MediaQuantum::Video { .. } | MediaQuantum::Audio => Work::Gen(GenMode::Decode),
+            MediaQuantum::Materialize => Work::Materialize,
+        }
+    }
+}
+
+struct MediaFlowState {
+    request: MediaRequest,
+    event_tx: MediaEventTx,
+    request_pool_idx: u32,
+    admission: Admission,
+    admission_sent: bool,
+    committed: MediaCursor,
+    projected: MediaCursor,
+    fixed_parent: VersionRef,
+    projected_parent: VersionRef,
+    cancelled: bool,
+    failure: Option<String>,
+}
+
+enum ScheduledRequest {
+    Generation(ReqState),
+    Media(MediaFlowState),
+}
+
+#[derive(Default)]
+struct ScheduledRequests {
+    states: HashMap<RequestId, ScheduledRequest>,
+}
+
+impl ScheduledRequests {
+    fn get(&self, id: &RequestId) -> Option<&ReqState> {
+        match self.states.get(id) {
+            Some(ScheduledRequest::Generation(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn get_mut(&mut self, id: &RequestId) -> Option<&mut ReqState> {
+        match self.states.get_mut(id) {
+            Some(ScheduledRequest::Generation(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn insert(&mut self, id: RequestId, state: ReqState) -> Option<ReqState> {
+        match self.states.insert(id, ScheduledRequest::Generation(state)) {
+            Some(ScheduledRequest::Generation(previous)) => Some(previous),
+            Some(ScheduledRequest::Media(_)) => {
+                unreachable!("request identity changed from media to generation")
+            }
+            None => None,
+        }
+    }
+
+    fn remove(&mut self, id: &RequestId) -> Option<ReqState> {
+        match self.states.remove(id) {
+            Some(ScheduledRequest::Generation(state)) => Some(state),
+            Some(ScheduledRequest::Media(_)) => {
+                unreachable!("generation removal selected a media request")
+            }
+            None => None,
+        }
+    }
+
+    fn contains_key(&self, id: &RequestId) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.states
+            .values()
+            .filter(|state| matches!(state, ScheduledRequest::Generation(_)))
+            .count()
+    }
+
+    fn total_len(&self) -> usize {
+        self.states.len()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &RequestId> {
+        self.states.iter().filter_map(|(id, state)| {
+            matches!(state, ScheduledRequest::Generation(_)).then_some(id)
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&RequestId, &ReqState)> {
+        self.states.iter().filter_map(|(id, state)| match state {
+            ScheduledRequest::Generation(state) => Some((id, state)),
+            ScheduledRequest::Media(_) => None,
+        })
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut ReqState> {
+        self.states.values_mut().filter_map(|state| match state {
+            ScheduledRequest::Generation(state) => Some(state),
+            ScheduledRequest::Media(_) => None,
+        })
+    }
+
+    fn insert_media(&mut self, state: MediaFlowState) {
+        let id = state.request.request_id;
+        if self
+            .states
+            .insert(id, ScheduledRequest::Media(state))
+            .is_some()
+        {
+            unreachable!("media admission reused a running request identity");
+        }
+    }
+
+    fn media(&self, id: RequestId) -> Option<&MediaFlowState> {
+        match self.states.get(&id) {
+            Some(ScheduledRequest::Media(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn media_mut(&mut self, id: RequestId) -> Option<&mut MediaFlowState> {
+        match self.states.get_mut(&id) {
+            Some(ScheduledRequest::Media(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn media_ids(&self) -> Vec<RequestId> {
+        self.states
+            .iter()
+            .filter_map(|(id, state)| matches!(state, ScheduledRequest::Media(_)).then_some(*id))
+            .collect()
+    }
+
+    fn take_media(&mut self, id: RequestId) -> Option<MediaFlowState> {
+        match self.states.remove(&id) {
+            Some(ScheduledRequest::Media(state)) => Some(state),
+            Some(ScheduledRequest::Generation(_)) => {
+                unreachable!("media removal selected a generation request")
+            }
+            None => None,
+        }
+    }
+}
+
+struct RetiringMedia {
+    request_key: RequestKey,
+    request_pool_idx: u32,
+}
+
 pub struct Scheduler {
     executor: Box<dyn Executor>,
     caps: WorkerCapabilities,
-    block_pool: BlockPool,
-    kv_coordinator: KvCacheCoordinator,
+    kv: Option<KvSchedulerState>,
     ctrl: ControlTokens,
     config: SchedulerConfig,
-    /// Total allocatable blocks (the empty pool's free count) — the structural
-    /// admission/rejection bound.
-    usable_blocks: usize,
     /// Pluggable host-side logits-processor pipeline.
     logits_pipeline: Vec<Arc<dyn crate::logits::LogitsProcessor>>,
     custom_logits_processors: usize,
@@ -711,7 +925,7 @@ pub struct Scheduler {
     reserved_encoder_entries: usize,
     request_slots: RequestSlotPool,
     latent_pages: LatentPagePool,
-    running: HashMap<RequestId, ReqState>,
+    running: ScheduledRequests,
     /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
     /// Worker-visible sessions whose close transaction has been submitted but
@@ -719,7 +933,11 @@ pub struct Scheduler {
     /// owned until the close report establishes the worker-side retirement
     /// ordering point.
     retiring_sessions: HashMap<RequestId, RetiringSession>,
-    order: Vec<RequestId>, // stable iteration order
+    order: Vec<RequestId>, // stable cross-request iteration order
+    pending_media: VecDeque<MediaSubmission>,
+    media_planner: MediaPlanner,
+    retiring_media: HashMap<RequestId, RetiringMedia>,
+    prefer_media: bool,
     pending: Box<dyn RequestQueue>,
     cpu_continuations: CpuContinuationPool,
     cpu_task_timeout: Duration,
@@ -1029,6 +1247,7 @@ fn assembly_lane(operation_variant: WorkVariant) -> AssemblyLane {
         WorkVariant::TokenDecode | WorkVariant::TokenVerify => AssemblyLane::Decode,
         WorkVariant::Draft
         | WorkVariant::GenFlow
+        | WorkVariant::GenDecode
         | WorkVariant::GenTransition
         | WorkVariant::Materialize
         | WorkVariant::TransferProduct
@@ -1097,11 +1316,25 @@ fn domain_window_metrics(
 
 /// One submitted-but-unresolved operation tracked in a request's ordered queue.
 /// Its apply record is paired by `(operation.request_key, operation.op_id)`.
+enum InflightApply {
+    Generation(SchedulerApply),
+    Media(MediaCursor),
+}
+
 struct InflightOp {
     operation: Operation,
-    apply: SchedulerApply,
+    apply: InflightApply,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
+}
+
+impl InflightOp {
+    fn generation_apply(&self) -> &SchedulerApply {
+        match &self.apply {
+            InflightApply::Generation(apply) => apply,
+            InflightApply::Media(_) => unreachable!("media operation entered generation planning"),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1199,7 +1432,8 @@ impl Scheduler {
             .saturating_mul(max_batch_ops)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
-        let flow_slot_reserve = usize::from(caps.supported_work.contains(&WorkVariant::GenFlow));
+        let flow_slot_reserve =
+            usize::from(caps.uses_kv() && caps.supported_work.contains(&WorkVariant::GenFlow));
         let request_pool_capacity = caps.max_request_pool_size as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_slot_reserve)
@@ -1212,24 +1446,29 @@ impl Scheduler {
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
-        // build from the worker's reported KV-cache groups (hybrid layouts);
-        // Empty means one full-attention group.
-        let block_pool = if caps.groups.is_empty() {
-            BlockPool::new(caps.num_blocks as usize, caps.block_size as usize)
-        } else {
-            let specs: Vec<(uniserve_core::KvGroupKind, u32, u32)> = caps
-                .groups
-                .iter()
-                .map(|g| (g.kind, g.block_offset, g.num_blocks))
-                .collect();
-            BlockPool::with_groups(caps.num_blocks as usize, caps.block_size as usize, &specs)
-        };
-        let usable_blocks = block_pool.request_page_capacity();
+        let kv = caps.uses_kv().then(|| {
+            let block_pool = if caps.groups.is_empty() {
+                BlockPool::new(caps.num_blocks as usize, caps.block_size as usize)
+            } else {
+                let specs: Vec<(uniserve_core::KvGroupKind, u32, u32)> = caps
+                    .groups
+                    .iter()
+                    .map(|g| (g.kind, g.block_offset, g.num_blocks))
+                    .collect();
+                BlockPool::with_groups(caps.num_blocks as usize, caps.block_size as usize, &specs)
+            };
+            let usable_blocks = block_pool.request_page_capacity();
+            KvSchedulerState {
+                block_pool,
+                coordinator: KvCacheCoordinator::default(),
+                usable_blocks,
+            }
+        });
         let stats = Arc::new(SchedStats::default());
-        stats
-            .kv_cache
-            .num_blocks
-            .store(usable_blocks, Ordering::Relaxed);
+        stats.kv_cache.num_blocks.store(
+            kv.as_ref().map_or(0, |state| state.usable_blocks),
+            Ordering::Relaxed,
+        );
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
         let request_slots = RequestSlotPool::new(request_pool_capacity);
         let latent_pages = LatentPagePool::new(caps.num_latent_pages, caps.latent_page_units);
@@ -1277,22 +1516,24 @@ impl Scheduler {
         Self {
             executor,
             caps,
-            block_pool,
-            kv_coordinator: KvCacheCoordinator::default(),
+            kv,
             ctrl,
             pending: make_queue(config.policy),
             config,
-            usable_blocks,
             logits_pipeline: crate::logits::default_pipeline(),
             custom_logits_processors: 0,
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
             request_slots,
             latent_pages,
-            running: HashMap::new(),
+            running: ScheduledRequests::default(),
             completed_outputs: HashMap::new(),
             retiring_sessions: HashMap::new(),
             order: Vec::new(),
+            pending_media: VecDeque::new(),
+            media_planner: MediaPlanner,
+            retiring_media: HashMap::new(),
+            prefer_media: true,
             cpu_continuations: CpuContinuationPool::new(cpu_waker),
             cpu_task_timeout: Duration::from_secs(30),
             cpu_deadlines: HashMap::new(),
@@ -1335,10 +1576,14 @@ impl Scheduler {
         &self.config
     }
     pub fn set_prefix_cache(&mut self, on: bool) {
-        self.kv_coordinator.set_prefix_enabled(on);
+        if let Some(kv) = self.kv.as_mut() {
+            kv.coordinator.set_prefix_enabled(on);
+        }
     }
     pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        self.kv_coordinator.set_hash_algo(algo);
+        if let Some(kv) = self.kv.as_mut() {
+            kv.coordinator.set_hash_algo(algo);
+        }
     }
     /// Register an extra logits processor — no other scheduler code changes.
     pub fn with_logits_processor(mut self, p: Box<dyn crate::logits::LogitsProcessor>) -> Self {
@@ -1372,8 +1617,9 @@ impl Scheduler {
         self.config.long_prefill_threshold = n.max(1);
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
-        let flow_slot_reserve =
-            usize::from(self.caps.supported_work.contains(&WorkVariant::GenFlow));
+        let flow_slot_reserve = usize::from(
+            self.caps.uses_kv() && self.caps.supported_work.contains(&WorkVariant::GenFlow),
+        );
         let capacity = self
             .request_slots
             .capacity()
@@ -1392,6 +1638,52 @@ impl Scheduler {
         self.stats.clone()
     }
 
+    fn kv_state(&self) -> &KvSchedulerState {
+        self.kv
+            .as_ref()
+            .expect("generation scheduling requires worker KV resources")
+    }
+
+    fn free_kv_blocks(&self) -> usize {
+        self.kv
+            .as_ref()
+            .map_or(0, |state| state.block_pool.free_request_pages())
+    }
+
+    fn usable_kv_blocks(&self) -> usize {
+        self.kv.as_ref().map_or(0, |state| state.usable_blocks)
+    }
+
+    fn cached_kv_blocks(&self) -> usize {
+        self.kv
+            .as_ref()
+            .map_or(0, |state| state.block_pool.cached_blocks())
+    }
+
+    fn media_state(&self, id: RequestId) -> Option<&MediaFlowState> {
+        self.running.media(id)
+    }
+
+    fn media_state_mut(&mut self, id: RequestId) -> Option<&mut MediaFlowState> {
+        self.running.media_mut(id)
+    }
+
+    fn media_ids(&self) -> Vec<RequestId> {
+        self.running.media_ids()
+    }
+
+    fn take_media_state(&mut self, id: RequestId) -> Option<MediaFlowState> {
+        self.running.take_media(id)
+    }
+
+    fn running_request_count(&self) -> usize {
+        self.running.total_len()
+    }
+
+    fn pending_request_count(&self) -> usize {
+        self.pending.len().saturating_add(self.pending_media.len())
+    }
+
     /// Record one explainable policy decision; `free_blocks`
     /// is sampled from the block manager at the decision point.
     fn record_decision(
@@ -1400,7 +1692,7 @@ impl Scheduler {
         reason: crate::policy::PolicyReason,
         needed_blocks: usize,
     ) {
-        let free_blocks = self.block_pool.free_request_pages();
+        let free_blocks = self.free_kv_blocks();
         self.decisions.record(crate::policy::PolicyDecision {
             request,
             reason,
@@ -1418,13 +1710,13 @@ impl Scheduler {
         let mq = self.stats.encoder.cache_queries.load(Ordering::Relaxed);
         let mh = self.stats.encoder.cache_hits.load(Ordering::Relaxed);
         crate::policy::PolicySnapshot {
-            waiting: self.pending.len(),
-            running: self.running.len(),
+            waiting: self.pending_request_count(),
+            running: self.running_request_count(),
             in_flight: self.executor.in_flight(),
-            free_blocks: self.block_pool.free_request_pages(),
-            total_blocks: self.usable_blocks,
+            free_blocks: self.free_kv_blocks(),
+            total_blocks: self.usable_kv_blocks(),
             reserved_blocks: self.reserved_blocks,
-            cached_blocks: self.block_pool.cached_blocks(),
+            cached_blocks: self.cached_kv_blocks(),
             prefix_hit_rate: if pq > 0 { ph as f32 / pq as f32 } else { 0.0 },
             mm_cache_hit_rate: if mq > 0 { mh as f32 / mq as f32 } else { 0.0 },
             op_latency_us: self.latency.as_pairs(),
@@ -1508,11 +1800,11 @@ impl Scheduler {
     /// resource pressure + policy/latency + backend caps + liveness.
     pub fn health_snapshot(&self) -> HealthSnapshot {
         HealthSnapshot {
-            running: self.running.len(),
-            pending: self.pending.len(),
+            running: self.running_request_count(),
+            pending: self.pending_request_count(),
             in_flight: self.executor.in_flight(),
-            free_blocks: self.block_pool.free_request_pages(),
-            total_blocks: self.usable_blocks,
+            free_blocks: self.free_kv_blocks(),
+            total_blocks: self.usable_kv_blocks(),
             reserved_blocks: self.reserved_blocks,
             completed_traces: self.completed_traces.len(),
             last_worker_exec_us: self
@@ -1610,6 +1902,13 @@ impl Scheduler {
 
     /// Abort every queued/gated/running request with a terminal event.
     fn abort_all_requests(&mut self) {
+        while let Some(submission) = self.pending_media.pop_front() {
+            let _ = submission.event_tx.send(MediaEvent::Aborted);
+        }
+        let media = self.media_ids();
+        for id in media {
+            self.finish_media(id, MediaEvent::Aborted, CloseReason::Cancelled, None);
+        }
         let queued: Vec<RequestId> = {
             let mut ids = Vec::new();
             while let Some(st) = self.pending.pop_request() {
@@ -1635,6 +1934,7 @@ impl Scheduler {
     fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Submit(submission) => self.enqueue(*submission),
+            Command::SubmitMedia(submission) => self.enqueue_media(*submission),
             Command::Cancel {
                 request_id,
                 output_token_count,
@@ -1662,6 +1962,25 @@ impl Scheduler {
     }
 
     fn mark_cancelled(&mut self, id: RequestId, abort: bool, output_token_count: Option<usize>) {
+        if let Some(index) = self
+            .pending_media
+            .iter()
+            .position(|submission| submission.request.request_id == id)
+            && let Some(submission) = self.pending_media.remove(index)
+        {
+            let _ = submission.event_tx.send(MediaEvent::Aborted);
+            return;
+        }
+        if self.media_state(id).is_some() {
+            self.media_state_mut(id)
+                .expect("media state exists")
+                .cancelled = true;
+            let drained = !self.has_inflight(id);
+            if drained {
+                self.finish_media(id, MediaEvent::Aborted, CloseReason::Cancelled, None);
+            }
+            return;
+        }
         if let Some(st) = self.running.get_mut(&id) {
             if let Some(output_token_count) = output_token_count {
                 let Some(cutoff) = st.token_cutoffs.get(&output_token_count).cloned() else {
@@ -1852,6 +2171,12 @@ impl Scheduler {
             request: req,
             event_tx,
         } = submission;
+        if self.kv.is_none() {
+            let _ = event_tx.send(GenEvent::Rejected {
+                message: "generation request requires worker KV resources".into(),
+            });
+            return;
+        }
         let context = match SchedulerContext::lower(&req) {
             Ok(context) => context,
             Err(error) => {
@@ -1879,7 +2204,7 @@ impl Scheduler {
         // queue grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
         // in-flight request. Reject the new submit with a typed event.
-        let waiting = self.pending.len() + self.completed_outputs.len();
+        let waiting = self.pending_request_count() + self.completed_outputs.len();
         if waiting >= self.config.max_num_waiting {
             self.record_decision(
                 req.request_id,
@@ -1923,7 +2248,7 @@ impl Scheduler {
             uniserve_core::TraceId(req.request_id.0),
         );
         let st = ReqState {
-            block_tables: (0..self.block_pool.num_groups())
+            block_tables: (0..self.kv_state().block_pool.num_groups())
                 .map(|group| BlockTable::new(group, self.caps.block_size as usize))
                 .collect(),
             flow_prefix: None,
@@ -1962,6 +2287,101 @@ impl Scheduler {
         self.next_epoch = self.next_epoch.saturating_add(1);
         self.trace_request_queued(&st, "pending");
         self.pending.add_request(st);
+    }
+
+    fn enqueue_media(&mut self, submission: MediaSubmission) {
+        let request = &submission.request;
+        if let Err(message) = request.validate() {
+            let _ = submission.event_tx.send(MediaEvent::Rejected {
+                message: message.to_string(),
+            });
+            return;
+        }
+        let required = [
+            WorkVariant::GenTransition,
+            WorkVariant::GenFlow,
+            WorkVariant::GenDecode,
+            WorkVariant::Materialize,
+        ];
+        if required
+            .iter()
+            .any(|variant| !self.caps.supported_work.contains(variant))
+        {
+            let _ = submission.event_tx.send(MediaEvent::Rejected {
+                message: "worker does not support the fixed media flow".to_string(),
+            });
+            return;
+        }
+        if self.caps.max_request_pool_size < 2
+            || self.caps.num_latent_pages < 3
+            || self.caps.latent_page_units == 0
+        {
+            let _ = submission.event_tx.send(MediaEvent::Rejected {
+                message: "worker does not provide two resident media state slots".to_string(),
+            });
+            return;
+        }
+        if self.pending.len() + self.pending_media.len() + self.completed_outputs.len()
+            >= self.config.max_num_waiting
+        {
+            let _ = submission.event_tx.send(MediaEvent::Rejected {
+                message: "scheduler waiting queue is full".to_string(),
+            });
+            return;
+        }
+        self.pending_media.push_back(submission);
+    }
+
+    fn admit_media(&mut self) {
+        while !self.request_slots.is_empty()
+            && self.running_request_count() < self.config.max_num_seqs
+        {
+            let Some(submission) = self.pending_media.pop_front() else {
+                break;
+            };
+            let id = submission.request.request_id;
+            let Some(request_pool_idx) = self.request_slots.acquire() else {
+                self.pending_media.push_front(submission);
+                break;
+            };
+            if !self
+                .latent_pages
+                .reserve(id, u64::from(self.caps.latent_page_units))
+            {
+                let _ = self.request_slots.release(request_pool_idx);
+                self.pending_media.push_front(submission);
+                break;
+            }
+            let epoch = self.next_epoch;
+            self.next_epoch = self.next_epoch.saturating_add(1);
+            let request_key = RequestKey::new(self.authority_id, id, epoch);
+            let admission = Admission::new_media(
+                request_key,
+                request_pool_idx,
+                MediaAdmission {
+                    prompt: submission.request.prompt.clone(),
+                    seed: submission.request.seed,
+                    profile: MediaProfileId::MinimaxH3T2va,
+                    output_path: submission.request.output_path.clone(),
+                },
+            )
+            .expect("validated media admission");
+            let root = VersionRef::admission_root(request_key, OpId(0), admission.digest.clone());
+            self.running.insert_media(MediaFlowState {
+                request: submission.request,
+                event_tx: submission.event_tx,
+                request_pool_idx,
+                admission,
+                admission_sent: false,
+                committed: MediaCursor::default(),
+                projected: MediaCursor::default(),
+                fixed_parent: root.clone(),
+                projected_parent: root,
+                cancelled: false,
+                failure: None,
+            });
+            self.order.push(id);
+        }
     }
 
     fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
@@ -2045,13 +2465,14 @@ impl Scheduler {
         let Some(request_pool_idx) = self.request_slots.acquire() else {
             return false;
         };
-        let mut block_tables = (0..self.block_pool.num_groups())
+        let mut block_tables = (0..self.kv_state().block_pool.num_groups())
             .map(|group| BlockTable::new(group, self.caps.block_size as usize))
             .collect::<Vec<_>>();
-        let Some(new_pages) =
-            self.kv_coordinator
-                .ensure_capacity(&self.block_pool, &mut block_tables, prefix_tokens)
-        else {
+        let Some(new_pages) = self.kv_state().coordinator.ensure_capacity(
+            &self.kv_state().block_pool,
+            &mut block_tables,
+            prefix_tokens,
+        ) else {
             let _ = self.request_slots.release(request_pool_idx);
             return false;
         };
@@ -2197,14 +2618,26 @@ impl Scheduler {
         // the complete resident cohort instead of admitting only when a slot
         // happens to open.
         self.admit();
+        self.admit_media();
         progressed |= self.start_cpu_continuations();
 
         // 4. submit as many batches as pipeline capacity allows.
         while self.executor.can_submit() {
             self.admit();
+            self.admit_media();
             progressed |= self.start_cpu_continuations();
+            if self.prefer_media && self.submit_media_batch() {
+                self.prefer_media = false;
+                progressed = true;
+                continue;
+            }
             let (new_reqs, ops) = self.assemble();
             if ops.is_empty() {
+                if self.submit_media_batch() {
+                    self.prefer_media = false;
+                    progressed = true;
+                    continue;
+                }
                 break;
             }
             // A prompt batch carries only the controls addressed to its own
@@ -2229,6 +2662,7 @@ impl Scheduler {
             if !self.submit_batch(new_reqs, ops, controls) {
                 break;
             }
+            self.prefer_media = true;
             progressed = true;
         }
         while self.executor.can_submit() && !self.pending_controls.is_empty() {
@@ -2242,39 +2676,252 @@ impl Scheduler {
         progressed
     }
 
+    fn media_completion_product(&mut self, request_key: RequestKey, op_id: OpId) -> ProductRef {
+        let generation = u32::try_from(self.next_product_generation.max(1))
+            .expect("media product generation exhausted");
+        self.next_product_generation = u64::from(generation).saturating_add(1);
+        ProductRef {
+            request_key,
+            producer_op_id: op_id,
+            output_index: 0,
+            generation,
+            kind: ProductKind::Completion,
+            storage_class: StorageClass::DeviceTensor,
+            dtype: DType::U32,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(1)],
+            },
+            point_range: PointRange {
+                base_point: 1,
+                max_points: 1,
+            },
+        }
+    }
+
+    fn submit_media_batch(&mut self) -> bool {
+        let max_unresolved = usize::try_from(self.caps.max_unresolved_window.max(1))
+            .unwrap_or(usize::MAX)
+            .min(self.executor.pipeline_depth().max(1));
+        let mut candidates = self
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| {
+                self.media_state(*id).and_then(|state| {
+                    let inflight = self.inflight_len(*id);
+                    (!state.cancelled
+                        && state.failure.is_none()
+                        && inflight < max_unresolved
+                        && self.media_planner.next(state.projected).is_some())
+                    .then_some((inflight, index, *id))
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(inflight, index, _)| (*inflight > 0, *index));
+        candidates.truncate(self.config.max_batch);
+        if candidates.is_empty() {
+            return false;
+        }
+
+        let step = self.step_id.saturating_add(1);
+        self.step_id = step;
+        let submit_at = Instant::now();
+        let collective_seq = self.next_collective_seq.max(1);
+        self.next_collective_seq = collective_seq.saturating_add(1);
+        let mut admissions = Vec::new();
+        let mut operations = Vec::with_capacity(candidates.len());
+        let mut latent_placements = Vec::new();
+        let mut decode_placements = Vec::new();
+        let mut controls = Vec::new();
+
+        for (_, _, id) in candidates {
+            let (request_key, parent, predicate, quantum, cursor_after) = {
+                let state = self.media_state(id).expect("media candidate exists");
+                let quantum = self
+                    .media_planner
+                    .next(state.projected)
+                    .expect("media candidate is runnable");
+                let predicate = self
+                    .inflight_ops
+                    .get(&id)
+                    .and_then(|inflight| inflight.back())
+                    .and_then(|inflight| inflight.operation.outputs.first().cloned());
+                (
+                    state.admission.request_key,
+                    state.projected_parent.clone(),
+                    predicate,
+                    quantum,
+                    self.media_planner.advance(state.projected, quantum),
+                )
+            };
+            let op_id = OpId(self.next_op_id.max(1));
+            self.next_op_id = self.next_op_id.saturating_add(1);
+            let work = self.media_planner.work(quantum);
+            let outputs = if matches!(quantum, MediaQuantum::Materialize) {
+                Vec::new()
+            } else {
+                vec![self.media_completion_product(request_key, op_id)]
+            };
+            let operation = Operation::registered(
+                request_key,
+                op_id,
+                parent,
+                work,
+                RouteId(0),
+                uniserve_worker_wire::Domain::Flow,
+                Bounds {
+                    max_points: 1,
+                    ..Bounds::default()
+                },
+                Vec::new(),
+                outputs,
+                predicate,
+                None,
+                0,
+            );
+            if matches!(
+                quantum,
+                MediaQuantum::Transition | MediaQuantum::Flow { .. }
+            ) {
+                let (start_step, step_count) = match quantum {
+                    MediaQuantum::Flow { step } => (step, 1),
+                    _ => (0, 0),
+                };
+                latent_placements.push(LatentPlacement {
+                    request_key,
+                    op_id,
+                    page_table: self.latent_pages.pages_for(id).to_vec(),
+                    latent_units: self.caps.latent_page_units,
+                    height: 768,
+                    width: 1344,
+                    start_step,
+                    step_count,
+                });
+            }
+            match quantum {
+                MediaQuantum::Video { unit } => decode_placements.push(DecodePlacement {
+                    request_key,
+                    op_id,
+                    kind: DecodeKind::Video,
+                    start_unit: unit,
+                    unit_count: 1,
+                }),
+                MediaQuantum::Audio => decode_placements.push(DecodePlacement {
+                    request_key,
+                    op_id,
+                    kind: DecodeKind::Audio,
+                    start_unit: 0,
+                    unit_count: 1,
+                }),
+                _ => {}
+            }
+            if operation.parent.producer_op_id.0 > 0 {
+                controls.push(Control::Release {
+                    request_key,
+                    op_id: operation.parent.producer_op_id,
+                });
+            }
+            let projected_parent = VersionRef {
+                request_key,
+                producer_op_id: op_id,
+                point: Point::Device {
+                    point_index: 1,
+                    selected_point: None,
+                    producer_plan_digest: operation.plan_digest.clone(),
+                },
+            };
+            let state = self.media_state_mut(id).expect("media candidate exists");
+            if !state.admission_sent {
+                admissions.push(state.admission.clone());
+                state.admission_sent = true;
+            }
+            state.projected = cursor_after;
+            state.projected_parent = projected_parent;
+            let operation_for_batch = operation.clone();
+            self.register_media_inflight(operation, cursor_after, submit_at);
+            operations.push(operation_for_batch);
+        }
+
+        let partition = BatchPartition {
+            partition_id: 1,
+            submission_group: 1,
+            collective_seq,
+            domain: uniserve_worker_wire::Domain::Flow,
+            route: RouteId(0),
+            execution: ExecutionCapability::DomainHomogeneous,
+            attention: AttentionRegime::None,
+            shape_class: 0,
+            operations,
+            block_tables: Vec::new(),
+            new_cache_pages: Vec::new(),
+            forward_rows: Vec::new(),
+            latent_placements,
+            decode_placements,
+        };
+        self.batch_started.insert(step, submit_at);
+        self.batch_partitions.insert(
+            step,
+            HashMap::from([(
+                1,
+                SubmittedPartitionAccounting {
+                    domain: uniserve_worker_wire::Domain::Flow,
+                    execution: ExecutionCapability::DomainHomogeneous,
+                    submission_group: 1,
+                    operation_count: partition.operations.len(),
+                },
+            )]),
+        );
+        self.batch_group_worker_exec_us.insert(step, HashMap::new());
+        let batch = Batch::new(step, admissions, vec![partition]).with_controls(controls.clone());
+        if let Err(error) = self.executor.submit(batch) {
+            self.batch_started.remove(&step);
+            self.batch_partitions.remove(&step);
+            self.batch_group_worker_exec_us.remove(&step);
+            self.fatal = true;
+            self.fail_all_running(&error.to_string());
+            return false;
+        }
+        if !controls.is_empty() {
+            self.control_batches.insert(step, controls);
+        }
+        true
+    }
+
     /// Surface cache observability (events drained into counters).
     fn publish_cache_stats(&mut self) {
         self.stats
             .general
             .running
-            .store(self.running.len(), Ordering::Relaxed);
+            .store(self.running_request_count(), Ordering::Relaxed);
         self.stats
             .general
             .pending
-            .store(self.pending.len(), Ordering::Relaxed);
+            .store(self.pending_request_count(), Ordering::Relaxed);
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.block_pool.free_request_pages(), Ordering::Relaxed);
+            .store(self.free_kv_blocks(), Ordering::Relaxed);
         self.stats
             .general
             .in_flight
             .store(self.executor.in_flight(), Ordering::Relaxed);
         // drain the manager's event ring so it doesn't grow unbounded; the
         // counters below already aggregate it, but draining keeps memory bounded.
-        let _ = self.block_pool.drain_events();
-        self.stats
-            .kv_cache
-            .blocks_evicted
-            .store(self.block_pool.stats().evictions, Ordering::Relaxed);
-        self.stats
-            .kv_cache
-            .blocks_stored
-            .store(self.block_pool.stats().blocks_stored, Ordering::Relaxed);
-        self.stats
-            .kv_cache
-            .cached_blocks
-            .store(self.block_pool.cached_blocks(), Ordering::Relaxed);
+        if let Some(kv) = self.kv.as_ref() {
+            let _ = kv.block_pool.drain_events();
+            self.stats
+                .kv_cache
+                .blocks_evicted
+                .store(kv.block_pool.stats().evictions, Ordering::Relaxed);
+            self.stats
+                .kv_cache
+                .blocks_stored
+                .store(kv.block_pool.stats().blocks_stored, Ordering::Relaxed);
+            self.stats
+                .kv_cache
+                .cached_blocks
+                .store(kv.block_pool.cached_blocks(), Ordering::Relaxed);
+        }
         self.stats
             .encoder
             .cache_queries
@@ -2345,7 +2992,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|op| &op.apply);
+            .map(InflightOp::generation_apply);
         st.cursor.project(applies)
     }
 
@@ -2368,7 +3015,7 @@ impl Scheduler {
             projected.phase = Phase::CommitGen;
         }
         for inflight in self.inflight_ops.get(&id).into_iter().flatten() {
-            match &inflight.apply.delta {
+            match &inflight.generation_apply().delta {
                 TransitionDelta::CloseKv {
                     image_id,
                     logical_position,
@@ -2607,6 +3254,36 @@ impl Scheduler {
         for control in controls {
             if let Control::Close { request_key, .. } = control {
                 let id = request_key.session_id;
+                if let Some(retiring) = self.retiring_media.get(&id) {
+                    if retiring.request_key != *request_key {
+                        tracing::error!(
+                            request_id = id.0,
+                            "media close acknowledgement mismatched its session"
+                        );
+                        self.fatal = true;
+                        continue;
+                    }
+                    let request_pool_idx = retiring.request_pool_idx;
+                    match self.executor.control_wait(ControlOp::DropSession(id), None) {
+                        Ok(_) => {
+                            self.retiring_media.remove(&id);
+                            self.latent_pages.release(id);
+                            if let Err(error) = self.request_slots.release(request_pool_idx) {
+                                tracing::error!(
+                                    request_id = id.0,
+                                    error,
+                                    "failed to release media request slot"
+                                );
+                                self.fatal = true;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(request_id = id.0, %error, "media worker session retirement failed");
+                            self.fatal = true;
+                        }
+                    }
+                    continue;
+                }
                 let Some(retiring) = self.retiring_sessions.get(&id) else {
                     tracing::error!(
                         request_id = id.0,
@@ -2708,7 +3385,7 @@ impl Scheduler {
         }
         if target == WorkVariant::TokenDecode {
             let feedback_continuation = matches!(
-                predecessor.apply.delta,
+                predecessor.generation_apply().delta,
                 TransitionDelta::FeedbackState {
                     is_final_step: true,
                     ..
@@ -2876,7 +3553,11 @@ impl Scheduler {
     }
 
     fn start_cpu_continuations(&mut self) -> bool {
-        let ids = self.order.clone();
+        let ids = self
+            .order
+            .iter()
+            .filter_map(|id| self.running.get(id).is_some().then_some(*id))
+            .collect::<Vec<_>>();
         let mut progressed = false;
         for id in ids {
             let required = self
@@ -3012,7 +3693,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|operation| operation.apply.output_event_bound)
+            .map(|operation| operation.generation_apply().output_event_bound)
             .sum::<usize>();
         available
             .saturating_sub(reserved)
@@ -3033,6 +3714,30 @@ impl Scheduler {
         &mut self,
         operation: Operation,
         apply: SchedulerApply,
+        started: Instant,
+        queue_us: u64,
+    ) {
+        self.register_inflight_apply(
+            operation,
+            InflightApply::Generation(apply),
+            started,
+            queue_us,
+        );
+    }
+
+    fn register_media_inflight(
+        &mut self,
+        operation: Operation,
+        cursor_after: MediaCursor,
+        started: Instant,
+    ) {
+        self.register_inflight_apply(operation, InflightApply::Media(cursor_after), started, 0);
+    }
+
+    fn register_inflight_apply(
+        &mut self,
+        operation: Operation,
+        apply: InflightApply,
         started: Instant,
         queue_us: u64,
     ) {
@@ -3139,7 +3844,10 @@ impl Scheduler {
                 "request_id": id.0,
                 "op_id": op_id,
             }));
-            if self.running.contains_key(&id) {
+            if let Some(state) = self.media_state_mut(id) {
+                state.failure = Some("worker returned an unknown media operation".to_string());
+                state.cancelled = true;
+            } else if self.running.contains_key(&id) {
                 self.finish(id, FinishReason::Error);
             }
             return;
@@ -3152,6 +3860,107 @@ impl Scheduler {
                 record,
                 products,
                 arrival_seq,
+            },
+        );
+    }
+
+    fn apply_media_completion(
+        &mut self,
+        operation: Operation,
+        cursor_after: MediaCursor,
+        record: CompletionRecord,
+    ) {
+        let id = record.request_key.session_id;
+        let Some(state) = self.media_state(id) else {
+            return;
+        };
+        let already_failed = state.failure.is_some();
+        if !already_failed {
+            let valid = record.status == OpStatus::Ok
+                && record.request_key == operation.request_key
+                && record.op_id == operation.op_id
+                && (!operation.advances_state || record.selected_point > 0);
+            if !valid {
+                if let Some(state) = self.media_state_mut(id) {
+                    state.failure = Some("media worker operation failed".to_string());
+                    state.cancelled = true;
+                }
+            } else if let Some(state) = self.media_state_mut(id) {
+                state.committed = cursor_after;
+                if operation.advances_state {
+                    state.fixed_parent = VersionRef {
+                        request_key: record.request_key,
+                        producer_op_id: record.op_id,
+                        point: Point::Fixed {
+                            point_index: record.selected_point,
+                            semantic_digest: record.semantic_digest.clone(),
+                        },
+                    };
+                }
+            }
+        }
+
+        let terminal = self.media_state(id).and_then(|state| {
+            if self.has_inflight(id) {
+                return None;
+            }
+            if let Some(message) = state.failure.clone() {
+                Some((MediaEvent::Failed { message }, CloseReason::Error))
+            } else if state.cancelled || state.event_tx.is_closed() {
+                Some((MediaEvent::Aborted, CloseReason::Cancelled))
+            } else if state.committed.materialized {
+                let event = match std::fs::metadata(&state.request.output_path) {
+                    Ok(metadata) => MediaEvent::Completed {
+                        bytes: metadata.len(),
+                    },
+                    Err(error) => MediaEvent::Failed {
+                        message: format!("media output was not materialized: {error}"),
+                    },
+                };
+                let reason = if matches!(event, MediaEvent::Completed { .. }) {
+                    CloseReason::Completed
+                } else {
+                    CloseReason::Error
+                };
+                Some((event, reason))
+            } else {
+                None
+            }
+        });
+        if let Some((event, reason)) = terminal {
+            self.finish_media(id, event, reason, None);
+        }
+    }
+
+    fn finish_media(
+        &mut self,
+        id: RequestId,
+        event: MediaEvent,
+        reason: CloseReason,
+        cutoff: Option<VersionRef>,
+    ) {
+        let Some(state) = self.take_media_state(id) else {
+            return;
+        };
+        self.order.retain(|candidate| *candidate != id);
+        let _ = state.event_tx.send(event);
+        if !state.admission_sent {
+            self.latent_pages.release(id);
+            let _ = self.request_slots.release(state.request_pool_idx);
+            return;
+        }
+        let request_key = state.admission.request_key;
+        self.pending_controls.push_back(Control::Close {
+            request_key,
+            control_seq: 1,
+            cutoff: cutoff.unwrap_or(state.fixed_parent),
+            reason,
+        });
+        self.retiring_media.insert(
+            id,
+            RetiringMedia {
+                request_key,
+                request_pool_idx: state.request_pool_idx,
             },
         );
     }
@@ -3193,7 +4002,7 @@ impl Scheduler {
         &mut self,
         request_key: RequestKey,
         op_id: u64,
-    ) -> Option<(Operation, SchedulerApply, Instant)> {
+    ) -> Option<(Operation, InflightApply, Instant)> {
         let id = request_key.session_id;
         let queue = self.inflight_ops.get_mut(&id)?;
         if op_id == 0
@@ -3485,17 +4294,28 @@ impl Scheduler {
                         "request_id": id.0,
                         "op_id": op_id,
                     }));
-                    if self.running.contains_key(&id) {
+                    if let Some(state) = self.media_state_mut(id) {
+                        state.failure =
+                            Some("worker returned an out-of-order media operation".to_string());
+                        state.cancelled = true;
+                    } else if self.running.contains_key(&id) {
                         self.finish(id, FinishReason::Error);
                     }
                     continue;
                 };
                 let operation_variant = operation.work.variant();
-                let view = SequenceView::from_report(&record, products.as_ref());
                 // fold this op's host-side round-trip latency into the history.
                 let roundtrip_us = started.elapsed().as_micros() as u64;
                 self.latency
                     .observe(operation_variant.as_wire_str(), roundtrip_us);
+                let apply = match apply {
+                    InflightApply::Media(cursor_after) => {
+                        self.apply_media_completion(operation, cursor_after, record);
+                        continue;
+                    }
+                    InflightApply::Generation(apply) => apply,
+                };
+                let view = SequenceView::from_report(&record, products.as_ref());
                 // record the op-resolved lifecycle event (op_id echoed by the
                 // worker, host round-trip + worker compute time).
                 let sampled_token_ids_len = view.committed_tokens.len();
@@ -4077,6 +4897,22 @@ impl Scheduler {
         self.prefill_steps.clear();
         self.batch_partitions.clear();
         self.batch_group_worker_exec_us.clear();
+        while let Some(submission) = self.pending_media.pop_front() {
+            let _ = submission.event_tx.send(MediaEvent::Failed {
+                message: message.to_string(),
+            });
+        }
+        let media = self.media_ids();
+        for id in media {
+            self.finish_media(
+                id,
+                MediaEvent::Failed {
+                    message: message.to_string(),
+                },
+                CloseReason::Error,
+                None,
+            );
+        }
         let ids = self.running.keys().copied().collect::<Vec<_>>();
         for id in ids {
             self.emit(
@@ -4109,6 +4945,29 @@ impl Scheduler {
             };
             self.finish(id, reason);
         }
+        let media = self
+            .order
+            .iter()
+            .filter_map(|id| {
+                self.media_state(*id)
+                    .filter(|state| state.cancelled && !self.has_inflight(state.request.request_id))
+                    .map(|state| state.request.request_id)
+            })
+            .collect::<Vec<_>>();
+        for id in media {
+            let event = self
+                .media_state(id)
+                .and_then(|state| state.failure.clone())
+                .map_or(MediaEvent::Aborted, |message| MediaEvent::Failed {
+                    message,
+                });
+            let reason = if matches!(event, MediaEvent::Failed { .. }) {
+                CloseReason::Error
+            } else {
+                CloseReason::Cancelled
+            };
+            self.finish_media(id, event, reason, None);
+        }
     }
 
     /// Admission: consume the waiting-queue head while budgets allow (vLLM's
@@ -4118,7 +4977,9 @@ impl Scheduler {
     fn admit(&mut self) {
         let bs = self.caps.block_size as usize;
         loop {
-            if self.running.len() >= self.config.max_num_seqs || self.request_slots.is_empty() {
+            if self.running_request_count() >= self.config.max_num_seqs
+                || self.request_slots.is_empty()
+            {
                 break;
             }
             let Some(head) = self.pending.peek_request() else {
@@ -4131,7 +4992,7 @@ impl Scheduler {
                     .reserved_encoder_entries
                     .saturating_add(encoder_entries)
                     <= self.enc_cache.budget();
-                if need > self.usable_blocks {
+                if need > self.usable_kv_blocks() {
                     let st = self.pending.pop_request().unwrap();
                     self.record_decision(
                         st.req.request_id,
@@ -4144,7 +5005,7 @@ impl Scheduler {
                         "request_id": st.req.request_id.0,
                         "reason": "too_large",
                         "needed_blocks": need,
-                        "usable_blocks": self.usable_blocks,
+                        "usable_blocks": self.usable_kv_blocks(),
                         "generation": behavior_str(&st.req),
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
@@ -4153,7 +5014,7 @@ impl Scheduler {
                     });
                     continue;
                 }
-                if self.block_pool.free_request_pages() >= need && encoder_ok {
+                if self.free_kv_blocks() >= need && encoder_ok {
                     let st = self.pending.pop_request().unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
@@ -4166,14 +5027,14 @@ impl Scheduler {
                 }
             } else {
                 let n = head.context.prompt_ids.len();
-                let text_usable_blocks = (0..self.block_pool.num_groups())
-                    .map(|group| self.block_pool.group_capacity(group))
+                let text_usable_blocks = (0..self.kv_state().block_pool.num_groups())
+                    .map(|group| self.kv_state().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
                 let prefix_admission = crate::prefix_cache::cached_blocks_for_admission(
-                    &self.kv_coordinator,
+                    &self.kv_state().coordinator,
                     head,
-                    &self.block_pool,
+                    &self.kv_state().block_pool,
                 );
                 let cached_prefix_blocks = prefix_admission.cached_blocks;
                 let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
@@ -4210,10 +5071,11 @@ impl Scheduler {
                     continue;
                 }
                 let capacity_available = prefix_admission.cached_free_blocks.len()
-                    == self.block_pool.num_groups()
+                    == self.kv_state().block_pool.num_groups()
                     && prefix_admission.cached_free_blocks.iter().enumerate().all(
                         |(group, cached_free)| {
-                            self.block_pool
+                            self.kv_state()
+                                .block_pool
                                 .free_blocks_in_group(group)
                                 .saturating_sub(*cached_free)
                                 >= first_chunk_blocks
@@ -4296,12 +5158,16 @@ impl Scheduler {
             "worstcase_blocks": worstcase_blocks,
             "running": self.running.len(),
             "pending": self.pending.len(),
-            "free_blocks": self.block_pool.free_request_pages(),
+            "free_blocks": self.free_kv_blocks(),
             "reserved_blocks": self.reserved_blocks,
             "reserved_encoder_entries": self.reserved_encoder_entries,
         }));
         if let Some(st) = self.running.get_mut(&id) {
-            crate::prefix_cache::lookup(&self.kv_coordinator, st, &self.block_pool, &self.stats);
+            let kv = self
+                .kv
+                .as_ref()
+                .expect("generation admission requires worker KV resources");
+            crate::prefix_cache::lookup(&kv.coordinator, st, &kv.block_pool, &self.stats);
         }
     }
 
@@ -4527,7 +5393,12 @@ impl Scheduler {
     }
 
     fn assembly_order(&self) -> Vec<RequestId> {
-        let mut ids: Vec<(usize, RequestId)> = self.order.iter().copied().enumerate().collect();
+        let mut ids: Vec<(usize, RequestId)> = self
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| self.running.get(id).is_some().then_some((index, *id)))
+            .collect();
         ids.sort_by_key(|(idx, id)| (self.assembly_priority(*id), *idx));
         ids.into_iter().map(|(_, id)| id).collect()
     }
@@ -4543,7 +5414,7 @@ impl Scheduler {
                 | WorkVariant::Materialize
                 | WorkVariant::TransferKvInstall,
             ) => 1,
-            Some(WorkVariant::GenFlow) => 2,
+            Some(WorkVariant::GenFlow | WorkVariant::GenDecode) => 2,
             Some(
                 WorkVariant::Draft
                 | WorkVariant::GenTransition
@@ -4725,7 +5596,7 @@ impl Scheduler {
             if let Some(lengths) = kv_lengths {
                 let table_changed =
                     admitted_request_keys.contains(&request_key) || new_page_count > 0;
-                for group_id in 0..self.block_pool.num_groups() {
+                for group_id in 0..self.kv_state().block_pool.num_groups() {
                     let page_ids = self
                         .running
                         .get(&request_id)
@@ -5013,15 +5884,15 @@ impl Scheduler {
         self.stats
             .general
             .running
-            .store(self.running.len(), Ordering::Relaxed);
+            .store(self.running_request_count(), Ordering::Relaxed);
         self.stats
             .general
             .pending
-            .store(self.pending.len(), Ordering::Relaxed);
+            .store(self.pending_request_count(), Ordering::Relaxed);
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.block_pool.free_request_pages(), Ordering::Relaxed);
+            .store(self.free_kv_blocks(), Ordering::Relaxed);
         let mixed = wire_ops.first().is_some_and(|first| {
             wire_ops
                 .iter()
@@ -5065,7 +5936,7 @@ impl Scheduler {
                 "running": self.running.len(),
                 "pending": self.pending.len(),
                 "in_flight_before_submit": self.executor.in_flight(),
-                "free_blocks": self.block_pool.free_request_pages(),
+                "free_blocks": self.free_kv_blocks(),
                 "reserved_blocks": self.reserved_blocks,
                 "worker_image_latent_active": self.worker_image_latent_used(),
                 "worker_image_latent_capacity": self.caps.latent_capacity_units(),
@@ -5233,6 +6104,7 @@ impl Scheduler {
                         new_cache_pages: partition_new_cache_pages,
                         forward_rows: partition_forward_rows,
                         latent_placements,
+                        decode_placements: Vec::new(),
                     });
                     next_partition_id = next_partition_id.saturating_add(1);
                 }
@@ -5267,6 +6139,7 @@ impl Scheduler {
                     new_cache_pages: partition_new_cache_pages,
                     forward_rows: partition_forward_rows,
                     latent_placements,
+                    decode_placements: Vec::new(),
                 });
                 next_partition_id = next_partition_id.saturating_add(1);
                 next_submission_group = next_submission_group.saturating_add(1);
@@ -5386,18 +6259,23 @@ impl Scheduler {
     }
 
     fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
+        let kv = self
+            .kv
+            .as_ref()
+            .expect("generation scheduling requires worker KV resources");
         let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
-        self.kv_coordinator
-            .ensure_capacity(&self.block_pool, &mut state.block_tables, total_tokens)
+        kv.coordinator
+            .ensure_capacity(&kv.block_pool, &mut state.block_tables, total_tokens)
             .is_some()
     }
 
     fn activate_request_tables(&self, id: RequestId) {
+        let kv = self.kv_state();
         if let Some(state) = self.running.get(&id) {
             for table in &state.block_tables {
-                table.activate(&self.block_pool);
+                table.activate(&kv.block_pool);
             }
         }
     }
@@ -5941,7 +6819,7 @@ impl Scheduler {
                     .flatten()
                     .filter(|inflight| {
                         matches!(
-                            inflight.apply.delta,
+                            inflight.generation_apply().delta,
                             TransitionDelta::FeedbackState {
                                 is_final_step: true,
                                 ..
@@ -6245,7 +7123,11 @@ impl Scheduler {
                 // the prompt is fully prefilled now — publish its full
                 // blocks to the prefix cache for later requests to reuse.
                 if let Some(st) = self.running.get_mut(&id) {
-                    crate::prefix_cache::cache_blocks(&self.kv_coordinator, st, &self.block_pool);
+                    let kv = self
+                        .kv
+                        .as_ref()
+                        .expect("generation scheduling requires worker KV resources");
+                    crate::prefix_cache::cache_blocks(&kv.coordinator, st, &kv.block_pool);
                 }
                 // A description-lowered prefix may already end at a branch trigger.
                 // Treat that boundary exactly like a sampled trigger.
@@ -6343,6 +7225,7 @@ impl Scheduler {
                 // count reaches `image.steps` (see the `Phase::DenoiseGen`
                 // planner); a worker completion flag does not drive termination.
             }
+            WorkVariant::GenDecode => {}
             WorkVariant::Materialize => {
                 let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
                 self.emit(id, GenEvent::ImageCommit { image_id });
@@ -6585,7 +7468,7 @@ impl Scheduler {
             "request_id": id.0,
             "required_blocks": required_blocks,
             "allocated_blocks": allocated_blocks,
-            "free_blocks": self.block_pool.free_request_pages(),
+            "free_blocks": self.free_kv_blocks(),
             "reserved_blocks": self.reserved_blocks,
         }));
         true
@@ -6974,7 +7857,7 @@ impl Scheduler {
                 );
                 awaits_close = true;
             }
-            self.order.retain(|x| *x != id);
+            self.order.retain(|request| *request != id);
             self.reserved_encoder_entries = self
                 .reserved_encoder_entries
                 .saturating_sub(st.req.resources.encoder_cache_keys.len());
@@ -7258,6 +8141,7 @@ fn partition_attention(operations: &[Operation]) -> AttentionRegime {
             | WorkVariant::Draft => AttentionRegime::Causal,
             WorkVariant::GenFlow => AttentionRegime::Hybrid,
             WorkVariant::GenTransition
+            | WorkVariant::GenDecode
             | WorkVariant::EncodeVision
             | WorkVariant::EncodeLatent
             | WorkVariant::TransferProduct
@@ -7286,6 +8170,7 @@ fn transition_output_bound(transition: &PlannedTransition) -> usize {
             }),
         WorkVariant::TokenExtend | WorkVariant::TokenDecode => 4,
         WorkVariant::GenFlow => transition.token_cost.saturating_add(2),
+        WorkVariant::GenDecode => 2,
         WorkVariant::Materialize => 3,
         _ => 2,
     }

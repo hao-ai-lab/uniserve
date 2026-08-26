@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from ..batch import SamplingOwnership
 from ..capabilities import (
+    KvGroupKind,
+    KvGroupSpec,
     RankInfo,
     RequestKind,
     ResourceClass,
@@ -151,7 +153,16 @@ def resolve_capabilities(
         max_cfg_branches=int(flow.max_cfg_branches) if flow is not None else 1,
         rank=RankInfo(tp_rank=int(deployment.tp_rank), tp_size=int(deployment.tp_size)),
         pipeline_depth=int(pipeline_depth),
-        groups=(),
+        groups=(
+            KvGroupSpec(
+                group_id=0,
+                block_offset=0,
+                num_blocks=int(capacity.num_blocks),
+                kind=KvGroupKind.FULL,
+                window=0,
+                sink=0,
+            ),
+        ),
         model_identity=architecture_digest or "",
         weight_digest=weight_digest or "",
     )

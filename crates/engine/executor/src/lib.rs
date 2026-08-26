@@ -52,6 +52,7 @@ const DECODE_WORK: &[WorkVariant] = &[
     WorkVariant::TokenVerify,
     WorkVariant::GenTransition,
     WorkVariant::GenFlow,
+    WorkVariant::GenDecode,
     WorkVariant::Materialize,
     WorkVariant::TransferKvPublish,
     WorkVariant::TransferKvInstall,
@@ -68,6 +69,7 @@ const UND_WORK: &[WorkVariant] = &[
 const GEN_WORK: &[WorkVariant] = &[
     WorkVariant::GenTransition,
     WorkVariant::GenFlow,
+    WorkVariant::GenDecode,
     WorkVariant::Materialize,
 ];
 
