@@ -13,7 +13,6 @@ from uniserve_worker.batch import (
     DeviceDim,
     DrawLayout,
     FinishFlags,
-    GenMode,
     Operation,
     ProductKind,
     ProductPayload,
@@ -22,6 +21,7 @@ from uniserve_worker.batch import (
     StorageClass,
     TokenSpan,
     TransferMode,
+    ForwardMode,
 )
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.runtime.device_products import ImageRange, device_product_storage
@@ -37,10 +37,11 @@ from .rows import OperationState, PartitionState
 def run_action(runtime: object, state: OperationState) -> bool:
     if state.phase != "initial":
         return False
-    if state.operation.work.kind == "gen" and state.operation.work.mode == GenMode.TRANSITION.value:
+    work = state.operation.work
+    if work is ForwardMode.GEN_TRANSITION:
         _transition(runtime, state)
         return True
-    if state.operation.work.kind not in {"token", "gen", "encode", "materialize"}:
+    if work.transfer_mode is not None or work is ForwardMode.DRAFT:
         _transfer(runtime, state)
         return True
     return False
@@ -145,8 +146,8 @@ def _transfer(runtime: object, state: OperationState) -> None:
     if transport is None:
         raise capability_mismatch("product transfer requires a configured transport")
     session_id = operation.request_key.session_id
-    mode = operation.work.mode
-    if mode == TransferMode.KV_PUBLISH.value:
+    mode = operation.work.transfer_mode
+    if mode is TransferMode.KV_PUBLISH:
         point = ops._fixed_parent(operation)
         outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
         if len(outputs) != 1:
@@ -183,7 +184,7 @@ def _transfer(runtime: object, state: OperationState) -> None:
             partition,
             products=(ProductPayload(product=outputs[0], payload=cast(bytes, payload)),),
         )
-    elif mode == TransferMode.KV_INSTALL.value:
+    elif mode is TransferMode.KV_INSTALL:
         inputs = tuple(
             reference for reference in operation.inputs if reference.kind is ProductKind.KV
         )

@@ -2,7 +2,7 @@
 //! no locks on engine state) — drain commands, advance each running request's
 //! generation lifecycle, admit pending requests against the block budget,
 //! assemble a `ForwardBatch`, submit it asynchronously through the `Executor`,
-//! and resolve completed `ForwardResult`s into `GenEvent`s and cursor transitions.
+//! and resolve completed `ForwardResult`s into `GenerationEvent`s and cursor transitions.
 //! `ForwardBatch` assembly is lane-aware for text prefill/decode and may still
 //! mix compatible non-text ops; workers preserve one result per submitted op.
 //!
@@ -228,19 +228,18 @@ use crossbeam_channel::Receiver;
 use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{
-    FinishReason, GenEvent, GenerationRequest, MediaEvent, MediaRequest, PositionLogprobs,
+    FinishReason, GenerationEvent, GenerationRequest, MediaEvent, MediaRequest, PositionLogprobs,
     PublicCommit, PublicModality, SemanticRoot, TokenLogprob,
 };
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable, Bounds,
-    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, DType,
-    DecodeKind, DecodePlacement, DimBound, Disposition, ExecutionCapability,
-    ForwardRow as WireForwardRow, GenAdmission, GenMode, LatentPlacement, MediaAdmission,
-    MediaProfileId, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
+    CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
+    DecodePlacement, DimBound, Disposition, ExecutionCapability, ForwardMode,
+    ForwardRow as WireForwardRow, GenAdmission, LatentPlacement, MediaAdmission, MediaProfileId,
+    ModelOutput, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
     ProductRef, RequestKey, ResourceClass, RouteId, SamplingState, ShapeBound, StorageClass,
-    TimingCounters, UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities,
-    WorkerForwardStats,
+    TimingCounters, UndAdmission, VersionRef, WorkerCapabilities, WorkerForwardStats,
 };
 
 use crate::executor::{WorkerExecError, WorkerLossError};
@@ -276,9 +275,9 @@ const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 /// rows ride along in the same forward.
 const FLOW_EXCLUSIVE_BATCH_ENV: &str = "UNISERVE_FLOW_EXCLUSIVE_BATCH";
 
-fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<GenEvent> {
+fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<GenerationEvent> {
     let metadata = validate_png_artifact(&pixels_png_b64, None)?;
-    Some(GenEvent::ImageDone {
+    Some(GenerationEvent::ImageDone {
         image_id,
         height: metadata.height,
         width: metadata.width,
@@ -316,7 +315,7 @@ struct SequenceView {
 }
 
 impl SequenceView {
-    fn from_report(record: &CompletionRecord, products: &[ProductPayload]) -> Self {
+    fn from_report(record: &ModelOutput, products: &[ProductPayload]) -> Self {
         let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
             .and_then(|payload| LogprobBlob::decode(&payload.bytes).ok())
             .unwrap_or_default();
@@ -339,7 +338,7 @@ impl SequenceView {
 
 fn token_prefix_versions(
     operation: Option<&Operation>,
-    record: &CompletionRecord,
+    record: &ModelOutput,
     parent: Option<&VersionRef>,
 ) -> Vec<VersionRef> {
     let Some(operation) = operation else {
@@ -487,7 +486,7 @@ pub struct ReqState {
     /// Latest frontend-decoder token prefix accepted for semantic commit.
     pub(crate) semantic_token_seq: usize,
     /// Ordered public events waiting for immediate-consumer channel capacity.
-    pub(crate) output_journal: VecDeque<GenEvent>,
+    pub(crate) output_journal: VecDeque<GenerationEvent>,
     /// Fixed semantic cutoffs indexed by public text-token count.
     pub(crate) token_cutoffs: BTreeMap<usize, VersionRef>,
     /// Ordered semantic commits held for the frontend decoder's exact-prefix
@@ -667,7 +666,7 @@ pub(crate) struct PendingSemanticCommit {
 pub(crate) struct ResidentDeviceVersion {
     version: VersionRef,
     token: ProductRef,
-    producer: WorkVariant,
+    producer: ForwardMode,
 }
 
 impl ReqState {
@@ -785,12 +784,12 @@ impl MediaPlanner {
         cursor
     }
 
-    fn work(&self, quantum: MediaQuantum) -> Work {
+    fn work(&self, quantum: MediaQuantum) -> ForwardMode {
         match quantum {
-            MediaQuantum::Transition => Work::Gen(GenMode::Transition),
-            MediaQuantum::Flow { .. } => Work::Gen(GenMode::Flow),
-            MediaQuantum::Video { .. } | MediaQuantum::Audio => Work::Gen(GenMode::Decode),
-            MediaQuantum::Materialize => Work::Materialize,
+            MediaQuantum::Transition => ForwardMode::GenTransition,
+            MediaQuantum::Flow { .. } => ForwardMode::GenFlow,
+            MediaQuantum::Video { .. } | MediaQuantum::Audio => ForwardMode::GenDecode,
+            MediaQuantum::Materialize => ForwardMode::Materialize,
         }
     }
 }
@@ -1046,7 +1045,7 @@ pub struct HealthSnapshot {
     pub queue_wait_us_total: u64,
     pub queue_wait_us_max: u64,
     pub fatal: bool,
-    pub supported_work: Vec<WorkVariant>,
+    pub supported_work: Vec<ForwardMode>,
     pub op_latency_us: Vec<(String, u64)>,
 }
 
@@ -1271,26 +1270,26 @@ fn behavior_str(request: &GenerationRequest) -> &'static str {
     }
 }
 
-fn assembly_lane(operation_variant: WorkVariant) -> AssemblyLane {
+fn assembly_lane(operation_variant: ForwardMode) -> AssemblyLane {
     match operation_variant {
-        WorkVariant::TokenExtend | WorkVariant::EncodeVision | WorkVariant::EncodeLatent => {
+        ForwardMode::TokenExtend | ForwardMode::EncodeVision | ForwardMode::EncodeLatent => {
             AssemblyLane::Prefill
         }
-        WorkVariant::TokenDecode | WorkVariant::TokenVerify => AssemblyLane::Decode,
-        WorkVariant::Draft
-        | WorkVariant::GenFlow
-        | WorkVariant::GenDecode
-        | WorkVariant::GenTransition
-        | WorkVariant::Materialize
-        | WorkVariant::TransferProduct
-        | WorkVariant::TransferKvPublish
-        | WorkVariant::TransferKvInstall => AssemblyLane::Other,
+        ForwardMode::TokenDecode | ForwardMode::TokenVerify => AssemblyLane::Decode,
+        ForwardMode::Draft
+        | ForwardMode::GenFlow
+        | ForwardMode::GenDecode
+        | ForwardMode::GenTransition
+        | ForwardMode::Materialize
+        | ForwardMode::TransferProduct
+        | ForwardMode::TransferKvPublish
+        | ForwardMode::TransferKvInstall => AssemblyLane::Other,
     }
 }
 
-fn completion_priority(operation_variant: WorkVariant) -> u8 {
+fn completion_priority(operation_variant: ForwardMode) -> u8 {
     match operation_variant {
-        WorkVariant::GenFlow | WorkVariant::Materialize | WorkVariant::TransferKvInstall => 0,
+        ForwardMode::GenFlow | ForwardMode::Materialize | ForwardMode::TransferKvInstall => 0,
         _ => 1,
     }
 }
@@ -1392,7 +1391,7 @@ struct ProjectedBranch {
 }
 
 struct PendingCompletion {
-    record: CompletionRecord,
+    record: ModelOutput,
     products: Arc<[ProductPayload]>,
     arrival_seq: u64,
 }
@@ -1404,7 +1403,7 @@ struct PendingFinish {
 
 struct RetiredOutput {
     event_tx: EventTx,
-    journal: VecDeque<GenEvent>,
+    journal: VecDeque<GenerationEvent>,
 }
 
 const OUTPUT_JOURNAL_CAPACITY: usize = EVENT_BUFFER_CAPACITY;
@@ -1465,7 +1464,7 @@ impl Scheduler {
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
         let flow_slot_reserve =
-            usize::from(caps.uses_kv() && caps.supported_work.contains(&WorkVariant::GenFlow));
+            usize::from(caps.uses_kv() && caps.supported_work.contains(&ForwardMode::GenFlow));
         let request_pool_capacity = caps.max_request_pool_size as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_slot_reserve)
@@ -1653,7 +1652,7 @@ impl Scheduler {
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
         let flow_slot_reserve = usize::from(
-            self.caps.uses_kv() && self.caps.supported_work.contains(&WorkVariant::GenFlow),
+            self.caps.uses_kv() && self.caps.supported_work.contains(&ForwardMode::GenFlow),
         );
         let capacity = self
             .request_slots
@@ -2037,7 +2036,7 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// timestep, so its cost multiplies the compiled latent geometry rather than the
 /// scalar per-step token cost.
 fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
-    if transition.operation_variant != WorkVariant::GenFlow {
+    if transition.operation_variant != ForwardMode::GenFlow {
         return transition.token_cost;
     }
     let latent_tokens = usize::try_from(transition.resources.latent_units)
@@ -2050,8 +2049,8 @@ fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
         .saturating_mul(timesteps)
 }
 
-fn tensorized_mixed_runner_work(variant: WorkVariant) -> bool {
-    matches!(variant, WorkVariant::TokenDecode | WorkVariant::GenFlow)
+fn tensorized_mixed_runner_work(variant: ForwardMode) -> bool {
+    matches!(variant, ForwardMode::TokenDecode | ForwardMode::GenFlow)
 }
 
 fn flow_matches_mixed_bucket(
@@ -2060,7 +2059,7 @@ fn flow_matches_mixed_bucket(
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     bucket: &uniserve_worker_ipc::MixedExecutionCapability,
 ) -> bool {
-    if operation.work.variant() != WorkVariant::GenFlow {
+    if operation.work != ForwardMode::GenFlow {
         return false;
     }
     let identity = (operation.request_key, operation.op_id);
@@ -2137,20 +2136,20 @@ fn extract_mixed_group(
 fn partition_attention(operations: &[Operation]) -> AttentionRegime {
     let regimes = operations
         .iter()
-        .map(|operation| match operation.work.variant() {
-            WorkVariant::TokenExtend
-            | WorkVariant::TokenDecode
-            | WorkVariant::TokenVerify
-            | WorkVariant::Draft => AttentionRegime::Causal,
-            WorkVariant::GenFlow => AttentionRegime::Hybrid,
-            WorkVariant::GenTransition
-            | WorkVariant::GenDecode
-            | WorkVariant::EncodeVision
-            | WorkVariant::EncodeLatent
-            | WorkVariant::TransferProduct
-            | WorkVariant::TransferKvPublish
-            | WorkVariant::TransferKvInstall
-            | WorkVariant::Materialize => AttentionRegime::None,
+        .map(|operation| match operation.work {
+            ForwardMode::TokenExtend
+            | ForwardMode::TokenDecode
+            | ForwardMode::TokenVerify
+            | ForwardMode::Draft => AttentionRegime::Causal,
+            ForwardMode::GenFlow => AttentionRegime::Hybrid,
+            ForwardMode::GenTransition
+            | ForwardMode::GenDecode
+            | ForwardMode::EncodeVision
+            | ForwardMode::EncodeLatent
+            | ForwardMode::TransferProduct
+            | ForwardMode::TransferKvPublish
+            | ForwardMode::TransferKvInstall
+            | ForwardMode::Materialize => AttentionRegime::None,
         })
         .collect::<HashSet<_>>();
     if regimes.len() == 1 {
@@ -2162,7 +2161,7 @@ fn partition_attention(operations: &[Operation]) -> AttentionRegime {
 
 fn transition_output_bound(transition: &PlannedTransition) -> usize {
     match transition.operation_variant {
-        WorkVariant::TokenVerify => transition
+        ForwardMode::TokenVerify => transition
             .validation
             .expected_text_tokens
             .map_or(4, |range| {
@@ -2171,17 +2170,17 @@ fn transition_output_bound(transition: &PlannedTransition) -> usize {
                     .saturating_mul(2)
                     .saturating_add(2)
             }),
-        WorkVariant::TokenExtend | WorkVariant::TokenDecode => 4,
-        WorkVariant::GenFlow => transition.token_cost.saturating_add(2),
-        WorkVariant::GenDecode => 2,
-        WorkVariant::Materialize => 3,
+        ForwardMode::TokenExtend | ForwardMode::TokenDecode => 4,
+        ForwardMode::GenFlow => transition.token_cost.saturating_add(2),
+        ForwardMode::GenDecode => 2,
+        ForwardMode::Materialize => 3,
         _ => 2,
     }
 }
 
 /// Flush as many ordered journal entries as the immediate consumer can accept.
 /// Returns true when the consumer has closed.
-fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenEvent>) -> bool {
+fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenerationEvent>) -> bool {
     while let Some(event) = journal.pop_front() {
         match event_tx.send(event) {
             Ok(()) => {}
@@ -2202,8 +2201,8 @@ fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenEvent>) ->
 /// Returns true when the consumer has closed.
 fn enqueue_public_event(
     event_tx: &EventTx,
-    journal: &mut VecDeque<GenEvent>,
-    event: GenEvent,
+    journal: &mut VecDeque<GenerationEvent>,
+    event: GenerationEvent,
 ) -> bool {
     if flush_public_journal(event_tx, journal) {
         return true;
@@ -2232,7 +2231,7 @@ fn operation_trace(operation: &Operation, apply: &SchedulerApply) -> serde_json:
         Point::Device { .. } => "device",
     };
     json!({
-        "work": operation.work.variant().as_wire_str(),
+        "work": operation.work.as_wire_str(),
         "domain": format!("{:?}", operation.domain),
         "parent_kind": parent_kind,
         "predicated": operation.predicate.is_some(),

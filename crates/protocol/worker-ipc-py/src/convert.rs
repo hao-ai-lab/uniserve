@@ -19,14 +19,13 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CacheCopy, CachePageAllocation,
-    CloseReason, CompletionRecord, CompletionReport, Control, DType, DecodeKind, DecodePlacement,
-    DimBound, Disposition, Domain, DrawLayout, EncodeMode, ErrorCode, ErrorOperationIdentity,
-    ExecutionCapability, FinishFlags, ForwardRow, GenAdmission, GenMode, LatentPlacement,
-    LogicalLengths, MediaAdmission, MediaProfileId, OpId, OpStatus, Operation, PartitionCompletion,
+    CloseReason, CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound,
+    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
+    FinishFlags, ForwardMode, ForwardRow, GenAdmission, LatentPlacement, LogicalLengths,
+    MediaAdmission, MediaProfileId, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion,
     Point, PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
     RequestKey, RequestKind, ResponseKind, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
-    TokenMode, TokenSpan, TransferMode, UndAdmission, VersionRef, Work, WorkerForwardStats,
-    WorkerRequest, WorkerResponse,
+    TokenSpan, UndAdmission, VersionRef, WorkerForwardStats, WorkerRequest, WorkerResponse,
 };
 
 #[cfg(test)]
@@ -154,10 +153,6 @@ impl NativeRequestTypes {
     fn build(py: Python<'_>) -> PyResult<Self> {
         let module = py.import("uniserve_worker.batch")?;
         let class = |name: &str| -> PyResult<Py<PyAny>> { Ok(module.getattr(name)?.unbind()) };
-        let work = module.getattr("Work")?;
-        let work_variant = |kind: &str, mode: Option<&str>| -> PyResult<Py<PyAny>> {
-            Ok(work.call1((kind, mode))?.unbind())
-        };
         Ok(Self {
             operation: class("Operation")?,
             request_key: class("RequestKey")?,
@@ -237,21 +232,25 @@ impl NativeRequestTypes {
                 "AttentionRegime",
                 ["none", "causal", "bidirectional", "hybrid"],
             )?,
-            works: [
-                work_variant("token", Some("extend"))?,
-                work_variant("token", Some("decode"))?,
-                work_variant("token", Some("verify"))?,
-                work_variant("draft", None)?,
-                work_variant("encode", Some("vision"))?,
-                work_variant("encode", Some("latent"))?,
-                work_variant("transfer", Some("product"))?,
-                work_variant("transfer", Some("kv_publish"))?,
-                work_variant("transfer", Some("kv_install"))?,
-                work_variant("gen", Some("transition"))?,
-                work_variant("gen", Some("flow"))?,
-                work_variant("materialize", None)?,
-                work_variant("gen", Some("decode"))?,
-            ],
+            works: enum_members(
+                &module,
+                "ForwardMode",
+                [
+                    "token_extend",
+                    "token_decode",
+                    "token_verify",
+                    "draft",
+                    "encode_vision",
+                    "encode_latent",
+                    "transfer_product",
+                    "transfer_kv_publish",
+                    "transfer_kv_install",
+                    "gen_transition",
+                    "gen_flow",
+                    "materialize",
+                    "gen_decode",
+                ],
+            )?,
         })
     }
 
@@ -272,21 +271,21 @@ impl NativeRequestTypes {
         self.domains[index].bind(py).clone()
     }
 
-    fn work<'py>(&self, py: Python<'py>, work: Work) -> Bound<'py, PyAny> {
+    fn work<'py>(&self, py: Python<'py>, work: ForwardMode) -> Bound<'py, PyAny> {
         let index = match work {
-            Work::Token(TokenMode::Extend) => 0,
-            Work::Token(TokenMode::Decode) => 1,
-            Work::Token(TokenMode::Verify) => 2,
-            Work::Draft => 3,
-            Work::Encode(EncodeMode::Vision) => 4,
-            Work::Encode(EncodeMode::Latent) => 5,
-            Work::Transfer(TransferMode::Product) => 6,
-            Work::Transfer(TransferMode::KvPublish) => 7,
-            Work::Transfer(TransferMode::KvInstall) => 8,
-            Work::Gen(GenMode::Transition) => 9,
-            Work::Gen(GenMode::Flow) => 10,
-            Work::Materialize => 11,
-            Work::Gen(GenMode::Decode) => 12,
+            ForwardMode::TokenExtend => 0,
+            ForwardMode::TokenDecode => 1,
+            ForwardMode::TokenVerify => 2,
+            ForwardMode::Draft => 3,
+            ForwardMode::EncodeVision => 4,
+            ForwardMode::EncodeLatent => 5,
+            ForwardMode::TransferProduct => 6,
+            ForwardMode::TransferKvPublish => 7,
+            ForwardMode::TransferKvInstall => 8,
+            ForwardMode::GenTransition => 9,
+            ForwardMode::GenFlow => 10,
+            ForwardMode::Materialize => 11,
+            ForwardMode::GenDecode => 12,
         };
         self.works[index].bind(py).clone()
     }
@@ -1410,7 +1409,7 @@ fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats>
     })
 }
 
-fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionRecord> {
+fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
     let status = str_field(dict, intern!(py, "status"))?;
@@ -1460,7 +1459,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionRecor
         copy_us: u64_of(&get(timing, intern!(py, "copy_us"))?)?,
         host_us: u64_of(&get(timing, intern!(py, "host_us"))?)?,
     };
-    Some(CompletionRecord {
+    Some(ModelOutput {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
         op_id: OpId(u64_of(&get(dict, intern!(py, "op_id"))?)?),
         completion_slot_generation: u32_of(&get(dict, intern!(py, "completion_slot_generation"))?)?,
@@ -1759,7 +1758,7 @@ mod tests {
             request_key,
             OpId(1),
             VersionRef::admission_root(request_key, OpId(0), admission.digest.clone()),
-            Work::Token(TokenMode::Extend),
+            ForwardMode::TokenExtend,
             uniserve_worker_ipc::RouteId(0),
             Domain::Prefill,
             Bounds {
@@ -1822,7 +1821,7 @@ mod tests {
             step_id: 11,
             partitions: vec![PartitionCompletion {
                 partition_id: 1,
-                completions: vec![CompletionRecord {
+                completions: vec![ModelOutput {
                     request_key,
                     op_id: OpId(1),
                     completion_slot_generation: 1,

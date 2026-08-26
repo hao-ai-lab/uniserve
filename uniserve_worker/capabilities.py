@@ -7,27 +7,27 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from .batch import Domain, SamplingOwnership, WorkVariant, protocol_layout_digest
+from .batch import Domain, SamplingOwnership, ForwardMode, protocol_layout_digest
 from .foundation.errors import invalid_descriptor
 
 # Two work variants are never admitted onto a configured serving route:
 # ``TOKEN_VERIFY`` is speculative acceptance the scheduler drives inside token
 # decode, and ``DRAFT`` has no depth-one route. Both are folded out of every
 # advertised capability.
-_UNCONFIGURED_WORK = frozenset({WorkVariant.TOKEN_VERIFY, WorkVariant.DRAFT})
+_UNCONFIGURED_WORK = frozenset({ForwardMode.TOKEN_VERIFY, ForwardMode.DRAFT})
 
 
-def configured_work_variants(variants: Iterable[WorkVariant]) -> tuple[WorkVariant, ...]:
+def configured_work_variants(variants: Iterable[ForwardMode]) -> tuple[ForwardMode, ...]:
     """The admitted work leaves among ``variants``.
 
     The result excludes the unconfigured work and follows canonical
-    ``WorkVariant`` order.
+    ``ForwardMode`` order.
     """
 
     selected = set(variants)
     return tuple(
         variant
-        for variant in WorkVariant
+        for variant in ForwardMode
         if variant in selected and variant not in _UNCONFIGURED_WORK
     )
 
@@ -301,7 +301,7 @@ class WorkerCapabilities:
     num_layers: int
     num_kv_heads: int
     head_dim: int
-    supported_work: tuple[WorkVariant, ...]
+    supported_work: tuple[ForwardMode, ...]
     latent_page_units: int
     num_latent_pages: int
     latent_width: int
@@ -346,12 +346,12 @@ class WorkerCapabilities:
             any(
                 variant
                 in {
-                    WorkVariant.TOKEN_EXTEND,
-                    WorkVariant.TOKEN_DECODE,
-                    WorkVariant.TOKEN_VERIFY,
-                    WorkVariant.DRAFT,
-                    WorkVariant.TRANSFER_KV_PUBLISH,
-                    WorkVariant.TRANSFER_KV_INSTALL,
+                    ForwardMode.TOKEN_EXTEND,
+                    ForwardMode.TOKEN_DECODE,
+                    ForwardMode.TOKEN_VERIFY,
+                    ForwardMode.DRAFT,
+                    ForwardMode.TRANSFER_KV_PUBLISH,
+                    ForwardMode.TRANSFER_KV_INSTALL,
                 }
                 for variant in self.supported_work
             )
@@ -453,8 +453,8 @@ class WorkerCapabilities:
         addresses_latent = any(
             variant
             in {
-                WorkVariant.GEN_TRANSITION,
-                WorkVariant.GEN_FLOW,
+                ForwardMode.GEN_TRANSITION,
+                ForwardMode.GEN_FLOW,
             }
             for variant in self.supported_work
         )
@@ -482,7 +482,7 @@ class WorkerCapabilities:
             num_kv_heads=_uint(data.get("num_kv_heads"), f"{where}.num_kv_heads"),
             head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
             supported_work=tuple(
-                _enum(WorkVariant, item, f"{where}.supported_work[{index}]")
+                _enum(ForwardMode, item, f"{where}.supported_work[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("supported_work"), f"{where}.supported_work")
                 )

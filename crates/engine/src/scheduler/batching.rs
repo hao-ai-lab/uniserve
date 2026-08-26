@@ -70,7 +70,7 @@ impl Scheduler {
                 }
             {
                 mixed_prefill = target == AssemblyLane::Decode
-                    && operation_variant == WorkVariant::TokenExtend
+                    && operation_variant == ForwardMode::TokenExtend
                     && mixed_left > 0
                     && self.running.get(&id).is_some_and(|st| {
                         st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
@@ -79,7 +79,7 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_type == Some(WorkVariant::GenFlow)
+            if next_type == Some(ForwardMode::GenFlow)
                 && (denoise_occupies_decode_pipeline
                     || !self.flow_prefix_is_schedulable(id)
                     || !self.can_schedule_denoise(id))
@@ -91,7 +91,7 @@ impl Scheduler {
             // the flag is set a flow op only opens an empty batch, and the loop
             // below closes the batch as soon as one is placed.
             if self.flow_exclusive_batch
-                && next_type == Some(WorkVariant::GenFlow)
+                && next_type == Some(ForwardMode::GenFlow)
                 && !(ops.is_empty() && mixed_ops.is_empty())
             {
                 continue;
@@ -165,7 +165,7 @@ impl Scheduler {
                     admissions.push(admission);
                 }
                 selected.insert(id);
-                let placed_flow = op.operation_variant == WorkVariant::GenFlow;
+                let placed_flow = op.operation_variant == ForwardMode::GenFlow;
                 if mixed_prefill {
                     mixed_ops.push(op);
                 } else {
@@ -234,26 +234,26 @@ impl Scheduler {
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_operation_variant(id) {
             Some(
-                WorkVariant::EncodeVision | WorkVariant::EncodeLatent | WorkVariant::TokenExtend,
+                ForwardMode::EncodeVision | ForwardMode::EncodeLatent | ForwardMode::TokenExtend,
             ) => 0,
             Some(
-                WorkVariant::TokenDecode
-                | WorkVariant::TokenVerify
-                | WorkVariant::Materialize
-                | WorkVariant::TransferKvInstall,
+                ForwardMode::TokenDecode
+                | ForwardMode::TokenVerify
+                | ForwardMode::Materialize
+                | ForwardMode::TransferKvInstall,
             ) => 1,
-            Some(WorkVariant::GenFlow | WorkVariant::GenDecode) => 2,
+            Some(ForwardMode::GenFlow | ForwardMode::GenDecode) => 2,
             Some(
-                WorkVariant::Draft
-                | WorkVariant::GenTransition
-                | WorkVariant::TransferProduct
-                | WorkVariant::TransferKvPublish,
+                ForwardMode::Draft
+                | ForwardMode::GenTransition
+                | ForwardMode::TransferProduct
+                | ForwardMode::TransferKvPublish,
             )
             | None => 3,
         }
     }
 
-    pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<WorkVariant> {
+    pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<ForwardMode> {
         let st = self.running.get(&id)?;
         if st.image_gen.branch_pending {
             return None;
@@ -271,34 +271,34 @@ impl Scheduler {
             })
         {
             return st.pending_image_step().map(|step| match step {
-                ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
-                ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
+                ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
+                ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
             });
         }
         Some(match st.lifecycle.phase {
             Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
-                ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
+                ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
+                ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
             },
-            Phase::IngestState => WorkVariant::TokenExtend,
-            Phase::Prefill => WorkVariant::TokenExtend,
-            Phase::DecodeUnd => WorkVariant::TokenDecode,
-            Phase::CloseKv => WorkVariant::TokenExtend,
-            Phase::PublishKv => WorkVariant::TransferKvPublish,
-            Phase::TransitionGen => WorkVariant::GenTransition,
+            Phase::IngestState => ForwardMode::TokenExtend,
+            Phase::Prefill => ForwardMode::TokenExtend,
+            Phase::DecodeUnd => ForwardMode::TokenDecode,
+            Phase::CloseKv => ForwardMode::TokenExtend,
+            Phase::PublishKv => ForwardMode::TransferKvPublish,
+            Phase::TransitionGen => ForwardMode::GenTransition,
             Phase::DenoiseGen if st.image_gen.steps_done >= st.req.image.steps => {
-                WorkVariant::Materialize
+                ForwardMode::Materialize
             }
-            Phase::DenoiseGen => WorkVariant::GenFlow,
-            Phase::CommitGen => WorkVariant::Materialize,
+            Phase::DenoiseGen => ForwardMode::GenFlow,
+            Phase::CommitGen => ForwardMode::Materialize,
             Phase::FeedbackEncode => {
                 let feedback = st.req.policy.feedback.as_ref()?;
                 match feedback.ingest.steps.get(st.feedback.ingest_step)? {
-                    ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
-                    ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
+                    ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
+                    ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
                 }
             }
-            Phase::FeedbackState => WorkVariant::TokenExtend,
+            Phase::FeedbackState => ForwardMode::TokenExtend,
         })
     }
 
@@ -389,7 +389,7 @@ impl Scheduler {
                     self.fatal = true;
                     return false;
                 };
-                let predicate_kind = if transition.operation_variant == WorkVariant::TokenDecode {
+                let predicate_kind = if transition.operation_variant == ForwardMode::TokenDecode {
                     ProductKind::Token
                 } else {
                     ProductKind::Completion
@@ -511,7 +511,7 @@ impl Scheduler {
                 }
             };
             let operation_identity = (operation.request_key, operation.op_id);
-            if operation.work.variant() == WorkVariant::GenFlow {
+            if operation.work == ForwardMode::GenFlow {
                 let conditioning_tokens = match &apply.delta {
                     TransitionDelta::DenoiseGen {
                         physical_kv_len, ..
@@ -593,8 +593,8 @@ impl Scheduler {
                 forward_rows.insert(operation_identity, operation_forward_rows);
             }
             if matches!(
-                operation.work.variant(),
-                WorkVariant::GenTransition | WorkVariant::GenFlow
+                operation.work,
+                ForwardMode::GenTransition | ForwardMode::GenFlow
             ) || operation
                 .inputs
                 .iter()
@@ -617,7 +617,7 @@ impl Scheduler {
                     _ => {
                         tracing::error!(
                             request_id = request_id.0,
-                            operation = operation.work.variant().as_wire_str(),
+                            operation = operation.work.as_wire_str(),
                             "latent operation has no declared schedule placement"
                         );
                         self.fatal = true;
@@ -638,7 +638,7 @@ impl Scheduler {
                     },
                 );
             }
-            let operation_variant = operation.work.variant().as_wire_str();
+            let operation_variant = operation.work.as_wire_str();
             if let Some(trace_ops) = trace_ops.as_mut() {
                 let phase = self
                     .running
@@ -724,19 +724,19 @@ impl Scheduler {
         let mixed = wire_ops.first().is_some_and(|first| {
             wire_ops
                 .iter()
-                .any(|operation| operation.work.variant() != first.work.variant())
+                .any(|operation| operation.work != first.work)
         });
         self.batch_started.insert(step, submit_at);
         if wire_ops
             .iter()
-            .any(|operation| assembly_lane(operation.work.variant()) == AssemblyLane::Prefill)
+            .any(|operation| assembly_lane(operation.work) == AssemblyLane::Prefill)
         {
             self.prefill_steps.insert(step);
         }
         if let Some(trace_ops) = trace_ops {
             let operation_types: Vec<&'static str> = wire_ops
                 .iter()
-                .map(|operation| operation.work.variant().as_wire_str())
+                .map(|operation| operation.work.as_wire_str())
                 .collect();
             let req_ids: Vec<u64> = wire_ops
                 .iter()
@@ -773,7 +773,7 @@ impl Scheduler {
         if mixed {
             let operation_types: Vec<&'static str> = wire_ops
                 .iter()
-                .map(|operation| operation.work.variant().as_wire_str())
+                .map(|operation| operation.work.as_wire_str())
                 .collect();
             let req_ids: Vec<u64> = wire_ops
                 .iter()
@@ -887,7 +887,7 @@ impl Scheduler {
                 }
                 let (candidates, independent): (Vec<_>, Vec<_>) = operations
                     .into_iter()
-                    .partition(|operation| tensorized_mixed_runner_work(operation.work.variant()));
+                    .partition(|operation| tensorized_mixed_runner_work(operation.work));
                 if !candidates.is_empty() {
                     mixed_candidates.push((domain, candidates));
                 }

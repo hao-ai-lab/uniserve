@@ -12,7 +12,7 @@ from typing import Any, Final, cast, overload
 import torch
 
 from ..batch import (
-    CompletionRecord,
+    ModelOutput,
     CompletionReport,
     FinishFlags,
     FixedPoint,
@@ -1249,13 +1249,13 @@ class _PendingDigest:
 
     def __init__(
         self,
-        record: CompletionRecord,
+        record: ModelOutput,
         parent: object,
         plan_digest: str,
         buffer: PinnedOutputBuffer,
         row: int,
         predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]],
-        resolved_callback: Callable[[CompletionRecord, str, str], None] | None = None,
+        resolved_callback: Callable[[ModelOutput, str, str], None] | None = None,
         completion_tasks: tuple[_CompletionImagePayload | _CompletionLogprobPayload, ...] = (),
     ) -> None:
         self._record = record
@@ -1418,7 +1418,7 @@ class _PendingErrorDigest:
     def __init__(
         self,
         parent: _PendingDigest | _PendingErrorDigest,
-        record: CompletionRecord,
+        record: ModelOutput,
         plan_digest: str,
     ) -> None:
         self._parent = parent
@@ -1457,7 +1457,7 @@ class _PendingErrorDigest:
         return self
 
 
-def _record_ready(record: CompletionRecord) -> bool:
+def _record_ready(record: ModelOutput) -> bool:
     """Whether a completion's deferred token copy and digest chain have landed."""
 
     digest = record.semantic_digest
@@ -1471,7 +1471,7 @@ def _record_ready(record: CompletionRecord) -> bool:
     return True
 
 
-def _finalized_record(record: CompletionRecord) -> CompletionRecord:
+def _finalized_record(record: ModelOutput) -> ModelOutput:
     digest = record.semantic_digest
     if isinstance(digest, _PendingErrorDigest):
         return replace(record, semantic_digest=digest.resolve())
@@ -1538,7 +1538,7 @@ def _finalized_record(record: CompletionRecord) -> CompletionRecord:
     )
 
 
-def _invalid_sampling_record(record: CompletionRecord) -> CompletionRecord:
+def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
     return replace(
         record,
         status=OpStatus.ERROR,
@@ -1551,7 +1551,7 @@ def _invalid_sampling_record(record: CompletionRecord) -> CompletionRecord:
     )
 
 
-def _completion_error_record(record: CompletionRecord) -> CompletionRecord:
+def _completion_error_record(record: ModelOutput) -> ModelOutput:
     return replace(
         record,
         status=OpStatus.ERROR,
@@ -1564,10 +1564,10 @@ def _completion_error_record(record: CompletionRecord) -> CompletionRecord:
 
 
 def _predicated_record(
-    record: CompletionRecord,
+    record: ModelOutput,
     selected_point: int,
     runtime: RequestRuntime,
-) -> CompletionRecord:
+) -> ModelOutput:
     return replace(
         record,
         status=OpStatus.PREDICATED,

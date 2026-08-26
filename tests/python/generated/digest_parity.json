@@ -22,10 +22,7 @@
         }
       }
     },
-    "work": {
-      "kind": "token",
-      "value": "decode"
-    },
+    "work": "token_decode",
     "route": 9,
     "domain": "decode",
     "advances_state": true,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from ..batch import WorkVariant
+from ..batch import ForwardMode
 from ..server.worker_kind import WorkerKind
 
 
@@ -19,7 +19,7 @@ class ModelLoadScope(StrEnum):
 class WorkerPlan:
     worker_kind: WorkerKind
     model_scope: ModelLoadScope
-    allowed_work_variants: frozenset[WorkVariant]
+    allowed_work_variants: frozenset[ForwardMode]
 
 
 def resolve_worker_plan(worker_kind: WorkerKind) -> WorkerPlan:

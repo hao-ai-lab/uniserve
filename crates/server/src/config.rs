@@ -35,46 +35,10 @@ pub enum EngineBackendKind {
     Worker,
 }
 
-/// How the server reaches its engine core(s).
-///
-/// `InProcess` is the deliberate single-node default: the engine
-/// runs on a thread inside the server with no serialized hop. The socket
-/// variants give UniServe vLLM's process topology — engines in separate
-/// processes behind the handshake-negotiated wire protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
-pub enum EngineConnection {
-    /// The engine runs on a scheduler thread inside this process.
-    #[default]
-    InProcess,
-    /// This server owns the startup handshake; engine processes (managed
-    /// subprocesses or externally started `uniserve engine`s) dial in.
-    Handshake {
-        /// Endpoint engines dial (e.g. `tcp://127.0.0.1:5557`).
-        handshake_address: String,
-        /// Host engines use to connect back to the data-plane sockets.
-        advertised_host: String,
-        /// Total engines expected to join.
-        engine_count: usize,
-        /// Per-phase startup wait; must cover the engines' model load.
-        ready_timeout: Duration,
-    },
-    /// An external supervisor fixed the transport addresses; bind them and
-    /// wait for the engines' registration frames.
-    Bootstrapped {
-        input_address: String,
-        output_address: String,
-        engine_count: usize,
-        ready_timeout: Duration,
-    },
-}
-
 /// Configuration of the in-process UniServe engine. Rust owns scheduling and
 /// engine execution; Python owns model forward execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EngineSettings {
-    /// How the server reaches its engine core(s): in-process (default) or
-    /// over the socket transport.
-    pub connection: EngineConnection,
     /// Which forward-only worker to drive.
     pub backend: EngineBackendKind,
     /// Compute device for the worker.
@@ -114,7 +78,7 @@ pub struct EngineSettings {
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// `None` selects one Full pool. A multi-stage spec
-    /// composes pools behind a `StageRouter`.
+    /// composes pools behind a `StagedExecutor`.
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
@@ -126,7 +90,6 @@ pub struct EngineSettings {
 impl Default for EngineSettings {
     fn default() -> Self {
         Self {
-            connection: EngineConnection::InProcess,
             backend: EngineBackendKind::Worker,
             device: "cuda".to_string(),
             attention_backend: "auto".to_string(),
@@ -234,16 +197,6 @@ impl Config {
             self.media_spool.is_absolute(),
             "media spool path must be absolute"
         );
-        if self.model_description == ModelDescription::MiniMaxH3 {
-            anyhow::ensure!(
-                !matches!(
-                    self.engine.connection,
-                    EngineConnection::Bootstrapped { .. }
-                ),
-                "MiniMax H3 requires an in-process or handshake-managed engine so the media spool can be verified"
-            );
-        }
-
         Ok(())
     }
 

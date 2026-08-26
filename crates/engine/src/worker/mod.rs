@@ -3,11 +3,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
 mod multiproc;
-mod stage_router;
+mod staged_executor;
 mod uniproc;
 
 pub use multiproc::MultiprocExecutor;
-pub use stage_router::StageRouter;
+pub use staged_executor::StagedExecutor;
 pub use uniproc::{LaneConfig, UniprocExecutor, WorkerLaunchConfig};
 
 pub(crate) fn park_descriptors(fds: &[i32], timeout: std::time::Duration) -> anyhow::Result<()> {

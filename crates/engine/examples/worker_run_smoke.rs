@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::GenEvent;
+use uniserve_core::GenerationEvent;
 use uniserve_core::{
     ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
@@ -69,7 +69,7 @@ fn await_finished(rxs: &mut Rxs, ids: &[RequestId], deadline: Instant) -> Vec<Re
             if let Some(rx) = rxs.get_mut(id) {
                 while let Ok(ev) = rx.try_recv() {
                     saw_any = true;
-                    if matches!(ev, GenEvent::Finished { .. }) {
+                    if matches!(ev, GenerationEvent::Finished { .. }) {
                         finished.push(*id);
                         break;
                     }

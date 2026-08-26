@@ -1,7 +1,7 @@
 //! Emits the canonical Rust-computed digest-parity fixture consumed by the
 //! Python mirror test (`tests/python/unit/contracts/test_batch_protocol.py`).
 //!
-//! The fixture carries one `Operation` and one `CompletionRecord` in their
+//! The fixture carries one `Operation` and one `ModelOutput` in their
 //! serde wire form plus the Rust-computed `plan_digest` and `semantic_digest`.
 //! The Python side reconstructs the records from the same wire form, recomputes
 //! both digests, and asserts they are byte-identical, proving the host digest
@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use uniserve_core::RequestId;
 use uniserve_worker_ipc::{
-    Bounds, CompletionRecord, DType, DimBound, Domain, DrawLayout, FinishFlags, LogicalLengths,
-    OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductRef, RequestKey, Rng,
-    RouteId, ShapeBound, StorageClass, TimingCounters, TokenMode, TokenSpan, VersionRef, Work,
+    Bounds, DType, DimBound, Domain, DrawLayout, FinishFlags, ForwardMode, LogicalLengths,
+    ModelOutput, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductRef, RequestKey,
+    Rng, RouteId, ShapeBound, StorageClass, TimingCounters, TokenSpan, VersionRef,
     protocol_layout_digest,
 };
 
@@ -111,7 +111,7 @@ fn canonical_operation() -> Operation {
         request_key(),
         OpId(11),
         parent,
-        Work::Token(TokenMode::Decode),
+        ForwardMode::TokenDecode,
         RouteId(9),
         Domain::Decode,
         Bounds {
@@ -139,8 +139,8 @@ fn canonical_operation() -> Operation {
     )
 }
 
-fn canonical_completion(semantic_digest: String) -> CompletionRecord {
-    CompletionRecord {
+fn canonical_completion(semantic_digest: String) -> ModelOutput {
+    ModelOutput {
         request_key: request_key(),
         op_id: OpId(11),
         completion_slot_generation: 2,

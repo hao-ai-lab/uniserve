@@ -5,7 +5,7 @@ use crate::profile::tokenizer::{DynTokenizer, IncrementalDecoder};
 use asynk_strim_attr::{TryYielder, try_stream};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
-use uniserve_core::{GenEvent, PositionLogprobs, PublicCommit};
+use uniserve_core::{GenerationEvent, PositionLogprobs, PublicCommit};
 
 use super::finish::{FinishReason, StopReason};
 use super::logprobs::{
@@ -244,7 +244,7 @@ pub async fn decoded_text_event_stream(
 
     while let Some(event) = raw_stream.next().await {
         match event {
-            GenEvent::Scheduled {
+            GenerationEvent::Scheduled {
                 queued_at: queued,
                 scheduled_at: scheduled,
             } => {
@@ -252,7 +252,7 @@ pub async fn decoded_text_event_stream(
                 scheduled_at = Some(scheduled);
                 emit_start_if_ready!();
             }
-            GenEvent::PromptLogprobs { positions } => {
+            GenerationEvent::PromptLogprobs { positions } => {
                 if !prompt_logprobs_requested {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -268,7 +268,7 @@ pub async fn decoded_text_event_stream(
                 }
                 emit_start_if_ready!();
             }
-            GenEvent::TextToken {
+            GenerationEvent::TextToken {
                 id, public_commit, ..
             } => {
                 emit_start_if_ready!();
@@ -291,7 +291,7 @@ pub async fn decoded_text_event_stream(
                     consume_token!(id, Vec::new(), public_commit);
                 }
             }
-            GenEvent::TokenLogprobs { id, candidates } => {
+            GenerationEvent::TokenLogprobs { id, candidates } => {
                 let (pending, public_commit) =
                     pending_token.take().ok_or_else(|| Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -312,7 +312,7 @@ pub async fn decoded_text_event_stream(
                     public_commit
                 );
             }
-            GenEvent::Finished {
+            GenerationEvent::Finished {
                 reason,
                 stop_reason,
                 completion_tokens,
@@ -356,19 +356,19 @@ pub async fn decoded_text_event_stream(
                 .await;
                 return Ok(());
             }
-            GenEvent::Rejected { message } | GenEvent::Error { message } => {
+            GenerationEvent::Rejected { message } | GenerationEvent::Error { message } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message,
                 });
             }
-            GenEvent::ImageBegin { .. }
-            | GenEvent::ImageStep { .. }
-            | GenEvent::ImageCommit { .. }
-            | GenEvent::ImageDone { .. }
-            | GenEvent::MediaCompleted { .. }
-            | GenEvent::MediaFailed { .. }
-            | GenEvent::MediaAborted => {
+            GenerationEvent::ImageBegin { .. }
+            | GenerationEvent::ImageStep { .. }
+            | GenerationEvent::ImageCommit { .. }
+            | GenerationEvent::ImageDone { .. }
+            | GenerationEvent::MediaCompleted { .. }
+            | GenerationEvent::MediaFailed { .. }
+            | GenerationEvent::MediaAborted => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message: "text-only request received a non-text lifecycle event".to_string(),

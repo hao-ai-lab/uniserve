@@ -2,7 +2,7 @@
 //!
 //! The simulator is a strict peer of the production execution protocol: it
 //! consumes typed admissions and operations, enforces lifecycle, version, and
-//! replay invariants, and returns one [`CompletionRecord`] per operation with the
+//! replay invariants, and returns one [`ModelOutput`] per operation with the
 //! resolved output-product values a host consumes. Every state point is named by
 //! its point index and semantic digest, exactly as a real worker names it.
 
@@ -21,11 +21,11 @@ use uniserve_core::{
     CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    Admission, Batch, CompletionRecord, CompletionReport, Digest, DrawLayout, ErrorCode,
-    FinishFlags, GenMode, LogicalLengths, MixedExecutionCapability, OpStatus, Operation,
+    Admission, Batch, CompletionReport, Digest, DrawLayout, ErrorCode, FinishFlags, ForwardMode,
+    LogicalLengths, MixedExecutionCapability, ModelOutput, OpStatus, Operation,
     PartitionCompletion, Point, ProductKind, ProductPayload, ProductRef, RegistrationAck,
     RequestKind, ResourceClass, SamplingState, TimingCounters, TokenMode, TokenSpan, TransferMode,
-    Work, WorkVariant, WorkerCapabilities, decode_sampling_state_bytes,
+    WorkerCapabilities, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -237,7 +237,7 @@ impl Drop for SimExecutor {
 #[derive(Clone)]
 struct RecordedCompletion {
     plan_digest: Digest,
-    completion: CompletionRecord,
+    completion: ModelOutput,
     products: Vec<ProductPayload>,
 }
 
@@ -328,16 +328,16 @@ impl SimEngine {
     pub fn new() -> Self {
         let caps = WorkerCapabilities {
             supported_work: vec![
-                WorkVariant::TokenExtend,
-                WorkVariant::TokenDecode,
-                WorkVariant::EncodeVision,
-                WorkVariant::EncodeLatent,
-                WorkVariant::GenTransition,
-                WorkVariant::GenFlow,
-                WorkVariant::Materialize,
-                WorkVariant::TransferProduct,
-                WorkVariant::TransferKvPublish,
-                WorkVariant::TransferKvInstall,
+                ForwardMode::TokenExtend,
+                ForwardMode::TokenDecode,
+                ForwardMode::EncodeVision,
+                ForwardMode::EncodeLatent,
+                ForwardMode::GenTransition,
+                ForwardMode::GenFlow,
+                ForwardMode::Materialize,
+                ForwardMode::TransferProduct,
+                ForwardMode::TransferKvPublish,
+                ForwardMode::TransferKvInstall,
             ],
             latent_page_units: 64,
             num_latent_pages: 1_025,
@@ -482,18 +482,18 @@ impl SimEngine {
     }
 
     /// Execute one operation against its session, producing the terminal
-    /// [`CompletionRecord`] and any resolved output-product values.
+    /// [`ModelOutput`] and any resolved output-product values.
     fn execute_operation(
         &self,
         operation: &Operation,
         session: &mut SimSession,
         input_products: &[ProductPayload],
-    ) -> anyhow::Result<(CompletionRecord, Vec<ProductPayload>)> {
+    ) -> anyhow::Result<(ModelOutput, Vec<ProductPayload>)> {
         let point_index = session.point_index;
         let selected_point = u32::from(operation.advances_state);
         let parent_semantic = session.committed_semantic.clone();
 
-        let mut record = CompletionRecord {
+        let mut record = ModelOutput {
             request_key: operation.request_key,
             op_id: operation.op_id,
             completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
@@ -518,7 +518,10 @@ impl SimEngine {
         let mut products = Vec::new();
 
         match operation.work {
-            Work::Token(mode) => {
+            work @ (ForwardMode::TokenExtend
+            | ForwardMode::TokenDecode
+            | ForwardMode::TokenVerify) => {
+                let mode = work.token_mode().expect("token mode");
                 let visual_state = operation.inputs.iter().any(|input| {
                     matches!(
                         input.kind,
@@ -670,9 +673,12 @@ impl SimEngine {
                     }
                 }
             }
-            Work::Draft => {}
-            Work::Encode(_) => {}
-            Work::Transfer(mode) => {
+            ForwardMode::Draft => {}
+            ForwardMode::EncodeVision | ForwardMode::EncodeLatent => {}
+            work @ (ForwardMode::TransferProduct
+            | ForwardMode::TransferKvPublish
+            | ForwardMode::TransferKvInstall) => {
+                let mode = work.transfer_mode().expect("transfer mode");
                 if mode == TransferMode::KvPublish {
                     session.kv_published_len = session.kv_visible_len;
                 }
@@ -683,8 +689,8 @@ impl SimEngine {
                     session.kv_published_len,
                 );
             }
-            Work::Gen(GenMode::Transition) => {}
-            Work::Gen(GenMode::Flow) => {
+            ForwardMode::GenTransition => {}
+            ForwardMode::GenFlow => {
                 let steps = operation.bounds.max_tokens.max(1) as u16;
                 session.flow_step = session.flow_step.saturating_add(steps);
                 let total = session
@@ -696,8 +702,8 @@ impl SimEngine {
                 // advanced through every scheduled step.
                 record.finish_flags.length = session.flow_step >= total;
             }
-            Work::Gen(GenMode::Decode) => {}
-            Work::Materialize => {
+            ForwardMode::GenDecode => {}
+            ForwardMode::Materialize => {
                 session.flow_step = 0;
                 if let Some(image) = session.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
@@ -748,8 +754,8 @@ impl SimEngine {
         Ok((record, products))
     }
 
-    fn predicated_completion(operation: &Operation, session: &SimSession) -> CompletionRecord {
-        let mut record = CompletionRecord {
+    fn predicated_completion(operation: &Operation, session: &SimSession) -> ModelOutput {
+        let mut record = ModelOutput {
             request_key: operation.request_key,
             op_id: operation.op_id,
             completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
@@ -948,7 +954,7 @@ impl ModelEngine for SimEngine {
                             *point_index == session.point_index,
                             "operation {} ({}) parent point {} does not match session point {}",
                             operation.op_id.0,
-                            operation.work.variant().as_wire_str(),
+                            operation.work.as_wire_str(),
                             point_index,
                             session.point_index
                         );
@@ -956,7 +962,7 @@ impl ModelEngine for SimEngine {
                             *semantic_digest == session.committed_semantic,
                             "operation {} ({}) parent semantic digest does not match the committed point",
                             operation.op_id.0,
-                            operation.work.variant().as_wire_str()
+                            operation.work.as_wire_str()
                         );
                     }
                     Point::Device {
@@ -1134,7 +1140,7 @@ mod tests {
             request_key,
             OpId(op_id),
             parent,
-            Work::Token(TokenMode::Extend),
+            ForwardMode::TokenExtend,
             RouteId(0),
             Domain::Prefill,
             Bounds {

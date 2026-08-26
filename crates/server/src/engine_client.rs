@@ -1,4 +1,4 @@
-//! Server-owned in-process and ZMQ engine clients.
+//! Server-owned in-process engine client.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -10,17 +10,12 @@ pub mod generation;
 mod in_process;
 pub mod media;
 pub mod metrics;
-pub mod zmq;
 
-pub use client::{
-    EngineClient, EngineStatus, InProcessEngineClient, StreamCancelCause, StreamControl,
-    StreamControlRequest,
-};
+pub use client::{EngineStatus, StreamCancelCause, StreamControl, StreamControlRequest};
 pub use error::{Error, Result};
 pub use generation::{GenerationEventStream, GenerationSubmission};
-pub(crate) use in_process::RuntimeEngineClient;
+pub use in_process::EngineClient;
 pub use media::{MediaEventStream, MediaSubmission};
-pub use zmq::{EngineId, TransportMode, ZmqClientConfig, ZmqEngineClient};
 
 impl EngineClient {
     pub fn snapshot(&self) -> EngineSnapshot {

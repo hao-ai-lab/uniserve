@@ -98,7 +98,7 @@ fn token_decode_operation() -> Operation {
         request_key(),
         OpId(11),
         fixed_parent(),
-        Work::Token(TokenMode::Decode),
+        ForwardMode::TokenDecode,
         RouteId(1),
         Domain::Decode,
         Bounds {
@@ -124,14 +124,14 @@ fn token_decode_operation() -> Operation {
     )
 }
 
-fn operation_for(work: Work, op_id: OpId, advances: bool) -> Operation {
+fn operation_for(work: ForwardMode, op_id: OpId, advances: bool) -> Operation {
     Operation::registered(
         request_key(),
         op_id,
         fixed_parent(),
         work,
         RouteId(1),
-        work.variant().domain(),
+        work.domain(),
         Bounds {
             max_points: if advances { 1 } else { 0 },
             ..Bounds::default()
@@ -144,8 +144,8 @@ fn operation_for(work: Work, op_id: OpId, advances: bool) -> Operation {
     )
 }
 
-fn completion_record() -> CompletionRecord {
-    CompletionRecord {
+fn completion_record() -> ModelOutput {
+    ModelOutput {
         request_key: request_key(),
         op_id: OpId(11),
         completion_slot_generation: 2,
@@ -245,8 +245,8 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 .iter()
                 .filter(|operation| {
                     matches!(
-                        operation.work.variant(),
-                        WorkVariant::GenTransition | WorkVariant::GenFlow
+                        operation.work,
+                        ForwardMode::GenTransition | ForwardMode::GenFlow
                     ) || operation
                         .inputs
                         .iter()
@@ -260,7 +260,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                     height: 1,
                     width: 1,
                     start_step: 0,
-                    step_count: u32::from(operation.work.variant() == WorkVariant::GenFlow),
+                    step_count: u32::from(operation.work == ForwardMode::GenFlow),
                 })
                 .collect();
             BatchPartition {
@@ -293,7 +293,7 @@ fn batch_with_operations(
 
 fn partition_report(
     step_id: u64,
-    completions: Vec<CompletionRecord>,
+    completions: Vec<ModelOutput>,
     products: Vec<ProductPayload>,
     visible: bool,
     worker_exec_us: Option<u64>,
@@ -315,30 +315,18 @@ fn partition_report(
 #[test]
 fn every_work_variant_round_trips_through_the_wire() {
     let variants = [
-        (Work::Token(TokenMode::Extend), true, Domain::Prefill),
-        (Work::Token(TokenMode::Decode), true, Domain::Decode),
-        (Work::Token(TokenMode::Verify), true, Domain::Decode),
-        (Work::Draft, false, Domain::Decode),
-        (Work::Encode(EncodeMode::Vision), false, Domain::Prefill),
-        (Work::Encode(EncodeMode::Latent), false, Domain::Prefill),
-        (
-            Work::Transfer(TransferMode::Product),
-            false,
-            Domain::Prefill,
-        ),
-        (
-            Work::Transfer(TransferMode::KvPublish),
-            false,
-            Domain::Prefill,
-        ),
-        (
-            Work::Transfer(TransferMode::KvInstall),
-            false,
-            Domain::Prefill,
-        ),
-        (Work::Gen(GenMode::Transition), true, Domain::Flow),
-        (Work::Gen(GenMode::Flow), true, Domain::Flow),
-        (Work::Materialize, false, Domain::Flow),
+        (ForwardMode::TokenExtend, true, Domain::Prefill),
+        (ForwardMode::TokenDecode, true, Domain::Decode),
+        (ForwardMode::TokenVerify, true, Domain::Decode),
+        (ForwardMode::Draft, false, Domain::Decode),
+        (ForwardMode::EncodeVision, false, Domain::Prefill),
+        (ForwardMode::EncodeLatent, false, Domain::Prefill),
+        (ForwardMode::TransferProduct, false, Domain::Prefill),
+        (ForwardMode::TransferKvPublish, false, Domain::Prefill),
+        (ForwardMode::TransferKvInstall, false, Domain::Prefill),
+        (ForwardMode::GenTransition, true, Domain::Flow),
+        (ForwardMode::GenFlow, true, Domain::Flow),
+        (ForwardMode::Materialize, false, Domain::Flow),
     ];
     for (index, (work, advances, domain)) in variants.into_iter().enumerate() {
         assert_eq!(
@@ -346,11 +334,7 @@ fn every_work_variant_round_trips_through_the_wire() {
             advances,
             "work table effect mismatch"
         );
-        assert_eq!(
-            work.variant().domain(),
-            domain,
-            "work table domain mismatch"
-        );
+        assert_eq!(work.domain(), domain, "work table domain mismatch");
         let operation = operation_for(work, OpId(100 + index as u64), advances);
         let batch = execute_round_trip(batch_with_operations(
             1,
@@ -377,7 +361,7 @@ fn version_ref_device_point_round_trips() {
         request_key(),
         OpId(12),
         device_parent.clone(),
-        Work::Token(TokenMode::Decode),
+        ForwardMode::TokenDecode,
         RouteId(1),
         Domain::Decode,
         Bounds {
@@ -585,7 +569,7 @@ fn validation_rejects_a_work_domain_mismatch() {
 
 #[test]
 fn kv_publication_requires_a_fixed_semantic_parent() {
-    let mut operation = operation_for(Work::Transfer(TransferMode::KvPublish), OpId(12), false);
+    let mut operation = operation_for(ForwardMode::TransferKvPublish, OpId(12), false);
     operation.parent = VersionRef {
         request_key: request_key(),
         producer_op_id: OpId(9),
@@ -799,7 +783,7 @@ fn kv_free_capabilities_round_trip_without_kv_geometry() {
         num_layers: 0,
         num_kv_heads: 0,
         head_dim: 0,
-        supported_work: vec![WorkVariant::GenTransition, WorkVariant::GenFlow],
+        supported_work: vec![ForwardMode::GenTransition, ForwardMode::GenFlow],
         latent_page_units: 64,
         num_latent_pages: 3,
         latent_width: 1,
@@ -828,9 +812,9 @@ fn capabilities_with_a_disagreeing_layout_digest_are_rejected() {
 fn capabilities_reject_duplicate_set_members() {
     let caps = WorkerCapabilities {
         supported_work: vec![
-            WorkVariant::TokenExtend,
-            WorkVariant::TokenDecode,
-            WorkVariant::TokenExtend,
+            ForwardMode::TokenExtend,
+            ForwardMode::TokenDecode,
+            ForwardMode::TokenExtend,
         ],
         ..Default::default()
     };
@@ -882,7 +866,7 @@ fn image_generation_requires_incremental_kv_publication() {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical wire fixtures cover every request and response kind, every `Work`
+// Canonical wire fixtures cover every request and response kind, every `ForwardMode`
 // and `Control` variant, fixed and device parents, full admissions, and non-empty
 // product payloads. Distinct scalar values expose transposed field mappings.
 // ---------------------------------------------------------------------------
@@ -975,28 +959,28 @@ fn full_image() -> ImageParams {
     }
 }
 
-/// One operation per closed `Work` variant, each on its own request key so the
+/// One operation per closed `ForwardMode` variant, each on its own request key so the
 /// batch admits them together; the first two keys also carry admissions.
 fn comprehensive_batch() -> Batch {
     let variants = [
-        Work::Token(TokenMode::Extend),
-        Work::Token(TokenMode::Decode),
-        Work::Token(TokenMode::Verify),
-        Work::Draft,
-        Work::Encode(EncodeMode::Vision),
-        Work::Encode(EncodeMode::Latent),
-        Work::Transfer(TransferMode::Product),
-        Work::Transfer(TransferMode::KvPublish),
-        Work::Transfer(TransferMode::KvInstall),
-        Work::Gen(GenMode::Transition),
-        Work::Gen(GenMode::Flow),
-        Work::Materialize,
+        ForwardMode::TokenExtend,
+        ForwardMode::TokenDecode,
+        ForwardMode::TokenVerify,
+        ForwardMode::Draft,
+        ForwardMode::EncodeVision,
+        ForwardMode::EncodeLatent,
+        ForwardMode::TransferProduct,
+        ForwardMode::TransferKvPublish,
+        ForwardMode::TransferKvInstall,
+        ForwardMode::GenTransition,
+        ForwardMode::GenFlow,
+        ForwardMode::Materialize,
     ];
     let mut operations = Vec::new();
     for (index, work) in variants.into_iter().enumerate() {
         let key = session_key(100 + index as u64);
         let op_id = OpId(11 + index as u64);
-        let parent = if work.variant().requires_fixed_parent() || index % 2 == 0 {
+        let parent = if work.requires_fixed_parent() || index % 2 == 0 {
             VersionRef::admission_root(key, OpId(1), digest_string(0xaa))
         } else {
             VersionRef {
@@ -1009,7 +993,7 @@ fn comprehensive_batch() -> Batch {
                 },
             }
         };
-        let domain = work.variant().domain();
+        let domain = work.domain();
         operations.push(Operation::registered(
             key,
             op_id,
@@ -1169,7 +1153,7 @@ fn request_fixtures() -> Vec<WorkerRequest> {
 
 fn full_caps() -> WorkerCapabilities {
     WorkerCapabilities {
-        supported_work: WorkVariant::ALL.to_vec(),
+        supported_work: ForwardMode::ALL.to_vec(),
         groups: vec![
             KvCacheGroupSpec {
                 group_id: 0,
@@ -1281,7 +1265,7 @@ fn full_forward_stats() -> WorkerForwardStats {
 }
 
 fn full_completion_report() -> CompletionReport {
-    let ok_record = CompletionRecord {
+    let ok_record = ModelOutput {
         request_key: session_key(100),
         op_id: OpId(11),
         completion_slot_generation: 2,

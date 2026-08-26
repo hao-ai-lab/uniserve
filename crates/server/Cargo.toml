@@ -17,7 +17,6 @@ bytes.workspace = true
 easy-ext.workspace = true
 fastokens.workspace = true
 futures.workspace = true
-hex.workspace = true
 hf-hub.workspace = true
 http-body.workspace = true
 image.workspace = true
@@ -50,7 +49,6 @@ uniserve-observability.workspace = true
 uuid.workspace = true
 validator.workspace = true
 winnow.workspace = true
-zeromq.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

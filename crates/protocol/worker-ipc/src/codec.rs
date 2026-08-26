@@ -9,16 +9,16 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 use crate::schema::uniserve::wire as fbs;
 use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CacheCopy,
-    CachePageAllocation, CloseReason, CompletionRecord, CompletionReport, Control, DType,
-    DecodeKind, DecodePlacement, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
-    ErrorOperationIdentity, ExecutionCapability, FinishFlags, ForwardRow, GenAdmission,
-    GraphBucketCapability, LaneCapabilities, LatentPlacement, LogicalLengths, MediaAdmission,
-    MediaProfileId, MixedExecutionCapability, OpId, OpStatus, Operation, PartitionCompletion,
-    Point, PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
+    CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
+    DecodePlacement, DimBound, Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity,
+    ExecutionCapability, FinishFlags, ForwardMode, ForwardRow, GenAdmission, GraphBucketCapability,
+    LaneCapabilities, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId,
+    MixedExecutionCapability, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion, Point,
+    PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
     RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId,
     SamplingOwnership, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenSpan,
-    UndAdmission, VersionRef, Work, WorkVariant, WorkerCapabilities, WorkerForwardStats,
-    WorkerRequest, WorkerResponse,
+    UndAdmission, VersionRef, WorkerCapabilities, WorkerForwardStats, WorkerRequest,
+    WorkerResponse,
 };
 
 pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -360,7 +360,7 @@ fn operation_from_table(operation: fbs::Operation<'_>) -> anyhow::Result<Operati
         request_key: request_key_from_table(operation.request_key(), "operation.request_key")?,
         op_id: OpId(operation.op_id()),
         parent: version_ref_from_table(operation.parent().context("operation has no parent")?)?,
-        work: Work::from_variant(work_from_fb(operation.work())?),
+        work: work_from_fb(operation.work())?,
         route: RouteId(operation.route()),
         domain: domain_from_fb(operation.domain())?,
         advances_state: operation.advances_state(),
@@ -631,9 +631,7 @@ fn partition_completion_from_table(
     Ok(report)
 }
 
-fn completion_record_from_table(
-    record: fbs::CompletionRecord<'_>,
-) -> anyhow::Result<CompletionRecord> {
+fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> anyhow::Result<ModelOutput> {
     let logical_lengths = record
         .logical_lengths()
         .context("completion record has no logical lengths")?;
@@ -646,7 +644,7 @@ fn completion_record_from_table(
     let timing_counters = record
         .timing_counters()
         .context("completion record has no timing counters")?;
-    let record = CompletionRecord {
+    let record = ModelOutput {
         request_key: request_key_from_table(record.request_key(), "completion.request_key")?,
         op_id: OpId(record.op_id()),
         completion_slot_generation: record.completion_slot_generation(),
@@ -1468,7 +1466,7 @@ fn operation_to_fb(operation: &Operation) -> anyhow::Result<fbs::OperationT> {
         request_key: Some(Box::new(request_key_to_fb(operation.request_key))),
         op_id: operation.op_id.0,
         parent: Some(Box::new(version_ref_to_fb(&operation.parent))),
-        work: work_to_fb(operation.work.variant()),
+        work: work_to_fb(operation.work),
         route: operation.route.0,
         domain: domain_to_fb(operation.domain),
         advances_state: operation.advances_state,
@@ -1660,8 +1658,8 @@ fn partition_completion_to_fb(report: &PartitionCompletion) -> fbs::PartitionCom
     }
 }
 
-fn completion_record_to_fb(record: &CompletionRecord) -> fbs::CompletionRecordT {
-    fbs::CompletionRecordT {
+fn completion_record_to_fb(record: &ModelOutput) -> fbs::ModelOutputT {
+    fbs::ModelOutputT {
         request_key: Some(Box::new(request_key_to_fb(record.request_key))),
         op_id: record.op_id.0,
         completion_slot_generation: record.completion_slot_generation,
@@ -2064,21 +2062,21 @@ fn snapshot_to_fb(snapshot: &SnapshotRef) -> fbs::SnapshotRefT {
 // Enum mappers
 // ---------------------------------------------------------------------------
 
-fn work_to_fb(variant: WorkVariant) -> fbs::WorkVariant {
+fn work_to_fb(variant: ForwardMode) -> fbs::ForwardMode {
     match variant {
-        WorkVariant::TokenExtend => fbs::WorkVariant::TokenExtend,
-        WorkVariant::TokenDecode => fbs::WorkVariant::TokenDecode,
-        WorkVariant::TokenVerify => fbs::WorkVariant::TokenVerify,
-        WorkVariant::Draft => fbs::WorkVariant::Draft,
-        WorkVariant::EncodeVision => fbs::WorkVariant::EncodeVision,
-        WorkVariant::EncodeLatent => fbs::WorkVariant::EncodeLatent,
-        WorkVariant::TransferProduct => fbs::WorkVariant::TransferProduct,
-        WorkVariant::TransferKvPublish => fbs::WorkVariant::TransferKvPublish,
-        WorkVariant::TransferKvInstall => fbs::WorkVariant::TransferKvInstall,
-        WorkVariant::GenTransition => fbs::WorkVariant::GenTransition,
-        WorkVariant::GenFlow => fbs::WorkVariant::GenFlow,
-        WorkVariant::Materialize => fbs::WorkVariant::Materialize,
-        WorkVariant::GenDecode => fbs::WorkVariant::GenDecode,
+        ForwardMode::TokenExtend => fbs::ForwardMode::TokenExtend,
+        ForwardMode::TokenDecode => fbs::ForwardMode::TokenDecode,
+        ForwardMode::TokenVerify => fbs::ForwardMode::TokenVerify,
+        ForwardMode::Draft => fbs::ForwardMode::Draft,
+        ForwardMode::EncodeVision => fbs::ForwardMode::EncodeVision,
+        ForwardMode::EncodeLatent => fbs::ForwardMode::EncodeLatent,
+        ForwardMode::TransferProduct => fbs::ForwardMode::TransferProduct,
+        ForwardMode::TransferKvPublish => fbs::ForwardMode::TransferKvPublish,
+        ForwardMode::TransferKvInstall => fbs::ForwardMode::TransferKvInstall,
+        ForwardMode::GenTransition => fbs::ForwardMode::GenTransition,
+        ForwardMode::GenFlow => fbs::ForwardMode::GenFlow,
+        ForwardMode::Materialize => fbs::ForwardMode::Materialize,
+        ForwardMode::GenDecode => fbs::ForwardMode::GenDecode,
     }
 }
 
@@ -2113,8 +2111,8 @@ fn media_profile_from_fb(profile: fbs::MediaProfileId) -> anyhow::Result<MediaPr
     }
 }
 
-fn work_from_fb(variant: fbs::WorkVariant) -> anyhow::Result<WorkVariant> {
-    for candidate in WorkVariant::ALL {
+fn work_from_fb(variant: fbs::ForwardMode) -> anyhow::Result<ForwardMode> {
+    for candidate in ForwardMode::ALL {
         if work_to_fb(candidate) == variant {
             return Ok(candidate);
         }

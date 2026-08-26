@@ -17,7 +17,7 @@ from ..batch import (
     BatchPartition,
     Close,
     Commit,
-    CompletionRecord,
+    ModelOutput,
     CompletionReport,
     DecodeKind,
     DecodePlacement,
@@ -34,7 +34,7 @@ from ..batch import (
     SamplingOwnership,
     TimingCounters,
     TokenSpan,
-    WorkVariant,
+    ForwardMode,
 )
 from ..capabilities import (
     LaneCapabilities,
@@ -62,10 +62,10 @@ from ..server.profiler import profile_range
 __all__ = ["MediaWorker", "is_h3_checkpoint"]
 
 _MEDIA_WORK = (
-    WorkVariant.GEN_TRANSITION,
-    WorkVariant.GEN_FLOW,
-    WorkVariant.GEN_DECODE,
-    WorkVariant.MATERIALIZE,
+    ForwardMode.GEN_TRANSITION,
+    ForwardMode.GEN_FLOW,
+    ForwardMode.GEN_DECODE,
+    ForwardMode.MATERIALIZE,
 )
 def is_h3_checkpoint(model_path: str) -> bool:
     """Identify the modular H3 composition root without loading its weights."""
@@ -334,12 +334,12 @@ class MediaWorker:
         ] = {}
         try:
             for operation in partition.operations:
-                if operation.work.variant in {
-                    WorkVariant.GEN_DECODE,
-                    WorkVariant.MATERIALIZE,
+                if operation.work in {
+                    ForwardMode.GEN_DECODE,
+                    ForwardMode.MATERIALIZE,
                 }:
                     lease = None
-                    if operation.work.variant is WorkVariant.GEN_DECODE:
+                    if operation.work is ForwardMode.GEN_DECODE:
                         placement = self._decode_placement(partition, operation)
                         lease = output_ring.reserve(placement.kind.value)
                     try:
@@ -383,7 +383,7 @@ class MediaWorker:
     ) -> tuple[DeviceProductWrite, ...]:
         bindings = []
         for operation in partition.operations:
-            if operation.work.variant is WorkVariant.MATERIALIZE:
+            if operation.work is ForwardMode.MATERIALIZE:
                 if operation.outputs:
                     raise invalid_descriptor("H3 materialize must not publish device products")
                 continue
@@ -404,17 +404,17 @@ class MediaWorker:
         reservation: CpuTaskReservation | None,
         ring_lease: H3OutputRingLease | None,
     ) -> tuple[object, ...]:
-        variant = operation.work.variant
-        if variant is WorkVariant.GEN_TRANSITION:
+        variant = operation.work
+        if variant is ForwardMode.GEN_TRANSITION:
             placement = self._placement(partition, operation)
             if placement.start_step != 0 or placement.step_count != 0:
                 raise invalid_descriptor("H3 transition placement must carry zero denoise steps")
             return ()
-        if variant is WorkVariant.GEN_FLOW:
+        if variant is ForwardMode.GEN_FLOW:
             placement = self._placement(partition, operation)
             self.model.denoise(slot, placement.start_step, placement.step_count)
             return ()
-        if variant is WorkVariant.GEN_DECODE:
+        if variant is ForwardMode.GEN_DECODE:
             placement = self._decode_placement(partition, operation)
             if placement.kind is DecodeKind.VIDEO:
                 rgb = self.model.decode_video(slot, placement)
@@ -467,7 +467,7 @@ class MediaWorker:
                     ring_lease.defer_until_capture_ready(capture)
                     raise
             return ()
-        if variant is WorkVariant.MATERIALIZE:
+        if variant is ForwardMode.MATERIALIZE:
             if self.mesh.coord("sp") == 0:
                 if reservation is None:
                     raise RuntimeError("rank zero lost its H3 materialize reservation")
@@ -492,7 +492,7 @@ class MediaWorker:
         )
         writes: tuple[DeviceProductWrite, ...] = ()
         reads: list[DeviceProductRead] = []
-        records: list[CompletionRecord] = []
+        records: list[ModelOutput] = []
         write_by_operation: dict[int, DeviceProductWrite] = {}
         try:
             writes = self._bind_outputs(partition)
@@ -509,7 +509,7 @@ class MediaWorker:
                     f"uniserve.h3.quantum step={step_id} "
                     f"partition={partition.partition_id} "
                     f"request={_request_label(operation)} op={operation.op_id} "
-                    f"work={operation.work.variant.value} rank={self.mesh.coord('sp')}"
+                    f"work={operation.work.value} rank={self.mesh.coord('sp')}"
                 ):
                     read = self._consume_predicate(operation)
                     if read is not None:
@@ -529,7 +529,7 @@ class MediaWorker:
                     write = write_by_operation.get(int(operation.op_id))
                     if write is not None:
                         self.device_products.publish_scalar_write(write, True)
-                placeholder = CompletionRecord(
+                placeholder = ModelOutput(
                     request_key=operation.request_key,
                     op_id=operation.op_id,
                     completion_slot_generation=buffer.generation,
@@ -597,7 +597,7 @@ class MediaWorker:
         transitions = {
             operation.request_key: operation
             for operation in batch.operations
-            if operation.work.variant is WorkVariant.GEN_TRANSITION
+            if operation.work is ForwardMode.GEN_TRANSITION
         }
         if set(admissions) != set(transitions):
             raise invalid_descriptor("H3 admissions must exactly match transition operations")

@@ -25,7 +25,7 @@ from uniserve_worker.batch import (
     Bounds,
     CachePageAllocation,
     Commit,
-    CompletionRecord,
+    ModelOutput,
     DevicePoint,
     Disposition,
     Domain,
@@ -56,8 +56,7 @@ from uniserve_worker.batch import (
     TokenSpan,
     UndAdmission,
     VersionRef,
-    Work,
-    WorkVariant,
+    ForwardMode,
     control_from_wire,
     control_to_wire,
     decode_sampling_state_bytes,
@@ -115,7 +114,7 @@ def _decode_operation(input_product: ProductRef | None = None) -> Operation:
         request_key=_request_key(),
         op_id=11,
         parent=_fixed_parent(),
-        work=Work.token(TokenMode.DECODE),
+        work=ForwardMode.token(TokenMode.DECODE),
         route=1,
         domain=Domain.DECODE,
         bounds=Bounds(max_points=1, max_tokens=1, max_kv_pages=1),
@@ -164,7 +163,7 @@ def _latent_product(
     )
 
 
-def _trajectory_operation(request_key: RequestKey, work: Work, *, op_id: int) -> Operation:
+def _trajectory_operation(request_key: RequestKey, work: ForwardMode, *, op_id: int) -> Operation:
     input_product = _latent_product(
         request_key,
         producer_op_id=op_id - 1,
@@ -172,10 +171,10 @@ def _trajectory_operation(request_key: RequestKey, work: Work, *, op_id: int) ->
     )
     outputs = (
         (_latent_product(request_key, producer_op_id=op_id, generation=2),)
-        if work.variant in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}
+        if work in {ForwardMode.GEN_TRANSITION, ForwardMode.GEN_FLOW}
         else ()
     )
-    inputs = () if work.variant is WorkVariant.GEN_TRANSITION else (input_product,)
+    inputs = () if work is ForwardMode.GEN_TRANSITION else (input_product,)
     return Operation.registered(
         request_key=request_key,
         op_id=op_id,
@@ -219,8 +218,8 @@ def _trajectory_partition(
                 latent_units=3,
                 height=16,
                 width=48,
-                start_step=(0 if operation.work.variant is WorkVariant.GEN_TRANSITION else 1),
-                step_count=(1 if operation.work.variant is WorkVariant.GEN_FLOW else 0),
+                start_step=(0 if operation.work is ForwardMode.GEN_TRANSITION else 1),
+                step_count=(1 if operation.work is ForwardMode.GEN_FLOW else 0),
             ),
         ),
     )
@@ -238,7 +237,7 @@ def test_plan_digest_matches_rust() -> None:
 
 def test_semantic_digest_matches_rust() -> None:
     fixture = _fixture()
-    completion = CompletionRecord.from_mapping(fixture["completion"])
+    completion = ModelOutput.from_mapping(fixture["completion"])
     assert completion.committed_tokens, "fixture must exercise non-empty committed tokens"
     recomputed = completion.compute_semantic_digest(
         fixture["parent_semantic_digest"], fixture["plan_digest"]
@@ -314,7 +313,7 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
         assert target.plan_digest == expected_plan
 
     fixture = _fixture()
-    completion = CompletionRecord.from_mapping(fixture["completion"])
+    completion = ModelOutput.from_mapping(fixture["completion"])
     other_completion = replace(completion, request_key=other_key, op_id=12)
     plans = {
         operation.request_key: operation.plan_digest,
@@ -348,7 +347,7 @@ def test_protocol_layout_digest_matches_rust() -> None:
 
 def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() -> None:
     first_key = _request_key()
-    first = _trajectory_operation(first_key, Work("gen", "transition"), op_id=20)
+    first = _trajectory_operation(first_key, ForwardMode.GEN_TRANSITION, op_id=20)
     with pytest.raises(WorkerError, match="has no latent placement"):
         BatchPartition(
             partition_id=1,
@@ -370,7 +369,7 @@ def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() 
     )
 
     second_key = RequestKey(authority_id=4, session_id=9, epoch=2)
-    second = _trajectory_operation(second_key, Work("gen", "transition"), op_id=21)
+    second = _trajectory_operation(second_key, ForwardMode.GEN_TRANSITION, op_id=21)
     first_placement = valid.latent_placements[0]
     with pytest.raises(WorkerError, match="overlap"):
         BatchPartition(
@@ -398,12 +397,12 @@ def test_trajectory_operations_require_exact_nonoverlapping_latent_placements() 
 def test_submission_group_has_one_fixed_latent_staging_partition() -> None:
     flow_operation = _trajectory_operation(
         _request_key(),
-        Work("materialize", None),
+        ForwardMode.MATERIALIZE,
         op_id=20,
     )
     transfer_operation = _trajectory_operation(
         RequestKey(authority_id=4, session_id=9, epoch=2),
-        Work("transfer", "product"),
+        ForwardMode.TRANSFER_PRODUCT,
         op_id=21,
     )
     partitions = (
@@ -453,7 +452,7 @@ def test_kv_publication_requires_a_fixed_semantic_parent() -> None:
             producer_op_id=9,
             point=DevicePoint(1, None, "cc" * 32),
         ),
-        work=Work("transfer", "kv_publish"),
+        work=ForwardMode.TRANSFER_KV_PUBLISH,
         route=1,
         domain=Domain.PREFILL,
         bounds=Bounds(),
@@ -465,18 +464,18 @@ def test_kv_publication_requires_a_fixed_semantic_parent() -> None:
 
 def test_work_variants_bind_state_advancement_and_execution_domain() -> None:
     variants = [
-        (Work("token", "extend"), True, Domain.PREFILL),
-        (Work("token", "decode"), True, Domain.DECODE),
-        (Work("token", "verify"), True, Domain.DECODE),
-        (Work("draft", None), False, Domain.DECODE),
-        (Work("encode", "vision"), False, Domain.PREFILL),
-        (Work("encode", "latent"), False, Domain.PREFILL),
-        (Work("transfer", "product"), False, Domain.PREFILL),
-        (Work("transfer", "kv_publish"), False, Domain.PREFILL),
-        (Work("transfer", "kv_install"), False, Domain.PREFILL),
-        (Work("gen", "transition"), True, Domain.FLOW),
-        (Work("gen", "flow"), True, Domain.FLOW),
-        (Work("materialize", None), False, Domain.FLOW),
+        (ForwardMode.TOKEN_EXTEND, True, Domain.PREFILL),
+        (ForwardMode.TOKEN_DECODE, True, Domain.DECODE),
+        (ForwardMode.TOKEN_VERIFY, True, Domain.DECODE),
+        (ForwardMode.DRAFT, False, Domain.DECODE),
+        (ForwardMode.ENCODE_VISION, False, Domain.PREFILL),
+        (ForwardMode.ENCODE_LATENT, False, Domain.PREFILL),
+        (ForwardMode.TRANSFER_PRODUCT, False, Domain.PREFILL),
+        (ForwardMode.TRANSFER_KV_PUBLISH, False, Domain.PREFILL),
+        (ForwardMode.TRANSFER_KV_INSTALL, False, Domain.PREFILL),
+        (ForwardMode.GEN_TRANSITION, True, Domain.FLOW),
+        (ForwardMode.GEN_FLOW, True, Domain.FLOW),
+        (ForwardMode.MATERIALIZE, False, Domain.FLOW),
     ]
     for work, advances, domain in variants:
         assert work.advances_state is advances
@@ -485,7 +484,7 @@ def test_work_variants_bind_state_advancement_and_execution_domain() -> None:
 
 def test_error_completion_requires_error_code() -> None:
     with pytest.raises(WorkerError):
-        CompletionRecord(
+        ModelOutput(
             request_key=_request_key(),
             op_id=11,
             completion_slot_generation=1,
@@ -501,7 +500,7 @@ def test_error_completion_requires_error_code() -> None:
             timing_counters=TimingCounters(),
         ).validate()
 
-    CompletionRecord(
+    ModelOutput(
         request_key=_request_key(),
         op_id=11,
         completion_slot_generation=1,

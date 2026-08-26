@@ -6,10 +6,10 @@ use uniserve_core::{
     ImageKvEffect, RequestId, SamplingParams, SegmentPlacement, UndTokenAction,
 };
 use uniserve_worker_ipc::{
-    Bounds, CompletionRecord, DType, DimBound, Domain, DrawLayout, EncodeMode, GenMode, OpId,
-    OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
-    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode, TransferMode,
-    VersionRef, Work, WorkVariant, encode_sampling_state_bytes, encode_token_product_bytes,
+    Bounds, DType, DimBound, Domain, DrawLayout, ForwardMode, ModelOutput, OpId, OpStatus,
+    Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
+    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode, VersionRef,
+    encode_sampling_state_bytes, encode_token_product_bytes,
 };
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
@@ -527,7 +527,7 @@ impl GenerationCursor {
         &mut self,
         operation: &Operation,
         apply: &SchedulerApply,
-        record: &CompletionRecord,
+        record: &ModelOutput,
         products: &[ProductPayload],
     ) -> Result<(), CursorApplyError> {
         let op_id = operation.op_id.0;
@@ -1007,7 +1007,7 @@ pub(crate) enum TransitionIntent {
 /// rides alongside because guidance, token policy, and scored prompt tokens are
 /// scheduler-owned rather than flat-wire fields.
 struct Wire {
-    work: Work,
+    work: ForwardMode,
     inputs: Vec<ProductRef>,
     outputs: Vec<ProductRef>,
     new_blocks: Vec<BlockId>,
@@ -1137,7 +1137,7 @@ impl GenerationPlanner {
                 let sampling_delta = operation_sampling_delta(&request.sampling, &sampling_state);
                 (
                     Wire {
-                        work: Work::Token(TokenMode::Extend),
+                        work: ForwardMode::TokenExtend,
                         inputs: Vec::new(),
                         outputs: token_outputs(
                             logprob_blob_bound(
@@ -1185,8 +1185,8 @@ impl GenerationPlanner {
                     return Err(PlanningError::MissingImageInput);
                 }
                 let work = match step {
-                    ImageIngestStep::VaeEncode => Work::Encode(EncodeMode::Latent),
-                    ImageIngestStep::VitEncode => Work::Encode(EncodeMode::Vision),
+                    ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
+                    ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
                 };
                 let has_source_product = source_product.is_some();
                 (
@@ -1239,7 +1239,7 @@ impl GenerationPlanner {
                 );
                 (
                     Wire {
-                        work: Work::Token(TokenMode::Extend),
+                        work: ForwardMode::TokenExtend,
                         inputs: vec![feature],
                         outputs: Vec::new(),
                         new_blocks,
@@ -1308,7 +1308,7 @@ impl GenerationPlanner {
                 let sampling_delta = operation_sampling_delta(&request.sampling, &sampling_state);
                 (
                     Wire {
-                        work: Work::Token(mode),
+                        work: ForwardMode::from_token(mode),
                         inputs: Vec::new(),
                         outputs: token_outputs(
                             logprob_blob_bound(&request.sampling, 0)?,
@@ -1346,7 +1346,7 @@ impl GenerationPlanner {
                 );
                 (
                     Wire {
-                        work: Work::Transfer(TransferMode::KvPublish),
+                        work: ForwardMode::TransferKvPublish,
                         inputs: Vec::new(),
                         outputs: vec![
                             output,
@@ -1387,7 +1387,7 @@ impl GenerationPlanner {
                 }
                 (
                     Wire {
-                        work: Work::Gen(GenMode::Transition),
+                        work: ForwardMode::GenTransition,
                         inputs: vec![conditioning],
                         outputs: vec![
                             self.latent_output(0, &request.resources)?,
@@ -1427,7 +1427,7 @@ impl GenerationPlanner {
                 new_blocks,
             } => (
                 Wire {
-                    work: Work::Token(TokenMode::Extend),
+                    work: ForwardMode::TokenExtend,
                     inputs: Vec::new(),
                     outputs: vec![output_product(
                         0,
@@ -1470,7 +1470,7 @@ impl GenerationPlanner {
                 let step_count = step_count.max(1);
                 (
                     Wire {
-                        work: Work::Gen(GenMode::Flow),
+                        work: ForwardMode::GenFlow,
                         inputs: vec![conditioning, latent],
                         outputs: vec![
                             self.latent_output(0, &request.resources)?,
@@ -1521,7 +1521,7 @@ impl GenerationPlanner {
                 ));
                 (
                     Wire {
-                        work: Work::Materialize,
+                        work: ForwardMode::Materialize,
                         inputs: vec![latent],
                         outputs,
                         new_blocks: Vec::new(),
@@ -1555,8 +1555,8 @@ impl GenerationPlanner {
                     return Err(PlanningError::FeedbackDisabled);
                 }
                 let work = match step {
-                    ImageIngestStep::VaeEncode => Work::Encode(EncodeMode::Latent),
-                    ImageIngestStep::VitEncode => Work::Encode(EncodeMode::Vision),
+                    ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
+                    ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
                 };
                 let mut outputs = encode_outputs(step, 0, &request.resources)?;
                 outputs.push(output_product(
@@ -1636,7 +1636,7 @@ impl GenerationPlanner {
                 )?;
                 (
                     Wire {
-                        work: Work::Token(TokenMode::Extend),
+                        work: ForwardMode::TokenExtend,
                         inputs: vec![feature],
                         outputs,
                         new_blocks,
@@ -1669,12 +1669,12 @@ impl GenerationPlanner {
                 )
             }
         };
-        let operation_variant = wire.work.variant();
+        let operation_variant = wire.work;
         let produces_latent = matches!(
             operation_variant,
-            WorkVariant::GenTransition | WorkVariant::GenFlow
+            ForwardMode::GenTransition | ForwardMode::GenFlow
         );
-        let is_materialize = operation_variant == WorkVariant::Materialize;
+        let is_materialize = operation_variant == ForwardMode::Materialize;
         let produces_token = wire
             .outputs
             .iter()
@@ -1737,13 +1737,13 @@ impl GenerationPlanner {
             },
             expects_encoder_handle: matches!(
                 operation_variant,
-                WorkVariant::EncodeLatent | WorkVariant::EncodeVision
+                ForwardMode::EncodeLatent | ForwardMode::EncodeVision
             ),
             expects_latent_generation: produces_latent,
             expects_image_artifact: is_materialize,
             expected_image_hw: is_materialize
                 .then_some((request.image.height, request.image.width)),
-            requires_kv_publication: operation_variant == WorkVariant::TransferKvPublish,
+            requires_kv_publication: operation_variant == ForwardMode::TransferKvPublish,
             expected_image_kv: match delta {
                 TransitionDelta::IngestImageState {
                     physical_start,
@@ -1791,12 +1791,12 @@ impl GenerationPlanner {
                 && request.sampling.generated_logprobs_requested()
                 && matches!(
                     operation_variant,
-                    WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
+                    ForwardMode::TokenExtend | ForwardMode::TokenDecode | ForwardMode::TokenVerify
                 ),
             expected_prompt_token_ids: wire.expected_prompt_token_ids,
         };
         let bounds = Bounds {
-            max_points: if operation_variant == WorkVariant::TokenVerify {
+            max_points: if operation_variant == ForwardMode::TokenVerify {
                 wire.token_cost.min(u32::MAX as usize) as u32
             } else {
                 1
@@ -1999,7 +1999,7 @@ pub(crate) enum PlanningError {
 /// Ephemeral scheduler builder consumed when an operation is registered.
 #[derive(Debug)]
 pub(crate) struct PlannedTransition {
-    pub(crate) work: Work,
+    pub(crate) work: ForwardMode,
     pub(crate) route: RouteId,
     pub(crate) domain: Domain,
     pub(crate) bounds: Bounds,
@@ -2008,7 +2008,7 @@ pub(crate) struct PlannedTransition {
     pub(crate) predicate: Option<ProductRef>,
     pub(crate) rng: Option<Rng>,
     pub(crate) control_seq: u64,
-    pub(crate) operation_variant: WorkVariant,
+    pub(crate) operation_variant: ForwardMode,
     pub(crate) request_id: RequestId,
     /// Monotonic microsecond stamps for the two pre-registration lifecycle
     /// phases. They are carried here because an operation gains its canonical
@@ -2180,7 +2180,7 @@ impl SchedulerApply {
     pub(crate) fn validate_result(
         &self,
         operation: &Operation,
-        record: &CompletionRecord,
+        record: &ModelOutput,
         products: &[ProductPayload],
         predicated_parent_point: Option<u32>,
     ) -> Result<(), TransitionValidationError> {
@@ -2226,8 +2226,7 @@ impl SchedulerApply {
                 actual_result: u64::from(record.selected_point),
             });
         }
-        self.validation
-            .validate(operation.work.variant(), record, products)
+        self.validation.validate(operation.work, record, products)
     }
 }
 
@@ -2383,8 +2382,8 @@ pub(crate) struct TextTokenCountRange {
 impl TransitionValidation {
     fn validate(
         &self,
-        operation_variant: WorkVariant,
-        record: &CompletionRecord,
+        operation_variant: ForwardMode,
+        record: &ModelOutput,
         products: &[ProductPayload],
     ) -> Result<(), TransitionValidationError> {
         if record.status != OpStatus::Ok {
@@ -2483,7 +2482,7 @@ impl TransitionValidation {
         if self.expects_sampled_token && sampled_tokens.is_empty() {
             return Err(TransitionValidationError::MissingSampledToken { operation_variant });
         }
-        let accepted_draft_tokens = if operation_variant == WorkVariant::TokenVerify {
+        let accepted_draft_tokens = if operation_variant == ForwardMode::TokenVerify {
             let drafts = self.draft_token_ids.as_deref().unwrap_or_default();
             let listed = record.committed_tokens.as_slice();
             let terminal_prefix = !listed.is_empty()
@@ -2654,10 +2653,10 @@ pub(crate) enum TransitionValidationError {
         actual: u32,
     },
     UnexpectedSampledToken {
-        operation_variant: WorkVariant,
+        operation_variant: ForwardMode,
     },
     MissingSampledToken {
-        operation_variant: WorkVariant,
+        operation_variant: ForwardMode,
     },
     AcceptedDraftCountExceeded {
         max: u32,
@@ -2673,7 +2672,7 @@ pub(crate) enum TransitionValidationError {
         token_id: u32,
     },
     UnexpectedPromptLogprobs {
-        operation_variant: WorkVariant,
+        operation_variant: ForwardMode,
     },
     PromptLogprobCountMismatch {
         expected: usize,
@@ -2691,7 +2690,7 @@ pub(crate) enum TransitionValidationError {
         position: usize,
     },
     UnexpectedGeneratedLogprobs {
-        operation_variant: WorkVariant,
+        operation_variant: ForwardMode,
     },
     MissingGeneratedLogprobs {
         token_id: u32,
@@ -2766,8 +2765,8 @@ mod tests {
         "ab".repeat(32)
     }
 
-    fn completion(request_key: RequestKey, op_id: u64, selected_point: u32) -> CompletionRecord {
-        CompletionRecord {
+    fn completion(request_key: RequestKey, op_id: u64, selected_point: u32) -> ModelOutput {
+        ModelOutput {
             request_key,
             op_id: OpId(op_id),
             completion_slot_generation: 1,
@@ -2793,8 +2792,8 @@ mod tests {
     #[test]
     fn planner_emits_the_closed_token_variant() {
         let transition = prefill_transition();
-        assert_eq!(transition.operation_variant, WorkVariant::TokenExtend);
-        assert_eq!(transition.work, Work::Token(TokenMode::Extend));
+        assert_eq!(transition.operation_variant, ForwardMode::TokenExtend);
+        assert_eq!(transition.work, ForwardMode::TokenExtend);
         let TransitionDelta::IngestText { start, end, .. } = transition.delta else {
             panic!("expected an ingest-text transition");
         };
@@ -3105,7 +3104,7 @@ mod tests {
                 },
             )
             .expect("plan KV closure");
-        assert_eq!(closure.work, Work::Token(TokenMode::Extend));
+        assert_eq!(closure.work, ForwardMode::TokenExtend);
         assert_eq!(closure.input_tokens, vec![42]);
         assert_eq!(closure.outputs[0].kind, ProductKind::Completion);
         assert_eq!(closure.resources.kv_target_tokens, Some(3));
@@ -3122,7 +3121,7 @@ mod tests {
                 TransitionIntent::PublishKv { image_id: 1 },
             )
             .expect("plan KV publication");
-        assert_eq!(publication.work, Work::Transfer(TransferMode::KvPublish));
+        assert_eq!(publication.work, ForwardMode::TransferKvPublish);
         assert!(publication.inputs.is_empty());
         assert_eq!(publication.outputs[0].kind, ProductKind::Kv);
         assert_eq!(publication.outputs[0].storage_class, StorageClass::PagedKv);

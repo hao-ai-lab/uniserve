@@ -15,7 +15,7 @@ use uniserve_core::{
     ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPlacement,
     TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_core::{FinishReason, GenEvent, PublicModality};
+use uniserve_core::{FinishReason, GenerationEvent, PublicModality};
 use uniserve_engine::EngineHandle;
 use uniserve_engine::executor::Executor;
 use uniserve_engine::scheduler::{ControlTokens, Scheduler, SchedulingPolicy};
@@ -200,9 +200,9 @@ fn run_requests(
                     reason: None,
                 });
                 match ev {
-                    GenEvent::TextToken { .. } => c.text += 1,
-                    GenEvent::ImageDone { .. } => c.images += 1,
-                    GenEvent::Finished { reason, .. } if !c.finished => {
+                    GenerationEvent::TextToken { .. } => c.text += 1,
+                    GenerationEvent::ImageDone { .. } => c.images += 1,
+                    GenerationEvent::Finished { reason, .. } if !c.finished => {
                         c.finished = true;
                         c.reason = Some(reason);
                         done += 1;
@@ -272,7 +272,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut began = false;
     while !began && Instant::now() < begin_deadline {
         match first.try_recv() {
-            Ok(GenEvent::ImageBegin { .. }) => began = true,
+            Ok(GenerationEvent::ImageBegin { .. }) => began = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -301,8 +301,8 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
         for (id, receiver) in [(RequestId(1), &mut first), (RequestId(2), &mut second)] {
             while let Ok(event) = receiver.try_recv() {
                 match event {
-                    GenEvent::ImageDone { .. } if id == RequestId(2) => second_images += 1,
-                    GenEvent::Finished { reason, .. } => {
+                    GenerationEvent::ImageDone { .. } if id == RequestId(2) => second_images += 1,
+                    GenerationEvent::Finished { reason, .. } => {
                         reasons.insert(id, reason);
                     }
                     _ => {}
@@ -354,25 +354,27 @@ fn image_events_cover_declared_denoise_steps() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenEvent::ImageBegin {
+            Ok(GenerationEvent::ImageBegin {
                 image_id,
                 height,
                 width,
                 steps,
             }) => begin = Some((image_id, height, width, steps)),
-            Ok(GenEvent::ImageStep { image_id, step }) => steps.push((image_id, step)),
-            Ok(GenEvent::ImageCommit { image_id }) => {
+            Ok(GenerationEvent::ImageStep { image_id, step }) => steps.push((image_id, step)),
+            Ok(GenerationEvent::ImageCommit { image_id }) => {
                 assert_eq!(image_id, 1);
                 commits += 1;
             }
-            Ok(GenEvent::ImageDone {
+            Ok(GenerationEvent::ImageDone {
                 image_id,
                 height,
                 width,
                 public_commit,
                 ..
             }) => image_done = Some((image_id, height, width, public_commit)),
-            Ok(GenEvent::Finished { reason, images, .. }) => finished = Some((reason, images)),
+            Ok(GenerationEvent::Finished { reason, images, .. }) => {
+                finished = Some((reason, images))
+            }
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -442,7 +444,7 @@ fn operation_window_metrics_record_the_full_lifecycle() {
     for _ in 0..512 {
         scheduler.step();
         while let Ok(event) = events.try_recv() {
-            if matches!(event, GenEvent::Finished { .. }) {
+            if matches!(event, GenerationEvent::Finished { .. }) {
                 finished = true;
             }
         }
@@ -550,8 +552,8 @@ fn relay_run(
         scheduler.step();
         while let Ok(event) = events.try_recv() {
             match event {
-                GenEvent::TextToken { id, .. } => tokens.push(id),
-                GenEvent::Finished { .. } => finished = true,
+                GenerationEvent::TextToken { id, .. } => tokens.push(id),
+                GenerationEvent::Finished { .. } => finished = true,
                 _ => {}
             }
         }
@@ -690,8 +692,8 @@ fn image_context_decode_is_depth_invariant() {
             scheduler.step();
             while let Ok(event) = events.try_recv() {
                 match event {
-                    GenEvent::TextToken { id, .. } => tokens.push(id),
-                    GenEvent::Finished { reason, .. } => finish_reason = Some(reason),
+                    GenerationEvent::TextToken { id, .. } => tokens.push(id),
+                    GenerationEvent::Finished { reason, .. } => finish_reason = Some(reason),
                     _ => {}
                 }
             }
@@ -734,8 +736,8 @@ fn stop_token_terminates_with_stop() {
     while reason.is_none() && Instant::now() < deadline {
         if let Ok(ev) = erx.try_recv() {
             match ev {
-                GenEvent::TextToken { .. } => text += 1,
-                GenEvent::Finished { reason: r, .. } => reason = Some(r),
+                GenerationEvent::TextToken { .. } => text += 1,
+                GenerationEvent::Finished { reason: r, .. } => reason = Some(r),
                 _ => {}
             }
         } else {
@@ -775,7 +777,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     let mut saw_token = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !saw_token && Instant::now() < deadline {
-        if let Ok(GenEvent::TextToken { .. }) = erx.try_recv() {
+        if let Ok(GenerationEvent::TextToken { .. }) = erx.try_recv() {
             saw_token = true;
         } else {
             thread::sleep(Duration::from_millis(1));
@@ -791,7 +793,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     let deadline = Instant::now() + Duration::from_secs(10);
     while reason.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::Finished { reason: r, .. }) => reason = Some(r),
+            Ok(GenerationEvent::Finished { reason: r, .. }) => reason = Some(r),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -843,7 +845,7 @@ fn stop_string_cutoff_is_request_local() {
     let mut consumed_tokens = 0;
     while consumed_tokens < 2 && Instant::now() < deadline {
         match stopping_events.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => {
+            Ok(GenerationEvent::TextToken { .. }) => {
                 consumed_tokens += 1;
                 if consumed_tokens == 1 {
                     handle.acknowledge_at(RequestId(2), 1);
@@ -861,12 +863,12 @@ fn stop_string_cutoff_is_request_local() {
     let mut unrelated_reason = None;
     while Instant::now() < deadline {
         while let Ok(event) = stopping_events.try_recv() {
-            if let GenEvent::Finished { reason, .. } = event {
+            if let GenerationEvent::Finished { reason, .. } = event {
                 stop_reason = Some(reason);
             }
         }
         while let Ok(event) = unrelated_events.try_recv() {
-            if let GenEvent::Finished { reason, .. } = event {
+            if let GenerationEvent::Finished { reason, .. } = event {
                 unrelated_reason = Some(reason);
             }
         }
@@ -929,7 +931,7 @@ fn hybrid_groups_handshake_runs() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -975,7 +977,7 @@ fn prefix_cache_reuses_shared_prompt() {
         let mut done = false;
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenEvent::Finished { .. }) => done = true,
+                Ok(GenerationEvent::Finished { .. }) => done = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1035,7 +1037,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             match events.try_recv() {
-                Ok(GenEvent::Finished { .. }) => return,
+                Ok(GenerationEvent::Finished { .. }) => return,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1123,8 +1125,8 @@ fn chunked_prefill_progresses_with_decode() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenEvent::TextToken { .. }) => text += 1,
-                Ok(GenEvent::Finished { .. }) => done = true,
+                Ok(GenerationEvent::TextToken { .. }) => text += 1,
+                Ok(GenerationEvent::Finished { .. }) => done = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1170,13 +1172,13 @@ fn run_sampling(
     let deadline = Instant::now() + Duration::from_secs(10);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { id, logprob, .. }) => {
+            Ok(GenerationEvent::TextToken { id, logprob, .. }) => {
                 toks.push(id);
                 if logprob.is_some() {
                     any_logprob = true;
                 }
             }
-            Ok(GenEvent::Finished { reason, .. }) => finished = Some(reason),
+            Ok(GenerationEvent::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1298,11 +1300,11 @@ fn multimodal_encode_then_cache_hit() {
         let mut seen = Vec::new();
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenEvent::ImageDone { .. }) => {
+                Ok(GenerationEvent::ImageDone { .. }) => {
                     seen.push("image_done".to_string());
                     images += 1;
                 }
-                Ok(GenEvent::Finished { reason, .. }) => {
+                Ok(GenerationEvent::Finished { reason, .. }) => {
                     seen.push(format!("finished:{reason:?}"));
                     done = true;
                 }
@@ -1376,8 +1378,8 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
             while let Ok(event) = events.try_recv() {
                 seen[index].push(format!("{event:?}"));
                 match event {
-                    GenEvent::TextToken { .. } => text_tokens[index] += 1,
-                    GenEvent::Finished { reason, .. } => reasons[index] = Some(reason),
+                    GenerationEvent::TextToken { .. } => text_tokens[index] += 1,
+                    GenerationEvent::Finished { reason, .. } => reasons[index] = Some(reason),
                     _ => {}
                 }
             }
@@ -1431,9 +1433,9 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => text_tokens += 1,
-            Ok(GenEvent::ImageDone { .. }) => images += 1,
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) => text_tokens += 1,
+            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1489,7 +1491,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while finish_reason.is_none() && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenEvent::TextToken {
+                Ok(GenerationEvent::TextToken {
                     id,
                     public_commit: Some(commit),
                     ..
@@ -1498,10 +1500,10 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
                     signature.push(('T', id));
                     publications.push(commit);
                 }
-                Ok(GenEvent::ImageBegin { .. }) => image_begins += 1,
-                Ok(GenEvent::ImageStep { .. }) => image_steps += 1,
-                Ok(GenEvent::ImageCommit { .. }) => image_commits += 1,
-                Ok(GenEvent::ImageDone {
+                Ok(GenerationEvent::ImageBegin { .. }) => image_begins += 1,
+                Ok(GenerationEvent::ImageStep { .. }) => image_steps += 1,
+                Ok(GenerationEvent::ImageCommit { .. }) => image_commits += 1,
+                Ok(GenerationEvent::ImageDone {
                     image_id,
                     public_commit: Some(commit),
                     ..
@@ -1510,15 +1512,15 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
                     signature.push(('I', image_id));
                     publications.push(commit);
                 }
-                Ok(GenEvent::TextToken {
+                Ok(GenerationEvent::TextToken {
                     public_commit: None,
                     ..
                 })
-                | Ok(GenEvent::ImageDone {
+                | Ok(GenerationEvent::ImageDone {
                     public_commit: None,
                     ..
                 }) => panic!("visible event omitted its exact publication identity"),
-                Ok(GenEvent::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(GenerationEvent::Finished { reason, .. }) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1612,9 +1614,9 @@ fn interleave_c4_generated_images_complete() {
             while let Ok(event) = event_rx.try_recv() {
                 let result = results.get_mut(id).expect("request result exists");
                 match event {
-                    GenEvent::TextToken { .. } => result.text += 1,
-                    GenEvent::ImageDone { .. } => result.images += 1,
-                    GenEvent::Finished { reason, .. } if !result.finished => {
+                    GenerationEvent::TextToken { .. } => result.text += 1,
+                    GenerationEvent::ImageDone { .. } => result.images += 1,
+                    GenerationEvent::Finished { reason, .. } if !result.finished => {
                         result.finished = true;
                         result.reason = Some(reason);
                     }
@@ -1696,9 +1698,9 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => sequence.push('T'),
-            Ok(GenEvent::ImageDone { .. }) => sequence.push('I'),
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) => sequence.push('T'),
+            Ok(GenerationEvent::ImageDone { .. }) => sequence.push('I'),
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1750,9 +1752,9 @@ fn gen_branch_waits_for_model_image_starts() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while finish_reason.is_none() && Instant::now() < deadline {
             match events.try_recv() {
-                Ok(GenEvent::TextToken { id, .. }) => tokens.push(id),
-                Ok(GenEvent::ImageDone { .. }) => images += 1,
-                Ok(GenEvent::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(GenerationEvent::TextToken { id, .. }) => tokens.push(id),
+                Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+                Ok(GenerationEvent::Finished { reason, .. }) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1807,9 +1809,9 @@ fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => visible_text += 1,
-            Ok(GenEvent::ImageDone { .. }) => images += 1,
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) => visible_text += 1,
+            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1858,9 +1860,9 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => text += 1,
-            Ok(GenEvent::ImageDone { .. }) => images += 1,
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) => text += 1,
+            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1911,9 +1913,9 @@ fn gen_branch_model_image_starts_spend_budget() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) => seq.push('T'),
+            Ok(GenerationEvent::ImageDone { .. }) => seq.push('I'),
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1974,8 +1976,8 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::Rejected { .. }) => rejected = true,
-            Ok(GenEvent::Finished { reason, .. }) => finished = Some(reason),
+            Ok(GenerationEvent::Rejected { .. }) => rejected = true,
+            Ok(GenerationEvent::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2034,9 +2036,9 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => text += 1,
-            Ok(GenEvent::ImageDone { .. }) => images += 1,
-            Ok(GenEvent::Finished { reason, .. }) => finished = Some(reason),
+            Ok(GenerationEvent::TextToken { .. }) => text += 1,
+            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+            Ok(GenerationEvent::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2095,7 +2097,7 @@ fn multiworker_executor_drives_scheduler_unchanged() {
     while done < total && Instant::now() < deadline {
         for erx in rxs.values_mut() {
             while let Ok(ev) = erx.try_recv() {
-                if matches!(ev, GenEvent::Finished { .. }) {
+                if matches!(ev, GenerationEvent::Finished { .. }) {
                     done += 1;
                 }
             }
@@ -2161,9 +2163,9 @@ fn gen_branch_literal_trigger_starts_images() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) => seq.push('T'),
+            Ok(GenerationEvent::ImageDone { .. }) => seq.push('I'),
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2229,9 +2231,11 @@ fn image_start_logit_bias_steers_gen_branch() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !finished && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenEvent::TextToken { .. }) if images == 0 => text_before_first_image += 1,
-                Ok(GenEvent::ImageDone { .. }) => images += 1,
-                Ok(GenEvent::Finished { .. }) => finished = true,
+                Ok(GenerationEvent::TextToken { .. }) if images == 0 => {
+                    text_before_first_image += 1
+                }
+                Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+                Ok(GenerationEvent::Finished { .. }) => finished = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -2289,9 +2293,9 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { .. }) if images == 0 => text_before_first_image += 1,
-            Ok(GenEvent::ImageDone { .. }) => images += 1,
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) if images == 0 => text_before_first_image += 1,
+            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2344,9 +2348,9 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::TextToken { .. }) => seq.push('T'),
+            Ok(GenerationEvent::ImageDone { .. }) => seq.push('I'),
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2407,7 +2411,7 @@ fn image_budget_suppresses_biased_image_start() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenEvent::TextToken { id, .. }) => {
+            Ok(GenerationEvent::TextToken { id, .. }) => {
                 if images >= 2 {
                     if id == 2222 {
                         post_budget_triggers += 1;
@@ -2416,8 +2420,8 @@ fn image_budget_suppresses_biased_image_start() {
                     }
                 }
             }
-            Ok(GenEvent::ImageDone { .. }) => images += 1,
-            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
+            Ok(GenerationEvent::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2699,7 +2703,7 @@ fn slow_cpu_continuation_suspends_only_its_request_lineage() {
     while Instant::now() < deadline && !fast_finished {
         scheduler.step();
         while let Ok(event) = fast_events.try_recv() {
-            fast_finished |= matches!(event, GenEvent::Finished { .. });
+            fast_finished |= matches!(event, GenerationEvent::Finished { .. });
         }
         thread::sleep(Duration::from_millis(1));
     }
@@ -2714,7 +2718,7 @@ fn slow_cpu_continuation_suspends_only_its_request_lineage() {
     while Instant::now() < deadline && !slow_finished {
         scheduler.step();
         while let Ok(event) = slow_events.try_recv() {
-            slow_finished |= matches!(event, GenEvent::Finished { .. });
+            slow_finished |= matches!(event, GenerationEvent::Finished { .. });
         }
         thread::sleep(Duration::from_millis(1));
     }
@@ -2785,12 +2789,12 @@ fn cpu_continuation_timeout_closes_only_its_request_lineage() {
     while Instant::now() < deadline && (slow_reason.is_none() || fast_reason.is_none()) {
         scheduler.step();
         while let Ok(event) = slow_events.try_recv() {
-            if let GenEvent::Finished { reason, .. } = event {
+            if let GenerationEvent::Finished { reason, .. } = event {
                 slow_reason = Some(reason);
             }
         }
         while let Ok(event) = fast_events.try_recv() {
-            if let GenEvent::Finished { reason, .. } = event {
+            if let GenerationEvent::Finished { reason, .. } = event {
                 fast_reason = Some(reason);
             }
         }
@@ -2891,7 +2895,7 @@ fn cpu_failure_storm_is_request_local_and_retires_every_request() {
             while let Ok(event) = receiver.try_recv() {
                 if matches!(
                     event,
-                    GenEvent::Finished {
+                    GenerationEvent::Finished {
                         reason: FinishReason::Error,
                         ..
                     }
@@ -2938,7 +2942,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     while Instant::now() < deadline && !fast_finished {
         scheduler.step();
         while let Ok(event) = fast_events.try_recv() {
-            fast_finished |= matches!(event, GenEvent::Finished { .. });
+            fast_finished |= matches!(event, GenerationEvent::Finished { .. });
         }
     }
     assert!(

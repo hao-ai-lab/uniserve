@@ -82,7 +82,7 @@ impl PublicCommit {
 /// Typed text and image event stream emitted by an engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum GenEvent {
+pub enum GenerationEvent {
     Scheduled {
         queued_at: f64,
         scheduled_at: f64,

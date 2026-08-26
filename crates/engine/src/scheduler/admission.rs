@@ -3,7 +3,7 @@ use super::*;
 impl Scheduler {
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
         if self.kv.is_none() {
-            let _ = event_tx.send(GenEvent::Rejected {
+            let _ = event_tx.send(GenerationEvent::Rejected {
                 message: "generation request requires worker KV resources".into(),
             });
             return;
@@ -11,14 +11,14 @@ impl Scheduler {
         let context = match SchedulerContext::lower(&req) {
             Ok(context) => context,
             Err(error) => {
-                let _ = event_tx.send(GenEvent::Rejected {
+                let _ = event_tx.send(GenerationEvent::Rejected {
                     message: format!("invalid generation request: {error:?}"),
                 });
                 return;
             }
         };
         if let Some(capability) = self.missing_required_capability(&req) {
-            let _ = event_tx.send(GenEvent::Rejected {
+            let _ = event_tx.send(GenerationEvent::Rejected {
                 message: format!(
                     "generation request requires worker capability `{capability}`, but the worker does not support it"
                 ),
@@ -26,7 +26,7 @@ impl Scheduler {
             return;
         }
         if let Err(error) = req.validate_resources(&self.caps.generation_runtime_capabilities()) {
-            let _ = event_tx.send(GenEvent::Rejected {
+            let _ = event_tx.send(GenerationEvent::Rejected {
                 message: format!("invalid generation resource declaration: {error}"),
             });
             return;
@@ -57,7 +57,7 @@ impl Scheduler {
                 },
                 "prompt_tokens": context.prompt_ids.len(),
             }));
-            let _ = event_tx.send(GenEvent::Rejected {
+            let _ = event_tx.send(GenerationEvent::Rejected {
                 message: "scheduler waiting queue is full".into(),
             });
             return;
@@ -129,10 +129,10 @@ impl Scheduler {
             return;
         }
         let required = [
-            WorkVariant::GenTransition,
-            WorkVariant::GenFlow,
-            WorkVariant::GenDecode,
-            WorkVariant::Materialize,
+            ForwardMode::GenTransition,
+            ForwardMode::GenFlow,
+            ForwardMode::GenDecode,
+            ForwardMode::Materialize,
         ];
         if required
             .iter()
@@ -346,7 +346,7 @@ impl Scheduler {
         transition: &mut PlannedTransition,
     ) -> bool {
         let id = transition.request_id;
-        if transition.operation_variant == WorkVariant::GenFlow && !self.ensure_flow_prefix(id) {
+        if transition.operation_variant == ForwardMode::GenFlow && !self.ensure_flow_prefix(id) {
             return false;
         }
         let resources = &transition.resources;
@@ -476,7 +476,7 @@ impl Scheduler {
                         "generation": behavior_str(&st.req),
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.event_tx.send(GenEvent::Rejected {
+                    let _ = st.event_tx.send(GenerationEvent::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
@@ -536,7 +536,7 @@ impl Scheduler {
                         "generation": behavior_str(&st.req),
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.event_tx.send(GenEvent::Rejected {
+                    let _ = st.event_tx.send(GenerationEvent::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
@@ -603,7 +603,7 @@ impl Scheduler {
         let encoder_entries = st.req.resources.encoder_cache_keys.len();
         self.emit_st(
             &mut st,
-            GenEvent::Scheduled {
+            GenerationEvent::Scheduled {
                 queued_at: q,
                 scheduled_at,
             },

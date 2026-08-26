@@ -37,7 +37,7 @@ from ..batch import (
     RequestKey,
     SnapshotRef,
     StorageClass,
-    WorkVariant,
+    ForwardMode,
 )
 from ..bootstrap.capabilities import resolve_capabilities
 from ..bootstrap.capacity import (
@@ -295,11 +295,11 @@ def _warmup_batch(
             latent_placements=tuple(
                 latent_placements[(operation.request_key, operation.op_id)]
                 for operation in members
-                if operation.work.variant
+                if operation.work
                 in {
-                    WorkVariant.GEN_TRANSITION,
-                    WorkVariant.GEN_FLOW,
-                    WorkVariant.MATERIALIZE,
+                    ForwardMode.GEN_TRANSITION,
+                    ForwardMode.GEN_FLOW,
+                    ForwardMode.MATERIALIZE,
                 }
             ),
         )
@@ -416,7 +416,7 @@ class Worker:
         attention: AttentionSelection,
         execution: ExecutionConfig,
         tokenizer: object | None,
-        allowed_work_variants: frozenset[WorkVariant],
+        allowed_work_variants: frozenset[ForwardMode],
         transfer_backend: str = "local",
         cross_process: bool = False,
         architecture_digest: str | None = None,
@@ -498,7 +498,7 @@ class Worker:
             raise capability_mismatch(f"{type(self).__name__} advertises no executable work")
         self._capabilities = replace(
             declared,
-            supported_work=tuple(variant for variant in WorkVariant if variant in advertised_work),
+            supported_work=tuple(variant for variant in ForwardMode if variant in advertised_work),
             pipeline_depth=int(pipeline_depth),
         )
         cache = model.cache_geometry
@@ -527,7 +527,7 @@ class Worker:
                 else None
             ),
         )
-        if WorkVariant.GEN_FLOW in self._effective_work_variants and not _supports_flow_attention(
+        if ForwardMode.GEN_FLOW in self._effective_work_variants and not _supports_flow_attention(
             attention,
             cache,
             self.cache_pool,
@@ -765,8 +765,8 @@ class Worker:
                 or not model.tensorized_mixed
                 or not _has_decode_flow_partition(execution.lanes)
                 or not {
-                    WorkVariant.TOKEN_DECODE,
-                    WorkVariant.GEN_FLOW,
+                    ForwardMode.TOKEN_DECODE,
+                    ForwardMode.GEN_FLOW,
                 }.issubset(self._effective_work_variants)
             )
             else tuple(
@@ -913,11 +913,11 @@ class Worker:
             )
             expected_resident_executables = 0
             if execution.cuda_graph:
-                if WorkVariant.TOKEN_DECODE in self._effective_work_variants:
+                if ForwardMode.TOKEN_DECODE in self._effective_work_variants:
                     expected_resident_executables += len(lane_decode_buckets)
                 if (
                     execution.prefill_cuda_graph
-                    and WorkVariant.TOKEN_EXTEND in self._effective_work_variants
+                    and ForwardMode.TOKEN_EXTEND in self._effective_work_variants
                 ):
                     expected_resident_executables += (
                         len(lane_prefill_buckets)
@@ -925,13 +925,13 @@ class Worker:
                         else len(lane_prefill_catalog)
                     )
                 if execution.prefill_cuda_graph and {
-                    WorkVariant.GEN_TRANSITION,
-                    WorkVariant.GEN_FLOW,
+                    ForwardMode.GEN_TRANSITION,
+                    ForwardMode.GEN_FLOW,
                 }.issubset(self._effective_work_variants):
                     expected_resident_executables += len(
                         {_flow_graph_executable(bucket) for bucket in lane_flow_buckets}
                     )
-                    if WorkVariant.TOKEN_DECODE in self._effective_work_variants:
+                    if ForwardMode.TOKEN_DECODE in self._effective_work_variants:
                         expected_resident_executables += len(
                             {
                                 _mixed_flow_graph_executable(bucket)
@@ -1099,7 +1099,7 @@ class Worker:
                         for bucket in flow_graph_buckets
                         if bucket.rows <= max_operations
                     )
-                    if WorkVariant.TOKEN_DECODE in self._effective_work_variants and {
+                    if ForwardMode.TOKEN_DECODE in self._effective_work_variants and {
                         Domain.DECODE,
                         Domain.FLOW,
                     } <= set(lane.domains):
@@ -1365,15 +1365,15 @@ class Worker:
                 request_pool_indices[operation.request_key] = admission.request_pool_idx
             else:
                 request_pool_indices[operation.request_key] = session.request_pool_idx
-            if operation.work.variant not in {
-                WorkVariant.TOKEN_EXTEND,
-                WorkVariant.TOKEN_DECODE,
-                WorkVariant.TOKEN_VERIFY,
-                WorkVariant.DRAFT,
-                WorkVariant.TRANSFER_KV_PUBLISH,
-                WorkVariant.TRANSFER_KV_INSTALL,
-                WorkVariant.GEN_TRANSITION,
-                WorkVariant.GEN_FLOW,
+            if operation.work not in {
+                ForwardMode.TOKEN_EXTEND,
+                ForwardMode.TOKEN_DECODE,
+                ForwardMode.TOKEN_VERIFY,
+                ForwardMode.DRAFT,
+                ForwardMode.TRANSFER_KV_PUBLISH,
+                ForwardMode.TRANSFER_KV_INSTALL,
+                ForwardMode.GEN_TRANSITION,
+                ForwardMode.GEN_FLOW,
             }:
                 continue
             if (
@@ -1389,12 +1389,12 @@ class Worker:
                 visible = int(runtime.kv_visible_len)
             input_length = (
                 int(operation.bounds.max_tokens)
-                if operation.work.variant
+                if operation.work
                 in {
-                    WorkVariant.TOKEN_EXTEND,
-                    WorkVariant.TOKEN_DECODE,
-                    WorkVariant.TOKEN_VERIFY,
-                    WorkVariant.DRAFT,
+                    ForwardMode.TOKEN_EXTEND,
+                    ForwardMode.TOKEN_DECODE,
+                    ForwardMode.TOKEN_VERIFY,
+                    ForwardMode.DRAFT,
                 }
                 else 0
             )
@@ -1459,9 +1459,9 @@ class Worker:
             page for pages in self._warmup_latent_pages.values() for page in pages
         }
         for operation in operations:
-            if operation.work.variant not in {
-                WorkVariant.GEN_TRANSITION,
-                WorkVariant.GEN_FLOW,
+            if operation.work not in {
+                ForwardMode.GEN_TRANSITION,
+                ForwardMode.GEN_FLOW,
             } and not any(product.kind is ProductKind.LATENT for product in operation.inputs):
                 continue
             page_table = self._warmup_latent_pages.setdefault(operation.request_key, [])
@@ -1489,11 +1489,11 @@ class Worker:
                 start_step=start_step,
                 step_count=(
                     int(operation.bounds.max_tokens)
-                    if operation.work.variant is WorkVariant.GEN_FLOW
+                    if operation.work is ForwardMode.GEN_FLOW
                     else 0
                 ),
             )
-            if operation.work.variant is WorkVariant.GEN_FLOW:
+            if operation.work is ForwardMode.GEN_FLOW:
                 extra_tables, extra_allocations, flow_rows = self._warmup_flow_tables(
                     operation,
                     request_pool_indices[operation.request_key],
@@ -1699,12 +1699,11 @@ class Worker:
             TokenMode,
             UndAdmission,
             VersionRef,
-            Work,
             encode_token_product_bytes,
         )
 
         variants = self._effective_work_variants
-        if WorkVariant.TOKEN_EXTEND not in variants:
+        if ForwardMode.TOKEN_EXTEND not in variants:
             return
         pool = self.cache_pool
         if self.requests.request_ids():
@@ -1722,7 +1721,7 @@ class Worker:
                     }
                 )
             )
-            if (self._execution.cuda_graph and WorkVariant.TOKEN_DECODE in variants)
+            if (self._execution.cuda_graph and ForwardMode.TOKEN_DECODE in variants)
             else (1,)
         )
         batch_sizes = tuple(
@@ -1774,7 +1773,7 @@ class Worker:
                 request_key=keys[sid],
                 op_id=op_id,
                 parent=parent,
-                work=Work.token(TokenMode.EXTEND),
+                work=ForwardMode.token(TokenMode.EXTEND),
                 route=0,
                 domain=Domain.PREFILL,
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
@@ -1800,7 +1799,7 @@ class Worker:
                     predecessor.op_id,
                     DevicePoint(1, None, predecessor.plan_digest),
                 ),
-                work=Work.token(TokenMode.DECODE),
+                work=ForwardMode.token(TokenMode.DECODE),
                 route=0,
                 domain=Domain.DECODE,
                 bounds=Bounds(max_points=1, max_tokens=1),
@@ -1825,10 +1824,10 @@ class Worker:
                     operations=tuple(operations),
                     input_products=tuple(payloads),
                 ),
-                retain_device_outputs=WorkVariant.TOKEN_DECODE in variants,
+                retain_device_outputs=ForwardMode.TOKEN_DECODE in variants,
             )
             predecessors.update(zip(session_ids, operations, strict=True))
-            if WorkVariant.TOKEN_DECODE not in variants:
+            if ForwardMode.TOKEN_DECODE not in variants:
                 return
             repeats = 2 if self._execution.cuda_graph else 1
             for _ in range(repeats):
@@ -1883,7 +1882,6 @@ class Worker:
             TokenMode,
             UndAdmission,
             VersionRef,
-            Work,
             encode_token_product_bytes,
         )
 
@@ -1968,7 +1966,7 @@ class Worker:
                             request_key=rk,
                             op_id=1,
                             parent=VersionRef(rk, 0, FixedPoint(0, admission.digest)),
-                            work=Work.token(TokenMode.EXTEND),
+                            work=ForwardMode.token(TokenMode.EXTEND),
                             route=0,
                             domain=Domain.PREFILL,
                             bounds=Bounds(max_points=1, max_tokens=token_count),
@@ -2019,18 +2017,15 @@ class Worker:
             ShapeBound,
             StaticDim,
             StorageClass,
-            TokenMode,
-            TransferMode,
             UndAdmission,
             VersionRef,
-            Work,
             encode_token_product_bytes,
         )
 
         generation = self.model.generation
         if not {
-            WorkVariant.GEN_TRANSITION,
-            WorkVariant.GEN_FLOW,
+            ForwardMode.GEN_TRANSITION,
+            ForwardMode.GEN_FLOW,
         }.issubset(self._effective_work_variants) or not isinstance(generation, GenerationPipeline):
             return
         if self.requests.request_ids():
@@ -2137,7 +2132,7 @@ class Worker:
                         request_key=key,
                         op_id=1,
                         parent=root,
-                        work=Work("transfer", TransferMode.KV_PUBLISH.value),
+                        work=ForwardMode.TRANSFER_KV_PUBLISH,
                         route=0,
                         domain=Domain.PREFILL,
                         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
@@ -2181,7 +2176,7 @@ class Worker:
                                 0,
                                 FixedPoint(0, text_admissions[session_id].digest),
                             ),
-                            work=Work.token(TokenMode.EXTEND),
+                            work=ForwardMode.token(TokenMode.EXTEND),
                             route=0,
                             domain=Domain.PREFILL,
                             bounds=Bounds(max_points=1, max_tokens=1),
@@ -2245,7 +2240,7 @@ class Worker:
                             request_key=key,
                             op_id=2,
                             parent=root,
-                            work=Work("gen", "transition"),
+                            work=ForwardMode.GEN_TRANSITION,
                             route=0,
                             domain=Domain.FLOW,
                             bounds=Bounds(
@@ -2303,7 +2298,7 @@ class Worker:
                                         flow_predecessors[session_id].plan_digest,
                                     ),
                                 ),
-                                work=Work("gen", "flow"),
+                                work=ForwardMode.GEN_FLOW,
                                 route=0,
                                 domain=Domain.FLOW,
                                 bounds=Bounds(
@@ -2351,7 +2346,7 @@ class Worker:
                                         predecessor.op_id,
                                         DevicePoint(1, None, predecessor.plan_digest),
                                     ),
-                                    work=Work.token(TokenMode.DECODE),
+                                    work=ForwardMode.token(TokenMode.DECODE),
                                     route=0,
                                     domain=Domain.DECODE,
                                     bounds=Bounds(max_points=1, max_tokens=1),
@@ -2395,7 +2390,7 @@ class Worker:
                                             flow_predecessors[session_id].plan_digest,
                                         ),
                                     ),
-                                    work=Work("gen", "flow"),
+                                    work=ForwardMode.GEN_FLOW,
                                     route=0,
                                     domain=Domain.FLOW,
                                     bounds=Bounds(

@@ -6,7 +6,7 @@ use crate::executor::{ControlAck, ControlOp, Executor, WorkerExecError, WorkerLo
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
-    Batch, CompletionRecord, CompletionReport, SamplingOwnership, WorkerCapabilities,
+    Batch, CompletionReport, ModelOutput, SamplingOwnership, WorkerCapabilities,
 };
 
 use crate::WorkerLaunchConfig;
@@ -231,7 +231,7 @@ impl MultiprocExecutor {
 
     /// Spawn a tensor-parallel pool for a staged worker kind: every rank is told
     /// which pipeline stage it serves. `world_size == 1` yields a one-rank pool
-    /// (still a valid `Executor`), so the `StageRouter` composition can treat
+    /// (still a valid `Executor`), so the `StagedExecutor` composition can treat
     /// every pool uniformly regardless of its tp size.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_staged(
@@ -803,8 +803,8 @@ fn validate_and_order_rank_report(
 /// the semantic result; only `product_generations` are per-rank shards, which
 /// concatenate in rank order.
 fn merge_completion_record(
-    canonical: &mut CompletionRecord,
-    rank_completion: &CompletionRecord,
+    canonical: &mut ModelOutput,
+    rank_completion: &ModelOutput,
     ownership: SamplingOwnership,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(

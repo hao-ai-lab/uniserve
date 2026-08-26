@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import torch
 
-from uniserve_worker.batch import WorkVariant
+from uniserve_worker.batch import ForwardMode as WorkMode
 from uniserve_worker.execution.forward_batch import ExpertRoute, ForwardMode, RouteSpan
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length
@@ -28,7 +28,7 @@ def columns(runtime, tasks: tuple[ForwardRow, ...]) -> dict[str, object]:
         raise invalid_descriptor("forward attention lengths are invalid")
     causal_rows = tuple(bool(task.causal) for task in tasks)
     pure_decode = all(
-        task.operation.work.variant is WorkVariant.TOKEN_DECODE
+        task.operation.work is WorkMode.TOKEN_DECODE
         and task.token_ids is not None
         and task.query_tokens == 1
         for task in tasks

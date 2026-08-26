@@ -18,7 +18,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from ..batch import WorkVariant
+from ..batch import ForwardMode as WorkMode
 from ..execution.forward_batch import (
     ForwardBatch,
     ForwardMode,
@@ -546,9 +546,9 @@ class Qwen3ForCausalLM(ExecutionModel):
         self.architecture = "Qwen3ForCausalLM"
         self.supported_work = frozenset(
             {
-                WorkVariant.TOKEN_EXTEND,
-                WorkVariant.TOKEN_DECODE,
-                WorkVariant.TOKEN_VERIFY,
+                WorkMode.TOKEN_EXTEND,
+                WorkMode.TOKEN_DECODE,
+                WorkMode.TOKEN_VERIFY,
             }
         )
         self.cache_geometry = CacheGeometry(

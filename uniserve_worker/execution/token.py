@@ -24,7 +24,7 @@ from uniserve_worker.batch import (
     SamplingState,
     TokenMode,
     TokenSpan,
-    WorkVariant,
+    ForwardMode,
 )
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
@@ -76,14 +76,14 @@ def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
     session = ops._request_row(runtime, partition, operation.request_key.session_id)
     if session.sampling is None:
         raise invalid_descriptor("sequence operation has no admitted sampling state")
-    mode = operation.work.mode
-    if mode == TokenMode.EXTEND.value and any(
+    mode = operation.work.token_mode
+    if mode is TokenMode.EXTEND and any(
         reference.kind in {ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE}
         for reference in operation.inputs
     ):
         return _pack_visual(runtime, state, session)
     start = int(session.logical_position)
-    if mode == TokenMode.EXTEND.value:
+    if mode is TokenMode.EXTEND:
         if isinstance(operation.parent.point, DevicePoint) and not any(
             reference.kind is ProductKind.TOKEN for reference in operation.inputs
         ):
@@ -109,7 +109,7 @@ def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
             scores_prompt=scores_prompt,
             mode="extend",
         )
-    elif mode == TokenMode.DECODE.value:
+    elif mode is TokenMode.DECODE:
         current = resolve_decode_token(runtime, operation, session, partition)
         task = token_task(
             runtime,
@@ -411,7 +411,7 @@ def _pack_visual(runtime: object, state: OperationState, session: object) -> tup
             close_image=close_image,
             logits=sample_token,
         )
-        variant = WorkVariant.ENCODE_VISION
+        variant = ForwardMode.ENCODE_VISION
     else:
         task = encode.latent_state_row(
             runtime,
@@ -422,7 +422,7 @@ def _pack_visual(runtime: object, state: OperationState, session: object) -> tup
             position,
             partition,
         )
-        variant = WorkVariant.ENCODE_LATENT
+        variant = ForwardMode.ENCODE_LATENT
     if task.query_tokens > int(operation.bounds.max_tokens):
         raise invalid_descriptor("image state query span exceeds the operation token bound")
     state.data.update(
@@ -445,7 +445,7 @@ def _consume_visual(runtime: object, state: OperationState, output: torch.Tensor
 
     task = state.data["task"]
     partition = state.partition
-    if state.data["variant"] is WorkVariant.ENCODE_VISION:
+    if state.data["variant"] is ForwardMode.ENCODE_VISION:
         value = token_logits_or_hidden(output)
     else:
         flow.prediction(output)

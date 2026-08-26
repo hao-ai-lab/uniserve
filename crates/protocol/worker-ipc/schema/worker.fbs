@@ -1,9 +1,8 @@
 namespace uniserve.wire;
 
-// The closed leaves of the `Work` algebra. Every configured route runs one of
-// these; the nesting (Token/Encode/Transfer/Gen) lives in the Rust and Python
-// types and flattens to this exhaustive tag on the wire.
-enum WorkVariant : ubyte {
+// Closed forward-mode tag for one operation. Declaration order is the
+// canonical index on the wire and in capability negotiation.
+enum ForwardMode : ubyte {
   TokenExtend,
   TokenDecode,
   TokenVerify,
@@ -201,7 +200,7 @@ table WorkerCapabilities {
   num_layers:uint;
   num_kv_heads:uint;
   head_dim:uint;
-  supported_work:[WorkVariant];
+  supported_work:[ForwardMode];
   latent_page_units:uint;
   num_latent_pages:uint;
   latent_width:uint;
@@ -309,7 +308,7 @@ table Operation {
   request_key:RequestKey;
   op_id:ulong;
   parent:VersionRef;
-  work:WorkVariant;
+  work:ForwardMode;
   route:uint;
   domain:Domain;
   advances_state:bool;
@@ -386,7 +385,7 @@ table TimingCounters {
   host_us:ulong;
 }
 
-table CompletionRecord {
+table ModelOutput {
   request_key:RequestKey;
   op_id:ulong;
   completion_slot_generation:uint;
@@ -493,7 +492,7 @@ table ProductPayload {
 
 table PartitionCompletion {
   partition_id:uint;
-  completions:[CompletionRecord];
+  completions:[ModelOutput];
   products:[ProductPayload];
   registration:RegistrationAck;
   worker_exec_us:ulong = null;

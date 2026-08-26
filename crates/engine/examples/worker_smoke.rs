@@ -2,7 +2,7 @@
 //! and drive a few requests through the scheduler over the shared-memory ring.
 use std::collections::HashMap;
 
-use uniserve_core::GenEvent;
+use uniserve_core::GenerationEvent;
 use uniserve_core::{
     ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
@@ -65,9 +65,9 @@ fn main() -> anyhow::Result<()> {
         while let Ok(ev) = rx.try_recv() {
             let e = counts.entry(*id).or_insert((0, 0, false));
             match ev {
-                GenEvent::TextToken { .. } => e.0 += 1,
-                GenEvent::ImageDone { .. } => e.1 += 1,
-                GenEvent::Finished { .. } => e.2 = true,
+                GenerationEvent::TextToken { .. } => e.0 += 1,
+                GenerationEvent::ImageDone { .. } => e.1 += 1,
+                GenerationEvent::Finished { .. } => e.2 = true,
                 _ => {}
             }
         }

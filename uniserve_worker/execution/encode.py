@@ -18,6 +18,7 @@ from uniserve_worker.batch import (
     ProductRef,
     StorageClass,
     TokenSpan,
+    ForwardMode,
 )
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.models.generation import LatentLayout, Materialization
@@ -53,9 +54,9 @@ from .rows import (
 def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
     if state.phase != "initial":
         return ()
-    if state.operation.work.kind == "encode":
+    if state.operation.work.encode_mode is not None:
         return _pack_encode(runtime, state)
-    if state.operation.work.kind == "materialize":
+    if state.operation.work is ForwardMode.MATERIALIZE:
         return _pack_materialize(runtime, state)
     return ()
 
@@ -92,7 +93,9 @@ def _pack_encode(runtime: object, state: OperationState) -> tuple[object, ...]:
     operation = state.operation
     partition = state.partition
     image_spec = ops._image_processor(runtime)
-    mode = EncodeMode(cast(str, operation.work.mode))
+    mode = operation.work.encode_mode
+    if mode is None:
+        raise invalid_descriptor("encode operation is missing an encode mode")
     feature_outputs = tuple(
         output
         for output in operation.outputs

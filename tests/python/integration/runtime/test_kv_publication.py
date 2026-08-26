@@ -32,9 +32,8 @@ from uniserve_worker.batch import (
     ShapeBound,
     StorageClass,
     TokenMode,
-    TransferMode,
     VersionRef,
-    Work,
+    ForwardMode,
 )
 from uniserve_worker.transfer.connector import CachePublication
 from uniserve_worker.transfer.tickets import (
@@ -67,7 +66,7 @@ def _installation_operation(
             request_key=admission.request_key,
             op_id=op_id,
             parent=parent,
-            work=Work("transfer", TransferMode.KV_INSTALL.value),
+            work=ForwardMode.TRANSFER_KV_INSTALL,
             route=0,
             domain=Domain.PREFILL,
             bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),

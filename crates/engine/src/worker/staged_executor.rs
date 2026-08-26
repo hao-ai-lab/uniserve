@@ -1,10 +1,10 @@
 //! Typed control-plane routing across heterogeneous worker pools.
 //!
-//! A staged topology partitions each execution batch by exact [`WorkVariant`],
+//! A staged topology partitions each execution batch by exact [`ForwardMode`],
 //! sends every session admission to a pool before that pool's first operation
 //! for the session, and publishes each independently ready partition by identity.
 //! A worker-local device product remains resident within its producing pool.
-//! The router retains a cross-pool consumer by exact product identity until the
+//! The executor retains a cross-pool consumer by exact product identity until the
 //! producer publishes the bounded transfer descriptor, then submits the
 //! consumer before exposing the producer completion to the scheduler.
 
@@ -15,8 +15,8 @@ use crate::executor::{ControlAck, ControlOp, Executor, WorkerKind};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
-    Admission, Batch, BatchPartition, CompletionReport, Control, Operation, ProductPayload,
-    ProductRef, RequestKey, TRANSFER_DESCRIPTOR_PREFIX, WorkVariant, WorkerCapabilities,
+    Admission, Batch, BatchPartition, CompletionReport, Control, ForwardMode, Operation,
+    ProductPayload, ProductRef, RequestKey, TRANSFER_DESCRIPTOR_PREFIX, WorkerCapabilities,
     is_transfer_descriptor,
 };
 
@@ -93,8 +93,8 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, String)> {
 }
 
 /// Routes a canonical typed batch across the pools of a staged topology.
-pub struct StageRouter {
-    routing: HashMap<WorkVariant, usize>,
+pub struct StagedExecutor {
+    routing: HashMap<ForwardMode, usize>,
     pools: Vec<PoolEntry>,
     caps: WorkerCapabilities,
     depth: usize,
@@ -121,13 +121,13 @@ fn extend_unique<T: Clone + Eq + std::hash::Hash>(target: &mut Vec<T>, incoming:
     }
 }
 
-impl StageRouter {
+impl StagedExecutor {
     /// Build a staged router after validating exact, non-overlapping pool claims.
     pub fn try_new(pools: Vec<(WorkerKind, Box<dyn Executor>)>) -> anyhow::Result<Self> {
-        anyhow::ensure!(!pools.is_empty(), "StageRouter needs at least one pool");
+        anyhow::ensure!(!pools.is_empty(), "StagedExecutor needs at least one pool");
         anyhow::ensure!(
             pools.len() <= u64::BITS as usize,
-            "StageRouter supports at most {} pools",
+            "StagedExecutor supports at most {} pools",
             u64::BITS
         );
 
@@ -191,17 +191,17 @@ impl StageRouter {
 
     fn merge_caps(
         pools: &[PoolEntry],
-        routing: &HashMap<WorkVariant, usize>,
+        routing: &HashMap<ForwardMode, usize>,
     ) -> anyhow::Result<WorkerCapabilities> {
         let routed_caps =
-            |variant: WorkVariant| routing.get(&variant).map(|index| pools[*index].exec.caps());
+            |variant: ForwardMode| routing.get(&variant).map(|index| pools[*index].exec.caps());
         let mut kv_pool_indices = [
-            WorkVariant::TokenExtend,
-            WorkVariant::TokenDecode,
-            WorkVariant::TokenVerify,
-            WorkVariant::Materialize,
-            WorkVariant::TransferKvPublish,
-            WorkVariant::TransferKvInstall,
+            ForwardMode::TokenExtend,
+            ForwardMode::TokenDecode,
+            ForwardMode::TokenVerify,
+            ForwardMode::Materialize,
+            ForwardMode::TransferKvPublish,
+            ForwardMode::TransferKvInstall,
         ]
         .into_iter()
         .filter_map(|variant| routing.get(&variant).copied())
@@ -265,7 +265,7 @@ impl StageRouter {
                 .unwrap_or(first.bytes_per_token);
         }
 
-        merged.supported_work = WorkVariant::ALL
+        merged.supported_work = ForwardMode::ALL
             .into_iter()
             .filter(|variant| routing.contains_key(variant))
             .collect();
@@ -317,8 +317,8 @@ impl StageRouter {
         );
         merged.sampling_ownership = sampling_ownership;
         merged.mixed_buckets = match (
-            routing.get(&WorkVariant::TokenDecode),
-            routing.get(&WorkVariant::GenFlow),
+            routing.get(&ForwardMode::TokenDecode),
+            routing.get(&ForwardMode::GenFlow),
         ) {
             (Some(decode), Some(flow)) if decode == flow => {
                 pools[*decode].exec.caps().mixed_buckets.clone()
@@ -326,7 +326,7 @@ impl StageRouter {
             _ => Vec::new(),
         };
 
-        let flow = routed_caps(WorkVariant::GenFlow);
+        let flow = routed_caps(ForwardMode::GenFlow);
         merged.latent_page_units = flow.as_ref().map_or(0, |caps| caps.latent_page_units);
         merged.num_latent_pages = flow.as_ref().map_or(0, |caps| caps.num_latent_pages);
         merged.latent_width = flow.as_ref().map_or(0, |caps| caps.latent_width);
@@ -335,23 +335,23 @@ impl StageRouter {
             .map_or_else(String::new, |caps| caps.latent_dtype.clone());
         merged.latent_downsample = flow.as_ref().map_or(0, |caps| caps.latent_downsample);
         merged.max_cfg_branches = flow.as_ref().map_or(0, |caps| caps.max_cfg_branches);
-        merged.max_vae_grid_tokens = routed_caps(WorkVariant::EncodeLatent)
+        merged.max_vae_grid_tokens = routed_caps(ForwardMode::EncodeLatent)
             .as_ref()
             .map_or(0, |caps| caps.max_vae_grid_tokens);
-        merged.max_vit_grid_tokens = routed_caps(WorkVariant::EncodeVision)
+        merged.max_vit_grid_tokens = routed_caps(ForwardMode::EncodeVision)
             .as_ref()
             .map_or(0, |caps| caps.max_vit_grid_tokens);
-        merged.max_latent_feature_bytes = routed_caps(WorkVariant::EncodeLatent)
+        merged.max_latent_feature_bytes = routed_caps(ForwardMode::EncodeLatent)
             .as_ref()
             .map_or(0, |caps| caps.max_latent_feature_bytes);
-        merged.max_vision_feature_bytes = routed_caps(WorkVariant::EncodeVision)
+        merged.max_vision_feature_bytes = routed_caps(ForwardMode::EncodeVision)
             .as_ref()
             .map_or(0, |caps| caps.max_vision_feature_bytes);
-        if let Some(materialize) = routed_caps(WorkVariant::Materialize) {
+        if let Some(materialize) = routed_caps(ForwardMode::Materialize) {
             merged.commit_marker_tokens = materialize.commit_marker_tokens;
             merged.gen_rope_advance = materialize.gen_rope_advance;
         }
-        merged.encoder_cache_budget = [WorkVariant::EncodeLatent, WorkVariant::EncodeVision]
+        merged.encoder_cache_budget = [ForwardMode::EncodeLatent, ForwardMode::EncodeVision]
             .into_iter()
             .filter_map(|variant| routed_caps(variant).map(|caps| caps.encoder_cache_budget))
             .min()
@@ -709,7 +709,7 @@ impl StageRouter {
     }
 }
 
-impl Executor for StageRouter {
+impl Executor for StagedExecutor {
     fn caps(&self) -> WorkerCapabilities {
         self.caps.clone()
     }
@@ -722,7 +722,7 @@ impl Executor for StageRouter {
         self.pending.len() + self.ready.len()
     }
 
-    fn device_products_reachable(&self, producer: WorkVariant, consumer: WorkVariant) -> bool {
+    fn device_products_reachable(&self, producer: ForwardMode, consumer: ForwardMode) -> bool {
         self.routing.contains_key(&producer) && self.routing.contains_key(&consumer)
     }
 
@@ -755,10 +755,10 @@ impl Executor for StageRouter {
         for partition in &batch.partitions {
             let mut pool_index = None;
             for operation in &partition.operations {
-                let variant = operation.work.variant();
+                let variant = operation.work;
                 let operation_pool = self.routing.get(&variant).copied().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "StageRouter has no pool for work variant {variant:?} in request {:?}",
+                        "StagedExecutor has no pool for work variant {variant:?} in request {:?}",
                         operation.request_key
                     )
                 })?;
@@ -792,11 +792,11 @@ impl Executor for StageRouter {
                     partition.partition_id
                 );
                 pool_index = Some(operation_pool);
-                if variant == WorkVariant::GenFlow {
+                if variant == ForwardMode::GenFlow {
                     let token_pool = self
                         .routing
-                        .get(&WorkVariant::TokenDecode)
-                        .or_else(|| self.routing.get(&WorkVariant::TokenExtend));
+                        .get(&ForwardMode::TokenDecode)
+                        .or_else(|| self.routing.get(&ForwardMode::TokenExtend));
                     if token_pool.is_some_and(|token_pool| *token_pool != operation_pool) {
                         anyhow::ensure!(
                             !operation.inputs.is_empty(),
@@ -840,7 +840,7 @@ impl Executor for StageRouter {
         for payload in &batch.input_products {
             let pool_index = input_routes.get(&payload.product).copied().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "StageRouter cannot route undeclared input product {:?}",
+                    "StagedExecutor cannot route undeclared input product {:?}",
                     payload.product
                 )
             })?;

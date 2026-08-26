@@ -33,7 +33,7 @@ use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
-use uniserve_core::{GenEvent, PublicCommit};
+use uniserve_core::{GenerationEvent, PublicCommit};
 
 pub use input::{
     CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection,
@@ -2075,7 +2075,7 @@ async fn assemble_event_stream(
     }
     while let Some(event) = stream.next().await {
         match event {
-            GenEvent::Scheduled {
+            GenerationEvent::Scheduled {
                 queued_at,
                 scheduled_at,
             } => {
@@ -2097,7 +2097,7 @@ async fn assemble_event_stream(
                     .scheduled
                     .fetch_add(1, Ordering::Relaxed);
             }
-            GenEvent::PromptLogprobs { positions } => {
+            GenerationEvent::PromptLogprobs { positions } => {
                 prompt_positions.extend(positions);
                 if prompt_positions.len() > expected_prompt_positions {
                     return Err(ServeError::OutputProcessing {
@@ -2122,7 +2122,7 @@ async fn assemble_event_stream(
                     emit_accepted!(Some(decoded));
                 }
             }
-            GenEvent::TextToken {
+            GenerationEvent::TextToken {
                 id, public_commit, ..
             } => {
                 if !accepted {
@@ -2145,7 +2145,7 @@ async fn assemble_event_stream(
                     consume_token!(id, None, public_commit);
                 }
             }
-            GenEvent::TokenLogprobs { id, candidates } => {
+            GenerationEvent::TokenLogprobs { id, candidates } => {
                 let (pending, public_commit) =
                     pending_token
                         .take()
@@ -2173,7 +2173,7 @@ async fn assemble_event_stream(
                 })?;
                 consume_token!(id, Some(logprobs), public_commit);
             }
-            GenEvent::ImageBegin {
+            GenerationEvent::ImageBegin {
                 image_id,
                 height,
                 width,
@@ -2191,7 +2191,7 @@ async fn assemble_event_stream(
                 })
                 .await;
             }
-            GenEvent::ImageStep { image_id, step } => {
+            GenerationEvent::ImageStep { image_id, step } => {
                 ensure_output_ready!("image-step event");
                 image_steps = image_steps.saturating_add(1);
                 y.yield_ok(ServeEvent::ImageStep {
@@ -2202,7 +2202,7 @@ async fn assemble_event_stream(
                 })
                 .await;
             }
-            GenEvent::ImageCommit { image_id } => {
+            GenerationEvent::ImageCommit { image_id } => {
                 ensure_output_ready!("image-commit event");
                 pending_image_events.push(ServeEvent::ImageCommit {
                     candidate_id: CandidateId::PRIMARY,
@@ -2210,7 +2210,7 @@ async fn assemble_event_stream(
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
             }
-            GenEvent::ImageDone {
+            GenerationEvent::ImageDone {
                 image_id,
                 height,
                 width,
@@ -2235,7 +2235,7 @@ async fn assemble_event_stream(
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
             }
-            GenEvent::Finished {
+            GenerationEvent::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens,
@@ -2292,7 +2292,7 @@ async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            GenEvent::Rejected { message } => {
+            GenerationEvent::Rejected { message } => {
                 flush_pending_images!();
                 y.yield_ok(ServeEvent::Rejected {
                     request_id: request_id.clone(),
@@ -2301,7 +2301,7 @@ async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            GenEvent::Error { message } => {
+            GenerationEvent::Error { message } => {
                 flush_pending_images!();
                 y.yield_ok(ServeEvent::Failed {
                     request_id: request_id.clone(),
@@ -2310,9 +2310,9 @@ async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            GenEvent::MediaCompleted { .. }
-            | GenEvent::MediaFailed { .. }
-            | GenEvent::MediaAborted => {
+            GenerationEvent::MediaCompleted { .. }
+            | GenerationEvent::MediaFailed { .. }
+            | GenerationEvent::MediaAborted => {
                 return Err(ServeError::OutputProcessing {
                     request_id,
                     message: "generation request received a media lifecycle event".to_string(),
@@ -2406,18 +2406,18 @@ mod tests {
     async fn assembler_attaches_ranked_logprobs_to_text_delta() {
         let tokenizer = crate::serving::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(GenEvent::Scheduled {
+        tx.try_send(GenerationEvent::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
         .unwrap();
-        tx.try_send(GenEvent::TextToken {
+        tx.try_send(GenerationEvent::TextToken {
             id: b'a' as u32,
             logprob: Some(-0.25),
             public_commit: None,
         })
         .unwrap();
-        tx.try_send(GenEvent::TokenLogprobs {
+        tx.try_send(GenerationEvent::TokenLogprobs {
             id: b'a' as u32,
             candidates: vec![TokenLogprob {
                 token_id: b'a' as u32,
@@ -2426,7 +2426,7 @@ mod tests {
             }],
         })
         .unwrap();
-        tx.try_send(GenEvent::Finished {
+        tx.try_send(GenerationEvent::Finished {
             reason: uniserve_core::FinishReason::MaxTokens,
             stop_reason: None,
             prompt_tokens: 1,
@@ -2481,7 +2481,7 @@ mod tests {
     async fn assembler_publishes_an_image_with_its_next_text_token() {
         let tokenizer = crate::serving::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(GenEvent::Scheduled {
+        tx.try_send(GenerationEvent::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
@@ -2509,7 +2509,7 @@ mod tests {
             Some(Ok(ServeEvent::Scheduled { .. }))
         ));
 
-        tx.send(GenEvent::TextToken {
+        tx.send(GenerationEvent::TextToken {
             id: b'a' as u32,
             logprob: None,
             public_commit: Some(public_commit(1, PublicModality::Text)),
@@ -2527,10 +2527,10 @@ mod tests {
             Some(Ok(ServeEvent::TextDelta { text, .. })) if text == "a"
         ));
 
-        tx.send(GenEvent::ImageCommit { image_id: 0 })
+        tx.send(GenerationEvent::ImageCommit { image_id: 0 })
             .await
             .unwrap();
-        tx.send(GenEvent::ImageDone {
+        tx.send(GenerationEvent::ImageDone {
             image_id: 0,
             height: 1,
             width: 1,
@@ -2548,7 +2548,7 @@ mod tests {
             "the image became public before a continuation token arrived"
         );
 
-        tx.send(GenEvent::TextToken {
+        tx.send(GenerationEvent::TextToken {
             id: b'b' as u32,
             logprob: None,
             public_commit: Some(public_commit(4, PublicModality::Text)),

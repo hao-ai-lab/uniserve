@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from torch import nn
 
-from ..batch import WorkVariant
+from ..batch import ForwardMode as WorkMode
 from ..foundation.errors import invalid_descriptor
 
 if TYPE_CHECKING:
@@ -110,7 +110,7 @@ class ExecutionModel(nn.Module):
     serving_dtype: str = "bfloat16"
     cache_geometry: CacheGeometry
     resource_geometry: ResourceGeometry
-    supported_work: frozenset[WorkVariant]
+    supported_work: frozenset[WorkMode]
     vocab_size: int
     hidden_size: int
     text_max_tokens: int

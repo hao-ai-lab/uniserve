@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from ..batch import WorkVariant
+from ..batch import ForwardMode
 
 
 class WorkerKind(StrEnum):
@@ -16,7 +16,7 @@ class WorkerKind(StrEnum):
     GEN = "gen"
 
     @property
-    def allowed_work_variants(self) -> frozenset[WorkVariant]:
+    def allowed_work_variants(self) -> frozenset[ForwardMode]:
         """The wire work variants this deployment role is admitted to run."""
 
         return _ROUTES[self]
@@ -27,38 +27,38 @@ class WorkerKind(StrEnum):
 
 
 _ROUTES = {
-    WorkerKind.FULL: frozenset(WorkVariant),
-    WorkerKind.ENCODER: frozenset({WorkVariant.ENCODE_VISION, WorkVariant.ENCODE_LATENT}),
-    WorkerKind.PREFILL: frozenset({WorkVariant.TOKEN_EXTEND}),
+    WorkerKind.FULL: frozenset(ForwardMode),
+    WorkerKind.ENCODER: frozenset({ForwardMode.ENCODE_VISION, ForwardMode.ENCODE_LATENT}),
+    WorkerKind.PREFILL: frozenset({ForwardMode.TOKEN_EXTEND}),
     WorkerKind.DECODE: frozenset(
         {
-            WorkVariant.TOKEN_DECODE,
-            WorkVariant.TOKEN_VERIFY,
-            WorkVariant.GEN_TRANSITION,
-            WorkVariant.GEN_FLOW,
-            WorkVariant.GEN_DECODE,
-            WorkVariant.MATERIALIZE,
-            WorkVariant.TRANSFER_KV_PUBLISH,
-            WorkVariant.TRANSFER_KV_INSTALL,
+            ForwardMode.TOKEN_DECODE,
+            ForwardMode.TOKEN_VERIFY,
+            ForwardMode.GEN_TRANSITION,
+            ForwardMode.GEN_FLOW,
+            ForwardMode.GEN_DECODE,
+            ForwardMode.MATERIALIZE,
+            ForwardMode.TRANSFER_KV_PUBLISH,
+            ForwardMode.TRANSFER_KV_INSTALL,
         }
     ),
     WorkerKind.UND: frozenset(
         {
-            WorkVariant.TOKEN_EXTEND,
-            WorkVariant.TOKEN_DECODE,
-            WorkVariant.TOKEN_VERIFY,
-            WorkVariant.ENCODE_VISION,
-            WorkVariant.ENCODE_LATENT,
-            WorkVariant.TRANSFER_KV_PUBLISH,
-            WorkVariant.TRANSFER_KV_INSTALL,
+            ForwardMode.TOKEN_EXTEND,
+            ForwardMode.TOKEN_DECODE,
+            ForwardMode.TOKEN_VERIFY,
+            ForwardMode.ENCODE_VISION,
+            ForwardMode.ENCODE_LATENT,
+            ForwardMode.TRANSFER_KV_PUBLISH,
+            ForwardMode.TRANSFER_KV_INSTALL,
         }
     ),
     WorkerKind.GEN: frozenset(
         {
-            WorkVariant.GEN_TRANSITION,
-            WorkVariant.GEN_FLOW,
-            WorkVariant.GEN_DECODE,
-            WorkVariant.MATERIALIZE,
+            ForwardMode.GEN_TRANSITION,
+            ForwardMode.GEN_FLOW,
+            ForwardMode.GEN_DECODE,
+            ForwardMode.MATERIALIZE,
         }
     ),
 }

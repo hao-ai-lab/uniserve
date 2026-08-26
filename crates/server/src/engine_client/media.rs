@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use tokio::sync::mpsc;
 use uniserve_core::MediaEvent;
-use uniserve_core::{RequestId, now_unix_secs};
 
 /// Frontend-owned metadata and the compact fixed-profile media input.
 #[derive(Debug, Clone)]
@@ -33,26 +32,6 @@ impl MediaSubmission {
             arrival_time: None,
             data_parallel_rank: None,
             trace_headers: None,
-        }
-    }
-
-    pub(crate) fn into_envelope(
-        self,
-        client_index: u32,
-    ) -> uniserve_core::codec::MediaRequestEnvelope {
-        uniserve_core::codec::MediaRequestEnvelope {
-            external_request_id: self.external_request_id,
-            arrival_time: self.arrival_time.unwrap_or_else(now_unix_secs),
-            client_index,
-            data_parallel_rank: self.data_parallel_rank,
-            trace_headers: self.trace_headers,
-            request: uniserve_core::MediaRequest {
-                request_id: RequestId(0),
-                prompt: self.prompt,
-                seed: self.seed,
-                priority: self.priority,
-                output_path: self.output_path,
-            },
         }
     }
 }

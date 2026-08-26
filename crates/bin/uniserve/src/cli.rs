@@ -49,13 +49,9 @@ impl Cli {
 /// Supported top-level CLI commands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Run the UniServe OpenAI server: the Rust engine + scheduler run
-    /// in-process by default, driving a forward-only worker.
+    /// Run the UniServe OpenAI server: the Rust engine and scheduler run
+    /// in-process, driving a forward-only worker.
     Serve(Box<ServeArgs>),
-    /// Run one headless engine process: dial a frontend's handshake
-    /// endpoint, host the Rust scheduler + forward-only worker behind the
-    /// engine wire protocol.
-    Engine(Box<EngineArgs>),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -94,154 +90,6 @@ impl From<ModelDescriptionArg> for ModelDescription {
     }
 }
 
-/// Arguments for the `engine` command (one headless engine process).
-#[derive(Educe, Clone, Args)]
-#[educe(Debug)]
-#[command(override_usage = "uniserve engine <MODEL> --handshake-address <ADDR> [OPTIONS]")]
-pub(crate) struct EngineArgs {
-    /// Model identifier or local model directory loaded by the forward-only
-    /// worker.
-    #[arg(value_name = "MODEL")]
-    pub model: String,
-
-    /// Frontend handshake endpoint to dial (e.g. `tcp://127.0.0.1:5557` or
-    /// `ipc:///tmp/uniserve-handshake`).
-    #[arg(long)]
-    pub handshake_address: String,
-    /// Engine index within the deployment; becomes the 2-byte little-endian
-    /// socket identity.
-    #[arg(long, default_value_t = 0)]
-    pub engine_index: u32,
-    /// Maximum seconds to wait for the frontend's INIT after HELLO.
-    #[arg(long, default_value_t = 300)]
-    pub init_timeout: u64,
-
-    /// Run the GPU-free CPU simulation engine instead of spawning the real
-    /// forward-only worker. No Python and no GPU are required.
-    #[arg(long)]
-    pub sim: bool,
-    /// Compute device for the forward-only worker.
-    #[arg(long, default_value = "cuda")]
-    pub device: String,
-    /// Attention backend preference forwarded to the Python worker.
-    #[arg(long, default_value = "auto")]
-    pub attention_backend: String,
-    /// KV block size in tokens (the page size).
-    #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
-    pub block_size: u32,
-    /// How many op-batches the scheduler keeps in flight against the worker.
-    #[arg(long, default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub pipeline_depth: usize,
-    /// Maximum number of ops assembled into one forward batch.
-    #[arg(long, default_value_t = DEFAULT_MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub max_batch: usize,
-    /// Per-step scheduling token budget (vLLM's max_num_batched_tokens).
-    #[arg(long, default_value_t = DEFAULT_MAX_NUM_BATCHED_TOKENS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub max_num_batched_tokens: usize,
-    /// Maximum concurrently running requests (vLLM's max_num_seqs).
-    #[arg(long = "max-running-requests", default_value_t = DEFAULT_MAX_NUM_SEQS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub max_num_seqs: usize,
-    /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
-    #[arg(long = "chunked-prefill-size", default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub long_prefill_threshold: usize,
-    /// Per-step budget of text prefill tokens allowed to join a decode batch
-    /// as one mixed extend+decode forward (0 disables mixing).
-    #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS)]
-    pub mixed_prefill_tokens: usize,
-    /// Waiting queue policy used by the scheduler.
-    #[arg(long = "schedule-policy", value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
-    pub scheduler_policy: SchedulerPolicyArg,
-    /// Maximum model context length reported to the frontend.
-    #[arg(long = "max-model-len")]
-    pub max_model_len: Option<u32>,
-    /// Optional explicit KV token capacity override for the worker.
-    #[arg(long = "max-total-tokens")]
-    pub kv_token_capacity: Option<u64>,
-    /// Python interpreter used to launch the worker.
-    #[arg(long, default_value_t = default_worker_python())]
-    pub worker_python: String,
-    /// Number of worker rank processes behind this engine (1 = single ring;
-    /// >1 spawns the MultiprocExecutor with one ring per rank).
-    #[arg(long = "tp-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub worker_ranks: usize,
-    /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
-    /// Unset = single Full pool.
-    #[arg(long)]
-    pub workers: Option<String>,
-    /// Per-edge data-plane transfer backend, e.g.
-    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
-    #[arg(long)]
-    pub transfer: Option<String>,
-    /// Response-ring slot capacity in bytes for the worker IPC transport.
-    #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub resp_slot_cap: usize,
-    /// Shared server/worker directory for completed media artifacts.
-    #[arg(long, hide = true)]
-    pub media_spool: Option<std::path::PathBuf>,
-    /// Explicit Python worker launch/runtime arguments.
-    #[command(flatten)]
-    pub worker_launch: WorkerLaunchArgs,
-}
-
-impl EngineArgs {
-    fn resolved_model(&self) -> String {
-        self.model.clone()
-    }
-
-    /// Build the engine-proc configuration. Control tokens default to the
-    /// sim-compatible values and are overridden by the frontend's INIT
-    /// generation control tokens during the handshake.
-    pub(crate) fn to_proc_config(&self) -> uniserve_engine::process::EngineProcConfig {
-        let mut core = uniserve_engine::EngineCoreConfig::sim(self.resolved_model());
-        core.backend = if self.sim {
-            uniserve_engine::EngineBackend::Sim
-        } else {
-            uniserve_engine::EngineBackend::Worker
-        };
-        core.device = self.device.clone();
-        core.attention_backend = self.attention_backend.clone();
-        core.block_size = self.block_size;
-        core.pipeline_depth = self.pipeline_depth;
-        core.max_batch = self.max_batch;
-        core.max_num_batched_tokens = self.max_num_batched_tokens;
-        core.max_num_seqs = self.max_num_seqs;
-        core.long_prefill_threshold = self.long_prefill_threshold;
-        core.mixed_prefill_tokens = self.mixed_prefill_tokens;
-        core.scheduler_policy = self.scheduler_policy.into();
-        // The engine subprocess does not load the frontend model backend, so it
-        // cannot derive the model's real context length here; an explicit
-        // override wins and otherwise the built-in default applies. The
-        // engine re-reports its effective `max_model_len` to the frontend after
-        // KV auto-fitting during the handshake.
-        core.max_model_len = self
-            .max_model_len
-            .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
-        core.kv_token_capacity = self.kv_token_capacity;
-        core.worker_python = self.worker_python.clone();
-        core.worker_ranks = self.worker_ranks;
-        core.workers = self.workers.clone();
-        core.transfer = self.transfer.clone();
-        let mut worker_launch = self.worker_launch.to_config();
-        worker_launch.media_spool = self
-            .media_spool
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
-        core.worker_launch = worker_launch;
-        if self.media_spool.is_some() {
-            core.req_slot_cap = EngineSettings::MEDIA_IPC_SLOT_CAP;
-            core.resp_slot_cap = EngineSettings::MEDIA_IPC_SLOT_CAP;
-        } else {
-            core.resp_slot_cap = self.resp_slot_cap;
-        }
-        uniserve_engine::process::EngineProcConfig {
-            handshake_address: self.handshake_address.clone(),
-            engine_index: self.engine_index,
-            init_timeout: std::time::Duration::from_secs(self.init_timeout),
-            core,
-        }
-    }
-}
-
 /// Arguments for the `serve` command.
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
@@ -274,17 +122,6 @@ impl ServeArgs {
             },
         };
         self.runtime.clone().into_config(listener_mode)
-    }
-
-    /// Build the server config with an explicit engine connection (the socket
-    /// modes: managed subprocesses or external engines).
-    pub(crate) fn to_uniserve_config_with_connection(
-        &self,
-        connection: uniserve_server::EngineConnection,
-    ) -> Config {
-        let mut config = self.to_uniserve_config();
-        config.engine.connection = connection;
-        config
     }
 }
 
@@ -334,7 +171,7 @@ pub(crate) struct SharedRuntimeArgs {
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// Unset = a single Full pool; a multi-stage spec composes local pools
-    /// behind a StageRouter.
+    /// behind a StagedExecutor.
     #[arg(long, hide = true)]
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend, e.g.
@@ -373,28 +210,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// `0` disables graceful drain (terminate immediately).
     #[arg(long, default_value_t = 30)]
     pub shutdown_timeout: u64,
-
-    /// Run the engine out-of-process: expect this many engine cores behind the
-    /// wire protocol (vLLM's process topology). `0` (the default) keeps the
-    /// in-process engine — the deliberate single-node zero-hop path.
-    #[arg(long, default_value_t = 0, hide = true)]
-    pub engine_count: usize,
-    /// Of `--engine-count`, how many engines this process spawns and
-    /// supervises locally (managed mode). Defaults to all of them; `0` runs
-    /// frontend-only — externally started `uniserve engine` processes dial in.
-    #[arg(long, hide = true)]
-    pub local_engine_count: Option<usize>,
-    /// Engine handshake endpoint (`tcp://host:port`). Auto-allocated on
-    /// 127.0.0.1 when unset (managed mode); set it explicitly for
-    /// frontend-only mode so external engines know where to dial.
-    #[arg(long, hide = true)]
-    pub handshake_address: Option<String>,
-    /// Host engines use to connect back to this frontend's data-plane sockets.
-    #[arg(long, default_value = "127.0.0.1", hide = true)]
-    pub advertised_host: String,
-    /// Seconds to wait for engines to become ready (must cover model load).
-    #[arg(long, default_value_t = 1800, hide = true)]
-    pub engine_ready_timeout: u64,
 
     /// The file path to the chat template, or the template in single-line form
     /// for the specified model.
@@ -471,7 +286,6 @@ impl SharedRuntimeArgs {
         worker_launch.media_spool =
             is_media.then(|| self.media_spool.to_string_lossy().into_owned());
         EngineSettings {
-            connection: uniserve_server::EngineConnection::InProcess,
             backend: if self.sim {
                 EngineBackendKind::Sim
             } else {
@@ -502,68 +316,6 @@ impl SharedRuntimeArgs {
             transfer: self.transfer.clone(),
             worker_launch,
         }
-    }
-
-    /// CLI arguments forwarded verbatim to each managed `uniserve engine`
-    /// subprocess (the engine-tier settings of this serve invocation).
-    pub(crate) fn engine_cli_args(&self) -> Vec<String> {
-        let is_media = matches!(self.model_description, ModelDescriptionArg::MiniMaxH3);
-        let resp_slot_cap = if is_media {
-            EngineSettings::MEDIA_IPC_SLOT_CAP
-        } else {
-            self.resp_slot_cap
-        };
-        let mut args = vec![
-            "--device".to_string(),
-            self.device.clone(),
-            "--worker-python".to_string(),
-            self.worker_python.clone(),
-            "--tp-size".to_string(),
-            self.worker_ranks.to_string(),
-            "--attention-backend".to_string(),
-            self.attention_backend.clone(),
-            "--page-size".to_string(),
-            self.block_size.to_string(),
-            "--pipeline-depth".to_string(),
-            self.pipeline_depth.to_string(),
-            "--max-batch".to_string(),
-            self.max_batch.to_string(),
-            "--max-num-batched-tokens".to_string(),
-            self.max_num_batched_tokens.to_string(),
-            "--max-running-requests".to_string(),
-            self.max_num_seqs.to_string(),
-            "--chunked-prefill-size".to_string(),
-            self.long_prefill_threshold.to_string(),
-            "--schedule-policy".to_string(),
-            format!("{:?}", self.scheduler_policy).to_ascii_lowercase(),
-            "--resp-slot-cap".to_string(),
-            resp_slot_cap.to_string(),
-        ];
-        if let Some(len) = self.max_model_len {
-            args.push("--max-model-len".to_string());
-            args.push(len.to_string());
-        }
-        if let Some(capacity) = self.kv_token_capacity {
-            args.push("--max-total-tokens".to_string());
-            args.push(capacity.to_string());
-        }
-        if let Some(workers) = &self.workers {
-            args.push("--workers".to_string());
-            args.push(workers.clone());
-        }
-        if let Some(transfer) = &self.transfer {
-            args.push("--transfer".to_string());
-            args.push(transfer.clone());
-        }
-        if is_media {
-            args.push("--media-spool".to_string());
-            args.push(self.media_spool.to_string_lossy().into_owned());
-        }
-        self.worker_launch.append_engine_cli_args(&mut args);
-        if self.sim {
-            args.push("--sim".to_string());
-        }
-        args
     }
 
     /// Build the OpenAI-server config for the in-process UniServe engine.
@@ -691,129 +443,6 @@ impl WorkerLaunchArgs {
             snapshot_dir: self.snapshot_dir.clone(),
             media_spool: None,
         }
-    }
-
-    fn append_engine_cli_args(&self, args: &mut Vec<String>) {
-        let cfg = self.to_config();
-        let default = WorkerLaunchConfig::default();
-        if cfg.stub {
-            args.push("--worker-stub".to_string());
-        }
-        push_if_changed(
-            args,
-            "--load-format",
-            &cfg.load_format,
-            &default.load_format,
-        );
-        push_option(args, "--download-dir", cfg.download_dir.as_ref());
-        push_u32_option(args, "--load-threads", cfg.load_threads);
-        push_option(args, "--checksum-manifest", cfg.checksum_manifest.as_ref());
-        push_if_changed(args, "--dtype", &cfg.model_dtype, &default.model_dtype);
-        push_option(args, "--kv-cache-dtype", cfg.kv_cache_dtype.as_ref());
-        push_if_changed(
-            args,
-            "--mem-fraction-static",
-            &cfg.kv_memory_fraction,
-            &default.kv_memory_fraction,
-        );
-        push_option(args, "--worker-mesh", cfg.mesh.as_ref());
-        push_option(args, "--tp-backend", cfg.tp_backend.as_ref());
-        for lane in &cfg.lanes {
-            args.push("--lane".to_string());
-            args.push(lane.worker_arg());
-        }
-        push_bool_value(args, "--cuda-graph", cfg.cuda_graph, default.cuda_graph);
-        push_option(
-            args,
-            "--decode-graph-batch-sizes",
-            cfg.decode_graph_batch_sizes.as_ref(),
-        );
-        push_bool_value(
-            args,
-            "--prefill-cuda-graph",
-            cfg.prefill_cuda_graph,
-            default.prefill_cuda_graph,
-        );
-        push_option(
-            args,
-            "--prefill-graph-token-sizes",
-            cfg.prefill_graph_token_sizes.as_ref(),
-        );
-        push_option(
-            args,
-            "--flow-graph-batch-sizes",
-            cfg.flow_graph_batch_sizes.as_ref(),
-        );
-        push_option(args, "--flow-graph-shapes", cfg.flow_graph_shapes.as_ref());
-        if cfg.flashinfer_workspace_size != default.flashinfer_workspace_size {
-            args.push("--flashinfer-workspace-size".to_string());
-            args.push(cfg.flashinfer_workspace_size.to_string());
-        }
-        push_option(
-            args,
-            "--flashinfer-use-tensor-core",
-            cfg.flashinfer_use_tensor_core.as_ref(),
-        );
-        push_if_changed(
-            args,
-            "--flashinfer-decode-backend",
-            &cfg.flashinfer_decode_backend,
-            &default.flashinfer_decode_backend,
-        );
-        push_if_changed(
-            args,
-            "--flashinfer-prefill-backend",
-            &cfg.flashinfer_prefill_backend,
-            &default.flashinfer_prefill_backend,
-        );
-        push_u32_option(
-            args,
-            "--flashinfer-decode-split-tile-size",
-            cfg.flashinfer_decode_split_tile_size,
-        );
-        push_u32_option(
-            args,
-            "--flashinfer-prefill-split-tile-size",
-            cfg.flashinfer_prefill_split_tile_size,
-        );
-        if cfg.flashinfer_disable_split_kv {
-            args.push("--flashinfer-disable-split-kv".to_string());
-        }
-        push_bool_value(
-            args,
-            "--flashinfer-fast-decode-plan",
-            cfg.flashinfer_fast_decode_plan,
-            default.flashinfer_fast_decode_plan,
-        );
-        push_option(args, "--snapshot-dir", cfg.snapshot_dir.as_ref());
-    }
-}
-
-fn push_option(args: &mut Vec<String>, name: &str, value: Option<&String>) {
-    if let Some(value) = value {
-        args.push(name.to_string());
-        args.push(value.clone());
-    }
-}
-
-fn push_if_changed(args: &mut Vec<String>, name: &str, value: &str, default: &str) {
-    if value != default {
-        args.push(name.to_string());
-        args.push(value.to_string());
-    }
-}
-
-fn push_bool_value(args: &mut Vec<String>, name: &str, value: bool, default: bool) {
-    if value != default {
-        args.push(name.to_string());
-        args.push(value.to_string());
-    }
-}
-
-fn push_u32_option(args: &mut Vec<String>, name: &str, value: Option<u32>) {
-    if let Some(value) = value {
-        args.push(name.to_string());
-        args.push(value.to_string());
     }
 }
 
@@ -945,32 +574,5 @@ mod tests {
         ])
         .expect("configured serve invocation");
         assert!(matches!(parsed.command, Command::Serve(_)));
-    }
-
-    #[test]
-    fn engine_accepts_runtime_configuration() {
-        let parsed = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "engine",
-            "model",
-            "--handshake-address",
-            "tcp://127.0.0.1:5557",
-            "--device",
-            "cpu",
-            "--tp-size",
-            "2",
-            "--page-size",
-            "128",
-            "--pipeline-depth",
-            "3",
-            "--schedule-policy",
-            "priority",
-            "--dtype",
-            "float16",
-            "--worker-mesh",
-            "tower=text:cpu",
-        ])
-        .expect("configured engine invocation");
-        assert!(matches!(parsed.command, Command::Engine(_)));
     }
 }

@@ -17,6 +17,7 @@ from uniserve_worker.batch import (
     ProductPayload,
     ProductRef,
     TokenSpan,
+    ForwardMode,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.generation import BranchSource, LatentLayout
@@ -37,7 +38,7 @@ from .rows import ForwardRow, LatentExecution, OperationState, PartitionState
 
 
 def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
-    if state.operation.work.kind != "gen" or state.operation.work.mode != "flow":
+    if state.operation.work is not ForwardMode.GEN_FLOW:
         return ()
     if state.phase == "initial":
         _initialize(runtime, state)

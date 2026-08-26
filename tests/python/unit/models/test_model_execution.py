@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.batch import WorkVariant
+from uniserve_worker.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import (
     EmptyMeshView,
     ForwardBatch,
@@ -180,9 +180,9 @@ def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
     assert model.cache_geometry.num_layers == 1
     assert model.text_max_tokens == 128
     assert model.supported_work == {
-        WorkVariant.TOKEN_EXTEND,
-        WorkVariant.TOKEN_DECODE,
-        WorkVariant.TOKEN_VERIFY,
+        ForwardMode.TOKEN_EXTEND,
+        ForwardMode.TOKEN_DECODE,
+        ForwardMode.TOKEN_VERIFY,
     }
 
 

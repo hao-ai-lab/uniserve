@@ -17,7 +17,7 @@ use uniserve_core::{
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
     RequestId, SamplingParams, UndVisibility,
 };
-use uniserve_core::{FinishReason, GenEvent};
+use uniserve_core::{FinishReason, GenerationEvent};
 use uniserve_engine::executor::{ControlOp, Executor, WorkerExecError, WorkerLossError};
 use uniserve_engine::scheduler::{
     ControlTokens, LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration, Scheduler,
@@ -27,10 +27,9 @@ use uniserve_engine::worker::{MultiprocExecutor, WorkerLaunchConfig};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
     CloseReason, Control, DType, DimBound, Disposition, Domain, ErrorCode, ExecutionCapability,
-    ForwardRow, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, RequestKey, RouteId, SamplingOwnership, ShapeBound, StorageClass,
-    TRANSFER_DESCRIPTOR_PREFIX, TokenMode, UndAdmission, VersionRef, Work,
-    encode_token_product_bytes,
+    ForwardMode, ForwardRow, OpId, OpStatus, Operation, Point, PointRange, ProductKind,
+    ProductPayload, ProductRef, RequestKey, RouteId, SamplingOwnership, ShapeBound, StorageClass,
+    TRANSFER_DESCRIPTOR_PREFIX, TokenMode, UndAdmission, VersionRef, encode_token_product_bytes,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -665,13 +664,13 @@ fn qualify_combined_pressure() -> anyhow::Result<()> {
     while Instant::now() < first_deadline && fast_finish.is_none() {
         scheduler.step();
         while let Ok(event) = fast.try_recv() {
-            if let GenEvent::Finished { reason, .. } = event {
+            if let GenerationEvent::Finished { reason, .. } = event {
                 fast_finish = Some(reason);
             }
         }
         for receiver in &mut rejected {
             while let Ok(event) = receiver.try_recv() {
-                if matches!(event, GenEvent::Rejected { .. }) {
+                if matches!(event, GenerationEvent::Rejected { .. }) {
                     rejected_count += 1;
                 }
             }
@@ -688,7 +687,7 @@ fn qualify_combined_pressure() -> anyhow::Result<()> {
     while Instant::now() < cpu_deadline && cpu_finish.is_none() {
         scheduler.step();
         while let Ok(event) = slow_cpu.try_recv() {
-            if let GenEvent::Finished { reason, .. } = event {
+            if let GenerationEvent::Finished { reason, .. } = event {
                 cpu_finish = Some(reason);
             }
         }
@@ -880,7 +879,7 @@ fn token_batch(
         request_key,
         op_id,
         parent,
-        Work::Token(mode),
+        ForwardMode::from_token(mode),
         RouteId(0),
         match mode {
             TokenMode::Extend => Domain::Prefill,
@@ -945,7 +944,7 @@ fn control_batch(step_id: u64, control: Control) -> Batch {
     Batch::new(step_id, Vec::new(), Vec::new()).with_controls(vec![control])
 }
 
-fn fixed_completion(record: &uniserve_worker_ipc::CompletionRecord) -> VersionRef {
+fn fixed_completion(record: &uniserve_worker_ipc::ModelOutput) -> VersionRef {
     VersionRef {
         request_key: record.request_key,
         producer_op_id: record.op_id,

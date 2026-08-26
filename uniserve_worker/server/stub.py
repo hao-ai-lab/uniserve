@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ..batch import WorkVariant
+from ..batch import ForwardMode
 from ..bootstrap.capacity import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -139,7 +139,7 @@ class StubModel(ExecutionModel):
             latent_downsample=STUB_LATENT_DOWNSAMPLE,
         )
         self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
-        self.supported_work = frozenset(WorkVariant)
+        self.supported_work = frozenset(ForwardMode)
         self.vocab_size = _STUB_VOCAB_SIZE
         self.hidden_size = _STUB_HIDDEN_SIZE
         self.text_max_tokens = STUB_MAX_LATENT_SIZE

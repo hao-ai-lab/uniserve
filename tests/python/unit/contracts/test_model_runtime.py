@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL
-from uniserve_worker.batch import WorkVariant
+from uniserve_worker.batch import ForwardMode
 from uniserve_worker.bootstrap.capabilities import resolve_capabilities
 from uniserve_worker.bootstrap.capacity import latent_trajectory_bytes, model_arena_capacity
 from uniserve_worker.foundation.errors import WorkerError
@@ -41,8 +41,8 @@ def test_capabilities_project_model_behavior_and_resource_geometry():
         weight_digest="b" * 64,
     )
 
-    assert WorkVariant.TOKEN_EXTEND in capabilities.supported_work
-    assert WorkVariant.GEN_FLOW in capabilities.supported_work
+    assert ForwardMode.TOKEN_EXTEND in capabilities.supported_work
+    assert ForwardMode.GEN_FLOW in capabilities.supported_work
     assert capabilities.mixed_buckets == ()
     assert capabilities.num_layers == TEST_MODEL.cache_geometry.num_layers
     assert capabilities.model_identity == "a" * 64

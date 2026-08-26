@@ -1,7 +1,6 @@
 //! The reified `EngineCore`: scheduler + executor + worker lifecycle, behind a
-//! transport-free surface (queues + an [`EngineHandle`]), so the same engine
-//! can be hosted in-process (the frontend's `InprocClient` analog) or inside a
-//! headless `uniserve engine` process ([`crate::proc`]).
+//! transport-free surface (queues + an [`EngineHandle`]). The HTTP process
+//! hosts one in-process core.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +13,7 @@ use crate::scheduler::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats,
     Scheduler, SchedulingPolicy,
 };
-use crate::worker::{MultiprocExecutor, StageRouter, WorkerLaunchConfig};
+use crate::worker::{MultiprocExecutor, StagedExecutor, WorkerLaunchConfig};
 use anyhow::Context as _;
 use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities, ModelDtype, RequestId};
 use uniserve_worker_ipc::WorkerCapabilities;
@@ -45,7 +44,7 @@ fn assign_pool_device(device: &str, gpu: usize) -> String {
     }
 }
 
-/// Configuration for one engine core (in-process or headless).
+/// Configuration for one in-process engine core.
 #[derive(Debug, Clone)]
 pub struct EngineCoreConfig {
     /// Model directory / identifier passed to the worker and used for metrics.
@@ -85,8 +84,8 @@ pub struct EngineCoreConfig {
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// `None` (or `full:1`) selects a single Full pool
-    /// driven directly, with no `StageRouter`. A multi-stage spec composes pools
-    /// behind a `StageRouter`.
+    /// driven directly, with no `StagedExecutor`. A multi-stage spec composes pools
+    /// behind a `StagedExecutor`.
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Participating worker
@@ -238,7 +237,7 @@ impl EngineCore {
         }
     }
 
-    /// Compose a `StageRouter` over the heterogeneous pools of a staged topology.
+    /// Compose a `StagedExecutor` over the heterogeneous pools of a staged topology.
     /// Each pool instance is a (tp-sized) `MultiprocExecutor` spawned with its
     /// `--worker-kind`; the router fans the scheduler's batch across them by
     /// exact operation type and merges the results.
@@ -333,7 +332,7 @@ impl EngineCore {
                 pools.push((pool.kind, Box::new(exec)));
             }
         }
-        Ok(Box::new(StageRouter::try_new(pools)?))
+        Ok(Box::new(StagedExecutor::try_new(pools)?))
     }
 
     /// Build the engine core from an executor supplied by a higher composition
@@ -549,7 +548,7 @@ impl EngineCoreBuilder<NeedsExecutor> {
         }
         // Resolve the staged topology. `None` or the trivial single-Full pool
         // takes the direct full-pool path below;
-        // anything else composes a StageRouter over heterogeneous pools.
+        // anything else composes a StagedExecutor over heterogeneous pools.
         let workers = match config.workers.as_deref() {
             Some(spec) => WorkersSpec::parse(spec).context("invalid --workers spec")?,
             None => WorkersSpec::single_full(config.worker_ranks),

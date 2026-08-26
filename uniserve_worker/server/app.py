@@ -20,6 +20,7 @@ from ..batch import (
     PartitionCompletion,
     RecoveryPlacement,
     SnapshotRef,
+    ForwardMode,
 )
 from ..capabilities import RequestKind, ResponseKind
 from ..foundation.env import env_int, env_optional_int
@@ -871,8 +872,8 @@ class WorkerServer:
         if not self._launch_reorder:
             return False
         return any(
-            operation.work.kind == "encode"
-            or (operation.work.kind == "token" and operation.work.mode == "extend")
+            operation.work.encode_mode is not None
+            or operation.work is ForwardMode.TOKEN_EXTEND
             for operation in batch.operations
         )
 
@@ -1004,9 +1005,9 @@ class WorkerServer:
         try:
             supported = frozenset(self.worker.capabilities.supported_work)
             unsupported = tuple(
-                operation.work.variant
+                operation.work
                 for operation in batch.operations
-                if operation.work.variant not in supported
+                if operation.work not in supported
             )
             if unsupported:
                 names = sorted({value.value for value in unsupported})

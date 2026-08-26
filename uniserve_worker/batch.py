@@ -1,12 +1,12 @@
 """Typed values crossing the scheduler-to-worker execution boundary.
 
 The scheduler and worker exchange four cross-layer records — :class:`Operation`,
-:class:`VersionRef`, :class:`ProductRef`, and :class:`CompletionRecord` — plus a
-request :class:`Control` command. Every operation names one closed :class:`Work`
-variant, one exact parent version, and its declared input and output products.
-Two host-computed digests fix identity: :meth:`Operation.compute_plan_digest`
-over immutable registration fields, and
-:meth:`CompletionRecord.compute_semantic_digest` over the selected result. The
+:class:`VersionRef`, :class:`ProductRef`, and :class:`ModelOutput` — plus a
+request :class:`Control` command. Every operation names one closed
+:class:`ForwardMode` variant, one exact parent version, and its declared input
+and output products. Two host-computed digests fix identity:
+:meth:`Operation.compute_plan_digest` over immutable registration fields, and
+:meth:`ModelOutput.compute_semantic_digest` over the selected result. The
 digest byte layout matches the Rust ``uniserve-worker-ipc`` crate exactly so both sides
 compute identical digests.
 """
@@ -72,7 +72,7 @@ class MediaProfileId(StrEnum):
     MINIMAX_H3_T2VA = "minimax_h3_t2va"
 
 
-class WorkVariant(StrEnum):
+class ForwardMode(StrEnum):
     TOKEN_EXTEND = "token_extend"
     TOKEN_DECODE = "token_decode"
     TOKEN_VERIFY = "token_verify"
@@ -87,6 +87,83 @@ class WorkVariant(StrEnum):
     MATERIALIZE = "materialize"
     GEN_DECODE = "gen_decode"
 
+    @property
+    def advances_state(self) -> bool:
+        return self in _STATE_ADVANCING_WORK
+
+    @property
+    def requires_fixed_parent(self) -> bool:
+        return self is ForwardMode.TRANSFER_KV_PUBLISH
+
+    @property
+    def token_mode(self) -> TokenMode | None:
+        if self is ForwardMode.TOKEN_EXTEND:
+            return TokenMode.EXTEND
+        if self is ForwardMode.TOKEN_DECODE:
+            return TokenMode.DECODE
+        if self is ForwardMode.TOKEN_VERIFY:
+            return TokenMode.VERIFY
+        return None
+
+    @property
+    def encode_mode(self) -> EncodeMode | None:
+        if self is ForwardMode.ENCODE_VISION:
+            return EncodeMode.VISION
+        if self is ForwardMode.ENCODE_LATENT:
+            return EncodeMode.LATENT
+        return None
+
+    @property
+    def transfer_mode(self) -> TransferMode | None:
+        if self is ForwardMode.TRANSFER_PRODUCT:
+            return TransferMode.PRODUCT
+        if self is ForwardMode.TRANSFER_KV_PUBLISH:
+            return TransferMode.KV_PUBLISH
+        if self is ForwardMode.TRANSFER_KV_INSTALL:
+            return TransferMode.KV_INSTALL
+        return None
+
+    @property
+    def gen_mode(self) -> GenMode | None:
+        if self is ForwardMode.GEN_TRANSITION:
+            return GenMode.TRANSITION
+        if self is ForwardMode.GEN_FLOW:
+            return GenMode.FLOW
+        if self is ForwardMode.GEN_DECODE:
+            return GenMode.DECODE
+        return None
+
+    @classmethod
+    def token(cls, mode: TokenMode) -> ForwardMode:
+        return {
+            TokenMode.EXTEND: cls.TOKEN_EXTEND,
+            TokenMode.DECODE: cls.TOKEN_DECODE,
+            TokenMode.VERIFY: cls.TOKEN_VERIFY,
+        }[mode]
+
+    @classmethod
+    def encode(cls, mode: EncodeMode) -> ForwardMode:
+        return {
+            EncodeMode.VISION: cls.ENCODE_VISION,
+            EncodeMode.LATENT: cls.ENCODE_LATENT,
+        }[mode]
+
+    @classmethod
+    def transfer(cls, mode: TransferMode) -> ForwardMode:
+        return {
+            TransferMode.PRODUCT: cls.TRANSFER_PRODUCT,
+            TransferMode.KV_PUBLISH: cls.TRANSFER_KV_PUBLISH,
+            TransferMode.KV_INSTALL: cls.TRANSFER_KV_INSTALL,
+        }[mode]
+
+    @classmethod
+    def gen(cls, mode: GenMode) -> ForwardMode:
+        return {
+            GenMode.TRANSITION: cls.GEN_TRANSITION,
+            GenMode.FLOW: cls.GEN_FLOW,
+            GenMode.DECODE: cls.GEN_DECODE,
+        }[mode]
+
 
 class Domain(StrEnum):
     PREFILL = "prefill"
@@ -95,25 +172,24 @@ class Domain(StrEnum):
 
 
 _DOMAIN_BY_WORK_VARIANT = {
-    WorkVariant.TOKEN_EXTEND: Domain.PREFILL,
-    WorkVariant.TOKEN_DECODE: Domain.DECODE,
-    WorkVariant.TOKEN_VERIFY: Domain.DECODE,
-    WorkVariant.DRAFT: Domain.DECODE,
-    WorkVariant.ENCODE_VISION: Domain.PREFILL,
-    WorkVariant.ENCODE_LATENT: Domain.PREFILL,
-    WorkVariant.TRANSFER_PRODUCT: Domain.PREFILL,
-    WorkVariant.TRANSFER_KV_PUBLISH: Domain.PREFILL,
-    WorkVariant.TRANSFER_KV_INSTALL: Domain.PREFILL,
-    WorkVariant.GEN_TRANSITION: Domain.FLOW,
-    WorkVariant.GEN_FLOW: Domain.FLOW,
-    WorkVariant.MATERIALIZE: Domain.FLOW,
-    WorkVariant.GEN_DECODE: Domain.FLOW,
+    ForwardMode.TOKEN_EXTEND: Domain.PREFILL,
+    ForwardMode.TOKEN_DECODE: Domain.DECODE,
+    ForwardMode.TOKEN_VERIFY: Domain.DECODE,
+    ForwardMode.DRAFT: Domain.DECODE,
+    ForwardMode.ENCODE_VISION: Domain.PREFILL,
+    ForwardMode.ENCODE_LATENT: Domain.PREFILL,
+    ForwardMode.TRANSFER_PRODUCT: Domain.PREFILL,
+    ForwardMode.TRANSFER_KV_PUBLISH: Domain.PREFILL,
+    ForwardMode.TRANSFER_KV_INSTALL: Domain.PREFILL,
+    ForwardMode.GEN_TRANSITION: Domain.FLOW,
+    ForwardMode.GEN_FLOW: Domain.FLOW,
+    ForwardMode.MATERIALIZE: Domain.FLOW,
+    ForwardMode.GEN_DECODE: Domain.FLOW,
 }
 
 
-def execution_domain(work: Work | WorkVariant) -> Domain:
-    variant = work if isinstance(work, WorkVariant) else work.variant
-    return _DOMAIN_BY_WORK_VARIANT[variant]
+def execution_domain(work: ForwardMode) -> Domain:
+    return _DOMAIN_BY_WORK_VARIANT[work]
 
 
 class ExecutionCapability(StrEnum):
@@ -202,32 +278,22 @@ class CloseReason(StrEnum):
     PREEMPTED = "preempted"
 
 
-# Ordered `(kind, mode)` for every closed `Work` leaf; the position is the
-# canonical variant index used on the wire and in the plan digest.
-_WORK_VARIANTS: tuple[tuple[str, str | None], ...] = (
-    ("token", "extend"),
-    ("token", "decode"),
-    ("token", "verify"),
-    ("draft", None),
-    ("encode", "vision"),
-    ("encode", "latent"),
-    ("transfer", "product"),
-    ("transfer", "kv_publish"),
-    ("transfer", "kv_install"),
-    ("gen", "transition"),
-    ("gen", "flow"),
-    ("materialize", None),
-    ("gen", "decode"),
+_STATE_ADVANCING_WORK = frozenset(
+    {
+        ForwardMode.TOKEN_EXTEND,
+        ForwardMode.TOKEN_DECODE,
+        ForwardMode.TOKEN_VERIFY,
+        ForwardMode.GEN_TRANSITION,
+        ForwardMode.GEN_FLOW,
+        ForwardMode.GEN_DECODE,
+    }
 )
-_STATE_ADVANCING_WORK = frozenset({0, 1, 2, 9, 10, 12})
 
 # Canonical variant-index tables. Digest byte layouts index enum members by
 # declaration order (mirroring the Rust codec); precomputing the tables keeps
 # the per-operation digest recomputation off `list(Enum).index` linear scans.
-_WORK_VARIANT_MEMBERS: tuple[WorkVariant, ...] = tuple(WorkVariant)
-_WORK_PAIR_INDEX: dict[tuple[str, str | None], int] = {
-    pair: index for index, pair in enumerate(_WORK_VARIANTS)
-}
+_FORWARD_MODE_INDEX = {member: index for index, member in enumerate(ForwardMode)}
+_FORWARD_MODE_BY_VALUE = {member.value: member for member in ForwardMode}
 _DOMAIN_INDEX = {member: index for index, member in enumerate(Domain)}
 _PRODUCT_KIND_INDEX = {member: index for index, member in enumerate(ProductKind)}
 _STORAGE_CLASS_INDEX = {member: index for index, member in enumerate(StorageClass)}
@@ -550,7 +616,7 @@ _LAYOUT_RECORDS: tuple[tuple[str, ...], ...] = (
 
 
 def protocol_layout_digest() -> str:
-    """The canonical protocol-layout digest over the closed ``Work`` and
+    """The canonical protocol-layout digest over the closed ``ForwardMode`` and
     ``Control`` variants and the fixed record field layouts.
 
     Mirrors the Rust ``uniserve-worker-ipc`` ``protocol_layout_digest`` byte-for-byte so
@@ -558,8 +624,8 @@ def protocol_layout_digest() -> str:
     """
 
     digest = _Digest(b"uniserve-protocol-layout\0")
-    digest.u64(len(WorkVariant))
-    for variant in WorkVariant:
+    digest.u64(len(ForwardMode))
+    for variant in ForwardMode:
         digest.string(variant.value)
     digest.u64(len(ProductKind))
     for kind in ProductKind:
@@ -1105,50 +1171,6 @@ class SnapshotRef:
 
 
 @dataclass(frozen=True, slots=True)
-class Work:
-    kind: str
-    mode: str | None = None
-
-    def __post_init__(self) -> None:
-        if (self.kind, self.mode) not in _WORK_PAIR_INDEX:
-            raise invalid_descriptor(f"unknown work variant {(self.kind, self.mode)!r}")
-
-    @property
-    def variant_index(self) -> int:
-        return _WORK_PAIR_INDEX[(self.kind, self.mode)]
-
-    @property
-    def variant(self) -> WorkVariant:
-        return _WORK_VARIANT_MEMBERS[self.variant_index]
-
-    @property
-    def advances_state(self) -> bool:
-        return self.variant_index in _STATE_ADVANCING_WORK
-
-    @property
-    def requires_fixed_parent(self) -> bool:
-        return self.variant is WorkVariant.TRANSFER_KV_PUBLISH
-
-    @classmethod
-    def token(cls, mode: TokenMode) -> Work:
-        return cls("token", mode.value)
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str = "work") -> Work:
-        work = _fast_work(value)
-        if work is not None:
-            return work
-        kind, payload = _tagged(value, where)
-        mode = None if payload is None else _str(payload, f"{where}.value")
-        return cls(kind, mode)
-
-    def to_mapping(self) -> dict[str, object]:
-        if self.mode is None:
-            return {"kind": self.kind}
-        return {"kind": self.kind, "value": self.mode}
-
-
-@dataclass(frozen=True, slots=True)
 class Bounds:
     max_points: int = 0
     max_tokens: int = 0
@@ -1218,7 +1240,7 @@ class Operation:
     request_key: RequestKey
     op_id: int
     parent: VersionRef
-    work: Work
+    work: ForwardMode
     route: int
     domain: Domain
     advances_state: bool
@@ -1237,7 +1259,7 @@ class Operation:
         request_key: RequestKey,
         op_id: int,
         parent: VersionRef,
-        work: Work,
+        work: ForwardMode,
         route: int,
         domain: Domain,
         bounds: Bounds,
@@ -1273,7 +1295,7 @@ class Operation:
         buf += _PACK_Q(self.op_id)
         _digest_version_ref(digest, self.parent)
         buf += _PACK_BIBB(
-            self.work.variant_index,
+            _FORWARD_MODE_INDEX[self.work],
             self.route,
             _DOMAIN_INDEX[self.domain],
             int(self.advances_state),
@@ -1428,7 +1450,7 @@ class Operation:
             parent = VersionRef.from_mapping(get("parent"), f"{where}.parent")
         work = _fast_work(get("work"))
         if work is None:
-            work = Work.from_mapping(get("work"), f"{where}.work")
+            work = _enum(ForwardMode, get("work"), f"{where}.work")
         route = get("route")
         if not (type(route) is int and route >= 0):
             route = _uint(route, f"{where}.route")
@@ -1516,7 +1538,7 @@ class Operation:
             "request_key": self.request_key.to_mapping(),
             "op_id": self.op_id,
             "parent": self.parent.to_mapping(),
-            "work": self.work.to_mapping(),
+            "work": self.work.value,
             "route": self.route,
             "domain": self.domain.value,
             "advances_state": self.advances_state,
@@ -1619,7 +1641,7 @@ class TimingCounters:
 
 
 @dataclass(frozen=True, slots=True)
-class CompletionRecord:
+class ModelOutput:
     request_key: RequestKey
     op_id: int
     completion_slot_generation: int
@@ -1682,7 +1704,7 @@ class CompletionRecord:
             )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "completion") -> CompletionRecord:
+    def from_mapping(cls, value: object, where: str = "completion") -> ModelOutput:
         data = _map(value, where)
         record = cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
@@ -2460,9 +2482,9 @@ class BatchPartition:
         latent_pages: set[int] = set()
 
         def addresses_trajectory(operation: Operation) -> bool:
-            return operation.work.variant in {
-                WorkVariant.GEN_TRANSITION,
-                WorkVariant.GEN_FLOW,
+            return operation.work in {
+                ForwardMode.GEN_TRANSITION,
+                ForwardMode.GEN_FLOW,
             } or any(reference.kind is ProductKind.LATENT for reference in operation.inputs)
 
         for latent_placement in self.latent_placements:
@@ -2495,12 +2517,12 @@ class BatchPartition:
                 raise invalid_descriptor("batch partition repeats a decode placement identity")
             decode_ids.add(identity)
             operation = operations.get(identity)
-            if operation is None or operation.work.variant is not WorkVariant.GEN_DECODE:
+            if operation is None or operation.work is not ForwardMode.GEN_DECODE:
                 raise invalid_descriptor(
                     "decode placement does not name a GenDecode partition operation"
                 )
         if any(
-            operation.work.variant is WorkVariant.GEN_DECODE
+            operation.work is ForwardMode.GEN_DECODE
             and (operation.request_key, operation.op_id) not in decode_ids
             for operation in self.operations
         ):
@@ -3079,7 +3101,7 @@ class WorkerForwardStats:
 @dataclass(frozen=True, slots=True)
 class PartitionCompletion:
     partition_id: int
-    completions: tuple[CompletionRecord, ...]
+    completions: tuple[ModelOutput, ...]
     products: tuple[ProductPayload, ...] = ()
     registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
@@ -3095,7 +3117,7 @@ class PartitionCompletion:
         return cls(
             partition_id=_uint(data.get("partition_id"), f"{where}.partition_id"),
             completions=tuple(
-                CompletionRecord.from_mapping(item, f"{where}.completions[{index}]")
+                ModelOutput.from_mapping(item, f"{where}.completions[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("completions", ()), f"{where}.completions")
                 )
@@ -3132,7 +3154,7 @@ class CompletionReport:
     partitions: tuple[PartitionCompletion, ...]
 
     @property
-    def completions(self) -> tuple[CompletionRecord, ...]:
+    def completions(self) -> tuple[ModelOutput, ...]:
         return tuple(
             completion for partition in self.partitions for completion in partition.completions
         )
@@ -3650,25 +3672,11 @@ def _fast_version_ref(value: object) -> VersionRef | None:
     return reference
 
 
-@lru_cache(maxsize=len(_WORK_VARIANTS))
-def _interned_work(kind: str, mode: str | None) -> Work:
-    work = object.__new__(Work)
-    object.__setattr__(work, "kind", kind)
-    object.__setattr__(work, "mode", mode)
-    return work
-
-
-def _fast_work(value: object) -> Work | None:
-    if type(value) is not dict:
-        return None
-    kind = value.get("kind")
-    mode = value.get("value")
-    if (
-        type(kind) is str
-        and (mode is None or type(mode) is str)
-        and (kind, mode) in _WORK_PAIR_INDEX
-    ):
-        return _interned_work(kind, mode)
+def _fast_work(value: object) -> ForwardMode | None:
+    if type(value) is ForwardMode:
+        return value
+    if type(value) is str:
+        return _FORWARD_MODE_BY_VALUE.get(value)
     return None
 
 

@@ -46,11 +46,9 @@ from uniserve_worker.batch import (
     StaticDim,
     StorageClass,
     TokenMode,
-    TransferMode,
     UndAdmission,
     VersionRef,
-    Work,
-    WorkVariant,
+    ForwardMode,
     encode_token_product_bytes,
     execution_domain,
 )
@@ -142,7 +140,7 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
         start_step=start_step,
         step_count=(
             int(operation.bounds.max_tokens)
-            if operation.work.variant is WorkVariant.GEN_FLOW
+            if operation.work is ForwardMode.GEN_FLOW
             else 0
         ),
     )
@@ -271,7 +269,7 @@ def execution_batch(
             if len(domains) > 1
             else ExecutionCapability.DOMAIN_HOMOGENEOUS
         )
-        variants = {operation.work.variant for operation in routed}
+        variants = {operation.work for operation in routed}
         attention = (
             AttentionRegime.HYBRID
             if any(variant.value == "gen_flow" for variant in variants)
@@ -307,7 +305,7 @@ def execution_batch(
                             lengths[1],
                         )
                     )
-                if operation.work.variant is WorkVariant.GEN_FLOW:
+                if operation.work is ForwardMode.GEN_FLOW:
                     image = _IMAGE_PARAMS[operation.request_key]
                     main_slot = _REQUEST_POOL_INDICES[operation.request_key]
                     main_len = 0 if lengths is None else lengths[2]
@@ -380,8 +378,8 @@ def execution_batch(
                     latent_placements=tuple(
                         _latent_placement(operation)
                         for operation in domain_operations
-                        if operation.work.variant
-                        in {WorkVariant.GEN_TRANSITION, WorkVariant.GEN_FLOW}
+                        if operation.work
+                        in {ForwardMode.GEN_TRANSITION, ForwardMode.GEN_FLOW}
                         or any(product.kind is ProductKind.LATENT for product in operation.inputs)
                     ),
                 )
@@ -627,9 +625,9 @@ def token_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work.token(mode),
+        work=ForwardMode.token(mode),
         route=0,
-        domain=execution_domain(Work.token(mode)),
+        domain=execution_domain(ForwardMode.token(mode)),
         bounds=Bounds(
             max_points=max_points,
             max_tokens=max(1, len(tokens)),
@@ -700,7 +698,7 @@ def encode_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work("encode", mode.value),
+        work=ForwardMode.encode(mode),
         route=0,
         domain=Domain.PREFILL,
         bounds=Bounds(max_points=1, max_tokens=64, max_latent_bytes=8_192),
@@ -751,7 +749,7 @@ def gen_transition_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work("gen", "transition"),
+        work=ForwardMode.GEN_TRANSITION,
         route=0,
         domain=Domain.FLOW,
         bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
@@ -794,7 +792,7 @@ def flow_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work("gen", "flow"),
+        work=ForwardMode.GEN_FLOW,
         route=0,
         domain=Domain.FLOW,
         bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
@@ -829,7 +827,7 @@ def kv_publication_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work("transfer", TransferMode.KV_PUBLISH.value),
+        work=ForwardMode.TRANSFER_KV_PUBLISH,
         route=0,
         domain=Domain.PREFILL,
         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
@@ -879,7 +877,7 @@ def materialize_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work("materialize", None),
+        work=ForwardMode.MATERIALIZE,
         route=0,
         domain=Domain.FLOW,
         bounds=Bounds(
@@ -934,7 +932,7 @@ def visual_state_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=Work.token(TokenMode.EXTEND),
+        work=ForwardMode.token(TokenMode.EXTEND),
         route=0,
         domain=Domain.PREFILL,
         bounds=Bounds(max_points=1, max_tokens=max_tokens),

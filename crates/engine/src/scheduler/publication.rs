@@ -114,16 +114,16 @@ impl Scheduler {
         mut view: SequenceView,
         prefix_versions: Vec<VersionRef>,
     ) {
-        let operation_variant = operation.work.variant();
+        let operation_variant = operation.work;
         if !view.prompt_logprobs.is_empty() {
             let positions = std::mem::take(&mut view.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
         }
-        if operation_variant == WorkVariant::TokenDecode {
+        if operation_variant == ForwardMode::TokenDecode {
             return self.resolve_decode_text(id, view, &prefix_versions);
         }
         match operation_variant {
-            WorkVariant::TokenExtend => {
+            ForwardMode::TokenExtend => {
                 self.activate_request_tables(id);
                 match &apply.delta {
                     crate::scheduler::generation::TransitionDelta::CloseKv { .. } => return,
@@ -334,7 +334,7 @@ impl Scheduler {
                     self.begin_image(id);
                 }
             }
-            WorkVariant::GenFlow => {
+            ForwardMode::GenFlow => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
                     let prev = match apply.delta {
@@ -360,7 +360,7 @@ impl Scheduler {
                 if prev_sd == 0 && sd >= 1 {
                     self.emit(
                         id,
-                        GenEvent::ImageBegin {
+                        GenerationEvent::ImageBegin {
                             image_id,
                             height: h,
                             width: w,
@@ -369,16 +369,16 @@ impl Scheduler {
                     );
                 }
                 for step in prev_sd.saturating_add(1)..=sd {
-                    self.emit(id, GenEvent::ImageStep { image_id, step });
+                    self.emit(id, GenerationEvent::ImageStep { image_id, step });
                 }
                 // The commit phase is entered host-side once the committed step
                 // count reaches `image.steps` (see the `Phase::DenoiseGen`
                 // planner); a worker completion flag does not drive termination.
             }
-            WorkVariant::GenDecode => {}
-            WorkVariant::Materialize => {
+            ForwardMode::GenDecode => {}
+            ForwardMode::Materialize => {
                 let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
-                self.emit(id, GenEvent::ImageCommit { image_id });
+                self.emit(id, GenerationEvent::ImageCommit { image_id });
                 let image = view.image_png.clone();
                 if let Some(image_b64) = image.clone() {
                     let Some(event) = image_done_event(image_id, image_b64) else {
@@ -439,7 +439,7 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            WorkVariant::EncodeVision | WorkVariant::EncodeLatent => match &apply.delta {
+            ForwardMode::EncodeVision | ForwardMode::EncodeLatent => match &apply.delta {
                 crate::scheduler::generation::TransitionDelta::EncodeImageStep {
                     encoder_cache_key,
                     ..
@@ -520,13 +520,13 @@ impl Scheduler {
                 }
                 _ => self.finish(id, FinishReason::Error),
             },
-            WorkVariant::TokenDecode
-            | WorkVariant::TokenVerify
-            | WorkVariant::Draft
-            | WorkVariant::GenTransition
-            | WorkVariant::TransferProduct
-            | WorkVariant::TransferKvPublish
-            | WorkVariant::TransferKvInstall => {}
+            ForwardMode::TokenDecode
+            | ForwardMode::TokenVerify
+            | ForwardMode::Draft
+            | ForwardMode::GenTransition
+            | ForwardMode::TransferProduct
+            | ForwardMode::TransferKvPublish
+            | ForwardMode::TransferKvInstall => {}
         }
     }
 
@@ -552,7 +552,7 @@ impl Scheduler {
         }
         self.emit(
             id,
-            GenEvent::PromptLogprobs {
+            GenerationEvent::PromptLogprobs {
                 positions: selected
                     .into_iter()
                     .map(|entries| PositionLogprobs {
@@ -664,7 +664,7 @@ impl Scheduler {
         progressed
     }
 
-    pub(super) fn emit(&mut self, id: RequestId, ev: GenEvent) {
+    pub(super) fn emit(&mut self, id: RequestId, ev: GenerationEvent) {
         if let Some(st) = self.running.get_mut(&id) {
             if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
                 st.cancelled = true;
@@ -677,7 +677,7 @@ impl Scheduler {
     pub(super) fn emit_visible(
         &mut self,
         id: RequestId,
-        mut event: GenEvent,
+        mut event: GenerationEvent,
         root: Option<&VersionRef>,
         modality: PublicModality,
     ) -> bool {
@@ -710,8 +710,8 @@ impl Scheduler {
             },
         };
         match &mut event {
-            GenEvent::TextToken { public_commit, .. }
-            | GenEvent::ImageDone { public_commit, .. } => *public_commit = Some(commit),
+            GenerationEvent::TextToken { public_commit, .. }
+            | GenerationEvent::ImageDone { public_commit, .. } => *public_commit = Some(commit),
             _ => {
                 self.finish_after_inflight(id, FinishReason::Error, None);
                 return false;
@@ -775,7 +775,7 @@ impl Scheduler {
             uniserve_core::UndTokenAction::Emit => {
                 let published = self.emit_visible(
                     id,
-                    GenEvent::TextToken {
+                    GenerationEvent::TextToken {
                         id: tok,
                         logprob,
                         public_commit: None,
@@ -821,7 +821,7 @@ impl Scheduler {
         {
             self.emit(
                 id,
-                GenEvent::TokenLogprobs {
+                GenerationEvent::TokenLogprobs {
                     id: tok,
                     candidates: ranked_logprobs(top_logprobs),
                 },
@@ -903,7 +903,7 @@ impl Scheduler {
         !self.running.contains_key(&id)
     }
 
-    pub(super) fn emit_st(&self, st: &mut ReqState, ev: GenEvent) {
+    pub(super) fn emit_st(&self, st: &mut ReqState, ev: GenerationEvent) {
         if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
             st.cancelled = true;
         } else {
@@ -1052,7 +1052,7 @@ impl Scheduler {
                 st.image_gen.images_done,
                 "running",
             );
-            let terminal = GenEvent::Finished {
+            let terminal = GenerationEvent::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens: st.context.prompt_ids.len(),

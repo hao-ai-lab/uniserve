@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::engine_client::StreamCancelCause;
 
-use uniserve_core::{GenEvent, GenerationRequest, now_unix_secs};
+use uniserve_core::{GenerationEvent, GenerationRequest};
 
 /// Transport metadata wrapped around one pure canonical generation request.
 #[derive(Debug, Clone)]
@@ -28,26 +28,9 @@ impl GenerationSubmission {
     }
 }
 
-/// Maximum number of canonical generation events buffered per request.
-impl GenerationSubmission {
-    pub(crate) fn into_envelope(
-        self,
-        client_index: u32,
-    ) -> uniserve_core::codec::GenerationRequestEnvelope {
-        uniserve_core::codec::GenerationRequestEnvelope {
-            external_request_id: self.external_request_id,
-            arrival_time: self.arrival_time.unwrap_or_else(now_unix_secs),
-            client_index,
-            data_parallel_rank: self.data_parallel_rank,
-            trace_headers: self.trace_headers,
-            request: self.request,
-        }
-    }
-}
-
 /// A typed text-and-image event stream for one canonical generation request.
 pub struct GenerationEventStream {
-    rx: mpsc::Receiver<GenEvent>,
+    rx: mpsc::Receiver<GenerationEvent>,
     cancel: Option<Box<dyn FnOnce(StreamCancelCause, usize) + Send + 'static>>,
     acknowledge: Option<Box<dyn Fn(usize) + Send + 'static>>,
     output_token_count: usize,
@@ -57,7 +40,7 @@ pub struct GenerationEventStream {
 }
 
 impl GenerationEventStream {
-    pub fn new(rx: mpsc::Receiver<GenEvent>) -> Self {
+    pub fn new(rx: mpsc::Receiver<GenerationEvent>) -> Self {
         Self {
             rx,
             cancel: None,
@@ -70,7 +53,7 @@ impl GenerationEventStream {
     }
 
     pub fn with_control(
-        rx: mpsc::Receiver<GenEvent>,
+        rx: mpsc::Receiver<GenerationEvent>,
         cancel: impl FnOnce(StreamCancelCause, usize) + Send + 'static,
         acknowledge: impl Fn(usize) + Send + 'static,
     ) -> Self {
@@ -79,7 +62,7 @@ impl GenerationEventStream {
 
     /// Attach exact-prefix controls and optionally acknowledge each consumed token.
     pub fn with_control_policy(
-        rx: mpsc::Receiver<GenEvent>,
+        rx: mpsc::Receiver<GenerationEvent>,
         cancel: impl FnOnce(StreamCancelCause, usize) + Send + 'static,
         acknowledge: impl Fn(usize) + Send + 'static,
         acknowledge_on_receive: bool,
@@ -115,9 +98,9 @@ impl GenerationEventStream {
     }
 
     /// Await the next event, or `None` once the stream is exhausted.
-    pub async fn next(&mut self) -> Option<GenEvent> {
+    pub async fn next(&mut self) -> Option<GenerationEvent> {
         let ev = self.rx.recv().await?;
-        if matches!(ev, GenEvent::TextToken { .. }) {
+        if matches!(ev, GenerationEvent::TextToken { .. }) {
             self.output_token_count = self.output_token_count.saturating_add(1);
             if self.acknowledge_on_receive {
                 self.acknowledge_text_prefix();
@@ -125,7 +108,9 @@ impl GenerationEventStream {
         }
         if matches!(
             ev,
-            GenEvent::Finished { .. } | GenEvent::Rejected { .. } | GenEvent::Error { .. }
+            GenerationEvent::Finished { .. }
+                | GenerationEvent::Rejected { .. }
+                | GenerationEvent::Error { .. }
         ) {
             self.finished = true;
             self.cancel = None;
@@ -160,7 +145,7 @@ mod tests {
     async fn canonical_stream_cancels_at_its_consumed_text_token_prefix() {
         let (tx, rx) = mpsc::channel(uniserve_engine::EVENT_BUFFER_CAPACITY);
         for id in 1..=3 {
-            tx.send(GenEvent::TextToken {
+            tx.send(GenerationEvent::TextToken {
                 id,
                 logprob: None,
                 public_commit: None,
@@ -181,12 +166,12 @@ mod tests {
         );
         assert!(matches!(
             stream.next().await,
-            Some(GenEvent::TextToken { id: 1, .. })
+            Some(GenerationEvent::TextToken { id: 1, .. })
         ));
         stream.acknowledge_text_prefix();
         assert!(matches!(
             stream.next().await,
-            Some(GenEvent::TextToken { id: 2, .. })
+            Some(GenerationEvent::TextToken { id: 2, .. })
         ));
         StreamCancelCause::StopStringMatched.drop_as(stream);
         assert_eq!(

@@ -1,8 +1,5 @@
-//! Shared scheduler-stats reporter: the single mapping from the
-//! scheduler's live [`SchedStats`] counters onto the wire [`SchedulerStats`]
-//! shape, used identically by the in-process server and the headless engine
-//! process so the aggregator is defined once instead of copy-pasted per
-//! transport.
+//! Scheduler-stats reporter: the mapping from live [`SchedStats`] counters onto
+//! the [`SchedulerStats`] snapshot consumed by the HTTP process.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;

@@ -407,7 +407,7 @@ impl Scheduler {
         self.inflight_ops
             .values()
             .flatten()
-            .any(|op| op.operation.work.variant() == WorkVariant::GenFlow)
+            .any(|op| op.operation.work == ForwardMode::GenFlow)
     }
 
     pub(super) fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
@@ -422,7 +422,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|op| op.operation.work.variant() == WorkVariant::GenFlow)
+                .any(|op| op.operation.work == ForwardMode::GenFlow)
     }
 
     pub(super) fn has_inflight(&self, id: RequestId) -> bool {
@@ -799,7 +799,7 @@ impl Scheduler {
     /// predecessor's not-yet-observed selected point. Eligibility requires an
     /// exact projected cursor and a reachable predicate product for the target
     /// work leaf.
-    pub(super) fn can_queue_successor(&self, id: RequestId, target: WorkVariant) -> bool {
+    pub(super) fn can_queue_successor(&self, id: RequestId, target: ForwardMode) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
         };
@@ -823,7 +823,7 @@ impl Scheduler {
         }
         if !self
             .executor
-            .device_products_reachable(predecessor.operation.work.variant(), target)
+            .device_products_reachable(predecessor.operation.work, target)
         {
             return false;
         }
@@ -833,7 +833,7 @@ impl Scheduler {
         ) {
             return false;
         }
-        if target == WorkVariant::TokenDecode {
+        if target == ForwardMode::TokenDecode {
             let feedback_continuation = matches!(
                 predecessor.generation_apply().delta,
                 TransitionDelta::FeedbackState {
@@ -854,15 +854,15 @@ impl Scheduler {
             if feedback_continuation {
                 return self
                     .projected_inflight_variant(id)
-                    .is_some_and(|variant| variant == WorkVariant::TokenDecode)
+                    .is_some_and(|variant| variant == ForwardMode::TokenDecode)
                     && state.und.tokens_emitted.saturating_add(1) < state.req.max_und_tokens;
             }
             if !matches!(state.lifecycle.phase, Phase::Prefill | Phase::DecodeUnd)
                 || (state.lifecycle.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue.iter().any(|op| {
                     !matches!(
-                        op.operation.work.variant(),
-                        WorkVariant::TokenExtend | WorkVariant::TokenDecode
+                        op.operation.work,
+                        ForwardMode::TokenExtend | ForwardMode::TokenDecode
                     )
                 })
             {
@@ -885,7 +885,7 @@ impl Scheduler {
                 .is_some_and(|variant| variant == target)
     }
 
-    pub(super) fn projected_inflight_variant(&self, id: RequestId) -> Option<WorkVariant> {
+    pub(super) fn projected_inflight_variant(&self, id: RequestId) -> Option<ForwardMode> {
         if !self.has_inflight(id) {
             return None;
         }
@@ -901,17 +901,17 @@ impl Scheduler {
             return None;
         }
         Some(match branch.phase {
-            Phase::Prefill | Phase::DecodeUnd => WorkVariant::TokenDecode,
-            Phase::CloseKv | Phase::FeedbackState => WorkVariant::TokenExtend,
-            Phase::PublishKv => WorkVariant::TransferKvPublish,
-            Phase::TransitionGen => WorkVariant::GenTransition,
-            Phase::DenoiseGen => WorkVariant::GenFlow,
-            Phase::CommitGen => WorkVariant::Materialize,
+            Phase::Prefill | Phase::DecodeUnd => ForwardMode::TokenDecode,
+            Phase::CloseKv | Phase::FeedbackState => ForwardMode::TokenExtend,
+            Phase::PublishKv => ForwardMode::TransferKvPublish,
+            Phase::TransitionGen => ForwardMode::GenTransition,
+            Phase::DenoiseGen => ForwardMode::GenFlow,
+            Phase::CommitGen => ForwardMode::Materialize,
             Phase::FeedbackEncode => {
                 let feedback = state.req.policy.feedback.as_ref()?;
                 match feedback.ingest.steps.get(branch.feedback_step)? {
-                    ImageIngestStep::VaeEncode => WorkVariant::EncodeLatent,
-                    ImageIngestStep::VitEncode => WorkVariant::EncodeVision,
+                    ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
+                    ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
                 }
             }
             Phase::Encode | Phase::IngestState => return None,
@@ -952,7 +952,7 @@ impl Scheduler {
                     .as_ref()
                     .is_some_and(|resident| {
                         self.executor
-                            .device_products_reachable(resident.producer, WorkVariant::TokenDecode)
+                            .device_products_reachable(resident.producer, ForwardMode::TokenDecode)
                     })
                 && state.is_replayable_text()
                 && state.lifecycle.phase == Phase::DecodeUnd
@@ -1153,9 +1153,9 @@ impl Scheduler {
 
     pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_operation_variant(id) {
-            Some(WorkVariant::TokenExtend | WorkVariant::TokenDecode) => 4,
-            Some(WorkVariant::GenFlow) => usize::from(self.denoise_step_burst).saturating_add(2),
-            Some(WorkVariant::Materialize) => 3,
+            Some(ForwardMode::TokenExtend | ForwardMode::TokenDecode) => 4,
+            Some(ForwardMode::GenFlow) => usize::from(self.denoise_step_burst).saturating_add(2),
+            Some(ForwardMode::Materialize) => 3,
             Some(_) | None => 2,
         }
     }
@@ -1280,7 +1280,7 @@ impl Scheduler {
 
     pub(super) fn stage_completion(
         &mut self,
-        record: CompletionRecord,
+        record: ModelOutput,
         products: Arc<[ProductPayload]>,
     ) {
         let id = record.request_key.session_id;
@@ -1326,7 +1326,7 @@ impl Scheduler {
         &mut self,
         operation: Operation,
         cursor_after: MediaCursor,
-        record: CompletionRecord,
+        record: ModelOutput,
     ) {
         let id = record.request_key.session_id;
         let Some(state) = self.media_state(id) else {
@@ -1432,7 +1432,7 @@ impl Scheduler {
                 let op_id = inflight.operation.op_id.0;
                 let completion = pending.get(&op_id)?;
                 Some((
-                    completion_priority(inflight.operation.work.variant()),
+                    completion_priority(inflight.operation.work),
                     completion.arrival_seq,
                     *id,
                     op_id,
@@ -1761,7 +1761,7 @@ impl Scheduler {
                     }
                     continue;
                 };
-                let operation_variant = operation.work.variant();
+                let operation_variant = operation.work;
                 // fold this op's host-side round-trip latency into the history.
                 let roundtrip_us = started.elapsed().as_micros() as u64;
                 self.latency
@@ -1954,7 +1954,7 @@ impl Scheduler {
                         })
                         .cloned();
                     token.map(|token| ResidentDeviceVersion {
-                        producer: operation.work.variant(),
+                        producer: operation.work,
                         token,
                         version: VersionRef {
                             request_key: operation.request_key,
@@ -1997,9 +1997,9 @@ impl Scheduler {
                     let public_event_limit = self.public_limit_for(id, &apply);
                     let decoder_decision_required = matches!(
                         operation_variant,
-                        WorkVariant::TokenExtend
-                            | WorkVariant::TokenDecode
-                            | WorkVariant::TokenVerify
+                        ForwardMode::TokenExtend
+                            | ForwardMode::TokenDecode
+                            | ForwardMode::TokenVerify
                     ) && self
                         .running
                         .get(&id)
@@ -2010,7 +2010,7 @@ impl Scheduler {
                         self.queue_commit(id, expected_parent, selected, public_event_limit);
                     }
                 }
-                let release_flow_prefix = operation_variant == WorkVariant::GenFlow
+                let release_flow_prefix = operation_variant == ForwardMode::GenFlow
                     && record.status == OpStatus::Ok
                     && match &apply.delta {
                         TransitionDelta::DenoiseGen {
@@ -2022,7 +2022,7 @@ impl Scheduler {
                         }),
                         _ => false,
                     };
-                if operation_variant == WorkVariant::GenFlow
+                if operation_variant == ForwardMode::GenFlow
                     && record.status == OpStatus::Ok
                     && let Some(prefix) = self
                         .running
@@ -2037,7 +2037,7 @@ impl Scheduler {
                 }
                 if matches!(
                     operation_variant,
-                    WorkVariant::GenFlow | WorkVariant::Materialize
+                    ForwardMode::GenFlow | ForwardMode::Materialize
                 ) {
                     let consumed_latents = operation
                         .inputs
@@ -2092,8 +2092,8 @@ impl Scheduler {
             ) in to_resolve
             {
                 let token_operation = matches!(
-                    operation.work.variant(),
-                    WorkVariant::TokenExtend | WorkVariant::TokenDecode | WorkVariant::TokenVerify
+                    operation.work,
+                    ForwardMode::TokenExtend | ForwardMode::TokenDecode | ForwardMode::TokenVerify
                 );
                 if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
                     self.resolve(id, operation, apply, view, prefix_versions.clone());
@@ -2338,7 +2338,7 @@ impl Scheduler {
             if self.running.contains_key(&id) {
                 self.emit(
                     id,
-                    GenEvent::Error {
+                    GenerationEvent::Error {
                         message: msg.to_string(),
                     },
                 );
@@ -2376,7 +2376,7 @@ impl Scheduler {
         for id in ids {
             self.emit(
                 id,
-                GenEvent::Error {
+                GenerationEvent::Error {
                     message: message.to_string(),
                 },
             );

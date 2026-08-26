@@ -14,7 +14,7 @@ impl Scheduler {
             let mut ids = Vec::new();
             while let Some(st) = self.pending.pop_request() {
                 ids.push(st.req.request_id);
-                let _ = st.event_tx.send(GenEvent::Finished {
+                let _ = st.event_tx.send(GenerationEvent::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
                     prompt_tokens: st.context.prompt_ids.len(),
@@ -117,7 +117,7 @@ impl Scheduler {
                 0,
                 "pending",
             );
-            let _ = st.event_tx.send(GenEvent::Finished {
+            let _ = st.event_tx.send(GenerationEvent::Finished {
                 reason,
                 stop_reason: None,
                 prompt_tokens: st.context.prompt_ids.len(),

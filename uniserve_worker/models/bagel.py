@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from ..batch import WorkVariant
+from ..batch import ForwardMode as WorkMode
 from ..execution.forward_batch import (
     ForwardBatch,
     ForwardMode,
@@ -543,17 +543,17 @@ class BagelForConditionalGeneration(ExecutionModel):
         )
         self.supported_work = frozenset(
             {
-                WorkVariant.TOKEN_EXTEND,
-                WorkVariant.TOKEN_DECODE,
-                WorkVariant.TOKEN_VERIFY,
-                WorkVariant.GEN_TRANSITION,
-                WorkVariant.GEN_FLOW,
-                WorkVariant.ENCODE_VISION,
-                WorkVariant.ENCODE_LATENT,
-                WorkVariant.MATERIALIZE,
-                WorkVariant.TRANSFER_PRODUCT,
-                WorkVariant.TRANSFER_KV_PUBLISH,
-                WorkVariant.TRANSFER_KV_INSTALL,
+                WorkMode.TOKEN_EXTEND,
+                WorkMode.TOKEN_DECODE,
+                WorkMode.TOKEN_VERIFY,
+                WorkMode.GEN_TRANSITION,
+                WorkMode.GEN_FLOW,
+                WorkMode.ENCODE_VISION,
+                WorkMode.ENCODE_LATENT,
+                WorkMode.MATERIALIZE,
+                WorkMode.TRANSFER_PRODUCT,
+                WorkMode.TRANSFER_KV_PUBLISH,
+                WorkMode.TRANSFER_KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS

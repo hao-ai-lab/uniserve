@@ -17,7 +17,7 @@ import torch
 from uniserve_worker.batch import (
     Batch,
     BatchPartition,
-    CompletionRecord,
+    ModelOutput,
     CompletionReport,
     DevicePoint,
     Domain,
@@ -39,11 +39,10 @@ from uniserve_worker.batch import (
     ShapeBound,
     StorageClass,
     TimingCounters,
-    TokenMode,
     TokenSpan,
     VersionRef,
     WorkerForwardStats,
-    WorkVariant,
+    ForwardMode,
     decode_sampling_state_bytes,
     decode_token_product_bytes,
 )
@@ -165,9 +164,9 @@ TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 _GENERATION_WORK_VARIANTS = frozenset(
     {
-        WorkVariant.GEN_TRANSITION,
-        WorkVariant.GEN_FLOW,
-        WorkVariant.MATERIALIZE,
+        ForwardMode.GEN_TRANSITION,
+        ForwardMode.GEN_FLOW,
+        ForwardMode.MATERIALIZE,
     }
 )
 MIXED_SERVICE_SERIAL_NUMERATOR = 5
@@ -196,7 +195,7 @@ class ExecutionResources:
     tokenizer: Any | None
     architecture_digest: str
     weight_digest: str
-    allowed_work_variants: frozenset[WorkVariant]
+    allowed_work_variants: frozenset[ForwardMode]
     mixed_buckets: frozenset[MixedExecutionCapability]
     trace: ExecutionTrace
     _device: torch.device
@@ -230,7 +229,7 @@ def create_execution_resources(
     tokenizer: Any | None,
     architecture_digest: str,
     weight_digest: str,
-    allowed_work_variants: frozenset[WorkVariant],
+    allowed_work_variants: frozenset[ForwardMode],
     mixed_buckets: tuple[MixedExecutionCapability, ...],
     trace: ExecutionTrace,
 ) -> ExecutionResources:
@@ -894,7 +893,7 @@ def _classify_partition_failure(
         operations=operations,
         req_id=None if sole is None else int(sole.request_key.session_id),
         op_id=None if sole is None else int(sole.op_id),
-        op_kind=None if sole is None else sole.work.variant.value,
+        op_kind=None if sole is None else sole.work.value,
         route=str(partition.route),
     )
     _log_partition_failure(runtime, partition, classified, cause=error)
@@ -1159,7 +1158,7 @@ def _execute_partition_group(
         if _operation_identity(operation) not in scope.predicated_operations
     )
     homogeneous_decode = bool(group_active) and all(
-        operation.work.kind == "token" and operation.work.mode == TokenMode.DECODE.value
+        operation.work is ForwardMode.TOKEN_DECODE
         for operation in group_active
     )
     states: list[OperationState] = []
@@ -1236,7 +1235,7 @@ def _run_ready_set(
         flow_ready = tuple(
             state
             for state in ready
-            if state.operation.work.variant is WorkVariant.GEN_FLOW
+            if state.operation.work is ForwardMode.GEN_FLOW
         )
         flow_ready_ids = {id(state) for state in flow_ready}
         for state in flow_ready:
@@ -1338,11 +1337,11 @@ def _pack_state_forward(
     from . import encode, flow, token
 
     operation = state.operation
-    if operation.work.kind == "token":
+    if operation.work.token_mode is not None:
         return token.pack_forward(runtime, state)
-    if operation.work.kind == "gen":
+    if operation.work.gen_mode is not None:
         return flow.pack_forward(runtime, state)
-    if operation.work.kind in {"encode", "materialize"}:
+    if operation.work.encode_mode is not None or operation.work is ForwardMode.MATERIALIZE:
         return encode.pack_forward(runtime, state)
     return ()
 
@@ -1355,11 +1354,11 @@ def _consume_state_forward(
     from . import encode, flow, token
 
     operation = state.operation
-    if operation.work.kind == "token":
+    if operation.work.token_mode is not None:
         token.consume_forward(runtime, state, outputs)
-    elif operation.work.kind == "gen":
+    elif operation.work.gen_mode is not None:
         flow.consume_forward(runtime, state, outputs)
-    elif operation.work.kind in {"encode", "materialize"}:
+    elif operation.work.encode_mode is not None or operation.work is ForwardMode.MATERIALIZE:
         encode.consume_forward(runtime, state, outputs)
     else:
         raise RuntimeError("model output has no operation consumer")
@@ -1388,7 +1387,7 @@ def _commit_partition(
             scope.latent_releases,
         )
     scope.completion.seal()
-    records: list[CompletionRecord] = []
+    records: list[ModelOutput] = []
     selected_versions: dict[int, VersionRef] = {}
     report_products: list[ProductPayload] = []
     pending_by_session: dict[int, _PendingDigest] = {}
@@ -1408,7 +1407,7 @@ def _commit_partition(
         if int(runtime.deployment.tp_rank) == 0:
             report_products.extend(outcome.products)
         parent_semantic = _parent_semantic(operation, request)
-        placeholder = CompletionRecord(
+        placeholder = ModelOutput(
             request_key=operation.request_key,
             op_id=operation.op_id,
             completion_slot_generation=scope.completion.generation,
@@ -1607,7 +1606,7 @@ def _reserve_cpu_tasks(
     scope: PartitionState,
 ) -> None:
     for operation in operations:
-        if operation.work.variant is not WorkVariant.MATERIALIZE:
+        if operation.work is not ForwardMode.MATERIALIZE:
             continue
         identity = _operation_identity(operation)
         if identity in scope.cpu_tasks:
@@ -1664,7 +1663,7 @@ def _build_error_partition(
     forward_stats: WorkerForwardStats,
 ) -> PartitionCompletion:
     protocol_code = _protocol_error_code(error.code)
-    records: list[CompletionRecord] = []
+    records: list[ModelOutput] = []
     for operation in partition.operations:
         session = runtime.requests.peek(operation.request_key.session_id)
         selected_parent = (
@@ -1684,7 +1683,7 @@ def _build_error_partition(
             if session is None
             else _logical_lengths(runtime, operation, session, None)
         )
-        placeholder = CompletionRecord(
+        placeholder = ModelOutput(
             request_key=operation.request_key,
             op_id=operation.op_id,
             completion_slot_generation=max(1, generation),
@@ -1742,7 +1741,7 @@ def _finalize_speculative_runtime(
     runtime,
     operation: Operation,
     selection: SpeculativeSelection,
-    record: CompletionRecord,
+    record: ModelOutput,
     selected_digest: str,
     parent_semantic: str,
 ) -> None:
@@ -1813,7 +1812,7 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
     if len(batch.operations) > runtime.deployment.max_batch_operations:
         raise invalid_descriptor("execution batch exceeds the deployment operation limit")
     for operation in batch.operations:
-        variant = operation.work.variant
+        variant = operation.work
         if variant not in runtime.allowed_work_variants:
             raise unsupported_operation(variant.value, operation.request_key.session_id)
     if any(
@@ -1833,11 +1832,11 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
         if first.execution is not ExecutionCapability.TENSORIZED_MIXED:
             continue
         variants = {
-            operation.work.variant for partition in partitions for operation in partition.operations
+            operation.work for partition in partitions for operation in partition.operations
         }
         if not runtime.model.tensorized_mixed or variants != {
-            WorkVariant.TOKEN_DECODE,
-            WorkVariant.GEN_FLOW,
+            ForwardMode.TOKEN_DECODE,
+            ForwardMode.GEN_FLOW,
         }:
             raise invalid_descriptor(
                 "tensorized mixed submission exceeds worker mixed-execution capabilities"
@@ -1890,7 +1889,7 @@ def _completion_devices(runtime, operations: tuple[Operation, ...]) -> tuple[str
     for operation in operations:
         target = (
             generation_device
-            if generation_device is not None and operation.work.variant in _GENERATION_WORK_VARIANTS
+            if generation_device is not None and operation.work in _GENERATION_WORK_VARIANTS
             else device
         )
         if target not in selected:
@@ -1903,7 +1902,7 @@ def _mixed_capability(
     partitions: tuple[BatchPartition, ...],
 ) -> MixedExecutionCapability:
     decode_rows = sum(
-        operation.work.variant is WorkVariant.TOKEN_DECODE
+        operation.work is ForwardMode.TOKEN_DECODE
         for partition in partitions
         for operation in partition.operations
     )
@@ -1911,7 +1910,7 @@ def _mixed_capability(
         operation
         for partition in partitions
         for operation in partition.operations
-        if operation.work.variant is WorkVariant.GEN_FLOW
+        if operation.work is ForwardMode.GEN_FLOW
     )
     flow_placements = {
         (placement.request_key, int(placement.op_id)): placement
@@ -1982,7 +1981,7 @@ def _reserve_outputs(
                 and output.kind is not ProductKind.COMPLETION
             ):
                 continue
-            if operation.work.variant is WorkVariant.TRANSFER_PRODUCT and transfer.transferable(
+            if operation.work is ForwardMode.TRANSFER_PRODUCT and transfer.transferable(
                 output
             ):
                 continue
@@ -2009,7 +2008,7 @@ def _reserve_outputs(
     scope.encoder_writes.extend(runtime.encoder_cache.bind_outputs(tuple(encoder_bindings)))
     operation_identities = {_operation_identity(operation) for operation in operations}
     token_operation_identities = {
-        _operation_identity(operation) for operation in operations if operation.work.kind == "token"
+        _operation_identity(operation) for operation in operations if operation.work.token_mode is not None
     }
     for write in scope.device_writes:
         operation_identity = _reference_operation_identity(write.reference)
@@ -2048,11 +2047,11 @@ def _reserve_outputs(
 def _operation_device(runtime, operation: Operation) -> torch.device:
     return (
         runtime._generation_device
-        if operation.work.variant
+        if operation.work
         in {
-            WorkVariant.GEN_TRANSITION,
-            WorkVariant.GEN_FLOW,
-            WorkVariant.MATERIALIZE,
+            ForwardMode.GEN_TRANSITION,
+            ForwardMode.GEN_FLOW,
+            ForwardMode.MATERIALIZE,
         }
         else runtime._device
     )
@@ -2333,10 +2332,10 @@ def _bind_latent_rows(
         committed_step = (
             int(session.flow_step) if transferred is None else int(cast(int, transferred.step))
         )
-        if operation.work.variant is WorkVariant.GEN_TRANSITION:
+        if operation.work is ForwardMode.GEN_TRANSITION:
             if int(placement.start_step) != 0 or int(placement.step_count) != 0:
                 raise invalid_descriptor("generation transition placement carries denoise steps")
-        elif operation.work.variant is WorkVariant.GEN_FLOW:
+        elif operation.work is ForwardMode.GEN_FLOW:
             if (
                 int(placement.start_step) != committed_step
                 or int(placement.step_count) < 1

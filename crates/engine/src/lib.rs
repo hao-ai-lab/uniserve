@@ -6,7 +6,6 @@ mod core;
 pub mod executor;
 mod handle;
 pub mod kv;
-pub mod process;
 pub mod scheduler;
 pub mod sim;
 pub mod worker;
@@ -23,4 +22,4 @@ pub use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy,
 };
-pub use crate::worker::{MultiprocExecutor, StageRouter, UniprocExecutor, WorkerLaunchConfig};
+pub use crate::worker::{MultiprocExecutor, StagedExecutor, UniprocExecutor, WorkerLaunchConfig};

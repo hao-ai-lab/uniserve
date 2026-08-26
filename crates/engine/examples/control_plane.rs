@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use uniserve_core::GenEvent;
+use uniserve_core::GenerationEvent;
 use uniserve_core::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
     GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
@@ -115,9 +115,9 @@ fn main() {
             while let Ok(ev) = rx.try_recv() {
                 let e = counts.entry(*id).or_insert((kind.clone(), 0, 0, false));
                 match ev {
-                    GenEvent::TextToken { .. } => e.1 += 1,
-                    GenEvent::ImageDone { .. } => e.2 += 1,
-                    GenEvent::Finished { .. } if !e.3 => {
+                    GenerationEvent::TextToken { .. } => e.1 += 1,
+                    GenerationEvent::ImageDone { .. } => e.2 += 1,
+                    GenerationEvent::Finished { .. } if !e.3 => {
                         e.3 = true;
                         done += 1;
                     }

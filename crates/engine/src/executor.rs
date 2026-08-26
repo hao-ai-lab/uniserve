@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
-    Batch, CacheCopy, CompletionReport, Operation, RecoveryPlacement, RequestKind, SnapshotRef,
-    WorkVariant, WorkerCapabilities, WorkerRequest,
+    Batch, CacheCopy, CompletionReport, ForwardMode, Operation, RecoveryPlacement, RequestKind,
+    SnapshotRef, WorkerCapabilities, WorkerRequest,
 };
 
 /// Synchronous model-engine seam used by deterministic local implementations.
@@ -37,40 +37,40 @@ pub enum WorkerKind {
     /// Understanding tower — text + vision-encode + sampling. The und half of
     /// the local MoT understanding/generation stage split; routes
     /// every non-generation model op so a `--workers und:1,gen:1` topology
-    /// composes the und/gen split through the general `StageRouter::new` path.
+    /// composes the und/gen split through the general `StagedExecutor::new` path.
     Und,
     /// Generation tower — image denoise/commit + frame encode. The gen half of
     /// the Und/Gen stage split.
     Gen,
 }
 
-const FULL_WORK: &[WorkVariant] = &WorkVariant::ALL;
-const ENCODER_WORK: &[WorkVariant] = &[WorkVariant::EncodeVision, WorkVariant::EncodeLatent];
-const PREFILL_WORK: &[WorkVariant] = &[WorkVariant::TokenExtend];
-const DECODE_WORK: &[WorkVariant] = &[
-    WorkVariant::TokenDecode,
-    WorkVariant::TokenVerify,
-    WorkVariant::GenTransition,
-    WorkVariant::GenFlow,
-    WorkVariant::GenDecode,
-    WorkVariant::Materialize,
-    WorkVariant::TransferKvPublish,
-    WorkVariant::TransferKvInstall,
+const FULL_WORK: &[ForwardMode] = &ForwardMode::ALL;
+const ENCODER_WORK: &[ForwardMode] = &[ForwardMode::EncodeVision, ForwardMode::EncodeLatent];
+const PREFILL_WORK: &[ForwardMode] = &[ForwardMode::TokenExtend];
+const DECODE_WORK: &[ForwardMode] = &[
+    ForwardMode::TokenDecode,
+    ForwardMode::TokenVerify,
+    ForwardMode::GenTransition,
+    ForwardMode::GenFlow,
+    ForwardMode::GenDecode,
+    ForwardMode::Materialize,
+    ForwardMode::TransferKvPublish,
+    ForwardMode::TransferKvInstall,
 ];
-const UND_WORK: &[WorkVariant] = &[
-    WorkVariant::TokenExtend,
-    WorkVariant::TokenDecode,
-    WorkVariant::TokenVerify,
-    WorkVariant::EncodeVision,
-    WorkVariant::EncodeLatent,
-    WorkVariant::TransferKvPublish,
-    WorkVariant::TransferKvInstall,
+const UND_WORK: &[ForwardMode] = &[
+    ForwardMode::TokenExtend,
+    ForwardMode::TokenDecode,
+    ForwardMode::TokenVerify,
+    ForwardMode::EncodeVision,
+    ForwardMode::EncodeLatent,
+    ForwardMode::TransferKvPublish,
+    ForwardMode::TransferKvInstall,
 ];
-const GEN_WORK: &[WorkVariant] = &[
-    WorkVariant::GenTransition,
-    WorkVariant::GenFlow,
-    WorkVariant::GenDecode,
-    WorkVariant::Materialize,
+const GEN_WORK: &[ForwardMode] = &[
+    ForwardMode::GenTransition,
+    ForwardMode::GenFlow,
+    ForwardMode::GenDecode,
+    ForwardMode::Materialize,
 ];
 
 impl WorkerKind {
@@ -100,7 +100,7 @@ impl WorkerKind {
     }
 
     /// Exact work variants accepted by this worker role.
-    pub fn supported_work(self) -> &'static [WorkVariant] {
+    pub fn supported_work(self) -> &'static [ForwardMode] {
         match self {
             Self::Full => FULL_WORK,
             Self::Encoder => ENCODER_WORK,
@@ -113,7 +113,7 @@ impl WorkerKind {
 
     /// Whether this role accepts this operation's work variant.
     pub fn handles(self, operation: &Operation) -> bool {
-        self.supported_work().contains(&operation.work.variant())
+        self.supported_work().contains(&operation.work)
     }
 }
 
@@ -179,7 +179,7 @@ impl WorkersSpec {
     }
 
     /// Whether this is the trivial single-Full-pool topology (the default, which
-    /// composes a plain executor rather than a `StageRouter`).
+    /// composes a plain executor rather than a `StagedExecutor`).
     pub fn is_single_full(&self) -> bool {
         self.pools.len() == 1 && self.pools[0].kind == WorkerKind::Full && self.pools[0].count == 1
     }
@@ -366,7 +366,7 @@ pub trait Executor: Send {
     /// producer through registration of the consumer. A local staged executor
     /// may satisfy this contract by retaining the consumer until the producing
     /// pool publishes its bounded transfer descriptor.
-    fn device_products_reachable(&self, _producer: WorkVariant, _consumer: WorkVariant) -> bool {
+    fn device_products_reachable(&self, _producer: ForwardMode, _consumer: ForwardMode) -> bool {
         true
     }
 
@@ -436,9 +436,7 @@ pub trait Executor: Send {
 mod tests {
     use super::*;
     use uniserve_core::RequestId;
-    use uniserve_worker_ipc::{
-        Bounds, GenMode, OpId, RequestKey, RouteId, TokenMode, VersionRef, Work,
-    };
+    use uniserve_worker_ipc::{Bounds, ForwardMode, OpId, RequestKey, RouteId, VersionRef};
 
     #[test]
     fn worker_kind_round_trips_and_maps_work() {
@@ -453,10 +451,10 @@ mod tests {
             assert_eq!(WorkerKind::from_token(kind.as_str()), Some(kind));
             assert!(!kind.supported_work().is_empty());
         }
-        let extend = op(Work::Token(TokenMode::Extend));
-        let decode = op(Work::Token(TokenMode::Decode));
-        let transition = op(Work::Gen(GenMode::Transition));
-        let materialize = op(Work::Materialize);
+        let extend = op(ForwardMode::TokenExtend);
+        let decode = op(ForwardMode::TokenDecode);
+        let transition = op(ForwardMode::GenTransition);
+        let materialize = op(ForwardMode::Materialize);
 
         assert!(WorkerKind::Full.handles(&extend));
         assert!(WorkerKind::Prefill.handles(&extend));
@@ -471,7 +469,7 @@ mod tests {
         assert_eq!(WorkerKind::from_token("nope"), None);
     }
 
-    fn op(work: Work) -> Operation {
+    fn op(work: ForwardMode) -> Operation {
         let request_key = RequestKey::new(1, RequestId(1), 1);
         Operation::registered(
             request_key,
@@ -479,7 +477,7 @@ mod tests {
             VersionRef::admission_root(request_key, OpId(1), "0".repeat(64)),
             work,
             RouteId(0),
-            work.variant().domain(),
+            work.domain(),
             Bounds::default(),
             Vec::new(),
             Vec::new(),

@@ -2,7 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use tokio::sync::mpsc;
-use uniserve_core::{GenEvent, GenerationRequest, MediaEvent, MediaRequest, RequestId};
+use uniserve_core::{GenerationEvent, GenerationRequest, MediaEvent, MediaRequest, RequestId};
 
 /// Maximum number of canonical generation events buffered between one
 /// scheduler request and its immediate consumer.
@@ -10,18 +10,18 @@ pub const EVENT_BUFFER_CAPACITY: usize = 64;
 
 #[derive(Debug)]
 pub enum EventSendError {
-    Full(Box<GenEvent>),
-    Closed(Box<GenEvent>),
+    Full(Box<GenerationEvent>),
+    Closed(Box<GenerationEvent>),
 }
 
 /// Bounded engine-to-caller event sender.
 #[derive(Clone)]
 pub struct EventTx {
-    inner: mpsc::Sender<GenEvent>,
+    inner: mpsc::Sender<GenerationEvent>,
 }
 
 impl EventTx {
-    pub fn send(&self, event: GenEvent) -> Result<(), EventSendError> {
+    pub fn send(&self, event: GenerationEvent) -> Result<(), EventSendError> {
         self.inner.try_send(event).map_err(|error| match error {
             mpsc::error::TrySendError::Full(event) => EventSendError::Full(Box::new(event)),
             mpsc::error::TrySendError::Closed(event) => EventSendError::Closed(Box::new(event)),
@@ -41,7 +41,7 @@ impl EventTx {
 /// the scheduler so an output-capacity-stalled lineage becomes runnable without
 /// polling.
 pub struct EventRx {
-    inner: mpsc::Receiver<GenEvent>,
+    inner: mpsc::Receiver<GenerationEvent>,
     waker: uniserve_core::CommandWaker,
     cancellation: Option<EventCancellation>,
     text_tokens_received: usize,
@@ -60,7 +60,7 @@ impl EventRx {
         self.cancellation = None;
     }
 
-    pub async fn recv(&mut self) -> Option<GenEvent> {
+    pub async fn recv(&mut self) -> Option<GenerationEvent> {
         let event = self.inner.recv().await;
         if let Some(event) = event.as_ref() {
             self.observe(event);
@@ -69,7 +69,7 @@ impl EventRx {
         event
     }
 
-    pub fn try_recv(&mut self) -> Result<GenEvent, mpsc::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<GenerationEvent, mpsc::error::TryRecvError> {
         let event = self.inner.try_recv();
         if let Ok(event) = event.as_ref() {
             self.observe(event);
@@ -78,9 +78,9 @@ impl EventRx {
         event
     }
 
-    fn observe(&mut self, event: &GenEvent) {
+    fn observe(&mut self, event: &GenerationEvent) {
         match event {
-            GenEvent::TextToken { .. } => {
+            GenerationEvent::TextToken { .. } => {
                 self.text_tokens_received = self.text_tokens_received.saturating_add(1);
                 if let Some(cancellation) = self
                     .cancellation
@@ -93,12 +93,12 @@ impl EventRx {
                     });
                 }
             }
-            GenEvent::Finished { .. }
-            | GenEvent::Rejected { .. }
-            | GenEvent::Error { .. }
-            | GenEvent::MediaCompleted { .. }
-            | GenEvent::MediaFailed { .. }
-            | GenEvent::MediaAborted => {
+            GenerationEvent::Finished { .. }
+            | GenerationEvent::Rejected { .. }
+            | GenerationEvent::Error { .. }
+            | GenerationEvent::MediaCompleted { .. }
+            | GenerationEvent::MediaFailed { .. }
+            | GenerationEvent::MediaAborted => {
                 self.cancellation = None;
             }
             _ => {}
@@ -414,14 +414,14 @@ mod tests {
             _ => panic!("expected Submit command"),
         };
         event_tx
-            .send(GenEvent::TextToken {
+            .send(GenerationEvent::TextToken {
                 id: 7,
                 logprob: None,
                 public_commit: None,
             })
             .unwrap();
         event_tx
-            .send(GenEvent::TextToken {
+            .send(GenerationEvent::TextToken {
                 id: 8,
                 logprob: None,
                 public_commit: None,
@@ -430,7 +430,7 @@ mod tests {
 
         assert!(matches!(
             events.try_recv(),
-            Ok(GenEvent::TextToken { id: 7, .. })
+            Ok(GenerationEvent::TextToken { id: 7, .. })
         ));
         drop(events);
 
@@ -575,11 +575,11 @@ mod tests {
         assert_eq!(FinishReason::MaxTokens, FinishReason::MaxTokens);
     }
 
-    /// A `GenEvent::Finished` carries the finish reason and terminal token
+    /// A `GenerationEvent::Finished` carries the finish reason and terminal token
     /// counts as its payload (the type is not `PartialEq`, so match on it).
     #[test]
     fn gen_event_finished_carries_reason_and_counts() {
-        let event = GenEvent::Finished {
+        let event = GenerationEvent::Finished {
             reason: FinishReason::Stop,
             stop_reason: Some("</s>".to_string()),
             prompt_tokens: 4,
@@ -588,7 +588,7 @@ mod tests {
         };
 
         match event {
-            GenEvent::Finished {
+            GenerationEvent::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens,

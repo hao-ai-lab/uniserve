@@ -1,12 +1,12 @@
 //! Worker execution protocol.
 //!
 //! The scheduler and worker exchange four cross-layer records — [`Operation`],
-//! [`VersionRef`], [`ProductRef`], and [`CompletionRecord`] — plus a request
-//! [`Control`] command. Every operation names one closed [`Work`] variant, one
+//! [`VersionRef`], [`ProductRef`], and [`ModelOutput`] — plus a request
+//! [`Control`] command. Every operation names one closed [`ForwardMode`] variant, one
 //! exact parent version, and its declared input and output products. The worker
-//! returns exactly one [`CompletionRecord`] per operation. Two host-computed
+//! returns exactly one [`ModelOutput`] per operation. Two host-computed
 //! digests fix identity: an operation [`Operation::plan_digest`] over immutable
-//! registration fields, and a [`CompletionRecord::compute_semantic_digest`] over
+//! registration fields, and a [`ModelOutput::compute_semantic_digest`] over
 //! the selected result.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -72,7 +72,7 @@ pub struct OpId(pub u64);
 pub struct RouteId(pub u32);
 
 // ---------------------------------------------------------------------------
-// Closed `Work` algebra
+// Closed `ForwardMode` algebra
 // ---------------------------------------------------------------------------
 
 /// State effect and role of a token operation's device work.
@@ -125,25 +125,12 @@ pub enum MediaProfileId {
     MinimaxH3T2va,
 }
 
-/// The single closed work algebra. The state effect and role of each variant
-/// are fixed; sampling is device postprocessing inside `Token(*)`, not a variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum Work {
-    Token(TokenMode),
-    Draft,
-    Encode(EncodeMode),
-    Transfer(TransferMode),
-    Gen(GenMode),
-    Materialize,
-}
-
-/// The flat exhaustive tag for one [`Work`] leaf, used on the wire and in
-/// capability negotiation. Declaration order is the canonical index.
+/// Closed forward-mode tag for one operation. Declaration order is the
+/// canonical index on the wire and in capability negotiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum WorkVariant {
+pub enum ForwardMode {
     TokenExtend = 0,
     TokenDecode = 1,
     TokenVerify = 2,
@@ -159,7 +146,7 @@ pub enum WorkVariant {
     GenDecode = 12,
 }
 
-impl WorkVariant {
+impl ForwardMode {
     pub const ALL: [Self; 13] = [
         Self::TokenExtend,
         Self::TokenDecode,
@@ -227,48 +214,71 @@ impl WorkVariant {
             Self::GenDecode => "gen_decode",
         }
     }
-}
 
-impl Work {
-    pub const fn variant(self) -> WorkVariant {
+    pub const fn from_token(mode: TokenMode) -> Self {
+        match mode {
+            TokenMode::Extend => Self::TokenExtend,
+            TokenMode::Decode => Self::TokenDecode,
+            TokenMode::Verify => Self::TokenVerify,
+        }
+    }
+
+    pub const fn token_mode(self) -> Option<TokenMode> {
         match self {
-            Self::Token(TokenMode::Extend) => WorkVariant::TokenExtend,
-            Self::Token(TokenMode::Decode) => WorkVariant::TokenDecode,
-            Self::Token(TokenMode::Verify) => WorkVariant::TokenVerify,
-            Self::Draft => WorkVariant::Draft,
-            Self::Encode(EncodeMode::Vision) => WorkVariant::EncodeVision,
-            Self::Encode(EncodeMode::Latent) => WorkVariant::EncodeLatent,
-            Self::Transfer(TransferMode::Product) => WorkVariant::TransferProduct,
-            Self::Transfer(TransferMode::KvPublish) => WorkVariant::TransferKvPublish,
-            Self::Transfer(TransferMode::KvInstall) => WorkVariant::TransferKvInstall,
-            Self::Gen(GenMode::Transition) => WorkVariant::GenTransition,
-            Self::Gen(GenMode::Flow) => WorkVariant::GenFlow,
-            Self::Gen(GenMode::Decode) => WorkVariant::GenDecode,
-            Self::Materialize => WorkVariant::Materialize,
+            Self::TokenExtend => Some(TokenMode::Extend),
+            Self::TokenDecode => Some(TokenMode::Decode),
+            Self::TokenVerify => Some(TokenMode::Verify),
+            _ => None,
         }
     }
 
-    pub const fn from_variant(variant: WorkVariant) -> Self {
-        match variant {
-            WorkVariant::TokenExtend => Self::Token(TokenMode::Extend),
-            WorkVariant::TokenDecode => Self::Token(TokenMode::Decode),
-            WorkVariant::TokenVerify => Self::Token(TokenMode::Verify),
-            WorkVariant::Draft => Self::Draft,
-            WorkVariant::EncodeVision => Self::Encode(EncodeMode::Vision),
-            WorkVariant::EncodeLatent => Self::Encode(EncodeMode::Latent),
-            WorkVariant::TransferProduct => Self::Transfer(TransferMode::Product),
-            WorkVariant::TransferKvPublish => Self::Transfer(TransferMode::KvPublish),
-            WorkVariant::TransferKvInstall => Self::Transfer(TransferMode::KvInstall),
-            WorkVariant::GenTransition => Self::Gen(GenMode::Transition),
-            WorkVariant::GenFlow => Self::Gen(GenMode::Flow),
-            WorkVariant::GenDecode => Self::Gen(GenMode::Decode),
-            WorkVariant::Materialize => Self::Materialize,
+    pub const fn from_encode(mode: EncodeMode) -> Self {
+        match mode {
+            EncodeMode::Vision => Self::EncodeVision,
+            EncodeMode::Latent => Self::EncodeLatent,
         }
     }
 
-    /// The canonical state effect fixed by the work table.
-    pub const fn advances_state(self) -> bool {
-        self.variant().advances_state()
+    pub const fn encode_mode(self) -> Option<EncodeMode> {
+        match self {
+            Self::EncodeVision => Some(EncodeMode::Vision),
+            Self::EncodeLatent => Some(EncodeMode::Latent),
+            _ => None,
+        }
+    }
+
+    pub const fn from_transfer(mode: TransferMode) -> Self {
+        match mode {
+            TransferMode::Product => Self::TransferProduct,
+            TransferMode::KvPublish => Self::TransferKvPublish,
+            TransferMode::KvInstall => Self::TransferKvInstall,
+        }
+    }
+
+    pub const fn transfer_mode(self) -> Option<TransferMode> {
+        match self {
+            Self::TransferProduct => Some(TransferMode::Product),
+            Self::TransferKvPublish => Some(TransferMode::KvPublish),
+            Self::TransferKvInstall => Some(TransferMode::KvInstall),
+            _ => None,
+        }
+    }
+
+    pub const fn from_gen(mode: GenMode) -> Self {
+        match mode {
+            GenMode::Transition => Self::GenTransition,
+            GenMode::Flow => Self::GenFlow,
+            GenMode::Decode => Self::GenDecode,
+        }
+    }
+
+    pub const fn gen_mode(self) -> Option<GenMode> {
+        match self {
+            Self::GenTransition => Some(GenMode::Transition),
+            Self::GenFlow => Some(GenMode::Flow),
+            Self::GenDecode => Some(GenMode::Decode),
+            _ => None,
+        }
     }
 }
 
@@ -601,7 +611,7 @@ pub struct Operation {
     pub request_key: RequestKey,
     pub op_id: OpId,
     pub parent: VersionRef,
-    pub work: Work,
+    pub work: ForwardMode,
     pub route: RouteId,
     pub domain: Domain,
     pub advances_state: bool,
@@ -621,7 +631,7 @@ impl Operation {
         request_key: RequestKey,
         op_id: OpId,
         parent: VersionRef,
-        work: Work,
+        work: ForwardMode,
         route: RouteId,
         domain: Domain,
         bounds: Bounds,
@@ -657,7 +667,7 @@ impl Operation {
         digest.request_key(self.request_key);
         digest.op_id(self.op_id);
         digest.version_ref(&self.parent);
-        digest.u8(self.work.variant() as u8);
+        digest.u8(self.work as u8);
         digest.u32(self.route.0);
         digest.u8(self.domain as u8);
         digest.bool(self.advances_state);
@@ -679,7 +689,7 @@ impl Operation {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.op_id.0 > 0, "operation id must be positive");
         anyhow::ensure!(
-            self.domain == self.work.variant().domain(),
+            self.domain == self.work.domain(),
             "operation domain is inconsistent with its work variant"
         );
         anyhow::ensure!(
@@ -692,7 +702,7 @@ impl Operation {
             "operation parent belongs to another request lineage"
         );
         anyhow::ensure!(
-            !self.work.variant().requires_fixed_parent() || self.parent.is_fixed(),
+            !self.work.requires_fixed_parent() || self.parent.is_fixed(),
             "operation requires a fixed semantic parent"
         );
         self.bounds_are_finite()?;
@@ -845,7 +855,7 @@ pub struct TimingCounters {
 /// The fixed-layout record a worker emits once for every operation, after its
 /// copy event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompletionRecord {
+pub struct ModelOutput {
     pub request_key: RequestKey,
     pub op_id: OpId,
     pub completion_slot_generation: u32,
@@ -864,7 +874,7 @@ pub struct CompletionRecord {
     pub timing_counters: TimingCounters,
 }
 
-impl CompletionRecord {
+impl ModelOutput {
     /// The selected-result identity digest, host-computed from the ready record.
     /// The committed token values are part of the semantic output delta, so two
     /// different tokens selected at the same span do not share a lineage.
@@ -1524,8 +1534,8 @@ impl BatchPartition {
                 anyhow::anyhow!("latent placement does not name a partition operation")
             })?;
             let addresses_trajectory = matches!(
-                operation.work.variant(),
-                WorkVariant::GenTransition | WorkVariant::GenFlow
+                operation.work,
+                ForwardMode::GenTransition | ForwardMode::GenFlow
             ) || operation
                 .inputs
                 .iter()
@@ -1544,8 +1554,8 @@ impl BatchPartition {
         }
         for operation in &self.operations {
             let needs_latent = matches!(
-                operation.work.variant(),
-                WorkVariant::GenTransition | WorkVariant::GenFlow
+                operation.work,
+                ForwardMode::GenTransition | ForwardMode::GenFlow
             ) || operation
                 .inputs
                 .iter()
@@ -1567,13 +1577,13 @@ impl BatchPartition {
                 anyhow::anyhow!("decode placement does not name a partition operation")
             })?;
             anyhow::ensure!(
-                operation.work.variant() == WorkVariant::GenDecode,
+                operation.work == ForwardMode::GenDecode,
                 "decode placement does not name a GenDecode operation"
             );
         }
         for operation in &self.operations {
             anyhow::ensure!(
-                operation.work.variant() != WorkVariant::GenDecode
+                operation.work != ForwardMode::GenDecode
                     || decode_ids.contains(&(operation.request_key, operation.op_id)),
                 "GenDecode operation has no decode placement"
             );
@@ -2108,7 +2118,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> anyhow::Result<SamplingState
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartitionCompletion {
     pub partition_id: u32,
-    pub completions: Vec<CompletionRecord>,
+    pub completions: Vec<ModelOutput>,
     pub products: Vec<ProductPayload>,
     pub registration: RegistrationAck,
     pub worker_exec_us: Option<u64>,
@@ -2141,7 +2151,7 @@ pub struct CompletionReport {
 }
 
 impl CompletionReport {
-    pub fn completions(&self) -> impl Iterator<Item = &CompletionRecord> {
+    pub fn completions(&self) -> impl Iterator<Item = &ModelOutput> {
         self.partitions
             .iter()
             .flat_map(|partition| partition.completions.iter())
@@ -2218,7 +2228,7 @@ pub struct WorkerCapabilities {
     pub num_layers: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
-    pub supported_work: Vec<WorkVariant>,
+    pub supported_work: Vec<ForwardMode>,
     pub latent_page_units: u32,
     pub num_latent_pages: u32,
     pub latent_width: u32,
@@ -2264,12 +2274,12 @@ impl WorkerCapabilities {
         self.supported_work.iter().any(|variant| {
             matches!(
                 variant,
-                WorkVariant::TokenExtend
-                    | WorkVariant::TokenDecode
-                    | WorkVariant::TokenVerify
-                    | WorkVariant::Draft
-                    | WorkVariant::TransferKvPublish
-                    | WorkVariant::TransferKvInstall
+                ForwardMode::TokenExtend
+                    | ForwardMode::TokenDecode
+                    | ForwardMode::TokenVerify
+                    | ForwardMode::Draft
+                    | ForwardMode::TransferKvPublish
+                    | ForwardMode::TransferKvInstall
             )
         }) || self.supported_controls.contains(&RequestKind::CopyKv)
             || self.resource_classes.contains(&ResourceClass::KvBlock)
@@ -2431,7 +2441,7 @@ impl WorkerCapabilities {
         let addresses_latent = self
             .supported_work
             .iter()
-            .any(|variant| matches!(variant, WorkVariant::GenTransition | WorkVariant::GenFlow));
+            .any(|variant| matches!(variant, ForwardMode::GenTransition | ForwardMode::GenFlow));
         anyhow::ensure!(
             !addresses_latent || self.resource_classes.contains(&ResourceClass::ImageLatent),
             "worker capabilities advertise latent work without a latent page pool"
@@ -2449,15 +2459,15 @@ impl WorkerCapabilities {
     }
 
     pub fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
-        let supports = |variant: WorkVariant| self.supported_work.contains(&variant);
+        let supports = |variant: ForwardMode| self.supported_work.contains(&variant);
         GenerationRuntimeCapabilities {
-            supports_understanding: supports(WorkVariant::TokenExtend)
-                && supports(WorkVariant::TokenDecode),
-            supports_vision_encode: supports(WorkVariant::EncodeVision),
-            supports_latent_encode: supports(WorkVariant::EncodeLatent),
-            supports_image_generation: supports(WorkVariant::GenFlow)
-                && supports(WorkVariant::Materialize)
-                && supports(WorkVariant::TransferKvPublish)
+            supports_understanding: supports(ForwardMode::TokenExtend)
+                && supports(ForwardMode::TokenDecode),
+            supports_vision_encode: supports(ForwardMode::EncodeVision),
+            supports_latent_encode: supports(ForwardMode::EncodeLatent),
+            supports_image_generation: supports(ForwardMode::GenFlow)
+                && supports(ForwardMode::Materialize)
+                && supports(ForwardMode::TransferKvPublish)
                 && self.incremental_kv_publication,
             max_latent_units: self.latent_capacity_units(),
             latent_downsample: self.latent_downsample,
@@ -2484,7 +2494,7 @@ impl Default for WorkerCapabilities {
             num_layers: 28,
             num_kv_heads: 8,
             head_dim: 128,
-            supported_work: vec![WorkVariant::TokenExtend, WorkVariant::TokenDecode],
+            supported_work: vec![ForwardMode::TokenExtend, ForwardMode::TokenDecode],
             latent_page_units: 0,
             num_latent_pages: 0,
             latent_width: 0,
@@ -2527,12 +2537,12 @@ impl Default for WorkerCapabilities {
     }
 }
 
-/// The canonical protocol-layout digest over the closed `Work` and `Control`
+/// The canonical protocol-layout digest over the closed `ForwardMode` and `Control`
 /// variants and the fixed record field layouts.
 pub fn protocol_layout_digest() -> Digest {
     let mut digest = CanonicalDigest::new(b"uniserve-protocol-layout\0");
-    digest.u64(WorkVariant::ALL.len() as u64);
-    for variant in WorkVariant::ALL {
+    digest.u64(ForwardMode::ALL.len() as u64);
+    for variant in ForwardMode::ALL {
         digest.string(variant.as_wire_str());
     }
     let product_kinds = [

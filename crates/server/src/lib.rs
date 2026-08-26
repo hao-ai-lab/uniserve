@@ -12,7 +12,7 @@ mod state;
 
 use std::sync::Arc;
 
-use crate::engine_client::{EngineClient, TransportMode, ZmqClientConfig};
+use crate::engine_client::EngineClient;
 pub use crate::profile::ModelDescription;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -21,14 +21,12 @@ pub use crate::serving::chat::ChatTemplateContentFormatOption;
 use crate::serving::chat::{ChatTemplateLoadOptions, HfChatRenderer};
 use crate::serving::{ResolvedModel, ServingRuntime};
 use anyhow::{Context as _, Result};
-pub use config::{Config, EngineBackendKind, EngineConnection, EngineSettings, HttpListenerMode};
+pub use config::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 use tracing::info;
-use uniserve_core::codec::generation::GenerationControlTokens;
 pub use uniserve_engine::SchedulingPolicy;
 use uniserve_engine::sim::{SimEngine, SimExecutor};
 use uniserve_engine::{EngineBackend, EngineCoreConfig};
 
-use crate::engine_client::RuntimeEngineClient;
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
 
@@ -189,129 +187,65 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         EngineBackendKind::Sim => (EngineBackend::Sim, control_tokens.eos.clone()),
         EngineBackendKind::Worker => (EngineBackend::Worker, control_tokens.eos.clone()),
     };
-    let client = match &config.engine.connection {
-        EngineConnection::InProcess => {
-            info!(
-                ?backend,
-                device = %config.engine.device,
-                block_size = config.engine.block_size,
-                pipeline_depth = config.engine.pipeline_depth,
-                "starting UniServe Rust engine (in-process)"
-            );
-            let engine_config = EngineCoreConfig {
-                model: config.model.clone(),
-                device: config.engine.device.clone(),
-                attention_backend: config.engine.attention_backend.clone(),
-                backend,
-                block_size: config.engine.block_size,
-                pipeline_depth: config.engine.pipeline_depth,
-                max_batch: config.engine.max_batch,
-                max_num_batched_tokens: config.engine.max_num_batched_tokens,
-                max_num_seqs: config.engine.max_num_seqs,
-                long_prefill_threshold: config.engine.long_prefill_threshold,
-                mixed_prefill_tokens: config.engine.mixed_prefill_tokens,
-                scheduler_policy: config.engine.scheduler_policy,
-                max_model_len: effective_max_model_len,
-                kv_token_capacity: config.engine.kv_token_capacity,
-                worker_python: config.engine.worker_python.clone(),
-                worker_ranks: config.engine.worker_ranks,
-                workers: config.engine.workers.clone(),
-                transfer: config.engine.transfer.clone(),
-                worker_launch: config.engine.worker_launch.clone(),
-                req_slot_cap: if config.model_description == ModelDescription::MiniMaxH3 {
-                    EngineSettings::MEDIA_IPC_SLOT_CAP
-                } else {
-                    1 << 20
-                },
-                resp_slot_cap: config.engine.resp_slot_cap,
-                bos: control_tokens.bos,
-                eos,
-                end_of_image: control_tokens.end_of_image,
-            };
-            let runtime_client = if backend == EngineBackend::Sim {
-                let mut sim = SimEngine::new();
-                let special_tokens = [
-                    control_tokens.bos,
-                    control_tokens.start_of_image,
-                    control_tokens.end_of_image,
-                ]
-                .into_iter()
-                .filter(|token| *token != 0)
-                .collect::<Vec<_>>();
-                sim.configure_control_tokens(
-                    engine_config.eos.first().copied().unwrap_or(151645),
-                    &special_tokens,
-                );
-                RuntimeEngineClient::connect_with_executor(
-                    engine_config,
-                    Box::new(SimExecutor::new(Box::new(sim))),
-                )
-            } else {
-                RuntimeEngineClient::connect(engine_config)
-            }
-            .context("failed to start the UniServe engine")?;
-            EngineClient::from_in_process(runtime_client)
-        }
-        connection => {
-            let controls = GenerationControlTokens {
-                bos: control_tokens.bos,
-                eos,
-                end_of_image: control_tokens.end_of_image,
-            };
-            let transport_mode = match connection.clone() {
-                EngineConnection::Handshake {
-                    handshake_address,
-                    advertised_host,
-                    engine_count,
-                    ready_timeout,
-                } => {
-                    info!(
-                        %handshake_address,
-                        engine_count,
-                        "connecting to engine cores (handshake-owner mode)"
-                    );
-                    TransportMode::HandshakeOwner {
-                        handshake_address,
-                        advertised_host,
-                        engine_count,
-                        ready_timeout,
-                        local_input_address: None,
-                        local_output_address: None,
-                    }
-                }
-                EngineConnection::Bootstrapped {
-                    input_address,
-                    output_address,
-                    engine_count,
-                    ready_timeout,
-                } => {
-                    info!(
-                        %input_address,
-                        %output_address,
-                        engine_count,
-                        "connecting to engine cores (bootstrapped mode)"
-                    );
-                    TransportMode::Bootstrapped {
-                        input_address,
-                        output_address,
-                        engine_count,
-                        ready_timeout,
-                    }
-                }
-                EngineConnection::InProcess => unreachable!("handled above"),
-            };
-            EngineClient::connect_zmq(ZmqClientConfig {
-                transport_mode,
-                model_name: config.model.clone(),
-                client_index: 0,
-                generation_controls: Some(controls),
-                media_spool: matches!(&profile, ModelProfile::MiniMaxH3(_))
-                    .then(|| config.media_spool.to_string_lossy().into_owned()),
-            })
-            .await
-            .context("failed to connect to the UniServe engine cores")?
-        }
+    info!(
+        ?backend,
+        device = %config.engine.device,
+        block_size = config.engine.block_size,
+        pipeline_depth = config.engine.pipeline_depth,
+        "starting UniServe Rust engine"
+    );
+    let engine_config = EngineCoreConfig {
+        model: config.model.clone(),
+        device: config.engine.device.clone(),
+        attention_backend: config.engine.attention_backend.clone(),
+        backend,
+        block_size: config.engine.block_size,
+        pipeline_depth: config.engine.pipeline_depth,
+        max_batch: config.engine.max_batch,
+        max_num_batched_tokens: config.engine.max_num_batched_tokens,
+        max_num_seqs: config.engine.max_num_seqs,
+        long_prefill_threshold: config.engine.long_prefill_threshold,
+        mixed_prefill_tokens: config.engine.mixed_prefill_tokens,
+        scheduler_policy: config.engine.scheduler_policy,
+        max_model_len: effective_max_model_len,
+        kv_token_capacity: config.engine.kv_token_capacity,
+        worker_python: config.engine.worker_python.clone(),
+        worker_ranks: config.engine.worker_ranks,
+        workers: config.engine.workers.clone(),
+        transfer: config.engine.transfer.clone(),
+        worker_launch: config.engine.worker_launch.clone(),
+        req_slot_cap: if config.model_description == ModelDescription::MiniMaxH3 {
+            EngineSettings::MEDIA_IPC_SLOT_CAP
+        } else {
+            1 << 20
+        },
+        resp_slot_cap: config.engine.resp_slot_cap,
+        bos: control_tokens.bos,
+        eos,
+        end_of_image: control_tokens.end_of_image,
     };
+    let client = if backend == EngineBackend::Sim {
+        let mut sim = SimEngine::new();
+        let special_tokens = [
+            control_tokens.bos,
+            control_tokens.start_of_image,
+            control_tokens.end_of_image,
+        ]
+        .into_iter()
+        .filter(|token| *token != 0)
+        .collect::<Vec<_>>();
+        sim.configure_control_tokens(
+            engine_config.eos.first().copied().unwrap_or(151645),
+            &special_tokens,
+        );
+        EngineClient::connect_with_executor(
+            engine_config,
+            Box::new(SimExecutor::new(Box::new(sim))),
+        )
+    } else {
+        EngineClient::connect(engine_config)
+    }
+    .context("failed to start the UniServe engine")?;
 
     let engine = Arc::new(client);
     let engine_status = engine.status();

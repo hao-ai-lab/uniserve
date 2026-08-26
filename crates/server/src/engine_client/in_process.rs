@@ -4,18 +4,18 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::engine_client::{
-    Error, GenerationEventStream, GenerationSubmission, InProcessEngineClient, MediaEventStream,
-    MediaSubmission, Result, StreamCancelCause,
-};
-use uniserve_core::GenEvent;
+use super::client::StreamCancelCause;
+use super::error::{Error, Result};
+use super::generation::{GenerationEventStream, GenerationSubmission};
+use super::media::{MediaEventStream, MediaSubmission};
+use uniserve_core::GenerationEvent;
 use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, RequestId};
 use uniserve_engine::EngineCore;
 use uniserve_engine::EngineHandle;
 use uniserve_engine::executor::Executor;
 
-/// Runtime-backed in-process engine client owned by the server layer.
-pub(crate) struct RuntimeEngineClient {
+/// In-process engine client owned by the server layer.
+pub struct EngineClient {
     core: Arc<EngineCore>,
     active: SharedActiveRequests,
     _stats_guard: Arc<()>,
@@ -41,15 +41,19 @@ fn remove_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: 
     }
 }
 
-impl RuntimeEngineClient {
-    pub(crate) fn connect(config: uniserve_engine::EngineCoreConfig) -> Result<Self> {
+impl EngineClient {
+    fn handle(&self) -> EngineHandle {
+        self.core.handle()
+    }
+
+    pub fn connect(config: uniserve_engine::EngineCoreConfig) -> Result<Self> {
         let core = EngineCore::new(config).map_err(|e| Error::ClientClosed {
             message: format!("failed to start the UniServe engine: {e:?}"),
         })?;
         Self::from_core(core)
     }
 
-    pub(crate) fn connect_with_executor(
+    pub fn connect_with_executor(
         config: uniserve_engine::EngineCoreConfig,
         executor: Box<dyn Executor>,
     ) -> Result<Self> {
@@ -96,46 +100,49 @@ impl RuntimeEngineClient {
             _stats_guard: stats_guard,
         })
     }
-
-    fn handle(&self) -> EngineHandle {
-        self.core.handle()
-    }
 }
 
-impl InProcessEngineClient for RuntimeEngineClient {
-    fn model_name(&self) -> &str {
+impl EngineClient {
+    pub fn model_name(&self) -> &str {
         self.core.model_name()
     }
 
-    fn engine_count(&self) -> usize {
+    pub fn engine_count(&self) -> usize {
         1
     }
 
-    fn max_model_len(&self) -> u32 {
+    pub fn max_model_len(&self) -> u32 {
         self.core.max_model_len()
     }
 
-    fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
+    pub fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
         self.core.generation_capabilities()
     }
 
-    fn model_dtype(&self) -> ModelDtype {
+    pub fn model_dtype(&self) -> ModelDtype {
         self.core.model_dtype()
     }
 
-    fn uniserve_version(&self) -> &str {
+    pub fn uniserve_version(&self) -> &str {
         "uniserve"
     }
 
-    fn total_num_gpu_blocks(&self) -> u64 {
+    pub fn total_num_gpu_blocks(&self) -> u64 {
         self.core.caps().num_blocks as u64
     }
 
-    fn is_healthy(&self) -> bool {
+    pub fn is_healthy(&self) -> bool {
         !self.core.is_dead()
     }
 
-    fn submit_generation(&self, submission: GenerationSubmission) -> Result<GenerationEventStream> {
+    pub fn health_error(&self) -> Option<Arc<Error>> {
+        None
+    }
+
+    pub async fn submit_generation(
+        &self,
+        submission: GenerationSubmission,
+    ) -> Result<GenerationEventStream> {
         let GenerationSubmission {
             external_request_id,
             mut request,
@@ -161,7 +168,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
         })?;
         scheduler_rx.delegate_cancellation();
         let (event_tx, event_rx) =
-            mpsc::channel::<GenEvent>(uniserve_engine::EVENT_BUFFER_CAPACITY);
+            mpsc::channel::<GenerationEvent>(uniserve_engine::EVENT_BUFFER_CAPACITY);
         let active = Arc::clone(&self.active);
         let active_id = external_request_id.clone();
         tokio::spawn(async move {
@@ -169,7 +176,9 @@ impl InProcessEngineClient for RuntimeEngineClient {
             while let Some(event) = scheduler_rx.recv().await {
                 reached_terminal = matches!(
                     event,
-                    GenEvent::Finished { .. } | GenEvent::Rejected { .. } | GenEvent::Error { .. }
+                    GenerationEvent::Finished { .. }
+                        | GenerationEvent::Rejected { .. }
+                        | GenerationEvent::Error { .. }
                 );
                 if event_tx.send(event).await.is_err() {
                     remove_active_request(&active, &active_id, rid);
@@ -181,7 +190,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
             }
             if !reached_terminal {
                 let _ = event_tx
-                    .send(GenEvent::Error {
+                    .send(GenerationEvent::Error {
                         message: "generation event stream closed before a terminal event"
                             .to_string(),
                     })
@@ -208,7 +217,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
         ))
     }
 
-    fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventStream> {
+    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventStream> {
         let MediaSubmission {
             external_request_id,
             prompt,
@@ -260,7 +269,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
         }))
     }
 
-    fn abort(&self, ids: &[String]) -> Result<()> {
+    pub async fn abort(&self, ids: &[String]) -> Result<()> {
         let handle = self.handle();
         let active = lock_active(&self.active);
         for id in ids {
@@ -271,7 +280,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
         Ok(())
     }
 
-    fn cancel(&self, ids: &[String]) -> Result<()> {
+    pub async fn cancel(&self, ids: &[String]) -> Result<()> {
         let handle = self.handle();
         let active = lock_active(&self.active);
         for id in ids {
@@ -282,7 +291,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
         Ok(())
     }
 
-    fn shutdown(self: Box<Self>) -> Result<()> {
+    pub async fn shutdown(self) -> Result<()> {
         self.core.shutdown();
         Ok(())
     }
@@ -291,28 +300,24 @@ impl InProcessEngineClient for RuntimeEngineClient {
 #[cfg(test)]
 mod tests {
     use crate::engine_client::{EngineClient, GenerationSubmission};
-    use uniserve_core::GenEvent;
     use uniserve_core::{
         ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
-        GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-        GenerationRequest, GenerationResourceBounds, ImageIngestRecipe, ImageKvEffect, ImageParams,
-        RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
+        GenerationBehaviorDescriptor, GenerationConstraint, GenerationEvent,
+        GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
+        ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor,
+        UndVisibility,
     };
     use uniserve_engine::EngineCoreConfig;
 
-    use super::RuntimeEngineClient;
-
     #[tokio::test]
     async fn sim_engine_generates_tokens_through_engine_client() {
-        let client = EngineClient::from_in_process(
-            RuntimeEngineClient::connect_with_executor(
-                EngineCoreConfig::sim("sim-model"),
-                Box::new(uniserve_engine::sim::SimExecutor::new(Box::new(
-                    uniserve_engine::sim::SimEngine::new(),
-                ))),
-            )
-            .expect("connect in-process sim engine"),
-        );
+        let client = EngineClient::connect_with_executor(
+            EngineCoreConfig::sim("sim-model"),
+            Box::new(uniserve_engine::sim::SimExecutor::new(Box::new(
+                uniserve_engine::sim::SimEngine::new(),
+            ))),
+        )
+        .expect("connect in-process sim engine");
 
         let constraint = GenerationConstraint::UndOnly;
         let policy = GenerationPolicyDescriptor::default();
@@ -348,13 +353,13 @@ mod tests {
         let mut finish = None;
         while let Some(event) = stream.next().await {
             match event {
-                GenEvent::TextToken { .. } => tokens += 1,
-                GenEvent::Finished { reason, .. } => {
+                GenerationEvent::TextToken { .. } => tokens += 1,
+                GenerationEvent::Finished { reason, .. } => {
                     finish = Some(reason);
                     break;
                 }
-                GenEvent::Rejected { message } => panic!("request rejected: {message}"),
-                GenEvent::Error { message } => panic!("engine error: {message}"),
+                GenerationEvent::Rejected { message } => panic!("request rejected: {message}"),
+                GenerationEvent::Error { message } => panic!("engine error: {message}"),
                 _ => {}
             }
         }
@@ -374,15 +379,13 @@ mod tests {
 
     #[tokio::test]
     async fn sim_engine_generates_image_through_engine_client() {
-        let client = EngineClient::from_in_process(
-            RuntimeEngineClient::connect_with_executor(
-                EngineCoreConfig::sim("sim-model"),
-                Box::new(uniserve_engine::sim::SimExecutor::new(Box::new(
-                    uniserve_engine::sim::SimEngine::new(),
-                ))),
-            )
-            .expect("connect in-process sim engine"),
-        );
+        let client = EngineClient::connect_with_executor(
+            EngineCoreConfig::sim("sim-model"),
+            Box::new(uniserve_engine::sim::SimExecutor::new(Box::new(
+                uniserve_engine::sim::SimEngine::new(),
+            ))),
+        )
+        .expect("connect in-process sim engine");
 
         let constraint = GenerationConstraint::GenOnly;
         let policy = GenerationPolicyDescriptor {
@@ -445,16 +448,16 @@ mod tests {
         let mut finished = false;
         while let Some(ev) = stream.next().await {
             match ev {
-                GenEvent::ImageBegin { .. } => begins += 1,
-                GenEvent::ImageStep { .. } => steps += 1,
-                GenEvent::ImageDone { .. } => dones += 1,
-                GenEvent::Finished { images, .. } => {
+                GenerationEvent::ImageBegin { .. } => begins += 1,
+                GenerationEvent::ImageStep { .. } => steps += 1,
+                GenerationEvent::ImageDone { .. } => dones += 1,
+                GenerationEvent::Finished { images, .. } => {
                     assert_eq!(images, 1, "expected exactly one image");
                     finished = true;
                     break;
                 }
-                GenEvent::Rejected { message } => panic!("request rejected: {message}"),
-                GenEvent::Error { message } => panic!("engine error: {message}"),
+                GenerationEvent::Rejected { message } => panic!("request rejected: {message}"),
+                GenerationEvent::Error { message } => panic!("engine error: {message}"),
                 _ => {}
             }
         }
