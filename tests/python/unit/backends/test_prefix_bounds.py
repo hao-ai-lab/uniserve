@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from uniserve_kernel._prefix_bounds import compute_prefix_bounds, compute_prefix_bounds_varlen
+from uniserve_kernel.flash_attn_jagged import compute_prefix_bounds, compute_prefix_bounds_varlen
 
 
 def test_prefix_bounds_match_full_width_varlen() -> None:

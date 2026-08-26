@@ -1,12 +1,12 @@
-"""Exactness and capture checks for the sampling provider."""
+"""Exactness and capture checks for exact top-k sampling."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from uniserve_kernel.sampling import SamplingParameters, sample_top_k
 
 from uniserve_worker.backends.triton import configure_triton_toolchain
+from uniserve_worker.execution.top_k_sampling import SamplingParameters, sample_top_k
 
 pytestmark = pytest.mark.unit
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import inspect
 from collections import OrderedDict
-from importlib import import_module
 from typing import Any, Protocol
 
 import torch
@@ -25,7 +24,7 @@ __all__ = [
     "Fa4CuteAttentionBackend",
 ]
 
-_IMPORT_ERROR: Exception | None = None
+_IMPORT_ERROR: BaseException | None = None
 # Authoritative table of (q, k, v) head-dim geometries the FA4 unified trunk
 # kernel accepts. This is the single source of truth: it is published through
 # AttentionCapabilities.trunk_geometries so the registry selector and the
@@ -67,13 +66,13 @@ class _ComputePrefixBoundsVarlen(Protocol):
 _compute_prefix_bounds: _ComputePrefixBounds | None
 _compute_prefix_bounds_varlen: _ComputePrefixBoundsVarlen | None
 try:  # pragma: no cover - optional CUDA package.
-    mm_attn_varlen = import_module("uniserve_kernel.mm_attn_varlen")
+    import uniserve_kernel.flash_attn_jagged as _jagged
 
-    _fa4_flash_attn_fwd = mm_attn_varlen.flash_attn_fwd
-    _compute_prefix_bounds = mm_attn_varlen.compute_prefix_bounds
-    _compute_prefix_bounds_varlen = mm_attn_varlen.compute_prefix_bounds_varlen
-    _hybrid_multimodal_mask = mm_attn_varlen.hybrid_multimodal_mask
-    _IMPORT_ERROR = mm_attn_varlen.import_error()
+    _fa4_flash_attn_fwd = _jagged.flash_attn_fwd
+    _compute_prefix_bounds = _jagged.compute_prefix_bounds
+    _compute_prefix_bounds_varlen = _jagged.compute_prefix_bounds_varlen
+    _hybrid_multimodal_mask = _jagged.hybrid_multimodal_mask
+    _IMPORT_ERROR = _jagged.import_error()
     _fa4_accepts_prefix_bounds = (
         "prefix_bounds" in inspect.signature(_fa4_flash_attn_fwd).parameters
         if _fa4_flash_attn_fwd is not None
@@ -332,8 +331,8 @@ def _require_fa4() -> None:
     if _fa4_flash_attn_fwd is None:
         detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""
         raise RuntimeError(
-            "fa4_cute backend is not available. Install the uniserve-kernel "
-            "provider package with its CUTE runtime dependencies"
+            "fa4_cute backend is not available. Install "
+            "uniserve-kernel[flash_attn_jagged] with its CUTE runtime dependencies"
             f"{detail}"
         )
 
@@ -367,7 +366,7 @@ def _cached_prefix_bounds(
     compute_prefix_bounds_varlen = _compute_prefix_bounds_varlen
     if compute_prefix_bounds is None or compute_prefix_bounds_varlen is None:
         detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""
-        raise RuntimeError(f"FA4 prefix-bound provider is unavailable{detail}")
+        raise RuntimeError(f"FA4 prefix-bound helper is unavailable{detail}")
 
     key = (
         id(visible_end),

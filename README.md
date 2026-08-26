@@ -174,7 +174,6 @@ crates/protocol/worker-ipc-py/           Python worker IPC extension
 crates/engine/                           Scheduler, KV pool, executors, simulator, and engine process
 crates/server/                           Model profiles, serving funnel, OpenAI API, HTTP, and engine clients
 crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
-crates/support/                          Examples and benchmark support packages
 uniserve_worker/         Forward-only Python model workers
 uniserve_eval/           Public-protocol serving evaluator
 specs/                   Builder-facing runtime and serving contracts

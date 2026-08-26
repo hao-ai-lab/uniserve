@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from importlib import import_module
 from typing import cast
 
 import torch
@@ -38,6 +37,7 @@ from .rows import (
     SampleRow,
     SampleWork,
 )
+from .top_k_sampling import SamplingParameters, sample_top_k
 
 SAMPLING_COMPLETION_FIELDS = 4
 TOKEN_CONTINUATION_BIT = 1 << 31
@@ -652,23 +652,17 @@ def _run_fused_top_k_sampling(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not triton_available(logits.device):
-        raise capability_mismatch("fused sampling requires a supported Triton toolchain")
-    provider = import_module("uniserve_kernel.sampling")
-    result = provider.sample_top_k(
+        raise capability_mismatch(
+            "fused top-k sampling requires a supported CUDA compile toolchain"
+        )
+    return sample_top_k(
         logits,
         draws,
         penalty_token_ids,
         penalty_counts,
-        provider.SamplingParameters.from_columns(parameters),
+        SamplingParameters.from_columns(parameters),
         int(top_k),
     )
-    if (
-        not isinstance(result, tuple)
-        or len(result) != 2
-        or not all(isinstance(value, torch.Tensor) for value in result)
-    ):
-        raise RuntimeError("sampling provider returned an invalid result")
-    return result
 
 
 def _sample_task_group(

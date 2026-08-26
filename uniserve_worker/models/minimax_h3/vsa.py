@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from importlib import import_module
 import math
+from dataclasses import dataclass
 from typing import Callable, Literal
 
 import torch
 from torch.nn import functional as F
 
 from ...nn.mesh import DeviceMesh
+from . import vsa_sm100
 
 __all__ = ["H3VsaAttention", "H3VsaMetadata", "build_vsa_metadata"]
 
@@ -62,19 +62,13 @@ def build_vsa_metadata(
 
 
 def _resolve_kernel() -> Callable[..., torch.Tensor]:
-    """Resolve the UniServe provider-pack SM100a operation once."""
+    """Resolve the FastH3 SM100a operation once at startup."""
 
-    try:
-        provider = import_module("uniserve_kernel.h3_vsa")
-    except Exception as error:
+    if not vsa_sm100.available():
         raise RuntimeError(
-            "FastH3 requires the UniServe SM100a H3 VSA provider operation"
-        ) from error
-    kernel = getattr(provider, "block_sparse_attention", None)
-    available = getattr(provider, "available", None)
-    if not callable(kernel) or (callable(available) and not bool(available())):
-        raise RuntimeError("the UniServe SM100a H3 VSA provider is unavailable")
-    return kernel
+            "FastH3 requires the SM100a H3 VSA kernel"
+        ) from vsa_sm100.import_error()
+    return vsa_sm100.block_sparse_attention
 
 
 class H3VsaAttention:

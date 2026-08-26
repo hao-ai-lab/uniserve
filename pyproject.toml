@@ -56,9 +56,15 @@ bench = [
 ]
 # Optional accelerator kernels. Worker imports are guarded and fall back to a
 # pure-PyTorch attention path when absent. Install only wheels that exist for
-# your platform.
+# your platform. UniServe-authored optional kernels live in the independent
+# `uniserve-kernel` pack (jagged FlashAttention is
+# `uniserve-kernel[flash_attn_jagged]`). MiniMax H3 SM100a sparse attention uses
+# FastVideo.
 gpu = [
     "flashinfer-python",
+]
+h3 = [
+    "fastvideo-kernel==0.3.4",
 ]
 
 [project.scripts]
@@ -66,9 +72,9 @@ uniserve-worker = "uniserve_worker.main:main"
 uniserve-eval = "uniserve_eval.cli:main"
 
 [tool.setuptools.packages.find]
-# Optional kernel provider packs are packaged independently (for example
-# `uniserve_kernel/pyproject.toml`) so the root worker distribution cannot mask
-# a missing provider install.
+# Optional UniServe kernels are packaged independently
+# (`uniserve_kernel/pyproject.toml`) so the root worker distribution cannot mask
+# a missing kernel install.
 include = ["uniserve_worker*", "uniserve_eval*"]
 
 [tool.setuptools.package-data]

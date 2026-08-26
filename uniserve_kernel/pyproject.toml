@@ -5,21 +5,24 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "uniserve-kernel"
 version = "0.1.0"
-description = "UniServe optional CUTE/Triton kernel provider pack"
-requires-python = ">=3.10"
+description = "UniServe optional kernel provider pack"
+requires-python = ">=3.11"
 dependencies = [
-  "fastvideo-kernel==0.3.4",
-  "flash-attn-4[cu13]==4.0.0b24",
-  "nvidia-cutlass-dsl[cu13]==4.6.0.dev0",
   "torch>=2.13,<2.14",
 ]
 
+[project.optional-dependencies]
+flash_attn_jagged = [
+  "flash-attn-4[cu13]==4.0.0b24",
+  "nvidia-cutlass-dsl[cu13]==4.6.0.dev0",
+]
+
 [tool.setuptools]
-package-dir = {"" = "python"}
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
-where = ["python"]
+where = ["src"]
 include = ["uniserve_kernel*"]
 
 [tool.setuptools.package-data]
-uniserve_kernel = ["py.typed", "_fa4_overlay/flash_attn/cute/*.py"]
+uniserve_kernel = ["py.typed", "flash_attn_jagged/cute/*.py"]

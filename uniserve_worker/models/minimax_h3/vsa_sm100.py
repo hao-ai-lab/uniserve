@@ -1,14 +1,17 @@
-"""SM100a block-sparse attention surface for the fixed FastH3 profile."""
+"""SM100a block-sparse attention for the fixed FastH3 profile."""
 
 from __future__ import annotations
+
+from typing import Any
 
 import torch
 
 _IMPORT_ERROR: BaseException | None = None
-_sm100a = None
-
+_sm100a: Any | None = None
 try:  # pragma: no cover - deployment-only CUDA provider.
-    from fastvideo_kernel import block_sparse_attn_sm100a as _sm100a
+    from fastvideo_kernel import block_sparse_attn_sm100a
+
+    _sm100a = block_sparse_attn_sm100a
 except BaseException as error:  # pragma: no cover
     _IMPORT_ERROR = error
 
@@ -20,8 +23,12 @@ def available() -> bool:
     return major == 10 and bool(getattr(_sm100a, "_HAS_VSA_SM100A", False))
 
 
+def import_error() -> BaseException | None:
+    return _IMPORT_ERROR
+
+
 @torch.library.custom_op(
-    "uniserve_kernel::h3_vsa_block_sparse",
+    "uniserve_worker::h3_vsa_block_sparse",
     mutates_args=(),
 )
 def _block_sparse_custom(
@@ -32,7 +39,7 @@ def _block_sparse_custom(
     mask_block_indices: torch.Tensor,
     valid_sizes: torch.Tensor,
 ) -> torch.Tensor:
-    if not available():
+    if not available() or _sm100a is None:
         raise RuntimeError("FastH3 SM100a sparse attention is unavailable") from _IMPORT_ERROR
     q_bhsd = query.transpose(0, 1).unsqueeze(0).contiguous()
     k_bhsd = key.transpose(0, 1).unsqueeze(0).contiguous()
@@ -92,4 +99,4 @@ def block_sparse_attention(
     )
 
 
-__all__ = ["available", "block_sparse_attention"]
+__all__ = ["available", "block_sparse_attention", "import_error"]

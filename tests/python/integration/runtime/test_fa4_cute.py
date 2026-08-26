@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_kernel import mm_attn_varlen
+from uniserve_kernel import flash_attn_jagged
 from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 
 
@@ -13,8 +13,8 @@ from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
 def test_visible_end_attention_matches_dense_sdpa(batch: int, sequence_length: int) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
-    if not mm_attn_varlen.available():
-        pytest.skip(f"FA4 CUTE provider unavailable: {mm_attn_varlen.import_error()}")
+    if not flash_attn_jagged.available():
+        pytest.skip(f"jagged FlashAttention kernel unavailable: {flash_attn_jagged.import_error()}")
 
     heads = 4
     kv_heads = 2

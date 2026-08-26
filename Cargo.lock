@@ -4097,16 +4097,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uniserve-benchmarks"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "uniserve-server",
-]
-
-[[package]]
 name = "uniserve-core"
 version = "0.2.0"
 dependencies = [
@@ -4135,15 +4125,6 @@ dependencies = [
  "tracing-subscriber",
  "uniserve-core",
  "uniserve-worker-ipc",
-]
-
-[[package]]
-name = "uniserve-examples"
-version = "0.2.0"
-dependencies = [
- "futures",
- "serde_json",
- "uniserve-server",
 ]
 
 [[package]]

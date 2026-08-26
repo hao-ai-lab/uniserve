@@ -1,4 +1,4 @@
-"""Capture-eligible exact top-k sampling provider."""
+"""Capture-eligible exact top-k sampling."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class SamplingParameters:
     presence_penalty: torch.Tensor
 
     @classmethod
-    def from_columns(cls, values: torch.Tensor) -> "SamplingParameters":
+    def from_columns(cls, values: torch.Tensor) -> SamplingParameters:
         if values.ndim != 2 or int(values.shape[-1]) != 6:
             raise ValueError("sampling parameters must have six columns per row")
         return cls(
@@ -193,7 +193,7 @@ def sample_top_k(
     """Draw exact tokens from rows whose top-k candidate bound is at most 128."""
 
     if logits.ndim != 2 or draws.shape != logits.shape[:1]:
-        raise ValueError("sampling provider draws must align with logits rows")
+        raise ValueError("top-k sampling draws must align with logits rows")
     if (
         parameters.temperature.shape != logits.shape[:1]
         or parameters.top_p.shape != logits.shape[:1]
@@ -202,15 +202,15 @@ def sample_top_k(
         or parameters.frequency_penalty.shape != logits.shape[:1]
         or parameters.presence_penalty.shape != logits.shape[:1]
     ):
-        raise ValueError("sampling provider parameter vectors do not align with logits")
+        raise ValueError("top-k sampling parameter vectors do not align with logits")
     if (
         penalty_token_ids.ndim != 2
         or penalty_counts.shape != penalty_token_ids.shape
         or penalty_token_ids.shape[0] != logits.shape[0]
     ):
-        raise ValueError("sampling provider penalty vectors do not align")
+        raise ValueError("top-k sampling penalty vectors do not align")
     if not 0 < int(top_k) <= 128 or int(top_k) >= int(logits.shape[1]):
-        raise ValueError("sampling provider requires an exact top-k candidate bound")
+        raise ValueError("top-k sampling requires an exact top-k candidate bound")
     args = (
         logits,
         draws,

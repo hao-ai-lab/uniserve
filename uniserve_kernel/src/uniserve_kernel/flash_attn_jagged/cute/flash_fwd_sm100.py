@@ -38,7 +38,7 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
-from flash_attn.cute.mask import AttentionMask
+from .mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
